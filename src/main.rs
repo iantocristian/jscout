@@ -8,6 +8,7 @@ mod mcp;
 mod parse;
 mod query;
 mod search;
+mod scout;
 mod stats;
 mod store;
 mod structural;
@@ -63,6 +64,9 @@ enum Command {
         /// Max results
         #[arg(short = 'k', long, default_value_t = 8)]
         limit: usize,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = search::DEFAULT_RESPONSE_BYTE_LIMIT)]
+        response_bytes: usize,
         /// Skip vector search even if a provider is configured
         #[arg(long)]
         no_vector: bool,
@@ -108,6 +112,9 @@ enum Command {
         /// Evaluation tool surface: baseline or structural
         #[arg(long, default_value = "structural")]
         profile: String,
+        /// Definition source representation: full or deterministic elided source
+        #[arg(long, default_value = "full")]
+        source_view: String,
     },
     /// Watch a repository and re-index on change
     Watch {
@@ -174,6 +181,7 @@ fn main() -> Result<()> {
             root,
             query,
             limit,
+            response_bytes,
             no_vector,
             json,
             expand,
@@ -191,6 +199,7 @@ fn main() -> Result<()> {
             search::SearchOptions {
                 limit,
                 expand,
+                response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
                     seed_limit: expand_seeds,
@@ -202,8 +211,13 @@ fn main() -> Result<()> {
             },
         ),
         Command::Events { root, name } => cmd_events(&root, name.as_deref()),
-        Command::Mcp { root, telemetry, profile } => {
-            mcp::serve(&root, telemetry.as_deref(), mcp::ToolProfile::parse(&profile)?)
+        Command::Mcp { root, telemetry, profile, source_view } => {
+            mcp::serve(
+                &root,
+                telemetry.as_deref(),
+                mcp::ToolProfile::parse(&profile)?,
+                scout::SourceView::parse(&source_view)?,
+            )
         }
         Command::Watch { root, embed } => watch::watch(&root, embed),
         Command::WhoUses { root, spec, json } => cmd_who_uses(&root, &spec, json),

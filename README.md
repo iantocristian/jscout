@@ -48,13 +48,17 @@ Structural expansion is off by default and does not alter search scores. Add
 
 ```bash
 jscout search /path/to/repo "checkout inventory" --json --expand \
+  --response-bytes 24000 \
   --expand-depth 1 --expand-seeds 3 \
   --expand-nodes 40 --expand-edges 120 --expand-bytes 24000
 ```
 
-The node, edge, and serialized node/edge byte limits are global across all
-search-hit seeds. `--expand-min-confidence` defaults to `likely`; use
-`possible` only when explicit unresolved candidates are useful.
+`--response-bytes` caps the complete pretty-printed JSON envelope: hits,
+expansion, budget metadata, and serialization overhead. The result reports its
+actual `rendered_bytes`, original `unbudgeted_bytes`, and any omitted content.
+The expansion node, edge, and payload limits are subordinate budgets shared
+across all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
+use `possible` only when explicit unresolved candidates are useful.
 
 ## Confidence tiers
 
@@ -130,6 +134,17 @@ that consume `AGENTS.md` or another instruction format.
 For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
 `neighborhood` or search expansion) and `--profile structural` (the default).
 See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
+
+`definition` returns full source by default. `jscout mcp --source-view elided`
+enables the experimental deterministic renderer, and each call can override it
+with `view: "full"` or `view: "elided"`. Both representations obey the same
+per-definition `source_bytes` ceiling and report original/rendered byte counts.
+The first SC-1 agent run found no compression on the artifacts selected by the
+elided arm, so elision remains experimental rather than becoming the default.
+The first discriminating three-arm run found no outcome gain over grep: both
+grep and structural answered 4/4 exactly, while structural inspected fewer
+files at substantially higher agent-token cost. See
+[eval/results/ai-pipe-discriminating-2026-08-07.md](eval/results/ai-pipe-discriminating-2026-08-07.md).
 
 For opt-in agent-behavior measurement, start MCP with
 `--telemetry .jscout-telemetry.jsonl` or set `JSCOUT_TELEMETRY_FILE`. The JSONL

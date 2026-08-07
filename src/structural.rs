@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -46,6 +47,8 @@ pub struct GraphNode {
     pub file: Option<String>,
     pub line: Option<i64>,
     pub meta: Value,
+    /// Query-local path relevance; not part of persistent graph identity.
+    pub relevance: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +61,47 @@ pub struct GraphEdge {
     pub file: Option<String>,
     pub line: Option<i64>,
     pub detail: Value,
+    /// Query-local path relevance; not part of the canonical edge.
+    pub relevance: f64,
+}
+
+#[derive(Debug)]
+struct RankedStep {
+    edge_id: i64,
+    edge: GraphEdge,
+    other: String,
+    depth: usize,
+    confidence_floor: f64,
+    relation_floor: f64,
+    hub_floor: f64,
+    score: f64,
+}
+
+impl PartialEq for RankedStep {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+            && self.depth == other.depth
+            && self.edge_id == other.edge_id
+            && self.other == other.other
+    }
+}
+
+impl Eq for RankedStep {}
+
+impl PartialOrd for RankedStep {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedStep {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.depth.cmp(&self.depth))
+            .then_with(|| other.other.cmp(&self.other))
+            .then_with(|| other.edge_id.cmp(&self.edge_id))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -734,87 +778,83 @@ fn neighborhood_in_snapshot(
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
     let min_rank = confidence_rank(&options.min_confidence).unwrap();
     let mut discovered = HashSet::from([resolved_anchor.clone()]);
-    let mut queue = VecDeque::from([(resolved_anchor.clone(), 0_usize)]);
+    let mut node_relevance = HashMap::from([(resolved_anchor.clone(), 1.0_f64)]);
+    let mut expanded = HashSet::from([resolved_anchor.clone()]);
+    let mut frontier = BinaryHeap::new();
     let mut edges_by_id: HashMap<i64, GraphEdge> = HashMap::new();
+    let mut degree_cache = HashMap::new();
     let mut truncated = false;
 
-    // TODO(RI-1 ranking): traversal is budgeted and deterministic, but not
-    // relevance-ranked. Under truncation, SQL edge ordering decides which
-    // candidates survive. Implement confidence × relation weight × distance
-    // decay × hub damping before describing this surface as ranked.
-    while let Some((node, depth)) = queue.pop_front() {
-        if depth >= options.depth {
+    if options.depth > 0 {
+        let root_degree = graph_degree(conn, &resolved_anchor)?;
+        degree_cache.insert(resolved_anchor.clone(), root_degree);
+        enqueue_ranked_steps(
+            conn,
+            &resolved_anchor,
+            0,
+            hub_damping(root_degree),
+            1.0,
+            1.0,
+            options,
+            min_rank,
+            &allowed_kinds,
+            &mut degree_cache,
+            &mut frontier,
+        )?;
+    }
+
+    while let Some(step) = frontier.pop() {
+        if edges_by_id.contains_key(&step.edge_id) {
             continue;
         }
-        let directions: &[&str] = match options.direction.as_str() {
-            "out" => &["out"],
-            "in" => &["in"],
-            _ => &["out", "in"],
-        };
-        for direction in directions {
-            let sql = if *direction == "out" {
-                "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                        f.path, e.line, e.detail_json
-                 FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
-                 WHERE e.src_key = ?1 ORDER BY e.kind, e.dst_key, e.id"
-            } else {
-                "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                        f.path, e.line, e.detail_json
-                 FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
-                 WHERE e.dst_key = ?1 ORDER BY e.kind, e.src_key, e.id"
-            };
-            let mut stmt = conn.prepare_cached(sql)?;
-            let rows = stmt.query_map([&node], |r| {
-                let detail: String = r.get(8)?;
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    GraphEdge {
-                        source: r.get(1)?,
-                        target: r.get(2)?,
-                        kind: r.get(3)?,
-                        confidence: r.get(4)?,
-                        provenance: r.get(5)?,
-                        file: r.get(6)?,
-                        line: r.get(7)?,
-                        detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (edge_id, edge) = row?;
-                if confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
-                    || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
-                {
-                    continue;
-                }
-                let other = if *direction == "out" {
-                    &edge.target
-                } else {
-                    &edge.source
-                };
-                if !discovered.contains(other) && discovered.len() >= options.node_limit {
-                    truncated = true;
-                    continue;
-                }
-                if edges_by_id.len() >= options.edge_limit && !edges_by_id.contains_key(&edge_id) {
-                    truncated = true;
-                    continue;
-                }
-                if discovered.insert(other.clone()) {
-                    queue.push_back((other.clone(), depth + 1));
-                }
-                edges_by_id.insert(edge_id, edge);
-            }
+        if edges_by_id.len() >= options.edge_limit {
+            truncated = true;
+            break;
+        }
+        let new_node = !discovered.contains(&step.other);
+        if new_node && discovered.len() >= options.node_limit {
+            truncated = true;
+            continue;
+        }
+        if new_node {
+            discovered.insert(step.other.clone());
+            node_relevance.insert(step.other.clone(), step.score);
+        }
+        edges_by_id.insert(step.edge_id, step.edge);
+
+        if step.depth < options.depth && expanded.insert(step.other.clone()) {
+            enqueue_ranked_steps(
+                conn,
+                &step.other,
+                step.depth,
+                step.confidence_floor,
+                step.relation_floor,
+                step.hub_floor,
+                options,
+                min_rank,
+                &allowed_kinds,
+                &mut degree_cache,
+                &mut frontier,
+            )?;
         }
     }
 
     let mut nodes = Vec::with_capacity(discovered.len());
     for key in discovered {
-        nodes.push(load_node(conn, &key)?.with_context(|| format!("missing graph node {key}"))?);
+        let mut node =
+            load_node(conn, &key)?.with_context(|| format!("missing graph node {key}"))?;
+        node.relevance = *node_relevance.get(&key).unwrap_or(&0.0);
+        nodes.push(node);
     }
-    nodes.sort_by(|a, b| a.key.cmp(&b.key));
+    nodes.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| a.key.cmp(&b.key))
+    });
     let mut edges: Vec<GraphEdge> = edges_by_id.into_values().collect();
-    edges.sort_by(|a, b| (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target)));
+    edges.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| {
+            (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target))
+        })
+    });
     Ok(Neighborhood {
         snapshot,
         requested_anchor: anchor.to_string(),
@@ -824,6 +864,142 @@ fn neighborhood_in_snapshot(
         edges,
         truncated,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_ranked_steps(
+    conn: &Connection,
+    node: &str,
+    depth: usize,
+    confidence_floor: f64,
+    relation_floor: f64,
+    hub_floor: f64,
+    options: &NeighborhoodOptions,
+    min_rank: u8,
+    allowed_kinds: &HashSet<&str>,
+    degree_cache: &mut HashMap<String, usize>,
+    frontier: &mut BinaryHeap<RankedStep>,
+) -> Result<()> {
+    let directions: &[&str] = match options.direction.as_str() {
+        "out" => &["out"],
+        "in" => &["in"],
+        _ => &["out", "in"],
+    };
+    for direction in directions {
+        let sql = if *direction == "out" {
+            "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
+                    f.path, e.line, e.detail_json
+             FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
+             WHERE e.src_key = ?1"
+        } else {
+            "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
+                    f.path, e.line, e.detail_json
+             FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
+             WHERE e.dst_key = ?1"
+        };
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map([node], |r| {
+            let detail: String = r.get(8)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                GraphEdge {
+                    source: r.get(1)?,
+                    target: r.get(2)?,
+                    kind: r.get(3)?,
+                    confidence: r.get(4)?,
+                    provenance: r.get(5)?,
+                    file: r.get(6)?,
+                    line: r.get(7)?,
+                    detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+                    relevance: 0.0,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (edge_id, mut edge) = row?;
+            if confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
+                || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
+            {
+                continue;
+            }
+            let other = if *direction == "out" {
+                edge.target.clone()
+            } else {
+                edge.source.clone()
+            };
+            let degree = match degree_cache.get(&other) {
+                Some(degree) => *degree,
+                None => {
+                    let degree = graph_degree(conn, &other)?;
+                    degree_cache.insert(other.clone(), degree);
+                    degree
+                }
+            };
+            let confidence_floor = confidence_floor.min(confidence_weight(&edge.confidence));
+            let relation_floor = relation_floor.min(relation_weight(&edge.kind));
+            let hub_floor = hub_floor.min(hub_damping(degree));
+            let next_depth = depth + 1;
+            let score = round_score(
+                confidence_floor
+                    * relation_floor
+                    * distance_decay(next_depth)
+                    * hub_floor,
+            );
+            edge.relevance = score;
+            frontier.push(RankedStep {
+                edge_id,
+                edge,
+                other,
+                depth: next_depth,
+                confidence_floor,
+                relation_floor,
+                hub_floor,
+                score,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn graph_degree(conn: &Connection, node: &str) -> Result<usize> {
+    let degree: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolved_edges WHERE src_key=?1 OR dst_key=?1",
+        [node],
+        |row| row.get(0),
+    )?;
+    Ok(degree.max(0) as usize)
+}
+
+fn confidence_weight(confidence: &str) -> f64 {
+    match confidence {
+        "certain" => 1.0,
+        "likely" => 0.6,
+        "possible" => 0.3,
+        _ => 0.0,
+    }
+}
+
+fn relation_weight(kind: &str) -> f64 {
+    match kind {
+        "call" | "render" | "extend" => 1.0,
+        "member_call" | "member_candidate" => 0.9,
+        "import" | "reexport" => 0.75,
+        "emits" | "listens" => 0.7,
+        "contains_event" => 0.6,
+        _ => 0.5,
+    }
+}
+
+fn distance_decay(depth: usize) -> f64 {
+    0.75_f64.powi(depth.saturating_sub(1) as i32)
+}
+
+fn hub_damping(degree: usize) -> f64 {
+    1.0 / (degree as f64 + 2.0).log2()
+}
+
+fn round_score(score: f64) -> f64 {
+    (score * 1_000_000.0).round() / 1_000_000.0
 }
 
 fn resolve_anchor(
@@ -947,6 +1123,7 @@ fn load_node(conn: &Connection, key: &str) -> Result<Option<GraphNode>> {
                 file: r.get(3)?,
                 line: r.get(4)?,
                 meta: serde_json::from_str(&meta).unwrap_or(Value::Null),
+                relevance: 0.0,
             })
         })
         .optional()?;
@@ -1068,6 +1245,54 @@ mod tests {
         assert!(keys.iter().any(|key| key.contains("#Alpha::ping@1")));
         assert!(keys.iter().any(|key| key.contains("#Beta::ping@1")));
         assert!(neighborhood(&conn, "ping", &NeighborhoodOptions::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_keeps_higher_ranked_candidates_not_sql_order() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(repo.path(), "root.ts", "export const root = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        for (key, name) in [("candidate:a-low", "a-low"), ("candidate:z-high", "z-high")] {
+            conn.execute(
+                "INSERT INTO graph_nodes(node_key, node_kind, display_name, meta_json)
+                 VALUES(?1, 'candidate', ?2, '{}')",
+                rusqlite::params![key, name],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO resolved_edges(
+               src_key, dst_key, kind, confidence, provenance, detail_json
+             ) VALUES('file:root.ts', 'candidate:a-low', 'call', 'possible', 'test', '{}')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO resolved_edges(
+               src_key, dst_key, kind, confidence, provenance, detail_json
+             ) VALUES('file:root.ts', 'candidate:z-high', 'import', 'certain', 'test', '{}')",
+            [],
+        )?;
+
+        let result = neighborhood(
+            &conn,
+            "file:root.ts",
+            &NeighborhoodOptions {
+                depth: 1,
+                direction: "out".into(),
+                node_limit: 2,
+                edge_limit: 2,
+                min_confidence: "possible".into(),
+                kinds: Vec::new(),
+                expected_snapshot: None,
+            },
+        )?;
+        assert!(result.truncated);
+        assert!(result.nodes.iter().any(|node| node.key == "candidate:z-high"));
+        assert!(!result.nodes.iter().any(|node| node.key == "candidate:a-low"));
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].kind, "import");
+        assert!(result.edges[0].relevance > 0.0);
         Ok(())
     }
 

@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::{embed, query, search, store, structural};
+use crate::{embed, query, scout, search, store, structural};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -36,7 +36,12 @@ impl ToolProfile {
     }
 }
 
-pub fn serve(root: &Path, telemetry_path: Option<&Path>, profile: ToolProfile) -> Result<()> {
+pub fn serve(
+    root: &Path,
+    telemetry_path: Option<&Path>,
+    profile: ToolProfile,
+    source_view: scout::SourceView,
+) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = store::open(&root)?;
     let provider = embed::Provider::from_env();
@@ -100,11 +105,20 @@ pub fn serve(root: &Path, telemetry_path: Option<&Path>, profile: ToolProfile) -
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
-                let result = call_tool(&conn, provider.as_ref(), profile, name, &args);
+                let result = call_tool(
+                    &root,
+                    &conn,
+                    provider.as_ref(),
+                    profile,
+                    source_view,
+                    name,
+                    &args,
+                );
                 log_tool_call(
                     &mut telemetry,
                     &conn,
                     profile,
+                    source_view,
                     name,
                     &result,
                     started.elapsed(),
@@ -166,6 +180,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
                     "limit": { "type": "integer", "default": 8 },
+                    "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered result, including hits, expansion, metadata, and JSON overhead" },
                     "expand": { "type": "boolean", "default": false, "description": "Attach a separately labelled structural context pack; off by default" },
                     "expand_depth": { "type": "integer", "default": 1 },
                     "expand_seeds": { "type": "integer", "default": 3 },
@@ -194,7 +209,9 @@ fn tool_defs(profile: ToolProfile) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": { "type": "string", "description": "NAME or path-substring:NAME" }
+                    "symbol": { "type": "string", "description": "NAME or path-substring:NAME" },
+                    "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
+                    "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" }
                 },
                 "required": ["symbol"]
             }
@@ -205,7 +222,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Repo-relative path (or unique suffix)" }
+                    "path": { "type": "string", "description": "Repo-relative path (or unique suffix)" },
+                    "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered outline response" }
                 },
                 "required": ["path"]
             }
@@ -264,9 +282,11 @@ fn tool_defs(profile: ToolProfile) -> Value {
 }
 
 fn call_tool(
+    root: &Path,
     conn: &Connection,
     provider: Option<&embed::Provider>,
     profile: ToolProfile,
+    source_view: scout::SourceView,
     name: &str,
     args: &Value,
 ) -> Result<String> {
@@ -285,6 +305,10 @@ fn call_tool(
                 &search::SearchOptions {
                     limit,
                     expand,
+                    response_byte_limit: args["response_bytes"]
+                        .as_u64()
+                        .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
+                        as usize,
                     expansion: search::ExpansionOptions {
                         depth: args["expand_depth"].as_u64().unwrap_or(1) as usize,
                         seed_limit: args["expand_seeds"].as_u64().unwrap_or(3) as usize,
@@ -313,24 +337,71 @@ fn call_tool(
         }
         "definition" => {
             let spec = args["symbol"].as_str().unwrap_or("");
+            let source_view = args["view"]
+                .as_str()
+                .map(scout::SourceView::parse)
+                .transpose()?
+                .unwrap_or(source_view);
+            let source_bytes = args["source_bytes"]
+                .as_u64()
+                .unwrap_or(scout::DEFAULT_SOURCE_BYTE_LIMIT as u64)
+                as usize;
             let targets = query::find_symbols(conn, spec)?;
             let mut results = Vec::new();
             for t in targets.iter().take(5) {
-                let source: Option<String> = conn
+                let chunk: Option<(String, i64, i64, String)> = conn
                     .query_row(
-                        "SELECT c.content FROM chunks c JOIN files f ON c.file_id = f.id
+                        "SELECT c.content, c.start, c.end, f.hash
+                         FROM chunks c JOIN files f ON c.file_id = f.id
                          WHERE f.id = ?1 AND (c.name = ?2 OR c.symbols LIKE '%' || ?2 || '%')
                          ORDER BY c.name = ?2 DESC LIMIT 1",
                         rusqlite::params![t.file_id, t.name],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .ok();
-                results.push(json!({ "target": t, "source": source }));
+                let rendered = chunk
+                    .map(|(content, start, end, indexed_hash)| {
+                        let disk_source = std::fs::read_to_string(root.join(&t.file)).ok();
+                        let current = disk_source.as_deref().is_some_and(|source| {
+                            blake3::hash(source.as_bytes()).to_hex().as_str() == indexed_hash
+                        });
+                        if current {
+                            let source = disk_source.as_deref().expect("checked disk source");
+                            scout::render_source(
+                                Path::new(&t.file),
+                                source,
+                                start as usize,
+                                end as usize,
+                                source_view,
+                                source_bytes,
+                            )
+                        } else {
+                            scout::render_source(
+                                Path::new(&t.file),
+                                &content,
+                                0,
+                                content.len(),
+                                source_view,
+                                source_bytes,
+                            )
+                        }
+                    })
+                    .transpose()?;
+                let source = rendered.as_ref().map(|artifact| artifact.text.clone());
+                results.push(json!({
+                    "target": t,
+                    "source": source,
+                    "source_meta": rendered,
+                }));
             }
             Ok(serde_json::to_string_pretty(&results)?)
         }
         "file_outline" => {
             let path = args["path"].as_str().unwrap_or("");
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
+                as usize;
             let mut stmt = conn.prepare(
                 "SELECT f.path, c.kind, c.name, c.scope_chain, c.start_line, c.end_line, c.id
                  FROM chunks c JOIN files f ON c.file_id = f.id
@@ -347,7 +418,7 @@ fn call_tool(
                 }))
             })?;
             let outline: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
-            Ok(serde_json::to_string_pretty(&outline)?)
+            render_bounded_items("outline", outline, response_bytes)
         }
         "events" => {
             let filter = args["name"].as_str();
@@ -387,10 +458,61 @@ fn call_tool(
     }
 }
 
+fn render_bounded_items(field: &str, items: Vec<Value>, byte_limit: usize) -> Result<String> {
+    if byte_limit == 0 {
+        anyhow::bail!("response byte limit must be greater than zero");
+    }
+    let original_items = items.len();
+    let budget = json!({
+        "byte_limit": byte_limit,
+        "rendered_bytes": 0,
+        "unbudgeted_bytes": 0,
+        "truncated": false,
+        "omitted_items": 0,
+    });
+    let mut response = json!({ (field): items, "response_budget": budget });
+    settle_value_rendered_bytes(&mut response)?;
+    let unbudgeted = response["response_budget"]["rendered_bytes"].as_u64().unwrap_or(0);
+    response["response_budget"]["unbudgeted_bytes"] = json!(unbudgeted);
+    settle_value_rendered_bytes(&mut response)?;
+
+    while serde_json::to_string_pretty(&response)?.len() > byte_limit {
+        if response[field]
+            .as_array_mut()
+            .expect("bounded response array")
+            .pop()
+            .is_none()
+        {
+            let minimum = serde_json::to_string_pretty(&response)?.len();
+            anyhow::bail!(
+                "response byte limit {byte_limit} is below the minimum {field} envelope ({minimum} bytes)"
+            );
+        }
+        response["response_budget"]["truncated"] = json!(true);
+        let remaining = response[field].as_array().map_or(0, Vec::len);
+        response["response_budget"]["omitted_items"] = json!(original_items - remaining);
+        settle_value_rendered_bytes(&mut response)?;
+    }
+    settle_value_rendered_bytes(&mut response)?;
+    Ok(serde_json::to_string_pretty(&response)?)
+}
+
+fn settle_value_rendered_bytes(value: &mut Value) -> Result<usize> {
+    for _ in 0..8 {
+        let rendered = serde_json::to_string_pretty(value)?.len();
+        if value["response_budget"]["rendered_bytes"].as_u64() == Some(rendered as u64) {
+            return Ok(rendered);
+        }
+        value["response_budget"]["rendered_bytes"] = json!(rendered);
+    }
+    Ok(serde_json::to_string_pretty(value)?.len())
+}
+
 fn log_tool_call(
     telemetry: &mut Option<File>,
     conn: &Connection,
     profile: ToolProfile,
+    source_view: scout::SourceView,
     tool: &str,
     result: &Result<String>,
     elapsed: std::time::Duration,
@@ -413,15 +535,53 @@ fn log_tool_call(
         Ok(text) => (true, text.len()),
         Err(error) => (false, error.to_string().len()),
     };
+    let source_metrics = result
+        .as_ref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value.as_array().cloned())
+        .map(|artifacts| {
+            let source_artifacts = artifacts
+                .iter()
+                .filter(|artifact| artifact.get("source_meta").is_some_and(Value::is_object))
+                .count();
+            let source_rendered_bytes = artifacts
+                .iter()
+                .filter_map(|artifact| artifact["source_meta"]["rendered_bytes"].as_u64())
+                .sum::<u64>();
+            let source_original_bytes = artifacts
+                .iter()
+                .filter_map(|artifact| artifact["source_meta"]["original_bytes"].as_u64())
+                .sum::<u64>();
+            let source_budget_truncations = artifacts
+                .iter()
+                .filter(|artifact| artifact["source_meta"]["budget_truncated"] == true)
+                .count();
+            (
+                source_artifacts,
+                source_rendered_bytes,
+                source_original_bytes,
+                source_budget_truncations,
+            )
+        })
+        .unwrap_or_default();
+    let profile_label = std::env::var("JSCOUT_PROFILE_LABEL")
+        .unwrap_or_else(|_| profile.as_str().to_string());
     let record = json!({
         "timestamp_ms": timestamp_ms,
         "session": session,
         "task": task,
-        "profile": profile.as_str(),
+        "profile": profile_label,
+        "tool_profile": profile.as_str(),
+        "source_view": source_view.as_str(),
         "tool": tool,
         "ok": ok,
         "elapsed_ms": elapsed.as_millis(),
         "result_bytes": result_bytes,
+        "source_artifacts": source_metrics.0,
+        "source_rendered_bytes": source_metrics.1,
+        "source_original_bytes": source_metrics.2,
+        "source_budget_truncations": source_metrics.3,
         "snapshot": snapshot,
     });
     if serde_json::to_writer(&mut *file, &record).is_err()
@@ -434,10 +594,15 @@ fn log_tool_call(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use anyhow::Result;
     use rusqlite::Connection;
     use serde_json::json;
 
-    use super::{ToolProfile, call_tool, server_instructions, tool_defs};
+    use super::{ToolProfile, call_tool, render_bounded_items, server_instructions, tool_defs};
+    use crate::{indexer, scout::SourceView, store};
 
     #[test]
     fn profile_instructions_explain_when_to_use_structural_traversal() {
@@ -459,6 +624,13 @@ mod tests {
             .find(|tool| tool["name"] == "semantic_search")
             .expect("semantic_search definition");
         assert!(search["inputSchema"]["properties"].get("expand").is_none());
+        assert!(search["inputSchema"]["properties"].get("response_bytes").is_some());
+        let definition = tools
+            .iter()
+            .find(|tool| tool["name"] == "definition")
+            .expect("definition tool");
+        assert!(definition["inputSchema"]["properties"].get("view").is_some());
+        assert!(definition["inputSchema"]["properties"].get("source_bytes").is_some());
 
         let structural = tool_defs(ToolProfile::Structural);
         let tools = structural.as_array().expect("tool definitions");
@@ -474,20 +646,78 @@ mod tests {
     fn baseline_profile_rejects_structural_calls_even_if_client_bypasses_schema() {
         let conn = Connection::open_in_memory().expect("in-memory database");
         let expanded = call_tool(
+            Path::new("."),
             &conn,
             None,
             ToolProfile::Baseline,
+            SourceView::Full,
             "semantic_search",
             &json!({ "query": "x", "expand": true }),
         );
         assert!(expanded.unwrap_err().to_string().contains("baseline MCP profile"));
         let neighborhood = call_tool(
+            Path::new("."),
             &conn,
             None,
             ToolProfile::Baseline,
+            SourceView::Full,
             "neighborhood",
             &json!({ "anchor": "file:x.ts" }),
         );
         assert!(neighborhood.unwrap_err().to_string().contains("baseline MCP profile"));
+    }
+
+    #[test]
+    fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function run(value: number): number {\n  const localPlumbingWithALongName = value + value + value + value;\n  if (value < 0) throw new Error('negative');\n  return value;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let elided = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Elided,
+            "definition",
+            &json!({ "symbol": "run", "source_bytes": 512 }),
+        )?;
+        let elided: serde_json::Value = serde_json::from_str(&elided)?;
+        assert_eq!(elided[0]["source_meta"]["representation"], "elided");
+        assert!(elided[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
+        assert!(!elided[0]["source"].as_str().unwrap().contains("localPlumbingWithALongName"));
+
+        let full = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Elided,
+            "definition",
+            &json!({ "symbol": "run", "view": "full", "source_bytes": 512 }),
+        )?;
+        let full: serde_json::Value = serde_json::from_str(&full)?;
+        assert_eq!(full[0]["source_meta"]["representation"], "full");
+        assert!(full[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
+        assert!(full[0]["source"].as_str().unwrap().contains("localPlumbingWithALongName"));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_item_envelope_accounts_for_json_overhead() -> Result<()> {
+        let items = (0..100)
+            .map(|index| json!({ "index": index, "text": "x".repeat(80) }))
+            .collect();
+        let rendered = render_bounded_items("outline", items, 1_500)?;
+        let value: serde_json::Value = serde_json::from_str(&rendered)?;
+        assert!(rendered.len() <= 1_500);
+        assert_eq!(value["response_budget"]["rendered_bytes"], rendered.len());
+        assert_eq!(value["response_budget"]["truncated"], true);
+        assert!(value["outline"].as_array().unwrap().len() < 100);
+        Ok(())
     }
 }

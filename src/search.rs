@@ -7,6 +7,8 @@ use crate::{embed, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
+pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
+
 #[derive(Debug, Clone)]
 pub struct ExpansionOptions {
     pub depth: usize,
@@ -34,12 +36,20 @@ impl Default for ExpansionOptions {
 pub struct SearchOptions {
     pub limit: usize,
     pub expand: bool,
+    /// Maximum bytes in the pretty-printed JSON search envelope. This covers
+    /// hits, expansion, metadata, and serialization overhead.
+    pub response_byte_limit: usize,
     pub expansion: ExpansionOptions,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self { limit: 8, expand: false, expansion: ExpansionOptions::default() }
+        Self {
+            limit: 8,
+            expand: false,
+            response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
+            expansion: ExpansionOptions::default(),
+        }
     }
 }
 
@@ -49,6 +59,19 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
+    pub response_budget: ResponseBudget,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ResponseBudget {
+    pub byte_limit: usize,
+    pub rendered_bytes: usize,
+    pub unbudgeted_bytes: usize,
+    pub truncated: bool,
+    pub omitted_hits: usize,
+    pub omitted_nodes: usize,
+    pub omitted_edges: usize,
+    pub truncated_snippets: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -73,6 +96,7 @@ pub struct Hit {
     pub end_line: i64,
     pub score: f64,
     pub snippet: String,
+    pub snippet_truncated: bool,
     /// Snapshot-scoped structural handles projected from this retrieval chunk.
     pub anchors: Vec<String>,
     pub file_anchor: String,
@@ -205,7 +229,17 @@ pub fn search(
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion))
             .transpose()?;
-        Ok(SearchResult { snapshot, hits, expansion })
+        let mut result = SearchResult {
+            snapshot,
+            hits,
+            expansion,
+            response_budget: ResponseBudget {
+                byte_limit: options.response_byte_limit,
+                ..Default::default()
+            },
+        };
+        apply_response_budget(&mut result)?;
+        Ok(result)
     })
 }
 
@@ -348,11 +382,137 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         end_line,
         score,
         snippet,
+        snippet_truncated: false,
         anchors,
         file_anchor,
         uses,
         used_by,
     }))
+}
+
+fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
+    let byte_limit = result.response_budget.byte_limit;
+    if byte_limit == 0 {
+        anyhow::bail!("response byte limit must be greater than zero");
+    }
+
+    let unbudgeted = settle_rendered_bytes(result)?;
+    result.response_budget.unbudgeted_bytes = unbudgeted;
+    let unbudgeted = settle_rendered_bytes(result)?;
+    result.response_budget.unbudgeted_bytes = unbudgeted;
+
+    while settle_rendered_bytes(result)? > byte_limit {
+        result.response_budget.truncated = true;
+
+        if let Some(expansion) = result.expansion.as_mut() {
+            if !expansion.nodes.is_empty() {
+                let removable = expansion
+                    .nodes
+                    .iter()
+                    .rposition(|node| !expansion.seeds.contains(&node.key))
+                    .unwrap_or(expansion.nodes.len() - 1);
+                let removed = expansion.nodes.remove(removable);
+                let edge_count = expansion.edges.len();
+                expansion.edges.retain(|edge| {
+                    edge.source != removed.key && edge.target != removed.key
+                });
+                expansion.truncated = true;
+                result.response_budget.omitted_nodes += 1;
+                result.response_budget.omitted_edges += edge_count - expansion.edges.len();
+                expansion.payload_bytes = expansion_payload_bytes(expansion)?;
+                continue;
+            }
+            if expansion.edges.pop().is_some() {
+                expansion.truncated = true;
+                result.response_budget.omitted_edges += 1;
+                expansion.payload_bytes = expansion_payload_bytes(expansion)?;
+                continue;
+            }
+        }
+
+        let rendered = result.response_budget.rendered_bytes;
+        if let Some((index, _)) = result
+            .hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| !hit.snippet.is_empty())
+            .max_by_key(|(_, hit)| hit.snippet.len())
+        {
+            let overshoot = rendered.saturating_sub(byte_limit);
+            let hit = &mut result.hits[index];
+            let target = hit.snippet.len().saturating_sub(overshoot.max(128));
+            truncate_utf8(&mut hit.snippet, target);
+            if !hit.snippet_truncated {
+                hit.snippet_truncated = true;
+                result.response_budget.truncated_snippets += 1;
+            }
+            continue;
+        }
+
+        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| !hit.used_by.is_empty()) {
+            hit.used_by.pop();
+            continue;
+        }
+        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| !hit.uses.is_empty()) {
+            hit.uses.pop();
+            continue;
+        }
+        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| hit.anchors.len() > 1) {
+            hit.anchors.pop();
+            continue;
+        }
+        if result.hits.pop().is_some() {
+            result.response_budget.omitted_hits += 1;
+            continue;
+        }
+
+        let minimum = settle_rendered_bytes(result)?;
+        anyhow::bail!(
+            "response byte limit {byte_limit} is below the minimum search envelope ({minimum} bytes)"
+        );
+    }
+
+    settle_rendered_bytes(result)?;
+    Ok(())
+}
+
+fn settle_rendered_bytes(result: &mut SearchResult) -> Result<usize> {
+    for _ in 0..8 {
+        let rendered = serde_json::to_string_pretty(result)?.len();
+        if result.response_budget.rendered_bytes == rendered {
+            return Ok(rendered);
+        }
+        result.response_budget.rendered_bytes = rendered;
+    }
+    Ok(serde_json::to_string_pretty(result)?.len())
+}
+
+fn expansion_payload_bytes(expansion: &SearchExpansion) -> Result<usize> {
+    let node_bytes = expansion
+        .nodes
+        .iter()
+        .map(|node| serde_json::to_vec(node).map(|bytes| bytes.len()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let edge_bytes = expansion
+        .edges
+        .iter()
+        .map(|edge| serde_json::to_vec(edge).map(|bytes| bytes.len()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(node_bytes.iter().sum::<usize>()
+        + edge_bytes.iter().sum::<usize>()
+        + node_bytes.len().saturating_sub(1)
+        + edge_bytes.len().saturating_sub(1))
+}
+
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
 }
 
 fn project_chunk_anchors(
@@ -446,9 +606,8 @@ fn expand_hits(
         }
     }
 
-    let mut nodes: HashMap<String, structural::GraphNode> = HashMap::new();
-    let mut edges: HashMap<EdgeIdentity, structural::GraphEdge> = HashMap::new();
-    let mut payload_bytes = 0_usize;
+    let mut candidate_nodes: HashMap<String, structural::GraphNode> = HashMap::new();
+    let mut candidate_edges: HashMap<EdgeIdentity, structural::GraphEdge> = HashMap::new();
     let mut truncated = false;
     for seed in &seeds {
         let neighborhood = structural::neighborhood(
@@ -466,22 +625,16 @@ fn expand_hits(
         )?;
         truncated |= neighborhood.truncated;
         for node in neighborhood.nodes {
-            if nodes.contains_key(&node.key) {
-                continue;
-            }
-            let bytes = serde_json::to_vec(&node)?.len() + usize::from(!nodes.is_empty());
-            if nodes.len() >= options.node_limit || payload_bytes + bytes > options.byte_limit {
-                truncated = true;
-                continue;
-            }
-            payload_bytes += bytes;
-            nodes.insert(node.key.clone(), node);
+            candidate_nodes
+                .entry(node.key.clone())
+                .and_modify(|current| {
+                    if node.relevance > current.relevance {
+                        *current = node.clone();
+                    }
+                })
+                .or_insert(node);
         }
         for edge in neighborhood.edges {
-            if !nodes.contains_key(&edge.source) || !nodes.contains_key(&edge.target) {
-                truncated = true;
-                continue;
-            }
             let key = (
                 edge.source.clone(),
                 edge.target.clone(),
@@ -489,26 +642,59 @@ fn expand_hits(
                 edge.file.clone(),
                 edge.line,
             );
-            if edges.contains_key(&key) {
-                continue;
-            }
-            let bytes = serde_json::to_vec(&edge)?.len() + usize::from(!edges.is_empty());
-            if edges.len() >= options.edge_limit || payload_bytes + bytes > options.byte_limit {
-                truncated = true;
-                continue;
-            }
-            payload_bytes += bytes;
-            edges.insert(key, edge);
+            candidate_edges
+                .entry(key)
+                .and_modify(|current| {
+                    if edge.relevance > current.relevance {
+                        *current = edge.clone();
+                    }
+                })
+                .or_insert(edge);
         }
     }
 
-    let mut nodes: Vec<_> = nodes.into_values().collect();
-    nodes.sort_by(|a, b| a.key.cmp(&b.key));
-    let mut edges: Vec<_> = edges.into_values().collect();
-    edges.sort_by(|a, b| {
-        (&a.source, &a.kind, &a.target, &a.file, a.line)
-            .cmp(&(&b.source, &b.kind, &b.target, &b.file, b.line))
+    let mut ranked_nodes: Vec<_> = candidate_nodes.into_values().collect();
+    ranked_nodes.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| a.key.cmp(&b.key))
     });
+    let mut ranked_edges: Vec<_> = candidate_edges.into_values().collect();
+    ranked_edges.sort_by(|a, b| {
+        b.relevance.total_cmp(&a.relevance).then_with(|| {
+            (&a.source, &a.kind, &a.target, &a.file, a.line)
+                .cmp(&(&b.source, &b.kind, &b.target, &b.file, b.line))
+        })
+    });
+
+    let mut nodes = Vec::new();
+    let mut selected_node_keys = HashSet::new();
+    let mut payload_bytes = 0_usize;
+    for node in ranked_nodes {
+        let bytes = serde_json::to_vec(&node)?.len() + usize::from(!nodes.is_empty());
+        if nodes.len() >= options.node_limit || payload_bytes + bytes > options.byte_limit {
+            truncated = true;
+            continue;
+        }
+        payload_bytes += bytes;
+        selected_node_keys.insert(node.key.clone());
+        nodes.push(node);
+    }
+
+    let mut edges = Vec::new();
+    for edge in ranked_edges {
+        if !selected_node_keys.contains(&edge.source)
+            || !selected_node_keys.contains(&edge.target)
+        {
+            truncated = true;
+            continue;
+        }
+        let bytes = serde_json::to_vec(&edge)?.len() + usize::from(!edges.is_empty());
+        if edges.len() >= options.edge_limit || payload_bytes + bytes > options.byte_limit {
+            truncated = true;
+            continue;
+        }
+        payload_bytes += bytes;
+        edges.push(edge);
+    }
     Ok(SearchExpansion {
         seeds,
         nodes,
@@ -527,8 +713,14 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{ExpansionOptions, SearchOptions, search};
-    use crate::{indexer, store};
+    use super::{
+        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ResponseBudget, SearchExpansion,
+        SearchOptions, SearchResult, apply_response_budget, search,
+    };
+    use crate::{
+        indexer, store,
+        structural::{GraphEdge, GraphNode},
+    };
 
     #[test]
     fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
@@ -583,6 +775,7 @@ mod tests {
             &SearchOptions {
                 limit: 8,
                 expand: true,
+                response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
                     seed_limit: 3,
@@ -606,6 +799,7 @@ mod tests {
             &SearchOptions {
                 limit: 8,
                 expand: true,
+                response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions { byte_limit: 1, ..Default::default() },
             },
         )?
@@ -615,6 +809,88 @@ mod tests {
         assert!(byte_starved.edges.is_empty());
         assert!(byte_starved.payload_bytes <= 1);
         assert!(byte_starved.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn response_budget_caps_the_complete_rendered_search_envelope() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = format!(
+            "export const needle = '{}';\n",
+            "x".repeat(12_000)
+        );
+        fs::write(repo.path().join("large.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let result = search(
+            &conn,
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 8,
+                response_byte_limit: 2_000,
+                ..Default::default()
+            },
+        )?;
+        let rendered = serde_json::to_string_pretty(&result)?;
+        assert!(rendered.len() <= 2_000);
+        assert_eq!(rendered.len(), result.response_budget.rendered_bytes);
+        assert!(result.response_budget.unbudgeted_bytes > rendered.len());
+        assert!(result.response_budget.truncated);
+        assert!(result.response_budget.truncated_snippets > 0);
+        serde_json::from_str::<serde_json::Value>(&rendered)?;
+        Ok(())
+    }
+
+    #[test]
+    fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
+        let node = |key: &str, relevance: f64| GraphNode {
+            key: key.into(),
+            kind: "symbol".into(),
+            display_name: key.into(),
+            file: None,
+            line: None,
+            meta: serde_json::json!({}),
+            relevance,
+        };
+        let edge = |target: &str, relevance: f64, padding: usize| GraphEdge {
+            source: "root".into(),
+            target: target.into(),
+            kind: "call".into(),
+            confidence: "certain".into(),
+            provenance: "test".into(),
+            file: None,
+            line: None,
+            detail: serde_json::json!({ "padding": "x".repeat(padding) }),
+            relevance,
+        };
+        let mut result = SearchResult {
+            snapshot: "s".repeat(64),
+            hits: Vec::new(),
+            expansion: Some(SearchExpansion {
+                seeds: vec!["root".into()],
+                nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],
+                edges: vec![edge("high", 0.8, 0), edge("low", 0.1, 1_200)],
+                node_limit: 3,
+                edge_limit: 2,
+                byte_limit: 10_000,
+                payload_bytes: 0,
+                truncated: false,
+            }),
+            response_budget: ResponseBudget {
+                byte_limit: 1_500,
+                ..Default::default()
+            },
+        };
+
+        apply_response_budget(&mut result)?;
+        let expansion = result.expansion.expect("expansion");
+        assert!(expansion.nodes.iter().any(|node| node.key == "high"));
+        assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
+        assert_eq!(expansion.edges.len(), 1);
+        assert_eq!(expansion.edges[0].target, "high");
+        assert!(result.response_budget.rendered_bytes <= 1_500);
         Ok(())
     }
 }
