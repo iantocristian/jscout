@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "repository": {
+    "name": "ai-pipe",
+    "commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+    "tracked_files": 930,
+    "indexed_files": 690,
+    "jscout_chunks": 5483,
+    "jscout_references": 28527,
+    "jscout_snapshot": "89d816adb5089f167441ddd26a68b43159b322e7d587285f433f1db204c17885"
+  },
+  "tasks": [
+    {
+      "id": "lookup-broker-risk-policy",
+      "category": "lookup-control",
+      "prompt": "Where is the deterministic decision that accepts or blocks a broker order based on trading safety constraints implemented? Return the defining production file and symbol.",
+      "gold": {
+        "files": ["server/brokers/riskPolicy.mjs"],
+        "symbols": ["evaluateBrokerRiskPolicy"]
+      }
+    },
+    {
+      "id": "lookup-flow-graph-state",
+      "category": "lookup-control",
+      "prompt": "Where is the frontend hook that owns editing state for the visual workflow graph implemented? Return the defining production file and symbol.",
+      "gold": {
+        "files": ["src/hooks/useFlowGraphState.ts"],
+        "symbols": ["useFlowGraphState"]
+      }
+    },
+    {
+      "id": "startup-orphan-reconciliation",
+      "category": "one-hop-structure",
+      "prompt": "At API process startup, what production implementation marks runs left active by a previous process as failed, and where is it invoked before scheduling begins? Return both production files and the named implementation symbol.",
+      "gold": {
+        "files": ["server/api.mjs", "server/db.mjs"],
+        "symbols": ["reconcileOrphanedRuns"]
+      }
+    },
+    {
+      "id": "pattern-journal-callers",
+      "category": "blast-radius",
+      "prompt": "Which production node executors directly persist detected pattern evidence through the shared journal helper? Return the helper and every direct production caller, with their files and symbols. Exclude tests and transitive callers.",
+      "gold": {
+        "files": [
+          "server/nodes/patternJournal.mjs",
+          "server/nodes/macroRegime.mjs",
+          "server/nodes/sectorRotation.mjs",
+          "server/nodes/stockPatterns.mjs",
+          "server/nodes/universeBreadth.mjs"
+        ],
+        "symbols": [
+          "journalPatternEvents",
+          "executeMacroRegime",
+          "executeSectorRotation",
+          "executeStockPatterns",
+          "executeUniverseBreadth"
+        ]
+      }
+    },
+    {
+      "id": "macro-index-ibkr-path",
+      "category": "multi-hop-structure",
+      "prompt": "Trace the production function path used when the macro-indicator source obtains an index series through the preferred IBKR provider, from the node executor through the index-bar fetch helper to construction of the broker HTTP client. Return the three files and symbols in path order.",
+      "gold": {
+        "files": [
+          "server/nodes/sourceMacroIndicators.mjs",
+          "server/providers/marketData/ibkrPreferred.mjs",
+          "server/brokers/ibkrHttpClient.mjs"
+        ],
+        "symbols": [
+          "executeMacroIndicatorsSource",
+          "fetchIbkrIndexDailyBars",
+          "createIbkrBrokerProvider"
+        ]
+      }
+    },
+    {
+      "id": "runtime-secret-consumers",
+      "category": "blast-radius",
+      "prompt": "Which production scheduler or API route handlers directly resolve stored secrets into a runtime environment? Return the resolver plus every direct production caller file and named caller symbol. Exclude tests and count multiple calls in one handler once.",
+      "gold": {
+        "files": [
+          "server/secrets.mjs",
+          "server/scheduler.mjs",
+          "server/api/routes/config.mjs",
+          "server/api/routes/runs.mjs",
+          "server/api/routes/webhooks.mjs"
+        ],
+        "symbols": [
+          "runtimeEnvWithSecrets",
+          "runSchedulerTick",
+          "handleConfigRoutes",
+          "startGuardedRun",
+          "handleWebhookRoutes"
+        ]
+      }
+    },
+    {
+      "id": "x-post-delivery-workflow",
+      "category": "workflow-trace",
+      "prompt": "Trace the production workflow from polling X posts through durable event fan-out to the scheduler claiming and running a delivery, including the failure helper that requeues transient failures. Return the source executor, enqueue function, scheduler tick, claim function, flow executor, failure helper, and requeue function with their defining files.",
+      "gold": {
+        "files": [
+          "server/nodes/sourceXPostEvents.mjs",
+          "server/db.mjs",
+          "server/scheduler.mjs",
+          "server/executor.mjs"
+        ],
+        "symbols": [
+          "executeXPostEventsSource",
+          "enqueueXPostEventDeliveries",
+          "runSchedulerTick",
+          "claimPendingWorkflowEventDelivery",
+          "runFlow",
+          "resolveEventDeliveryFailure",
+          "markWorkflowEventDeliveryRequeued"
+        ]
+      }
+    },
+    {
+      "id": "dynamic-node-dispatch-boundary",
+      "category": "uncertainty-control",
+      "prompt": "The runtime selects node behavior from a registry rather than a direct call per node type. Which production symbol constructs that registry and which symbol dispatches a node through it? Return their files and symbols, and state whether a static call graph alone proves the complete set of runtime node types.",
+      "gold": {
+        "files": ["server/nodes/registry.mjs", "server/nodes/index.mjs"],
+        "symbols": ["createRuntimeNodeRegistry", "executeNode"]
+      }
+    }
+  ]
+}

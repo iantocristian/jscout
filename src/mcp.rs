@@ -89,7 +89,8 @@ pub fn serve(root: &Path, telemetry_path: Option<&Path>, profile: ToolProfile) -
                     json!({
                         "protocolVersion": requested,
                         "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "jscout", "version": env!("CARGO_PKG_VERSION") }
+                        "serverInfo": { "name": "jscout", "version": env!("CARGO_PKG_VERSION") },
+                        "instructions": server_instructions(profile)
                     }),
                 )
             }
@@ -142,6 +143,17 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn server_instructions(profile: ToolProfile) -> &'static str {
+    match profile {
+        ToolProfile::Baseline => {
+            "jscout is the repository index for code localization. Start unfamiliar repository questions with semantic_search instead of a broad filesystem scan. Use definition for exact symbol source, who_uses for direct callers/usages, file_outline for one file, and events for string-keyed event wiring. Treat confidence-labelled results as leads and verify decisive claims in source."
+        }
+        ToolProfile::Structural => {
+            "jscout is the repository index for code localization. Start unfamiliar repository questions with semantic_search instead of a broad filesystem scan. Use definition for exact symbol source, who_uses for direct callers/usages, file_outline for one file, and events for string-keyed event wiring. For blast-radius, multi-hop, or workflow questions, use neighborhood or semantic_search with expand=true, then verify decisive claims in source. Treat confidence-labelled graph results as leads, not runtime proof."
+        }
+    }
 }
 
 fn tool_defs(profile: ToolProfile) -> Value {
@@ -425,7 +437,17 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
 
-    use super::{ToolProfile, call_tool, tool_defs};
+    use super::{ToolProfile, call_tool, server_instructions, tool_defs};
+
+    #[test]
+    fn profile_instructions_explain_when_to_use_structural_traversal() {
+        let baseline = server_instructions(ToolProfile::Baseline);
+        let structural = server_instructions(ToolProfile::Structural);
+        assert!(baseline.contains("semantic_search"));
+        assert!(!baseline.contains("neighborhood"));
+        assert!(structural.contains("neighborhood"));
+        assert!(structural.contains("verify decisive claims in source"));
+    }
 
     #[test]
     fn baseline_profile_removes_structural_tools_and_expansion_controls() {
