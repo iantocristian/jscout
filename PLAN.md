@@ -26,7 +26,8 @@
 > The representative P0 agent evaluation is complete; see
 > [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md).
 > Expansion remains opt-in. The current next step is RI-1 whole-response
-> budgeting followed by the equal-budget SC-1 elided-source experiment in
+> budgeting and a discriminating grep/baseline/structural task set, followed by
+> the equal-budget SC-1 elided-source experiment in
 > [PLAN-KG-REVISED-CODEX.md](PLAN-KG-REVISED-CODEX.md).
 
 A fast indexer for JavaScript/TypeScript codebases built for RAG and agent retrieval.

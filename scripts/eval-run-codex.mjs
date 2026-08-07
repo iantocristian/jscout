@@ -70,7 +70,7 @@ function sameSet(left = [], right = []) {
   return a.size === b.size && [...a].every((value) => b.has(value));
 }
 
-function promptFor(task, { requireJscout = false } = {}) {
+function promptFor(task, { profile, requireJscout = false } = {}) {
   const lines = [
     "You are completing a read-only repository-localization evaluation.",
     "Answer only from the checked-out repository. Do not edit files or run tests.",
@@ -79,7 +79,9 @@ function promptFor(task, { requireJscout = false } = {}) {
     "In `inspected_files`, include every repository file whose contents you read directly or through a tool-provided snippet.",
     "Use repository-relative POSIX file paths and bare symbol names.",
   ];
-  if (requireJscout) {
+  if (profile === "grep") {
+    lines.push("Use repository-local shell and filesystem search; this arm has no repository index configured.");
+  } else if (requireJscout) {
     lines.push("Start with the configured jscout MCP server and use it as the primary localization interface; verify decisive claims in source before answering.");
   }
   lines.push("", task.prompt);
@@ -93,6 +95,12 @@ async function main() {
   if (options.task) tasks = tasks.filter((task) => task.id === options.task);
   if (tasks.length === 0) throw new Error("no matching tasks");
   const profiles = options.profiles.split(",").map((value) => value.trim()).filter(Boolean);
+  const invalidProfiles = profiles.filter(
+    (profile) => !["grep", "baseline", "structural"].includes(profile),
+  );
+  if (invalidProfiles.length > 0) {
+    throw new Error(`unknown profiles: ${invalidProfiles.join(", ")}`);
+  }
   if (!/^[A-Za-z0-9._-]+$/.test(options.trial)) {
     throw new Error("--trial may contain only letters, numbers, dot, underscore, and hyphen");
   }
@@ -127,6 +135,7 @@ async function main() {
     const task = tasks[taskIndex];
     const orderedProfiles = taskIndex % 2 === 0 ? profiles : [...profiles].reverse();
     for (const profile of orderedProfiles) {
+      const usesJscout = profile !== "grep";
       const session = `${profile}-${task.id}-${options.trial}`;
       const lastMessage = path.join(os.tmpdir(), `jscout-${session}-${process.pid}.json`);
       const args = [
@@ -147,19 +156,23 @@ async function main() {
         "--config", "features.computer_use=false",
         "--config", "features.plugins=false",
         "--config", "tools.web_search=false",
-        "--config", `mcp_servers.jscout.command=${JSON.stringify(jscout)}`,
-        "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", repository, "--profile", profile, "--telemetry", telemetry])}`,
-        "--config", `mcp_servers.jscout.env.JSCOUT_TASK_ID=${JSON.stringify(task.id)}`,
-        "--config", `mcp_servers.jscout.env.JSCOUT_SESSION_ID=${JSON.stringify(session)}`,
-        "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.semantic_search.approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.who_uses.approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.definition.approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.file_outline.approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.events.approval_mode=\"approve\"",
-        "--config", "mcp_servers.jscout.tools.neighborhood.approval_mode=\"approve\"",
       ];
       if (options["load-user-config"] !== "true") args.splice(1, 0, "--ignore-user-config");
+      if (usesJscout) {
+        args.push(
+          "--config", `mcp_servers.jscout.command=${JSON.stringify(jscout)}`,
+          "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", repository, "--profile", profile, "--telemetry", telemetry])}`,
+          "--config", `mcp_servers.jscout.env.JSCOUT_TASK_ID=${JSON.stringify(task.id)}`,
+          "--config", `mcp_servers.jscout.env.JSCOUT_SESSION_ID=${JSON.stringify(session)}`,
+          "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.semantic_search.approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.who_uses.approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.definition.approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.file_outline.approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.events.approval_mode=\"approve\"",
+          "--config", "mcp_servers.jscout.tools.neighborhood.approval_mode=\"approve\"",
+        );
+      }
       for (const name of disabledMcps) args.push("--config", `mcp_servers.${name}.enabled=false`);
       for (const config of extraConfig) args.push("--config", config);
       if (disabledSkills.length > 0) {
@@ -168,7 +181,10 @@ async function main() {
           .join(", ");
         args.push("--config", `skills.config=[${skillConfig}]`);
       }
-      args.push(promptFor(task, { requireJscout: options["require-jscout"] === "true" }));
+      args.push(promptFor(task, {
+        profile,
+        requireJscout: options["require-jscout"] === "true",
+      }));
       process.stderr.write(`[${task.id}] ${profile}\n`);
       const result = await run(options.codex, args, {
         cwd: repository,

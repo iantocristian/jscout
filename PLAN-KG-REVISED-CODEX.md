@@ -62,6 +62,12 @@ The first RI-1 slice is implemented:
 - indexing fully rebuilds disposable `graph_nodes` and `resolved_edges` after
   module resolution and publishes a BLAKE3 repository snapshot;
 - file, symbol, package, and unknown-receiver event-hub identities exist;
+- ambiguous root references fan out to visible `possible` candidate edges
+  instead of disappearing;
+- tier-3 member calls project through unknown-receiver property hubs, keeping
+  storage linear while making name-matched candidates traversable at
+  `possible` confidence; unmatched sites remain canonical but do not create
+  dead-end traversal nodes;
 - CLI and MCP expose bounded `neighborhood` traversal with direction,
   confidence, edge-kind, node, and edge limits;
 - saved anchors can carry a snapshot; stale symbol anchors are re-resolved by
@@ -82,7 +88,9 @@ The first RI-1 slice is implemented:
 - the P0 Codex runner freezes the repository, isolates agent configuration,
   counterbalances profiles, captures structured answers, and joins telemetry;
 - the representative `ai-pipe` P0 run is complete; see
-  [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md).
+  [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md);
+- `jscout agent-guide --install <root>` ships the explicit project-local agent
+  integration contract that MCP metadata alone did not deliver in Codex.
 
 P0 is complete as a bounded direction gate. The assisted comparison tied on
 correctness while structural retrieval reduced mean calls, irrelevant file
@@ -92,6 +100,13 @@ uptake. Therefore expansion remains opt-in, explicit agent integration is part
 of the product contract, and this result does not establish a general accuracy
 gain. RI-1 still needs whole-response rendered-token budgeting and broader
 end-to-end MCP schema tests before SC-1's equal-budget comparison.
+
+The current release-build measurement on the frozen 690-file `ai-pipe` corpus
+is 182 ms for a full traversal-projection rebuild: 103 ms references, 31 ms
+candidate-bearing member calls, 6 ms modules, and under 1 ms events. This does
+not meet RI-1's 100 ms projection target. Member-call projection is bounded to
+properties with at least one indexed symbol candidate; all unmatched sites
+remain in the canonical `member_calls` table.
 
 ## Architectural conclusion from the research
 
@@ -260,7 +275,7 @@ This keeps storage linear in event sites and prevents unrelated `error`,
 Inputs: anchor spec, direction, depth, global node/token budget,
 `min_confidence`, and edge-kind filters.
 
-Initial ranking is deliberately simple and treated as a hypothesis:
+The target ranking is deliberately simple and treated as a hypothesis:
 
 ```text
 path score = minimum edge confidence on path
@@ -268,6 +283,13 @@ path score = minimum edge confidence on path
            × distance decay
            × hub damping
 ```
+
+It is not implemented yet. Current traversal is a deterministic BFS with
+global node/edge budgets; under truncation, stable SQL edge order decides which
+neighbors survive. Keep that limitation explicit. Do not spend ranking effort
+on standalone `neighborhood` UX until discriminating evaluations show a need;
+expanded search is the current agent-facing delivery vehicle for this
+machinery.
 
 The budget is global across all anchors, not per hit. Nodes and edges are
 deduplicated before rendering. Confidence and provenance remain visible.
@@ -297,6 +319,9 @@ not dominate repository importance.
 - Collision fixtures for same-named methods and duplicate declarations.
 - Barrel/re-export fixture proving a changed barrel reroutes unchanged refs.
 - Event fixtures proving unrelated receivers do not pair.
+- Ambiguous-reference fixtures proving candidates survive as `possible`.
+- Member-call fixtures proving unknown-receiver candidates are traversable
+  without materializing a call-site × symbol cross-product.
 - Full graph projection rebuild under 100 ms on the current `ai-pipe` corpus.
 - `neighborhood` under 50 ms at depth two on that corpus.
 - Global output-budget tests and deterministic ordering.
@@ -746,6 +771,12 @@ each representation layer:
 
 This is the product metric. Retrieval scores are component diagnostics.
 
+The next repository-outcome run has three arms: grep-only, jscout baseline,
+and jscout structural. Its task set must create accuracy or cost headroom with
+deep barrel indirection, misleading same-name candidates, receiver-ambiguous
+events, dynamic registries, and cross-file workflow paths. Repeating the
+current 8/8 task set with more seeds measures variance but not discrimination.
+
 ---
 
 ## Sequencing
@@ -761,10 +792,11 @@ This is the product metric. Retrieval scores are component diagnostics.
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
-The immediate implementation sequence is: finish RI-1 whole-response budgets
-and MCP schema gates, then run SC-1 full-source versus elided-source at equal
-budgets. The P0 result keeps expansion opt-in and makes payload reduction the
-next measured constraint. LLM workflow scouting and agent write-back share the
+The immediate implementation sequence is: author the discriminating three-arm
+task set, finish RI-1 whole-response budgets and MCP schema gates, then run SC-1
+full-source versus elided-source at equal rendered-byte budgets. The P0 result
+keeps expansion opt-in and makes payload reduction the next measured
+constraint. LLM workflow scouting and agent write-back share the
 first R3 storage/validation phase. Broad workflow coverage benefits from
 routes/events/tables, but the bounded experiment does not wait for every EN-1
 extractor. Cards and summaries must earn separate implementation effort.

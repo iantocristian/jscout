@@ -60,6 +60,33 @@ function meanPresent(values) {
   return mean(values.filter((value) => typeof value === "number" && Number.isFinite(value)));
 }
 
+const DELTA_METRICS = [
+  "file_precision",
+  "file_recall",
+  "symbol_precision",
+  "symbol_recall",
+  "correctness_rate",
+  "mean_tool_calls",
+  "mean_failed_tool_calls",
+  "mean_tool_latency_ms",
+  "mean_result_bytes",
+  "mean_inspected_files",
+  "mean_irrelevant_files",
+  "mean_total_tokens",
+  "mean_run_duration_ms",
+];
+
+function profileDelta(summaries, minuend, subtrahend) {
+  if (!summaries[minuend] || !summaries[subtrahend]) return {};
+  const deltas = {};
+  for (const metric of DELTA_METRICS) {
+    const left = summaries[minuend][metric];
+    const right = summaries[subtrahend][metric];
+    deltas[metric] = left === null || right === null ? null : left - right;
+  }
+  return deltas;
+}
+
 export function buildReport(taskSet, responses, telemetry = []) {
   if (taskSet.schema_version !== 1 || !Array.isArray(taskSet.tasks)) {
     throw new Error("unsupported task-set schema");
@@ -132,7 +159,10 @@ export function buildReport(taskSet, responses, telemetry = []) {
     };
   }
 
-  const expectedProfiles = ["baseline", "structural"];
+  const expectedProfiles = taskSet.profiles ?? ["baseline", "structural"];
+  if (!Array.isArray(expectedProfiles) || expectedProfiles.length === 0) {
+    throw new Error("task-set profiles must be a non-empty array");
+  }
   const completed = new Set(responses.map((response) => `${response.task_id}\0${response.profile}`));
   const missing = [];
   for (const task of taskSet.tasks) {
@@ -141,28 +171,12 @@ export function buildReport(taskSet, responses, telemetry = []) {
     }
   }
 
-  const deltas = {};
-  if (summaries.baseline && summaries.structural) {
-    for (const metric of [
-      "file_precision",
-      "file_recall",
-      "symbol_precision",
-      "symbol_recall",
-      "correctness_rate",
-      "mean_tool_calls",
-      "mean_failed_tool_calls",
-      "mean_tool_latency_ms",
-      "mean_result_bytes",
-      "mean_inspected_files",
-      "mean_irrelevant_files",
-      "mean_total_tokens",
-      "mean_run_duration_ms",
-    ]) {
-      const baseline = summaries.baseline[metric];
-      const structural = summaries.structural[metric];
-      deltas[metric] = baseline === null || structural === null ? null : structural - baseline;
-    }
-  }
+  const structuralMinusBaseline = profileDelta(summaries, "structural", "baseline");
+  const profileDeltas = {
+    structural_minus_baseline: structuralMinusBaseline,
+    baseline_minus_grep: profileDelta(summaries, "baseline", "grep"),
+    structural_minus_grep: profileDelta(summaries, "structural", "grep"),
+  };
 
   taskResults.sort((a, b) =>
     `${a.task_id}\0${a.profile}\0${a.session}`.localeCompare(
@@ -173,7 +187,8 @@ export function buildReport(taskSet, responses, telemetry = []) {
     schema_version: 1,
     repository: taskSet.repository,
     profiles: summaries,
-    structural_minus_baseline: deltas,
+    structural_minus_baseline: structuralMinusBaseline,
+    profile_deltas: profileDeltas,
     missing,
     tasks: taskResults,
   };

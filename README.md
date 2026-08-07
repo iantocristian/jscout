@@ -19,6 +19,8 @@ jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood
                                #   who_uses, definition, file_outline, events
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
+jscout agent-guide             # print agent integration guidance
+jscout agent-guide --install R # install a project-local jscout skill
 ```
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
@@ -30,7 +32,9 @@ jscout re-resolves stale symbol anchors by path, scope, and name, and returns an
 error with candidates instead of guessing when the identity is ambiguous.
 Traversal defaults to `certain`/`likely` edges. Use
 `--min-confidence possible` to include unresolved string-event hubs and other
-explicit candidates.
+explicit candidates. Unknown-receiver member calls are projected through
+property hubs; use depth two to traverse from a candidate symbol to possible
+callers without materializing every call-site × symbol pair.
 
 ## Search anchors and expansion
 
@@ -56,6 +60,10 @@ search-hit seeds. `--expand-min-confidence` defaults to `likely`; use
 
 - **certain** — resolved through binding analysis + Node module resolution (incl. package.json `exports`, tsconfig `paths`, barrel/star re-exports, CommonJS `require` with literals, dynamic `import('...')` literals).
 - **possible** — name-matched member calls (`x.getUser()`): candidates listed, never silently dropped. This is the honest checker-less answer for calls through type annotations.
+
+When an otherwise-certain reference resolves to multiple same-named root
+symbols, the traversal projection emits every candidate at `possible`
+confidence and includes ambiguity details instead of dropping the edge.
 
 Event wiring (`emit('x')` ↔ `on('x')`) is surfaced by the `events` tool/command.
 
@@ -92,7 +100,8 @@ bge-reranker-v2-m3). The top RRF candidates are reranked before final ordering.
 Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
 (per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`.
 Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (bm25 / embed-query /
-vector-scan / rerank) to stderr on any search.
+vector-scan / rerank) to stderr on search and structural-projection stage
+timings during indexing.
 
 ## MCP integration
 
@@ -105,6 +114,18 @@ vector-scan / rerank) to stderr on any search.
 ```
 
 Run `jscout index` (or `jscout watch`) beside it to keep the DB fresh.
+
+MCP metadata alone does not reliably cause every agent client to select a
+repository tool. Install the shipped project-local guide so supported agents
+receive an explicit integration contract:
+
+```bash
+jscout agent-guide --install /path/to/repo
+```
+
+The command creates `.agents/skills/jscout/SKILL.md` and refuses to overwrite
+an existing guide. Use `jscout agent-guide` to print the same text for clients
+that consume `AGENTS.md` or another instruction format.
 
 For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
 `neighborhood` or search expansion) and `--profile structural` (the default).

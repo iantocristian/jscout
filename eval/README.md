@@ -1,8 +1,9 @@
-# Agent A/B evaluation
+# Agent evaluation
 
 This harness compares agent behavior with the same prompts, model, limits, and
-repository snapshot under two MCP profiles:
+repository snapshot under controlled retrieval profiles:
 
+- `grep`: no repository-index MCP server; shell/filesystem search only;
 - `baseline`: existing retrieval/definition/usage tools; no `neighborhood` and
   no search expansion;
 - `structural`: the same tools plus `neighborhood` and opt-in search expansion.
@@ -13,7 +14,7 @@ improves behavior on a large real repository.
 ## Codex runner
 
 `scripts/eval-run-codex.mjs` runs a frozen repository task set through Codex in
-both profiles, counterbalances profile order, captures structured responses,
+the configured profiles, counterbalances profile order, captures structured responses,
 and tags jscout telemetry by task/profile/session. It isolates user config and
 disables unrelated tools by default.
 
@@ -21,6 +22,11 @@ First run a naturalistic adoption pass by omitting `--require-jscout`. Then run
 the capability comparison with `--require-jscout true`, which gives both
 profiles the same integration instruction to start with jscout but does not
 tell the structural agent to use expansion or `neighborhood`.
+
+For the next value comparison, use three arms: `grep` has no jscout MCP server,
+`baseline` has indexed search/definition/usage tools, and `structural` adds
+expansion and `neighborhood`. Declare the same list in the task set's optional
+top-level `profiles` field so the grader can report entirely missing arms:
 
 ```bash
 node scripts/eval-run-codex.mjs \
@@ -32,6 +38,7 @@ node scripts/eval-run-codex.mjs \
   --artifacts /tmp/jscout-artifacts \
   --model gpt-5.6-terra \
   --reasoning low \
+  --profiles grep,baseline,structural \
   --trial 001 \
   --require-jscout true
 ```
@@ -39,10 +46,9 @@ node scripts/eval-run-codex.mjs \
 Use new output paths for every run; the runner refuses non-empty response,
 telemetry, or artifact targets. Change `--trial` when repeating a task/profile
 pair so its telemetry session remains unique. The target repository should be
-a clean Git checkout because its own
-agent instructions may require a status check even though the runner permits a
-non-Git directory. Raw artifact logs can contain repository source; keep them
-outside the product repository.
+a clean Git checkout because its own agent instructions may require a status
+check even though the runner permits a non-Git directory. Raw artifact logs can
+contain repository source; keep them outside the product repository.
 
 The representative P0 result is recorded in
 [`results/ai-pipe-p0-2026-08-07.md`](results/ai-pipe-p0-2026-08-07.md).

@@ -1,3 +1,4 @@
+mod agent;
 mod chunk;
 mod embed;
 mod graph;
@@ -13,7 +14,7 @@ mod structural;
 mod walk;
 mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -154,6 +155,12 @@ enum Command {
         #[arg(long = "kind")]
         kinds: Vec<String>,
     },
+    /// Print or install the jscout agent-integration skill
+    AgentGuide {
+        /// Install into ROOT/.agents/skills/jscout/SKILL.md; print when omitted
+        #[arg(long)]
+        install: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -223,11 +230,20 @@ fn main() -> Result<()> {
                 kinds,
             },
         ),
+        Command::AgentGuide { install } => {
+            if let Some(root) = install {
+                let target = agent::install(&root)?;
+                println!("installed {}", target.display());
+            } else {
+                print!("{}", agent::GUIDE);
+            }
+            Ok(())
+        }
     }
 }
 
 fn cmd_neighborhood(
-    root: &PathBuf,
+    root: &Path,
     anchor: &str,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
@@ -237,7 +253,7 @@ fn cmd_neighborhood(
     Ok(())
 }
 
-fn cmd_embed(root: &PathBuf, batch: usize) -> Result<()> {
+fn cmd_embed(root: &Path, batch: usize) -> Result<()> {
     let conn = store::open(root)?;
     let Some(provider) = embed::Provider::from_env() else {
         anyhow::bail!(
@@ -252,7 +268,7 @@ fn cmd_embed(root: &PathBuf, batch: usize) -> Result<()> {
 }
 
 fn cmd_search(
-    root: &PathBuf,
+    root: &Path,
     query: &str,
     no_vector: bool,
     json: bool,
@@ -311,7 +327,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_index(root: &PathBuf) -> Result<()> {
+fn cmd_index(root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
     let conn = store::open(root)?;
     let o = indexer::index_repo(root, &conn)?;
@@ -322,7 +338,7 @@ fn cmd_index(root: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_events(root: &PathBuf, name: Option<&str>) -> Result<()> {
+fn cmd_events(root: &Path, name: Option<&str>) -> Result<()> {
     let conn = store::open(root)?;
     let sites = query::events(&conn, name)?;
     if sites.is_empty() {
@@ -341,7 +357,7 @@ fn cmd_events(root: &PathBuf, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_who_uses(root: &PathBuf, spec: &str, json: bool) -> Result<()> {
+fn cmd_who_uses(root: &Path, spec: &str, json: bool) -> Result<()> {
     let conn = store::open(root)?;
     let graph = query::ModuleGraph::load(&conn)?;
     let targets = query::find_symbols(&conn, spec)?;
@@ -385,18 +401,17 @@ fn cmd_who_uses(root: &PathBuf, spec: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_chunks(root: &PathBuf, filter: Option<&str>) -> Result<()> {
+fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
     let files = walk::source_files(root);
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
     for file in &files {
         let rel = file.strip_prefix(root).unwrap_or(file);
-        if let Some(f) = filter {
-            if !rel.to_string_lossy().contains(f) {
+        if let Some(f) = filter
+            && !rel.to_string_lossy().contains(f) {
                 continue;
             }
-        }
         let Ok(source) = std::fs::read_to_string(file) else { continue };
         let chunks = parse::with_parsed(&source, file, |ret, _| {
             let chunker = chunk::Chunker::new(rel, &source, ret);
@@ -415,7 +430,7 @@ fn cmd_chunks(root: &PathBuf, filter: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(root: &PathBuf) -> Result<()> {
+fn cmd_stats(root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
     let files = walk::source_files(root);
     let mut total = stats::FileStats::default();
