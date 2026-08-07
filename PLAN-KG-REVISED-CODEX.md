@@ -78,13 +78,20 @@ The first RI-1 slice is implemented:
   protocol make controlled agent A/B runs reproducible;
 - opt-in privacy-minimal MCP telemetry records tool selection, latency,
   success, result size, task, profile, session, and snapshot without recording
-  arguments or results.
+  arguments or results;
+- the P0 Codex runner freezes the repository, isolates agent configuration,
+  counterbalances profiles, captures structured answers, and joins telemetry;
+- the representative `ai-pipe` P0 run is complete; see
+  [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md).
 
-This does **not** complete P0 or RI-1. P0 still needs a scripted agent A/B
-run and task outcomes on a representative large repository; the included
-synthetic fixture validates only the protocol. RI-1 still needs whole-response
-rendered-token budgeting, latency measurements on that corpus, and broader
-end-to-end MCP schema tests.
+P0 is complete as a bounded direction gate. The assisted comparison tied on
+correctness while structural retrieval reduced mean calls, irrelevant file
+reads, tokens, and wall time, but increased returned tool bytes by 59% and had
+no standalone `neighborhood` adoption. The unassisted pass had zero jscout
+uptake. Therefore expansion remains opt-in, explicit agent integration is part
+of the product contract, and this result does not establish a general accuracy
+gain. RI-1 still needs whole-response rendered-token budgeting and broader
+end-to-end MCP schema tests before SC-1's equal-budget comparison.
 
 ## Architectural conclusion from the research
 
@@ -745,7 +752,7 @@ This is the product metric. Retrieval scores are component diagnostics.
 
 | Phase | Deliverable | Dependency | Rough scope |
 |---|---|---|---|
-| **P0** | Paired baseline/structural profiles, task schema, telemetry join, and grader are implemented; representative-repository agent outcomes are not | Current core | Run and analyze the experiment |
+| **P0** | Complete: frozen `ai-pipe` task set, isolated Codex runner, paired naturalistic/assisted observations, telemetry join, and recorded decision | Current core | Done 2026-08-07 |
 | **RI-1** | Finish whole-response rendered budgets and representative latency/schema gates; identity, materialized graph, neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures are implemented | P0 observation can run in parallel | <1 day plus corpus run |
 | **SC-1** | Full-source vs elided-source A/B, contract plane, multi-resolution renderer, file-projected overview; custom IR only if it wins | RI-1 | 1–2 days, plus optional IR experiment |
 | **SC-2a** | Bounded LLM workflow experiment, semantic storage/freshness, and validated `annotate` write-back | SC-1 | 1–2 days plus prompt iteration |
@@ -754,10 +761,11 @@ This is the product metric. Retrieval scores are component diagnostics.
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
-The immediate implementation sequence is: finish the P0 harness and remaining
-RI-1 consumer surfaces, run the baseline, then implement SC-1 elided-source
-compression. LLM workflow scouting and agent write-back share the first R3
-storage/validation phase. Broad workflow coverage benefits from
+The immediate implementation sequence is: finish RI-1 whole-response budgets
+and MCP schema gates, then run SC-1 full-source versus elided-source at equal
+budgets. The P0 result keeps expansion opt-in and makes payload reduction the
+next measured constraint. LLM workflow scouting and agent write-back share the
+first R3 storage/validation phase. Broad workflow coverage benefits from
 routes/events/tables, but the bounded experiment does not wait for every EN-1
 extractor. Cards and summaries must earn separate implementation effort.
 
