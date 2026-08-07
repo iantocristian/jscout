@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -7,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "1";
+pub const PROJECTION_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -20,6 +21,21 @@ struct SymbolNode {
     decl_end: i64,
     line: i64,
     key: String,
+}
+
+#[derive(Debug, Default)]
+struct ProjectedTargets {
+    keys: Vec<String>,
+    ambiguous: bool,
+}
+
+impl ProjectedTargets {
+    fn exact(key: String) -> Self {
+        Self {
+            keys: vec![key],
+            ambiguous: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,7 +181,13 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
              ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         )?;
 
+        let timing = std::env::var_os("JSCOUT_TIMING").is_some();
+        let stage_started = Instant::now();
         project_module_edges(conn, &files, &mut insert_node, &mut insert_edge)?;
+        if timing {
+            eprintln!("timing project-modules={:?}", stage_started.elapsed());
+        }
+        let stage_started = Instant::now();
         project_references(
             conn,
             &files,
@@ -174,7 +196,25 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             &root_symbol,
             &mut insert_edge,
         )?;
+        if timing {
+            eprintln!("timing project-references={:?}", stage_started.elapsed());
+        }
+        let stage_started = Instant::now();
+        project_member_calls(
+            conn,
+            &files,
+            &symbols,
+            &mut insert_node,
+            &mut insert_edge,
+        )?;
+        if timing {
+            eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
+        }
+        let stage_started = Instant::now();
         project_events(conn, &files, &mut insert_node, &mut insert_edge)?;
+        if timing {
+            eprintln!("timing project-events={:?}", stage_started.elapsed());
+        }
 
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('snapshot', ?1)
@@ -381,43 +421,181 @@ fn project_references(
             .map(|s| s.key.clone())
             .unwrap_or_else(|| file_key(path));
 
-        let target = if local {
-            unique_symbol(root_symbol.get(&(file_id, name.clone())))
+        let targets = if local {
+            projected_symbols(root_symbol.get(&(file_id, name.clone())))
         } else if let Some(request) = request.as_deref() {
             match graph.edge(file_id, request) {
-                Some(target_file) if name == "*" => {
-                    graph.paths.get(&target_file).map(|path| file_key(path))
-                }
+                Some(target_file) if name == "*" => graph
+                    .paths
+                    .get(&target_file)
+                    .map(|path| ProjectedTargets::exact(file_key(path)))
+                    .unwrap_or_default(),
                 Some(target_file) => {
                     let resolved = graph
                         .resolve_export(target_file, &name)
                         .or_else(|| Some((target_file, name.clone())));
-                    resolved.and_then(|(resolved_file, resolved_name)| {
+                    resolved.map_or_else(ProjectedTargets::default, |(resolved_file, resolved_name)| {
                         if resolved_name == "*" {
-                            graph.paths.get(&resolved_file).map(|path| file_key(path))
+                            graph
+                                .paths
+                                .get(&resolved_file)
+                                .map(|path| ProjectedTargets::exact(file_key(path)))
+                                .unwrap_or_default()
                         } else {
-                            unique_symbol(root_symbol.get(&(resolved_file, resolved_name)))
+                            projected_symbols(root_symbol.get(&(resolved_file, resolved_name)))
                         }
                     })
                 }
                 None => package_for
                     .get(&(file_id, request.to_string()))
-                    .map(|package| package_key(package)),
+                    .map(|package| ProjectedTargets::exact(package_key(package)))
+                    .unwrap_or_default(),
             }
         } else {
-            None
+            ProjectedTargets::default()
         };
-        let Some(target) = target else { continue };
+        if targets.keys.is_empty() {
+            continue;
+        }
+        let projected_confidence = if targets.ambiguous {
+            "possible"
+        } else {
+            confidence.as_str()
+        };
+        let provenance = if targets.ambiguous {
+            "semantic+resolver-candidate"
+        } else {
+            "semantic+resolver"
+        };
+        let edge_detail = json!({
+            "request": &request,
+            "targetName": &name,
+            "detail": &detail,
+            "ambiguousTarget": targets.ambiguous,
+            "candidateCount": targets.keys.len(),
+            "candidates": targets.ambiguous.then_some(&targets.keys),
+        })
+        .to_string();
+        for target in &targets.keys {
+            insert_edge.execute(params![
+                source,
+                target,
+                kind,
+                projected_confidence,
+                provenance,
+                file_id,
+                id,
+                line,
+                edge_detail,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+fn project_member_calls(
+    conn: &Connection,
+    files: &HashMap<i64, String>,
+    symbols: &[SymbolNode],
+    insert_node: &mut rusqlite::CachedStatement<'_>,
+    insert_edge: &mut rusqlite::CachedStatement<'_>,
+) -> Result<()> {
+    let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
+    let mut candidates_by_name: HashMap<String, Vec<&SymbolNode>> = HashMap::new();
+    for symbol in symbols {
+        symbols_by_file
+            .entry(symbol.file_id)
+            .or_default()
+            .push(symbol);
+        candidates_by_name
+            .entry(symbol.name.clone())
+            .or_default()
+            .push(symbol);
+    }
+
+    let mut hubs = HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT m.rowid, m.file_id, m.start, m.line, m.prop, m.object
+         FROM member_calls m
+         ORDER BY m.prop, m.file_id, m.start, m.rowid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (member_call_id, file_id, start, line, property, object) = row?;
+        let Some(path) = files.get(&file_id) else {
+            continue;
+        };
+        let candidates: &[&SymbolNode] = candidates_by_name
+            .get(&property)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if candidates.is_empty() {
+            continue;
+        }
+        let hub = member_key(&property);
+        if hubs.insert(hub.clone()) {
+            insert_node.execute(params![
+                hub,
+                "member_hub",
+                Option::<String>::None,
+                Option::<i64>::None,
+                property,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                json!({
+                    "property": property,
+                    "receiver": "unknown",
+                    "candidateCount": candidates.len()
+                })
+                .to_string(),
+            ])?;
+            for candidate in candidates {
+                insert_edge.execute(params![
+                    hub,
+                    candidate.key,
+                    "member_candidate",
+                    "possible",
+                    "member-name-match",
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    json!({
+                        "property": property,
+                        "candidateCount": candidates.len()
+                    })
+                    .to_string(),
+                ])?;
+            }
+        }
+
+        let source = owner_at(symbols_by_file.get(&file_id), start)
+            .map(|symbol| symbol.key.clone())
+            .unwrap_or_else(|| file_key(path));
         insert_edge.execute(params![
             source,
-            target,
-            kind,
-            confidence,
-            "semantic+resolver",
+            hub,
+            "member_call",
+            "possible",
+            "member-name-match",
             file_id,
-            id,
+            Option::<i64>::None,
             line,
-            json!({ "request": request, "targetName": name, "detail": detail }).to_string(),
+            json!({
+                "memberCallId": member_call_id,
+                "object": object,
+                "property": property,
+                "candidateCount": candidates.len()
+            })
+            .to_string(),
         ])?;
     }
     Ok(())
@@ -512,9 +690,14 @@ fn owner_at<'a>(symbols: Option<&Vec<&'a SymbolNode>>, offset: i64) -> Option<&'
         .min_by_key(|s| s.decl_end - s.decl_start)
 }
 
-fn unique_symbol(symbols: Option<&Vec<&SymbolNode>>) -> Option<String> {
-    let symbols = symbols?;
-    (symbols.len() == 1).then(|| symbols[0].key.clone())
+fn projected_symbols(symbols: Option<&Vec<&SymbolNode>>) -> ProjectedTargets {
+    let Some(symbols) = symbols else {
+        return ProjectedTargets::default();
+    };
+    ProjectedTargets {
+        keys: symbols.iter().map(|symbol| symbol.key.clone()).collect(),
+        ambiguous: symbols.len() > 1,
+    }
 }
 
 pub fn neighborhood(
@@ -555,6 +738,10 @@ fn neighborhood_in_snapshot(
     let mut edges_by_id: HashMap<i64, GraphEdge> = HashMap::new();
     let mut truncated = false;
 
+    // TODO(RI-1 ranking): traversal is budgeted and deterministic, but not
+    // relevance-ranked. Under truncation, SQL edge ordering decides which
+    // candidates survive. Implement confidence × relation weight × distance
+    // decay × hub damping before describing this surface as ranked.
     while let Some((node, depth)) = queue.pop_front() {
         if depth >= options.depth {
             continue;
@@ -787,6 +974,10 @@ fn event_key(name: &str) -> String {
     format!("event:unknown:{name}")
 }
 
+fn member_key(name: &str) -> String {
+    format!("member:unknown:{name}")
+}
+
 fn symbol_key(path: &str, scope: &str, name: &str, ordinal: usize) -> String {
     format!("sym:{path}#{scope}::{name}@{ordinal}")
 }
@@ -807,7 +998,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{NeighborhoodOptions, neighborhood};
+    use super::{NeighborhoodOptions, compute_snapshot, neighborhood, rebuild_projection};
     use crate::{indexer, store};
 
     fn write(root: &Path, path: &str, source: &str) -> Result<()> {
@@ -877,6 +1068,101 @@ mod tests {
         assert!(keys.iter().any(|key| key.contains("#Alpha::ping@1")));
         assert!(keys.iter().any(|key| key.contains("#Beta::ping@1")));
         assert!(neighborhood(&conn, "ping", &NeighborhoodOptions::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_root_reference_projects_every_candidate_as_possible() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "ambiguous.js",
+            "function target() {}\nfunction run() { target(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let file_id: i64 = conn.query_row(
+            "SELECT id FROM files WHERE path='ambiguous.js'",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO symbols(
+               file_id, name, kind, start, end, decl_start, decl_end,
+               scope_chain, line, exported
+             ) VALUES(?1, 'target', 'function', 0, 20, 0, 20, '', 1, 0)",
+            [file_id],
+        )?;
+        let snapshot = compute_snapshot(&conn)?;
+        rebuild_projection(&conn, &snapshot)?;
+
+        let result = neighborhood(
+            &conn,
+            "ambiguous.js:run",
+            &NeighborhoodOptions {
+                direction: "out".into(),
+                min_confidence: "possible".into(),
+                ..Default::default()
+            },
+        )?;
+        let candidates: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "call" && edge.target.contains("::target@"))
+            .collect();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|edge| edge.confidence == "possible"));
+        assert!(candidates.iter().all(|edge| {
+            edge.detail["ambiguousTarget"] == true && edge.detail["candidateCount"] == 2
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn possible_member_calls_traverse_through_candidate_hubs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "service.ts",
+            "class Service { load() {} }\nfunction run(client) { client.load(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let default_result = neighborhood(
+            &conn,
+            "service.ts:load",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "both".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(!default_result.edges.iter().any(|edge| {
+            edge.kind == "member_call" || edge.kind == "member_candidate"
+        }));
+
+        let result = neighborhood(
+            &conn,
+            "service.ts:load",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "both".into(),
+                min_confidence: "possible".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "member_candidate"
+                && edge.source == "member:unknown:load"
+                && edge.target.contains("#Service::load@1")
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "member_call"
+                && edge.source.contains("#::run@1")
+                && edge.target == "member:unknown:load"
+                && edge.confidence == "possible"
+        }));
         Ok(())
     }
 

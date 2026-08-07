@@ -23,13 +23,11 @@ struct StatsVisitor {
 impl<'a> Visit<'a> for StatsVisitor {
     fn visit_function(&mut self, func: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         self.stats.functions += 1;
-        if self.is_jsx_file {
-            if let Some(id) = &func.id {
-                if id.name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        if self.is_jsx_file
+            && let Some(id) = &func.id
+                && id.name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
                     self.stats.jsx_components_defined += 1;
                 }
-            }
-        }
         oxc_ast_visit::walk::walk_function(self, func, flags);
     }
 

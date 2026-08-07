@@ -10,7 +10,6 @@ use crate::graph::{self, FileGraph};
 use crate::{parse, store, walk};
 
 pub struct IndexOutcome {
-    pub total_files: usize,
     pub indexed: usize,
     pub unchanged: usize,
     pub failed: usize,
@@ -56,7 +55,6 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let files = walk::source_files(&root);
     let mut outcome = IndexOutcome {
-        total_files: files.len(),
         indexed: 0,
         unchanged: 0,
         failed: 0,
@@ -82,12 +80,11 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
             continue;
         };
         let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-        if let Some((_, old_hash)) = existing.get(&rel) {
-            if *old_hash == hash {
+        if let Some((_, old_hash)) = existing.get(&rel)
+            && *old_hash == hash {
                 outcome.unchanged += 1;
                 continue;
             }
-        }
         if std::env::var_os("JSCOUT_DEBUG").is_some() {
             eprintln!("extracting {rel}");
         }
@@ -129,7 +126,11 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
         [root.to_string_lossy()],
     )?;
     let snapshot = crate::structural::compute_snapshot(conn)?;
+    let projection_started = std::time::Instant::now();
     crate::structural::rebuild_projection(conn, &snapshot)?;
+    if std::env::var_os("JSCOUT_TIMING").is_some() {
+        eprintln!("timing structural-projection={:?}", projection_started.elapsed());
+    }
     Ok(outcome)
 }
 
@@ -238,12 +239,14 @@ fn insert_file(conn: &Connection, rel: &str, hash: &str, data: &FileData) -> Res
     }
 
     let mut ins_mc = conn.prepare_cached(
-        "INSERT INTO member_calls(file_id, chunk_id, line, prop, object) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO member_calls(file_id, chunk_id, start, line, prop, object)
+         VALUES(?1,?2,?3,?4,?5,?6)",
     )?;
     for m in &data.graph.member_calls {
         ins_mc.execute(params![
             file_id,
             chunk_for(m.span_start),
+            m.span_start,
             data.lines.line(m.span_start),
             m.prop,
             m.object,

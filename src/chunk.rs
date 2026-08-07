@@ -348,9 +348,9 @@ impl<'s> Chunker<'s> {
                         return;
                     }
                     // Oversized arrow function: split its body if it's a block.
-                    if let Some(Expression::ArrowFunctionExpression(arrow)) = &d.init {
-                        if let ArrowFunctionBody::FunctionBody(body) = &arrow.body {
-                            if let Some(first) = body.statements.first().map(|s| s.span().start) {
+                    if let Some(Expression::ArrowFunctionExpression(arrow)) = &d.init
+                        && let ArrowFunctionBody::FunctionBody(body) = &arrow.body
+                            && let Some(first) = body.statements.first().map(|s| s.span().start) {
                                 out.push(Unit {
                                     span: Span::new(full_span.start, first),
                                     kind,
@@ -371,8 +371,6 @@ impl<'s> Chunker<'s> {
                                 }
                                 return;
                             }
-                        }
-                    }
                 }
             }
         }

@@ -16,7 +16,6 @@ pub struct ModuleGraph {
     exports: HashMap<i64, Vec<ExportEntry>>,
     edges: HashMap<(i64, String), Option<i64>>,
     pub paths: HashMap<i64, String>,
-    pub ids: HashMap<String, i64>,
 }
 
 impl ModuleGraph {
@@ -51,15 +50,13 @@ impl ModuleGraph {
         }
 
         let mut paths = HashMap::new();
-        let mut ids = HashMap::new();
         let mut stmt = conn.prepare("SELECT id, path FROM files")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, path) = row?;
-            paths.insert(id, path.clone());
-            ids.insert(path, id);
+            paths.insert(id, path);
         }
-        Ok(Self { exports, edges, paths, ids })
+        Ok(Self { exports, edges, paths })
     }
 
     pub fn edge(&self, file: i64, request: &str) -> Option<i64> {
@@ -103,12 +100,12 @@ impl ModuleGraph {
         }
         // Star re-exports: try each source module.
         for e in entries {
-            if e.export_name == "*" && e.from_request.is_some() {
-                if let Some(target) = self.edge(file, e.from_request.as_ref().unwrap()) {
-                    if let Some(hit) = self.resolve_export_inner(target, name, visited) {
-                        return Some(hit);
-                    }
-                }
+            if e.export_name == "*"
+                && let Some(request) = e.from_request.as_deref()
+                && let Some(target) = self.edge(file, request)
+                && let Some(hit) = self.resolve_export_inner(target, name, visited)
+            {
+                return Some(hit);
             }
         }
         None

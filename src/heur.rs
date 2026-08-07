@@ -18,7 +18,6 @@ pub struct RequireBinding {
 pub struct CjsExport {
     pub export_name: String,
     pub local_name: Option<String>,
-    pub span_start: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -89,8 +88,8 @@ fn require_request(expr: &Expression<'_>) -> Option<String> {
 
 impl<'a> Visit<'a> for HeurVisitor {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
-        if let Some(init) = &decl.init {
-            if let Some(request) = require_request(init) {
+        if let Some(init) = &decl.init
+            && let Some(request) = require_request(init) {
                 match &decl.id {
                     BindingPattern::BindingIdentifier(id) => {
                         self.out.requires.push(RequireBinding {
@@ -115,7 +114,6 @@ impl<'a> Visit<'a> for HeurVisitor {
                     _ => {}
                 }
             }
-        }
         oxc_ast_visit::walk::walk_variable_declarator(self, decl);
     }
 
@@ -133,14 +131,13 @@ impl<'a> Visit<'a> for HeurVisitor {
                     self.out.cjs_exports.push(CjsExport {
                         export_name: prop,
                         local_name: local,
-                        span_start: expr.span.start,
                     });
                 }
                 Some("module") if prop == "exports" => {
                     if let Expression::ObjectExpression(obj) = &expr.right {
                         for p in &obj.properties {
-                            if let ObjectPropertyKind::ObjectProperty(op) = p {
-                                if let Some(name) = op.key.static_name() {
+                            if let ObjectPropertyKind::ObjectProperty(op) = p
+                                && let Some(name) = op.key.static_name() {
                                     let local = match &op.value {
                                         Expression::Identifier(id) => Some(id.name.to_string()),
                                         _ if op.shorthand => Some(name.to_string()),
@@ -149,10 +146,8 @@ impl<'a> Visit<'a> for HeurVisitor {
                                     self.out.cjs_exports.push(CjsExport {
                                         export_name: name.to_string(),
                                         local_name: local,
-                                        span_start: op.span().start,
                                     });
                                 }
-                            }
                         }
                     }
                 }
@@ -201,8 +196,8 @@ impl<'a> Visit<'a> for HeurVisitor {
         if let Some(id) = &class.id {
             let class_name = id.name.to_string();
             for member in &class.body.body {
-                if let ClassElement::MethodDefinition(m) = member {
-                    if let Some(name) = m.key.static_name() {
+                if let ClassElement::MethodDefinition(m) = member
+                    && let Some(name) = m.key.static_name() {
                         self.out.methods.push(MethodDef {
                             class: class_name.clone(),
                             name: name.to_string(),
@@ -210,7 +205,6 @@ impl<'a> Visit<'a> for HeurVisitor {
                             span_end: m.span().end,
                         });
                     }
-                }
             }
         }
         oxc_ast_visit::walk::walk_class(self, class);

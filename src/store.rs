@@ -122,6 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_events_name ON events(name);
 CREATE TABLE IF NOT EXISTS member_calls(
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   chunk_id INTEGER,
+  start INTEGER NOT NULL,
   line INTEGER NOT NULL,
   prop TEXT NOT NULL,
   object TEXT
@@ -281,8 +282,25 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    if version < 4 {
+        if !has_column(conn, "member_calls", "start")? {
+            conn.execute(
+                "ALTER TABLE member_calls ADD COLUMN start INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+
+        // Member-call ownership in the traversal projection requires exact
+        // source offsets. Force canonical extraction because legacy rows can
+        // only be migrated with a placeholder offset.
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','3')
+        "INSERT INTO meta(key, value) VALUES('schema_version','4')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -346,7 +364,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -360,6 +378,42 @@ mod tests {
         )?;
         assert!(reference.0 > 0);
         assert_eq!(reference.1, 0);
+        let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
+        assert!(hash.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v3_member_calls_and_forces_offset_reextraction() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let db_path = repo.path().join(".jscout.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '3');
+             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
+             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');
+             CREATE TABLE member_calls(
+               file_id INTEGER, chunk_id INTEGER, line INTEGER,
+               prop TEXT, object TEXT
+             );
+             INSERT INTO member_calls VALUES(1, NULL, 7, 'load', 'client');",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(version, "4");
+        let member_call: (i64, i64) = conn.query_row(
+            "SELECT start, line FROM member_calls WHERE prop='load'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(member_call, (0, 7));
         let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
         assert!(hash.is_empty());
         Ok(())

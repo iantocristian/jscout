@@ -52,12 +52,9 @@ pub fn watch(root: &Path, embed_on_change: bool) -> Result<()> {
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    loop {
-        // Block until something happens, then debounce until 300ms of quiet.
-        let first = match rx.recv() {
-            Ok(ev) => ev,
-            Err(_) => break,
-        };
+    while let Ok(first) = rx.recv() {
+        // The outer receive blocks until something happens; then debounce
+        // until 300ms of quiet.
         let mut pending: Vec<PathBuf> = Vec::new();
         if let Ok(ev) = first {
             pending.extend(ev.paths);

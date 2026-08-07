@@ -324,14 +324,13 @@ fn classify_reference<'a>(
                 }
                 return ("use", member_prop);
             }
-            AstKind::Class(c) => {
+            AstKind::Class(c)
                 if c.super_class
                     .as_ref()
                     .is_some_and(|s| s.span().contains_inclusive(ref_span))
-                {
+                => {
                     return ("extend", member_prop);
                 }
-            }
             _ => {}
         }
     }
