@@ -275,7 +275,7 @@ This keeps storage linear in event sites and prevents unrelated `error`,
 Inputs: anchor spec, direction, depth, global node/token budget,
 `min_confidence`, and edge-kind filters.
 
-The target ranking is deliberately simple and treated as a hypothesis:
+Traversal now uses this deliberately simple best-first ranking hypothesis:
 
 ```text
 path score = minimum edge confidence on path
@@ -284,12 +284,13 @@ path score = minimum edge confidence on path
            × hub damping
 ```
 
-It is not implemented yet. Current traversal is a deterministic BFS with
-global node/edge budgets; under truncation, stable SQL edge order decides which
-neighbors survive. Keep that limitation explicit. Do not spend ranking effort
-on standalone `neighborhood` UX until discriminating evaluations show a need;
-expanded search is the current agent-facing delivery vehicle for this
-machinery.
+The implementation maps confidence to `1.0 / 0.6 / 0.3`, applies explicit
+relation weights, decays each additional hop by `0.75`, and damps hubs by
+`1/log2(degree+2)`. These weights are unvalidated product hypotheses, not
+learned relevance. Search expansion merges candidates from all seeds by this
+score before enforcing global budgets. Do not spend standalone
+`neighborhood` UX effort until discriminating evaluations show a need;
+expanded search remains the current agent-facing delivery vehicle.
 
 The budget is global across all anchors, not per hit. Nodes and edges are
 deduplicated before rendering. Confidence and provenance remain visible.
@@ -784,20 +785,23 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | Phase | Deliverable | Dependency | Rough scope |
 |---|---|---|---|
 | **P0** | Complete: frozen `ai-pipe` task set, isolated Codex runner, paired naturalistic/assisted observations, telemetry join, and recorded decision | Current core | Done 2026-08-07 |
-| **RI-1** | Finish whole-response rendered budgets and representative latency/schema gates; identity, materialized graph, neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures are implemented | P0 observation can run in parallel | <1 day plus corpus run |
-| **SC-1** | Full-source vs elided-source A/B, contract plane, multi-resolution renderer, file-projected overview; custom IR only if it wins | RI-1 | 1–2 days, plus optional IR experiment |
+| **RI-1** | Complete: whole-search and outline response budgets, identity, materialized graph, candidate projection, ranked neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures | P0 | Done 2026-08-07; broader per-tool envelope coverage remains incremental |
+| **SC-1** | First full-source vs deterministic-elided A/B complete: equal correctness, no selected-artifact compression, worse observed calls/bytes; full remains default and custom IR is not earned | RI-1 | Current renderer rejected 2026-08-07; iterate only behind another gate |
 | **SC-2a** | Bounded LLM workflow experiment, semantic storage/freshness, and validated `annotate` write-back | SC-1 | 1–2 days plus prompt iteration |
 | **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
 | **SC-2b** | Expand workflow coverage only if bounded evaluation succeeds; use EN-1 seeds when available | SC-2a; EN-1 improves workflow seeds | Incremental |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
-The immediate implementation sequence is: author the discriminating three-arm
-task set, finish RI-1 whole-response budgets and MCP schema gates, then run SC-1
-full-source versus elided-source at equal rendered-byte budgets. The P0 result
-keeps expansion opt-in and makes payload reduction the next measured
-constraint. LLM workflow scouting and agent write-back share the
-first R3 storage/validation phase. Broad workflow coverage benefits from
+The discriminating grep/baseline/structural suite is complete. Grep and
+structural both scored 4/4; structural inspected fewer files but consumed 73%
+more agent tokens, so RI-2 graph expansion and standalone `neighborhood` tuning
+have not earned priority. The immediate next step is the bounded SC-2a
+workflow/write-back experiment. Expansion remains opt-in. The failed first
+SC-1 gate keeps full source as the default and requires a paired-artifact
+compression benchmark before another source-view agent run. Retrieval cleanup
+should add production-path filtering because poor initial hits still seed graph
+expansion with tests and build scripts. Broad workflow coverage benefits from
 routes/events/tables, but the bounded experiment does not wait for every EN-1
 extractor. Cards and summaries must earn separate implementation effort.
 

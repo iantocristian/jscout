@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "profiles": ["structural-full", "structural-elided"],
+  "repository": {
+    "name": "ai-pipe",
+    "commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+    "tracked_files": 930,
+    "indexed_files": 690,
+    "jscout_chunks": 5483,
+    "jscout_references": 28527,
+    "jscout_snapshot": "93fc29f5b7260c604d0e6d426420437921267ddda7f5eb5e8ebadbf8da2a4b86"
+  },
+  "experiment": {
+    "question": "Does deterministic elided source preserve answer quality while reducing rendered definition bytes?",
+    "controlled_difference": "MCP definition source view only",
+    "source_byte_limit": 12000,
+    "primary_metrics": ["correctness_rate", "mean_source_rendered_bytes"],
+    "secondary_metrics": ["mean_result_bytes", "mean_total_tokens", "mean_run_duration_ms"]
+  },
+  "tasks": [
+    {
+      "id": "pattern-journal-callers",
+      "category": "blast-radius",
+      "prompt": "Which production node executors directly persist detected pattern evidence through the shared journal helper? Return the helper and every direct production caller, with their files and symbols. Exclude tests and transitive callers.",
+      "gold": {
+        "files": [
+          "server/nodes/patternJournal.mjs",
+          "server/nodes/macroRegime.mjs",
+          "server/nodes/sectorRotation.mjs",
+          "server/nodes/stockPatterns.mjs",
+          "server/nodes/universeBreadth.mjs"
+        ],
+        "symbols": [
+          "journalPatternEvents",
+          "executeMacroRegime",
+          "executeSectorRotation",
+          "executeStockPatterns",
+          "executeUniverseBreadth"
+        ]
+      }
+    },
+    {
+      "id": "macro-index-ibkr-path",
+      "category": "multi-hop-structure",
+      "prompt": "Trace the production function path used when the macro-indicator source obtains an index series through the preferred IBKR provider, from the node executor through the index-bar fetch helper to construction of the broker HTTP client. Return the three files and symbols in path order.",
+      "gold": {
+        "files": [
+          "server/nodes/sourceMacroIndicators.mjs",
+          "server/providers/marketData/ibkrPreferred.mjs",
+          "server/brokers/ibkrHttpClient.mjs"
+        ],
+        "symbols": [
+          "executeMacroIndicatorsSource",
+          "fetchIbkrIndexDailyBars",
+          "createIbkrBrokerProvider"
+        ]
+      }
+    },
+    {
+      "id": "x-post-delivery-workflow",
+      "category": "workflow-trace",
+      "prompt": "Trace the production workflow from polling X posts through durable event fan-out to the scheduler claiming and running a delivery, including the failure helper that requeues transient failures. Return the source executor, enqueue function, scheduler tick, claim function, flow executor, failure helper, and requeue function with their defining files.",
+      "gold": {
+        "files": [
+          "server/nodes/sourceXPostEvents.mjs",
+          "server/db.mjs",
+          "server/scheduler.mjs",
+          "server/executor.mjs"
+        ],
+        "symbols": [
+          "executeXPostEventsSource",
+          "enqueueXPostEventDeliveries",
+          "runSchedulerTick",
+          "claimPendingWorkflowEventDelivery",
+          "runFlow",
+          "resolveEventDeliveryFailure",
+          "markWorkflowEventDeliveryRequeued"
+        ]
+      }
+    },
+    {
+      "id": "dynamic-node-dispatch-boundary",
+      "category": "uncertainty-control",
+      "prompt": "The runtime selects node behavior from a registry rather than a direct call per node type. Which production symbol constructs that registry and which symbol dispatches a node through it? Return their files and symbols, and state whether a static call graph alone proves the complete set of runtime node types.",
+      "gold": {
+        "files": ["server/nodes/registry.mjs", "server/nodes/index.mjs"],
+        "symbols": ["createRuntimeNodeRegistry", "executeNode"]
+      }
+    }
+  ]
+}

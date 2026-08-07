@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "profiles": ["grep", "baseline", "structural"],
+  "repository": {
+    "name": "ai-pipe",
+    "commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+    "tracked_files": 930,
+    "indexed_files": 690,
+    "jscout_chunks": 5483,
+    "jscout_references": 28527,
+    "jscout_snapshot": "93fc29f5b7260c604d0e6d426420437921267ddda7f5eb5e8ebadbf8da2a4b86"
+  },
+  "experiment": {
+    "question": "Does an assisted repository index improve correctness or work over grep on structural questions designed to require indirection and disambiguation?",
+    "profiles": {
+      "grep": "repository-local shell and filesystem search only",
+      "baseline": "indexed retrieval and definition tools without graph expansion",
+      "structural": "baseline tools plus opt-in graph expansion and neighborhood"
+    },
+    "primary_metrics": ["correctness_rate", "file_recall", "symbol_recall"],
+    "secondary_metrics": ["mean_inspected_files", "mean_result_bytes", "mean_total_tokens", "mean_run_duration_ms"]
+  },
+  "tasks": [
+    {
+      "id": "registry-macro-ibkr-dispatch",
+      "category": "registry-dispatch",
+      "prompt": "Trace the data-driven runtime path for node type `source.macroIndicators`: from the registry constructor and generic node dispatcher, through the registered source executor, to its preferred IBKR daily-index fetch and construction of the broker HTTP client. Return only the five defining production files and five named symbols in path order; do not include registry wrapper methods or fallback providers.",
+      "gold": {
+        "files": [
+          "server/nodes/registry.mjs",
+          "server/nodes/index.mjs",
+          "server/nodes/sourceMacroIndicators.mjs",
+          "server/providers/marketData/ibkrPreferred.mjs",
+          "server/brokers/ibkrHttpClient.mjs"
+        ],
+        "symbols": [
+          "createRuntimeNodeRegistry",
+          "executeNode",
+          "executeMacroIndicatorsSource",
+          "fetchIbkrIndexDailyBars",
+          "createIbkrBrokerProvider"
+        ]
+      }
+    },
+    {
+      "id": "universe-breadth-barrel-resolution",
+      "category": "deep-barrel-indirection",
+      "prompt": "The universe-breadth executor imports four runtime values through the patterns barrel. Resolve the executor, the barrel, and the leaf definition of every imported runtime value (`sectorBreadth`, `breadthSeries`, `zweigThrust`, and `DEFAULT_BREADTH_UNIVERSE`). Return only the five production files and five named symbols; include the barrel file even though it adds no named symbol.",
+      "gold": {
+        "files": [
+          "server/nodes/universeBreadth.mjs",
+          "server/patterns/index.mjs",
+          "server/patterns/sector.mjs",
+          "server/patterns/breadth.mjs",
+          "server/patterns/universe.mjs"
+        ],
+        "symbols": [
+          "executeUniverseBreadth",
+          "sectorBreadth",
+          "breadthSeries",
+          "zweigThrust",
+          "DEFAULT_BREADTH_UNIVERSE"
+        ]
+      }
+    },
+    {
+      "id": "http-close-scheduler-receiver",
+      "category": "event-receiver-disambiguation",
+      "prompt": "Several production files listen for generic `close`, `error`, or `data` events on unrelated child processes. Identify only the HTTP-server close wiring used to tear down scheduling during API shutdown: return the production file containing that registration, the exported API server factory, and the scheduler factory whose returned callback is registered. Exclude child-process listeners and return only exported named symbols.",
+      "gold": {
+        "files": [
+          "server/api.mjs",
+          "server/scheduler.mjs"
+        ],
+        "symbols": [
+          "createApiServer",
+          "startScheduler"
+        ]
+      }
+    },
+    {
+      "id": "x-post-delivery-retry-policy",
+      "category": "cross-file-workflow",
+      "prompt": "Trace the production workflow from polling X posts through durable event fan-out to scheduler claim and flow execution, then through transient-failure retry-policy resolution to requeue. Return only the defining production files and these path symbols: source executor, enqueue function, scheduler tick, claim function, flow executor, failure resolver, retry-policy resolver, and requeue function.",
+      "gold": {
+        "files": [
+          "server/nodes/sourceXPostEvents.mjs",
+          "server/db.mjs",
+          "server/scheduler.mjs",
+          "server/executor.mjs",
+          "server/deliveryRetryPolicy.mjs"
+        ],
+        "symbols": [
+          "executeXPostEventsSource",
+          "enqueueXPostEventDeliveries",
+          "runSchedulerTick",
+          "claimPendingWorkflowEventDelivery",
+          "runFlow",
+          "resolveEventDeliveryFailure",
+          "resolveDeliveryRetryPolicy",
+          "markWorkflowEventDeliveryRequeued"
+        ]
+      }
+    }
+  ]
+}

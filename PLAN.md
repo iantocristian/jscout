@@ -25,9 +25,13 @@
 >
 > The representative P0 agent evaluation is complete; see
 > [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md).
-> Expansion remains opt-in. The current next step is RI-1 whole-response
-> budgeting and a discriminating grep/baseline/structural task set, followed by
-> the equal-budget SC-1 elided-source experiment in
+> Expansion remains opt-in. RI-1 response budgeting, candidate projection,
+> ranked traversal, and shipped integration guidance are complete. The first
+> SC-1 full/elided agent gate retained answer quality but found no source-byte
+> reduction, so full source remains the default. The discriminating three-arm
+> comparison also found no outcome gain over grep (4/4 each); structural
+> inspected fewer files at much higher agent-token cost. Graph scope is frozen
+> while the bounded SC-2a workflow-memory/write-back experiment begins in
 > [PLAN-KG-REVISED-CODEX.md](PLAN-KG-REVISED-CODEX.md).
 
 A fast indexer for JavaScript/TypeScript codebases built for RAG and agent retrieval.

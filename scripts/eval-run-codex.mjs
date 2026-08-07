@@ -70,7 +70,7 @@ function sameSet(left = [], right = []) {
   return a.size === b.size && [...a].every((value) => b.has(value));
 }
 
-function promptFor(task, { profile, requireJscout = false } = {}) {
+function promptFor(task, { profile, requireJscout = false, requireDefinition = false } = {}) {
   const lines = [
     "You are completing a read-only repository-localization evaluation.",
     "Answer only from the checked-out repository. Do not edit files or run tests.",
@@ -84,6 +84,9 @@ function promptFor(task, { profile, requireJscout = false } = {}) {
   } else if (requireJscout) {
     lines.push("Start with the configured jscout MCP server and use it as the primary localization interface; verify decisive claims in source before answering.");
   }
+  if (requireDefinition && profile !== "grep") {
+    lines.push("Before answering, call jscout definition for every named symbol in your final answer; use the returned source as the verification evidence.");
+  }
   lines.push("", task.prompt);
   return lines.join("\n");
 }
@@ -96,7 +99,13 @@ async function main() {
   if (tasks.length === 0) throw new Error("no matching tasks");
   const profiles = options.profiles.split(",").map((value) => value.trim()).filter(Boolean);
   const invalidProfiles = profiles.filter(
-    (profile) => !["grep", "baseline", "structural"].includes(profile),
+    (profile) => ![
+      "grep",
+      "baseline",
+      "structural",
+      "structural-full",
+      "structural-elided",
+    ].includes(profile),
   );
   if (invalidProfiles.length > 0) {
     throw new Error(`unknown profiles: ${invalidProfiles.join(", ")}`);
@@ -110,15 +119,39 @@ async function main() {
   const telemetry = path.resolve(options.telemetry);
   const responses = path.resolve(options.responses);
   const artifacts = path.resolve(options.artifacts);
+  const lockPath = `${responses}.lock`;
+  let lockFd;
+  try {
+    lockFd = fs.openSync(lockPath, "wx");
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      throw new Error(`another evaluation writer holds ${lockPath}; wait for it to exit before resuming`);
+    }
+    throw error;
+  }
+  const releaseLock = () => {
+    if (lockFd === undefined) return;
+    fs.closeSync(lockFd);
+    lockFd = undefined;
+    try { fs.unlinkSync(lockPath); } catch {}
+  };
+  process.once("exit", releaseLock);
+  const resume = options.resume === "true";
   for (const outputPath of [responses, telemetry]) {
-    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+    if (!resume && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
       throw new Error(`refusing to append to non-empty output: ${outputPath}`);
     }
   }
-  if (fs.existsSync(artifacts) && fs.readdirSync(artifacts).length > 0) {
+  if (!resume && fs.existsSync(artifacts) && fs.readdirSync(artifacts).length > 0) {
     throw new Error(`refusing to overwrite non-empty artifacts directory: ${artifacts}`);
   }
   fs.mkdirSync(artifacts, { recursive: true });
+  const completed = new Set(
+    resume && fs.existsSync(responses)
+      ? jsonLines(fs.readFileSync(responses, "utf8"))
+        .map((row) => `${row.task_id}\0${row.profile}`)
+      : [],
+  );
   const output = [];
   const disabledSkills = options["disable-skills"]
     ? options["disable-skills"].split(",").map((value) => value.trim()).filter(Boolean)
@@ -135,7 +168,13 @@ async function main() {
     const task = tasks[taskIndex];
     const orderedProfiles = taskIndex % 2 === 0 ? profiles : [...profiles].reverse();
     for (const profile of orderedProfiles) {
+      if (completed.has(`${task.id}\0${profile}`)) {
+        process.stderr.write(`[${task.id}] ${profile} (already complete)\n`);
+        continue;
+      }
       const usesJscout = profile !== "grep";
+      const toolProfile = profile.startsWith("structural-") ? "structural" : profile;
+      const sourceView = profile === "structural-elided" ? "elided" : "full";
       const session = `${profile}-${task.id}-${options.trial}`;
       const lastMessage = path.join(os.tmpdir(), `jscout-${session}-${process.pid}.json`);
       const args = [
@@ -150,7 +189,7 @@ async function main() {
         "--output-last-message", lastMessage,
         "--config", `model_reasoning_effort=${JSON.stringify(options.reasoning)}`,
         "--config", "approval_policy=\"never\"",
-        "--config", "agents.enabled=false",
+        "--config", "features.multi_agent=false",
         "--config", "features.apps=false",
         "--config", "features.browser_use=false",
         "--config", "features.computer_use=false",
@@ -161,9 +200,10 @@ async function main() {
       if (usesJscout) {
         args.push(
           "--config", `mcp_servers.jscout.command=${JSON.stringify(jscout)}`,
-          "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", repository, "--profile", profile, "--telemetry", telemetry])}`,
+          "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", repository, "--profile", toolProfile, "--source-view", sourceView, "--telemetry", telemetry])}`,
           "--config", `mcp_servers.jscout.env.JSCOUT_TASK_ID=${JSON.stringify(task.id)}`,
           "--config", `mcp_servers.jscout.env.JSCOUT_SESSION_ID=${JSON.stringify(session)}`,
+          "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
           "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
           "--config", "mcp_servers.jscout.tools.semantic_search.approval_mode=\"approve\"",
           "--config", "mcp_servers.jscout.tools.who_uses.approval_mode=\"approve\"",
@@ -184,6 +224,7 @@ async function main() {
       args.push(promptFor(task, {
         profile,
         requireJscout: options["require-jscout"] === "true",
+        requireDefinition: options["require-definition"] === "true",
       }));
       process.stderr.write(`[${task.id}] ${profile}\n`);
       const result = await run(options.codex, args, {

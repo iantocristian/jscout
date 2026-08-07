@@ -110,3 +110,45 @@ test("evaluation report supports a declared grep/baseline/structural comparison"
   assert.equal(report.profile_deltas.structural_minus_baseline.mean_total_tokens, -200);
   assert.deepEqual(report.missing, []);
 });
+
+test("evaluation report compares full and elided rendered source bytes", () => {
+  const tasks = {
+    schema_version: 1,
+    profiles: ["structural-full", "structural-elided"],
+    tasks: [{ id: "flow", category: "workflow", gold: { files: ["a.ts"], symbols: ["run"] } }],
+  };
+  const responses = ["structural-full", "structural-elided"].map((profile) => ({
+    task_id: "flow",
+    profile,
+    session: `${profile}-flow-001`,
+    files: ["a.ts"],
+    symbols: ["run"],
+    correct: true,
+  }));
+  const telemetry = [
+    {
+      task: "flow",
+      profile: "structural-full",
+      session: "structural-full-flow-001",
+      tool: "definition",
+      ok: true,
+      source_rendered_bytes: 1200,
+      source_original_bytes: 1200,
+    },
+    {
+      task: "flow",
+      profile: "structural-elided",
+      session: "structural-elided-flow-001",
+      tool: "definition",
+      ok: true,
+      source_rendered_bytes: 700,
+      source_original_bytes: 1200,
+    },
+  ];
+
+  const report = buildReport(tasks, responses, telemetry);
+  assert.equal(report.profiles["structural-full"].mean_source_rendered_bytes, 1200);
+  assert.equal(report.profiles["structural-elided"].mean_source_rendered_bytes, 700);
+  assert.equal(report.profile_deltas.structural_elided_minus_full.mean_source_rendered_bytes, -500);
+  assert.deepEqual(report.missing, []);
+});

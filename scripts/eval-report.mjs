@@ -70,6 +70,9 @@ const DELTA_METRICS = [
   "mean_failed_tool_calls",
   "mean_tool_latency_ms",
   "mean_result_bytes",
+  "mean_source_rendered_bytes",
+  "mean_source_original_bytes",
+  "mean_source_budget_truncations",
   "mean_inspected_files",
   "mean_irrelevant_files",
   "mean_total_tokens",
@@ -127,6 +130,18 @@ export function buildReport(taskSet, responses, telemetry = []) {
       failed_tool_calls: calls.filter((call) => call.ok === false).length,
       tool_latency_ms: calls.reduce((sum, call) => sum + Number(call.elapsed_ms || 0), 0),
       result_bytes: calls.reduce((sum, call) => sum + Number(call.result_bytes || 0), 0),
+      source_rendered_bytes: calls.reduce(
+        (sum, call) => sum + Number(call.source_rendered_bytes || 0),
+        0,
+      ),
+      source_original_bytes: calls.reduce(
+        (sum, call) => sum + Number(call.source_original_bytes || 0),
+        0,
+      ),
+      source_budget_truncations: calls.reduce(
+        (sum, call) => sum + Number(call.source_budget_truncations || 0),
+        0,
+      ),
       inspected_files: inspectedFiles?.size ?? null,
       irrelevant_files: inspectedFiles
         ? [...inspectedFiles].filter((file) => !goldFiles.has(file)).length
@@ -152,6 +167,11 @@ export function buildReport(taskSet, responses, telemetry = []) {
       mean_failed_tool_calls: mean(results.map((result) => result.failed_tool_calls)),
       mean_tool_latency_ms: mean(results.map((result) => result.tool_latency_ms)),
       mean_result_bytes: mean(results.map((result) => result.result_bytes)),
+      mean_source_rendered_bytes: mean(results.map((result) => result.source_rendered_bytes)),
+      mean_source_original_bytes: mean(results.map((result) => result.source_original_bytes)),
+      mean_source_budget_truncations: mean(
+        results.map((result) => result.source_budget_truncations),
+      ),
       mean_inspected_files: meanPresent(results.map((result) => result.inspected_files)),
       mean_irrelevant_files: meanPresent(results.map((result) => result.irrelevant_files)),
       mean_total_tokens: meanPresent(results.map((result) => result.total_tokens)),
@@ -176,6 +196,11 @@ export function buildReport(taskSet, responses, telemetry = []) {
     structural_minus_baseline: structuralMinusBaseline,
     baseline_minus_grep: profileDelta(summaries, "baseline", "grep"),
     structural_minus_grep: profileDelta(summaries, "structural", "grep"),
+    structural_elided_minus_full: profileDelta(
+      summaries,
+      "structural-elided",
+      "structural-full",
+    ),
   };
 
   taskResults.sort((a, b) =>

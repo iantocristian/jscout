@@ -43,15 +43,48 @@ node scripts/eval-run-codex.mjs \
   --require-jscout true
 ```
 
+The SC-1 source-compression gate uses `structural-full` and
+`structural-elided`. Both map to the same structural tool surface and differ
+only in the default `definition` source representation. Each definition uses
+the same 12,000-byte source ceiling. Telemetry records rendered and original
+source bytes without recording source text:
+
+```bash
+node scripts/eval-run-codex.mjs \
+  --tasks eval/tasks/ai-pipe-sc1.json \
+  --repository /path/to/frozen/repository \
+  --jscout "$PWD/target/release/jscout" \
+  --responses /tmp/jscout-sc1-responses.jsonl \
+  --telemetry /tmp/jscout-sc1-telemetry.jsonl \
+  --artifacts /tmp/jscout-sc1-artifacts \
+  --profiles structural-full,structural-elided \
+  --trial 001 \
+  --require-jscout true \
+  --require-definition true
+```
+
+The primary gate is answer correctness at lower
+`mean_source_rendered_bytes`; compression ratio alone is not a success metric.
+
 Use new output paths for every run; the runner refuses non-empty response,
 telemetry, or artifact targets. Change `--trial` when repeating a task/profile
 pair so its telemetry session remains unique. The target repository should be
 a clean Git checkout because its own agent instructions may require a status
 check even though the runner permits a non-Git directory. Raw artifact logs can
 contain repository source; keep them outside the product repository.
+If a batch is interrupted and the prior process has exited, rerun the same
+command with `--resume true`; the runner preserves existing artifacts and skips
+completed task/profile pairs. An exclusive response-file lock rejects
+overlapping writers.
 
 The representative P0 result is recorded in
 [`results/ai-pipe-p0-2026-08-07.md`](results/ai-pipe-p0-2026-08-07.md).
+The first SC-1 gate is recorded in
+[`results/ai-pipe-sc1-2026-08-07.md`](results/ai-pipe-sc1-2026-08-07.md); it
+keeps full source as the default. The harder three-arm task set is
+[`tasks/ai-pipe-discriminating.json`](tasks/ai-pipe-discriminating.json), with
+its result recorded in
+[`results/ai-pipe-discriminating-2026-08-07.md`](results/ai-pipe-discriminating-2026-08-07.md).
 
 ## 1. Build and index the fixture
 
