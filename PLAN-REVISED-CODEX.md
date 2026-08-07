@@ -36,24 +36,25 @@ capability rather than by declaring every original milestone complete.
 | Repository walk | JS/JSX/TS/TSX/MJS/CJS/MTS/CTS discovery via `ignore`; common build/output directories and declaration files skipped |
 | Parsing | `oxc_parser` + `oxc_semantic`; runtime bindings and references extracted without the TypeScript checker |
 | Chunking | AST-aware function/class/method/component/module chunks with source spans, scope, JSDoc inclusion, file imports, and BLAKE3 content hashes |
-| Runtime graph | Files, symbols, imports, exports, re-exports, resolved module edges, local/imported references, JSX renders, calls, construction, inheritance |
+| Runtime graph | Files, declaration-scoped symbols, imports, exports, re-exports, resolved module edges, local/imported references, JSX renders, calls, construction, inheritance |
 | Heuristics | CommonJS `require`/exports, literal dynamic imports, string-keyed event sites, and name-matched member calls |
-| Storage | One embedded SQLite database containing metadata, graph tables, FTS5, event/member-call sites, and embedding blobs |
+| Storage | One embedded SQLite database containing canonical extraction tables, FTS5, event/member-call sites, embedding blobs, and a disposable materialized traversal projection |
 | Retrieval | FTS5 BM25; optional embedding search; reciprocal-rank fusion; optional HTTP reranker; compact call/usage hints on hits |
 | Incremental indexing | File and chunk content hashes; unchanged files skipped; deleted files removed; module resolution rebuilt; optional filesystem watcher |
-| Agent interface | CLI plus MCP tools: `semantic_search`, `who_uses`, `definition`, `file_outline`, and `events` |
-| Evaluation artifacts | Chunk unit tests plus local benchmark scripts/results for lexical, embedding, and reranker retrieval |
+| Agent interface | CLI plus MCP tools: `semantic_search`, `neighborhood`, `who_uses`, `definition`, `file_outline`, and `events`; opt-in privacy-minimal MCP call telemetry |
+| Snapshot safety | BLAKE3 repository snapshots; returned graph anchors are snapshot-scoped; stale symbol anchors re-resolve by path/scope/name or fail with candidates |
+| Evaluation artifacts | Chunk unit tests, structural graph fixtures, and local benchmark scripts/results for lexical, embedding, and reranker retrieval |
 
 ### Partial or deferred
 
 | Original promise | Actual state / destination |
 |---|---|
-| Golden-file and integration tests across several OSS repositories | Not implemented; current automated Rust coverage is concentrated in the chunker |
+| Golden-file and integration tests across several OSS repositories | Partial; synthetic structural fixtures exist, but multi-repository integration coverage does not |
 | Git-aware Merkle state via `gix` | Not implemented; content hashing provides current incremental behavior |
 | Patch graph edges for changed files and their dependency closure | References are replaced per changed file and module edges are rebuilt globally; no dependency-closure invalidator |
 | Route-table and DI-token heuristics | Not implemented; routes move to deterministic entity extraction; DI tokens remain unscheduled |
 | Constant-prefix dynamic imports | Not implemented; only literal strings and expression-free templates are indexed |
-| `neighborhood` MCP tool and expanded search | Not implemented; first phase of the revised graph plan |
+| Expanded search | Not implemented; `neighborhood` CLI/MCP and its materialized graph are implemented, but search-to-anchor projection and opt-in expansion are next |
 | Repo map, paths, graph export | Not implemented; later structural-retrieval phase |
 | Real-provider embedding verification | Provider plumbing and mock-compatible verification exist; repeatable real-provider acceptance remains environment-dependent |
 | Runtime trace tier | Not implemented and not on the near-term critical path |

@@ -53,6 +53,31 @@ comes from the index; semantic memory can come from scouts or agents, but every
 claim must remain attributable, evidence-backed, confidence-limited, and
 freshness-aware.
 
+## Implementation status — 2026-08-07
+
+The first RI-1 slice is implemented:
+
+- schema v3 adds declaration spans, scope chains, reference identities, and
+  source offsets;
+- indexing fully rebuilds disposable `graph_nodes` and `resolved_edges` after
+  module resolution and publishes a BLAKE3 repository snapshot;
+- file, symbol, package, and unknown-receiver event-hub identities exist;
+- CLI and MCP expose bounded `neighborhood` traversal with direction,
+  confidence, edge-kind, node, and edge limits;
+- saved anchors can carry a snapshot; stale symbol anchors are re-resolved by
+  path/scope/name, and ambiguity is an error with candidates;
+- structural fixtures cover call resolution, same-named methods, barrel
+  rerouting, stale anchors, and event hubs;
+- opt-in privacy-minimal MCP telemetry records tool selection, latency,
+  success, result size, session, and snapshot without recording arguments or
+  results.
+
+This does **not** complete P0 or RI-1. P0 still needs a scripted agent A/B
+baseline and task outcomes. RI-1 still needs chunk-to-anchor projection in
+search, expansion kept off by default, global rendered-token budgeting,
+latency measurements on a representative large corpus, and end-to-end schema
+tests.
+
 ## Architectural conclusion from the research
 
 There is no query-independent compression of arbitrary code that preserves all
@@ -96,8 +121,8 @@ architecture rather than a one-shot prompt compressor.
 |---|---|---|---|
 | **R0 — source** | Repository files and exact stored chunk content | User/repository | Source of truth |
 | **R1 — structural graph** | Files, symbols, resolved references, modules, events, entities | Parser/resolver/extractors | Rebuilt with index |
-| **R2 — scout IR** | Contracts, signatures, deterministic behavioral skeletons, compact maps | AST lowering + R1 projection | Rebuilt with changed files/graph |
-| **R3 — semantic memory** | Symbol cards, workflows, agent annotations, and optional file/module summaries | Scouts or agents using R1+R2 evidence | Fingerprinted; fresh/stale/degraded |
+| **R2 — scout views** | Contracts, signatures, query-focused elided source, optional behavioral IR, compact maps | AST/source elision + R1 projection | Rendered from the current snapshot; store only representations that win the gate |
+| **R3 — semantic memory** | Workflows, agent annotations, and optional symbol/file/module summaries | Scouts or agents using R1+R2 evidence | Fingerprinted; fresh/stale/degraded |
 
 R0–R2 are deterministic. R3 contains semantic assertions rather than
 structural facts. The distinction must be visible in storage and in every
@@ -114,8 +139,8 @@ response.
 - `entity:<type>:<normalized-name>`
 - `event:<receiver-or-unknown>:<name>`
 
-The ordinal is file order among declarations with the same path, scope, name,
-and kind. These keys are **snapshot-deterministic**, not stable across arbitrary
+The ordinal is file order among declarations with the same path, scope, and
+name. These keys are **snapshot-deterministic**, not stable across arbitrary
 edits, renames, or moves. Public APIs must describe them as snapshot-scoped.
 
 The current `symbols.start/end` values describe binding spans, which are not
@@ -264,24 +289,34 @@ not dominate repository importance.
 
 ---
 
-## SC-1 — deterministic scouting compiler
+## SC-1 — deterministic scouting compression
 
-Scouting begins after RI-1 because the graph tells the compiler which exact
-relationships to retain and how to attribute them. It should be implemented
-before broad LLM workflow generation.
+Scouting begins after RI-1 because the graph identifies exact relationships
+and evidence anchors. The first comparison is deliberately thin: full source
+versus deterministic elided source at equal context budgets. A custom
+behavioral IR is not the default merely because it is more compressed.
 
-### Why R2 is stored
+### Default: query-focused elided source
 
-Behavioral skeletons cannot be reconstructed from the current graph tables:
-those tables do not retain guards, returns, throws, transaction boundaries,
-interfaces, or enough exact source structure. Re-parsing every requested file
-would be correct but would turn the overview renderer into another indexer.
+Render source with imports, signatures, calls, guards, loops, returns, throws,
+and query-relevant bodies retained. Collapse comments, formatting, local
+plumbing, and distant implementations behind explicit span-linked elision
+markers. The renderer reparses selected files on demand initially. Caching is
+earned only when profiling shows parsing/rendering latency matters.
 
-Store deterministic scout IR as disposable derived data, regenerated for
-changed files and re-linked after graph projection refresh.
+This representation preserves the source language and exact surviving text,
+which reduces the new-parser burden imposed on the consuming model. Compare it
+against full source on the curated structural task set before designing a new
+IR.
+
+### Optional: behavioral IR behind an A/B gate
+
+The richer skeleton below is an experiment. Persist it only if, at equal token
+budgets, it improves agent outcomes over elided source and the gain justifies
+another representation, renderer, migration path, and preservation suite.
 
 ```sql
-scout_units(
+scout_units(                         -- created only if behavioral IR wins
   id INTEGER PRIMARY KEY,
   anchor_key TEXT NOT NULL,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -295,8 +330,8 @@ scout_units(
 );
 ```
 
-The JSON is the durable deterministic form. `rendered_text` is a replaceable
-cache for agent output and embedding.
+If the gate passes, JSON is the durable deterministic form and `rendered_text`
+is a replaceable cache. If it does not, no `scout_units` table is needed.
 
 ### Runtime skeleton
 
@@ -359,7 +394,7 @@ Given a focus and token budget, assemble context by distance:
 | Region | Representation |
 |---|---|
 | Direct search hits / edit targets | Exact source or full chunk |
-| One-hop structural neighbors | Behavioral skeleton + semantic card when fresh |
+| One-hop structural neighbors | Elided source; behavioral IR only if it wins; workflow role when fresh |
 | Two-hop neighbors | Signature, one-line purpose, typed edges |
 | Remaining important repository regions | Deterministic file/module overview; semantic summary only when available and fresh |
 
@@ -368,11 +403,13 @@ request the next lower level for any anchor.
 
 ### SC-1 definition of done
 
+- Full-source versus elided-source agent A/B at equal rendered budgets.
 - Golden fixtures for guards, loops, try/catch/finally, async calls, events,
   JSX, transactions, returns/throws, and public TypeScript contracts.
 - Preservation checks: every exported identifier and every certain outgoing
-  edge appears in either the signature or skeleton.
-- Skeletons contain no unresolved fabricated names; all links validate.
+  edge appears in retained source/signatures.
+- If behavioral IR is tested, it has a separate preservation suite and ships
+  only after outperforming elided source on the pre-registered task set.
 - Compression ratio reported per corpus, without making ratio the quality goal.
 - `repo_overview --tokens N` stays within its actual rendered budget.
 
@@ -384,37 +421,12 @@ LLMs add semantic information that syntax and embeddings do not make explicit.
 The first useful product is not a free-standing ontology; it is structured,
 evidence-backed annotations over R1/R2 anchors.
 
-### Step 1: symbol cards
-
-For each selected symbol, provide the LLM:
-
-- exact implementation for that symbol;
-- deterministic runtime skeleton and contract;
-- signatures/cards for direct callers and callees;
-- adjacent events/entities;
-- repository-level vocabulary accumulated so far.
-
-Require structured output:
-
-```json
-{
-  "purpose": "Coordinates checkout and payment initiation",
-  "architectural_role": "workflow orchestrator",
-  "domain_terms": ["checkout", "inventory reservation", "payment"],
-  "side_effects": ["creates order", "reserves inventory"],
-  "invariants": ["inventory is reserved before payment authorization"],
-  "failure_modes": ["empty cart", "payment authorization failure"]
-}
-```
-
-The LLM should infer intent, role, invariants, and domain language. It should
-not spend tokens restating calls or signatures that R2 already knows.
-
-### Step 2: features and workflows
+### Step 1: bounded workflow experiment
 
 Generate candidate subgraphs from entry points, calls, events, routes, tables,
-and graph communities. Ask the LLM to name the feature/workflow and assign a
-role to each participant.
+and graph communities. Start with dozens of high-value seeds, not one LLM call
+per symbol. Ask the LLM to name the feature/workflow and assign a role to each
+participant.
 
 ```json
 {
@@ -428,20 +440,16 @@ role to each participant.
 }
 ```
 
-Concept-to-concept edges are deferred until the vocabulary is stable. Embedding
-clusters, if implemented, are called `themes`; they are candidate regions, not
-domain concepts.
+Workflows are first because they answer “which workflows does this code
+participate in?” and require cross-file semantics that structural search does
+not already provide. Each participant and role needs validated evidence.
 
-Workflows are the first repository-level semantic artifact because they answer
-the concrete target query: “which workflows does this code participate in?”
-They are generated before file/module summaries and are evaluated by whether
-an agent can reach the right participants and exact evidence.
-
-### Step 3: validated agent write-back
+### Step 2: validated agent write-back
 
 Add an `annotate` MCP tool over `semantic_artifacts` and
-`semantic_supports`. An agent that has proved a repository-level fact while
-doing development work should be able to preserve it for later sessions.
+`semantic_supports` in the same phase as the workflow experiment. An agent that
+has proved a repository-level fact while doing development work should be able
+to preserve it for later sessions.
 
 Write-back follows the same trust contract as scout output:
 
@@ -463,12 +471,43 @@ Write-back follows the same trust contract as scout output:
 - write-back can only create semantic artifacts and supports. It cannot write
   `graph_nodes`, `resolved_edges`, entities, or any other structural fact.
 
-This lands in SC-2b as soon as SC-2a has proved storage, support validation, and
-freshness on symbol cards. It is not blocked on file/module summarization.
+### Step 3: optional symbol cards
+
+For each selected symbol, provide the LLM:
+
+- exact implementation for that symbol;
+- query-focused elided source and contract evidence;
+- signatures for direct callers and callees;
+- a deterministic runtime skeleton only if the SC-1 IR experiment won;
+- adjacent events/entities;
+- repository-level vocabulary accumulated so far.
+
+Require structured output:
+
+```json
+{
+  "purpose": "Coordinates checkout and payment initiation",
+  "architectural_role": "workflow orchestrator",
+  "domain_terms": ["checkout", "inventory reservation", "payment"],
+  "side_effects": ["creates order", "reserves inventory"],
+  "invariants": ["inventory is reserved before payment authorization"],
+  "failure_modes": ["empty cart", "payment authorization failure"]
+}
+```
+
+The LLM should infer intent, role, invariants, and domain language. It should
+not spend tokens restating calls or signatures that R2 already knows.
+
+Concept-to-concept edges are deferred until the vocabulary is stable. Embedding
+clusters, if implemented, are called `themes`; they are candidate regions, not
+domain concepts.
+
+Cards now share the optional-summary gate. They ship only if a pre-registered
+query set shows value beyond search, elided source, and workflow artifacts.
 
 ### Step 4: optional hierarchical summaries
 
-- File summaries aggregate symbol cards and file topology.
+- File summaries aggregate available workflow/card evidence and file topology.
 - Module/package summaries aggregate file summaries, not raw repository code.
 - Summaries retain lists of supporting anchors; prose without traceability is
   not indexable memory.
@@ -534,9 +573,10 @@ evidence.
 
 ### SC-2 definition of done
 
-- `scout` can generate symbol cards for a bounded, PageRank/retrieval-selected
-  subset before attempting the entire repository.
-- Every card/workflow field has at least one valid support anchor.
+- `scout` can generate workflows for a bounded entry-point/retrieval-selected
+  subset before attempting broad repository coverage.
+- Every workflow field and optional card field has at least one valid support
+  anchor.
 - Changed evidence produces a visible stale/degraded state.
 - Semantic search can retrieve a workflow and traverse to exact supporting
   code.
@@ -544,8 +584,8 @@ evidence.
   marks it stale/degraded after relevant code changes.
 - A curated set of repository questions compares base search, R2 scouting, and
   R2+R3 semantic memory.
-- File/module summaries are not a prerequisite for SC-2 completion; SC-2c owns
-  their separate value gate.
+- Symbol cards and file/module summaries are not prerequisites for SC-2
+  completion; SC-2c owns their separate value gate.
 
 ---
 
@@ -626,6 +666,30 @@ resolver, heuristic, and batch-scout provenance.
 
 ---
 
+## Positioning versus an LSP
+
+jscout does not compete with `tsserver` on checker-backed operations. An LSP
+should remain the first choice for precise typed definition/call hierarchy,
+rename/refactor safety, diagnostics, and interface-to-implementation navigation
+inside a configured TypeScript project.
+
+jscout's scope is different:
+
+- one fast runtime-oriented view across JavaScript and TypeScript without
+  requiring a healthy checker configuration;
+- explicit uncertainty when member or event receiver identity is unresolved;
+- repository entities and multi-file workflows beyond language-server symbol
+  operations;
+- bounded, snapshot-labelled retrieval designed for agent context;
+- persistent, evidence-backed scout and agent memory across sessions.
+
+Do not reimplement checker machinery speculatively. An optional tsserver
+enrichment pass for interface-to-implementation edges is deferred until agent
+evaluation shows that missing typed edges are a material failure mode and the
+latency/operational cost is justified.
+
+---
+
 ## Evaluation
 
 ### Structural retrieval
@@ -673,19 +737,21 @@ This is the product metric. Retrieval scores are component diagnostics.
 
 | Phase | Deliverable | Dependency | Rough scope |
 |---|---|---|---|
-| **RI-1** | Node identity, chunk projection, materialized traversal graph, neighborhood, search expansion, structural fixtures | Current core | 2–3 days |
-| **SC-1** | Stored deterministic scout IR, contract plane, multi-resolution renderer, file-projected overview | RI-1 | 2–3 days |
-| **SC-2a** | Bounded LLM symbol-card experiment with freshness labels and semantic search | SC-1 | 1–2 days plus prompt iteration |
+| **P0** | Scripted agent A/B harness over current tools; telemetry is implemented, baseline outcomes are not | Current core | 0.5–1 day |
+| **RI-1** | Finish chunk projection, opt-in search expansion, rendered budgets, latency/schema gates; identity, materialized graph, neighborhood, stale anchors, and core fixtures are implemented | P0 observation can run in parallel | 1–2 days remaining |
+| **SC-1** | Full-source vs elided-source A/B, contract plane, multi-resolution renderer, file-projected overview; custom IR only if it wins | RI-1 | 1–2 days, plus optional IR experiment |
+| **SC-2a** | Bounded LLM workflow experiment, semantic storage/freshness, and validated `annotate` write-back | SC-1 | 1–2 days plus prompt iteration |
 | **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
-| **SC-2b** | Workflow synthesis plus validated `annotate` write-back | SC-2a; EN-1 improves workflow seeds | 1–2 days plus prompt/eval iteration |
-| **SC-2c** | Optional file/module summary experiment; ship only after its separate value gate | SC-2a + SC-2b | 1 day plus evaluation, if earned |
+| **SC-2b** | Expand workflow coverage only if bounded evaluation succeeds; use EN-1 seeds when available | SC-2a; EN-1 improves workflow seeds | Incremental |
+| **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
-Scouting starts immediately after structural graph correctness. LLM semantics
-are tested before every deterministic entity extractor is complete, but broad
-workflow synthesis benefits from routes/events/tables as entry-point and
-side-effect evidence. Agent write-back can land as soon as SC-2a's storage and
-validation contract is stable; it does not wait for EN-1 or summaries.
+The immediate implementation sequence is: finish the P0 harness and remaining
+RI-1 consumer surfaces, run the baseline, then implement SC-1 elided-source
+compression. LLM workflow scouting and agent write-back share the first R3
+storage/validation phase. Broad workflow coverage benefits from
+routes/events/tables, but the bounded experiment does not wait for every EN-1
+extractor. Cards and summaries must earn separate implementation effort.
 
 ## Explicitly deferred
 
@@ -698,6 +764,8 @@ validation contract is stable; it does not wait for EN-1 or summaries.
 - Agent assertions modifying deterministic structural facts.
 - Selective materialized-edge invalidation before full rebuild misses its
   measured latency target.
+- tsserver enrichment until missing checker-backed edges are a measured agent
+  failure mode.
 
 ## Research references
 
