@@ -1,0 +1,9 @@
+{
+  "name": "graph-engineering-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node examples/graph-memory/demo.mjs",
+    "test": "node --test examples/graph-memory/demo.test.mjs"
+  }
+}

@@ -1,0 +1,320 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Result;
+use rusqlite::Connection;
+
+#[derive(Debug, Clone)]
+struct ExportEntry {
+    export_name: String,
+    local_name: Option<String>,
+    from_request: Option<String>,
+    from_name: Option<String>,
+}
+
+/// In-memory view of the module graph for export-chain resolution.
+pub struct ModuleGraph {
+    exports: HashMap<i64, Vec<ExportEntry>>,
+    edges: HashMap<(i64, String), Option<i64>>,
+    pub paths: HashMap<i64, String>,
+    pub ids: HashMap<String, i64>,
+}
+
+impl ModuleGraph {
+    pub fn load(conn: &Connection) -> Result<Self> {
+        let mut exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
+        let mut stmt =
+            conn.prepare("SELECT file_id, export_name, local_name, from_request, from_name FROM exports")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                ExportEntry {
+                    export_name: r.get(1)?,
+                    local_name: r.get(2)?,
+                    from_request: r.get(3)?,
+                    from_name: r.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, e) = row?;
+            exports.entry(id).or_default().push(e);
+        }
+
+        let mut edges: HashMap<(i64, String), Option<i64>> = HashMap::new();
+        let mut stmt = conn.prepare("SELECT from_file, request, to_file FROM module_edges")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), r.get::<_, Option<i64>>(2)?))
+        })?;
+        for row in rows {
+            let (k, v) = row?;
+            edges.insert(k, v);
+        }
+
+        let mut paths = HashMap::new();
+        let mut ids = HashMap::new();
+        let mut stmt = conn.prepare("SELECT id, path FROM files")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, path) = row?;
+            paths.insert(id, path.clone());
+            ids.insert(path, id);
+        }
+        Ok(Self { exports, edges, paths, ids })
+    }
+
+    pub fn edge(&self, file: i64, request: &str) -> Option<i64> {
+        self.edges.get(&(file, request.to_string())).copied().flatten()
+    }
+
+    /// Follow export chains (aliases, re-exports, barrels, stars) from
+    /// (file, export_name) to the defining (file, local_name).
+    pub fn resolve_export(&self, file: i64, name: &str) -> Option<(i64, String)> {
+        self.resolve_export_inner(file, name, &mut HashSet::new())
+    }
+
+    fn resolve_export_inner(
+        &self,
+        file: i64,
+        name: &str,
+        visited: &mut HashSet<(i64, String)>,
+    ) -> Option<(i64, String)> {
+        if !visited.insert((file, name.to_string())) {
+            return None; // cycle
+        }
+        let entries = self.exports.get(&file)?;
+        // Exact export first.
+        for e in entries {
+            if e.export_name != name {
+                continue;
+            }
+            match (&e.local_name, &e.from_request, &e.from_name) {
+                (Some(local), _, _) => return Some((file, local.clone())),
+                (None, None, _) => return Some((file, "default".to_string())),
+                (None, Some(req), Some(from)) => {
+                    let target = self.edge(file, req)?;
+                    if from == "*" {
+                        // `export * as ns from` — the namespace itself.
+                        return Some((target, "*".to_string()));
+                    }
+                    return self.resolve_export_inner(target, from, visited);
+                }
+                _ => return None,
+            }
+        }
+        // Star re-exports: try each source module.
+        for e in entries {
+            if e.export_name == "*" && e.from_request.is_some() {
+                if let Some(target) = self.edge(file, e.from_request.as_ref().unwrap()) {
+                    if let Some(hit) = self.resolve_export_inner(target, name, visited) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct Usage {
+    pub file: String,
+    pub line: i64,
+    pub kind: String,
+    pub confidence: String,
+    pub detail: Option<String>,
+    pub chunk_name: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SymbolTarget {
+    pub file: String,
+    pub file_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub line: i64,
+    pub exported: bool,
+}
+
+/// Find symbols matching "Name" or "path-substring:Name".
+pub fn find_symbols(conn: &Connection, spec: &str) -> Result<Vec<SymbolTarget>> {
+    let (path_filter, name) = match spec.rsplit_once(':') {
+        Some((p, n)) => (Some(p.to_string()), n.to_string()),
+        None => (None, spec.to_string()),
+    };
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.id, s.name, s.kind, s.line, s.exported
+         FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1 ORDER BY s.exported DESC",
+    )?;
+    let rows = stmt.query_map([&name], |r| {
+        Ok(SymbolTarget {
+            file: r.get(0)?,
+            file_id: r.get(1)?,
+            name: r.get(2)?,
+            kind: r.get(3)?,
+            line: r.get(4)?,
+            exported: r.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    for row in rows {
+        let t = row?;
+        if path_filter.as_deref().is_none_or(|p| t.file.contains(p)) {
+            out.push(t);
+        }
+    }
+    // Class methods aren't root symbols; they exist as method chunks.
+    if out.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT f.path, f.id, c.name, c.start_line, c.scope_chain
+             FROM chunks c JOIN files f ON c.file_id = f.id
+             WHERE c.name = ?1 AND c.kind = 'method'",
+        )?;
+        let rows = stmt.query_map([&name], |r| {
+            Ok((
+                SymbolTarget {
+                    file: r.get(0)?,
+                    file_id: r.get(1)?,
+                    name: name.clone(),
+                    kind: "method".into(),
+                    line: r.get(3)?,
+                    exported: false,
+                },
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (mut t, scope) = row?;
+            if !scope.is_empty() {
+                t.kind = format!("method of {scope}");
+            }
+            if path_filter.as_deref().is_none_or(|p| t.file.contains(p)) {
+                out.push(t);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// All usages of the symbol `name` defined in `file_id`.
+pub fn who_uses(conn: &Connection, graph: &ModuleGraph, file_id: i64, name: &str) -> Result<Vec<Usage>> {
+    let mut usages = Vec::new();
+
+    // Same-file references.
+    let mut stmt = conn.prepare(
+        "SELECT f.path, r.line, r.kind, r.confidence, r.detail, c.name
+         FROM refs r JOIN files f ON r.file_id = f.id
+         LEFT JOIN chunks c ON r.chunk_id = c.id
+         WHERE r.local = 1 AND r.file_id = ?1 AND r.target_name = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![file_id, name], row_to_usage)?;
+    usages.extend(rows.filter_map(|r| r.ok()));
+
+    // Cross-file: refs through imports whose export chain lands on (file_id, name).
+    let mut stmt = conn.prepare(
+        "SELECT f.path, r.line, r.kind, r.confidence, r.detail, c.name, r.file_id, r.target_request, r.target_name
+         FROM refs r JOIN files f ON r.file_id = f.id
+         LEFT JOIN chunks c ON r.chunk_id = c.id
+         WHERE r.local = 0 AND r.target_request IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            row_to_usage(r)?,
+            r.get::<_, i64>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (usage, ref_file, request, target_name) = row?;
+        if target_name == "*" {
+            continue; // bare namespace use; not symbol-specific
+        }
+        let Some(target_file) = graph.edge(ref_file, &request) else { continue };
+        let resolved = if target_file == file_id && target_name == name {
+            // direct hit even without export rows (defensive)
+            Some((file_id, name.to_string()))
+        } else {
+            graph.resolve_export(target_file, &target_name)
+        };
+        if resolved == Some((file_id, name.to_string())) {
+            usages.push(usage);
+        }
+    }
+
+    // Tier 3: member-call name matches (`x.name(...)`), minus sites already
+    // matched precisely above.
+    let seen: HashSet<(String, i64)> =
+        usages.iter().map(|u| (u.file.clone(), u.line)).collect();
+    let mut stmt = conn.prepare(
+        "SELECT f.path, m.line, m.object, c.name
+         FROM member_calls m JOIN files f ON m.file_id = f.id
+         LEFT JOIN chunks c ON m.chunk_id = c.id
+         WHERE m.prop = ?1",
+    )?;
+    let rows = stmt.query_map([name], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (file, line, object, chunk_name) = row?;
+        if seen.contains(&(file.clone(), line)) {
+            continue;
+        }
+        usages.push(Usage {
+            file,
+            line,
+            kind: "call".into(),
+            confidence: "possible".into(),
+            detail: object.map(|o| format!("{o}.{name}()")),
+            chunk_name,
+        });
+    }
+    Ok(usages)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct EventSite {
+    pub file: String,
+    pub line: i64,
+    pub role: String,
+    pub name: String,
+    pub method: String,
+    pub chunk_name: Option<String>,
+}
+
+/// Event wiring: emit/listen sites, optionally filtered by event name.
+pub fn events(conn: &Connection, filter: Option<&str>) -> Result<Vec<EventSite>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, e.line, e.role, e.name, e.method, c.name
+         FROM events e JOIN files f ON e.file_id = f.id
+         LEFT JOIN chunks c ON e.chunk_id = c.id
+         WHERE (?1 IS NULL OR e.name = ?1)
+         ORDER BY e.name, e.role DESC, f.path, e.line",
+    )?;
+    let rows = stmt.query_map([filter], |r| {
+        Ok(EventSite {
+            file: r.get(0)?,
+            line: r.get(1)?,
+            role: r.get(2)?,
+            name: r.get(3)?,
+            method: r.get(4)?,
+            chunk_name: r.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+fn row_to_usage(r: &rusqlite::Row<'_>) -> rusqlite::Result<Usage> {
+    Ok(Usage {
+        file: r.get(0)?,
+        line: r.get(1)?,
+        kind: r.get(2)?,
+        confidence: r.get(3)?,
+        detail: r.get(4)?,
+        chunk_name: r.get(5)?,
+    })
+}
