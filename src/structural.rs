@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::query::ModuleGraph;
+use crate::{query::ModuleGraph, store};
 
 pub const PROJECTION_VERSION: &str = "1";
 
@@ -518,6 +518,16 @@ fn unique_symbol(symbols: Option<&Vec<&SymbolNode>>) -> Option<String> {
 }
 
 pub fn neighborhood(
+    conn: &Connection,
+    anchor: &str,
+    options: &NeighborhoodOptions,
+) -> Result<Neighborhood> {
+    store::with_read_snapshot(conn, "jscout_neighborhood", || {
+        neighborhood_in_snapshot(conn, anchor, options)
+    })
+}
+
+fn neighborhood_in_snapshot(
     conn: &Connection,
     anchor: &str,
     options: &NeighborhoodOptions,

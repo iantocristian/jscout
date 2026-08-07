@@ -68,6 +68,27 @@ enum Command {
         /// Output JSON
         #[arg(long)]
         json: bool,
+        /// Attach a separately labelled structural context pack (off by default)
+        #[arg(long)]
+        expand: bool,
+        /// Structural expansion depth
+        #[arg(long, default_value_t = 1)]
+        expand_depth: usize,
+        /// Maximum search-hit anchors used as expansion seeds
+        #[arg(long, default_value_t = 3)]
+        expand_seeds: usize,
+        /// Global expansion node budget
+        #[arg(long, default_value_t = 40)]
+        expand_nodes: usize,
+        /// Global expansion edge budget
+        #[arg(long, default_value_t = 120)]
+        expand_edges: usize,
+        /// Global serialized node/edge payload budget
+        #[arg(long, default_value_t = 24_000)]
+        expand_bytes: usize,
+        /// Lowest expansion confidence: certain, likely, or possible
+        #[arg(long, default_value = "likely")]
+        expand_min_confidence: String,
     },
     /// List string-keyed event wiring (emit/listen sites)
     Events {
@@ -83,6 +104,9 @@ enum Command {
         /// Append privacy-minimal tool-call metrics as JSONL (no queries or results)
         #[arg(long)]
         telemetry: Option<PathBuf>,
+        /// Evaluation tool surface: baseline or structural
+        #[arg(long, default_value = "structural")]
+        profile: String,
     },
     /// Watch a repository and re-index on change
     Watch {
@@ -139,11 +163,41 @@ fn main() -> Result<()> {
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
         Command::Index { root } => cmd_index(&root),
         Command::Embed { root, batch } => cmd_embed(&root, batch),
-        Command::Search { root, query, limit, no_vector, json } => {
-            cmd_search(&root, &query, limit, no_vector, json)
-        }
+        Command::Search {
+            root,
+            query,
+            limit,
+            no_vector,
+            json,
+            expand,
+            expand_depth,
+            expand_seeds,
+            expand_nodes,
+            expand_edges,
+            expand_bytes,
+            expand_min_confidence,
+        } => cmd_search(
+            &root,
+            &query,
+            no_vector,
+            json,
+            search::SearchOptions {
+                limit,
+                expand,
+                expansion: search::ExpansionOptions {
+                    depth: expand_depth,
+                    seed_limit: expand_seeds,
+                    node_limit: expand_nodes,
+                    edge_limit: expand_edges,
+                    byte_limit: expand_bytes,
+                    min_confidence: expand_min_confidence,
+                },
+            },
+        ),
         Command::Events { root, name } => cmd_events(&root, name.as_deref()),
-        Command::Mcp { root, telemetry } => mcp::serve(&root, telemetry.as_deref()),
+        Command::Mcp { root, telemetry, profile } => {
+            mcp::serve(&root, telemetry.as_deref(), mcp::ToolProfile::parse(&profile)?)
+        }
         Command::Watch { root, embed } => watch::watch(&root, embed),
         Command::WhoUses { root, spec, json } => cmd_who_uses(&root, &spec, json),
         Command::Neighborhood {
@@ -197,19 +251,26 @@ fn cmd_embed(root: &PathBuf, batch: usize) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(root: &PathBuf, query: &str, limit: usize, no_vector: bool, json: bool) -> Result<()> {
+fn cmd_search(
+    root: &PathBuf,
+    query: &str,
+    no_vector: bool,
+    json: bool,
+    options: search::SearchOptions,
+) -> Result<()> {
     let conn = store::open(root)?;
     let provider = if no_vector { None } else { embed::Provider::from_env() };
-    let hits = search::search(&conn, provider.as_ref(), query, limit)?;
+    let result = search::search(&conn, provider.as_ref(), query, &options)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
-    if hits.is_empty() {
+    println!("snapshot: {}", result.snapshot);
+    if result.hits.is_empty() {
         println!("no results");
         return Ok(());
     }
-    for (i, h) in hits.iter().enumerate() {
+    for (i, h) in result.hits.iter().enumerate() {
         let name = h.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
         println!(
             "{:2}. {}:{}-{} [{}{}] score={:.4}",
@@ -229,6 +290,22 @@ fn cmd_search(root: &PathBuf, query: &str, limit: usize, no_vector: bool, json: 
         }
         if !h.used_by.is_empty() {
             println!("      ← used by: {}", h.used_by.join(", "));
+        }
+        println!("      anchors: {}", h.anchors.join(", "));
+    }
+    if let Some(expansion) = &result.expansion {
+        println!(
+            "\nstructural expansion: {} nodes, {} edges, {} bytes{}",
+            expansion.nodes.len(),
+            expansion.edges.len(),
+            expansion.payload_bytes,
+            if expansion.truncated { " (truncated)" } else { "" }
+        );
+        for edge in &expansion.edges {
+            println!(
+                "  {} -[{}:{}]-> {}",
+                edge.source, edge.kind, edge.confidence, edge.target
+            );
         }
     }
     Ok(())

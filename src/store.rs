@@ -171,6 +171,28 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
     Ok(())
 }
 
+/// Pin a multi-statement read to one SQLite snapshot. The savepoint also nests
+/// safely when search expansion calls neighborhood traversal.
+pub(crate) fn with_read_snapshot<T>(
+    conn: &Connection,
+    savepoint: &'static str,
+    read: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(&format!("SAVEPOINT {savepoint}"))?;
+    match read() {
+        Ok(value) => {
+            conn.execute_batch(&format!("RELEASE {savepoint}"))?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO {savepoint}; RELEASE {savepoint}"
+            ));
+            Err(error)
+        }
+    }
+}
+
 /// Migrations only preserve canonical/source rows where that is safe. Graph
 /// projections are disposable and are rebuilt by the next index operation.
 fn migrate(conn: &Connection) -> Result<()> {

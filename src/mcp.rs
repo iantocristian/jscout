@@ -13,7 +13,30 @@ use serde_json::{json, Value};
 
 use crate::{embed, query, search, store, structural};
 
-pub fn serve(root: &Path, telemetry_path: Option<&Path>) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    Baseline,
+    Structural,
+}
+
+impl ToolProfile {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "structural" => Ok(Self::Structural),
+            _ => anyhow::bail!("MCP profile must be one of: baseline, structural"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Structural => "structural",
+        }
+    }
+}
+
+pub fn serve(root: &Path, telemetry_path: Option<&Path>, profile: ToolProfile) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = store::open(&root)?;
     let provider = embed::Provider::from_env();
@@ -71,13 +94,20 @@ pub fn serve(root: &Path, telemetry_path: Option<&Path>) -> Result<()> {
                 )
             }
             "ping" => rpc_ok(id, json!({})),
-            "tools/list" => rpc_ok(id, json!({ "tools": tool_defs() })),
+            "tools/list" => rpc_ok(id, json!({ "tools": tool_defs(profile) })),
             "tools/call" => {
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
-                let result = call_tool(&conn, provider.as_ref(), name, &args);
-                log_tool_call(&mut telemetry, &conn, name, &result, started.elapsed());
+                let result = call_tool(&conn, provider.as_ref(), profile, name, &args);
+                log_tool_call(
+                    &mut telemetry,
+                    &conn,
+                    profile,
+                    name,
+                    &result,
+                    started.elapsed(),
+                );
                 match result {
                     Ok(text) => rpc_ok(
                         id,
@@ -114,8 +144,8 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn tool_defs() -> Value {
-    json!([
+fn tool_defs(profile: ToolProfile) -> Value {
+    let mut tools = json!([
         {
             "name": "semantic_search",
             "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Returns ranked code chunks with call-graph context.",
@@ -123,7 +153,14 @@ fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
-                    "limit": { "type": "integer", "default": 8 }
+                    "limit": { "type": "integer", "default": 8 },
+                    "expand": { "type": "boolean", "default": false, "description": "Attach a separately labelled structural context pack; off by default" },
+                    "expand_depth": { "type": "integer", "default": 1 },
+                    "expand_seeds": { "type": "integer", "default": 3 },
+                    "expand_nodes": { "type": "integer", "default": 40 },
+                    "expand_edges": { "type": "integer", "default": 120 },
+                    "expand_bytes": { "type": "integer", "default": 24000 },
+                    "expand_min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" }
                 },
                 "required": ["query"]
             }
@@ -189,12 +226,35 @@ fn tool_defs() -> Value {
                 "required": ["anchor"]
             }
         }
-    ])
+    ]);
+    if profile == ToolProfile::Baseline {
+        let Some(definitions) = tools.as_array_mut() else { return tools };
+        definitions.retain(|tool| tool["name"] != "neighborhood");
+        if let Some(properties) = definitions
+            .iter_mut()
+            .find(|tool| tool["name"] == "semantic_search")
+            .and_then(|tool| tool["inputSchema"]["properties"].as_object_mut())
+        {
+            for key in [
+                "expand",
+                "expand_depth",
+                "expand_seeds",
+                "expand_nodes",
+                "expand_edges",
+                "expand_bytes",
+                "expand_min_confidence",
+            ] {
+                properties.remove(key);
+            }
+        }
+    }
+    tools
 }
 
 fn call_tool(
     conn: &Connection,
     provider: Option<&embed::Provider>,
+    profile: ToolProfile,
     name: &str,
     args: &Value,
 ) -> Result<String> {
@@ -202,8 +262,31 @@ fn call_tool(
         "semantic_search" => {
             let q = args["query"].as_str().unwrap_or("");
             let limit = args["limit"].as_u64().unwrap_or(8) as usize;
-            let hits = search::search(conn, provider, q, limit)?;
-            Ok(serde_json::to_string_pretty(&hits)?)
+            let expand = args["expand"].as_bool().unwrap_or(false);
+            if expand && profile == ToolProfile::Baseline {
+                anyhow::bail!("structural expansion is unavailable in the baseline MCP profile");
+            }
+            let result = search::search(
+                conn,
+                provider,
+                q,
+                &search::SearchOptions {
+                    limit,
+                    expand,
+                    expansion: search::ExpansionOptions {
+                        depth: args["expand_depth"].as_u64().unwrap_or(1) as usize,
+                        seed_limit: args["expand_seeds"].as_u64().unwrap_or(3) as usize,
+                        node_limit: args["expand_nodes"].as_u64().unwrap_or(40) as usize,
+                        edge_limit: args["expand_edges"].as_u64().unwrap_or(120) as usize,
+                        byte_limit: args["expand_bytes"].as_u64().unwrap_or(24_000) as usize,
+                        min_confidence: args["expand_min_confidence"]
+                            .as_str()
+                            .unwrap_or("likely")
+                            .to_string(),
+                    },
+                },
+            )?;
+            Ok(serde_json::to_string_pretty(&result)?)
         }
         "who_uses" => {
             let spec = args["symbol"].as_str().unwrap_or("");
@@ -260,6 +343,9 @@ fn call_tool(
             Ok(serde_json::to_string_pretty(&sites)?)
         }
         "neighborhood" => {
+            if profile == ToolProfile::Baseline {
+                anyhow::bail!("neighborhood is unavailable in the baseline MCP profile");
+            }
             let anchor = args["anchor"].as_str().unwrap_or("");
             let options = structural::NeighborhoodOptions {
                 expected_snapshot: args["snapshot"].as_str().map(str::to_string),
@@ -292,6 +378,7 @@ fn call_tool(
 fn log_tool_call(
     telemetry: &mut Option<File>,
     conn: &Connection,
+    profile: ToolProfile,
     tool: &str,
     result: &Result<String>,
     elapsed: std::time::Duration,
@@ -303,7 +390,13 @@ fn log_tool_call(
         .unwrap_or_default();
     let session = std::env::var("JSCOUT_SESSION_ID")
         .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
-    let snapshot = structural::current_snapshot(conn).ok();
+    let task = std::env::var("JSCOUT_TASK_ID").ok();
+    let snapshot = result
+        .as_ref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value["snapshot"].as_str().map(str::to_string))
+        .or_else(|| structural::current_snapshot(conn).ok());
     let (ok, result_bytes) = match result {
         Ok(text) => (true, text.len()),
         Err(error) => (false, error.to_string().len()),
@@ -311,6 +404,8 @@ fn log_tool_call(
     let record = json!({
         "timestamp_ms": timestamp_ms,
         "session": session,
+        "task": task,
+        "profile": profile.as_str(),
         "tool": tool,
         "ok": ok,
         "elapsed_ms": elapsed.as_millis(),
@@ -322,5 +417,55 @@ fn log_tool_call(
         || file.flush().is_err()
     {
         eprintln!("warning: failed to write jscout MCP telemetry");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    use super::{ToolProfile, call_tool, tool_defs};
+
+    #[test]
+    fn baseline_profile_removes_structural_tools_and_expansion_controls() {
+        let baseline = tool_defs(ToolProfile::Baseline);
+        let tools = baseline.as_array().expect("tool definitions");
+        assert!(!tools.iter().any(|tool| tool["name"] == "neighborhood"));
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "semantic_search")
+            .expect("semantic_search definition");
+        assert!(search["inputSchema"]["properties"].get("expand").is_none());
+
+        let structural = tool_defs(ToolProfile::Structural);
+        let tools = structural.as_array().expect("tool definitions");
+        assert!(tools.iter().any(|tool| tool["name"] == "neighborhood"));
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "semantic_search")
+            .expect("semantic_search definition");
+        assert!(search["inputSchema"]["properties"].get("expand").is_some());
+    }
+
+    #[test]
+    fn baseline_profile_rejects_structural_calls_even_if_client_bypasses_schema() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        let expanded = call_tool(
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            "semantic_search",
+            &json!({ "query": "x", "expand": true }),
+        );
+        assert!(expanded.unwrap_err().to_string().contains("baseline MCP profile"));
+        let neighborhood = call_tool(
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            "neighborhood",
+            &json!({ "anchor": "file:x.ts" }),
+        );
+        assert!(neighborhood.unwrap_err().to_string().contains("baseline MCP profile"));
     }
 }

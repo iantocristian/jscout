@@ -106,7 +106,8 @@ def eval_model(model, use_vector=True, use_rerank=False):
         if "vector search unavailable" in r.stderr:
             vector_failures += 1
         try:
-            hits = json.loads(r.stdout)
+            payload = json.loads(r.stdout)
+            hits = payload["hits"] if isinstance(payload, dict) else payload
         except json.JSONDecodeError:
             ranks.append(None)
             continue
