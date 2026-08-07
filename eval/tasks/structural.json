@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "repository": "eval/fixtures/structural",
+  "tasks": [
+    {
+      "id": "lookup-payment-definition",
+      "category": "lookup-control",
+      "prompt": "Where is payment authorization implemented? Return the defining repository file and symbol.",
+      "gold": {
+        "files": ["src/payments.ts"],
+        "symbols": ["authorizePayment"]
+      }
+    },
+    {
+      "id": "checkout-direct-effects",
+      "category": "one-hop-structure",
+      "prompt": "Which repository functions are called directly by checkout before it emits its completion event? Return their defining files and symbols.",
+      "gold": {
+        "files": ["src/inventory.ts", "src/payments.ts"],
+        "symbols": ["reserveInventory", "authorizePayment"]
+      }
+    },
+    {
+      "id": "http-to-inventory-path",
+      "category": "multi-hop-structure",
+      "prompt": "Trace the repository call path from the HTTP checkout handler to inventory reservation. Return every participating repository file and symbol in order.",
+      "gold": {
+        "files": ["src/http.ts", "src/checkout.ts", "src/inventory.ts"],
+        "symbols": ["handleCheckout", "checkout", "reserveInventory"]
+      }
+    },
+    {
+      "id": "barrel-checkout-target",
+      "category": "barrel-resolution",
+      "prompt": "The HTTP module imports checkout through a barrel. Where is the implementation ultimately defined, and which HTTP symbol invokes it?",
+      "gold": {
+        "files": ["src/http.ts", "src/checkout.ts"],
+        "symbols": ["handleCheckout", "checkout"]
+      }
+    },
+    {
+      "id": "order-created-participants",
+      "category": "uncertain-event",
+      "prompt": "Which repository symbols participate in the order.created event, and what is each symbol's role? Treat same-name event matching as uncertain unless receiver identity proves otherwise.",
+      "gold": {
+        "files": ["src/checkout.ts", "src/worker.ts"],
+        "symbols": ["checkout", "startReceiptWorker"]
+      }
+    }
+  ]
+}

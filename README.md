@@ -9,6 +9,7 @@ Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level co
 ```
 jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
+                               #   add --expand for a bounded structural context pack
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
@@ -30,6 +31,26 @@ error with candidates instead of guessing when the identity is ambiguous.
 Traversal defaults to `certain`/`likely` edges. Use
 `--min-confidence possible` to include unresolved string-event hubs and other
 explicit candidates.
+
+## Search anchors and expansion
+
+Search returns a repository snapshot plus ranked hits. Every hit includes a
+`file_anchor` and one or more snapshot-scoped `anchors` projected from the
+chunk's overlapping declarations. Chunks remain retrieval units; they do not
+become graph identity.
+
+Structural expansion is off by default and does not alter search scores. Add
+`--expand` to attach a separately labelled context pack:
+
+```bash
+jscout search /path/to/repo "checkout inventory" --json --expand \
+  --expand-depth 1 --expand-seeds 3 \
+  --expand-nodes 40 --expand-edges 120 --expand-bytes 24000
+```
+
+The node, edge, and serialized node/edge byte limits are global across all
+search-hit seeds. `--expand-min-confidence` defaults to `likely`; use
+`possible` only when explicit unresolved candidates are useful.
 
 ## Confidence tiers
 
@@ -85,11 +106,17 @@ vector-scan / rerank) to stderr on any search.
 
 Run `jscout index` (or `jscout watch`) beside it to keep the DB fresh.
 
+For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
+`neighborhood` or search expansion) and `--profile structural` (the default).
+See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
+
 For opt-in agent-behavior measurement, start MCP with
 `--telemetry .jscout-telemetry.jsonl` or set `JSCOUT_TELEMETRY_FILE`. The JSONL
 records tool name, latency, success, response size, session, and snapshot. It
 does not record queries, arguments, source, or results. Set
-`JSCOUT_SESSION_ID` to correlate calls from one evaluation run.
+`JSCOUT_SESSION_ID` to correlate calls from one evaluation run and
+`JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
+included in each record.
 
 ## Storage
 

@@ -68,15 +68,23 @@ The first RI-1 slice is implemented:
   path/scope/name, and ambiguity is an error with candidates;
 - structural fixtures cover call resolution, same-named methods, barrel
   rerouting, stale anchors, and event hubs;
+- search hits project chunks onto snapshot-scoped symbol/file anchors, and
+  opt-in expansion returns a separately labelled context pack under one global
+  seed/node/edge/byte budget without changing retrieval scores;
+- multi-statement search and neighborhood reads are pinned to one SQLite
+  snapshot so the fingerprint, anchors, nodes, and edges cannot straddle an
+  indexing commit;
+- baseline and structural MCP profiles plus a vendor-neutral JSONL task/grader
+  protocol make controlled agent A/B runs reproducible;
 - opt-in privacy-minimal MCP telemetry records tool selection, latency,
-  success, result size, session, and snapshot without recording arguments or
-  results.
+  success, result size, task, profile, session, and snapshot without recording
+  arguments or results.
 
 This does **not** complete P0 or RI-1. P0 still needs a scripted agent A/B
-baseline and task outcomes. RI-1 still needs chunk-to-anchor projection in
-search, expansion kept off by default, global rendered-token budgeting,
-latency measurements on a representative large corpus, and end-to-end schema
-tests.
+run and task outcomes on a representative large repository; the included
+synthetic fixture validates only the protocol. RI-1 still needs whole-response
+rendered-token budgeting, latency measurements on that corpus, and broader
+end-to-end MCP schema tests.
 
 ## Architectural conclusion from the research
 
@@ -737,8 +745,8 @@ This is the product metric. Retrieval scores are component diagnostics.
 
 | Phase | Deliverable | Dependency | Rough scope |
 |---|---|---|---|
-| **P0** | Scripted agent A/B harness over current tools; telemetry is implemented, baseline outcomes are not | Current core | 0.5–1 day |
-| **RI-1** | Finish chunk projection, opt-in search expansion, rendered budgets, latency/schema gates; identity, materialized graph, neighborhood, stale anchors, and core fixtures are implemented | P0 observation can run in parallel | 1–2 days remaining |
+| **P0** | Paired baseline/structural profiles, task schema, telemetry join, and grader are implemented; representative-repository agent outcomes are not | Current core | Run and analyze the experiment |
+| **RI-1** | Finish whole-response rendered budgets and representative latency/schema gates; identity, materialized graph, neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures are implemented | P0 observation can run in parallel | <1 day plus corpus run |
 | **SC-1** | Full-source vs elided-source A/B, contract plane, multi-resolution renderer, file-projected overview; custom IR only if it wins | RI-1 | 1–2 days, plus optional IR experiment |
 | **SC-2a** | Bounded LLM workflow experiment, semantic storage/freshness, and validated `annotate` write-back | SC-1 | 1–2 days plus prompt iteration |
 | **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
