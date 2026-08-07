@@ -115,12 +115,21 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     }
     conn.execute_batch("COMMIT")?;
 
+    // Canonical rows are now newer than the traversal projection. Remove the
+    // public snapshot before resolution so readers fail closed instead of
+    // receiving an old graph under a current-looking anchor contract.
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+        [],
+    )?;
     resolve_module_edges(&root, conn)?;
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('root', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [root.to_string_lossy()],
     )?;
+    let snapshot = crate::structural::compute_snapshot(conn)?;
+    crate::structural::rebuild_projection(conn, &snapshot)?;
     Ok(outcome)
 }
 
@@ -181,7 +190,9 @@ fn insert_file(conn: &Connection, rel: &str, hash: &str, data: &FileData) -> Res
     };
 
     let mut ins_sym = conn.prepare_cached(
-        "INSERT INTO symbols(file_id, name, kind, start, end, line, exported) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT INTO symbols(
+           file_id, name, kind, start, end, decl_start, decl_end, scope_chain, line, exported
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
     )?;
     for s in &data.graph.symbols {
         ins_sym.execute(params![
@@ -190,7 +201,10 @@ fn insert_file(conn: &Connection, rel: &str, hash: &str, data: &FileData) -> Res
             s.kind,
             s.start,
             s.end,
-            data.lines.line(s.start),
+            s.decl_start,
+            s.decl_end,
+            s.scope_chain,
+            data.lines.line(s.decl_start),
             s.exported as i64,
         ])?;
     }
@@ -237,13 +251,16 @@ fn insert_file(conn: &Connection, rel: &str, hash: &str, data: &FileData) -> Res
     }
 
     let mut ins_ref = conn.prepare_cached(
-        "INSERT INTO refs(file_id, chunk_id, line, kind, confidence, target_request, target_name, local, detail)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO refs(
+           file_id, chunk_id, start, line, kind, confidence,
+           target_request, target_name, local, detail
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
     )?;
     for r in &data.graph.refs {
         ins_ref.execute(params![
             file_id,
             chunk_for(r.span_start),
+            r.span_start,
             data.lines.line(r.span_start),
             r.kind,
             r.confidence,

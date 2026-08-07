@@ -9,6 +9,7 @@ mod query;
 mod search;
 mod stats;
 mod store;
+mod structural;
 mod walk;
 mod watch;
 
@@ -79,6 +80,9 @@ enum Command {
     Mcp {
         /// Repository root (must be indexed)
         root: PathBuf,
+        /// Append privacy-minimal tool-call metrics as JSONL (no queries or results)
+        #[arg(long)]
+        telemetry: Option<PathBuf>,
     },
     /// Watch a repository and re-index on change
     Watch {
@@ -98,6 +102,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Traverse the snapshot-safe structural graph around a file or symbol
+    Neighborhood {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Node key, file path, symbol name, or path-substring:symbol
+        anchor: String,
+        /// Snapshot carried with a saved anchor; stale anchors are re-resolved
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Maximum traversal depth
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        /// Edge direction: in, out, or both
+        #[arg(long, default_value = "both")]
+        direction: String,
+        /// Maximum returned nodes
+        #[arg(long, default_value_t = 50)]
+        node_limit: usize,
+        /// Maximum returned edges
+        #[arg(long, default_value_t = 200)]
+        edge_limit: usize,
+        /// Lowest confidence to include: certain, likely, or possible
+        #[arg(long, default_value = "likely")]
+        min_confidence: String,
+        /// Restrict traversal to an edge kind (repeatable)
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -111,10 +143,44 @@ fn main() -> Result<()> {
             cmd_search(&root, &query, limit, no_vector, json)
         }
         Command::Events { root, name } => cmd_events(&root, name.as_deref()),
-        Command::Mcp { root } => mcp::serve(&root),
+        Command::Mcp { root, telemetry } => mcp::serve(&root, telemetry.as_deref()),
         Command::Watch { root, embed } => watch::watch(&root, embed),
         Command::WhoUses { root, spec, json } => cmd_who_uses(&root, &spec, json),
+        Command::Neighborhood {
+            root,
+            anchor,
+            snapshot,
+            depth,
+            direction,
+            node_limit,
+            edge_limit,
+            min_confidence,
+            kinds,
+        } => cmd_neighborhood(
+            &root,
+            &anchor,
+            structural::NeighborhoodOptions {
+                expected_snapshot: snapshot,
+                depth,
+                direction,
+                node_limit,
+                edge_limit,
+                min_confidence,
+                kinds,
+            },
+        ),
     }
+}
+
+fn cmd_neighborhood(
+    root: &PathBuf,
+    anchor: &str,
+    options: structural::NeighborhoodOptions,
+) -> Result<()> {
+    let conn = store::open(root)?;
+    let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
+    println!("{}", serde_json::to_string_pretty(&neighborhood)?);
+    Ok(())
 }
 
 fn cmd_embed(root: &PathBuf, batch: usize) -> Result<()> {

@@ -1,20 +1,35 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
 //! Exposes the index to agents: semantic_search, who_uses, definition,
-//! file_outline, events.
+//! file_outline, events, neighborhood.
 
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::{embed, query, search, store};
+use crate::{embed, query, search, store, structural};
 
-pub fn serve(root: &Path) -> Result<()> {
+pub fn serve(root: &Path, telemetry_path: Option<&Path>) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = store::open(&root)?;
     let provider = embed::Provider::from_env();
+    let telemetry_path = telemetry_path
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("JSCOUT_TELEMETRY_FILE").map(PathBuf::from));
+    let mut telemetry = match telemetry_path {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("open telemetry file {}", path.display()))?,
+        ),
+        None => None,
+    };
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -60,7 +75,10 @@ pub fn serve(root: &Path) -> Result<()> {
             "tools/call" => {
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                match call_tool(&conn, provider.as_ref(), name, &args) {
+                let started = Instant::now();
+                let result = call_tool(&conn, provider.as_ref(), name, &args);
+                log_tool_call(&mut telemetry, &conn, name, &result, started.elapsed());
+                match result {
                     Ok(text) => rpc_ok(
                         id,
                         json!({ "content": [{ "type": "text", "text": text }] }),
@@ -152,6 +170,24 @@ fn tool_defs() -> Value {
                     "name": { "type": "string", "description": "Optional event name filter" }
                 }
             }
+        },
+        {
+            "name": "neighborhood",
+            "description": "Bounded traversal of the snapshot-safe structural graph around a file or symbol. Returns the current snapshot and reports when a stale saved anchor was re-resolved.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "anchor": { "type": "string", "description": "Node key, file path, symbol name, or path-substring:symbol" },
+                    "snapshot": { "type": "string", "description": "Optional snapshot returned with a saved anchor" },
+                    "depth": { "type": "integer", "default": 1 },
+                    "direction": { "type": "string", "enum": ["in", "out", "both"], "default": "both" },
+                    "node_limit": { "type": "integer", "default": 50 },
+                    "edge_limit": { "type": "integer", "default": 200 },
+                    "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
+                    "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" }
+                },
+                "required": ["anchor"]
+            }
         }
     ])
 }
@@ -223,6 +259,68 @@ fn call_tool(
             let sites = query::events(conn, filter)?;
             Ok(serde_json::to_string_pretty(&sites)?)
         }
+        "neighborhood" => {
+            let anchor = args["anchor"].as_str().unwrap_or("");
+            let options = structural::NeighborhoodOptions {
+                expected_snapshot: args["snapshot"].as_str().map(str::to_string),
+                depth: args["depth"].as_u64().unwrap_or(1) as usize,
+                direction: args["direction"].as_str().unwrap_or("both").to_string(),
+                node_limit: args["node_limit"].as_u64().unwrap_or(50) as usize,
+                edge_limit: args["edge_limit"].as_u64().unwrap_or(200) as usize,
+                min_confidence: args["min_confidence"]
+                    .as_str()
+                    .unwrap_or("likely")
+                    .to_string(),
+                kinds: args["kinds"]
+                    .as_array()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            let result = structural::neighborhood(conn, anchor, &options)?;
+            Ok(serde_json::to_string_pretty(&result)?)
+        }
         _ => anyhow::bail!("unknown tool: {name}"),
+    }
+}
+
+fn log_tool_call(
+    telemetry: &mut Option<File>,
+    conn: &Connection,
+    tool: &str,
+    result: &Result<String>,
+    elapsed: std::time::Duration,
+) {
+    let Some(file) = telemetry else { return };
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let session = std::env::var("JSCOUT_SESSION_ID")
+        .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let snapshot = structural::current_snapshot(conn).ok();
+    let (ok, result_bytes) = match result {
+        Ok(text) => (true, text.len()),
+        Err(error) => (false, error.to_string().len()),
+    };
+    let record = json!({
+        "timestamp_ms": timestamp_ms,
+        "session": session,
+        "tool": tool,
+        "ok": ok,
+        "elapsed_ms": elapsed.as_millis(),
+        "result_bytes": result_bytes,
+        "snapshot": snapshot,
+    });
+    if serde_json::to_writer(&mut *file, &record).is_err()
+        || file.write_all(b"\n").is_err()
+        || file.flush().is_err()
+    {
+        eprintln!("warning: failed to write jscout MCP telemetry");
     }
 }

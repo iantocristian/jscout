@@ -10,16 +10,26 @@ Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level co
 jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
+jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
-jscout mcp <root>              # MCP stdio server: semantic_search, who_uses, definition,
-                               #   file_outline, events
+jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
+                               #   who_uses, definition, file_outline, events
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 ```
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
+
+`A` accepts a returned node key, a repo-relative file path, a symbol name, or
+`path-substring:NAME`. Every neighborhood includes the current repository
+snapshot. When reusing an anchor after edits, pass that value with `--snapshot`;
+jscout re-resolves stale symbol anchors by path, scope, and name, and returns an
+error with candidates instead of guessing when the identity is ambiguous.
+Traversal defaults to `certain`/`likely` edges. Use
+`--min-confidence possible` to include unresolved string-event hubs and other
+explicit candidates.
 
 ## Confidence tiers
 
@@ -75,9 +85,20 @@ vector-scan / rerank) to stderr on any search.
 
 Run `jscout index` (or `jscout watch`) beside it to keep the DB fresh.
 
+For opt-in agent-behavior measurement, start MCP with
+`--telemetry .jscout-telemetry.jsonl` or set `JSCOUT_TELEMETRY_FILE`. The JSONL
+records tool name, latency, success, response size, session, and snapshot. It
+does not record queries, arguments, source, or results. Set
+`JSCOUT_SESSION_ID` to correlate calls from one evaluation run.
+
 ## Storage
 
-Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to `.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, resolved module edges, classified references, event sites, member-call sites, embeddings.
+Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
+`.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, classified
+references, event/member-call sites, embeddings, and a disposable
+`graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
+after indexing so barrel changes can reroute references in otherwise unchanged
+files without leaving stale graph edges behind.
 
 ## Build
 

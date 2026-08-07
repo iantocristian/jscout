@@ -11,6 +11,9 @@ pub struct SymbolRow {
     pub kind: String,
     pub start: u32,
     pub end: u32,
+    pub decl_start: u32,
+    pub decl_end: u32,
+    pub scope_chain: String,
     pub exported: bool,
 }
 
@@ -180,6 +183,9 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
             kind: format!("method:{}", m.class),
             start: m.span_start,
             end: m.span_end,
+            decl_start: m.span_start,
+            decl_end: m.span_end,
+            scope_chain: m.class.clone(),
             exported: false,
         });
     }
@@ -209,11 +215,15 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
                 continue;
             }
             let span = scoping.symbol_span(*symbol_id);
+            let declaration = semantic.symbol_declaration(*symbol_id).kind().span();
             g.symbols.push(SymbolRow {
                 name: name.clone(),
                 kind: symbol_kind(flags).to_string(),
                 start: span.start,
                 end: span.end,
+                decl_start: declaration.start,
+                decl_end: declaration.end,
+                scope_chain: String::new(),
                 exported: exported_locals.contains(name),
             });
         }

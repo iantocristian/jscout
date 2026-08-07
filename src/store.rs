@@ -18,7 +18,7 @@ pub fn open(root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS symbols(
   kind TEXT NOT NULL,
   start INTEGER NOT NULL,
   end INTEGER NOT NULL,
+  decl_start INTEGER NOT NULL,
+  decl_end INTEGER NOT NULL,
+  scope_chain TEXT NOT NULL DEFAULT '',
   line INTEGER NOT NULL,
   exported INTEGER NOT NULL DEFAULT 0
 );
@@ -91,8 +94,10 @@ CREATE INDEX IF NOT EXISTS idx_module_edges_from ON module_edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_module_edges_to ON module_edges(to_file);
 
 CREATE TABLE IF NOT EXISTS refs(
+  id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   chunk_id INTEGER,
+  start INTEGER NOT NULL,
   line INTEGER NOT NULL,
   kind TEXT NOT NULL,             -- call | render | extend | use
   confidence TEXT NOT NULL,       -- certain | likely | possible
@@ -130,19 +135,54 @@ CREATE TABLE IF NOT EXISTS embeddings(
   vec BLOB NOT NULL,
   PRIMARY KEY (chunk_hash, model)
 );
+
+CREATE TABLE IF NOT EXISTS graph_nodes(
+  node_key TEXT PRIMARY KEY,
+  node_kind TEXT NOT NULL,
+  native_table TEXT,
+  native_id INTEGER,
+  display_name TEXT NOT NULL,
+  file_id INTEGER,
+  line INTEGER,
+  meta_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_display ON graph_nodes(display_name);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_file ON graph_nodes(file_id);
+
+CREATE TABLE IF NOT EXISTS resolved_edges(
+  id INTEGER PRIMARY KEY,
+  src_key TEXT NOT NULL,
+  dst_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  provenance TEXT NOT NULL,
+  source_file_id INTEGER,
+  source_ref_id INTEGER,
+  line INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
+  ON resolved_edges(src_key, confidence, kind);
+CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
+  ON resolved_edges(dst_key, confidence, kind);
 "#,
     )?;
     migrate(conn)?;
     Ok(())
 }
 
-/// v1 -> v2: embeddings PK was chunk_hash alone, so different models
-/// overwrote each other's vectors. The table is a cache — drop and rebuild.
+/// Migrations only preserve canonical/source rows where that is safe. Graph
+/// projections are disposable and are rebuilt by the next index operation.
 fn migrate(conn: &Connection) -> Result<()> {
-    let version: Option<String> = conn
+    let version: u32 = conn
         .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
-        .ok();
-    if version.as_deref() != Some("2") {
+        .ok()
+        .and_then(|v: String| v.parse().ok())
+        .unwrap_or(0);
+
+    // v1 -> v2: embeddings PK was chunk_hash alone, so different models
+    // overwrote each other's vectors. The table is a cache — drop and rebuild.
+    if version < 2 {
         let pk_cols: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('embeddings') WHERE pk > 0",
             [],
@@ -160,13 +200,78 @@ fn migrate(conn: &Connection) -> Result<()> {
                  );",
             )?;
         }
+    }
+
+    if version < 3 {
+        if !has_column(conn, "symbols", "decl_start")? {
+            conn.execute("ALTER TABLE symbols ADD COLUMN decl_start INTEGER", [])?;
+        }
+        if !has_column(conn, "symbols", "decl_end")? {
+            conn.execute("ALTER TABLE symbols ADD COLUMN decl_end INTEGER", [])?;
+        }
+        if !has_column(conn, "symbols", "scope_chain")? {
+            conn.execute(
+                "ALTER TABLE symbols ADD COLUMN scope_chain TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version','2')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "UPDATE symbols
+             SET decl_start = COALESCE(decl_start, start),
+                 decl_end = COALESCE(decl_end, end)",
             [],
         )?;
+
+        if !has_column(conn, "refs", "id")? || !has_column(conn, "refs", "start")? {
+            conn.execute_batch(
+                "ALTER TABLE refs RENAME TO refs_v2;
+                 CREATE TABLE refs(
+                   id INTEGER PRIMARY KEY,
+                   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                   chunk_id INTEGER,
+                   start INTEGER NOT NULL,
+                   line INTEGER NOT NULL,
+                   kind TEXT NOT NULL,
+                   confidence TEXT NOT NULL,
+                   target_request TEXT,
+                   target_name TEXT NOT NULL,
+                   local INTEGER NOT NULL DEFAULT 0,
+                   detail TEXT
+                 );
+                 INSERT INTO refs(
+                   file_id, chunk_id, start, line, kind, confidence,
+                   target_request, target_name, local, detail
+                 )
+                 SELECT file_id, chunk_id, 0, line, kind, confidence,
+                        target_request, target_name, local, detail
+                 FROM refs_v2;
+                 DROP TABLE refs_v2;
+                 CREATE INDEX idx_refs_file ON refs(file_id);
+                 CREATE INDEX idx_refs_target ON refs(target_name);",
+            )?;
+        }
+
+        // Force canonical extraction once so declaration spans and reference
+        // offsets are populated for repositories indexed under schema v2.
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
+
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version','3')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+    )?;
     Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+    );
+    Ok(conn.query_row(&sql, [column], |r| r.get::<_, i64>(0))? != 0)
 }
 
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
@@ -178,4 +283,63 @@ pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
     )?;
     conn.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use rusqlite::Connection;
+
+    use super::open;
+
+    #[test]
+    fn migrates_v2_symbols_and_references_without_preserving_stale_projection() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let db_path = repo.path().join(".jscout.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '2');
+             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
+             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');
+             CREATE TABLE symbols(
+               id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
+               start INTEGER, end INTEGER, line INTEGER, exported INTEGER
+             );
+             INSERT INTO symbols VALUES(1, 1, 'old', 'function', 3, 8, 1, 1);
+             CREATE TABLE refs(
+               file_id INTEGER, chunk_id INTEGER, line INTEGER, kind TEXT,
+               confidence TEXT, target_request TEXT, target_name TEXT,
+               local INTEGER, detail TEXT
+             );
+             INSERT INTO refs VALUES(1, NULL, 1, 'call', 'certain', NULL, 'old', 1, NULL);
+             CREATE INDEX idx_refs_file ON refs(file_id);
+             CREATE INDEX idx_refs_target ON refs(target_name);",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(version, "3");
+        let symbol: (i64, i64, String) = conn.query_row(
+            "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(symbol, (3, 8, String::new()));
+        let reference: (i64, i64) = conn.query_row(
+            "SELECT id, start FROM refs WHERE target_name='old'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert!(reference.0 > 0);
+        assert_eq!(reference.1, 0);
+        let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
+        assert!(hash.is_empty());
+        Ok(())
+    }
 }
