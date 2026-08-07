@@ -1,0 +1,719 @@
+# js-rag persistent repository memory — structural retrieval and scouting
+
+> Independent Codex revision, 2026-08-07. This file does not replace
+> [PLAN-KG.md](PLAN-KG.md). It presents an alternative architecture derived
+> from the implementation review, the design discussion, and research on
+> repository-level context compression and summarization.
+
+## Objective
+
+`js-rag` is persistent, verifiable repository memory for coding agents. It is
+a complementary tool, not a replacement for agent reasoning. It should let
+knowledge survive across sessions while making the repository easier for an
+agent to observe by providing:
+
+- exact structural facts;
+- compact, reversible overviews;
+- inferred domain meaning and agent-reported findings with evidence;
+- explicit confidence and freshness;
+- fast drill-down to source.
+
+The central contract is:
+
+> Given an agent's current query or focus, return the smallest trustworthy
+> slice of repository evidence that improves its next action.
+
+This is broader than a “knowledge graph” and narrower than autonomous software
+comprehension. The graph is the structural substrate. **Scouting** compiles it
+into a multi-resolution field guide. LLM enrichment adds meanings the parser
+cannot infer, such as capabilities, workflows, and domain concepts. Validated
+agent write-back turns discoveries made during development work into the same
+fingerprinted semantic memory.
+
+## Inherited decisions from revision 2 and its review
+
+This revision changes storage and sequencing details, but it inherits the
+following decisions and rationale from [PLAN-KG.md](PLAN-KG.md), especially its
+“Research notes (inputs, with corrections from review).” They are recorded
+here so the reasons do not disappear behind the revised specification.
+
+| Decision retained | Why / evidence | Revisit trigger |
+|---|---|---|
+| Project search chunks onto symbol/file anchors; do not make chunks ontology nodes | Chunk boundaries follow retrieval budgets and churn independently of repository identity | Only if a concrete query needs chunk identity independent of its source anchors |
+| Rebuild the resolved traversal projection after indexing | A barrel edit can reroute unchanged importers; full rebuild is simpler and currently below the latency budget | A measured repository exceeds the 100 ms projection target |
+| Model uncertain events through receiver-qualified or unknown hubs | Pairing emitters and listeners by event name creates false relationships and quadratic fan-out | Direct edges become available when receiver identity resolves |
+| Separate canonical entities from source occurrences | Identity, evidence, confidence, and file-lifecycle behavior have different update semantics | No planned revisit |
+| Keep graph expansion off by default | GraphRAG-Bench reports that graph retrieval can underperform vanilla retrieval on simple lookups; expected value is concentrated in structural and multi-hop questions | The code-specific agent-utility evaluation shows expansion improves the default workload |
+| Treat expansion weights as an unvalidated heuristic | LARGER reports 55.7 Acc@5 for the full system, 48.2 without graph expansion (7.5 points absolute; 13.5% relative), and 53.1 without confidence (2.6 points; 4.7% relative). Its published confidence values are fixed and provenance-specific, not learned support for this plan's weights | Tune or replace the heuristic using the structural suite |
+| Treat focus ranking as Aider-inspired, not an Aider reproduction | Aider's identifier multipliers affect graph edge weights, while PageRank personalization is file-based | Replace when a simpler measured ranking performs better |
+
+The product decision inherited from revision 2 is equally important: this is
+memory, not merely a batch-generated repository description. Structural truth
+comes from the index; semantic memory can come from scouts or agents, but every
+claim must remain attributable, evidence-backed, confidence-limited, and
+freshness-aware.
+
+## Architectural conclusion from the research
+
+There is no query-independent compression of arbitrary code that preserves all
+semantics needed by every future development task. Logging is noise for one
+architecture question and the answer to an observability bug. A retry loop is
+boilerplate until the task concerns failure recovery.
+
+Therefore:
+
+1. Raw code is never replaced.
+2. Compression is hierarchical and reversible.
+3. Exact identifiers and program topology survive every level.
+4. More implementation is retained near the current query/focus.
+5. Semantic artifacts—whether scout- or agent-authored—are derived claims, not
+   source truth.
+
+The research supports this shape:
+
+- Hierarchical Context Pruning reports that preserving repository topology and
+  function-level structure while pruning many dependent implementations can
+  retain or improve repository-level completion performance.
+- ProConSuL reports that call-graph/callee context improves function summaries
+  and reduces hallucination compared with isolated summarization.
+- Higher-level code summarization experiments find full code strongest for
+  individual files, reduced code a cost-efficient alternative, and hierarchical
+  aggregation strongest for module summaries.
+- RepoSummary finds feature-oriented grouping more useful and traceable than
+  directory-only repository summaries.
+- CodePromptZip and newer issue-resolution compressors show that generic text
+  compression is the wrong abstraction: code roles, structure, and the current
+  task determine what is safe to remove.
+
+The implementation below turns those observations into a local, incremental
+architecture rather than a one-shot prompt compressor.
+
+---
+
+## Four representation layers
+
+| Layer | Contents | Generated by | Freshness |
+|---|---|---|---|
+| **R0 — source** | Repository files and exact stored chunk content | User/repository | Source of truth |
+| **R1 — structural graph** | Files, symbols, resolved references, modules, events, entities | Parser/resolver/extractors | Rebuilt with index |
+| **R2 — scout IR** | Contracts, signatures, deterministic behavioral skeletons, compact maps | AST lowering + R1 projection | Rebuilt with changed files/graph |
+| **R3 — semantic memory** | Symbol cards, workflows, agent annotations, and optional file/module summaries | Scouts or agents using R1+R2 evidence | Fingerprinted; fresh/stale/degraded |
+
+R0–R2 are deterministic. R3 contains semantic assertions rather than
+structural facts. The distinction must be visible in storage and in every
+response.
+
+## Identity model
+
+### Canonical graph anchors
+
+- `file:<repo-relative-path>`
+- `pkg:<package-name>`
+- `sym:<path>#<scope>::<name>@<ordinal>`
+- `contract:<path>#<scope>::<name>@<ordinal>`
+- `entity:<type>:<normalized-name>`
+- `event:<receiver-or-unknown>:<name>`
+
+The ordinal is file order among declarations with the same path, scope, name,
+and kind. These keys are **snapshot-deterministic**, not stable across arbitrary
+edits, renames, or moves. Public APIs must describe them as snapshot-scoped.
+
+The current `symbols.start/end` values describe binding spans, which are not
+enough for containment or reference ownership. RI-1 extends symbol extraction
+with `decl_start`, `decl_end`, and `scope_chain`. A reference belongs to the
+smallest declaration span containing its source offset; if no declaration owns
+it, the source anchor is the file. This same declaration-span model powers
+chunk projection and prevents calls from merged module chunks being attributed
+to every symbol in the chunk.
+
+### Chunks are not graph nodes
+
+Chunks are retrieval artifacts whose boundaries depend on token budgets. A
+search hit projects to graph anchors:
+
+1. select declarations whose spans overlap the hit;
+2. prefer the chunk's primary named declaration;
+3. use all overlapping declarations for merged module chunks;
+4. fall back to the file node when the chunk contains imports or module-level
+   behavior without a declaration anchor.
+
+The response retains the originating chunk/hit so an agent can request exact
+source even though traversal uses symbol/file identity.
+
+---
+
+## RI-1 — trustworthy structural graph and traversal
+
+### Source tables versus traversal projection
+
+The existing typed tables remain canonical because they retain extractor-
+specific provenance. Add a derived traversal projection rather than replacing
+them with one generic source-of-truth table.
+
+```sql
+-- Existing refs need an explicit id for materialized provenance.
+refs(id INTEGER PRIMARY KEY, ...);
+
+graph_nodes(
+  node_key TEXT PRIMARY KEY,
+  node_kind TEXT NOT NULL,
+  native_table TEXT,
+  native_id INTEGER,
+  display_name TEXT NOT NULL,
+  file_id INTEGER,
+  line INTEGER,
+  meta_json TEXT NOT NULL DEFAULT '{}'
+);
+
+resolved_edges(
+  id INTEGER PRIMARY KEY,
+  src_key TEXT NOT NULL,
+  dst_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  provenance TEXT NOT NULL,       -- semantic | resolver | heuristic | synthetic
+  source_file_id INTEGER,
+  source_ref_id INTEGER,
+  line INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX resolved_edges_src ON resolved_edges(src_key, confidence, kind);
+CREATE INDEX resolved_edges_dst ON resolved_edges(dst_key, confidence, kind);
+```
+
+`graph_nodes` and `resolved_edges` are disposable read models. Schema migrations
+or indexing can rebuild them from files/symbols/refs/module/entity tables.
+
+### Resolution refresh
+
+After changed files are extracted and `module_edges` are rebuilt:
+
+1. construct the export/module resolver snapshot;
+2. rebuild all `graph_nodes` and `resolved_edges` in one transaction;
+3. atomically expose the new snapshot;
+4. update the index fingerprint only after the rebuild commits.
+
+A full rebuild is the initial policy. Barrel edits can reroute unchanged
+importers, and the current graph is small enough that correctness is cheaper
+than transitive invalidation logic. Introduce selective invalidation only after
+a measured repository violates the latency gate.
+
+### Events
+
+Never generate every emit→listener pair sharing a string. Use a hub:
+
+- emit site → `event:unknown:<name>`;
+- event hub → listener site;
+- both edges are `possible` when receiver identity is unknown;
+- if both receivers resolve to the same object/bus symbol, create a direct
+  `likely` relationship through a receiver-qualified event key;
+- mark high-fanout hubs `generic` and suppress them from default expansion.
+
+This keeps storage linear in event sites and prevents unrelated `error`,
+`data`, `close`, or signal handlers from looking connected.
+
+### Traversal tools
+
+#### `neighborhood`
+
+Inputs: anchor spec, direction, depth, global node/token budget,
+`min_confidence`, and edge-kind filters.
+
+Initial ranking is deliberately simple and treated as a hypothesis:
+
+```text
+path score = minimum edge confidence on path
+           × relation weight
+           × distance decay
+           × hub damping
+```
+
+The budget is global across all anchors, not per hit. Nodes and edges are
+deduplicated before rendering. Confidence and provenance remain visible.
+
+#### `search --expand`
+
+Search ranking remains BM25/vector/RRF/reranker. Expansion runs after ranking
+and returns a separately labelled context pack for the top hits. It does not
+silently alter retrieval scores. Initial default: off, with a clear MCP
+description explaining that it helps structural/multi-hop questions.
+
+#### `paths`
+
+Bounded shortest paths over selected structural edges, with direction and a
+maximum depth. Results include every edge's confidence and evidence location.
+
+#### `repo_overview`
+
+Use a **file-level projection**, not PageRank over the full heterogeneous
+graph. Aggregate confident cross-file symbol edges into weighted file edges,
+personalize on focused paths/symbols, rank files, then select important symbols
+within each file. Event/entity hubs and possible member-call candidates should
+not dominate repository importance.
+
+### RI-1 definition of done
+
+- Collision fixtures for same-named methods and duplicate declarations.
+- Barrel/re-export fixture proving a changed barrel reroutes unchanged refs.
+- Event fixtures proving unrelated receivers do not pair.
+- Full graph projection rebuild under 100 ms on the current `ai-pipe` corpus.
+- `neighborhood` under 50 ms at depth two on that corpus.
+- Global output-budget tests and deterministic ordering.
+- CLI and MCP schemas versioned and covered end to end.
+
+---
+
+## SC-1 — deterministic scouting compiler
+
+Scouting begins after RI-1 because the graph tells the compiler which exact
+relationships to retain and how to attribute them. It should be implemented
+before broad LLM workflow generation.
+
+### Why R2 is stored
+
+Behavioral skeletons cannot be reconstructed from the current graph tables:
+those tables do not retain guards, returns, throws, transaction boundaries,
+interfaces, or enough exact source structure. Re-parsing every requested file
+would be correct but would turn the overview renderer into another indexer.
+
+Store deterministic scout IR as disposable derived data, regenerated for
+changed files and re-linked after graph projection refresh.
+
+```sql
+scout_units(
+  id INTEGER PRIMARY KEY,
+  anchor_key TEXT NOT NULL,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  unit_kind TEXT NOT NULL,           -- signature | behavior | contract
+  source_hash TEXT NOT NULL,
+  ir_version INTEGER NOT NULL,
+  signature TEXT,
+  ir_json TEXT NOT NULL,
+  rendered_text TEXT NOT NULL,
+  UNIQUE(anchor_key, unit_kind, ir_version)
+);
+```
+
+The JSON is the durable deterministic form. `rendered_text` is a replaceable
+cache for agent output and embedding.
+
+### Runtime skeleton
+
+Lower the AST into a compact, language-like IR that retains:
+
+- exact names, scope, exported status, decorators, and signature;
+- `async`, `await`, generators, callbacks, and transaction/error boundaries;
+- guards and significant branch predicates;
+- loops plus important calls/side effects inside them;
+- calls, construction, renders, inheritance, events, and resolved targets;
+- writes/reads of deterministic entities when available;
+- returns, throws, error types, and externally meaningful literals;
+- first-line documentation and exact source span.
+
+Collapse local expression plumbing, repeated assignments, formatting, and
+unselected pure calculations behind explicit elision markers. Do not ask an
+LLM to produce this pseudocode: free-form paraphrase can silently rename calls,
+erase failure paths, or invent sequencing.
+
+Example:
+
+```text
+async checkout(cart: Cart, user: User) -> Promise<Order>
+  guard cart.items.length > 0 else throw EmptyCartError
+  transaction:
+    call inventory.reserve(cart.items)
+    write table:orders
+  try call payments.authorize(order.total)
+  catch:
+    call orders.markPaymentFailed(order.id)
+    rethrow
+  emit event:order.created
+  return order
+```
+
+Every call/entity/event in the rendering is linked to an R1 anchor and can be
+expanded back to source.
+
+### Contract plane
+
+The runtime graph may erase type-space for resolution, but scouting must retain
+human/agent-facing contracts:
+
+- exported interfaces and type aliases;
+- function parameter and return types;
+- class/public method signatures;
+- enums and discriminated unions;
+- validation schemas and decorators;
+- referenced type names and import text;
+- `.d.ts` declarations when they describe repository-owned public APIs.
+
+These become `contract:` anchors or documentary fields, not runtime-call
+targets. Checker-less relationships are labelled documentary/textual rather
+than certain runtime facts.
+
+### Multi-resolution context assembly
+
+Given a focus and token budget, assemble context by distance:
+
+| Region | Representation |
+|---|---|
+| Direct search hits / edit targets | Exact source or full chunk |
+| One-hop structural neighbors | Behavioral skeleton + semantic card when fresh |
+| Two-hop neighbors | Signature, one-line purpose, typed edges |
+| Remaining important repository regions | Deterministic file/module overview; semantic summary only when available and fresh |
+
+This is adaptive compression without destroying information. An agent can
+request the next lower level for any anchor.
+
+### SC-1 definition of done
+
+- Golden fixtures for guards, loops, try/catch/finally, async calls, events,
+  JSX, transactions, returns/throws, and public TypeScript contracts.
+- Preservation checks: every exported identifier and every certain outgoing
+  edge appears in either the signature or skeleton.
+- Skeletons contain no unresolved fabricated names; all links validate.
+- Compression ratio reported per corpus, without making ratio the quality goal.
+- `repo_overview --tokens N` stays within its actual rendered budget.
+
+---
+
+## SC-2 — LLM semantic scouting
+
+LLMs add semantic information that syntax and embeddings do not make explicit.
+The first useful product is not a free-standing ontology; it is structured,
+evidence-backed annotations over R1/R2 anchors.
+
+### Step 1: symbol cards
+
+For each selected symbol, provide the LLM:
+
+- exact implementation for that symbol;
+- deterministic runtime skeleton and contract;
+- signatures/cards for direct callers and callees;
+- adjacent events/entities;
+- repository-level vocabulary accumulated so far.
+
+Require structured output:
+
+```json
+{
+  "purpose": "Coordinates checkout and payment initiation",
+  "architectural_role": "workflow orchestrator",
+  "domain_terms": ["checkout", "inventory reservation", "payment"],
+  "side_effects": ["creates order", "reserves inventory"],
+  "invariants": ["inventory is reserved before payment authorization"],
+  "failure_modes": ["empty cart", "payment authorization failure"]
+}
+```
+
+The LLM should infer intent, role, invariants, and domain language. It should
+not spend tokens restating calls or signatures that R2 already knows.
+
+### Step 2: features and workflows
+
+Generate candidate subgraphs from entry points, calls, events, routes, tables,
+and graph communities. Ask the LLM to name the feature/workflow and assign a
+role to each participant.
+
+```json
+{
+  "type": "workflow",
+  "name": "checkout",
+  "participants": [
+    {"anchor": "...checkout...", "role": "orchestrator"},
+    {"anchor": "...reserveInventory...", "role": "inventory consistency"},
+    {"anchor": "...authorize...", "role": "payment initiation"}
+  ]
+}
+```
+
+Concept-to-concept edges are deferred until the vocabulary is stable. Embedding
+clusters, if implemented, are called `themes`; they are candidate regions, not
+domain concepts.
+
+Workflows are the first repository-level semantic artifact because they answer
+the concrete target query: “which workflows does this code participate in?”
+They are generated before file/module summaries and are evaluated by whether
+an agent can reach the right participants and exact evidence.
+
+### Step 3: validated agent write-back
+
+Add an `annotate` MCP tool over `semantic_artifacts` and
+`semantic_supports`. An agent that has proved a repository-level fact while
+doing development work should be able to preserve it for later sessions.
+
+Write-back follows the same trust contract as scout output:
+
+- every annotation supplies one or more current R1/R2 support anchors and
+  exact evidence spans;
+- the server validates anchors, spans, source hashes, and the current snapshot
+  before committing;
+- `model = 'agent-reported'` and `prompt_version = 'annotate/v1'`;
+  reporter/session details may be stored inside `body_json` without being
+  treated as evidence;
+- confidence is `likely` or `possible`, never `certain`;
+- changed evidence produces the same stale/degraded states as scout output;
+- a write creates a new attributable artifact rather than silently
+  overwriting or merging another scout's or agent's assertion; corrections
+  point to the prior artifact through `supersedes_artifact_id`;
+- competing claims may coexist and remain distinguishable by provenance;
+- `body_json` must pass the artifact-type schema and is rendered as quoted
+  repository data, never as instructions to a consuming agent;
+- write-back can only create semantic artifacts and supports. It cannot write
+  `graph_nodes`, `resolved_edges`, entities, or any other structural fact.
+
+This lands in SC-2b as soon as SC-2a has proved storage, support validation, and
+freshness on symbol cards. It is not blocked on file/module summarization.
+
+### Step 4: optional hierarchical summaries
+
+- File summaries aggregate symbol cards and file topology.
+- Module/package summaries aggregate file summaries, not raw repository code.
+- Summaries retain lists of supporting anchors; prose without traceability is
+  not indexable memory.
+
+Nothing downstream depends on these summaries. They enter a separate SC-2c
+gate and ship only if curated questions or agent-utility evaluation show that
+they reduce source reads, tool calls, or tokens beyond the deterministic
+overview, symbol cards, and workflows. Otherwise they remain an experiment,
+not default memory.
+
+### Semantic storage and freshness
+
+```sql
+semantic_artifacts(
+  id INTEGER PRIMARY KEY,
+  supersedes_artifact_id INTEGER REFERENCES semantic_artifacts(id),
+  artifact_type TEXT NOT NULL,     -- symbol_card | workflow | annotation | concept | file_summary | module_summary
+  canonical_name TEXT,
+  body_json TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  source_snapshot TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+semantic_supports(
+  artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id) ON DELETE CASCADE,
+  claim_path TEXT NOT NULL,       -- JSON pointer to the supported field/claim
+  anchor_key TEXT NOT NULL,
+  role TEXT,
+  evidence_file TEXT NOT NULL,
+  evidence_start_line INTEGER NOT NULL CHECK(evidence_start_line > 0),
+  evidence_end_line INTEGER NOT NULL CHECK(evidence_end_line >= evidence_start_line),
+  source_hash TEXT NOT NULL,
+  context_hash TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible'))
+);
+```
+
+Repository fingerprints use BLAKE3 over sorted `(path, file_hash)` records plus
+schema/IR versions. Do not use XOR: duplicate hashes can cancel and paths are
+lost.
+
+Short-term freshness contract:
+
+- a semantic run records its source snapshot;
+- changed snapshot marks affected artifacts stale;
+- stale artifacts may be returned only with an explicit label;
+- `scout --rebuild` performs a full refresh.
+
+Long-term incremental contract:
+
+- `source_hash` change → source-stale;
+- direct structural-neighborhood fingerprint change → context-stale;
+- some stale participants → workflow `degraded`;
+- no fresh support → artifact eligible for garbage collection;
+- file/module summaries depend on child artifact fingerprints.
+
+No scout- or agent-authored assertion is `certain`. `likely` means supported by
+identifiable code; `possible` means useful interpretation with incomplete
+evidence.
+
+### SC-2 definition of done
+
+- `scout` can generate symbol cards for a bounded, PageRank/retrieval-selected
+  subset before attempting the entire repository.
+- Every card/workflow field has at least one valid support anchor.
+- Changed evidence produces a visible stale/degraded state.
+- Semantic search can retrieve a workflow and traverse to exact supporting
+  code.
+- `annotate` round-trips an agent claim with validated evidence and visibly
+  marks it stale/degraded after relevant code changes.
+- A curated set of repository questions compares base search, R2 scouting, and
+  R2+R3 semantic memory.
+- File/module summaries are not a prerequisite for SC-2 completion; SC-2c owns
+  their separate value gate.
+
+---
+
+## EN-1 — deterministic non-code entities
+
+Entities improve both direct blast-radius questions and semantic scouting.
+Keep canonical identity separate from occurrences/provenance.
+
+```sql
+entities(
+  id INTEGER PRIMARY KEY,
+  entity_key TEXT UNIQUE NOT NULL,
+  type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  meta_json TEXT NOT NULL DEFAULT '{}'
+);
+
+entity_occurrences(
+  id INTEGER PRIMARY KEY,
+  entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_id INTEGER,
+  line INTEGER NOT NULL,
+  extractor TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+
+entity_edges(
+  occurrence_id INTEGER NOT NULL REFERENCES entity_occurrences(id) ON DELETE CASCADE,
+  target_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  confidence TEXT NOT NULL
+);
+```
+
+Initial extractors:
+
+1. Routes: Express/Fastify plus Next.js file conventions.
+2. Environment variables: `process.env` and `import.meta.env`.
+3. Database resources: SQL literals and common ORM/client patterns.
+4. External services: literal URL hosts in network clients.
+5. Events: migrate current sites into receiver-qualified or unknown hubs.
+
+Packages remain `pkg:` nodes. A package dependency is not automatically an
+external service.
+
+Occurrences cascade with changed/deleted files. Canonical entities with no
+occurrences are garbage-collected after indexing.
+
+---
+
+## Agent-facing surface
+
+Keep the tool surface small and composable:
+
+- `semantic_search(query, limit, expand, context_level, token_budget)`
+- `neighborhood(anchor, depth, direction, kinds, min_confidence, token_budget)`
+- `repo_overview(focus, token_budget, include_semantics)`
+- `paths(from, to, kinds, max_depth)`
+- `entities(type, query)`
+- `annotate(type, name, body, supports, confidence, supersedes?)`
+- existing `definition`, `who_uses`, `file_outline`, and `events`
+
+Every result includes:
+
+- snapshot/index fingerprint;
+- anchor keys and source locations;
+- deterministic, batch-scout, or agent-reported provenance;
+- confidence;
+- freshness for semantic artifacts;
+- explicit handles for requesting more detail.
+
+`annotate` uses the same semantic-artifact/support validation and freshness
+machinery as scout output. Agent reports are memory claims, never structural
+truth; callers can inspect their evidence and distinguish them from parser,
+resolver, heuristic, and batch-scout provenance.
+
+---
+
+## Evaluation
+
+### Structural retrieval
+
+- Fixture precision by confidence tier.
+- Curated one- and two-hop questions where expansion should surface a gold
+  neighbor that lexical search alone does not return.
+- Latency and global output-budget gates.
+
+### Base retrieval
+
+- JSDoc holdout Recall@5/@10 for BM25, embeddings, and reranker.
+- This does not evaluate expansion because expansion occurs after ranking.
+
+### Scouting preservation
+
+- Identifier, signature, certain-edge, exception, and entity preservation.
+- Compression ratio alongside preservation—not as a substitute for it.
+- Exact drill-down validation for every rendered anchor.
+
+### Semantic memory
+
+- Curated questions such as “which workflows does this code participate in?”
+  with gold supporting symbols.
+- Evidence-support checks for every scout- or agent-authored claim.
+- Freshness tests after source, edge, and participant changes.
+
+### Agent utility
+
+On repeated tasks over the same repositories, compare agents with and without
+each representation layer:
+
+- searches/tool calls to first relevant file;
+- irrelevant files read;
+- tokens to a correct implementation plan or edit;
+- affected callers/tests/routes/tables discovered;
+- task completion and regression rate;
+- whether a later session benefits from earlier scouting or agent write-back.
+
+This is the product metric. Retrieval scores are component diagnostics.
+
+---
+
+## Sequencing
+
+| Phase | Deliverable | Dependency | Rough scope |
+|---|---|---|---|
+| **RI-1** | Node identity, chunk projection, materialized traversal graph, neighborhood, search expansion, structural fixtures | Current core | 2–3 days |
+| **SC-1** | Stored deterministic scout IR, contract plane, multi-resolution renderer, file-projected overview | RI-1 | 2–3 days |
+| **SC-2a** | Bounded LLM symbol-card experiment with freshness labels and semantic search | SC-1 | 1–2 days plus prompt iteration |
+| **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
+| **SC-2b** | Workflow synthesis plus validated `annotate` write-back | SC-2a; EN-1 improves workflow seeds | 1–2 days plus prompt/eval iteration |
+| **SC-2c** | Optional file/module summary experiment; ship only after its separate value gate | SC-2a + SC-2b | 1 day plus evaluation, if earned |
+| **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
+
+Scouting starts immediately after structural graph correctness. LLM semantics
+are tested before every deterministic entity extractor is complete, but broad
+workflow synthesis benefits from routes/events/tables as entry-point and
+side-effect evidence. Agent write-back can land as soon as SC-2a's storage and
+validation contract is stable; it does not wait for EN-1 or summaries.
+
+## Explicitly deferred
+
+- Cross-edit stable symbol identity.
+- Type-checker-backed interface-to-implementation resolution.
+- Runtime traces.
+- Learned compression models and policy optimization.
+- Concept-to-concept ontology edges.
+- Embedding clusters presented as concepts.
+- Agent assertions modifying deterministic structural facts.
+- Selective materialized-edge invalidation before full rebuild misses its
+  measured latency target.
+
+## Research references
+
+- HCP — Hierarchical Context Pruning:
+  https://arxiv.org/abs/2406.18294
+- ProConSuL — call-graph-aware code summarization:
+  https://aclanthology.org/2024.emnlp-industry.65/
+- Higher-level full/reduced/hierarchical code summarization:
+  https://arxiv.org/abs/2503.10737
+- RepoSummary — feature-oriented repository summarization:
+  https://arxiv.org/abs/2510.11039
+- CodePromptZip — code-aware prompt compression:
+  https://aclanthology.org/2026.findings-acl.1384/
+- RepoDistill — graph retrieval plus learned budget allocation:
+  https://aclanthology.org/2026.findings-acl.217/
+- LARGER — confidence-filtered expansion from repository search anchors:
+  https://arxiv.org/abs/2605.16352
+- Aider repository map implementation:
+  https://github.com/Aider-AI/aider/blob/main/aider/repomap.py
