@@ -1,4 +1,4 @@
-# js-rag
+# jscout
 
 A fast, runtime-level JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on [oxc](https://oxc.rs).
 
@@ -7,16 +7,16 @@ Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level co
 ## Commands
 
 ```
-js-rag index <root>            # build/update .jsrag.db (incremental, content-hash based)
-js-rag search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
-js-rag who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
-js-rag events <root> [name]    # string-keyed event wiring (emit/listen sites)
-js-rag watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
-js-rag embed <root>            # embed chunks missing embeddings (cached by content hash)
-js-rag mcp <root>              # MCP stdio server: semantic_search, who_uses, definition,
+jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
+jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
+jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
+jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
+jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
+jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
+jscout mcp <root>              # MCP stdio server: semantic_search, who_uses, definition,
                                #   file_outline, events
-js-rag stats <root>            # parse stats
-js-rag chunks <root>           # dump AST-aware chunks as JSONL
+jscout stats <root>            # parse stats
+jscout chunks <root>           # dump AST-aware chunks as JSONL
 ```
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
@@ -34,20 +34,20 @@ Search works BM25-only out of the box. For hybrid semantic search set one of:
 
 - `VOYAGE_API_KEY` — uses `voyage-code-3`
 - `OPENAI_API_KEY` — uses `text-embedding-3-small`
-- `JSRAG_EMBED_URL` (+ `JSRAG_EMBED_KEY`) — any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM)
+- `JSCOUT_EMBED_URL` (+ `JSCOUT_EMBED_KEY`) — any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM)
 
-Overrides: `JSRAG_EMBED_MODEL`, `JSRAG_EMBED_PROVIDER=voyage|openai|none`.
+Overrides: `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_PROVIDER=voyage|openai|none`.
 
 Asymmetric models: when the model name contains `nomic-embed-code` or `coderankembed`,
 queries are automatically prefixed with `"Represent this query for searching relevant
-code: "` (documents embed raw). Override with `JSRAG_QUERY_PREFIX`.
+code: "` (documents embed raw). Override with `JSCOUT_QUERY_PREFIX`.
 
 LM Studio example (loads `nomic-embed-code` GGUF, serves OpenAI-compatible API):
 
 ```bash
-JSRAG_EMBED_URL=http://localhost:1234/v1/embeddings \
-JSRAG_EMBED_MODEL=text-embedding-nomic-embed-code \
-js-rag embed /path/to/repo
+JSCOUT_EMBED_URL=http://localhost:1234/v1/embeddings \
+JSCOUT_EMBED_MODEL=text-embedding-nomic-embed-code \
+jscout embed /path/to/repo
 ```
 
 Embeddings are keyed by (chunk content hash, model): unchanged code is never
@@ -55,12 +55,12 @@ re-embedded, and multiple models can coexist in one index.
 
 ## Reranking (optional)
 
-Set `JSRAG_RERANK_URL` to a cross-encoder service speaking
+Set `JSCOUT_RERANK_URL` to a cross-encoder service speaking
 `POST {query, candidates:[{id,text}]}` → `{scores:[{id,score}]}` (e.g. a local
 bge-reranker-v2-m3). The top RRF candidates are reranked before final ordering.
-Tuning: `JSRAG_RERANK_TOP` (candidate pool, default 50), `JSRAG_RERANK_CHARS`
-(per-candidate truncation, default 4000), `JSRAG_RERANK_MODEL`.
-Diagnostics: `JSRAG_TIMING=1` prints per-stage latency (bm25 / embed-query /
+Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
+(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`.
+Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (bm25 / embed-query /
 vector-scan / rerank) to stderr on any search.
 
 ## MCP integration
@@ -68,19 +68,19 @@ vector-scan / rerank) to stderr on any search.
 ```json
 {
   "mcpServers": {
-    "js-rag": { "command": "/path/to/js-rag", "args": ["mcp", "/path/to/repo"] }
+    "jscout": { "command": "/path/to/jscout", "args": ["mcp", "/path/to/repo"] }
   }
 }
 ```
 
-Run `js-rag index` (or `js-rag watch`) beside it to keep the DB fresh.
+Run `jscout index` (or `jscout watch`) beside it to keep the DB fresh.
 
 ## Storage
 
-Everything lives in one SQLite file, `.jsrag.db`, in the repo root (add it to `.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, resolved module edges, classified references, event sites, member-call sites, embeddings.
+Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to `.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, resolved module edges, classified references, event sites, member-call sites, embeddings.
 
 ## Build
 
 ```
-cargo build --release   # binary at target/release/js-rag
+cargo build --release   # binary at target/release/jscout
 ```

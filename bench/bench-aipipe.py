@@ -1,18 +1,21 @@
 """Hard eval on ai-pipe: 24 paraphrased queries, identifier words avoided,
 so semantic retrieval has to do real work. Same harness as bench.py otherwise."""
 import json
+import os
 import re
 import statistics
 import subprocess
+import sys
 import time
 import urllib.request
+from pathlib import Path
 
-JSRAG = "/Users/cristian/git/js-rag/target/release/js-rag"
-REPO = "/Users/cristian/git/ai-pipe"
+JSCOUT = os.environ.get(
+    "JSCOUT_BIN", str(Path(__file__).resolve().parents[1] / "target/release/jscout")
+)
+REPO = os.environ.get("JSCOUT_BENCH_REPO", "/Users/cristian/git/ai-pipe")
 LMS = "http://localhost:1234/v1/embeddings"
 RERANK = "http://127.0.0.1:8792/rerank"
-
-import sys
 
 MODELS = [
     "text-embedding-bge-m3",
@@ -87,15 +90,15 @@ def eval_model(model, use_vector=True, use_rerank=False):
     env = {}
     label = "bm25-only"
     if use_vector:
-        env = {"JSRAG_EMBED_URL": LMS, "JSRAG_EMBED_MODEL": model}
+        env = {"JSCOUT_EMBED_URL": LMS, "JSCOUT_EMBED_MODEL": model}
         label = model.replace("text-embedding-", "")
     if use_rerank:
-        env["JSRAG_RERANK_URL"] = RERANK
+        env["JSCOUT_RERANK_URL"] = RERANK
         label += "+rerank"
     ranks, times = [], []
     vector_failures = 0
     for query, pattern in EVALS:
-        cmd = [JSRAG, "search", REPO, query, "-k", "20", "--json"]
+        cmd = [JSCOUT, "search", REPO, query, "-k", "20", "--json"]
         if not use_vector:
             cmd.append("--no-vector")
         r, dt = run(cmd, env=env)
@@ -131,16 +134,16 @@ def eval_model(model, use_vector=True, use_rerank=False):
 
 def ensure_embedded(model):
     q = f"SELECT COUNT(*) FROM embeddings WHERE model='{model}'"
-    existing = int(subprocess.run(["sqlite3", f"{REPO}/.jsrag.db", q],
+    existing = int(subprocess.run(["sqlite3", f"{REPO}/.jscout.db", q],
                                   capture_output=True, text=True).stdout.strip() or 0)
-    total = int(subprocess.run(["sqlite3", f"{REPO}/.jsrag.db", "SELECT COUNT(DISTINCT hash) FROM chunks"],
+    total = int(subprocess.run(["sqlite3", f"{REPO}/.jscout.db", "SELECT COUNT(DISTINCT hash) FROM chunks"],
                                capture_output=True, text=True).stdout.strip() or 0)
     if existing >= total:
         print(f"  embeddings cached: {existing}/{total} vectors", flush=True)
         return "cached"
     for attempt in range(2):
-        r, dt = run([JSRAG, "embed", REPO, "--batch", "32"],
-                    env={"JSRAG_EMBED_URL": LMS, "JSRAG_EMBED_MODEL": model})
+        r, dt = run([JSCOUT, "embed", REPO, "--batch", "32"],
+                    env={"JSCOUT_EMBED_URL": LMS, "JSCOUT_EMBED_MODEL": model})
         m = re.search(r"embedded (\d+)/\d+ chunks", r.stdout)
         n = int(m.group(1)) if m else 0
         if r.returncode == 0 and n > 0:

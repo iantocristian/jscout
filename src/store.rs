@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use rusqlite::Connection;
 
-pub const DB_FILE: &str = ".jsrag.db";
+pub const DB_FILE: &str = ".jscout.db";
 
 pub fn db_path(root: &Path) -> std::path::PathBuf {
     root.join(DB_FILE)

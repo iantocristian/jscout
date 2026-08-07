@@ -1,21 +1,21 @@
-# js-rag — agent memory architecture (plan, revision 2)
+# jscout — agent memory architecture (plan, revision 2)
 
 Supersedes revision 1 of this file after design review (nine findings folded in)
 and the product-framing discussion.
 
-## What js-rag is
+## What jscout is
 
 **Persistent, verifiable memory for coding agents working on a repository.**
 Agents start every session amnesiac; they re-derive the same structural facts
 and the same semantic conclusions (what calls what, what participates in which
-workflow) hundreds of times, then discard them. js-rag is where that knowledge
+workflow) hundreds of times, then discard them. jscout is where that knowledge
 persists between sessions — with the discipline that every stored claim carries
 provenance, confidence, and freshness, so accumulated memory never masquerades
 as current truth.
 
 The serving contract: *given an agent's query or focus, return the smallest
 trustworthy slice of repository evidence that improves its next action.*
-The agent remains the reasoner; js-rag supplies evidence and relationships.
+The agent remains the reasoner; jscout supplies evidence and relationships.
 
 ## Trust tiers
 
@@ -120,7 +120,7 @@ existing RRF + rerank pipeline (never counted against the rerank pool),
 attach `neighborhood(depth=1, budget=8)` of the top 3 hits, rendered as
 skeletons (KG-2 format). Default off, per GraphRAG-Bench.
 
-**Eval harness (`js-rag eval`)** — part of KG-1's definition of done, not an
+**Eval harness (`jscout eval`)** — part of KG-1's definition of done, not an
 afterthought:
 1. **JSDoc holdout** (automatic): sample N documented functions, query with
    the doc text, gold = its chunk; Recall@5/@10 for BM25 / +vector / +rerank.
@@ -197,7 +197,7 @@ sem_supports(record_id, node_id, role,        -- e.g. 'orchestrator'
              confidence)                      -- likely | possible, never certain
 ```
 
-**Generation (`js-rag scout [--budget N]`)**: seeds = entry-point
+**Generation (`jscout scout [--budget N]`)**: seeds = entry-point
 neighborhoods ordered by PageRank importance (routes and event hubs when
 KG-4 lands make seeds much better — that's L2's job description). Per seed:
 one LLM call, input = skeleton rendering of the neighborhood (KG-2 — cheap,
@@ -208,7 +208,7 @@ likely/possible; **never certain**.
 **Write-back (`annotate` MCP tool)**: agents can store their own findings as
 sem_records with `model = agent-reported`, same evidence/fingerprint rules.
 The most natural author of "this is the checkout flow" is the agent that just
-spent a session proving it. This turns js-rag from a read-only index into
+spent a session proving it. This turns jscout from a read-only index into
 shared memory across agent sessions — it is the cheapest high-leverage
 feature in this plan.
 
@@ -284,7 +284,7 @@ hit-rate with/without expansion; neighborhood precision per tier on fixtures;
 latency gates (neighborhood < 50ms, map < 300ms, resolved_refs < 100ms).
 
 **Product metric (the one that matters)**: on repeated agent sessions over
-the same repo (bvb / ai-pipe), with js-rag MCP vs. without — searches per
+the same repo (bvb / ai-pipe), with jscout MCP vs. without — searches per
 task, files read per task, tokens to first correct edit, task completion.
 "Does the second session start warmer than the first." Recall@k is a
 component metric, not the product metric.

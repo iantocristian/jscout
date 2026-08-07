@@ -140,7 +140,7 @@ each phase gate loses a sharpening question it should have — *does this beat
 what an LSP wrapper gives for free?*
 
 **Counter-proposal.** Add a positioning section to the operative plan:
-what js-rag concedes (precise typed call hierarchy, rename/refactor
+what jscout concedes (precise typed call hierarchy, rename/refactor
 tooling), what it wins on (speed, JS parity, honest uncertainty, entities,
 memory, ops), and park "optional tsserver enrichment pass for
 interface→implementation edges" as an explicitly deferred idea with a

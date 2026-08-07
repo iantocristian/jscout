@@ -55,7 +55,7 @@ fn vector_ranking(
 ) -> Result<Vec<(i64, f64)>> {
     let t = std::time::Instant::now();
     let qv = provider.embed_query(q)?;
-    if std::env::var_os("JSRAG_TIMING").is_some() {
+    if std::env::var_os("JSCOUT_TIMING").is_some() {
         eprintln!("timing:   embed-query {:?}", t.elapsed());
     }
     // Brute-force cosine over all embedded chunks; dedup hash -> best chunk.
@@ -76,7 +76,7 @@ fn vector_ranking(
 
 /// Optional cross-encoder rerank stage (dms-style service:
 /// POST {query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
-/// Configure with JSRAG_RERANK_URL (e.g. http://127.0.0.1:8792/rerank).
+/// Configure with JSCOUT_RERANK_URL (e.g. http://127.0.0.1:8792/rerank).
 pub struct Reranker {
     url: String,
     model: Option<String>,
@@ -84,8 +84,8 @@ pub struct Reranker {
 
 impl Reranker {
     pub fn from_env() -> Option<Self> {
-        let url = std::env::var("JSRAG_RERANK_URL").ok()?;
-        Some(Self { url, model: std::env::var("JSRAG_RERANK_MODEL").ok() })
+        let url = std::env::var("JSCOUT_RERANK_URL").ok()?;
+        Some(Self { url, model: std::env::var("JSCOUT_RERANK_MODEL").ok() })
     }
 
     fn rerank(&self, query: &str, candidates: &[(i64, String)]) -> Result<Vec<(i64, f64)>> {
@@ -137,7 +137,7 @@ pub fn search(
     q: &str,
     limit: usize,
 ) -> Result<Vec<Hit>> {
-    let timing = std::env::var_os("JSRAG_TIMING").is_some();
+    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(conn, q, pool)?];
@@ -158,13 +158,13 @@ pub fn search(
 
     // Cross-encoder rerank of the candidate pool, when a service is configured.
     // Pool size and per-candidate truncation trade quality for latency:
-    // JSRAG_RERANK_TOP (default 50), JSRAG_RERANK_CHARS (default 4000).
+    // JSCOUT_RERANK_TOP (default 50), JSCOUT_RERANK_CHARS (default 4000).
     if let Some(reranker) = Reranker::from_env() {
-        let pool_n: usize = std::env::var("JSRAG_RERANK_TOP")
+        let pool_n: usize = std::env::var("JSCOUT_RERANK_TOP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
-        let max_chars: usize = std::env::var("JSRAG_RERANK_CHARS")
+        let max_chars: usize = std::env::var("JSCOUT_RERANK_CHARS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4000);

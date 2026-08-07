@@ -1,5 +1,5 @@
 /target
 .DS_Store
-.jsrag.db
-.jsrag.db-shm
-.jsrag.db-wal
+.jscout.db
+.jscout.db-shm
+.jscout.db-wal

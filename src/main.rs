@@ -18,7 +18,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "js-rag", about = "Runtime-level JS/TS codebase indexer for RAG")]
+#[command(name = "jscout", about = "Runtime-level JS/TS codebase indexer for RAG")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -39,7 +39,7 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Build or update the index database (.jsrag.db in the repo root)
+    /// Build or update the index database (.jscout.db in the repo root)
     Index {
         /// Repository root
         root: PathBuf,
@@ -122,7 +122,7 @@ fn cmd_embed(root: &PathBuf, batch: usize) -> Result<()> {
     let Some(provider) = embed::Provider::from_env() else {
         anyhow::bail!(
             "no embedding provider configured — set VOYAGE_API_KEY, OPENAI_API_KEY, \
-             or JSRAG_EMBED_URL (OpenAI-compatible, e.g. Ollama)"
+             or JSCOUT_EMBED_URL (OpenAI-compatible, e.g. Ollama)"
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);

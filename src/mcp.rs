@@ -51,7 +51,7 @@ pub fn serve(root: &Path) -> Result<()> {
                     json!({
                         "protocolVersion": requested,
                         "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "js-rag", "version": env!("CARGO_PKG_VERSION") }
+                        "serverInfo": { "name": "jscout", "version": env!("CARGO_PKG_VERSION") }
                     }),
                 )
             }

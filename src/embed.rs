@@ -3,11 +3,11 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 
 /// A pluggable embedding backend. Selected from environment:
-/// - JSRAG_EMBED_PROVIDER=voyage|openai|none (optional override)
+/// - JSCOUT_EMBED_PROVIDER=voyage|openai|none (optional override)
 /// - VOYAGE_API_KEY (voyage-code-3)
-/// - OPENAI_API_KEY, or JSRAG_EMBED_URL(+JSRAG_EMBED_KEY) for any
+/// - OPENAI_API_KEY, or JSCOUT_EMBED_URL(+JSCOUT_EMBED_KEY) for any
 ///   OpenAI-compatible endpoint (Ollama, LM Studio, vLLM...)
-/// - JSRAG_EMBED_MODEL overrides the model name
+/// - JSCOUT_EMBED_MODEL overrides the model name
 pub struct Provider {
     pub name: String,
     pub model: String,
@@ -17,7 +17,7 @@ pub struct Provider {
     /// different auth header casing; kept uniform, distinguished by name.
     is_voyage: bool,
     /// Asymmetric-retrieval prefix prepended to queries only (never documents).
-    /// nomic-embed-code / CodeRankEmbed style; override with JSRAG_QUERY_PREFIX.
+    /// nomic-embed-code / CodeRankEmbed style; override with JSCOUT_QUERY_PREFIX.
     query_prefix: String,
 }
 
@@ -34,11 +34,11 @@ fn default_query_prefix(model: &str) -> &'static str {
 
 impl Provider {
     pub fn from_env() -> Option<Provider> {
-        let choice = std::env::var("JSRAG_EMBED_PROVIDER").unwrap_or_default();
+        let choice = std::env::var("JSCOUT_EMBED_PROVIDER").unwrap_or_default();
         let voyage_key = std::env::var("VOYAGE_API_KEY").ok();
         let openai_key = std::env::var("OPENAI_API_KEY").ok();
-        let custom_url = std::env::var("JSRAG_EMBED_URL").ok();
-        let model_override = std::env::var("JSRAG_EMBED_MODEL").ok();
+        let custom_url = std::env::var("JSCOUT_EMBED_URL").ok();
+        let model_override = std::env::var("JSCOUT_EMBED_MODEL").ok();
 
         let pick_voyage = choice == "voyage" || (choice.is_empty() && voyage_key.is_some());
         let pick_openai =
@@ -48,7 +48,7 @@ impl Provider {
             return None;
         }
         let query_prefix = |model: &str| {
-            std::env::var("JSRAG_QUERY_PREFIX")
+            std::env::var("JSCOUT_QUERY_PREFIX")
                 .unwrap_or_else(|_| default_query_prefix(model).to_string())
         };
         if pick_voyage && voyage_key.is_some() {
@@ -70,7 +70,7 @@ impl Provider {
                 model,
                 url: custom_url
                     .unwrap_or_else(|| "https://api.openai.com/v1/embeddings".into()),
-                key: std::env::var("JSRAG_EMBED_KEY").ok().or(openai_key),
+                key: std::env::var("JSCOUT_EMBED_KEY").ok().or(openai_key),
                 is_voyage: false,
             });
         }

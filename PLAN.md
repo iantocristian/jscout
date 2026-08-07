@@ -1,4 +1,4 @@
-# js-rag — a runtime-level JS/TS codebase indexer
+# jscout — a runtime-level JS/TS codebase indexer
 
 > **Status (2026-08-06, retrospective): M0–M4 fully implemented; M5–M6
 > implemented with deferred scope.** Verified on bvb (86 files), raggazzi (235),
@@ -18,7 +18,7 @@
 >   server only; reranking + asymmetric query prefixes added post-M6 (see
 >   README).
 >
-> **Next: [PLAN-KG.md](PLAN-KG.md) (revision 2)** — js-rag reframed as
+> **Next: [PLAN-KG.md](PLAN-KG.md) (revision 2)** — jscout reframed as
 > persistent agent memory: T1 deterministic facts (KG-1 identity/resolution/
 > traversal + KG-4 entities), T2 on-demand renderers (skeletons/map/paths),
 > T3 fingerprinted semantic memory (workflows + agent write-back).
@@ -62,19 +62,19 @@ classes, components, parse errors). Proves the parse layer end to end.
 Split-then-merge walker over the oxc AST. Erase type-only nodes (interfaces, type
 aliases, annotations). Emit chunks with: content, blake3 hash, byte/line span, kind
 (function/class/method/component/module-top), enclosing scope chain, imports in
-scope, JSDoc. `js-rag chunks <repo>` dumps JSONL. Golden-file tests against 2–3 real
+scope, JSDoc. `jscout chunks <repo>` dumps JSONL. Golden-file tests against 2–3 real
 OSS repos (e.g. excalidraw, cal.com).
 
 ### M2 — Module + symbol graph
 Per-file symbols/scopes from oxc_semantic; cross-file binding by joining export maps
 to imports via oxc_resolver (must see through barrel files / re-export chains). JSX
 element → component binding edges. Store nodes+edges in SQLite.
-`js-rag who-uses <file>:<symbol>` works, with confidence labels.
+`jscout who-uses <file>:<symbol>` works, with confidence labels.
 
 ### M3 — Retrieval
 tantivy index over chunk text + identifiers (BM25). Embedding pipeline with the
 pluggable provider trait; vectors in LanceDB/sqlite-vec, cached by chunk hash.
-`js-rag search "<query>"` → RRF-fused results, each expandable with graph neighbors
+`jscout search "<query>"` → RRF-fused results, each expandable with graph neighbors
 (callers/callees/renders). Optional reranker pass.
 
 ### M4 — Incremental + git
@@ -97,7 +97,8 @@ Cursor / anything.
 
 - Embedding default: local ONNX (zero-config, slower) vs API-key (better, faster)?
 - One storage engine or three? (SQLite-only with FTS5+sqlite-vec is simpler; tantivy+LanceDB is faster at scale.)
-- Name: `js-rag`? The repo currently holds an unrelated graph-memory demo — move it or start the Rust workspace in a subdirectory / fresh repo?
+- Product, crate, binary, MCP server, database, and environment-variable prefix
+  use `jscout` consistently.
 
 ## Reference material
 

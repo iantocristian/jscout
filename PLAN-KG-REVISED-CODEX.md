@@ -1,4 +1,4 @@
-# js-rag persistent repository memory — structural retrieval and scouting
+# jscout persistent repository memory — structural retrieval and scouting
 
 > Independent Codex revision, 2026-08-07. This file does not replace
 > [PLAN-KG.md](PLAN-KG.md). It presents an alternative architecture derived
@@ -7,7 +7,7 @@
 
 ## Objective
 
-`js-rag` is persistent, verifiable repository memory for coding agents. It is
+`jscout` is persistent, verifiable repository memory for coding agents. It is
 a complementary tool, not a replacement for agent reasoning. It should let
 knowledge survive across sessions while making the repository easier for an
 agent to observe by providing:

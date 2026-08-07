@@ -88,7 +88,7 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
                 continue;
             }
         }
-        if std::env::var_os("JSRAG_DEBUG").is_some() {
+        if std::env::var_os("JSCOUT_DEBUG").is_some() {
             eprintln!("extracting {rel}");
         }
         match extract_file(file, &rel, &source) {

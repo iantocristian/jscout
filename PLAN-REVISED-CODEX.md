@@ -1,12 +1,12 @@
-# js-rag core plan — corrected baseline and forward contract
+# jscout core plan — corrected baseline and forward contract
 
 > Independent Codex revision, 2026-08-07. This file does not replace
 > [PLAN.md](PLAN.md); it records the implementation that actually exists and
 > defines the boundary that the next architecture should build on.
 
-## What js-rag is
+## What jscout is
 
-`js-rag` is persistent, verifiable repository memory for coding agents. It
+`jscout` is persistent, verifiable repository memory for coding agents. It
 stores deterministic repository facts, refreshable semantic claims, and
 agent-reported findings so later sessions do not have to rediscover them. It
 complements rather than replaces the agent's reasoning: its job is to make
