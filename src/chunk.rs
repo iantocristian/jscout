@@ -491,6 +491,11 @@ impl<'s> Chunker<'s> {
         while start < span.end {
             let mut end = (start + budget_bytes).min(span.end);
             if end < span.end {
+                // The byte budget can land inside a multibyte code point. Make
+                // the provisional end sliceable before looking for a newline.
+                while end > start && !self.source.is_char_boundary(end as usize) {
+                    end -= 1;
+                }
                 // back up to a line boundary
                 let slice = &self.source[start as usize..end as usize];
                 if let Some(pos) = slice.rfind('\n') {
@@ -587,6 +592,36 @@ export default function App() { return <UserCard id="1" />; }
             .collect();
         assert!(!methods.is_empty());
         assert!(methods.iter().all(|c| c.scope_chain == vec!["Big".to_string()]));
+    }
+
+    #[test]
+    fn line_fallback_never_splits_multibyte_characters() {
+        let mut src = String::from("export const text = `");
+        while src.len() < 4_799 {
+            src.push('a');
+        }
+        src.push('—');
+        while src.len() < 9_598 {
+            src.push('b');
+        }
+        src.push('ل');
+        while src.len() < 11_000 {
+            src.push('c');
+        }
+        src.push_str("`;\n");
+
+        let chunks = chunks_of("unicode.ts", &src);
+        assert!(chunks.len() >= 3);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<String>(),
+            src.strip_suffix('\n').unwrap()
+        );
+        assert!(chunks.iter().all(|chunk| {
+            src.is_char_boundary(chunk.start as usize) && src.is_char_boundary(chunk.end as usize)
+        }));
     }
 
     #[test]
