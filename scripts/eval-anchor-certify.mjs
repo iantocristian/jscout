@@ -113,7 +113,13 @@ function main() {
 
   const results = [];
   for (const taskSet of taskSets) {
-    for (const task of taskSet.tasks) {
+    const tasks = Array.isArray(taskSet.tasks)
+      ? taskSet.tasks
+      : (taskSet.pairs ?? []).map((pair) => ({
+        ...pair.session2,
+        id: `${pair.id}:session2`,
+      }));
+    for (const task of tasks) {
       const goldContents = [];
       for (const file of task.gold?.files ?? []) {
         const absolute = path.join(repository, file);

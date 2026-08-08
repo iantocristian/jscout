@@ -1046,6 +1046,14 @@ fn round_score(score: f64) -> f64 {
     (score * 1_000_000.0).round() / 1_000_000.0
 }
 
+/// Resolve a user-facing anchor against the current structural snapshot for a
+/// durable semantic support. Ambiguity remains an error; stored supports use
+/// the returned exact node key.
+pub fn resolve_current_anchor(conn: &Connection, anchor: &str) -> Result<String> {
+    let snapshot = current_snapshot(conn)?;
+    resolve_anchor(conn, anchor, None, &snapshot).map(|(resolved, _)| resolved)
+}
+
 fn resolve_anchor(
     conn: &Connection,
     anchor: &str,

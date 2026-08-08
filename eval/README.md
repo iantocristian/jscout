@@ -194,6 +194,46 @@ run. It is a bounded direction gate, not a general product benchmark.
   `results/file-roles-prechange-expansion-backfill-2026-08-09.json`.
 - The SC-2a memory gate is specified in
   [protocols/two-session-memory.md](protocols/two-session-memory.md).
+
+## Two-session semantic-memory runner
+
+`scripts/eval-run-memory.mjs` executes each admitted pair as one session-1
+write-back run plus counterbalanced cold/warm session-2 runs. It requires a
+schema-v6 seed database with empty semantic tables, gives each arm an isolated
+copy-on-write clone through `jscout mcp --database`, and archives the warm
+database immediately after session 1. Responses record the structural seed
+fingerprint and before/after semantic fingerprints.
+
+```bash
+node scripts/eval-run-memory.mjs \
+  --tasks eval/tasks/memory-pairs.json \
+  --repository /path/to/frozen/repository \
+  --seed-database /path/to/clean-v6.db \
+  --jscout "$PWD/target/release/jscout" \
+  --responses /tmp/jscout-memory-responses.jsonl \
+  --telemetry /tmp/jscout-memory-telemetry.jsonl \
+  --artifacts /tmp/jscout-memory-artifacts \
+  --model gpt-5.6-terra --reasoning high --trial 001
+```
+
+The runner requires copy-on-write database cloning because a large-repository
+index is hundreds of megabytes. Keep the seed and artifact directory on one
+reflink-capable volume. `--allow-full-copy true` is an explicit, expensive
+fallback. `eval/tasks/memory-fixture-smoke.json` checks the runner only and is
+excluded from product claims.
+
+Report one or more trials with:
+
+```bash
+node scripts/eval-memory-report.mjs \
+  --tasks eval/tasks/memory-pairs.json \
+  --responses /tmp/memory-seed1.jsonl,/tmp/memory-seed2.jsonl \
+  --telemetry /tmp/memory-seed1-telemetry.jsonl,/tmp/memory-seed2-telemetry.jsonl
+```
+
+The report enforces single-model pooling, pairs by task/trial, checks actual
+artifact reads and writes, bootstraps by pair, and implements the registered
+20%/10% gate plus the hard stale-as-fresh failure.
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, file_role, store, structural};
+use crate::{embed, file_role, semantic, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -47,6 +47,8 @@ pub struct SearchOptions {
     pub response_byte_limit: usize,
     /// Optional role allowlist for primary hits. Empty preserves normal recall.
     pub file_roles: Vec<String>,
+    pub include_memory: bool,
+    pub memory_limit: usize,
     pub expansion: ExpansionOptions,
 }
 
@@ -57,6 +59,8 @@ impl Default for SearchOptions {
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
+            include_memory: true,
+            memory_limit: 4,
             expansion: ExpansionOptions::default(),
         }
     }
@@ -66,6 +70,8 @@ impl Default for SearchOptions {
 pub struct SearchResult {
     pub snapshot: String,
     pub hits: Vec<Hit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
@@ -78,6 +84,7 @@ pub struct ResponseBudget {
     pub unbudgeted_bytes: usize,
     pub truncated: bool,
     pub omitted_hits: usize,
+    pub omitted_semantic_artifacts: usize,
     pub omitted_nodes: usize,
     pub omitted_edges: usize,
     pub truncated_snippets: usize,
@@ -238,6 +245,11 @@ pub fn search(
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
         let hits = ranked_hits(conn, provider, q, options.limit, &options.file_roles)?;
+        let semantic_artifacts = if options.include_memory {
+            semantic::search(conn, q, options.memory_limit)?
+        } else {
+            Vec::new()
+        };
         let expansion = options
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion))
@@ -245,6 +257,7 @@ pub fn search(
         let mut result = SearchResult {
             snapshot,
             hits,
+            semantic_artifacts,
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
@@ -451,6 +464,11 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
                 expansion.payload_bytes = expansion_payload_bytes(expansion)?;
                 continue;
             }
+        }
+
+        if result.semantic_artifacts.pop().is_some() {
+            result.response_budget.omitted_semantic_artifacts += 1;
+            continue;
         }
 
         let rendered = result.response_budget.rendered_bytes;
@@ -806,6 +824,8 @@ mod tests {
                 limit: 8,
                 expand: true,
                 file_roles: Vec::new(),
+                include_memory: true,
+                memory_limit: 4,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
@@ -835,6 +855,8 @@ mod tests {
                 limit: 8,
                 expand: true,
                 file_roles: Vec::new(),
+                include_memory: true,
+                memory_limit: 4,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions { byte_limit: 1, ..Default::default() },
             },
@@ -905,6 +927,7 @@ mod tests {
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
             hits: Vec::new(),
+            semantic_artifacts: Vec::new(),
             expansion: Some(SearchExpansion {
                 seeds: vec!["root".into()],
                 nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],

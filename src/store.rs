@@ -10,7 +10,14 @@ pub fn db_path(root: &Path) -> std::path::PathBuf {
 }
 
 pub fn open(root: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path(root))?;
+    open_path(&db_path(root))
+}
+
+/// Open an index database independently of the repository root. Evaluation
+/// uses this to give warm and cold sessions isolated semantic-memory state
+/// while both read the same frozen source tree.
+pub fn open_path(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -167,6 +174,43 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
   ON resolved_edges(src_key, confidence, kind);
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
+
+CREATE TABLE IF NOT EXISTS semantic_artifacts(
+  id INTEGER PRIMARY KEY,
+  supersedes_artifact_id INTEGER REFERENCES semantic_artifacts(id),
+  artifact_type TEXT NOT NULL,
+  canonical_name TEXT,
+  body_json TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  source_snapshot TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_artifacts_type_name
+  ON semantic_artifacts(artifact_type, canonical_name);
+CREATE INDEX IF NOT EXISTS idx_semantic_artifacts_supersedes
+  ON semantic_artifacts(supersedes_artifact_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_artifacts_one_successor
+  ON semantic_artifacts(supersedes_artifact_id)
+  WHERE supersedes_artifact_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS semantic_supports(
+  artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id) ON DELETE CASCADE,
+  claim_path TEXT NOT NULL,
+  anchor_key TEXT NOT NULL,
+  role TEXT,
+  evidence_file TEXT NOT NULL,
+  evidence_start_line INTEGER NOT NULL CHECK(evidence_start_line > 0),
+  evidence_end_line INTEGER NOT NULL CHECK(evidence_end_line >= evidence_start_line),
+  source_hash TEXT NOT NULL,
+  context_hash TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible'))
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_supports_artifact
+  ON semantic_supports(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
+  ON semantic_supports(anchor_key);
 "#,
     )?;
     migrate(conn)?;
@@ -312,8 +356,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    // The idempotent schema batch creates v6 semantic tables. Preserve their
+    // rows across later source indexing so support fingerprints can expose
+    // stale and degraded memory instead of silently deleting it.
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','5')
+        "INSERT INTO meta(key, value) VALUES('schema_version','6')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -343,7 +391,22 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::open;
+    use super::{open, open_path};
+
+    #[test]
+    fn opens_an_index_database_outside_the_repository_root() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("isolated-memory.db");
+        let conn = open_path(&database)?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "6");
+        assert!(database.is_file());
+        Ok(())
+    }
 
     #[test]
     fn migrates_v2_symbols_and_references_without_preserving_stale_projection() -> Result<()> {
@@ -377,7 +440,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -420,7 +483,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -456,6 +519,38 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v5_by_adding_empty_semantic_memory_tables() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '5');",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let artifacts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM semantic_artifacts",
+            [],
+            |row| row.get(0),
+        )?;
+        let supports: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM semantic_supports",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "6");
+        assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
 }

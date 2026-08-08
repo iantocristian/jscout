@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "repository": {
+    "name": "structural-fixture",
+    "evidence_use": "Harness smoke test only; never include in the SC-2a product result."
+  },
+  "experiment": {
+    "claim_eligible": false
+  },
+  "pairs": [
+    {
+      "id": "fixture-checkout-lifecycle",
+      "admission": {
+        "anchor_class": "anchor-free",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high"
+        },
+        "note": "Mechanical fixture certificate for runner validation, not product evidence."
+      },
+      "session1": {
+        "prompt": "Trace the checkout lifecycle from the HTTP boundary through its synchronous effects and the asynchronous receipt consumer. Investigate the complete flow, but return only the production entrypoint and event-consumer files and symbols.",
+        "gold": {
+          "files": ["src/http.ts", "src/worker.ts"],
+          "symbols": ["handleCheckout", "startReceiptWorker", "sendReceipt"]
+        }
+      },
+      "session2": {
+        "prompt": "Which direct synchronous operations occur between request entry and asynchronous receipt dispatch? Return only their defining production files and symbols.",
+        "gold": {
+          "files": ["src/inventory.ts", "src/payments.ts"],
+          "symbols": ["reserveInventory", "authorizePayment"]
+        }
+      }
+    }
+  ]
+}

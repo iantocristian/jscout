@@ -10,6 +10,7 @@ mod parse;
 mod query;
 mod search;
 mod scout;
+mod semantic;
 mod stats;
 mod store;
 mod structural;
@@ -68,6 +69,12 @@ enum Command {
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
+        /// Do not attach matching persistent semantic memory
+        #[arg(long)]
+        no_memory: bool,
+        /// Maximum matching semantic artifacts
+        #[arg(long, default_value_t = 4)]
+        memory_limit: usize,
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = search::DEFAULT_RESPONSE_BYTE_LIMIT)]
         response_bytes: usize,
@@ -113,6 +120,9 @@ enum Command {
     Mcp {
         /// Repository root (must be indexed)
         root: PathBuf,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
         /// Append privacy-minimal tool-call metrics as JSONL (no queries or results)
         #[arg(long)]
         telemetry: Option<PathBuf>,
@@ -122,6 +132,30 @@ enum Command {
         /// Definition source representation: full or deterministic elided source
         #[arg(long, default_value = "full")]
         source_view: String,
+    },
+    /// Persist an evidence-backed workflow or repository annotation
+    Annotate {
+        /// Repository root whose source supports the annotation
+        root: PathBuf,
+        /// JSON file containing the annotate tool input
+        input: PathBuf,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Search persistent semantic memory and report freshness
+    Memory {
+        /// Repository root used to locate the default index
+        root: PathBuf,
+        /// Optional lexical query; empty lists the newest records
+        #[arg(default_value = "")]
+        query: String,
+        /// Maximum returned artifacts
+        #[arg(short = 'k', long, default_value_t = 20)]
+        limit: usize,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
     /// Watch a repository and re-index on change
     Watch {
@@ -192,6 +226,8 @@ fn main() -> Result<()> {
             query,
             limit,
             file_roles,
+            no_memory,
+            memory_limit,
             response_bytes,
             no_vector,
             json,
@@ -212,6 +248,8 @@ fn main() -> Result<()> {
                 limit,
                 expand,
                 file_roles,
+                include_memory: !no_memory,
+                memory_limit,
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -225,13 +263,27 @@ fn main() -> Result<()> {
             },
         ),
         Command::Events { root, name } => cmd_events(&root, name.as_deref()),
-        Command::Mcp { root, telemetry, profile, source_view } => {
+        Command::Mcp { root, database, telemetry, profile, source_view } => {
             mcp::serve(
                 &root,
+                database.as_deref(),
                 telemetry.as_deref(),
                 mcp::ToolProfile::parse(&profile)?,
                 scout::SourceView::parse(&source_view)?,
             )
+        }
+        Command::Annotate { root, input, database } => {
+            let conn = open_database(&root, database.as_deref())?;
+            let input: semantic::AnnotateInput = serde_json::from_slice(&std::fs::read(&input)?)?;
+            let artifact = semantic::annotate(&root, &conn, &input)?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+            Ok(())
+        }
+        Command::Memory { root, query, limit, database } => {
+            let conn = open_database(&root, database.as_deref())?;
+            let artifacts = semantic::search(&conn, &query, limit)?;
+            println!("{}", serde_json::to_string_pretty(&artifacts)?);
+            Ok(())
         }
         Command::Watch { root, embed } => watch::watch(&root, embed),
         Command::WhoUses { root, spec, json } => cmd_who_uses(&root, &spec, json),
@@ -270,6 +322,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn open_database(root: &Path, database: Option<&Path>) -> Result<rusqlite::Connection> {
+    match database {
+        Some(path) => store::open_path(path),
+        None => store::open(root),
     }
 }
 

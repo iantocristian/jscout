@@ -16,7 +16,9 @@ jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
 jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
-                               #   who_uses, definition, file_outline, events
+                               #   who_uses, definition, file_outline, events, annotate
+jscout memory <root> [query]   # inspect persistent semantic artifacts + freshness
+jscout annotate <root> in.json # write a validated semantic artifact
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
@@ -67,6 +69,11 @@ actual `rendered_bytes`, original `unbudgeted_bytes`, and any omitted content.
 The expansion node, edge, and payload limits are subordinate budgets shared
 across all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
 use `possible` only when explicit unresolved candidates are useful.
+
+Matching semantic memory is attached to CLI and structural-profile search by
+default; use `--no-memory` or `--memory-limit` to control it. Every artifact carries
+evidence supports and a computed `fresh`, `degraded`, or `stale` label. The
+complete response-byte limit includes semantic artifacts.
 
 ## Confidence tiers
 
@@ -140,7 +147,9 @@ an existing guide. Use `jscout agent-guide` to print the same text for clients
 that consume `AGENTS.md` or another instruction format.
 
 For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
-`neighborhood` or search expansion) and `--profile structural` (the default).
+semantic memory, `annotate`, `neighborhood`, or search expansion) and
+`--profile structural` (the default). `--database PATH` separates the index
+and semantic-memory state from the source root for isolated warm/cold runs.
 See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
 
 `definition` returns full source by default. `jscout mcp --source-view elided`
@@ -162,6 +171,8 @@ does not record queries, arguments, source, or results. Set
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
 included in each record. Expanded searches also record aggregate node totals
 and `expansion_role_counts`; no paths or source are added to telemetry.
+Semantic calls add only aggregate artifact returned/written counts and
+fresh/degraded/stale totals.
 
 ## Storage
 
@@ -172,6 +183,12 @@ references, event/member-call sites, embeddings, and a disposable
 after indexing so barrel changes can reroute references in otherwise unchanged
 files without leaving stale graph edges behind. File roles live on canonical
 file rows and are refreshed even when source hashes are unchanged.
+
+Agent-authored `workflow` and `annotation` records live in separate
+`semantic_artifacts`/`semantic_supports` tables; they never become structural
+edges. Supports store source and direct structural-context fingerprints.
+Re-indexing preserves memory and makes source/context drift visible instead of
+silently deleting or serving the record as current.
 
 ## Build
 
