@@ -170,5 +170,29 @@ and returned bytes. Missing task/profile runs are listed explicitly.
 
 The fingerprinted `ai-pipe` task set is the first representative-repository P0
 run. It is a bounded direction gate, not a general product benchmark.
+
+## Task admission and pooling discipline
+
+- `scripts/eval-anchor-certify.mjs --tasks <sets> --repository <frozen checkout>`
+  classifies each task as `anchored` / `weak` / `anchor-free` by whether prompt
+  tokens appear in gold files. Graph-discriminating suites should require
+  `anchor-free` (`--require anchor-free`); the 2026-08-09 Twenty pilot tasks
+  all certify `weak`.
+- Responses now record `model` and `reasoning`;
+  `scripts/eval-pooled-report.mjs` refuses to pool mixed execution models
+  unless `--allow-cross-model true` is passed and the result is labelled.
+- Retrieval changes re-run a recorded suite only with a pre-registration in
+  `eval/prereg/` (first: [file-roles](prereg/file-roles-2026-08-09.md)).
+- File-role runs read `tool_profiles.<profile>.expansion_role_counts` and
+  `expansion_test_fixture_generated_share` from the pooled report. These are
+  aggregated from privacy-minimal MCP telemetry rather than agent-authored
+  inspected-file lists.
+- Backfill the same role share for pre-role telemetry from retained raw Codex
+  artifacts with `scripts/eval-expansion-role-backfill.mjs`; it reads only
+  expansion node paths and the frozen repository's indexed role column. The
+  registered baseline is recorded in
+  `results/file-roles-prechange-expansion-backfill-2026-08-09.json`.
+- The SC-2a memory gate is specified in
+  [protocols/two-session-memory.md](protocols/two-session-memory.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).

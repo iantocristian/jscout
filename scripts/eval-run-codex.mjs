@@ -247,6 +247,8 @@ async function main() {
         task_id: task.id,
         profile,
         session,
+        model: options.model,
+        reasoning: options.reasoning,
         files: answer.files ?? [],
         symbols: answer.symbols ?? [],
         inspected_files: answer.inspected_files ?? [],

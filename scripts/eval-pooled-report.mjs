@@ -125,7 +125,20 @@ export function buildPooledReport({
   adjudications = [],
   bootstrap,
   seed,
+  allowCrossModel = false,
 }) {
+  // Pooling runs from different models (or reasoning levels) silently blends
+  // incomparable cost/behavior distributions. Refuse unless explicitly allowed.
+  const executionModels = [...new Set(
+    responses.map((response) => `${response.model ?? "unknown"}/${response.reasoning ?? "unknown"}`),
+  )].sort();
+  if (executionModels.length > 1 && !allowCrossModel) {
+    throw new Error(
+      `refusing to pool across execution models: ${executionModels.join(", ")} ` +
+        "(pass --allow-cross-model true to override; label the result accordingly)",
+    );
+  }
+
   const taskById = new Map();
   const repositoryByTask = new Map();
   for (const taskSet of taskSets) {
@@ -222,9 +235,23 @@ export function buildPooledReport({
   const toolProfiles = {};
   for (const [profile, entries] of Map.groupBy(telemetry, (entry) => entry.profile)) {
     const byTool = {};
+    const expansionRoleCounts = {};
     for (const [tool, toolEntries] of Map.groupBy(entries, (entry) => entry.tool)) {
       byTool[tool] = toolEntries.length;
     }
+    for (const entry of entries) {
+      for (const [role, count] of Object.entries(entry.expansion_role_counts ?? {})) {
+        expansionRoleCounts[role] = (expansionRoleCounts[role] ?? 0) + Number(count ?? 0);
+      }
+    }
+    const expansionFileNodes = entries.reduce(
+      (sum, entry) => sum + Number(entry.expansion_file_nodes ?? 0),
+      0,
+    );
+    const expansionTestFixtureGeneratedNodes = entries.reduce(
+      (sum, entry) => sum + Number(entry.expansion_test_fixture_generated_nodes ?? 0),
+      0,
+    );
     toolProfiles[profile] = {
       calls: entries.length,
       failed_calls: entries.filter((entry) => entry.ok === false).length,
@@ -234,12 +261,24 @@ export function buildPooledReport({
         (sum, entry) => sum + Number(entry.source_budget_truncations ?? 0),
         0,
       ),
+      expansion_nodes: entries.reduce(
+        (sum, entry) => sum + Number(entry.expansion_nodes ?? 0),
+        0,
+      ),
+      expansion_file_nodes: expansionFileNodes,
+      expansion_role_counts: expansionRoleCounts,
+      expansion_test_fixture_generated_nodes: expansionTestFixtureGeneratedNodes,
+      expansion_test_fixture_generated_share:
+        expansionFileNodes === 0
+          ? null
+          : expansionTestFixtureGeneratedNodes / expansionFileNodes,
       tools: byTool,
     };
   }
 
   return {
     schema_version: 1,
+    execution_models: executionModels,
     tasks: taskById.size,
     trials: new Set(rows.map((row) => row.trial)).size,
     runs: rows.length,
@@ -263,6 +302,7 @@ function main() {
     adjudications,
     bootstrap: Number(options.bootstrap),
     seed: Number(options.seed),
+    allowCrossModel: options["allow-cross-model"] === "true",
   });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }

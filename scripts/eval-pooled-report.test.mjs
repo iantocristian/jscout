@@ -41,3 +41,78 @@ test("pooled report computes paired profile deltas", () => {
   assert.equal(report.paired_deltas.baseline_minus_grep.exact.mean, -1);
   assert.equal(report.paired_deltas.structural_minus_grep.total_tokens.mean, -5);
 });
+
+test("pooling refuses mixed execution models unless overridden", () => {
+  const taskSets = [{
+    repository: { name: "fixture" },
+    tasks: [{ id: "task", gold: { files: ["a.ts"], symbols: ["a"] } }],
+  }];
+  const response = (profile, model) => ({
+    task_id: "task",
+    profile,
+    session: `${profile}-task-seed1`,
+    model,
+    reasoning: "high",
+    files: ["a.ts"],
+    symbols: ["a"],
+    inspected_files: ["a.ts"],
+    total_tokens: 1,
+    duration_ms: 1,
+    correct: true,
+  });
+  const mixed = {
+    taskSets,
+    responses: [response("grep", "gpt-5.6-terra"), response("baseline", "gpt-5.4")],
+    telemetry: [],
+    bootstrap: 10,
+    seed: 1,
+  };
+  assert.throws(() => buildPooledReport(mixed), /refusing to pool across execution models/);
+  const overridden = buildPooledReport({ ...mixed, allowCrossModel: true });
+  assert.deepEqual(overridden.execution_models, ["gpt-5.4/high", "gpt-5.6-terra/high"]);
+});
+
+test("pooled telemetry reports the pre-registered expansion role share", () => {
+  const taskSets = [{
+    repository: { name: "fixture" },
+    tasks: [{ id: "task", gold: { files: ["a.ts"], symbols: ["a"] } }],
+  }];
+  const responses = [{
+    task_id: "task",
+    profile: "structural",
+    session: "structural-task-seed1",
+    model: "gpt-5.6-terra",
+    reasoning: "high",
+    files: ["a.ts"],
+    symbols: ["a"],
+    inspected_files: ["a.ts"],
+    total_tokens: 1,
+    duration_ms: 1,
+    correct: true,
+  }];
+  const telemetry = [{
+    task: "task",
+    profile: "structural",
+    session: "structural-task-seed1",
+    tool: "semantic_search",
+    ok: true,
+    expansion_nodes: 5,
+    expansion_file_nodes: 4,
+    expansion_role_counts: { production: 2, test: 1, fixture: 1 },
+    expansion_test_fixture_generated_nodes: 2,
+  }];
+  const report = buildPooledReport({
+    taskSets,
+    responses,
+    telemetry,
+    bootstrap: 10,
+    seed: 1,
+  });
+  assert.equal(report.tool_profiles.structural.expansion_nodes, 5);
+  assert.deepEqual(report.tool_profiles.structural.expansion_role_counts, {
+    production: 2,
+    test: 1,
+    fixture: 1,
+  });
+  assert.equal(report.tool_profiles.structural.expansion_test_fixture_generated_share, 0.5);
+});
