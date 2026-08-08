@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "profiles": ["grep", "baseline", "structural"],
+  "repository": {
+    "name": "n8n",
+    "commit": "9d9e9bf97e8ae5382a930cd662637a9cf7046ef9",
+    "tracked_files": 26341,
+    "indexed_files": 19199,
+    "jscout_chunks": 92210,
+    "jscout_references": 404990,
+    "jscout_resolved_edges": 772596,
+    "jscout_member_calls": 545748,
+    "jscout_snapshot": "5d500dc2400d5fa427834d6a58d88a323fdffeb28460544de826eb7a1d091bb9"
+  },
+  "experiment": {
+    "question": "Does jscout improve localization on cross-file n8n workflows introduced after 2026-01-01 and not recoverable from model memory?",
+    "candidate_since": "2026-01-01",
+    "admission_gate": "Run the same model with no repository and no tools; reject complete file localization and manually review any partial overlap.",
+    "execution_model": "gpt-5.6-terra",
+    "execution_reasoning": "high",
+    "gold_review_model": "gpt-5.6-sol",
+    "gold_review_reasoning": "high",
+    "primary_metrics": ["correctness_rate", "file_recall", "symbol_recall"],
+    "secondary_metrics": ["mean_inspected_files", "mean_result_bytes", "mean_total_tokens", "mean_run_duration_ms"]
+  },
+  "tasks": [
+    {
+      "id": "n8n-deferred-tool-resume",
+      "category": "stateful-runtime-flow",
+      "prompt": "In the current n8n agent runtime, trace how deferred tools loaded during an earlier turn are reconstructed from persisted message history and made available in the next model request. Return only the three defining production files and three named classes that own runtime orchestration, current-tool assembly, and reconstruction of successful load-tool calls. Exclude tests and SDK type declarations.",
+      "contamination_prompt": "where does the agent runtime reconstruct deferred tools loaded in an earlier turn from persisted messages, and how are those tools put into the next model request? Return the defining production files and classes only.",
+      "gold": {
+        "files": [
+          "packages/@n8n/agents/src/runtime/loop/agent-runtime.ts",
+          "packages/@n8n/agents/src/runtime/loop/runtime-context.ts",
+          "packages/@n8n/agents/src/runtime/tools/deferred-tool-manager.ts"
+        ],
+        "symbols": [
+          "AgentRuntime",
+          "RuntimeContextBuilder",
+          "DeferredToolManager"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "DeferredToolManager",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        },
+        {
+          "symbol": "RuntimeContextBuilder",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        },
+        {
+          "symbol": "AgentRuntime",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        }
+      ]
+    },
+    {
+      "id": "n8n-scoped-memory-background-jobs",
+      "category": "background-workflow",
+      "prompt": "In the current n8n agent runtime, trace end-of-turn persistence into background observation-log and episodic-memory work, including the component that serializes jobs per observation scope and renews distributed locks while a task runs. Return only the three defining production files and three named classes for the runtime owner, memory orchestrator, and scoped task runner.",
+      "contamination_prompt": "where is end-of-turn agent memory persistence converted into background observation and episodic-memory work, and what component serializes that work per scope while renewing its lock? Return the defining production files and classes only.",
+      "gold": {
+        "files": [
+          "packages/@n8n/agents/src/runtime/loop/agent-runtime.ts",
+          "packages/@n8n/agents/src/runtime/memory/memory-orchestrator.ts",
+          "packages/@n8n/agents/src/runtime/memory/scoped-memory-task-runner.ts"
+        ],
+        "symbols": [
+          "AgentRuntime",
+          "MemoryOrchestrator",
+          "ScopedMemoryTaskRunner"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "AgentRuntime",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        },
+        {
+          "symbol": "MemoryOrchestrator",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        },
+        {
+          "symbol": "ScopedMemoryTaskRunner",
+          "date": "2026-06-17",
+          "commit": "30224e9a4158a130c70427210c92f95ac81b3d17"
+        }
+      ]
+    },
+    {
+      "id": "n8n-workflow-review-core-bridge",
+      "category": "plugin-to-core-workflow",
+      "prompt": "At the current n8n tip, trace how optional workflow-review policy plugs into generic workflow operations without core importing the review module: module registration, both proxy abstractions, the concrete publish and auto-close providers, and the core consumers for publish, archive/delete, and ownership transfer. Return only the seven defining production files and seven named classes; exclude repositories, errors, controllers, and tests.",
+      "contamination_prompt": "where does the optional workflow-review feature register its publish veto and lifecycle cleanup without core importing the feature, and which core services consume those hooks for publish, archive/delete, and ownership transfer? Return the defining production files and classes only.",
+      "gold": {
+        "files": [
+          "packages/cli/src/modules/workflow-reviews.ee/workflow-reviews.module.ts",
+          "packages/cli/src/modules/workflow-reviews.ee/workflow-review-publish-guard.service.ts",
+          "packages/cli/src/modules/workflow-reviews.ee/workflow-review-auto-close.service.ts",
+          "packages/cli/src/workflows/workflow-publish-guard-proxy.service.ts",
+          "packages/cli/src/workflows/workflow-mutation-hooks-proxy.service.ts",
+          "packages/cli/src/workflows/workflow.service.ts",
+          "packages/cli/src/workflows/workflow.service.ee.ts"
+        ],
+        "symbols": [
+          "WorkflowReviewsModule",
+          "WorkflowReviewPublishGuard",
+          "WorkflowReviewAutoCloseService",
+          "WorkflowPublishGuardProxy",
+          "WorkflowMutationHooksProxy",
+          "WorkflowService",
+          "EnterpriseWorkflowService"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "WorkflowReviewsModule",
+          "date": "2026-07-21",
+          "commit": "6d38f2ee392ce32f19859dd21bd82dc6f14c1679"
+        },
+        {
+          "symbol": "WorkflowReviewPublishGuard",
+          "date": "2026-07-30",
+          "commit": "eb07728511dc96a81c552bb55d0f7248c57d3367"
+        },
+        {
+          "symbol": "WorkflowReviewAutoCloseService",
+          "date": "2026-08-07",
+          "commit": "a044c0d1d8e40db29c89bb4e46e1a674b1ca96e8"
+        },
+        {
+          "symbol": "workflowMutationHooks core integration",
+          "date": "2026-08-07",
+          "commit": "a044c0d1d8e40db29c89bb4e46e1a674b1ca96e8"
+        }
+      ]
+    },
+    {
+      "id": "n8n-live-execution-redaction",
+      "category": "lazy-module-runtime-boundary",
+      "prompt": "At the current n8n tip, trace the optional execution-redaction implementation from lazy module initialization, through the no-op core proxy, into the editor's real-time execution push path that fails closed before sending node data. Return only the four defining production files and four named symbols for those boundaries; exclude strategies, tests, and persisted-execution API consumers.",
+      "contamination_prompt": "where is the optional execution-redaction implementation lazily installed behind a no-op core bridge and then applied fail-closed to real-time editor execution pushes? Return the defining production files and symbols only.",
+      "gold": {
+        "files": [
+          "packages/cli/src/modules/redaction/redaction.module.ts",
+          "packages/cli/src/executions/execution-redaction-proxy.service.ts",
+          "packages/cli/src/modules/redaction/executions/execution-redaction.service.ts",
+          "packages/cli/src/execution-lifecycle/execution-lifecycle-hooks.ts"
+        ],
+        "symbols": [
+          "RedactionModule",
+          "ExecutionRedactionServiceProxy",
+          "ExecutionRedactionService",
+          "hookFunctionsPush"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "RedactionModule",
+          "date": "2026-02-23",
+          "commit": "9edc271c09e8ec67286228f53a138de0e6d31c00"
+        },
+        {
+          "symbol": "ExecutionRedactionServiceProxy",
+          "date": "2026-02-26",
+          "commit": "37399989156e16fda0e2502686c64f4d80325e7d"
+        },
+        {
+          "symbol": "real-time push redaction integration",
+          "date": "2026-03-18",
+          "commit": "87595474e7d28b292f07b8e87869137d2d654c04"
+        }
+      ]
+    }
+  ]
+}

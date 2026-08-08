@@ -37,7 +37,7 @@ node scripts/eval-run-codex.mjs \
   --telemetry /tmp/jscout-telemetry.jsonl \
   --artifacts /tmp/jscout-artifacts \
   --model gpt-5.6-terra \
-  --reasoning low \
+  --reasoning high \
   --profiles grep,baseline,structural \
   --trial 001 \
   --require-jscout true
@@ -65,6 +65,42 @@ node scripts/eval-run-codex.mjs \
 
 The primary gate is answer correctness at lower
 `mean_source_rendered_bytes`; compression ratio alone is not a success metric.
+
+## Post-cutoff task admission
+
+For fast-moving repositories, mine candidate tasks from code introduced or
+materially reshaped after the model cutoff and retain the `git log -S` evidence
+in the task file. Before admitting a candidate, run the same execution model in
+an empty workspace with no repository or tools:
+
+```bash
+node scripts/eval-contamination-probe.mjs \
+  --tasks eval/tasks/n8n-post-cutoff-pilot.json \
+  --output /tmp/n8n-contamination.jsonl \
+  --artifacts /tmp/n8n-contamination-artifacts \
+  --model gpt-5.6-terra \
+  --reasoning high
+```
+
+The probe rejects tool-using runs and fully remembered file sets. Any partial
+file or symbol overlap is labelled `review` and is not automatically admitted.
+The no-tool rule is verified from Codex JSONL events rather than trusted from
+the prompt alone.
+
+Use Sol/high to review gold answers independently before execution. Blindly
+adjudicate exact-set disagreements after the run; do not silently rewrite gold
+to favor an arm.
+
+For repeated trials across multiple task sets, pool paired results with
+task-clustered bootstrap intervals:
+
+```bash
+node scripts/eval-pooled-report.mjs \
+  --tasks eval/tasks/n8n-post-cutoff-pilot.json,eval/tasks/twenty-post-cutoff-pilot.json \
+  --responses /tmp/n8n-seed1.jsonl,/tmp/twenty-seed1.jsonl \
+  --telemetry /tmp/n8n-seed1-telemetry.jsonl,/tmp/twenty-seed1-telemetry.jsonl \
+  --adjudications eval/results/post-cutoff-adjudications-2026-08-09.jsonl
+```
 
 Use new output paths for every run; the runner refuses non-empty response,
 telemetry, or artifact targets. Change `--trial` when repeating a task/profile
@@ -134,3 +170,5 @@ and returned bytes. Missing task/profile runs are listed explicitly.
 
 The fingerprinted `ai-pipe` task set is the first representative-repository P0
 run. It is a bounded direction gate, not a general product benchmark.
+The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
+[`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).

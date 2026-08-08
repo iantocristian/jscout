@@ -11,7 +11,7 @@ function parseArgs(argv) {
   const options = {
     codex: "codex",
     model: "gpt-5.6-terra",
-    reasoning: "low",
+    reasoning: "high",
     profiles: "baseline,structural",
     trial: "001",
   };

@@ -1,0 +1,8 @@
+{"task_id":"n8n-deferred-tool-resume","repository":"n8n","commit":"9d9e9bf97e8ae5382a930cd662637a9cf7046ef9","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"n8n-scoped-memory-background-jobs","repository":"n8n","commit":"9d9e9bf97e8ae5382a930cd662637a9cf7046ef9","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"n8n-workflow-review-core-bridge","repository":"n8n","commit":"9d9e9bf97e8ae5382a930cd662637a9cf7046ef9","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"n8n-live-execution-redaction","repository":"n8n","commit":"9d9e9bf97e8ae5382a930cd662637a9cf7046ef9","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"twenty-fireflies-call-sync","repository":"twenty","commit":"02a187d065354872c0f318b0723a1e7d8762ae00","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"twenty-pdl-post-install-workflow","repository":"twenty","commit":"02a187d065354872c0f318b0723a1e7d8762ae00","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"twenty-slack-assistant-queue","repository":"twenty","commit":"02a187d065354872c0f318b0723a1e7d8762ae00","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}
+{"task_id":"twenty-recall-webhook-routing","repository":"twenty","commit":"02a187d065354872c0f318b0723a1e7d8762ae00","model":"gpt-5.6-terra","reasoning":"high","tool_activity":[],"files":[],"symbols":[],"status":"clean"}

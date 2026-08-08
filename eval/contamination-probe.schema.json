@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "files", "symbols", "confidence"],
+  "properties": {
+    "answer": {
+      "type": "string"
+    },
+    "files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "symbols": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["known", "partial", "guess", "unknown"]
+    }
+  }
+}

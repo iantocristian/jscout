@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "profiles": ["grep", "baseline", "structural"],
+  "repository": {
+    "name": "twenty",
+    "commit": "02a187d065354872c0f318b0723a1e7d8762ae00",
+    "tracked_files": 27790,
+    "indexed_files": 22735,
+    "jscout_chunks": 75095,
+    "jscout_references": 298700,
+    "jscout_resolved_edges": 450576,
+    "jscout_member_calls": 134902,
+    "jscout_snapshot": "d16d6913368424fb58fdd8cd11b8ff9a34febfac5a649805d288d9b02e8c7682"
+  },
+  "experiment": {
+    "question": "Does jscout improve localization on cross-file Twenty workflows introduced after 2026-01-01 and not recoverable from model memory?",
+    "candidate_since": "2026-01-01",
+    "admission_gate": "Run the same model with no repository and no tools; reject complete file localization and manually review any partial overlap.",
+    "execution_model": "gpt-5.6-terra",
+    "execution_reasoning": "high",
+    "gold_review_model": "gpt-5.6-sol",
+    "gold_review_reasoning": "high",
+    "primary_metrics": ["correctness_rate", "file_recall", "symbol_recall"],
+    "secondary_metrics": ["mean_inspected_files", "mean_result_bytes", "mean_total_tokens", "mean_run_duration_ms"]
+  },
+  "tasks": [
+    {
+      "id": "twenty-fireflies-call-sync",
+      "category": "webhook-to-record-workflow",
+      "prompt": "At the current Twenty tip, trace a Fireflies transcript/summary webhook from the unauthenticated route wrapper through event selection, field-specific synchronization, and calendar-event matching. Return only the four defining production files and four named symbols at those boundaries; exclude API fetchers, data types, constants, and tests.",
+      "contamination_prompt": "where does a Fireflies transcript or summary webhook pass through event selection, field-specific CallRecording synchronization, and calendar-event matching? Return the defining production files and symbols only.",
+      "gold": {
+        "files": [
+          "packages/twenty-apps/public/fireflies/src/logic-functions/fireflies-webhook.ts",
+          "packages/twenty-apps/public/fireflies/src/logic-functions/handlers/fireflies-webhook-handler.ts",
+          "packages/twenty-apps/public/fireflies/src/logic-functions/utils/sync-fireflies-call-to-call-recording.util.ts",
+          "packages/twenty-apps/public/fireflies/src/logic-functions/utils/find-matching-calendar-event.ts"
+        ],
+        "symbols": [
+          "firefliesWebhookRouteHandler",
+          "firefliesWebhookHandler",
+          "syncFirefliesCallToCallRecording",
+          "findMatchingCalendarEvent"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "firefliesWebhookHandler",
+          "date": "2026-05-19",
+          "commit": "d345a6b2d61a648bc258b9ac165921438ecb808f"
+        },
+        {
+          "symbol": "findMatchingCalendarEvent",
+          "date": "2026-05-19",
+          "commit": "d345a6b2d61a648bc258b9ac165921438ecb808f"
+        },
+        {
+          "symbol": "syncFirefliesCallToCallRecording hardened lifecycle",
+          "date": "2026-07-31",
+          "commit": "f8ed432e2aa2c7df4031a9ddfde88c8a60d25de7"
+        }
+      ]
+    },
+    {
+      "id": "twenty-pdl-post-install-workflow",
+      "category": "installation-to-workflow-seeding",
+      "prompt": "At the current Twenty tip, trace People Data Labs post-install setup from installed logic-function resolution through idempotent enrichment-workflow discovery and workflow/version/step creation. Return only the three defining production files and three named symbols for post-install orchestration, workflow seeding, and existing-workflow lookup; exclude seed constants, builders, types, and tests.",
+      "contamination_prompt": "where does People Data Labs post-install setup resolve installed logic functions, avoid duplicate enrichment workflows, and create and activate the missing workflow version and logic-function step? Return the defining production files and symbols only.",
+      "gold": {
+        "files": [
+          "packages/twenty-apps/public/people-data-labs/src/logic-functions/handlers/post-install.ts",
+          "packages/twenty-apps/public/people-data-labs/src/logic-functions/utils/seed-enrichment-workflow.ts",
+          "packages/twenty-apps/public/people-data-labs/src/logic-functions/utils/find-existing-workflow-id.ts"
+        ],
+        "symbols": [
+          "postInstallCore",
+          "seedEnrichmentWorkflow",
+          "findExistingWorkflowId"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "postInstallCore",
+          "date": "2026-06-11",
+          "commit": "6756ea628dfc44a3c77d6c0947614a26c0ae10a3"
+        },
+        {
+          "symbol": "seedEnrichmentWorkflow",
+          "date": "2026-06-11",
+          "commit": "6756ea628dfc44a3c77d6c0947614a26c0ae10a3"
+        },
+        {
+          "symbol": "findExistingWorkflowId",
+          "date": "2026-06-11",
+          "commit": "6756ea628dfc44a3c77d6c0947614a26c0ae10a3"
+        }
+      ]
+    },
+    {
+      "id": "twenty-slack-assistant-queue",
+      "category": "routed-event-queue-worker",
+      "prompt": "At the current Twenty tip, trace a Slack assistant event from owner-workspace route resolution to request parsing/gating, idempotent request-record creation, and the database-event worker that runs the agent and replaces the placeholder response. Return only the four defining production files and four named symbols at those boundaries; exclude Slack API helpers, data access leaves, types, and tests.",
+      "contamination_prompt": "where does a Slack assistant event get routed to a workspace, parsed and gated, idempotently queued as a request record, and consumed by the database-event worker that runs the agent? Return the defining production files and symbols only.",
+      "gold": {
+        "files": [
+          "packages/twenty-apps/public/slack/src/logic-functions/slack-events-resolver.ts",
+          "packages/twenty-apps/public/slack/src/logic-functions/utils/enqueue-slack-assistant-request.ts",
+          "packages/twenty-apps/public/slack/src/logic-functions/utils/enqueue-slack-assistant-request-record.ts",
+          "packages/twenty-apps/public/slack/src/logic-functions/slack-assistant-worker.ts"
+        ],
+        "symbols": [
+          "slackEventsResolverHandler",
+          "enqueueSlackAssistantRequest",
+          "enqueueSlackAssistantRequestRecord",
+          "slackAssistantWorkerHandler"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "slackEventsResolverHandler",
+          "date": "2026-07-30",
+          "commit": "72322a4d722ce9ba8dd26cb5925d467572671450"
+        },
+        {
+          "symbol": "slackAssistantWorkerHandler",
+          "date": "2026-07-30",
+          "commit": "72322a4d722ce9ba8dd26cb5925d467572671450"
+        },
+        {
+          "symbol": "enqueueSlackAssistantRequest follow-up gating",
+          "date": "2026-08-07",
+          "commit": "fd85e64fe3c3b9826f6c09313b995b5f6d7e76e8"
+        }
+      ]
+    },
+    {
+      "id": "twenty-recall-webhook-routing",
+      "category": "signed-webhook-workspace-routing",
+      "prompt": "At the current Twenty tip, trace a Recall webhook from the server-route boundary through signature verification and workspace extraction, into the workspace-scoped processor and lifecycle handler. Return only the five defining production files and five named symbols for route resolution, verification, workspace extraction, scoped processing, and status/artifact handling; exclude constants, types, record data-access leaves, and tests.",
+      "contamination_prompt": "where does a Recall webhook get signature-verified, mapped to a Twenty workspace, dispatched to a workspace-scoped processor, and converted into CallRecording status or artifact-import work? Return the defining production files and symbols only.",
+      "gold": {
+        "files": [
+          "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-webhook.ts",
+          "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/verify-recall-webhook-signature.util.ts",
+          "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/extract-twenty-workspace-id-from-recall-webhook.util.ts",
+          "packages/twenty-apps/public/call-recorder/src/logic-functions/process-recall-webhook.ts",
+          "packages/twenty-apps/public/call-recorder/src/logic-functions/flows/handle-recall-webhook.util.ts"
+        ],
+        "symbols": [
+          "recallWebhookRouteHandler",
+          "verifyRecallWebhookSignature",
+          "extractTwentyWorkspaceIdFromRecallWebhook",
+          "processRecallWebhookHandler",
+          "handleRecallWebhook"
+        ]
+      },
+      "post_cutoff_evidence": [
+        {
+          "symbol": "recallWebhookRouteHandler",
+          "date": "2026-06-16",
+          "commit": "5cb8a091fc506b640ff670b1d6a106daf008e004"
+        },
+        {
+          "symbol": "verifyRecallWebhookSignature",
+          "date": "2026-06-16",
+          "commit": "5cb8a091fc506b640ff670b1d6a106daf008e004"
+        },
+        {
+          "symbol": "handleRecallWebhook",
+          "date": "2026-06-16",
+          "commit": "5cb8a091fc506b640ff670b1d6a106daf008e004"
+        }
+      ]
+    }
+  ]
+}

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "demo": "node examples/graph-memory/demo.mjs",
-    "test": "node --test examples/graph-memory/demo.test.mjs scripts/eval-report.test.mjs",
+    "test": "node --test examples/graph-memory/demo.test.mjs scripts/eval-contamination-probe.test.mjs scripts/eval-pooled-report.test.mjs scripts/eval-report.test.mjs",
     "eval:report": "node scripts/eval-report.mjs"
   }
 }

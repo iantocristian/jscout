@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reason", "missing_boundaries", "unjustified_boundaries"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["correct", "acceptable_alternative", "incorrect"]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "missing_boundaries": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "unjustified_boundaries": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

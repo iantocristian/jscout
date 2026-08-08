@@ -89,17 +89,23 @@ The first RI-1 slice is implemented:
   counterbalances profiles, captures structured answers, and joins telemetry;
 - the representative `ai-pipe` P0 run is complete; see
   [eval/results/ai-pipe-p0-2026-08-07.md](eval/results/ai-pipe-p0-2026-08-07.md);
+- the contamination-probed, post-cutoff n8n/Twenty run is complete; see
+  [eval/results/n8n-twenty-post-cutoff-2026-08-09.md](eval/results/n8n-twenty-post-cutoff-2026-08-09.md);
 - `jscout agent-guide --install <root>` ships the explicit project-local agent
   integration contract that MCP metadata alone did not deliver in Codex.
 
-P0 is complete as a bounded direction gate. The assisted comparison tied on
-correctness while structural retrieval reduced mean calls, irrelevant file
-reads, tokens, and wall time, but increased returned tool bytes by 59% and had
-no standalone `neighborhood` adoption. The unassisted pass had zero jscout
-uptake. Therefore expansion remains opt-in, explicit agent integration is part
-of the product contract, and this result does not establish a general accuracy
-gain. RI-1 still needs whole-response rendered-token budgeting and broader
-end-to-end MCP schema tests before SC-1's equal-budget comparison.
+P0 and the large-repository follow-up are complete as bounded direction gates.
+The first assisted comparison tied on correctness, while the later three-seed
+post-cutoff run scored grep 24/24 and both indexed profiles 23/24 after blind
+adjudication. Structural retrieval inspected 6.38 more irrelevant files than
+grep per paired run, with a task-clustered 95% interval of +1.00 to +12.38.
+Token and wall-time intervals crossed zero. Neither run had standalone
+`neighborhood` adoption; expanded search is the graph delivery vehicle. The
+unassisted pass had zero jscout uptake. Therefore expansion remains opt-in,
+explicit agent integration is part of the product contract, production-path
+filtering precedes further expansion work, and no general localization gain is
+claimed. Whole-response budgeting is complete; broader per-tool schema
+coverage remains incremental.
 
 The current release-build measurement on the frozen 690-file `ai-pipe` corpus
 is 182 ms for a full traversal-projection rebuild: 103 ms references, 31 ms
@@ -793,17 +799,21 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
-The discriminating grep/baseline/structural suite is complete. Grep and
-structural both scored 4/4; structural inspected fewer files but consumed 73%
-more agent tokens, so RI-2 graph expansion and standalone `neighborhood` tuning
-have not earned priority. The immediate next step is the bounded SC-2a
-workflow/write-back experiment. Expansion remains opt-in. The failed first
-SC-1 gate keeps full source as the default and requires a paired-artifact
-compression benchmark before another source-view agent run. Retrieval cleanup
-should add production-path filtering because poor initial hits still seed graph
-expansion with tests and build scripts. Broad workflow coverage benefits from
-routes/events/tables, but the bounded experiment does not wait for every EN-1
-extractor. Cards and summaries must earn separate implementation effort.
+The contamination-probed n8n/Twenty suite is complete: 72 Terra/high runs over
+eight post-cutoff tasks and three trials. Grep scored 24/24; baseline and
+structural each scored 23/24 after blind Sol adjudication. Structural retrieval
+read significantly more irrelevant files, mostly tests, fixtures, generated
+files, and adjacent framework code. RI-2 expansion breadth and standalone
+`neighborhood` UX have not earned priority. The immediate retrieval step is
+production/test/fixture/generated file-role classification plus search and
+expansion filtering. Then proceed with the bounded SC-2a workflow/write-back
+experiment, whose questions must test semantic workflow participation rather
+than repeat L1 localization. Expansion remains opt-in. The failed first SC-1
+gate keeps full source as the default and requires a paired-artifact compression
+benchmark before another source-view agent run. Broad workflow coverage
+benefits from routes/events/tables, but the bounded experiment does not wait for
+every EN-1 extractor. Cards and summaries must earn separate implementation
+effort.
 
 ## Explicitly deferred
 
