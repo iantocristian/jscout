@@ -805,10 +805,12 @@ structural each scored 23/24 after blind Sol adjudication. Structural retrieval
 read significantly more irrelevant files, mostly tests, fixtures, generated
 files, and adjacent framework code. RI-2 expansion breadth and standalone
 `neighborhood` UX have not earned priority. Deterministic file roles plus
-search filters and pre-budget expansion filtering/penalties are implemented;
-the pre-registered n8n/Twenty re-run is the remaining L1 gate. Then proceed
-with the bounded SC-2a workflow/write-back experiment, whose questions must
-test semantic workflow participation rather than repeat L1 localization.
+search filters and pre-budget expansion filtering/penalties passed their
+pre-registered gate: structural irrelevant inspection fell to +1.08 versus
+grep with an interval including zero, while all arms scored 24/24. L1 retrieval
+investment closes here. Proceed with the bounded SC-2a workflow/write-back
+experiment, whose questions must test semantic workflow participation rather
+than repeat L1 localization.
 Expansion remains opt-in. The failed first SC-1
 gate keeps full source as the default and requires a paired-artifact compression
 benchmark before another source-view agent run. Broad workflow coverage

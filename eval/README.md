@@ -196,3 +196,5 @@ run. It is a bounded direction gate, not a general product benchmark.
   [protocols/two-session-memory.md](protocols/two-session-memory.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
+The pre-registered file-role re-run is recorded in
+[`results/file-roles-rerun-2026-08-09.md`](results/file-roles-rerun-2026-08-09.md).
