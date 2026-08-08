@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE NOT NULL,
-  hash TEXT NOT NULL
+  hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'unknown'
 );
 
 CREATE TABLE IF NOT EXISTS chunks(
@@ -299,8 +300,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    if version < 5 {
+        if !has_column(conn, "files", "role")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
+                [],
+            )?;
+        }
+        // Role-aware result payloads must not appear current until every file
+        // has passed through the classifier on the next index operation.
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','4')
+        "INSERT INTO meta(key, value) VALUES('schema_version','5')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -364,7 +377,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -407,7 +420,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -416,6 +429,33 @@ mod tests {
         assert_eq!(member_call, (0, 7));
         let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
         assert!(hash.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v4_files_with_unknown_roles_and_invalidates_snapshot() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let db_path = repo.path().join(".jscout.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '4');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '2');
+             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
+             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let role: String = conn.query_row("SELECT role FROM files WHERE id=1", [], |r| r.get(0))?;
+        assert_eq!(role, "unknown");
+        let snapshots: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(snapshots, 0);
         Ok(())
     }
 }

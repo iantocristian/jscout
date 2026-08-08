@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{query::ModuleGraph, store};
+use crate::{file_role, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "2";
+pub const PROJECTION_VERSION: &str = "3";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -45,6 +45,8 @@ pub struct GraphNode {
     pub kind: String,
     pub display_name: String,
     pub file: Option<String>,
+    /// Deterministic role of the backing file; absent for package/event hubs.
+    pub file_role: Option<String>,
     pub line: Option<i64>,
     pub meta: Value,
     /// Query-local path relevance; not part of persistent graph identity.
@@ -74,6 +76,7 @@ struct RankedStep {
     confidence_floor: f64,
     relation_floor: f64,
     hub_floor: f64,
+    role_floor: f64,
     score: f64,
 }
 
@@ -113,6 +116,10 @@ pub struct NeighborhoodOptions {
     pub edge_limit: usize,
     pub min_confidence: String,
     pub kinds: Vec<String>,
+    /// Empty means every role. Hubs without a backing file always remain eligible.
+    pub file_roles: Vec<String>,
+    /// Apply deterministic non-production penalties before traversal budgets.
+    pub penalize_file_roles: bool,
 }
 
 impl Default for NeighborhoodOptions {
@@ -125,6 +132,8 @@ impl Default for NeighborhoodOptions {
             edge_limit: 200,
             min_confidence: "likely".into(),
             kinds: Vec::new(),
+            file_roles: Vec::new(),
+            penalize_file_roles: false,
         }
     }
 }
@@ -151,14 +160,22 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-structural-snapshot\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
-    let mut stmt = conn.prepare("SELECT path, hash FROM files ORDER BY path")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut stmt = conn.prepare("SELECT path, hash, role FROM files ORDER BY path")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
     for row in rows {
-        let (path, hash) = row?;
+        let (path, hash, role) = row?;
         hasher.update(b"\0");
         hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(role.as_bytes());
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -765,6 +782,7 @@ fn neighborhood_in_snapshot(
     if confidence_rank(&options.min_confidence).is_none() {
         bail!("min confidence must be one of: certain, likely, possible");
     }
+    file_role::validate_all(&options.file_roles)?;
     if options.node_limit == 0 || options.edge_limit == 0 {
         bail!("node and edge limits must be greater than zero");
     }
@@ -776,6 +794,8 @@ fn neighborhood_in_snapshot(
         &snapshot,
     )?;
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
+    let allowed_file_roles: HashSet<&str> =
+        options.file_roles.iter().map(String::as_str).collect();
     let min_rank = confidence_rank(&options.min_confidence).unwrap();
     let mut discovered = HashSet::from([resolved_anchor.clone()]);
     let mut node_relevance = HashMap::from([(resolved_anchor.clone(), 1.0_f64)]);
@@ -795,9 +815,11 @@ fn neighborhood_in_snapshot(
             hub_damping(root_degree),
             1.0,
             1.0,
+            1.0,
             options,
             min_rank,
             &allowed_kinds,
+            &allowed_file_roles,
             &mut degree_cache,
             &mut frontier,
         )?;
@@ -830,9 +852,11 @@ fn neighborhood_in_snapshot(
                 step.confidence_floor,
                 step.relation_floor,
                 step.hub_floor,
+                step.role_floor,
                 options,
                 min_rank,
                 &allowed_kinds,
+                &allowed_file_roles,
                 &mut degree_cache,
                 &mut frontier,
             )?;
@@ -874,9 +898,11 @@ fn enqueue_ranked_steps(
     confidence_floor: f64,
     relation_floor: f64,
     hub_floor: f64,
+    role_floor: f64,
     options: &NeighborhoodOptions,
     min_rank: u8,
     allowed_kinds: &HashSet<&str>,
+    allowed_file_roles: &HashSet<&str>,
     degree_cache: &mut HashMap<String, usize>,
     frontier: &mut BinaryHeap<RankedStep>,
 ) -> Result<()> {
@@ -888,13 +914,19 @@ fn enqueue_ranked_steps(
     for direction in directions {
         let sql = if *direction == "out" {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json
-             FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
+                    f.path, e.line, e.detail_json, other_file.role
+             FROM resolved_edges e
+             LEFT JOIN files f ON e.source_file_id = f.id
+             LEFT JOIN graph_nodes other ON other.node_key=e.dst_key
+             LEFT JOIN files other_file ON other.file_id=other_file.id
              WHERE e.src_key = ?1"
         } else {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json
-             FROM resolved_edges e LEFT JOIN files f ON e.source_file_id = f.id
+                    f.path, e.line, e.detail_json, other_file.role
+             FROM resolved_edges e
+             LEFT JOIN files f ON e.source_file_id = f.id
+             LEFT JOIN graph_nodes other ON other.node_key=e.src_key
+             LEFT JOIN files other_file ON other.file_id=other_file.id
              WHERE e.dst_key = ?1"
         };
         let mut stmt = conn.prepare_cached(sql)?;
@@ -913,12 +945,17 @@ fn enqueue_ranked_steps(
                     detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
                     relevance: 0.0,
                 },
+                r.get::<_, Option<String>>(9)?,
             ))
         })?;
         for row in rows {
-            let (edge_id, mut edge) = row?;
+            let (edge_id, mut edge, other_file_role) = row?;
             if confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
                 || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
+                || (!allowed_file_roles.is_empty()
+                    && other_file_role
+                        .as_deref()
+                        .is_some_and(|role| !allowed_file_roles.contains(role)))
             {
                 continue;
             }
@@ -938,12 +975,18 @@ fn enqueue_ranked_steps(
             let confidence_floor = confidence_floor.min(confidence_weight(&edge.confidence));
             let relation_floor = relation_floor.min(relation_weight(&edge.kind));
             let hub_floor = hub_floor.min(hub_damping(degree));
+            let role_floor = if options.penalize_file_roles {
+                role_floor.min(file_role::penalty(other_file_role.as_deref()))
+            } else {
+                role_floor
+            };
             let next_depth = depth + 1;
             let score = round_score(
                 confidence_floor
                     * relation_floor
                     * distance_decay(next_depth)
-                    * hub_floor,
+                    * hub_floor
+                    * role_floor,
             );
             edge.relevance = score;
             frontier.push(RankedStep {
@@ -954,6 +997,7 @@ fn enqueue_ranked_steps(
                 confidence_floor,
                 relation_floor,
                 hub_floor,
+                role_floor,
                 score,
             });
         }
@@ -1110,18 +1154,19 @@ fn file_candidates(conn: &Connection, path: &str) -> Result<Vec<String>> {
 
 fn load_node(conn: &Connection, key: &str) -> Result<Option<GraphNode>> {
     let mut stmt = conn.prepare(
-        "SELECT g.node_key, g.node_kind, g.display_name, f.path, g.line, g.meta_json
+        "SELECT g.node_key, g.node_kind, g.display_name, f.path, f.role, g.line, g.meta_json
          FROM graph_nodes g LEFT JOIN files f ON g.file_id=f.id WHERE g.node_key=?1",
     )?;
     let node = stmt
         .query_row([key], |r| {
-            let meta: String = r.get(5)?;
+            let meta: String = r.get(6)?;
             Ok(GraphNode {
                 key: r.get(0)?,
                 kind: r.get(1)?,
                 display_name: r.get(2)?,
                 file: r.get(3)?,
-                line: r.get(4)?,
+                file_role: r.get(4)?,
+                line: r.get(5)?,
                 meta: serde_json::from_str(&meta).unwrap_or(Value::Null),
                 relevance: 0.0,
             })
@@ -1285,6 +1330,8 @@ mod tests {
                 min_confidence: "possible".into(),
                 kinds: Vec::new(),
                 expected_snapshot: None,
+                file_roles: Vec::new(),
+                penalize_file_roles: false,
             },
         )?;
         assert!(result.truncated);

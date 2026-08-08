@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, store, structural};
+use crate::{embed, file_role, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -17,6 +17,8 @@ pub struct ExpansionOptions {
     pub edge_limit: usize,
     pub byte_limit: usize,
     pub min_confidence: String,
+    /// Eligible file-backed expansion roles. Empty means all roles.
+    pub file_roles: Vec<String>,
 }
 
 impl Default for ExpansionOptions {
@@ -28,6 +30,10 @@ impl Default for ExpansionOptions {
             edge_limit: 120,
             byte_limit: 24_000,
             min_confidence: "likely".into(),
+            file_roles: file_role::DEFAULT_EXPANSION
+                .iter()
+                .map(|role| (*role).to_string())
+                .collect(),
         }
     }
 }
@@ -39,6 +45,8 @@ pub struct SearchOptions {
     /// Maximum bytes in the pretty-printed JSON search envelope. This covers
     /// hits, expansion, metadata, and serialization overhead.
     pub response_byte_limit: usize,
+    /// Optional role allowlist for primary hits. Empty preserves normal recall.
+    pub file_roles: Vec<String>,
     pub expansion: ExpansionOptions,
 }
 
@@ -48,6 +56,7 @@ impl Default for SearchOptions {
             limit: 8,
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
+            file_roles: Vec::new(),
             expansion: ExpansionOptions::default(),
         }
     }
@@ -82,6 +91,7 @@ pub struct SearchExpansion {
     pub node_limit: usize,
     pub edge_limit: usize,
     pub byte_limit: usize,
+    pub file_roles: Vec<String>,
     pub payload_bytes: usize,
     pub truncated: bool,
 }
@@ -90,6 +100,7 @@ pub struct SearchExpansion {
 pub struct Hit {
     pub chunk_id: i64,
     pub file: String,
+    pub file_role: String,
     pub kind: String,
     pub name: Option<String>,
     pub start_line: i64,
@@ -222,9 +233,11 @@ pub fn search(
     q: &str,
     options: &SearchOptions,
 ) -> Result<SearchResult> {
+    file_role::validate_all(&options.file_roles)?;
+    file_role::validate_all(&options.expansion.file_roles)?;
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let hits = ranked_hits(conn, provider, q, options.limit)?;
+        let hits = ranked_hits(conn, provider, q, options.limit, &options.file_roles)?;
         let expansion = options
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion))
@@ -248,6 +261,7 @@ fn ranked_hits(
     provider: Option<&embed::Provider>,
     q: &str,
     limit: usize,
+    file_roles: &[String],
 ) -> Result<Vec<Hit>> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
@@ -314,9 +328,16 @@ fn ranked_hits(
     }
 
     let mut hits = Vec::new();
-    for (chunk_id, score) in fused.into_iter().take(limit) {
+    let allowed_roles: HashSet<&str> = file_roles.iter().map(String::as_str).collect();
+    for (chunk_id, score) in fused {
         if let Some(hit) = load_hit(conn, chunk_id, score)? {
+            if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
+                continue;
+            }
             hits.push(hit);
+            if hits.len() >= limit {
+                break;
+            }
         }
     }
     Ok(hits)
@@ -325,24 +346,25 @@ fn ranked_hits(
 fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
-            "SELECT f.path, c.kind, c.name, c.start_line, c.end_line, c.content, c.symbols, c.file_id
+            "SELECT f.path, f.role, c.kind, c.name, c.start_line, c.end_line, c.content, c.symbols, c.file_id
              FROM chunks c JOIN files f ON c.file_id = f.id WHERE c.id = ?1",
             [chunk_id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                     r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(5)?,
                     r.get::<_, String>(6)?,
-                    r.get::<_, i64>(7)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
                 ))
             },
         )
         .ok();
-    let Some((file, kind, name, start_line, end_line, content, symbols, _file_id)) = row else {
+    let Some((file, role, kind, name, start_line, end_line, content, symbols, _file_id)) = row else {
         return Ok(None);
     };
     let anchors = project_chunk_anchors(conn, chunk_id, &file, name.as_deref())?;
@@ -376,6 +398,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
     Ok(Some(Hit {
         chunk_id,
         file,
+        file_role: role,
         kind,
         name,
         start_line,
@@ -581,11 +604,15 @@ fn expand_hits(
 
     let mut seeds = Vec::new();
     let mut seen_seeds = HashSet::new();
+    let allowed_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
     // Prefer declaration anchors across the ranked set. Import/module chunks
     // often outrank the implementation they mention; letting those file
     // fallbacks consume every seed would turn expansion into an import listing.
     for file_fallbacks in [false, true] {
         for hit in hits {
+            if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
+                continue;
+            }
             for anchor in &hit.anchors {
                 if anchor.starts_with("file:") != file_fallbacks {
                     continue;
@@ -621,6 +648,8 @@ fn expand_hits(
                 edge_limit: options.edge_limit,
                 min_confidence: options.min_confidence.clone(),
                 kinds: Vec::new(),
+                file_roles: options.file_roles.clone(),
+                penalize_file_roles: true,
             },
         )?;
         truncated |= neighborhood.truncated;
@@ -702,6 +731,7 @@ fn expand_hits(
         node_limit: options.node_limit,
         edge_limit: options.edge_limit,
         byte_limit: options.byte_limit,
+        file_roles: options.file_roles.clone(),
         payload_bytes,
         truncated,
     })
@@ -718,7 +748,7 @@ mod tests {
         SearchOptions, SearchResult, apply_response_budget, search,
     };
     use crate::{
-        indexer, store,
+        file_role, indexer, store,
         structural::{GraphEdge, GraphNode},
     };
 
@@ -775,6 +805,7 @@ mod tests {
             &SearchOptions {
                 limit: 8,
                 expand: true,
+                file_roles: Vec::new(),
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
@@ -783,6 +814,10 @@ mod tests {
                     edge_limit: 1,
                     byte_limit: 1_500,
                     min_confidence: "likely".into(),
+                    file_roles: file_role::DEFAULT_EXPANSION
+                        .iter()
+                        .map(|role| (*role).to_string())
+                        .collect(),
                 },
             },
         )?;
@@ -799,6 +834,7 @@ mod tests {
             &SearchOptions {
                 limit: 8,
                 expand: true,
+                file_roles: Vec::new(),
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions { byte_limit: 1, ..Default::default() },
             },
@@ -850,6 +886,7 @@ mod tests {
             kind: "symbol".into(),
             display_name: key.into(),
             file: None,
+            file_role: None,
             line: None,
             meta: serde_json::json!({}),
             relevance,
@@ -875,6 +912,7 @@ mod tests {
                 node_limit: 3,
                 edge_limit: 2,
                 byte_limit: 10_000,
+                file_roles: vec!["production".into(), "unknown".into()],
                 payload_bytes: 0,
                 truncated: false,
             }),
@@ -891,6 +929,79 @@ mod tests {
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
         assert!(result.response_budget.rendered_bytes <= 1_500);
+        Ok(())
+    }
+
+    #[test]
+    fn file_roles_tag_hits_and_filter_search_and_expansion_before_budgets() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src"))?;
+        fs::create_dir_all(repo.path().join("tests"))?;
+        fs::write(
+            repo.path().join("src/service.ts"),
+            "export function performRoleFilteredWork() { return 1; }\n",
+        )?;
+        fs::write(
+            repo.path().join("tests/service.test.ts"),
+            "import { performRoleFilteredWork } from '../src/service';\nexport function exerciseRoleFilteredWork() { return performRoleFilteredWork(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let test_only = search(
+            &conn,
+            None,
+            "performRoleFilteredWork",
+            &SearchOptions {
+                file_roles: vec!["test".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(!test_only.hits.is_empty());
+        assert!(test_only.hits.iter().all(|hit| hit.file_role == "test"));
+
+        let production_expansion = search(
+            &conn,
+            None,
+            "performRoleFilteredWork",
+            &SearchOptions {
+                expand: true,
+                ..Default::default()
+            },
+        )?
+        .expansion
+        .expect("expansion context pack");
+        assert_eq!(
+            production_expansion.file_roles,
+            vec!["production".to_string(), "unknown".to_string()]
+        );
+        assert!(production_expansion.nodes.iter().all(|node| {
+            node.file_role
+                .as_deref()
+                .is_none_or(|role| matches!(role, "production" | "unknown"))
+        }));
+
+        let all_roles = search(
+            &conn,
+            None,
+            "performRoleFilteredWork",
+            &SearchOptions {
+                expand: true,
+                expansion: ExpansionOptions {
+                    file_roles: Vec::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?
+        .expansion
+        .expect("expansion context pack");
+        assert!(
+            all_roles
+                .nodes
+                .iter()
+                .any(|node| node.file_role.as_deref() == Some("test"))
+        );
         Ok(())
     }
 }

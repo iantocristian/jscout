@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::graph::{self, FileGraph};
-use crate::{parse, store, walk};
+use crate::{file_role, parse, store, walk};
 
 pub struct IndexOutcome {
     pub indexed: usize,
@@ -62,10 +62,17 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
         refs: 0,
     };
 
-    let existing: HashMap<String, (i64, String)> = {
-        let mut stmt = conn.prepare("SELECT path, id, hash FROM files")?;
+    let existing: HashMap<String, (i64, String, String)> = {
+        let mut stmt = conn.prepare("SELECT path, id, hash, role FROM files")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ),
+            ))
         })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
@@ -80,8 +87,12 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
             continue;
         };
         let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-        if let Some((_, old_hash)) = existing.get(&rel)
+        let role = file_role::classify(Path::new(&rel), &source);
+        if let Some((id, old_hash, old_role)) = existing.get(&rel)
             && *old_hash == hash {
+                if old_role != role {
+                    conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
+                }
                 outcome.unchanged += 1;
                 continue;
             }
@@ -90,10 +101,10 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
         }
         match extract_file(file, &rel, &source) {
             Ok(data) => {
-                if let Some((old_id, _)) = existing.get(&rel) {
+                if let Some((old_id, _, _)) = existing.get(&rel) {
                     store::delete_file(conn, *old_id)?;
                 }
-                let (nchunks, nrefs) = insert_file(conn, &rel, &hash, &data)?;
+                let (nchunks, nrefs) = insert_file(conn, &rel, &hash, role, &data)?;
                 outcome.indexed += 1;
                 outcome.chunks += nchunks;
                 outcome.refs += nrefs;
@@ -105,7 +116,7 @@ pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
         }
     }
     // Remove files that disappeared from disk.
-    for (path, (id, _)) in &existing {
+    for (path, (id, _, _)) in &existing {
         if !seen.contains(path) {
             store::delete_file(conn, *id)?;
         }
@@ -143,8 +154,17 @@ fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
     })
 }
 
-fn insert_file(conn: &Connection, rel: &str, hash: &str, data: &FileData) -> Result<(usize, usize)> {
-    conn.execute("INSERT INTO files(path, hash) VALUES(?1, ?2)", params![rel, hash])?;
+fn insert_file(
+    conn: &Connection,
+    rel: &str,
+    hash: &str,
+    role: &str,
+    data: &FileData,
+) -> Result<(usize, usize)> {
+    conn.execute(
+        "INSERT INTO files(path, hash, role) VALUES(?1, ?2, ?3)",
+        params![rel, hash, role],
+    )?;
     let file_id = conn.last_insert_rowid();
 
     // Chunk spans for assigning refs to chunks (sorted by construction).

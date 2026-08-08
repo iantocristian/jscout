@@ -2,6 +2,7 @@
 //! Exposes the index to agents: semantic_search, who_uses, definition,
 //! file_outline, events, neighborhood.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -180,6 +181,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
                     "limit": { "type": "integer", "default": 8 },
+                    "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional primary-hit role allowlist; omitted means all roles" },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered result, including hits, expansion, metadata, and JSON overhead" },
                     "expand": { "type": "boolean", "default": false, "description": "Attach a separately labelled structural context pack; off by default" },
                     "expand_depth": { "type": "integer", "default": 1 },
@@ -187,7 +189,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "expand_nodes": { "type": "integer", "default": 40 },
                     "expand_edges": { "type": "integer", "default": 120 },
                     "expand_bytes": { "type": "integer", "default": 24000 },
-                    "expand_min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" }
+                    "expand_min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
+                    "expand_file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "default": ["production", "unknown"], "description": "Expansion role allowlist. Non-production roles are penalized before budgets when explicitly included; [] includes all roles" }
                 },
                 "required": ["query"]
             }
@@ -251,7 +254,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "node_limit": { "type": "integer", "default": 50 },
                     "edge_limit": { "type": "integer", "default": 200 },
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
-                    "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" }
+                    "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
+                    "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" }
                 },
                 "required": ["anchor"]
             }
@@ -273,6 +277,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "expand_edges",
                 "expand_bytes",
                 "expand_min_confidence",
+                "expand_file_roles",
             ] {
                 properties.remove(key);
             }
@@ -305,6 +310,7 @@ fn call_tool(
                 &search::SearchOptions {
                     limit,
                     expand,
+                    file_roles: json_string_array(args, "file_roles"),
                     response_byte_limit: args["response_bytes"]
                         .as_u64()
                         .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
@@ -319,6 +325,14 @@ fn call_tool(
                             .as_str()
                             .unwrap_or("likely")
                             .to_string(),
+                        file_roles: if args.get("expand_file_roles").is_some() {
+                            json_string_array(args, "expand_file_roles")
+                        } else {
+                            crate::file_role::DEFAULT_EXPANSION
+                                .iter()
+                                .map(|role| (*role).to_string())
+                                .collect()
+                        },
                     },
                 },
             )?;
@@ -450,12 +464,29 @@ fn call_tool(
                             .collect()
                     })
                     .unwrap_or_default(),
+                file_roles: json_string_array(args, "file_roles"),
+                penalize_file_roles: args["file_roles"]
+                    .as_array()
+                    .is_some_and(|roles| !roles.is_empty()),
             };
             let result = structural::neighborhood(conn, anchor, &options)?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
+}
+
+fn json_string_array(args: &Value, key: &str) -> Vec<String> {
+    args[key]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn render_bounded_items(field: &str, items: Vec<Value>, byte_limit: usize) -> Result<String> {
@@ -565,6 +596,11 @@ fn log_tool_call(
             )
         })
         .unwrap_or_default();
+    let expansion_metrics = result
+        .as_ref()
+        .ok()
+        .map(|text| expansion_role_metrics(text))
+        .unwrap_or_default();
     let profile_label = std::env::var("JSCOUT_PROFILE_LABEL")
         .unwrap_or_else(|_| profile.as_str().to_string());
     let record = json!({
@@ -582,6 +618,10 @@ fn log_tool_call(
         "source_rendered_bytes": source_metrics.1,
         "source_original_bytes": source_metrics.2,
         "source_budget_truncations": source_metrics.3,
+        "expansion_nodes": expansion_metrics.nodes,
+        "expansion_file_nodes": expansion_metrics.file_nodes,
+        "expansion_role_counts": expansion_metrics.role_counts,
+        "expansion_test_fixture_generated_nodes": expansion_metrics.test_fixture_generated,
         "snapshot": snapshot,
     });
     if serde_json::to_writer(&mut *file, &record).is_err()
@@ -590,6 +630,38 @@ fn log_tool_call(
     {
         eprintln!("warning: failed to write jscout MCP telemetry");
     }
+}
+
+#[derive(Default)]
+struct ExpansionRoleMetrics {
+    nodes: usize,
+    file_nodes: usize,
+    role_counts: BTreeMap<String, usize>,
+    test_fixture_generated: usize,
+}
+
+fn expansion_role_metrics(text: &str) -> ExpansionRoleMetrics {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return ExpansionRoleMetrics::default();
+    };
+    let Some(nodes) = value["expansion"]["nodes"].as_array() else {
+        return ExpansionRoleMetrics::default();
+    };
+    let mut metrics = ExpansionRoleMetrics {
+        nodes: nodes.len(),
+        ..Default::default()
+    };
+    for node in nodes {
+        let Some(role) = node["file_role"].as_str() else {
+            continue;
+        };
+        metrics.file_nodes += 1;
+        *metrics.role_counts.entry(role.to_string()).or_default() += 1;
+        if matches!(role, "test" | "fixture" | "generated") {
+            metrics.test_fixture_generated += 1;
+        }
+    }
+    metrics
 }
 
 #[cfg(test)]
@@ -601,7 +673,10 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
 
-    use super::{ToolProfile, call_tool, render_bounded_items, server_instructions, tool_defs};
+    use super::{
+        ToolProfile, call_tool, expansion_role_metrics, render_bounded_items,
+        server_instructions, tool_defs,
+    };
     use crate::{indexer, scout::SourceView, store};
 
     #[test]
@@ -719,5 +794,25 @@ mod tests {
         assert_eq!(value["response_budget"]["truncated"], true);
         assert!(value["outline"].as_array().unwrap().len() < 100);
         Ok(())
+    }
+
+    #[test]
+    fn telemetry_counts_expansion_file_roles_without_recording_payloads() {
+        let metrics = expansion_role_metrics(
+            &json!({
+                "expansion": {
+                    "nodes": [
+                        { "file_role": "production" },
+                        { "file_role": "test" },
+                        { "file_role": null }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(metrics.nodes, 3);
+        assert_eq!(metrics.file_nodes, 2);
+        assert_eq!(metrics.role_counts["production"], 1);
+        assert_eq!(metrics.test_fixture_generated, 1);
     }
 }

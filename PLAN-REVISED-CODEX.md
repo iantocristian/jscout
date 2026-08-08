@@ -54,7 +54,7 @@ capability rather than by declaring every original milestone complete.
 | Patch graph edges for changed files and their dependency closure | References are replaced per changed file and module edges are rebuilt globally; no dependency-closure invalidator |
 | Route-table and DI-token heuristics | Not implemented; routes move to deterministic entity extraction; DI tokens remain unscheduled |
 | Constant-prefix dynamic imports | Not implemented; only literal strings and expression-free templates are indexed |
-| Expanded search acceptance | Search-to-anchor projection, ranked opt-in expansion, and whole-response budgets are implemented; the three-seed n8n/Twenty evaluation found no localization win and significantly more irrelevant inspection under structural retrieval, so expansion remains opt-in pending production-path filtering |
+| Expanded search acceptance | Search-to-anchor projection, ranked opt-in expansion, whole-response budgets, deterministic file roles, and pre-budget role filtering/penalties are implemented; the three-seed n8n/Twenty evaluation found no localization win and significantly more irrelevant inspection under structural retrieval, so expansion remains opt-in pending the pre-registered file-role re-run |
 | Repo map, paths, graph export | Not implemented; later structural-retrieval phase |
 | Real-provider embedding verification | Provider plumbing and mock-compatible verification exist; repeatable real-provider acceptance remains environment-dependent |
 | Runtime trace tier | Not implemented and not on the near-term critical path |

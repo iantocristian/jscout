@@ -1,6 +1,7 @@
 mod agent;
 mod chunk;
 mod embed;
+mod file_role;
 mod graph;
 mod heur;
 mod indexer;
@@ -64,6 +65,9 @@ enum Command {
         /// Max results
         #[arg(short = 'k', long, default_value_t = 8)]
         limit: usize,
+        /// Restrict primary hits to a file role (repeatable)
+        #[arg(long = "file-role")]
+        file_roles: Vec<String>,
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = search::DEFAULT_RESPONSE_BYTE_LIMIT)]
         response_bytes: usize,
@@ -94,6 +98,9 @@ enum Command {
         /// Lowest expansion confidence: certain, likely, or possible
         #[arg(long, default_value = "likely")]
         expand_min_confidence: String,
+        /// Restrict expansion to a file role (repeatable; defaults to production/unknown)
+        #[arg(long = "expand-file-role", default_values_t = [String::from("production"), String::from("unknown")])]
+        expand_file_roles: Vec<String>,
     },
     /// List string-keyed event wiring (emit/listen sites)
     Events {
@@ -161,6 +168,9 @@ enum Command {
         /// Restrict traversal to an edge kind (repeatable)
         #[arg(long = "kind")]
         kinds: Vec<String>,
+        /// Restrict traversal to a file role (repeatable)
+        #[arg(long = "file-role")]
+        file_roles: Vec<String>,
     },
     /// Print or install the jscout agent-integration skill
     AgentGuide {
@@ -181,6 +191,7 @@ fn main() -> Result<()> {
             root,
             query,
             limit,
+            file_roles,
             response_bytes,
             no_vector,
             json,
@@ -191,6 +202,7 @@ fn main() -> Result<()> {
             expand_edges,
             expand_bytes,
             expand_min_confidence,
+            expand_file_roles,
         } => cmd_search(
             &root,
             &query,
@@ -199,6 +211,7 @@ fn main() -> Result<()> {
             search::SearchOptions {
                 limit,
                 expand,
+                file_roles,
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -207,6 +220,7 @@ fn main() -> Result<()> {
                     edge_limit: expand_edges,
                     byte_limit: expand_bytes,
                     min_confidence: expand_min_confidence,
+                    file_roles: expand_file_roles,
                 },
             },
         ),
@@ -231,6 +245,7 @@ fn main() -> Result<()> {
             edge_limit,
             min_confidence,
             kinds,
+            file_roles,
         } => cmd_neighborhood(
             &root,
             &anchor,
@@ -242,6 +257,8 @@ fn main() -> Result<()> {
                 edge_limit,
                 min_confidence,
                 kinds,
+                penalize_file_roles: !file_roles.is_empty(),
+                file_roles,
             },
         ),
         Command::AgentGuide { install } => {

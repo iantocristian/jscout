@@ -804,11 +804,12 @@ eight post-cutoff tasks and three trials. Grep scored 24/24; baseline and
 structural each scored 23/24 after blind Sol adjudication. Structural retrieval
 read significantly more irrelevant files, mostly tests, fixtures, generated
 files, and adjacent framework code. RI-2 expansion breadth and standalone
-`neighborhood` UX have not earned priority. The immediate retrieval step is
-production/test/fixture/generated file-role classification plus search and
-expansion filtering. Then proceed with the bounded SC-2a workflow/write-back
-experiment, whose questions must test semantic workflow participation rather
-than repeat L1 localization. Expansion remains opt-in. The failed first SC-1
+`neighborhood` UX have not earned priority. Deterministic file roles plus
+search filters and pre-budget expansion filtering/penalties are implemented;
+the pre-registered n8n/Twenty re-run is the remaining L1 gate. Then proceed
+with the bounded SC-2a workflow/write-back experiment, whose questions must
+test semantic workflow participation rather than repeat L1 localization.
+Expansion remains opt-in. The failed first SC-1
 gate keeps full source as the default and requires a paired-artifact compression
 benchmark before another source-view agent run. Broad workflow coverage
 benefits from routes/events/tables, but the bounded experiment does not wait for

@@ -39,9 +39,11 @@ callers without materializing every call-site × symbol pair.
 ## Search anchors and expansion
 
 Search returns a repository snapshot plus ranked hits. Every hit includes a
-`file_anchor` and one or more snapshot-scoped `anchors` projected from the
-chunk's overlapping declarations. Chunks remain retrieval units; they do not
-become graph identity.
+`file_role`, a `file_anchor`, and one or more snapshot-scoped `anchors`
+projected from the chunk's overlapping declarations. Roles are deterministic:
+`production`, `test`, `fixture`, `generated`, `documentation`, or `unknown`.
+Use repeatable `--file-role` flags to restrict primary hits. Chunks remain
+retrieval units; they do not become graph identity.
 
 Structural expansion is off by default and does not alter search scores. Add
 `--expand` to attach a separately labelled context pack:
@@ -52,6 +54,12 @@ jscout search /path/to/repo "checkout inventory" --json --expand \
   --expand-depth 1 --expand-seeds 3 \
   --expand-nodes 40 --expand-edges 120 --expand-bytes 24000
 ```
+
+Expansion defaults to `production` and `unknown` file-backed nodes while
+retaining structural hubs. Use repeatable `--expand-file-role` flags to opt
+tests, fixtures, generated files, or documentation back in. Explicitly
+included non-production nodes receive deterministic ranking penalties before
+the traversal and global node/byte budgets are consumed.
 
 `--response-bytes` caps the complete pretty-printed JSON envelope: hits,
 expansion, budget metadata, and serialization overhead. The result reports its
@@ -152,7 +160,8 @@ records tool name, latency, success, response size, session, and snapshot. It
 does not record queries, arguments, source, or results. Set
 `JSCOUT_SESSION_ID` to correlate calls from one evaluation run and
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
-included in each record.
+included in each record. Expanded searches also record aggregate node totals
+and `expansion_role_counts`; no paths or source are added to telemetry.
 
 ## Storage
 
@@ -161,7 +170,8 @@ Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
 references, event/member-call sites, embeddings, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
 after indexing so barrel changes can reroute references in otherwise unchanged
-files without leaving stale graph edges behind.
+files without leaving stale graph edges behind. File roles live on canonical
+file rows and are refreshed even when source hashes are unchanged.
 
 ## Build
 
