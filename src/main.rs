@@ -48,6 +48,9 @@ enum Command {
     Index {
         /// Repository root
         root: PathBuf,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
     /// Embed chunks that don't have embeddings yet (needs an API key, see README)
     Embed {
@@ -219,7 +222,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
-        Command::Index { root } => cmd_index(&root),
+        Command::Index { root, database } => cmd_index(&root, database.as_deref()),
         Command::Embed { root, batch } => cmd_embed(&root, batch),
         Command::Search {
             root,
@@ -417,9 +420,9 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_index(root: &Path) -> Result<()> {
+fn cmd_index(root: &Path, database: Option<&Path>) -> Result<()> {
     let started = std::time::Instant::now();
-    let conn = store::open(root)?;
+    let conn = open_database(root, database)?;
     let o = indexer::index_repo(root, &conn)?;
     println!(
         "indexed {} files ({} unchanged, {} failed) — {} chunks, {} refs in {:?}",

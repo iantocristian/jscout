@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
-import { databaseState, promptFor, validateTaskSet } from "./eval-run-memory.mjs";
+import {
+  databaseState,
+  prepareStaleRepository,
+  promptFor,
+  validateTaskSet,
+} from "./eval-run-memory.mjs";
 
 function taskSet() {
   return {
@@ -26,6 +32,34 @@ test("memory task admission requires anchor and transfer certificates", () => {
   const invalid = taskSet();
   invalid.pairs[0].admission.transfer_triviality.status = "fail";
   assert.throws(() => validateTaskSet(invalid), /transfer-triviality/);
+});
+
+test("staleness edits are validated and applied without mutating the source repository", () => {
+  const directory = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "jscout-stale-test-"));
+  const source = path.join(directory, "source");
+  const target = path.join(directory, "target");
+  fs.mkdirSync(path.join(source, "src"), { recursive: true });
+  const before = "export const value = 'old';\n";
+  const after = "export const value = 'new';\n";
+  fs.writeFileSync(path.join(source, "src/value.ts"), before);
+  const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
+  const tasks = taskSet();
+  tasks.pairs[0].staleness = {
+    edit: {
+      file: "src/value.ts",
+      find: "'old'",
+      replace: "'new'",
+      base_sha256: digest(before),
+      mutated_sha256: digest(after),
+    },
+  };
+  assert.equal(validateTaskSet(tasks).pairs.length, 1);
+  prepareStaleRepository(tasks.pairs[0], source, target, false);
+  assert.equal(fs.readFileSync(path.join(source, "src/value.ts"), "utf8"), before);
+  assert.equal(fs.readFileSync(path.join(target, "src/value.ts"), "utf8"), after);
+
+  tasks.pairs[0].staleness.edit.file = "../outside.ts";
+  assert.throws(() => validateTaskSet(tasks), /repository-relative/);
 });
 
 test("session prompts isolate write-back to session 1 and freshness handling to session 2", () => {

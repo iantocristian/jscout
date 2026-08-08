@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "repository": {
+    "name": "twenty",
+    "commit": "02a187d065354872c0f318b0723a1e7d8762ae00",
+    "tracked_files": 27790,
+    "indexed_files": 22735,
+    "jscout_snapshot": "5fb20574f2b8c69d57aa0fd87d980abff911a164723ffc762bab75be24e149b2"
+  },
+  "experiment": {
+    "claim_eligible": true,
+    "question": "Does evidence-backed workflow memory make a fresh agent session materially cheaper on a related workflow or change-impact question?",
+    "execution_model": "gpt-5.6-terra",
+    "execution_reasoning": "high",
+    "trials": 3,
+    "gate": "eval/protocols/two-session-memory.md"
+  },
+  "pairs": [
+    {
+      "id": "twenty-memory-fireflies-sync",
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-fireflies-sync-admission-001-warm-session1",
+          "source_answer_sha256": "348b04897705a30605768cd7deff11388dc260f432d9e13b6f2f71418a7b0feb",
+          "probe_session": "memory-transfer-twenty-memory-fireflies-sync-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete production lifecycle of an incoming Fireflies transcript or summary through CallRecording synchronization so its durable workflow can be recorded. In the final answer, return only the unauthenticated route wrapper and event-selection boundary files and symbols; exclude downstream synchronization helpers, API fetchers, types, constants, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/fireflies/src/logic-functions/fireflies-webhook.ts",
+            "packages/twenty-apps/public/fireflies/src/logic-functions/handlers/fireflies-webhook-handler.ts"
+          ],
+          "symbols": [
+            "firefliesWebhookRouteHandler",
+            "firefliesWebhookHandler"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to imported meeting association must cover the whole production path from external callback ingress through event selection, field-specific recording synchronization, and calendar-occurrence matching. Which four defining files and symbols participate? Exclude API fetchers, data types, constants, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/fireflies/src/logic-functions/fireflies-webhook.ts",
+            "packages/twenty-apps/public/fireflies/src/logic-functions/handlers/fireflies-webhook-handler.ts",
+            "packages/twenty-apps/public/fireflies/src/logic-functions/utils/sync-fireflies-call-to-call-recording.util.ts",
+            "packages/twenty-apps/public/fireflies/src/logic-functions/utils/find-matching-calendar-event.ts"
+          ],
+          "symbols": [
+            "firefliesWebhookRouteHandler",
+            "firefliesWebhookHandler",
+            "syncFirefliesCallToCallRecording",
+            "findMatchingCalendarEvent"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "firefliesWebhookHandler", "date": "2026-05-19", "commit": "d345a6b2d61a648bc258b9ac165921438ecb808f" },
+        { "symbol": "syncFirefliesCallToCallRecording", "date": "2026-07-31", "commit": "f8ed432e2aa2c7df4031a9ddfde88c8a60d25de7" }
+      ]
+    },
+    {
+      "id": "twenty-memory-pdl-seeding",
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-pdl-seeding-admission-001-warm-session1",
+          "source_answer_sha256": "270616f686a2142341b319a4d81b91f129d7486cfc1255548b8b94f3e69d4ba8",
+          "probe_session": "memory-transfer-twenty-memory-pdl-seeding-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete People Data Labs post-install setup flow so its durable workflow can be recorded. In the final answer, return only the production post-install orchestrator and existing-workflow lookup files and symbols; exclude the workflow seeder, seed constants, builders, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/people-data-labs/src/logic-functions/handlers/post-install.ts",
+            "packages/twenty-apps/public/people-data-labs/src/logic-functions/utils/find-existing-workflow-id.ts"
+          ],
+          "symbols": [
+            "postInstallCore",
+            "findExistingWorkflowId"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to enrichment workflow activation and step creation must preserve idempotent app setup. Which three production boundaries resolve the post-install work, detect an existing workflow, and create the missing workflow/version/step? Return only their files and symbols; exclude constants, builders, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/people-data-labs/src/logic-functions/handlers/post-install.ts",
+            "packages/twenty-apps/public/people-data-labs/src/logic-functions/utils/seed-enrichment-workflow.ts",
+            "packages/twenty-apps/public/people-data-labs/src/logic-functions/utils/find-existing-workflow-id.ts"
+          ],
+          "symbols": [
+            "postInstallCore",
+            "seedEnrichmentWorkflow",
+            "findExistingWorkflowId"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "postInstallCore", "date": "2026-06-11", "commit": "6756ea628dfc44a3c77d6c0947614a26c0ae10a3" },
+        { "symbol": "seedEnrichmentWorkflow", "date": "2026-06-11", "commit": "6756ea628dfc44a3c77d6c0947614a26c0ae10a3" }
+      ]
+    },
+    {
+      "id": "twenty-memory-slack-queue",
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-slack-queue-admission-002-warm-session1",
+          "source_answer_sha256": "d918bc911dcb6ac983e7a542e55b5faccbb32c80b4ebcf1696ac21df4d6c90eb",
+          "probe_session": "memory-transfer-twenty-memory-slack-queue-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete production handling of a Slack assistant callback through queued execution so its durable workflow can be recorded. In the final answer, return exactly two production files and two symbols: the exported owner-workspace route handler and the top-level assistant-request enqueue coordinator. Exclude the route's enqueue wrapper, workspace resolver, parser/classifier/normalizer/gating helpers, record creation, worker execution, Slack API helpers, data-access leaves, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/slack/src/logic-functions/slack-events-resolver.ts",
+            "packages/twenty-apps/public/slack/src/logic-functions/utils/enqueue-slack-assistant-request.ts"
+          ],
+          "symbols": [
+            "slackEventsResolverHandler",
+            "enqueueSlackAssistantRequest"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to assistant-request idempotency and placeholder replacement must account for the complete production path from workspace routing through request gating, request-record creation, and the database-event consumer. Which four files and symbols define those boundaries? Exclude Slack API helpers, data-access leaves, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/slack/src/logic-functions/slack-events-resolver.ts",
+            "packages/twenty-apps/public/slack/src/logic-functions/utils/enqueue-slack-assistant-request.ts",
+            "packages/twenty-apps/public/slack/src/logic-functions/utils/enqueue-slack-assistant-request-record.ts",
+            "packages/twenty-apps/public/slack/src/logic-functions/slack-assistant-worker.ts"
+          ],
+          "symbols": [
+            "slackEventsResolverHandler",
+            "enqueueSlackAssistantRequest",
+            "enqueueSlackAssistantRequestRecord",
+            "slackAssistantWorkerHandler"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "slackEventsResolverHandler", "date": "2026-07-30", "commit": "72322a4d722ce9ba8dd26cb5925d467572671450" },
+        { "symbol": "enqueueSlackAssistantRequest", "date": "2026-08-07", "commit": "fd85e64fe3c3b9826f6c09313b995b5f6d7e76e8" }
+      ]
+    },
+    {
+      "id": "twenty-memory-recall-lifecycle",
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-recall-lifecycle-admission-001-warm-session1",
+          "source_answer_sha256": "4854da44e7e2e1d526703d3462bb8791b793b42ef7e650b3a1290f316f490f89",
+          "probe_session": "memory-transfer-twenty-memory-recall-lifecycle-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete production lifecycle of a Recall callback through status or artifact handling so its durable workflow can be recorded. In the final answer, return only the server-route, signature-verification, and workspace-extraction files and symbols; exclude the workspace processor, lifecycle handler, constants, types, data-access leaves, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-webhook.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/verify-recall-webhook-signature.util.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/extract-twenty-workspace-id-from-recall-webhook.util.ts"
+          ],
+          "symbols": [
+            "recallWebhookRouteHandler",
+            "verifyRecallWebhookSignature",
+            "extractTwentyWorkspaceIdFromRecallWebhook"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to recording status and artifact import must cover the complete signed callback path: route resolution, verification, workspace extraction, scoped processing, and lifecycle handling. Which five production files and symbols define it? Exclude constants, types, record data-access leaves, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-webhook.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/verify-recall-webhook-signature.util.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/recall-api/extract-twenty-workspace-id-from-recall-webhook.util.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/process-recall-webhook.ts",
+            "packages/twenty-apps/public/call-recorder/src/logic-functions/flows/handle-recall-webhook.util.ts"
+          ],
+          "symbols": [
+            "recallWebhookRouteHandler",
+            "verifyRecallWebhookSignature",
+            "extractTwentyWorkspaceIdFromRecallWebhook",
+            "processRecallWebhookHandler",
+            "handleRecallWebhook"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "recallWebhookRouteHandler", "date": "2026-06-16", "commit": "5cb8a091fc506b640ff670b1d6a106daf008e004" },
+        { "symbol": "handleRecallWebhook", "date": "2026-06-16", "commit": "5cb8a091fc506b640ff670b1d6a106daf008e004" }
+      ]
+    },
+    {
+      "id": "twenty-memory-document-generation",
+      "staleness": {
+        "edit": {
+          "file": "packages/twenty-apps/examples/document-generator/src/logic-functions/utils/render-template.ts",
+          "find": "return '';",
+          "replace": "return '[missing]';",
+          "base_sha256": "c8f6d194805052b8d01d77b0ce68c878bca2b821b2daf5c2ab9ad53831b6cef5",
+          "mutated_sha256": "ab1cdb7ac699c3b181baa7ffb1a26ee1f86a54178395382b273bfd82291c0bff"
+        }
+      },
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-document-generation-admission-001-warm-session1",
+          "source_answer_sha256": "bb2547c9bf893ee4792efdc5507d60311acb7c68b636947ecad72dac18d13cfc",
+          "probe_session": "memory-transfer-twenty-memory-document-generation-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete production document-generation path from template lookup through record loading, placeholder rendering, record creation, and best-effort PDF attachment so its durable workflow can be recorded. In the final answer, return only the shared orchestration and target-record loading files and symbols; exclude rendering and PDF helpers, trigger wrappers, schemas, types, constants, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/handlers/generate-document-handler.ts",
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/utils/load-record-values.ts"
+          ],
+          "symbols": [
+            "generateDocumentHandler",
+            "loadRecordValues"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to placeholder resolution and generated-file failure handling must account for the production boundaries that orchestrate generation, load and flatten the target record, replace missing tokens, render the PDF, and attach it without discarding an already-created record. Return only the four defining files and five symbols; exclude trigger wrappers, schemas, types, constants, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/handlers/generate-document-handler.ts",
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/utils/load-record-values.ts",
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/utils/render-template.ts",
+            "packages/twenty-apps/examples/document-generator/src/logic-functions/utils/generate-document-pdf.ts"
+          ],
+          "symbols": [
+            "generateDocumentHandler",
+            "loadRecordValues",
+            "renderTemplate",
+            "generateDocumentPdf",
+            "attachGeneratedPdf"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "generateDocumentHandler", "date": "2026-07-07", "commit": "07a921f8ca89a27cbda52ef59228d4627eb4b4c0" },
+        { "symbol": "generateDocumentPdf", "date": "2026-07-07", "commit": "07a921f8ca89a27cbda52ef59228d4627eb4b4c0" }
+      ]
+    },
+    {
+      "id": "twenty-memory-self-hosting-link",
+      "staleness": {
+        "edit": {
+          "file": "packages/twenty-apps/internal/self-hosting/src/logic-functions/utils/is-test-or-example-email.ts",
+          "find": "normalizedEmail.includes('test')",
+          "replace": "normalizedEmail.includes('synthetic')",
+          "base_sha256": "b9bd359a54e265a6b529ff7df3611a61c2c038264b9409d31ee525821f4176c5",
+          "mutated_sha256": "c751b6d2e4cf720b266947b37512aca8560db4682d87eaf9c032b432d3a31b12"
+        }
+      },
+      "admission": {
+        "anchor_class": "weak",
+        "transfer_triviality": {
+          "status": "pass",
+          "model": "gpt-5.6-terra",
+          "reasoning": "high",
+          "source_session": "memory-twenty-memory-self-hosting-link-admission-001-warm-session1",
+          "source_answer_sha256": "390199dbf6f70c595b65e2b79be0f985026edbe84d95acdf2e06c6073c3460d3",
+          "probe_session": "memory-transfer-twenty-memory-self-hosting-link-admission-001"
+        }
+      },
+      "session1": {
+        "prompt": "Investigate the complete production path from a self-hosted signup telemetry callback through user upsert and later person linkage so its durable workflow can be recorded. In the final answer, return only the inbound callback owner and test/example-address filter files and symbols; exclude the record-event consumer, SDK leaves, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/internal/self-hosting/src/logic-functions/telemetryWebhook.function.ts",
+            "packages/twenty-apps/internal/self-hosting/src/logic-functions/utils/is-test-or-example-email.ts"
+          ],
+          "symbols": [
+            "main",
+            "isTestOrExampleEmail"
+          ]
+        }
+      },
+      "session2": {
+        "prompt": "A change to signup identity matching must cover the full production path that filters inbound telemetry, upserts the self-hosting user, reacts to its creation or changed email, finds or creates a matching person, and links the records. Return only the three defining files and symbols; exclude SDK leaves, types, and tests.",
+        "gold": {
+          "files": [
+            "packages/twenty-apps/internal/self-hosting/src/logic-functions/telemetryWebhook.function.ts",
+            "packages/twenty-apps/internal/self-hosting/src/logic-functions/utils/is-test-or-example-email.ts",
+            "packages/twenty-apps/internal/self-hosting/src/logic-functions/match-telemetry-event-with-people.ts"
+          ],
+          "symbols": [
+            "main",
+            "isTestOrExampleEmail",
+            "handler"
+          ]
+        }
+      },
+      "post_cutoff_evidence": [
+        { "symbol": "main", "date": "2026-03-02", "commit": "d021f7e369e9e597fa04a1f3de50129712126c91" },
+        { "symbol": "isTestOrExampleEmail", "date": "2026-06-22", "commit": "8b9e3a0fc379d84910e576578c6e4f5b4dfeb4f1" }
+      ]
+    }
+  ]
+}

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "demo": "node examples/graph-memory/demo.mjs",
-    "test": "node --test examples/graph-memory/demo.test.mjs scripts/eval-anchor-certify.test.mjs scripts/eval-contamination-probe.test.mjs scripts/eval-expansion-role-backfill.test.mjs scripts/eval-memory-report.test.mjs scripts/eval-pooled-report.test.mjs scripts/eval-report.test.mjs scripts/eval-run-memory.test.mjs",
+    "test": "node --test examples/graph-memory/demo.test.mjs scripts/eval-anchor-certify.test.mjs scripts/eval-contamination-probe.test.mjs scripts/eval-expansion-role-backfill.test.mjs scripts/eval-memory-report.test.mjs scripts/eval-memory-staleness-adjudicate.test.mjs scripts/eval-memory-transfer-probe.test.mjs scripts/eval-pooled-report.test.mjs scripts/eval-report.test.mjs scripts/eval-run-memory.test.mjs",
     "eval:report": "node scripts/eval-report.mjs"
   }
 }

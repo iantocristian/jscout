@@ -43,7 +43,7 @@ function parseArgs(argv) {
   return options;
 }
 
-export function validateTaskSet(taskSet) {
+export function validateTaskSet(taskSet, { requireTransfer = true } = {}) {
   if (taskSet?.schema_version !== 1 || !Array.isArray(taskSet.pairs) || taskSet.pairs.length === 0) {
     throw new Error("memory task set requires schema_version 1 and a non-empty pairs array");
   }
@@ -65,8 +65,26 @@ export function validateTaskSet(taskSet) {
     if (!new Set(["anchor-free", "weak"]).has(pair.admission?.anchor_class)) {
       throw new Error(`${pair.id} must certify session 2 as anchor-free or weak`);
     }
-    if (pair.admission?.transfer_triviality?.status !== "pass") {
+    if (requireTransfer && pair.admission?.transfer_triviality?.status !== "pass") {
       throw new Error(`${pair.id} requires a passing transfer-triviality certificate`);
+    }
+    if (pair.staleness) {
+      const edit = pair.staleness.edit;
+      for (const field of ["file", "find", "replace", "base_sha256", "mutated_sha256"]) {
+        if (typeof edit?.[field] !== "string" || edit[field] === "") {
+          throw new Error(`${pair.id}.staleness.edit.${field} is required`);
+        }
+      }
+      if (path.isAbsolute(edit.file) || edit.file.split(/[\\/]/).includes("..")) {
+        throw new Error(`${pair.id}.staleness.edit.file must be repository-relative`);
+      }
+      if (!/^[a-f0-9]{64}$/.test(edit.base_sha256) ||
+          !/^[a-f0-9]{64}$/.test(edit.mutated_sha256)) {
+        throw new Error(`${pair.id}.staleness edit hashes must be lowercase SHA-256 values`);
+      }
+      if (edit.base_sha256 === edit.mutated_sha256) {
+        throw new Error(`${pair.id}.staleness edit must change the file hash`);
+      }
     }
   }
   return taskSet;
@@ -234,6 +252,38 @@ function cloneDatabase(source, target, allowFullCopy) {
   }
 }
 
+function cloneRepository(source, target, allowFullCopy) {
+  const clone = spawnSync("cp", ["-cR", source, target], { encoding: "utf8" });
+  if (clone.status === 0) return;
+  if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+  if (!allowFullCopy) {
+    throw new Error(
+      `copy-on-write repository clone failed (${clone.stderr.trim()}); pass --allow-full-copy true only if the full copy is intentional`,
+    );
+  }
+  fs.cpSync(source, target, { recursive: true, errorOnExist: true });
+}
+
+export function prepareStaleRepository(pair, sourceRoot, targetRoot, allowFullCopy) {
+  const edit = pair.staleness?.edit;
+  if (!edit) throw new Error(`${pair.id}: staleness case requires an edit`);
+  cloneRepository(sourceRoot, targetRoot, allowFullCopy);
+  const target = path.join(targetRoot, edit.file);
+  const source = fs.readFileSync(target, "utf8");
+  if (sha256(target) !== edit.base_sha256) {
+    throw new Error(`${pair.id}: staleness base hash does not match ${edit.file}`);
+  }
+  const occurrences = source.split(edit.find).length - 1;
+  if (occurrences !== 1) {
+    throw new Error(`${pair.id}: staleness edit must match exactly once; found ${occurrences}`);
+  }
+  fs.writeFileSync(target, source.replace(edit.find, edit.replace));
+  if (sha256(target) !== edit.mutated_sha256) {
+    throw new Error(`${pair.id}: staleness mutated hash does not match ${edit.file}`);
+  }
+  return targetRoot;
+}
+
 function copyCleanSeed(seed, target, allowFullCopy) {
   const wal = `${seed}-wal`;
   if (fs.existsSync(wal) && fs.statSync(wal).size > 0) {
@@ -353,26 +403,36 @@ async function runSession({
     semantic_state_before: semanticStateBefore,
     semantic_state: databaseState(database),
   };
+  if (arm === "stale") row.staleness_edit = pair.staleness.edit;
   if (runnerError) row.runner_error = runnerError;
   return row;
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const taskSet = validateTaskSet(JSON.parse(fs.readFileSync(options.tasks, "utf8")));
+  const prepareOnly = options.mode === "prepare";
+  if (options.mode && !new Set(["prepare", "full"]).has(options.mode)) {
+    throw new Error("--mode must be prepare or full");
+  }
+  const taskSet = validateTaskSet(
+    JSON.parse(fs.readFileSync(options.tasks, "utf8")),
+    { requireTransfer: !prepareOnly },
+  );
   let pairs = taskSet.pairs;
   if (options.pair) pairs = pairs.filter((pair) => pair.id === options.pair);
   if (pairs.length === 0) throw new Error("no matching memory pairs");
 
   const repository = path.resolve(options.repository);
   certifyMemoryAnchors(taskSet, repository);
-  for (const pair of pairs) {
-    const certificate = pair.admission.transfer_triviality;
-    if (certificate.model !== options.model || certificate.reasoning !== options.reasoning) {
-      throw new Error(
-        `${pair.id}: transfer-triviality certificate ${certificate.model}/${certificate.reasoning} ` +
-        `does not match execution ${options.model}/${options.reasoning}`,
-      );
+  if (!prepareOnly) {
+    for (const pair of pairs) {
+      const certificate = pair.admission.transfer_triviality;
+      if (certificate.model !== options.model || certificate.reasoning !== options.reasoning) {
+        throw new Error(
+          `${pair.id}: transfer-triviality certificate ${certificate.model}/${certificate.reasoning} ` +
+          `does not match execution ${options.model}/${options.reasoning}`,
+        );
+      }
     }
   }
   const seedDatabase = path.resolve(options["seed-database"]);
@@ -409,8 +469,10 @@ async function main() {
   fs.mkdirSync(artifacts, { recursive: true });
   const databaseDirectory = path.join(artifacts, "databases");
   const snapshotDirectory = path.join(artifacts, "memory-snapshots");
+  const staleRepositoryDirectory = path.join(artifacts, "stale-repositories");
   fs.mkdirSync(databaseDirectory, { recursive: true });
   fs.mkdirSync(snapshotDirectory, { recursive: true });
+  fs.mkdirSync(staleRepositoryDirectory, { recursive: true });
   const completedRows = resume && fs.existsSync(responses)
     ? jsonLines(fs.readFileSync(responses, "utf8"))
     : [];
@@ -454,6 +516,8 @@ async function main() {
       throw new Error(`resume requires preserved warm database: ${warmDatabase}`);
     }
 
+    if (prepareOnly) continue;
+
     const arms = pairIndex % 2 === 0 ? ["cold", "warm"] : ["warm", "cold"];
     for (const arm of arms) {
       const key = `${pair.id}\0${arm}\0session2\0${options.trial}`;
@@ -481,6 +545,58 @@ async function main() {
       fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);
       emitted.push(row);
       completed.add(key);
+    }
+
+    if (pair.staleness) {
+      const key = `${pair.id}\0stale\0session2\0${options.trial}`;
+      if (!completed.has(key)) {
+        const staleRepository = path.join(
+          staleRepositoryDirectory,
+          `${pair.id}-${options.trial}`,
+        );
+        if (fs.existsSync(staleRepository)) {
+          throw new Error(`stale repository already exists: ${staleRepository}`);
+        }
+        prepareStaleRepository(
+          pair,
+          repository,
+          staleRepository,
+          options["allow-full-copy"] === "true",
+        );
+        const staleDatabase = path.join(
+          databaseDirectory,
+          `${pair.id}-${options.trial}-stale.db`,
+        );
+        cloneDatabase(
+          path.join(snapshotDirectory, `${pair.id}-${options.trial}-after-session1.db`),
+          staleDatabase,
+          options["allow-full-copy"] === "true",
+        );
+        const indexed = await run(
+          path.resolve(options.jscout),
+          ["index", staleRepository, "--database", staleDatabase],
+          { cwd: repository, env: process.env },
+        );
+        if (indexed.code !== 0) {
+          throw new Error(`${pair.id}: stale reindex failed: ${indexed.stderr.trim()}`);
+        }
+        const row = await runSession({
+          options,
+          pair,
+          task: pair.session2,
+          phase: "session2",
+          arm: "stale",
+          database: staleDatabase,
+          repository: staleRepository,
+          schema,
+          telemetry,
+          artifacts,
+          seedSha256,
+        });
+        fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);
+        emitted.push(row);
+        completed.add(key);
+      }
     }
   }
   process.stdout.write(`${JSON.stringify(emitted, null, 2)}\n`);

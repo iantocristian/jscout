@@ -10,6 +10,15 @@
   "pairs": [
     {
       "id": "fixture-checkout-lifecycle",
+      "staleness": {
+        "edit": {
+          "file": "src/inventory.ts",
+          "find": "return inventoryClient.reserve(skus);",
+          "replace": "return inventoryClient.reserve(skus, { strict: true });",
+          "base_sha256": "b8b88a0c926f38b2510ddcc671ea6609c3b5e880e6be76a53ca0078b0631c2e8",
+          "mutated_sha256": "676552b85475baa3151eef28d25273905c3ec5f51d63e38dfd4bf69bfabb0898"
+        }
+      },
       "admission": {
         "anchor_class": "anchor-free",
         "transfer_triviality": {

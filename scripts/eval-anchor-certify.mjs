@@ -49,7 +49,10 @@ function isIdentifierLike(token) {
 
 export function extractAnchors(prompt) {
   const quoted = [...prompt.matchAll(/[`'"]([^`'"]{3,80})[`'"]/g)].map((m) => m[1]);
-  const tokens = prompt.split(/[^\w$./:-]+/).filter((t) => t.length >= 4);
+  const tokens = prompt
+    .split(/[^\w$./:-]+/)
+    .map((token) => token.replace(/^[./:-]+|[./:-]+$/g, ""))
+    .filter((token) => token.length >= 4);
   const identifiers = new Set(quoted.filter((q) => !q.includes(" ")));
   const words = new Set();
   for (const token of tokens) {

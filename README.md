@@ -8,6 +8,7 @@ Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level co
 
 ```
 jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
+                               #   --database PATH isolates index/memory state
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   add --expand for a bounded structural context pack
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence

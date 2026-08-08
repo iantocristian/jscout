@@ -59,3 +59,50 @@ test("memory report refuses cross-model pooling", () => {
     /refusing to pool across execution models/,
   );
 });
+
+test("staleness gate requires retrieval, a stale label, and re-verification", () => {
+  const staleTaskSets = structuredClone(taskSets);
+  staleTaskSets[0].pairs[0].staleness = {
+    edit: {
+      file: "b.ts",
+      find: "old",
+      replace: "new",
+      base_sha256: "a".repeat(64),
+      mutated_sha256: "b".repeat(64),
+    },
+  };
+  const responses = [
+    response("warm", "session1", 100),
+    response("warm", "session2", 60),
+    response("cold", "session2", 100),
+    { ...response("stale", "session2", 70), staleness_edit: staleTaskSets[0].pairs[0].staleness.edit },
+  ];
+  const telemetry = [
+    { session: "warm-session1", semantic_artifacts_written: 1 },
+    { session: "warm-session2", semantic_artifacts_returned: 1, semantic_artifacts_fresh: 1 },
+    { session: "cold-session2", semantic_artifacts_returned: 0 },
+    { session: "stale-session2", semantic_artifacts_returned: 1, semantic_artifacts_degraded: 1 },
+  ];
+  const passing = buildMemoryReport({
+    taskSets: staleTaskSets,
+    responses,
+    telemetry,
+    adjudications: [{ session: "stale-session2", stale_reverified: true }],
+    bootstrap: 100,
+    seed: 1,
+  });
+  assert.equal(passing.staleness.artifact_not_retrieved, 0);
+  assert.equal(passing.staleness.artifact_not_labelled_stale_or_degraded, 0);
+  assert.equal(passing.decision, "pass");
+
+  const failed = buildMemoryReport({
+    taskSets: staleTaskSets,
+    responses,
+    telemetry: telemetry.filter((row) => row.session !== "stale-session2"),
+    adjudications: [{ session: "stale-session2", stale_reverified: true }],
+    bootstrap: 100,
+    seed: 1,
+  });
+  assert.equal(failed.staleness.artifact_not_retrieved, 1);
+  assert.equal(failed.decision, "fail-staleness");
+});

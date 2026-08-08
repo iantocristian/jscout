@@ -54,3 +54,9 @@ test("substring matches do not count as whole-token anchors", () => {
   const certificate = certifyTask("Where is the retry policy?", gold);
   assert.equal(certificate.status, "anchor-free");
 });
+
+test("sentence punctuation does not turn a prose word into an identifier anchor", () => {
+  const { identifiers, words } = extractAnchors("Update the record. Return its owner.");
+  assert.ok(!identifiers.includes("record."));
+  assert.ok(words.includes("record"));
+});

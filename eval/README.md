@@ -198,7 +198,9 @@ run. It is a bounded direction gate, not a general product benchmark.
 ## Two-session semantic-memory runner
 
 `scripts/eval-run-memory.mjs` executes each admitted pair as one session-1
-write-back run plus counterbalanced cold/warm session-2 runs. It requires a
+write-back run plus counterbalanced cold/warm session-2 runs. Pairs with a
+controlled `staleness.edit` also get a stale session-2 arm after a copy-on-write
+repository clone, exact edit-hash validation, and isolated reindex. It requires a
 schema-v6 seed database with empty semantic tables, gives each arm an isolated
 copy-on-write clone through `jscout mcp --database`, and archives the warm
 database immediately after session 1. Responses record the structural seed
@@ -222,18 +224,49 @@ reflink-capable volume. `--allow-full-copy true` is an explicit, expensive
 fallback. `eval/tasks/memory-fixture-smoke.json` checks the runner only and is
 excluded from product claims.
 
+Task admission is a separate, ordered phase. First run session 1 only with
+`--mode prepare`, then prove that its final answer cannot directly yield the
+session-2 key. The probe runs the same execution model without tools or a
+repository and can emit a certified task-set copy:
+
+```bash
+node scripts/eval-memory-transfer-probe.mjs \
+  --tasks eval/tasks/memory-pairs-draft.json \
+  --session1-responses /tmp/memory-admission-responses.jsonl \
+  --output /tmp/memory-transfer-certificates.jsonl \
+  --artifacts /tmp/memory-transfer-artifacts \
+  --certified-tasks eval/tasks/memory-pairs.json \
+  --model gpt-5.6-terra --reasoning high
+```
+
+After the registered runs, blindly adjudicate every stale response with Sol.
+The judge has no repository or tools and sees only the controlled edit and
+recorded answer. A pass additionally requires the runner-recorded
+`inspected_files` to contain the edited file:
+
+```bash
+node scripts/eval-memory-staleness-adjudicate.mjs \
+  --tasks eval/tasks/memory-pairs.json \
+  --responses /tmp/memory-seed1.jsonl,/tmp/memory-seed2.jsonl \
+  --output /tmp/memory-stale-adjudications.jsonl \
+  --artifacts /tmp/memory-stale-adjudication-artifacts \
+  --model gpt-5.6-sol --reasoning high
+```
+
 Report one or more trials with:
 
 ```bash
 node scripts/eval-memory-report.mjs \
   --tasks eval/tasks/memory-pairs.json \
   --responses /tmp/memory-seed1.jsonl,/tmp/memory-seed2.jsonl \
-  --telemetry /tmp/memory-seed1-telemetry.jsonl,/tmp/memory-seed2-telemetry.jsonl
+  --telemetry /tmp/memory-seed1-telemetry.jsonl,/tmp/memory-seed2-telemetry.jsonl \
+  --adjudications /tmp/memory-stale-adjudications.jsonl
 ```
 
 The report enforces single-model pooling, pairs by task/trial, checks actual
 artifact reads and writes, bootstraps by pair, and implements the registered
-20%/10% gate plus the hard stale-as-fresh failure.
+20%/10% gate plus the hard stale-handling failures: not retrieved, not visibly
+stale/degraded, or not re-verified.
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

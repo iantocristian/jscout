@@ -86,6 +86,11 @@ export function buildMemoryReport({
   }
 
   const telemetryBySession = Map.groupBy(telemetry, (entry) => entry.session);
+  const adjudicationBySession = new Map(adjudications.map((row) => [row.session, row]));
+  const adjudicatedCorrect = (response) => {
+    const verdict = adjudicationBySession.get(response.session)?.verdict;
+    return response.correct === true || verdict === "correct" || verdict === "acceptable_alternative";
+  };
   const responseByKey = new Map(
     responses.map((row) => [`${row.pair_id}\0${row.trial}\0${row.arm}\0${row.phase}`, row]),
   );
@@ -96,6 +101,12 @@ export function buildMemoryReport({
       for (const [arm, phase] of [["warm", "session1"], ["warm", "session2"], ["cold", "session2"]]) {
         const key = `${pair.id}\0${trial}\0${arm}\0${phase}`;
         if (!responseByKey.has(key)) missing.push({ pair_id: pair.id, trial, arm, phase });
+      }
+      if (pair.staleness) {
+        const key = `${pair.id}\0${trial}\0stale\0session2`;
+        if (!responseByKey.has(key)) {
+          missing.push({ pair_id: pair.id, trial, arm: "stale", phase: "session2" });
+        }
       }
     }
   }
@@ -114,8 +125,10 @@ export function buildMemoryReport({
       paired.push({
         pair_id: pair.id,
         trial,
-        warm_correct: Number(Boolean(warm.correct)),
-        cold_correct: Number(Boolean(cold.correct)),
+        warm_exact: Number(Boolean(warm.correct)),
+        cold_exact: Number(Boolean(cold.correct)),
+        warm_correct: Number(adjudicatedCorrect(warm)),
+        cold_correct: Number(adjudicatedCorrect(cold)),
         warm_tokens: Number(warm.total_tokens),
         cold_tokens: Number(cold.total_tokens),
         token_delta: Number(warm.total_tokens) - Number(cold.total_tokens),
@@ -131,7 +144,8 @@ export function buildMemoryReport({
         artifact_reads: artifactReads,
         artifact_used: artifactReads > 0,
         session1_tokens: Number(first.total_tokens),
-        session1_correct: Number(Boolean(first.correct)),
+        session1_exact: Number(Boolean(first.correct)),
+        session1_correct: Number(adjudicatedCorrect(first)),
         session1_tool_calls: firstTelemetry.length,
         session1_artifacts_written: sum(firstTelemetry, "semantic_artifacts_written"),
         session1_failed_annotation_calls: firstTelemetry.filter(
@@ -141,11 +155,6 @@ export function buildMemoryReport({
         cold_combined_tokens: Number(first.total_tokens) + Number(cold.total_tokens),
         warm_semantic_state_before: warm.semantic_state_before,
         cold_semantic_state_before: cold.semantic_state_before,
-        staleness_case: Boolean(pair.staleness),
-        stale_or_degraded_reads:
-          sum(warmTelemetry, "semantic_artifacts_stale") +
-          sum(warmTelemetry, "semantic_artifacts_degraded"),
-        fresh_reads: sum(warmTelemetry, "semantic_artifacts_fresh"),
         runner_error: warm.runner_error ?? cold.runner_error ?? first.runner_error ?? null,
       });
     }
@@ -175,22 +184,43 @@ export function buildMemoryReport({
     warm_minus_cold: mean(paired.map((row) => row.warm_correct - row.cold_correct)),
     capability_wins: paired.filter((row) => row.warm_correct === 1 && row.cold_correct === 0).length,
     regressions: paired.filter((row) => row.warm_correct === 0 && row.cold_correct === 1).length,
+    exact_warm: mean(paired.map((row) => row.warm_exact)),
+    exact_cold: mean(paired.map((row) => row.cold_exact)),
   };
   const tokenWins = paired.filter(
     (row) => row.warm_correct === 1 && row.cold_correct === 1 && row.token_delta < 0,
   );
-  const stalenessRows = paired.filter((row) => row.staleness_case);
+  const stalenessRows = [];
+  for (const pair of pairs.filter((candidate) => candidate.staleness)) {
+    for (const trial of trials) {
+      const response = responseByKey.get(`${pair.id}\0${trial}\0stale\0session2`);
+      if (!response) continue;
+      const entries = telemetryBySession.get(response.session) ?? [];
+      const artifactReads = sum(entries, "semantic_artifacts_returned");
+      stalenessRows.push({
+        pair_id: pair.id,
+        trial,
+        session: response.session,
+        exact: Number(Boolean(response.correct)),
+        correct: Number(adjudicatedCorrect(response)),
+        artifact_reads: artifactReads,
+        stale_or_degraded_reads:
+          sum(entries, "semantic_artifacts_stale") +
+          sum(entries, "semantic_artifacts_degraded"),
+        fresh_reads: sum(entries, "semantic_artifacts_fresh"),
+        edit: response.staleness_edit,
+        runner_error: response.runner_error ?? null,
+      });
+    }
+  }
+  const staleArtifactNotRetrieved = stalenessRows.filter((row) => row.artifact_reads === 0);
+  const staleArtifactNotLabelled = stalenessRows.filter(
+    (row) => row.artifact_reads > 0 && row.stale_or_degraded_reads === 0,
+  );
   const silentStaleFresh = stalenessRows.filter(
     (row) => row.artifact_reads > 0 && row.stale_or_degraded_reads === 0 && row.fresh_reads > 0,
   );
-  const adjudicationBySession = new Map(adjudications.map((row) => [row.session, row]));
-  const staleAdjudications = stalenessRows.map((row) => {
-    const response = responses.find(
-      (candidate) => candidate.pair_id === row.pair_id &&
-        candidate.trial === row.trial && candidate.arm === "warm" && candidate.phase === "session2",
-    );
-    return response ? adjudicationBySession.get(response.session) : undefined;
-  });
+  const staleAdjudications = stalenessRows.map((row) => adjudicationBySession.get(row.session));
   const staleReverificationFailures = staleAdjudications.filter(
     (row) => row && row.stale_reverified === false,
   ).length;
@@ -199,9 +229,11 @@ export function buildMemoryReport({
   const session1Correctness = mean(paired.map((row) => row.session1_correct));
   const artifactsRetrievedInAllWins = tokenWins.length > 0 && tokenWins.every((row) => row.artifact_used);
   const correctnessParity = correctness.warm >= correctness.cold && session1Correctness === 1;
-  const hardStalenessFailure = silentStaleFresh.length > 0 || staleReverificationFailures > 0;
+  const hardStalenessFailure = staleArtifactNotRetrieved.length > 0 ||
+    staleArtifactNotLabelled.length > 0 || staleReverificationFailures > 0;
   const claimEligible = taskSets.every((taskSet) => taskSet.experiment?.claim_eligible !== false);
   const incomplete = missing.length > 0 || paired.some((row) => row.runner_error) ||
+    stalenessRows.some((row) => row.runner_error) ||
     (stalenessRows.length > 0 && staleAdjudicationMissing > 0);
   const decision = !claimEligible
     ? "not-claim-eligible"
@@ -248,9 +280,12 @@ export function buildMemoryReport({
     },
     staleness: {
       cases: stalenessRows.length,
+      artifact_not_retrieved: staleArtifactNotRetrieved.length,
+      artifact_not_labelled_stale_or_degraded: staleArtifactNotLabelled.length,
       silent_stale_served_as_fresh: silentStaleFresh.length,
       revalidation_failures: staleReverificationFailures,
       missing_adjudications: staleAdjudicationMissing,
+      runs: stalenessRows,
     },
     decision,
     paired,
