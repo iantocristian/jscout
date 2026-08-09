@@ -253,6 +253,18 @@ node scripts/eval-memory-staleness-adjudicate.mjs \
   --model gpt-5.6-sol --reasoning high
 ```
 
+Blindly source-review exact-set disagreements without exposing arm labels:
+
+```bash
+node scripts/eval-memory-correctness-adjudicate.mjs \
+  --tasks eval/tasks/memory-pairs.json \
+  --repository /path/to/frozen/repository \
+  --responses /tmp/memory-seed1.jsonl,/tmp/memory-seed2.jsonl \
+  --output /tmp/memory-correctness-adjudications.jsonl \
+  --artifacts /tmp/memory-correctness-adjudication-artifacts \
+  --model gpt-5.6-sol --reasoning high --batch-size 4
+```
+
 Report one or more trials with:
 
 ```bash
