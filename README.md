@@ -13,6 +13,7 @@ jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only witho
                                #   add --expand for a bounded structural context pack
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
+jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)

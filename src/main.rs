@@ -160,6 +160,26 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
     },
+    /// Enumerate a bounded production-symbol candidate set for workflow scouting
+    WorkflowCandidates {
+        /// Repository root used to resolve candidate evidence
+        root: PathBuf,
+        /// Current workflow seed anchors or uniquely resolvable symbol names
+        #[arg(required = true)]
+        seeds: Vec<String>,
+        /// Optional expected structural snapshot
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Ranked traversal depth
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// Maximum issued symbol candidates
+        #[arg(long, default_value_t = semantic::MAX_WORKFLOW_CANDIDATES)]
+        candidate_limit: usize,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
     /// Watch a repository and re-index on change
     Watch {
         /// Repository root
@@ -287,6 +307,28 @@ fn main() -> Result<()> {
             let conn = open_database(&root, database.as_deref())?;
             let artifacts = semantic::search(&conn, &query, limit)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
+            Ok(())
+        }
+        Command::WorkflowCandidates {
+            root,
+            seeds,
+            snapshot,
+            depth,
+            candidate_limit,
+            database,
+        } => {
+            let conn = open_database(&root, database.as_deref())?;
+            let candidates = semantic::workflow_candidates(
+                &root,
+                &conn,
+                &seeds,
+                &semantic::WorkflowCandidateOptions {
+                    expected_snapshot: snapshot,
+                    depth,
+                    candidate_limit,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&candidates)?);
             Ok(())
         }
         Command::Watch { root, embed } => watch::watch(&root, embed),

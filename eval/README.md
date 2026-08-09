@@ -326,6 +326,24 @@ Prose in the stored artifact cannot affect this diagnostic.
 The free-form producer preflight and its decision to block the full treatment
 run are recorded in
 [`results/workflow-scope-preflight-2026-08-09.md`](results/workflow-scope-preflight-2026-08-09.md).
+
+Run candidate-closed Stage A before any semantic-classification calls:
+
+```bash
+node scripts/eval-workflow-candidate-gate.mjs \
+  --tasks eval/tasks/twenty-memory-pairs.json \
+  --repository /path/to/frozen/twenty \
+  --database /path/to/frozen/twenty-v6.db \
+  --jscout "$PWD/target/release/jscout" \
+  --output /tmp/twenty-workflow-candidates.json
+```
+
+Seeds are mechanically resolved from session-1 gold only. The report keeps
+candidate recall, per-pair misses, and graph truncation separate; a failure
+stops the experiment before any Terra classification run.
+The failed Stage A run, resolver diagnosis, deterministic repair rerun, and
+decision to require explicit runtime-boundary entities are recorded in
+[`results/twenty-workflow-candidate-gate-2026-08-09.md`](results/twenty-workflow-candidate-gate-2026-08-09.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

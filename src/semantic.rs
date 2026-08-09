@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +10,9 @@ use crate::structural;
 
 const MAX_BODY_BYTES: usize = 12_000;
 const MAX_SUPPORTS: usize = 32;
+pub const MAX_WORKFLOW_CANDIDATES: usize = 31;
+const WORKFLOW_TRAVERSAL_NODE_LIMIT: usize = 100;
+const WORKFLOW_TRAVERSAL_EDGE_LIMIT: usize = 400;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportInput {
@@ -108,6 +111,48 @@ pub struct SemanticArtifact {
     pub relevance: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowCandidateOptions {
+    pub expected_snapshot: Option<String>,
+    pub depth: usize,
+    pub candidate_limit: usize,
+}
+
+impl Default for WorkflowCandidateOptions {
+    fn default() -> Self {
+        Self {
+            expected_snapshot: None,
+            depth: 2,
+            candidate_limit: MAX_WORKFLOW_CANDIDATES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCandidate {
+    pub anchor: String,
+    pub display_name: String,
+    pub file: String,
+    pub evidence_start_line: i64,
+    pub evidence_end_line: i64,
+    pub relevance: f64,
+    pub seed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowCandidateSet {
+    pub snapshot: String,
+    pub seeds: Vec<String>,
+    pub direction: String,
+    pub depth: usize,
+    pub min_confidence: String,
+    pub candidate_limit: usize,
+    pub fingerprint: String,
+    pub traversal_truncated: bool,
+    pub candidate_truncated: bool,
+    pub candidates: Vec<WorkflowCandidate>,
+}
+
 struct ValidatedSupport {
     claim_path: String,
     anchor: String,
@@ -118,6 +163,161 @@ struct ValidatedSupport {
     source_hash: String,
     context_hash: String,
     confidence: String,
+}
+
+pub fn workflow_candidates(
+    root: &Path,
+    conn: &Connection,
+    seeds: &[String],
+    options: &WorkflowCandidateOptions,
+) -> Result<WorkflowCandidateSet> {
+    if seeds.is_empty() {
+        bail!("workflow candidates require at least one seed anchor");
+    }
+    if options.depth == 0 || options.depth > 3 {
+        bail!("workflow candidate depth must be between 1 and 3");
+    }
+    if options.candidate_limit == 0 || options.candidate_limit > MAX_WORKFLOW_CANDIDATES {
+        bail!("workflow candidate limit must be between 1 and {MAX_WORKFLOW_CANDIDATES}");
+    }
+    let snapshot = structural::current_snapshot(conn)?;
+    if options.expected_snapshot.as_deref().is_some_and(|value| value != snapshot) {
+        bail!("workflow candidate snapshot is stale; current snapshot is {snapshot}");
+    }
+    let mut resolved_seeds = seeds
+        .iter()
+        .map(|seed| structural::resolve_current_anchor(conn, seed))
+        .collect::<Result<Vec<_>>>()?;
+    resolved_seeds.sort();
+    resolved_seeds.dedup();
+
+    let mut nodes: HashMap<String, (structural::GraphNode, bool)> = HashMap::new();
+    let mut traversal_truncated = false;
+    for seed in &resolved_seeds {
+        let neighborhood = structural::neighborhood(
+            conn,
+            seed,
+            &structural::NeighborhoodOptions {
+                expected_snapshot: Some(snapshot.clone()),
+                depth: options.depth,
+                direction: "both".into(),
+                node_limit: WORKFLOW_TRAVERSAL_NODE_LIMIT,
+                edge_limit: WORKFLOW_TRAVERSAL_EDGE_LIMIT,
+                min_confidence: "likely".into(),
+                kinds: Vec::new(),
+                file_roles: vec!["production".into()],
+                penalize_file_roles: true,
+            },
+        )?;
+        traversal_truncated |= neighborhood.truncated;
+        for node in neighborhood.nodes {
+            if node.kind != "symbol" || node.file_role.as_deref() != Some("production") {
+                continue;
+            }
+            let is_seed = resolved_seeds.contains(&node.key);
+            nodes
+                .entry(node.key.clone())
+                .and_modify(|(existing, existing_seed)| {
+                    existing.relevance = existing.relevance.max(node.relevance);
+                    *existing_seed |= is_seed;
+                })
+                .or_insert((node, is_seed));
+        }
+    }
+    let mut candidates = nodes
+        .into_values()
+        .map(|(node, seed)| workflow_candidate(root, conn, node, seed))
+        .collect::<Result<Vec<_>>>()?;
+    candidates.sort_by(|left, right| {
+        right
+            .seed
+            .cmp(&left.seed)
+            .then_with(|| right.relevance.total_cmp(&left.relevance))
+            .then_with(|| left.anchor.cmp(&right.anchor))
+    });
+    let candidate_truncated = candidates.len() > options.candidate_limit;
+    candidates.truncate(options.candidate_limit);
+    let fingerprint = workflow_candidate_fingerprint(
+        &snapshot,
+        &resolved_seeds,
+        options.depth,
+        options.candidate_limit,
+        &candidates,
+    );
+    Ok(WorkflowCandidateSet {
+        snapshot,
+        seeds: resolved_seeds,
+        direction: "both".into(),
+        depth: options.depth,
+        min_confidence: "likely".into(),
+        candidate_limit: options.candidate_limit,
+        fingerprint,
+        traversal_truncated,
+        candidate_truncated,
+        candidates,
+    })
+}
+
+fn workflow_candidate(
+    root: &Path,
+    conn: &Connection,
+    node: structural::GraphNode,
+    seed: bool,
+) -> Result<WorkflowCandidate> {
+    let (file, start_line, declaration_end): (String, i64, i64) = conn.query_row(
+        "SELECT f.path, s.line, s.decl_end
+         FROM graph_nodes g
+         JOIN symbols s ON g.native_table='symbols' AND g.native_id=s.id
+         JOIN files f ON f.id=s.file_id
+         WHERE g.node_key=?1",
+        [&node.key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let source = std::fs::read_to_string(root.join(&file))
+        .with_context(|| format!("read workflow candidate file `{file}`"))?;
+    let declaration_end = usize::try_from(declaration_end)
+        .unwrap_or(source.len())
+        .min(source.len());
+    let end_line = source
+        .get(..declaration_end)
+        .map_or(start_line, |prefix| prefix.lines().count() as i64)
+        .max(start_line);
+    Ok(WorkflowCandidate {
+        anchor: node.key,
+        display_name: node.display_name,
+        file,
+        evidence_start_line: start_line,
+        evidence_end_line: end_line,
+        relevance: node.relevance,
+        seed,
+    })
+}
+
+fn workflow_candidate_fingerprint(
+    snapshot: &str,
+    seeds: &[String],
+    depth: usize,
+    candidate_limit: usize,
+    candidates: &[WorkflowCandidate],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-workflow-candidates-v1\0");
+    for value in [snapshot, "both", "likely"] {
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(depth.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(candidate_limit.to_string().as_bytes());
+    for seed in seeds {
+        hasher.update(b"\0seed\0");
+        hasher.update(seed.as_bytes());
+    }
+    for candidate in candidates {
+        hasher.update(b"\0candidate\0");
+        hasher.update(candidate.anchor.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 pub fn annotate_request(
@@ -713,7 +913,10 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{AnnotateInput, SupportInput, annotate, search, support_relationship};
+    use super::{
+        AnnotateInput, SupportInput, WorkflowCandidateOptions, annotate, search,
+        support_relationship, workflow_candidates,
+    };
     use crate::{indexer, store, structural};
 
     fn support(claim_path: &str, anchor: &str, file: &str) -> SupportInput {
@@ -859,6 +1062,59 @@ mod tests {
                 .to_string()
                 .contains("duplicated")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_candidates_expand_ranked_production_symbols_and_fingerprint_the_set() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("entry.ts"),
+            "import { middle } from './middle';\nexport function entry() { return middle(); }\n",
+        )?;
+        fs::write(
+            repo.path().join("middle.ts"),
+            "import { leaf } from './leaf';\nexport function middle() { return leaf(); }\n",
+        )?;
+        fs::write(repo.path().join("leaf.ts"), "export function leaf() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("entry.test.ts"),
+            "export function testHelper() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let entry = "sym:entry.ts#::entry@1".to_string();
+        let leaf = "sym:leaf.ts#::leaf@1".to_string();
+        let options = WorkflowCandidateOptions::default();
+        let result = workflow_candidates(
+            repo.path(),
+            &conn,
+            &[entry.clone(), leaf.clone()],
+            &options,
+        )?;
+        assert_eq!(result.candidates.len(), 3);
+        assert!(!result.traversal_truncated);
+        assert!(!result.candidate_truncated);
+        assert!(result.candidates.iter().all(|candidate| !candidate.file.contains("test")));
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.display_name == "middle" && candidate.evidence_end_line >= 2
+        }));
+
+        let reversed = workflow_candidates(repo.path(), &conn, &[leaf, entry], &options)?;
+        assert_eq!(result.fingerprint, reversed.fingerprint);
+        assert_eq!(
+            result.candidates.iter().map(|candidate| &candidate.anchor).collect::<Vec<_>>(),
+            reversed.candidates.iter().map(|candidate| &candidate.anchor).collect::<Vec<_>>(),
+        );
+
+        let limited = workflow_candidates(
+            repo.path(),
+            &conn,
+            &["entry".into()],
+            &WorkflowCandidateOptions { candidate_limit: 2, ..Default::default() },
+        )?;
+        assert_eq!(limited.candidates.len(), 2);
+        assert!(limited.candidate_truncated);
         Ok(())
     }
 
