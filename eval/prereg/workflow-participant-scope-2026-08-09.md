@@ -131,3 +131,24 @@ measures whether the later boundaries exist anywhere in scoped memory. The
 defining/supporting split is reported as a diagnostic and tested behaviorally
 through warm correctness and the zero-Recall-regression condition; no precision
 claim is made against a deliberately partial follow-up gold set.
+
+## Pre-run coverage amendment
+
+The same non-claim smoke also exposed a producer omission: the stored workflow
+mentioned inventory reservation and payment authorization only inside the
+checkout orchestrator's role, without participant anchors for
+`reserveInventory` or `authorizePayment`. The warm agent answered correctly by
+re-reading those files, so answer correctness did not validate artifact
+coverage.
+
+Before the registered run, MCP workflow instructions are clarified as follows:
+
+- record every distinct, stable, cross-file production stage or effect as its
+  own participant;
+- use `supporting` for internal/leaf stages that are useful for later
+  localization instead of omitting them;
+- do not mention an anchored operation only inside another participant's role.
+
+A final non-claim fixture smoke must retain both synchronous operation anchors
+as participants. If it does not, the Twenty run does not start: the producer is
+not reliably synthesizing reusable workflow coverage.
