@@ -196,6 +196,9 @@ run. It is a bounded direction gate, not a general product benchmark.
   [protocols/two-session-memory.md](protocols/two-session-memory.md).
 - The post-SC-2a workflow-scope treatment is pre-registered in
   [prereg/workflow-participant-scope-2026-08-09.md](prereg/workflow-participant-scope-2026-08-09.md).
+- Candidate-closed workflow scouting and its structural-before-semantic gate are
+  pre-registered in
+  [prereg/candidate-closed-scouting-2026-08-09.md](prereg/candidate-closed-scouting-2026-08-09.md).
 
 ## Two-session semantic-memory runner
 
