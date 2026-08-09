@@ -57,14 +57,12 @@ memory retrieval remain out of scope.
 - Keep the stale arm because participant supports still participate in
   freshness; its original hard failure rules remain unchanged.
 - Blindly adjudicate every exact-set disagreement with `gpt-5.6-sol`/high.
-- Independently extract every successful session-1 workflow and compare its
-  `defining` anchors with that pair's hidden session-2 gold. This is an artifact
-  representation diagnostic, not an answer grade. Report micro and per-pair
-  precision/recall plus every false-defining and missing-defining anchor.
-
-The defining-scope diagnostic is intentionally keyed to the later question:
-the artifact is useful only if it preserves the abstraction level a later
-agent needs without receiving that question's answer directly.
+- Independently extract every successful session-1 workflow and compare all of
+  its participant anchors with that pair's hidden session-2 gold. This is an
+  artifact-coverage diagnostic, not an answer grade. Report micro and per-pair
+  recall, every missing follow-up boundary, and whether each matched boundary
+  was defining or supporting. Do not treat additional workflow participants as
+  false positives because the follow-up intentionally asks for only one slice.
 
 ## Registered outcomes
 
@@ -74,8 +72,8 @@ The treatment passes only if all are true:
    participant has a valid scope and at least one participant is `defining`.
    Runs with no `supporting` participant are reported but do not fail
    mechanically.
-2. Micro defining-participant precision and recall are each at least 80%, and
-   no pair has either metric below 50% across its three trials.
+2. Micro all-participant recall of hidden follow-up boundaries is at least 80%,
+   and no pair has recall below 50% across its three trials.
 3. Adjudicated warm session-2 correctness is at least cold correctness, with
    zero warm regressions on Recall.
 4. Median warm session-2 token reduction is at least 20%, memory is returned in
@@ -83,8 +81,9 @@ The treatment passes only if all are true:
 5. Failed `annotate` calls are at most 17, half the v1 count rounded down.
 6. The existing stale-safety gate has no failure.
 
-Failure of outcome 2 blocks broad workflow generation: the new field would be
-structured guesswork. Failure only of outcome 5 keeps the semantic model but
+Failure of outcome 2 blocks broad workflow generation: the record is omitting
+too much of the workflow to support later questions. Failure only of outcome 5
+keeps the semantic model but
 requires an ergonomic write API before agent write-back expands. Correctness
 regression or stale-safety failure blocks SC-2b/default rollout. Efficiency
 below 20% keeps memory opt-in even if the artifact representation improves.
@@ -116,3 +115,19 @@ changing the semantic treatment:
 The full run may start only after a fresh non-claim fixture session writes one
 valid scoped workflow with at most one failed `annotate` call. The smoke is a
 mechanical API check and does not contribute to any registered outcome.
+
+## Pre-run metric correction
+
+The amended fixture smoke wrote one valid workflow with one failed call, so the
+ergonomic prerequisite passed. It also proved the original defining-only
+diagnostic invalid: `reserveInventory` and `authorizePayment` were reasonably
+labelled supporting operations in the complete checkout/receipt workflow, yet
+they are exactly the later question's gold and the warm answer was correct.
+The follow-up task selects a workflow slice; it is not ground truth for the
+workflow's abstraction level.
+
+This correction was made before any registered Twenty run. Outcome 2 now
+measures whether the later boundaries exist anywhere in scoped memory. The
+defining/supporting split is reported as a diagnostic and tested behaviorally
+through warm correctness and the zero-Recall-regression condition; no precision
+claim is made against a deliberately partial follow-up gold set.
