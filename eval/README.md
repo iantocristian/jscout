@@ -194,6 +194,8 @@ run. It is a bounded direction gate, not a general product benchmark.
   `results/file-roles-prechange-expansion-backfill-2026-08-09.json`.
 - The SC-2a memory gate is specified in
   [protocols/two-session-memory.md](protocols/two-session-memory.md).
+- The post-SC-2a workflow-scope treatment is pre-registered in
+  [prereg/workflow-participant-scope-2026-08-09.md](prereg/workflow-participant-scope-2026-08-09.md).
 
 ## Two-session semantic-memory runner
 
