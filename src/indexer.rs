@@ -326,11 +326,11 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     )?;
     let mut cache: HashMap<(PathBuf, String), (Option<i64>, Option<String>)> = HashMap::new();
     for (file_id, rel_path, request) in pairs {
-        let dir = root.join(&rel_path).parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
-        let key = (dir.clone(), request.clone());
+        let importer = root.join(&rel_path);
+        let key = (importer.clone(), request.clone());
         let (to_file, package) = cache
             .entry(key)
-            .or_insert_with(|| match resolver.resolve(&dir, &request) {
+            .or_insert_with(|| match resolver.resolve_file(&importer, &request) {
                 Ok(resolution) => {
                     let p = resolution.path().to_path_buf();
                     match file_ids.get(&p) {
@@ -358,5 +358,48 @@ fn package_name(request: &str) -> String {
         (Some(scope), Some(name)) if scope.starts_with('@') => format!("{scope}/{name}"),
         (Some(name), _) => name.to_string(),
         _ => request.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+
+    use super::index_repo;
+    use crate::store;
+
+    #[test]
+    fn resolves_paths_from_the_importers_nearest_tsconfig() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let app = repo.path().join("packages/app");
+        fs::create_dir_all(app.join("src"))?;
+        fs::write(
+            app.join("tsconfig.json"),
+            r#"{
+                "compilerOptions": { "paths": { "src/*": ["./src/*"] } },
+                "include": ["src/**/*.ts"]
+            }"#,
+        )?;
+        fs::write(
+            app.join("src/main.ts"),
+            "import { helper } from 'src/helper';\nexport const main = () => helper();\n",
+        )?;
+        fs::write(app.join("src/helper.ts"), "export const helper = () => 1;\n")?;
+
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let resolved: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT target.path, edge.package
+             FROM module_edges edge
+             JOIN files source ON source.id=edge.from_file
+             LEFT JOIN files target ON target.id=edge.to_file
+             WHERE source.path='packages/app/src/main.ts' AND edge.request='src/helper'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(resolved, (Some("packages/app/src/helper.ts".into()), None));
+        Ok(())
     }
 }
