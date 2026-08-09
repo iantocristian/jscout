@@ -92,3 +92,27 @@ below 20% keeps memory opt-in even if the artifact representation improves.
 This run may establish the value of scoped workflow artifacts. It may not be
 claimed as evidence for file/module summaries, concepts, autonomous repository-
 wide scouting, or repositories beyond the admitted Twenty workflows.
+
+## Pre-run ergonomic amendment
+
+Before any registered Twenty run, a non-claim fixture smoke exposed 25 failed
+`annotate` calls and two successful writes in one session. The agent discovered
+the generic request one field at a time, then duplicated JSON-pointer supports
+for participant anchor/scope/role leaves. A richer nested schema description
+did not fix the v1 repair loop.
+
+The workflow request shape is therefore refined before execution, without
+changing the semantic treatment:
+
+- `type`, `name`, `participants`, `confidence`, `snapshot`, and optional
+  `supersedes` are top-level;
+- each participant carries `anchor`, `role`, `scope`, exact evidence file/span,
+  and confidence directly;
+- the server constructs the canonical body plus `/name` and participant-role
+  support rows; agents do not author JSON pointers for workflows;
+- generic `body` plus `supports` remains the request shape for free-form
+  `annotation` records only.
+
+The full run may start only after a fresh non-claim fixture session writes one
+valid scoped workflow with at most one failed `annotate` call. The smoke is a
+mechanical API check and does not contribute to any registered outcome.
