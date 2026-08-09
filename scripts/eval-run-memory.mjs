@@ -230,7 +230,7 @@ function checkpointDatabase(databasePath) {
   }
 }
 
-function cloneDatabase(source, target, allowFullCopy) {
+export function cloneDatabase(source, target, allowFullCopy) {
   try {
     fs.copyFileSync(
       source,
@@ -299,7 +299,7 @@ function copyCleanSeed(seed, target, allowFullCopy) {
   cloneDatabase(seed, target, allowFullCopy);
 }
 
-async function runSession({
+export async function runSession({
   options,
   pair,
   task,
@@ -313,7 +313,8 @@ async function runSession({
   seedSha256,
 }) {
   const semanticStateBefore = databaseState(database);
-  const session = `memory-${pair.id}-${options.trial}-${arm}-${phase}`;
+  const sessionPrefix = options["session-prefix"] ?? "memory";
+  const session = `${sessionPrefix}-${pair.id}-${options.trial}-${arm}-${phase}`;
   const lastMessage = path.join(os.tmpdir(), `jscout-${session}-${process.pid}.json`);
   const args = [
     "exec",

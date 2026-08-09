@@ -466,7 +466,12 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
             }
         }
 
-        if result.semantic_artifacts.pop().is_some() {
+        // Preserve the highest-ranked semantic artifact over ordinary code hits.
+        // A warm-memory response that silently budgets away its only artifact
+        // has not delivered the requested treatment. Lower-ranked artifacts are
+        // still expendable before we reduce primary hits.
+        if result.semantic_artifacts.len() > 1 {
+            result.semantic_artifacts.pop();
             result.response_budget.omitted_semantic_artifacts += 1;
             continue;
         }
@@ -504,6 +509,13 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
         }
         if result.hits.pop().is_some() {
             result.response_budget.omitted_hits += 1;
+            continue;
+        }
+
+        // The final artifact is removed only when it cannot fit in the
+        // response envelope by itself.
+        if result.semantic_artifacts.pop().is_some() {
+            result.response_budget.omitted_semantic_artifacts += 1;
             continue;
         }
 
@@ -762,11 +774,12 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ResponseBudget, SearchExpansion,
+        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, SearchExpansion,
         SearchOptions, SearchResult, apply_response_budget, search,
     };
     use crate::{
         file_role, indexer, store,
+        semantic::SemanticArtifact,
         structural::{GraphEdge, GraphNode},
     };
 
@@ -952,6 +965,63 @@ mod tests {
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
         assert!(result.response_budget.rendered_bytes <= 1_500);
+        Ok(())
+    }
+
+    #[test]
+    fn response_budget_preserves_top_memory_before_code_hits() -> Result<()> {
+        let mut result = SearchResult {
+            snapshot: "s".repeat(64),
+            hits: vec![Hit {
+                chunk_id: 1,
+                file: "src/large.ts".into(),
+                file_role: "production".into(),
+                kind: "function".into(),
+                name: Some("largeHit".into()),
+                start_line: 1,
+                end_line: 200,
+                score: 1.0,
+                snippet: "x".repeat(8_000),
+                snippet_truncated: false,
+                anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
+                file_anchor: "file:src/large.ts".into(),
+                uses: vec!["helper (call)".into()],
+                used_by: vec!["caller: 1 site".into()],
+            }],
+            semantic_artifacts: vec![SemanticArtifact {
+                id: 1,
+                supersedes: None,
+                artifact_type: "workflow".into(),
+                name: Some("checkout lifecycle".into()),
+                trust: "untrusted-semantic-memory".into(),
+                body: serde_json::json!({
+                    "participants": [{
+                        "anchor": "sym:src/checkout.ts#::checkout@1",
+                        "role": "workflow entry"
+                    }]
+                }),
+                model: "agent-reported".into(),
+                prompt_version: "annotate/v1".into(),
+                confidence: "likely".into(),
+                source_snapshot: "s".repeat(64),
+                created_at: "2026-08-09T00:00:00Z".into(),
+                freshness: "fresh".into(),
+                supports: Vec::new(),
+                relevance: 1.0,
+            }],
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 2_000,
+                ..Default::default()
+            },
+        };
+
+        apply_response_budget(&mut result)?;
+        assert_eq!(result.semantic_artifacts.len(), 1);
+        assert_eq!(result.response_budget.omitted_semantic_artifacts, 0);
+        assert!(result.response_budget.truncated);
+        assert!(result.response_budget.omitted_hits > 0 || result.hits[0].snippet_truncated);
+        assert!(result.response_budget.rendered_bytes <= 2_000);
         Ok(())
     }
 

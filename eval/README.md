@@ -279,6 +279,25 @@ The report enforces single-model pooling, pairs by task/trial, checks actual
 artifact reads and writes, bootstraps by pair, and implements the registered
 20%/10% gate plus the hard stale-handling failures: not retrieved, not visibly
 stale/degraded, or not re-verified.
+
+For a pre-registered fixed-snapshot replay, reuse archived session-1 databases
+without regenerating memory or cold rows:
+
+```bash
+node scripts/eval-run-memory-replay.mjs \
+  --tasks eval/tasks/memory-pairs.json \
+  --repository /path/to/frozen/repository \
+  --jscout "$PWD/target/release/jscout" \
+  --source-responses /tmp/memory-001.jsonl,/tmp/memory-002.jsonl \
+  --source-artifacts /tmp/memory-001-artifacts,/tmp/memory-002-artifacts \
+  --responses /tmp/memory-replay-responses.jsonl \
+  --telemetry /tmp/memory-replay-telemetry.jsonl \
+  --artifacts /tmp/memory-replay-artifacts \
+  --model gpt-5.6-terra --reasoning high
+```
+
+The replay runner verifies every archived semantic-table fingerprint against
+its source response before cloning it and assigns new session identifiers.
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
