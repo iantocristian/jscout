@@ -34,10 +34,49 @@ pub struct AnnotateInput {
     pub supersedes: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowParticipantInput {
+    pub anchor: String,
+    pub role: String,
+    pub scope: String,
+    pub evidence_file: String,
+    pub evidence_start_line: i64,
+    pub evidence_end_line: i64,
+    pub confidence: String,
+}
+
+/// Agent-facing write request. Workflows use an ergonomic direct shape; the
+/// generic JSON-pointer form is retained only for free-form annotations.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnnotateRequest {
+    #[serde(rename = "workflow")]
+    Workflow {
+        name: String,
+        participants: Vec<WorkflowParticipantInput>,
+        confidence: String,
+        snapshot: String,
+        supersedes: Option<i64>,
+    },
+    #[serde(rename = "annotation")]
+    Annotation {
+        name: Option<String>,
+        body: Value,
+        supports: Vec<SupportInput>,
+        confidence: String,
+        snapshot: String,
+        supersedes: Option<i64>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticSupport {
     pub claim_path: String,
     pub anchor: String,
+    /// How this evidence relates to the rendered semantic artifact. Workflow
+    /// participant evidence is separated by abstraction level so consumers do
+    /// not mistake an internal helper for a defining boundary.
+    pub relationship: String,
     pub role: Option<String>,
     pub evidence_file: String,
     pub evidence_start_line: i64,
@@ -79,6 +118,85 @@ struct ValidatedSupport {
     source_hash: String,
     context_hash: String,
     confidence: String,
+}
+
+pub fn annotate_request(
+    root: &Path,
+    conn: &Connection,
+    request: AnnotateRequest,
+) -> Result<SemanticArtifact> {
+    let input = match request {
+        AnnotateRequest::Workflow {
+            name,
+            participants,
+            confidence,
+            snapshot,
+            supersedes,
+        } => workflow_request(name, participants, confidence, snapshot, supersedes)?,
+        AnnotateRequest::Annotation {
+            name,
+            body,
+            supports,
+            confidence,
+            snapshot,
+            supersedes,
+        } => AnnotateInput {
+            artifact_type: "annotation".into(),
+            name,
+            body,
+            supports,
+            confidence,
+            snapshot,
+            supersedes,
+        },
+    };
+    annotate(root, conn, &input)
+}
+
+fn workflow_request(
+    name: String,
+    participants: Vec<WorkflowParticipantInput>,
+    confidence: String,
+    snapshot: String,
+    supersedes: Option<i64>,
+) -> Result<AnnotateInput> {
+    let name_evidence = participants
+        .iter()
+        .find(|participant| participant.scope == "defining")
+        .context("workflow request requires at least one defining participant")?;
+    let participant_body: Vec<Value> = participants
+        .iter()
+        .map(|participant| {
+            serde_json::json!({
+                "anchor": participant.anchor,
+                "role": participant.role,
+                "scope": participant.scope,
+            })
+        })
+        .collect();
+    let support = |claim_path: String, participant: &WorkflowParticipantInput| SupportInput {
+        claim_path,
+        anchor: participant.anchor.clone(),
+        role: None,
+        evidence_file: participant.evidence_file.clone(),
+        evidence_start_line: participant.evidence_start_line,
+        evidence_end_line: participant.evidence_end_line,
+        confidence: participant.confidence.clone(),
+    };
+    let mut supports = Vec::with_capacity(participants.len() + 1);
+    supports.push(support("/name".into(), name_evidence));
+    for (index, participant) in participants.iter().enumerate() {
+        supports.push(support(format!("/participants/{index}/role"), participant));
+    }
+    Ok(AnnotateInput {
+        artifact_type: "workflow".into(),
+        name: Some(name),
+        body: serde_json::json!({ "participants": participant_body }),
+        supports,
+        confidence,
+        snapshot,
+        supersedes,
+    })
 }
 
 pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result<SemanticArtifact> {
@@ -212,7 +330,7 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
             "INSERT INTO semantic_artifacts(
                supersedes_artifact_id, artifact_type, canonical_name, body_json,
                model, prompt_version, confidence, source_snapshot, created_at
-             ) VALUES(?1,?2,?3,?4,'agent-reported','annotate/v1',?5,?6,
+             ) VALUES(?1,?2,?3,?4,'agent-reported','annotate/v2',?5,?6,
                       strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             params![
                 input.supersedes,
@@ -333,6 +451,8 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
     let Some((id, supersedes, artifact_type, name, body_json, model, prompt_version, confidence, source_snapshot, created_at)) = row else {
         return Ok(None);
     };
+    let body: Value = serde_json::from_str(&body_json)
+        .with_context(|| format!("semantic artifact {id} has invalid body JSON"))?;
     let mut statement = conn.prepare(
         "SELECT claim_path, anchor_key, role, evidence_file, evidence_start_line,
                 evidence_end_line, source_hash, context_hash, confidence
@@ -370,6 +490,7 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
             "fresh"
         };
         supports.push(SemanticSupport {
+            relationship: support_relationship(&artifact_type, &body, &claim_path),
             claim_path,
             anchor,
             role,
@@ -399,8 +520,7 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
         artifact_type,
         name,
         trust: "untrusted-semantic-memory".into(),
-        body: serde_json::from_str(&body_json)
-            .with_context(|| format!("semantic artifact {id} has invalid body JSON"))?,
+        body,
         model,
         prompt_version,
         confidence,
@@ -429,7 +549,8 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     let mut required_claims = Vec::new();
     collect_claim_paths(&input.body, "", &mut required_claims);
     required_claims.retain(|claim_path| {
-        !(claim_path.starts_with("/participants/") && claim_path.ends_with("/anchor"))
+        !(claim_path.starts_with("/participants/")
+            && (claim_path.ends_with("/anchor") || claim_path.ends_with("/scope")))
     });
     for claim_path in required_claims {
         if !input
@@ -458,13 +579,25 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     if !input.supports.iter().any(|support| support.claim_path == "/name") {
         bail!("workflow name requires a support with claim_path `/name`");
     }
+    let mut participant_anchors = HashSet::new();
+    let mut defining_participants = 0;
     for (index, participant) in participants.iter().enumerate() {
         let anchor = participant["anchor"]
             .as_str()
             .filter(|anchor| !anchor.is_empty())
             .with_context(|| format!("workflow participant {index} requires an anchor"))?;
+        if !participant_anchors.insert(anchor) {
+            bail!("workflow participant anchor `{anchor}` is duplicated");
+        }
         if participant["role"].as_str().is_none_or(str::is_empty) {
             bail!("workflow participant {index} requires a role");
+        }
+        match participant["scope"].as_str() {
+            Some("defining") => defining_participants += 1,
+            Some("supporting") => {}
+            _ => bail!(
+                "workflow participant {index} requires scope `defining` or `supporting`"
+            ),
         }
         let claim_path = format!("/participants/{index}/role");
         if !input
@@ -477,7 +610,33 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
             );
         }
     }
+    if defining_participants == 0 {
+        bail!("workflow body requires at least one defining participant");
+    }
     Ok(())
+}
+
+fn support_relationship(artifact_type: &str, body: &Value, claim_path: &str) -> String {
+    if claim_path == "/name" {
+        return "artifact-name-evidence".into();
+    }
+    if artifact_type != "workflow" || !claim_path.starts_with("/participants/") {
+        return "claim-evidence".into();
+    }
+    let mut segments = claim_path.split('/');
+    let _root = segments.next();
+    let _participants = segments.next();
+    let Some(index) = segments.next() else {
+        return "claim-evidence".into();
+    };
+    match body
+        .pointer(&format!("/participants/{index}/scope"))
+        .and_then(Value::as_str)
+    {
+        Some("defining") => "defining-participant-evidence".into(),
+        Some("supporting") => "supporting-participant-evidence".into(),
+        _ => "legacy-participant-evidence".into(),
+    }
 }
 
 fn collect_claim_paths(value: &Value, prefix: &str, output: &mut Vec<String>) {
@@ -554,7 +713,7 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{AnnotateInput, SupportInput, annotate, search};
+    use super::{AnnotateInput, SupportInput, annotate, search, support_relationship};
     use crate::{indexer, store, structural};
 
     fn support(claim_path: &str, anchor: &str, file: &str) -> SupportInput {
@@ -584,8 +743,8 @@ mod tests {
             name: Some("handoff workflow".into()),
             body: json!({
                 "participants": [
-                    { "anchor": alpha, "role": "starts handoff" },
-                    { "anchor": beta, "role": "finishes handoff" }
+                    { "anchor": alpha, "role": "starts handoff", "scope": "defining" },
+                    { "anchor": beta, "role": "finishes handoff", "scope": "supporting" }
                 ]
             }),
             supports: vec![
@@ -601,8 +760,23 @@ mod tests {
         assert_eq!(artifact.freshness, "fresh");
         assert_eq!(artifact.trust, "untrusted-semantic-memory");
         assert_eq!(artifact.model, "agent-reported");
-        assert_eq!(artifact.prompt_version, "annotate/v1");
+        assert_eq!(artifact.prompt_version, "annotate/v2");
         assert_eq!(artifact.supports.len(), 3);
+        assert_eq!(artifact.supports[0].relationship, "artifact-name-evidence");
+        assert!(artifact.supports.iter().any(|support| {
+            support.relationship == "defining-participant-evidence"
+        }));
+        assert!(artifact.supports.iter().any(|support| {
+            support.relationship == "supporting-participant-evidence"
+        }));
+        assert_eq!(
+            support_relationship(
+                "workflow",
+                &json!({ "participants": [{ "anchor": alpha, "role": "legacy" }] }),
+                "/participants/0/role",
+            ),
+            "legacy-participant-evidence"
+        );
         assert_eq!(search(&conn, "handoff", 4)?.len(), 1);
 
         fs::write(repo.path().join("a.ts"), "export function alpha() { return 3; }\n")?;
@@ -620,6 +794,70 @@ mod tests {
                 .supports
                 .iter()
                 .any(|support| support.freshness == "fresh")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_requires_unique_scoped_participants_and_one_defining_boundary() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let alpha = "sym:a.ts#::alpha@1";
+        let snapshot = structural::current_snapshot(&conn)?;
+        let make_input = |participants| AnnotateInput {
+            artifact_type: "workflow".into(),
+            name: Some("scoped workflow".into()),
+            body: json!({ "participants": participants }),
+            supports: vec![
+                support("/name", alpha, "a.ts"),
+                support("/participants/0/role", alpha, "a.ts"),
+            ],
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        };
+
+        let missing_scope = make_input(json!([
+            { "anchor": alpha, "role": "entry" }
+        ]));
+        assert!(
+            annotate(repo.path(), &conn, &missing_scope)
+                .unwrap_err()
+                .to_string()
+                .contains("requires scope")
+        );
+
+        let only_supporting = make_input(json!([
+            { "anchor": alpha, "role": "helper", "scope": "supporting" }
+        ]));
+        assert!(
+            annotate(repo.path(), &conn, &only_supporting)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one defining participant")
+        );
+
+        let duplicate = AnnotateInput {
+            body: json!({
+                "participants": [
+                    { "anchor": alpha, "role": "entry", "scope": "defining" },
+                    { "anchor": alpha, "role": "helper", "scope": "supporting" }
+                ]
+            }),
+            supports: vec![
+                support("/name", alpha, "a.ts"),
+                support("/participants/0/role", alpha, "a.ts"),
+                support("/participants/1/role", alpha, "a.ts"),
+            ],
+            ..make_input(json!([]))
+        };
+        assert!(
+            annotate(repo.path(), &conn, &duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicated")
         );
         Ok(())
     }

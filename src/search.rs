@@ -997,11 +997,12 @@ mod tests {
                 body: serde_json::json!({
                     "participants": [{
                         "anchor": "sym:src/checkout.ts#::checkout@1",
-                        "role": "workflow entry"
+                        "role": "workflow entry",
+                        "scope": "defining"
                     }]
                 }),
                 model: "agent-reported".into(),
-                prompt_version: "annotate/v1".into(),
+                prompt_version: "annotate/v2".into(),
                 confidence: "likely".into(),
                 source_snapshot: "s".repeat(64),
                 created_at: "2026-08-09T00:00:00Z".into(),

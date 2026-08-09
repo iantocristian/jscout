@@ -187,9 +187,20 @@ file rows and are refreshed even when source hashes are unchanged.
 
 Agent-authored `workflow` and `annotation` records live in separate
 `semantic_artifacts`/`semantic_supports` tables; they never become structural
-edges. Supports store source and direct structural-context fingerprints.
+edges. Workflow participants are explicitly `defining` (the minimal stable
+cross-file skeleton) or `supporting` (internal helpers and leaf operations), so
+evidence does not flatten every related function into an equal boundary.
+Supports store source and direct structural-context fingerprints.
 Re-indexing preserves memory and makes source/context drift visible instead of
 silently deleting or serving the record as current.
+
+Workflow writes use a direct request: `participants` is top-level and every
+participant carries its own anchor, role, scope, evidence file/span, and
+confidence. jscout constructs the stored body and support pointers. Generic
+`body`/`supports` input is reserved for `annotation` records. Writers retain
+every distinct stable cross-file production stage as a participant; internal
+or leaf stages are `supporting`, not compressed into another participant's
+prose role.
 
 ## Build
 

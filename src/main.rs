@@ -277,8 +277,9 @@ fn main() -> Result<()> {
         }
         Command::Annotate { root, input, database } => {
             let conn = open_database(&root, database.as_deref())?;
-            let input: semantic::AnnotateInput = serde_json::from_slice(&std::fs::read(&input)?)?;
-            let artifact = semantic::annotate(&root, &conn, &input)?;
+            let input: semantic::AnnotateRequest =
+                serde_json::from_slice(&std::fs::read(&input)?)?;
+            let artifact = semantic::annotate_request(&root, &conn, input)?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
             Ok(())
         }

@@ -480,9 +480,9 @@ participant.
   "type": "workflow",
   "name": "checkout",
   "participants": [
-    {"anchor": "...checkout...", "role": "orchestrator"},
-    {"anchor": "...reserveInventory...", "role": "inventory consistency"},
-    {"anchor": "...authorize...", "role": "payment initiation"}
+    {"anchor": "...checkout...", "role": "orchestrator", "scope": "defining"},
+    {"anchor": "...reserveInventory...", "role": "inventory consistency", "scope": "defining"},
+    {"anchor": "...retryAuthorization...", "role": "retry helper", "scope": "supporting"}
   ]
 }
 ```
@@ -490,6 +490,11 @@ participant.
 Workflows are first because they answer “which workflows does this code
 participate in?” and require cross-file semantics that structural search does
 not already provide. Each participant and role needs validated evidence.
+`defining` participants form the minimal stable cross-file skeleton;
+`supporting` participants retain useful internal detail without presenting a
+helper as an equal workflow boundary. Every distinct stable cross-file stage
+still gets its own participant anchor; scope prevents flattening without
+discarding localization evidence.
 
 ### Step 2: validated agent write-back
 
@@ -504,7 +509,7 @@ Write-back follows the same trust contract as scout output:
   exact evidence spans;
 - the server validates anchors, spans, source hashes, and the current snapshot
   before committing;
-- `model = 'agent-reported'` and `prompt_version = 'annotate/v1'`;
+- `model = 'agent-reported'` and `prompt_version = 'annotate/v2'`;
   reporter/session details may be stored inside `body_json` without being
   treated as evidence;
 - confidence is `likely` or `possible`, never `certain`;
@@ -795,7 +800,7 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **SC-1** | First full-source vs deterministic-elided A/B complete: equal correctness, no selected-artifact compression, worse observed calls/bytes; full remains default and custom IR is not earned | RI-1 | Current renderer rejected 2026-08-07; iterate only behind another gate |
 | **SC-2a** | Complete: bounded workflow memory, semantic storage/freshness, validated `annotate` write-back, and fixed-snapshot response-budget replay | SC-1 | Passed registered replay 2026-08-09; remains opt-in |
 | **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
-| **SC-2b** | Expand workflow coverage only if bounded evaluation succeeds; use EN-1 seeds when available | SC-2a; EN-1 improves workflow seeds | Incremental |
+| **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; EN-1 improves workflow seeds | Free-form producer blocked in preflight 2026-08-09 |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
 
@@ -817,6 +822,13 @@ correct token win. This accepts opt-in workflow memory, not default retrieval
 or broad scouting. The remaining Recall regression requires defining
 participants to be separated from evidence-only helpers before SC-2b expands
 coverage.
+The first participant-scope preflight then showed that scope labels alone do
+not prevent omissions: two direct-write smokes omitted both later-needed
+synchronous operations, including after explicit complete-stage guidance. No
+registered Twenty run was started. SC-2b must therefore be candidate-closed:
+deterministic graph expansion enumerates a bounded set and the LLM must classify
+every candidate as defining, supporting, or excluded. Free-form LLM discovery
+is not the next implementation step.
 Expansion remains opt-in. The failed first SC-1
 gate keeps full source as the default and requires a paired-artifact compression
 benchmark before another source-view agent run. Broad workflow coverage

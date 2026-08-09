@@ -305,6 +305,24 @@ pass `--require-session1-correctness false` to the report; the output records
 that gate setting rather than silently changing the default protocol.
 The first fixed-snapshot replay and its passing registered result are recorded
 in [`results/twenty-memory-budget-replay-2026-08-09.md`](results/twenty-memory-budget-replay-2026-08-09.md).
+
+For the participant-scope treatment, inspect the archived session-1 databases
+directly and compare all participant anchors with the hidden follow-up gold:
+
+```bash
+node scripts/eval-workflow-scope-report.mjs \
+  --tasks eval/tasks/twenty-memory-pairs.json \
+  --responses /tmp/memory-001.jsonl,/tmp/memory-002.jsonl \
+  --artifacts /tmp/memory-001-artifacts,/tmp/memory-002-artifacts
+```
+
+The report exposes every missing follow-up boundary and reports whether matched
+boundaries were defining or supporting. Additional participants are diagnostic,
+not false positives, because the follow-up asks for only one workflow slice.
+Prose in the stored artifact cannot affect this diagnostic.
+The free-form producer preflight and its decision to block the full treatment
+run are recorded in
+[`results/workflow-scope-preflight-2026-08-09.md`](results/workflow-scope-preflight-2026-08-09.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
