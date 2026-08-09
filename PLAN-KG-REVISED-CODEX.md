@@ -793,7 +793,7 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **P0** | Complete: frozen `ai-pipe` task set, isolated Codex runner, paired naturalistic/assisted observations, telemetry join, and recorded decision | Current core | Done 2026-08-07 |
 | **RI-1** | Complete: whole-search and outline response budgets, identity, materialized graph, candidate projection, ranked neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures | P0 | Done 2026-08-07; broader per-tool envelope coverage remains incremental |
 | **SC-1** | First full-source vs deterministic-elided A/B complete: equal correctness, no selected-artifact compression, worse observed calls/bytes; full remains default and custom IR is not earned | RI-1 | Current renderer rejected 2026-08-07; iterate only behind another gate |
-| **SC-2a** | Bounded LLM workflow experiment, semantic storage/freshness, and validated `annotate` write-back | SC-1 | 1–2 days plus prompt iteration |
+| **SC-2a** | Complete: bounded workflow memory, semantic storage/freshness, validated `annotate` write-back, and fixed-snapshot response-budget replay | SC-1 | Passed registered replay 2026-08-09; remains opt-in |
 | **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
 | **SC-2b** | Expand workflow coverage only if bounded evaluation succeeds; use EN-1 seeds when available | SC-2a; EN-1 improves workflow seeds | Incremental |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
@@ -808,9 +808,15 @@ files, and adjacent framework code. RI-2 expansion breadth and standalone
 search filters and pre-budget expansion filtering/penalties passed their
 pre-registered gate: structural irrelevant inspection fell to +1.08 versus
 grep with an interval including zero, while all arms scored 24/24. L1 retrieval
-investment closes here. Proceed with the bounded SC-2a workflow/write-back
-experiment, whose questions must test semantic workflow participation rather
-than repeat L1 localization.
+investment closes here. The bounded SC-2a workflow/write-back experiment
+initially landed inconclusive because response budgeting dropped the matching
+artifact in 4/18 warm runs. Its single pre-registered fixed-snapshot revision
+delivered memory in 18/18 and passed: 36.40% median session-2 token reduction,
+17/18 warm correctness versus 14/18 frozen cold, and artifact reads in every
+correct token win. This accepts opt-in workflow memory, not default retrieval
+or broad scouting. The remaining Recall regression requires defining
+participants to be separated from evidence-only helpers before SC-2b expands
+coverage.
 Expansion remains opt-in. The failed first SC-1
 gate keeps full source as the default and requires a paired-artifact compression
 benchmark before another source-view agent run. Broad workflow coverage

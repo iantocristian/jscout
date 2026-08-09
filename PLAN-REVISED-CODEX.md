@@ -43,7 +43,8 @@ capability rather than by declaring every original milestone complete.
 | Incremental indexing | File and chunk content hashes; unchanged files skipped; deleted files removed; module resolution rebuilt; optional filesystem watcher |
 | Agent interface | CLI plus MCP tools: `semantic_search`, `neighborhood`, `who_uses`, `definition`, `file_outline`, and `events`; opt-in privacy-minimal MCP call telemetry |
 | Snapshot safety | BLAKE3 repository snapshots; returned graph anchors are snapshot-scoped; stale symbol anchors re-resolve by path/scope/name or fail with candidates |
-| Evaluation artifacts | Chunk/structural/search unit tests, local retrieval benchmarks, and a paired baseline/structural agent-task protocol with telemetry-aware grading |
+| Semantic memory | Evidence-backed `workflow`/`annotation` artifacts, validated `annotate` write-back, freshness/degradation, search attachment, and memory inspection; top matching memory survives whole-response truncation when it fits |
+| Evaluation artifacts | Chunk/structural/search unit tests; contamination and anchor admission; three-arm retrieval, source-view, file-role, and two-session memory protocols with telemetry-aware grading |
 
 ### Partial or deferred
 
@@ -58,6 +59,7 @@ capability rather than by declaring every original milestone complete.
 | Repo map, paths, graph export | Not implemented; later structural-retrieval phase |
 | Real-provider embedding verification | Provider plumbing and mock-compatible verification exist; repeatable real-provider acceptance remains environment-dependent |
 | Runtime trace tier | Not implemented and not on the near-term critical path |
+| Broad semantic scouting | Bounded agent-authored workflow memory passed its fixed-snapshot budget replay; automated broad workflow generation and default retrieval remain gated on artifact-scope quality and fresh-pair evaluation |
 
 ## Decisions that now match the code
 

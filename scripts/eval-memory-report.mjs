@@ -64,6 +64,7 @@ export function buildMemoryReport({
   bootstrap = 10000,
   seed = 20260809,
   allowCrossModel = false,
+  requireSession1Correctness = true,
 }) {
   for (const taskSet of taskSets) validateTaskSet(taskSet);
   const pairs = taskSets.flatMap((taskSet) => taskSet.pairs);
@@ -228,7 +229,8 @@ export function buildMemoryReport({
   const tokenReduction = metric("token_reduction_fraction");
   const session1Correctness = mean(paired.map((row) => row.session1_correct));
   const artifactsRetrievedInAllWins = tokenWins.length > 0 && tokenWins.every((row) => row.artifact_used);
-  const correctnessParity = correctness.warm >= correctness.cold && session1Correctness === 1;
+  const correctnessParity = correctness.warm >= correctness.cold &&
+    (!requireSession1Correctness || session1Correctness === 1);
   const hardStalenessFailure = staleArtifactNotRetrieved.length > 0 ||
     staleArtifactNotLabelled.length > 0 || staleReverificationFailures > 0;
   const claimEligible = taskSets.every((taskSet) => taskSet.experiment?.claim_eligible !== false);
@@ -258,6 +260,10 @@ export function buildMemoryReport({
     runner_errors: paired.filter((row) => row.runner_error).length,
     correctness,
     session1_correctness: session1Correctness,
+    gates: {
+      require_session1_correctness: requireSession1Correctness,
+      correctness_parity: correctnessParity,
+    },
     session2: {
       token_delta_warm_minus_cold: metric("token_delta"),
       token_reduction_fraction: tokenReduction,
@@ -302,6 +308,7 @@ function main() {
     bootstrap: Number(options.bootstrap),
     seed: Number(options.seed),
     allowCrossModel: options["allow-cross-model"] === "true",
+    requireSession1Correctness: options["require-session1-correctness"] !== "false",
   });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }

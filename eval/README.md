@@ -297,7 +297,12 @@ node scripts/eval-run-memory-replay.mjs \
 ```
 
 The replay runner verifies every archived semantic-table fingerprint against
-its source response before cloning it and assigns new session identifiers.
+its source response before cloning it and assigns new session identifiers. A
+replay whose pre-registration treats session-1 databases as frozen inputs must
+pass `--require-session1-correctness false` to the report; the output records
+that gate setting rather than silently changing the default protocol.
+The first fixed-snapshot replay and its passing registered result are recorded
+in [`results/twenty-memory-budget-replay-2026-08-09.md`](results/twenty-memory-budget-replay-2026-08-09.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

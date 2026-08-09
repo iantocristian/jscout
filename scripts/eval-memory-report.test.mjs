@@ -60,6 +60,39 @@ test("memory report refuses cross-model pooling", () => {
   );
 });
 
+test("memory replay can report session 1 correctness without re-gating it", () => {
+  const responses = [
+    { ...response("warm", "session1", 100), correct: false },
+    response("warm", "session2", 60),
+    response("cold", "session2", 100),
+  ];
+  const telemetry = [
+    { session: "warm-session2", semantic_artifacts_returned: 1 },
+  ];
+  const defaultReport = buildMemoryReport({
+    taskSets,
+    responses,
+    telemetry,
+    bootstrap: 100,
+    seed: 1,
+  });
+  assert.equal(defaultReport.decision, "inconclusive");
+  assert.equal(defaultReport.gates.require_session1_correctness, true);
+
+  const replayReport = buildMemoryReport({
+    taskSets,
+    responses,
+    telemetry,
+    bootstrap: 100,
+    seed: 1,
+    requireSession1Correctness: false,
+  });
+  assert.equal(replayReport.session1_correctness, 0);
+  assert.equal(replayReport.gates.require_session1_correctness, false);
+  assert.equal(replayReport.gates.correctness_parity, true);
+  assert.equal(replayReport.decision, "pass");
+});
+
 test("staleness gate requires retrieval, a stale label, and re-verification", () => {
   const staleTaskSets = structuredClone(taskSets);
   staleTaskSets[0].pairs[0].staleness = {
