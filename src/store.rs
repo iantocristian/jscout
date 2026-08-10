@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 pub const DB_FILE: &str = ".jscout.db";
@@ -353,9 +353,7 @@ pub(crate) fn with_read_snapshot<T>(
             Ok(value)
         }
         Err(error) => {
-            let _ = conn.execute_batch(&format!(
-                "ROLLBACK TO {savepoint}; RELEASE {savepoint}"
-            ));
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {savepoint}; RELEASE {savepoint}"));
             Err(error)
         }
     }
@@ -365,7 +363,11 @@ pub(crate) fn with_read_snapshot<T>(
 /// projections are disposable and are rebuilt by the next index operation.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: u32 = conn
-        .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
         .ok()
         .and_then(|v: String| v.parse().ok())
         .unwrap_or(0);
@@ -446,7 +448,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     if version < 4 {
@@ -463,7 +468,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     if version < 5 {
@@ -475,7 +483,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         // Role-aware result payloads must not appear current until every file
         // has passed through the classifier on the next index operation.
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // The idempotent schema batch creates v6 semantic tables. Preserve their
@@ -491,7 +502,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         if !has_column(conn, "module_edges", "resolution")? {
             conn.execute("ALTER TABLE module_edges ADD COLUMN resolution TEXT", [])?;
         }
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v7 -> v8: package instances become the ownership boundary for
@@ -523,7 +537,10 @@ fn migrate(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v8 -> v9: runtime/general entities preserve per-site spans and trust
@@ -533,7 +550,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v9 -> v10: the contract plane shares the evidence/occurrence machinery
@@ -618,7 +638,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v10 -> v11: deterministic general-entity extractors were added without
@@ -630,7 +653,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v11 -> v12: module resolution remains shared by the runtime and
@@ -646,7 +672,10 @@ fn migrate(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     conn.execute(
@@ -658,9 +687,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
-    );
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)");
     Ok(conn.query_row(&sql, [column], |r| r.get::<_, i64>(0))? != 0)
 }
 
@@ -699,7 +726,8 @@ pub fn file_source_path(conn: &Connection, root: &Path, file_id: i64) -> Result<
     match origin.as_str() {
         "repository" | "workspace" => Ok(root.join(path)),
         "dependency" => {
-            let package_path = package_path.context("dependency file has no package-relative path")?;
+            let package_path =
+                package_path.context("dependency file has no package-relative path")?;
             let package_root = package_root.context("dependency file has no package instance")?;
             Ok(PathBuf::from(package_root).join(package_path))
         }
@@ -860,16 +888,14 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        let artifacts: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_artifacts",
-            [],
-            |row| row.get(0),
-        )?;
-        let supports: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_supports",
-            [],
-            |row| row.get(0),
-        )?;
+        let artifacts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        let supports: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(version, "12");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())

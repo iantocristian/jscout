@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{embed, query, scout, search, semantic, store, structural, surface};
 
@@ -76,7 +76,10 @@ pub fn serve(
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_msg(&mut out, &rpc_error(Value::Null, -32700, &format!("parse error: {e}")))?;
+                write_msg(
+                    &mut out,
+                    &rpc_error(Value::Null, -32700, &format!("parse error: {e}")),
+                )?;
                 continue;
             }
         };
@@ -129,10 +132,9 @@ pub fn serve(
                     started.elapsed(),
                 );
                 match result {
-                    Ok(text) => rpc_ok(
-                        id,
-                        json!({ "content": [{ "type": "text", "text": text }] }),
-                    ),
+                    Ok(text) => {
+                        rpc_ok(id, json!({ "content": [{ "type": "text", "text": text }] }))
+                    }
                     Err(e) => rpc_ok(
                         id,
                         json!({
@@ -397,7 +399,9 @@ fn tool_defs(profile: ToolProfile) -> Value {
         }
     ]);
     if profile == ToolProfile::Baseline {
-        let Some(definitions) = tools.as_array_mut() else { return tools };
+        let Some(definitions) = tools.as_array_mut() else {
+            return tools;
+        };
         definitions.retain(|tool| {
             !matches!(
                 tool["name"].as_str(),
@@ -593,15 +597,16 @@ fn call_tool(
             let rows = stmt.query_map(
                 rusqlite::params![path, repository, workspace, dependency],
                 |r| {
-                Ok(json!({
-                    "file": r.get::<_, String>(0)?,
-                    "file_origin": r.get::<_, String>(1)?,
-                    "kind": r.get::<_, String>(2)?,
-                    "name": r.get::<_, Option<String>>(3)?,
-                    "scope": r.get::<_, String>(4)?,
-                    "lines": [r.get::<_, i64>(5)?, r.get::<_, i64>(6)?],
-                }))
-            })?;
+                    Ok(json!({
+                        "file": r.get::<_, String>(0)?,
+                        "file_origin": r.get::<_, String>(1)?,
+                        "kind": r.get::<_, String>(2)?,
+                        "name": r.get::<_, Option<String>>(3)?,
+                        "scope": r.get::<_, String>(4)?,
+                        "lines": [r.get::<_, i64>(5)?, r.get::<_, i64>(6)?],
+                    }))
+                },
+            )?;
             let outline: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
             render_bounded_items("outline", outline, response_bytes)
         }
@@ -628,15 +633,10 @@ fn call_tool(
                             .map(|role| (*role).to_string())
                             .collect()
                     }),
-                    file_origins: json_string_array_or(
-                        args,
-                        "origins",
-                        crate::origin::defaults,
-                    ),
+                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
                     limit: (args["limit"].as_u64().unwrap_or(20) as usize).min(100),
-                    occurrences_per_entity: (args["occurrences_per_entity"]
-                        .as_u64()
-                        .unwrap_or(8) as usize)
+                    occurrences_per_entity: (args["occurrences_per_entity"].as_u64().unwrap_or(8)
+                        as usize)
                         .min(50),
                 },
             )?;
@@ -672,11 +672,7 @@ fn call_tool(
                             .map(|role| (*role).to_string())
                             .collect()
                     }),
-                    file_origins: json_string_array_or(
-                        args,
-                        "origins",
-                        crate::origin::defaults,
-                    ),
+                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
                 },
             )?;
             render_bounded_object_arrays(
@@ -800,7 +796,9 @@ fn render_bounded_object_arrays(
     });
     response["response_budget"] = budget;
     settle_value_rendered_bytes(&mut response)?;
-    let unbudgeted = response["response_budget"]["rendered_bytes"].as_u64().unwrap_or(0);
+    let unbudgeted = response["response_budget"]["rendered_bytes"]
+        .as_u64()
+        .unwrap_or(0);
     response["response_budget"]["unbudgeted_bytes"] = json!(unbudgeted);
     settle_value_rendered_bytes(&mut response)?;
 
@@ -906,8 +904,8 @@ fn log_tool_call(
         .ok()
         .map(|text| semantic_artifact_metrics(text))
         .unwrap_or_default();
-    let profile_label = std::env::var("JSCOUT_PROFILE_LABEL")
-        .unwrap_or_else(|_| profile.as_str().to_string());
+    let profile_label =
+        std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let record = json!({
         "timestamp_ms": timestamp_ms,
         "session": session,
@@ -1044,8 +1042,7 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "annotate")
             .expect("annotate definition");
-        let participant =
-            &annotate["inputSchema"]["properties"]["participants"]["items"];
+        let participant = &annotate["inputSchema"]["properties"]["participants"]["items"];
         assert_eq!(
             participant["properties"]["scope"]["enum"],
             json!(["defining", "supporting"])
@@ -1086,20 +1083,40 @@ mod tests {
         assert!(!tools.iter().any(|tool| tool["name"] == "annotate"));
         assert!(!tools.iter().any(|tool| tool["name"] == "entities"));
         assert!(!tools.iter().any(|tool| tool["name"] == "paths"));
-        assert!(!tools.iter().any(|tool| tool["name"] == "repository_overview"));
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool["name"] == "repository_overview")
+        );
         let search = tools
             .iter()
             .find(|tool| tool["name"] == "semantic_search")
             .expect("semantic_search definition");
         assert!(search["inputSchema"]["properties"].get("expand").is_none());
-        assert!(search["inputSchema"]["properties"].get("include_memory").is_none());
-        assert!(search["inputSchema"]["properties"].get("response_bytes").is_some());
+        assert!(
+            search["inputSchema"]["properties"]
+                .get("include_memory")
+                .is_none()
+        );
+        assert!(
+            search["inputSchema"]["properties"]
+                .get("response_bytes")
+                .is_some()
+        );
         let definition = tools
             .iter()
             .find(|tool| tool["name"] == "definition")
             .expect("definition tool");
-        assert!(definition["inputSchema"]["properties"].get("view").is_some());
-        assert!(definition["inputSchema"]["properties"].get("source_bytes").is_some());
+        assert!(
+            definition["inputSchema"]["properties"]
+                .get("view")
+                .is_some()
+        );
+        assert!(
+            definition["inputSchema"]["properties"]
+                .get("source_bytes")
+                .is_some()
+        );
 
         let structural = tool_defs(ToolProfile::Structural);
         let tools = structural.as_array().expect("tool definitions");
@@ -1107,7 +1124,11 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "annotate"));
         assert!(tools.iter().any(|tool| tool["name"] == "entities"));
         assert!(tools.iter().any(|tool| tool["name"] == "paths"));
-        assert!(tools.iter().any(|tool| tool["name"] == "repository_overview"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "repository_overview")
+        );
         let search = tools
             .iter()
             .find(|tool| tool["name"] == "semantic_search")
@@ -1127,7 +1148,12 @@ mod tests {
             "semantic_search",
             &json!({ "query": "x", "expand": true }),
         );
-        assert!(expanded.unwrap_err().to_string().contains("baseline MCP profile"));
+        assert!(
+            expanded
+                .unwrap_err()
+                .to_string()
+                .contains("baseline MCP profile")
+        );
         let neighborhood = call_tool(
             Path::new("."),
             &conn,
@@ -1137,7 +1163,12 @@ mod tests {
             "neighborhood",
             &json!({ "anchor": "file:x.ts" }),
         );
-        assert!(neighborhood.unwrap_err().to_string().contains("baseline MCP profile"));
+        assert!(
+            neighborhood
+                .unwrap_err()
+                .to_string()
+                .contains("baseline MCP profile")
+        );
         let entities = call_tool(
             Path::new("."),
             &conn,
@@ -1147,7 +1178,12 @@ mod tests {
             "entities",
             &json!({}),
         );
-        assert!(entities.unwrap_err().to_string().contains("baseline MCP profile"));
+        assert!(
+            entities
+                .unwrap_err()
+                .to_string()
+                .contains("baseline MCP profile")
+        );
         let annotate = call_tool(
             Path::new("."),
             &conn,
@@ -1157,7 +1193,12 @@ mod tests {
             "annotate",
             &json!({}),
         );
-        assert!(annotate.unwrap_err().to_string().contains("baseline MCP profile"));
+        assert!(
+            annotate
+                .unwrap_err()
+                .to_string()
+                .contains("baseline MCP profile")
+        );
     }
 
     #[test]
@@ -1182,7 +1223,12 @@ mod tests {
         )?;
         let entities: serde_json::Value = serde_json::from_str(&entities)?;
         assert_eq!(entities["entities"][0]["name"], "API_KEY");
-        assert!(entities["response_budget"]["rendered_bytes"].as_u64().unwrap() <= 4000);
+        assert!(
+            entities["response_budget"]["rendered_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 4000
+        );
 
         let paths = call_tool(
             repo.path(),
@@ -1214,7 +1260,12 @@ mod tests {
         )?;
         let overview: serde_json::Value = serde_json::from_str(&overview)?;
         assert_eq!(overview["totals"]["files"], 1);
-        assert!(overview["response_budget"]["rendered_bytes"].as_u64().unwrap() <= 4000);
+        assert!(
+            overview["response_budget"]["rendered_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 4000
+        );
         Ok(())
     }
 
@@ -1265,7 +1316,10 @@ mod tests {
             &json!({ "query": "handoff" }),
         )?;
         let structural_search: serde_json::Value = serde_json::from_str(&structural_search)?;
-        assert_eq!(structural_search["semantic_artifacts"][0]["name"], "handoff workflow");
+        assert_eq!(
+            structural_search["semantic_artifacts"][0]["name"],
+            "handoff workflow"
+        );
 
         let baseline_search = call_tool(
             repo.path(),
@@ -1303,7 +1357,12 @@ mod tests {
         let elided: serde_json::Value = serde_json::from_str(&elided)?;
         assert_eq!(elided[0]["source_meta"]["representation"], "elided");
         assert!(elided[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
-        assert!(!elided[0]["source"].as_str().unwrap().contains("localPlumbingWithALongName"));
+        assert!(
+            !elided[0]["source"]
+                .as_str()
+                .unwrap()
+                .contains("localPlumbingWithALongName")
+        );
 
         let full = call_tool(
             repo.path(),
@@ -1317,7 +1376,12 @@ mod tests {
         let full: serde_json::Value = serde_json::from_str(&full)?;
         assert_eq!(full[0]["source_meta"]["representation"], "full");
         assert!(full[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
-        assert!(full[0]["source"].as_str().unwrap().contains("localPlumbingWithALongName"));
+        assert!(
+            full[0]["source"]
+                .as_str()
+                .unwrap()
+                .contains("localPlumbingWithALongName")
+        );
         Ok(())
     }
 

@@ -331,7 +331,8 @@ impl<'s> Chunker<'s> {
             if let BindingPattern::BindingIdentifier(id) = &d.id {
                 let is_fn_value = matches!(
                     d.init,
-                    Some(Expression::ArrowFunctionExpression(_)) | Some(Expression::FunctionExpression(_))
+                    Some(Expression::ArrowFunctionExpression(_))
+                        | Some(Expression::FunctionExpression(_))
                 );
                 if is_fn_value {
                     let name = id.name.to_string();
@@ -350,27 +351,28 @@ impl<'s> Chunker<'s> {
                     // Oversized arrow function: split its body if it's a block.
                     if let Some(Expression::ArrowFunctionExpression(arrow)) = &d.init
                         && let ArrowFunctionBody::FunctionBody(body) = &arrow.body
-                            && let Some(first) = body.statements.first().map(|s| s.span().start) {
-                                out.push(Unit {
-                                    span: Span::new(full_span.start, first),
-                                    kind,
-                                    name: Some(name.clone()),
-                                    scope_chain: vec![],
-                                    symbols,
-                                    atomic: true,
-                                });
-                                for s in &body.statements {
-                                    out.push(Unit {
-                                        span: s.span(),
-                                        kind: ChunkKind::Module,
-                                        name: None,
-                                        scope_chain: vec![name.clone()],
-                                        symbols: vec![],
-                                        atomic: false,
-                                    });
-                                }
-                                return;
-                            }
+                        && let Some(first) = body.statements.first().map(|s| s.span().start)
+                    {
+                        out.push(Unit {
+                            span: Span::new(full_span.start, first),
+                            kind,
+                            name: Some(name.clone()),
+                            scope_chain: vec![],
+                            symbols,
+                            atomic: true,
+                        });
+                        for s in &body.statements {
+                            out.push(Unit {
+                                span: s.span(),
+                                kind: ChunkKind::Module,
+                                name: None,
+                                scope_chain: vec![name.clone()],
+                                symbols: vec![],
+                                atomic: false,
+                            });
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -431,9 +433,14 @@ impl<'s> Chunker<'s> {
                             || (both_anonymous
                                 && est_tokens(a.span) + est_tokens(u.span) <= TARGET_TOKENS));
                     if mergeable {
-                        a.span = Span::new(a.span.start.min(u.span.start), a.span.end.max(u.span.end));
+                        a.span =
+                            Span::new(a.span.start.min(u.span.start), a.span.end.max(u.span.end));
                         if a.kind != u.kind {
-                            a.kind = if both_imports { ChunkKind::Imports } else { ChunkKind::Module };
+                            a.kind = if both_imports {
+                                ChunkKind::Imports
+                            } else {
+                                ChunkKind::Module
+                            };
                         }
                         if a.name.is_none() {
                             a.name = u.name;
@@ -591,7 +598,11 @@ export default function App() { return <UserCard id="1" />; }
             .filter(|c| c.kind == ChunkKind::Method)
             .collect();
         assert!(!methods.is_empty());
-        assert!(methods.iter().all(|c| c.scope_chain == vec!["Big".to_string()]));
+        assert!(
+            methods
+                .iter()
+                .all(|c| c.scope_chain == vec!["Big".to_string()])
+        );
     }
 
     #[test]
@@ -626,9 +637,17 @@ export default function App() { return <UserCard id="1" />; }
 
     #[test]
     fn jsdoc_attaches_to_declaration() {
-        let src = "/** Fetches a user by id. */\nexport function getUser(id) { return db.get(id); }\n";
+        let src =
+            "/** Fetches a user by id. */\nexport function getUser(id) { return db.get(id); }\n";
         let chunks = chunks_of("a.js", src);
-        let c = chunks.iter().find(|c| c.name.as_deref() == Some("getUser")).unwrap();
-        assert!(c.content.starts_with("/** Fetches a user"), "content: {}", &c.content[..40.min(c.content.len())]);
+        let c = chunks
+            .iter()
+            .find(|c| c.name.as_deref() == Some("getUser"))
+            .unwrap();
+        assert!(
+            c.content.starts_with("/** Fetches a user"),
+            "content: {}",
+            &c.content[..40.min(c.content.len())]
+        );
     }
 }

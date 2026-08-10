@@ -463,13 +463,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             eprintln!("timing project-entities={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
-        project_member_calls(
-            conn,
-            &files,
-            &symbols,
-            &mut insert_node,
-            &mut insert_edge,
-        )?;
+        project_member_calls(conn, &files, &symbols, &mut insert_node, &mut insert_edge)?;
         if timing {
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
@@ -647,7 +641,11 @@ fn project_module_edges(
                     "package",
                     "package_instances",
                     instance_id,
-                    format!("{}@{}", name, instance_version.as_deref().unwrap_or("unknown")),
+                    format!(
+                        "{}@{}",
+                        name,
+                        instance_version.as_deref().unwrap_or("unknown")
+                    ),
                     Option::<i64>::None,
                     Option::<i64>::None,
                     json!({
@@ -731,7 +729,11 @@ fn project_module_edges(
             insert_edge.execute(params![
                 file_key(from_path),
                 hub,
-                if type_only { "imports_package_types" } else { "imports_package" },
+                if type_only {
+                    "imports_package_types"
+                } else {
+                    "imports_package"
+                },
                 confidence,
                 provenance,
                 from_id,
@@ -783,10 +785,7 @@ fn project_references(
         } else {
             package_key(&package)
         };
-        Ok((
-            (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
-            target,
-        ))
+        Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), target))
     })?;
     for row in package_rows {
         let (key, package) = row?;
@@ -845,17 +844,20 @@ fn project_references(
                             (resolved_file, resolved_name)
                         })
                         .or_else(|| Some((target_file, name.clone())));
-                    resolved.map_or_else(ProjectedTargets::default, |(resolved_file, resolved_name)| {
-                        if resolved_name == "*" {
-                            graph
-                                .paths
-                                .get(&resolved_file)
-                                .map(|path| ProjectedTargets::exact(file_key(path)))
-                                .unwrap_or_default()
-                        } else {
-                            projected_symbols(root_symbol.get(&(resolved_file, resolved_name)))
-                        }
-                    })
+                    resolved.map_or_else(
+                        ProjectedTargets::default,
+                        |(resolved_file, resolved_name)| {
+                            if resolved_name == "*" {
+                                graph
+                                    .paths
+                                    .get(&resolved_file)
+                                    .map(|path| ProjectedTargets::exact(file_key(path)))
+                                    .unwrap_or_default()
+                            } else {
+                                projected_symbols(root_symbol.get(&(resolved_file, resolved_name)))
+                            }
+                        },
+                    )
                 }
                 None => package_for
                     .get(&(file_id, request.to_string()))
@@ -919,7 +921,10 @@ fn project_entities(
 ) -> Result<()> {
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
-        symbols_by_file.entry(symbol.file_id).or_default().push(symbol);
+        symbols_by_file
+            .entry(symbol.file_id)
+            .or_default()
+            .push(symbol);
     }
     let sites = load_entity_sites(conn)?;
     let contract_catalog = ContractCatalog::build(conn, &sites, files)?;
@@ -952,7 +957,9 @@ fn project_entities(
     )?;
 
     for site in sites {
-        let Some(path) = files.get(&site.file_id) else { continue };
+        let Some(path) = files.get(&site.file_id) else {
+            continue;
+        };
         if site.plane == "contract" {
             project_contract_site(
                 conn,
@@ -974,7 +981,11 @@ fn project_entities(
         let identity = resolve_entity_identity(conn, &site, path, graph, root_symbol)?;
         let occurrence_confidence = lower_confidence(
             &site.confidence,
-            if identity.ambiguous { "possible" } else { &site.confidence },
+            if identity.ambiguous {
+                "possible"
+            } else {
+                &site.confidence
+            },
         );
         let entity_key = match site.identity_kind.as_str() {
             "literal" => entity_key(&site.entity_type, &site.identity_name),
@@ -1054,16 +1065,9 @@ fn project_entities(
         });
 
         match site.role.as_str() {
-            "dispatch_site"
-            | "lifecycle_producer"
-            | "job_producer"
-            | "injection_site"
-            | "graphql_operation"
-            | "environment_read"
-            | "database_read"
-            | "database_write"
-            | "feature_flag_check"
-            | "external_host_call" => {
+            "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site"
+            | "graphql_operation" | "environment_read" | "database_read" | "database_write"
+            | "feature_flag_check" | "external_host_call" => {
                 let kind = match site.role.as_str() {
                     "dispatch_site" => "dispatches",
                     "lifecycle_producer" => "produces_lifecycle",
@@ -1084,11 +1088,7 @@ fn project_entities(
                     site.provenance,
                     graph_detail.to_string(),
                 ])?;
-                if projected_edges.insert((
-                    source.clone(),
-                    entity_key.clone(),
-                    kind.to_string(),
-                )) {
+                if projected_edges.insert((source.clone(), entity_key.clone(), kind.to_string())) {
                     insert_edge.execute(params![
                         source,
                         entity_key,
@@ -1118,12 +1118,8 @@ fn project_entities(
                     )?;
                 }
             }
-            "registered_handler"
-            | "lifecycle_listener"
-            | "job_handler"
-            | "provider"
-            | "route_handler"
-            | "graphql_handler" => {
+            "registered_handler" | "lifecycle_listener" | "job_handler" | "provider"
+            | "route_handler" | "graphql_handler" => {
                 let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
                 let target_fallback = targets.keys.is_empty();
                 if target_fallback {
@@ -1144,7 +1140,11 @@ fn project_entities(
                 }
                 let edge_confidence = lower_confidence(
                     &occurrence_confidence,
-                    if targets.ambiguous { "possible" } else { &occurrence_confidence },
+                    if targets.ambiguous {
+                        "possible"
+                    } else {
+                        &occurrence_confidence
+                    },
                 );
                 let kind = match site.role.as_str() {
                     "registered_handler" => "registered_handler",
@@ -1199,7 +1199,9 @@ impl ContractCatalog {
             if site.plane != "contract" || site.role != "contract_declaration" {
                 continue;
             }
-            let Some(path) = files.get(&site.file_id) else { continue };
+            let Some(path) = files.get(&site.file_id) else {
+                continue;
+            };
             let definition = ContractDefinition {
                 site_id: site.id,
                 file_id: site.file_id,
@@ -1216,7 +1218,11 @@ impl ContractCatalog {
                 .entry((site.file_id, site.identity_name.clone()))
                 .or_default()
                 .push(definition.clone());
-            catalog.by_file.entry(site.file_id).or_default().push(definition);
+            catalog
+                .by_file
+                .entry(site.file_id)
+                .or_default()
+                .push(definition);
         }
         let mut stmt = conn.prepare(
             "SELECT file_id, local_name, imported_name, request
@@ -1295,7 +1301,11 @@ fn project_contract_site(
             &site.confidence
         },
     );
-    let backing_file = if targets.len() == 1 { targets.first() } else { None };
+    let backing_file = if targets.len() == 1 {
+        targets.first()
+    } else {
+        None
+    };
     let backing_file_id = backing_file.and_then(|target| target.file_id);
     let backing_line = backing_file.and_then(|target| target.line);
     let (entity_key, entity_type, display_name, identity_anchor) = match targets.as_slice() {
@@ -1314,7 +1324,10 @@ fn project_contract_site(
         candidates => (
             contract_reference_key(
                 &site.entity_type,
-                &candidates.iter().map(|target| target.key.clone()).collect::<Vec<_>>(),
+                &candidates
+                    .iter()
+                    .map(|target| target.key.clone())
+                    .collect::<Vec<_>>(),
                 path,
                 &site.identity_name,
             ),
@@ -1445,7 +1458,10 @@ fn site_source_symbol<'a>(
     if let Some(owner) = owner_at(symbols, site.start) {
         return Some(&owner.key);
     }
-    if !matches!(site.role.as_str(), "decorator_use" | "route_handler" | "graphql_handler") {
+    if !matches!(
+        site.role.as_str(),
+        "decorator_use" | "route_handler" | "graphql_handler"
+    ) {
         return None;
     }
     // Decorators precede their class/method declaration, so they fall outside
@@ -1455,9 +1471,7 @@ fn site_source_symbol<'a>(
     symbols?
         .iter()
         .copied()
-        .filter(|symbol| {
-            symbol.decl_start >= site.start && symbol.decl_start - site.start <= 512
-        })
+        .filter(|symbol| symbol.decl_start >= site.start && symbol.decl_start - site.start <= 512)
         .min_by_key(|symbol| symbol.decl_start - site.start)
         .map(|symbol| &symbol.key)
 }
@@ -1695,7 +1709,9 @@ fn resolve_reference_at(
     if local {
         return Ok(projected_symbols(root_symbol.get(&(file_id, name))));
     }
-    let Some(request) = request else { return Ok(ProjectedTargets::default()) };
+    let Some(request) = request else {
+        return Ok(ProjectedTargets::default());
+    };
     let Some(target_file) = graph.edge(file_id, &request) else {
         return Ok(ProjectedTargets::default());
     };
@@ -1735,11 +1751,7 @@ fn project_entity_callers(
     for row in rows {
         let (caller, call_confidence, source_file_id, line) = row?;
         let confidence = lower_confidence(occurrence_confidence, &call_confidence);
-        if !projected_edges.insert((
-            caller.clone(),
-            entity_key.to_string(),
-            via_kind.to_string(),
-        )) {
+        if !projected_edges.insert((caller.clone(), entity_key.to_string(), via_kind.to_string())) {
             continue;
         }
         insert_edge.execute(params![
@@ -1767,7 +1779,12 @@ fn lower_confidence(left: &str, right: &str) -> String {
         "likely" => 1,
         _ => 0,
     };
-    if rank(left) <= rank(right) { left } else { right }.to_string()
+    if rank(left) <= rank(right) {
+        left
+    } else {
+        right
+    }
+    .to_string()
 }
 
 fn project_member_calls(
@@ -2014,8 +2031,7 @@ fn neighborhood_in_snapshot(
         &allowed_file_origins,
     )?;
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
-    let allowed_file_roles: HashSet<&str> =
-        options.file_roles.iter().map(String::as_str).collect();
+    let allowed_file_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
     let min_rank = confidence_rank(&options.min_confidence).unwrap();
     let mut discovered = HashSet::from([resolved_anchor.clone()]);
     let mut node_relevance = HashMap::from([(resolved_anchor.clone(), 1.0_f64)]);
@@ -2093,13 +2109,15 @@ fn neighborhood_in_snapshot(
         nodes.push(node);
     }
     nodes.sort_by(|a, b| {
-        b.relevance.total_cmp(&a.relevance).then_with(|| a.key.cmp(&b.key))
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| a.key.cmp(&b.key))
     });
     let mut edges: Vec<GraphEdge> = edges_by_id.into_values().collect();
     edges.sort_by(|a, b| {
-        b.relevance.total_cmp(&a.relevance).then_with(|| {
-            (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target))
-        })
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target)))
     });
     Ok(Neighborhood {
         snapshot,
@@ -2182,17 +2200,16 @@ pub fn workflow_neighborhood(
             let hub_floor = state.hub_floor.min(step.hub_floor);
             let crossed_runtime = state.crossed_runtime || step.runtime_boundary;
             let score = round_score(
-                confidence_floor
-                    * relation_floor
-                    * distance_decay(next_depth)
-                    * hub_floor
+                confidence_floor * relation_floor * distance_decay(next_depth) * hub_floor
                     + if crossed_runtime { 1.0 } else { 0.0 },
             );
             relevance
                 .entry(step.other.key.clone())
                 .and_modify(|existing| *existing = existing.max(score))
                 .or_insert(score);
-            nodes.entry(step.other.key.clone()).or_insert(step.other.clone());
+            nodes
+                .entry(step.other.key.clone())
+                .or_insert(step.other.clone());
             if !step.terminal {
                 frontier.push(WorkflowRankedNode {
                     key: step.other.key,
@@ -2220,7 +2237,11 @@ pub fn workflow_neighborhood(
             .total_cmp(&left.relevance)
             .then_with(|| left.key.cmp(&right.key))
     });
-    Ok(WorkflowNeighborhood { nodes, traversed_edges, truncated })
+    Ok(WorkflowNeighborhood {
+        nodes,
+        traversed_edges,
+        truncated,
+    })
 }
 
 fn workflow_logical_steps(
@@ -2249,7 +2270,9 @@ fn workflow_logical_steps(
             continue;
         }
         let other_key = if source == node { &target } else { &source };
-        let Some(other) = load_node(conn, other_key)? else { continue };
+        let Some(other) = load_node(conn, other_key)? else {
+            continue;
+        };
         if workflow_direct_kind(&kind) && workflow_symbol_allowed(&other, allowed_origins) {
             let step = WorkflowLogicalStep {
                 // Symbol degree includes documentary and file-projection edges
@@ -2304,8 +2327,7 @@ fn workflow_logical_steps(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (peer_source, peer_target, peer_kind, peer_confidence) in entity_edges {
-            let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind)
-            else {
+            let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind) else {
                 continue;
             };
             if family != peer_family
@@ -2323,7 +2345,9 @@ fn workflow_logical_steps(
             if peer_key == node {
                 continue;
             }
-            let Some(peer) = load_node(conn, peer_key)? else { continue };
+            let Some(peer) = load_node(conn, peer_key)? else {
+                continue;
+            };
             if !workflow_symbol_allowed(&peer, allowed_origins) {
                 continue;
             }
@@ -2386,16 +2410,21 @@ fn collect_general_workflow_steps(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (source, target, peer_kind, peer_confidence) in peers {
         if workflow_general_association_kind(&peer_kind) != Some(family)
-            || confidence_rank(&peer_confidence).unwrap_or(0)
-                < confidence_rank("likely").unwrap()
+            || confidence_rank(&peer_confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
         }
-        let peer_key = if source == entity.key { &target } else { &source };
+        let peer_key = if source == entity.key {
+            &target
+        } else {
+            &source
+        };
         if peer_key == node {
             continue;
         }
-        let Some(peer) = load_node(conn, peer_key)? else { continue };
+        let Some(peer) = load_node(conn, peer_key)? else {
+            continue;
+        };
         if !workflow_symbol_allowed(&peer, allowed_origins) {
             continue;
         }
@@ -2420,7 +2449,8 @@ fn retain_stronger_workflow_step(
     candidate: WorkflowLogicalStep,
 ) {
     match steps.get(&candidate.other.key) {
-        Some(existing) if workflow_step_strength(existing) >= workflow_step_strength(&candidate) => {}
+        Some(existing)
+            if workflow_step_strength(existing) >= workflow_step_strength(&candidate) => {}
         _ => {
             steps.insert(candidate.other.key.clone(), candidate);
         }
@@ -2463,8 +2493,7 @@ fn workflow_direct_degree(
     for row in incident {
         let (source, target, kind, confidence) = row?;
         if !workflow_direct_kind(&kind)
-            || confidence_rank(&confidence).unwrap_or(0)
-                < confidence_rank("likely").unwrap()
+            || confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
         }
@@ -2509,12 +2538,7 @@ fn workflow_runtime_boundary_kind(kind: &str) -> Option<(&'static str, bool)> {
     }
 }
 
-pub fn paths(
-    conn: &Connection,
-    from: &str,
-    to: &str,
-    options: &PathOptions,
-) -> Result<PathSearch> {
+pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> Result<PathSearch> {
     if options.max_depth == 0 || options.max_depth > 8 {
         bail!("path depth must be between 1 and 8");
     }
@@ -2591,7 +2615,10 @@ pub fn paths(
         score: f64,
     }
 
-    let candidate_limit = options.path_limit.saturating_mul(32).max(options.path_limit);
+    let candidate_limit = options
+        .path_limit
+        .saturating_mul(32)
+        .max(options.path_limit);
     let mut stack = vec![Candidate {
         nodes: vec![neighborhood.resolved_anchor.clone()],
         steps: Vec::new(),
@@ -2612,7 +2639,9 @@ pub fn paths(
         if candidate.steps.len() >= options.max_depth {
             continue;
         }
-        let Some(edges) = adjacency.get(current) else { continue };
+        let Some(edges) = adjacency.get(current) else {
+            continue;
+        };
         for (next, edge) in edges.iter().rev() {
             if candidate.nodes.contains(next) {
                 continue;
@@ -2645,7 +2674,11 @@ pub fn paths(
                 .iter()
                 .filter_map(|key| node_by_key.get(key).cloned())
                 .collect();
-            GraphPath { score: candidate.score, nodes, steps: candidate.steps }
+            GraphPath {
+                score: candidate.score,
+                nodes,
+                steps: candidate.steps,
+            }
         })
         .collect();
     Ok(PathSearch {
@@ -2969,11 +3002,13 @@ fn allowed_candidates(
 ) -> Result<Vec<String>> {
     candidates
         .into_iter()
-        .filter_map(|candidate| match node_origin_allowed(conn, &candidate, allowed_origins) {
-            Ok(true) => Some(Ok(candidate)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
+        .filter_map(
+            |candidate| match node_origin_allowed(conn, &candidate, allowed_origins) {
+                Ok(true) => Some(Ok(candidate)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
         .collect()
 }
 
@@ -3064,7 +3099,11 @@ fn package_key(package: &str) -> String {
 fn package_instance_key(name: &str, version: Option<&str>, locator: &str) -> String {
     let identity = format!("{name}\0{}\0{locator}", version.unwrap_or("unknown"));
     let digest = blake3::hash(identity.as_bytes()).to_hex();
-    format!("pkg:{name}@{}#{}", version.unwrap_or("unknown"), &digest[..8])
+    format!(
+        "pkg:{name}@{}#{}",
+        version.unwrap_or("unknown"),
+        &digest[..8]
+    )
 }
 
 fn event_key(name: &str) -> String {
@@ -3322,8 +3361,18 @@ mod tests {
             40,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "processHandler"));
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "continueWorkflow"));
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "processHandler")
+        );
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "continueWorkflow")
+        );
         assert!(!workflow.truncated);
         Ok(())
     }
@@ -3391,7 +3440,10 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(producer_edges, 1, "occurrences must not duplicate traversal edges");
+        assert_eq!(
+            producer_edges, 1,
+            "occurrences must not duplicate traversal edges"
+        );
         let collapsed_edges: i64 = conn.query_row(
             "SELECT count(*) FROM resolved_edges
              WHERE src_key LIKE '%enqueue.ts#::enqueueRequest@1'
@@ -3400,7 +3452,10 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(collapsed_edges, 1, "caller collapse must also be deduplicated");
+        assert_eq!(
+            collapsed_edges, 1,
+            "caller collapse must also be deduplicated"
+        );
 
         let result = neighborhood(
             &conn,
@@ -3429,8 +3484,18 @@ mod tests {
             40,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "enqueueRequest"));
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "workerHandler"));
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "enqueueRequest")
+        );
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "workerHandler")
+        );
         assert!(!workflow.truncated);
         Ok(())
     }
@@ -3466,9 +3531,17 @@ mod tests {
             400,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "shared"));
         assert!(
-            !workflow.nodes.iter().any(|node| node.display_name == "caller0"),
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "shared")
+        );
+        assert!(
+            !workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "caller0"),
             "a high-degree helper is evidence but must not bridge to every caller"
         );
         assert!(!workflow.truncated);
@@ -3509,7 +3582,11 @@ mod tests {
                }\n\
              }\n",
         )?;
-        write(repo.path(), "token.ts", "export const MAILER = Symbol('mailer');\n")?;
+        write(
+            repo.path(),
+            "token.ts",
+            "export const MAILER = Symbol('mailer');\n",
+        )?;
         write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
         write(
             repo.path(),
@@ -3559,11 +3636,15 @@ mod tests {
         )?;
         assert!(cron.edges.iter().any(|edge| {
             edge.kind == "produces_job"
-                && edge.source.contains("producer.ts#Producer::scheduleCleanup@1")
+                && edge
+                    .source
+                    .contains("producer.ts#Producer::scheduleCleanup@1")
         }));
         assert!(cron.edges.iter().any(|edge| {
             edge.kind == "job_handler"
-                && edge.target.contains("jobs.ts#JobConsumer::cleanupHandler@1")
+                && edge
+                    .target
+                    .contains("jobs.ts#JobConsumer::cleanupHandler@1")
         }));
 
         let provider: (String, String) = conn.query_row(
@@ -3638,20 +3719,15 @@ mod tests {
                 && edge.detail["documentary"] == true
         }));
         assert!(result.edges.iter().any(|edge| {
-            edge.kind == "returns_contract"
-                && edge.target == alias
-                && edge.confidence == "certain"
+            edge.kind == "returns_contract" && edge.target == alias && edge.confidence == "certain"
         }));
-        let workflow = workflow_neighborhood(
-            &conn,
-            "sym:api.ts#::load@1",
-            2,
-            20,
-            40,
-            &origin::defaults(),
-        )?;
+        let workflow =
+            workflow_neighborhood(&conn, "sym:api.ts#::load@1", 2, 20, 40, &origin::defaults())?;
         assert!(
-            !workflow.nodes.iter().any(|node| node.display_name == "save"),
+            !workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "save"),
             "shared contracts are documentary and must not create workflow candidates"
         );
         let contract_file: String = conn.query_row(
@@ -3785,15 +3861,14 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(handler_target, "getUser");
-        let workflow = workflow_neighborhood(
-            &conn,
-            "sym:app.ts#::run@1",
-            1,
-            20,
-            40,
-            &origin::defaults(),
-        )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "followup"));
+        let workflow =
+            workflow_neighborhood(&conn, "sym:app.ts#::run@1", 1, 20, 40, &origin::defaults())?;
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "followup")
+        );
         Ok(())
     }
 
@@ -3866,8 +3941,18 @@ mod tests {
             },
         )?;
         assert!(result.truncated);
-        assert!(result.nodes.iter().any(|node| node.key == "candidate:z-high"));
-        assert!(!result.nodes.iter().any(|node| node.key == "candidate:a-low"));
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| node.key == "candidate:z-high")
+        );
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|node| node.key == "candidate:a-low")
+        );
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].kind, "import");
         assert!(result.edges[0].relevance > 0.0);
@@ -3884,11 +3969,10 @@ mod tests {
         )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
-        let file_id: i64 = conn.query_row(
-            "SELECT id FROM files WHERE path='ambiguous.js'",
-            [],
-            |r| r.get(0),
-        )?;
+        let file_id: i64 =
+            conn.query_row("SELECT id FROM files WHERE path='ambiguous.js'", [], |r| {
+                r.get(0)
+            })?;
         conn.execute(
             "INSERT INTO symbols(
                file_id, name, kind, start, end, decl_start, decl_end,
@@ -3941,9 +4025,12 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert!(!default_result.edges.iter().any(|edge| {
-            edge.kind == "member_call" || edge.kind == "member_candidate"
-        }));
+        assert!(
+            !default_result
+                .edges
+                .iter()
+                .any(|edge| { edge.kind == "member_call" || edge.kind == "member_candidate" })
+        );
 
         let result = neighborhood(
             &conn,

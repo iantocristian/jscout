@@ -181,7 +181,11 @@ pub fn workflow_candidates(
         bail!("workflow candidate limit must be between 1 and {MAX_WORKFLOW_CANDIDATES}");
     }
     let snapshot = structural::current_snapshot(conn)?;
-    if options.expected_snapshot.as_deref().is_some_and(|value| value != snapshot) {
+    if options
+        .expected_snapshot
+        .as_deref()
+        .is_some_and(|value| value != snapshot)
+    {
         bail!("workflow candidate snapshot is stale; current snapshot is {snapshot}");
     }
     let mut resolved_seeds = seeds
@@ -438,7 +442,10 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
             );
         }
         if support.claim_path != "/name" && input.body.pointer(&support.claim_path).is_none() {
-            bail!("support claim_path `{}` does not exist in body", support.claim_path);
+            bail!(
+                "support claim_path `{}` does not exist in body",
+                support.claim_path
+            );
         }
         let anchor = structural::resolve_current_anchor(conn, &support.anchor)?;
         if anchor != support.anchor {
@@ -453,8 +460,8 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
             )
             .optional()?
             .flatten();
-        let anchor_file = anchor_file
-            .with_context(|| format!("support anchor `{anchor}` is not file-backed"))?;
+        let anchor_file =
+            anchor_file.with_context(|| format!("support anchor `{anchor}` is not file-backed"))?;
         if anchor_file != support.evidence_file {
             bail!(
                 "support anchor `{anchor}` belongs to `{anchor_file}`, not `{}`",
@@ -476,7 +483,10 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         let source = std::fs::read_to_string(root.join(&support.evidence_file))
             .with_context(|| format!("read support file `{}`", support.evidence_file))?;
         if blake3::hash(source.as_bytes()).to_hex().as_str() != source_hash {
-            bail!("support file `{}` changed since indexing", support.evidence_file);
+            bail!(
+                "support file `{}` changed since indexing",
+                support.evidence_file
+            );
         }
         let line_count = source.lines().count() as i64;
         if support.evidence_end_line > line_count {
@@ -500,7 +510,9 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         let role = if support.claim_path.starts_with("/participants/")
             && support.claim_path.ends_with("/role")
         {
-            input.body.pointer(&support.claim_path)
+            input
+                .body
+                .pointer(&support.claim_path)
                 .and_then(Value::as_str)
                 .map(str::to_string)
         } else {
@@ -587,7 +599,9 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
         .query_map([], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let tokens: Vec<String> = query
-        .split(|character: char| !character.is_alphanumeric() && character != '_' && character != '$')
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '$'
+        })
         .filter(|token| token.len() > 1)
         .map(str::to_lowercase)
         .collect();
@@ -606,8 +620,8 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
             continue;
         }
         let name_bonus = usize::from(!name.is_empty() && query.eq_ignore_ascii_case(&name));
-        artifact.relevance = ((matches + name_bonus * 4) as f64 / tokens.len().max(1) as f64)
-            .min(1.0);
+        artifact.relevance =
+            ((matches + name_bonus * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
         artifacts.push(artifact);
     }
     artifacts.sort_by(|left, right| {
@@ -643,7 +657,19 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
             },
         )
         .optional()?;
-    let Some((id, supersedes, artifact_type, name, body_json, model, prompt_version, confidence, source_snapshot, created_at)) = row else {
+    let Some((
+        id,
+        supersedes,
+        artifact_type,
+        name,
+        body_json,
+        model,
+        prompt_version,
+        confidence,
+        source_snapshot,
+        created_at,
+    )) = row
+    else {
         return Ok(None);
     };
     let body: Value = serde_json::from_str(&body_json)
@@ -669,7 +695,17 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
     })?;
     let mut supports = Vec::new();
     for row in rows {
-        let (claim_path, anchor, role, evidence_file, evidence_start_line, evidence_end_line, source_hash, stored_context_hash, support_confidence) = row?;
+        let (
+            claim_path,
+            anchor,
+            role,
+            evidence_file,
+            evidence_start_line,
+            evidence_end_line,
+            source_hash,
+            stored_context_hash,
+            support_confidence,
+        ) = row?;
         let current_source_hash: Option<String> = conn
             .query_row(
                 "SELECT hash FROM files WHERE path=?1",
@@ -679,7 +715,8 @@ fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>>
             .optional()?;
         let freshness = if current_source_hash.as_deref() != Some(source_hash.as_str()) {
             "source-stale"
-        } else if context_hash(conn, &anchor).ok().as_deref() != Some(stored_context_hash.as_str()) {
+        } else if context_hash(conn, &anchor).ok().as_deref() != Some(stored_context_hash.as_str())
+        {
             "context-stale"
         } else {
             "fresh"
@@ -771,7 +808,11 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     if participants.is_empty() {
         bail!("workflow body requires at least one participant");
     }
-    if !input.supports.iter().any(|support| support.claim_path == "/name") {
+    if !input
+        .supports
+        .iter()
+        .any(|support| support.claim_path == "/name")
+    {
         bail!("workflow name requires a support with claim_path `/name`");
     }
     let mut participant_anchors = HashSet::new();
@@ -790,9 +831,7 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
         match participant["scope"].as_str() {
             Some("defining") => defining_participants += 1,
             Some("supporting") => {}
-            _ => bail!(
-                "workflow participant {index} requires scope `defining` or `supporting`"
-            ),
+            _ => bail!("workflow participant {index} requires scope `defining` or `supporting`"),
         }
         let claim_path = format!("/participants/{index}/role");
         if !input
@@ -800,9 +839,7 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
             .iter()
             .any(|support| support.claim_path == claim_path && support.anchor == anchor)
         {
-            bail!(
-                "workflow participant {index} requires support `{claim_path}` with its anchor"
-            );
+            bail!("workflow participant {index} requires support `{claim_path}` with its anchor");
         }
     }
     if defining_participants == 0 {
@@ -893,7 +930,9 @@ fn context_hash(conn: &Connection, anchor: &str) -> Result<String> {
     })?;
     for row in rows {
         let values = row?;
-        for value in [values.0, values.1, values.2, values.3, values.4, values.5, values.6] {
+        for value in [
+            values.0, values.1, values.2, values.3, values.4, values.5, values.6,
+        ] {
             hasher.update(b"\0");
             hasher.update(value.as_bytes());
         }
@@ -927,10 +966,17 @@ mod tests {
     }
 
     #[test]
-    fn workflow_round_trips_with_evidence_and_degrades_after_supported_source_changes() -> Result<()> {
+    fn workflow_round_trips_with_evidence_and_degrades_after_supported_source_changes() -> Result<()>
+    {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
-        fs::write(repo.path().join("b.ts"), "export function beta() { return 2; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
+        fs::write(
+            repo.path().join("b.ts"),
+            "export function beta() { return 2; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
         let snapshot = structural::current_snapshot(&conn)?;
@@ -961,12 +1007,18 @@ mod tests {
         assert_eq!(artifact.prompt_version, "annotate/v2");
         assert_eq!(artifact.supports.len(), 3);
         assert_eq!(artifact.supports[0].relationship, "artifact-name-evidence");
-        assert!(artifact.supports.iter().any(|support| {
-            support.relationship == "defining-participant-evidence"
-        }));
-        assert!(artifact.supports.iter().any(|support| {
-            support.relationship == "supporting-participant-evidence"
-        }));
+        assert!(
+            artifact
+                .supports
+                .iter()
+                .any(|support| { support.relationship == "defining-participant-evidence" })
+        );
+        assert!(
+            artifact
+                .supports
+                .iter()
+                .any(|support| { support.relationship == "supporting-participant-evidence" })
+        );
         assert_eq!(
             support_relationship(
                 "workflow",
@@ -977,7 +1029,10 @@ mod tests {
         );
         assert_eq!(search(&conn, "handoff", 4)?.len(), 1);
 
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 3; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 3; }\n",
+        )?;
         indexer::index_repo(repo.path(), &conn)?;
         let stale = search(&conn, "handoff", 4)?;
         assert_eq!(stale[0].freshness, "degraded");
@@ -999,7 +1054,10 @@ mod tests {
     #[test]
     fn workflow_requires_unique_scoped_participants_and_one_defining_boundary() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
         let alpha = "sym:a.ts#::alpha@1";
@@ -1061,7 +1119,8 @@ mod tests {
     }
 
     #[test]
-    fn workflow_candidates_expand_ranked_production_symbols_and_fingerprint_the_set() -> Result<()> {
+    fn workflow_candidates_expand_ranked_production_symbols_and_fingerprint_the_set() -> Result<()>
+    {
         let repo = tempfile::tempdir()?;
         fs::write(
             repo.path().join("entry.ts"),
@@ -1071,7 +1130,10 @@ mod tests {
             repo.path().join("middle.ts"),
             "import { leaf } from './leaf';\nexport function middle() { return leaf(); }\n",
         )?;
-        fs::write(repo.path().join("leaf.ts"), "export function leaf() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("leaf.ts"),
+            "export function leaf() { return 1; }\n",
+        )?;
         fs::write(
             repo.path().join("entry.test.ts"),
             "export function testHelper() { return 1; }\n",
@@ -1081,16 +1143,17 @@ mod tests {
         let entry = "sym:entry.ts#::entry@1".to_string();
         let leaf = "sym:leaf.ts#::leaf@1".to_string();
         let options = WorkflowCandidateOptions::default();
-        let result = workflow_candidates(
-            repo.path(),
-            &conn,
-            &[entry.clone(), leaf.clone()],
-            &options,
-        )?;
+        let result =
+            workflow_candidates(repo.path(), &conn, &[entry.clone(), leaf.clone()], &options)?;
         assert_eq!(result.candidates.len(), 3);
         assert!(!result.traversal_truncated);
         assert!(!result.candidate_truncated);
-        assert!(result.candidates.iter().all(|candidate| !candidate.file.contains("test")));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.file.contains("test"))
+        );
         assert!(result.candidates.iter().any(|candidate| {
             candidate.display_name == "middle" && candidate.evidence_end_line >= 2
         }));
@@ -1098,15 +1161,26 @@ mod tests {
         let reversed = workflow_candidates(repo.path(), &conn, &[leaf, entry], &options)?;
         assert_eq!(result.fingerprint, reversed.fingerprint);
         assert_eq!(
-            result.candidates.iter().map(|candidate| &candidate.anchor).collect::<Vec<_>>(),
-            reversed.candidates.iter().map(|candidate| &candidate.anchor).collect::<Vec<_>>(),
+            result
+                .candidates
+                .iter()
+                .map(|candidate| &candidate.anchor)
+                .collect::<Vec<_>>(),
+            reversed
+                .candidates
+                .iter()
+                .map(|candidate| &candidate.anchor)
+                .collect::<Vec<_>>(),
         );
 
         let limited = workflow_candidates(
             repo.path(),
             &conn,
             &["entry".into()],
-            &WorkflowCandidateOptions { candidate_limit: 2, ..Default::default() },
+            &WorkflowCandidateOptions {
+                candidate_limit: 2,
+                ..Default::default()
+            },
         )?;
         assert_eq!(limited.candidates.len(), 2);
         assert!(limited.candidate_truncated);
@@ -1116,7 +1190,10 @@ mod tests {
     #[test]
     fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
         let alpha = "sym:a.ts#::alpha@1";
@@ -1129,7 +1206,12 @@ mod tests {
             snapshot: structural::current_snapshot(&conn)?,
             supersedes: None,
         };
-        assert!(annotate(repo.path(), &conn, &base).unwrap_err().to_string().contains("likely"));
+        assert!(
+            annotate(repo.path(), &conn, &base)
+                .unwrap_err()
+                .to_string()
+                .contains("likely")
+        );
 
         let bad_span = AnnotateInput {
             confidence: "likely".into(),
@@ -1139,15 +1221,27 @@ mod tests {
             }],
             ..base.clone()
         };
-        assert!(annotate(repo.path(), &conn, &bad_span).unwrap_err().to_string().contains("line count"));
+        assert!(
+            annotate(repo.path(), &conn, &bad_span)
+                .unwrap_err()
+                .to_string()
+                .contains("line count")
+        );
 
         let stale_snapshot = AnnotateInput {
             snapshot: "0".repeat(64),
             supports: vec![support("/claim", alpha, "a.ts")],
             ..bad_span
         };
-        assert!(annotate(repo.path(), &conn, &stale_snapshot).unwrap_err().to_string().contains("stale"));
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM semantic_artifacts", [], |row| row.get(0))?;
+        assert!(
+            annotate(repo.path(), &conn, &stale_snapshot)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM semantic_artifacts", [], |row| {
+            row.get(0)
+        })?;
         assert_eq!(count, 0);
         Ok(())
     }
@@ -1155,7 +1249,10 @@ mod tests {
     #[test]
     fn superseding_annotation_hides_prior_record_from_default_search() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
         let snapshot = structural::current_snapshot(&conn)?;
@@ -1196,7 +1293,10 @@ mod tests {
     #[test]
     fn every_semantic_leaf_claim_requires_evidence_support() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("a.ts"), "export function alpha() { return 1; }\n")?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
         let alpha = "sym:a.ts#::alpha@1";

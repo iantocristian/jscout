@@ -13,7 +13,10 @@ pub fn validate_all(origins: &[String]) -> Result<()> {
     }
     for origin in origins {
         if !ALL.contains(&origin.as_str()) {
-            bail!("file origin must be one of: {}; got `{origin}`", ALL.join(", "));
+            bail!(
+                "file origin must be one of: {}; got `{origin}`",
+                ALL.join(", ")
+            );
         }
     }
     Ok(())

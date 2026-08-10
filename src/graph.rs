@@ -2,7 +2,9 @@ use oxc_ast::AstKind;
 use oxc_parser::ParserReturn;
 use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::module_record::{ExportExportName, ExportImportName, ExportLocalName, ImportImportName};
+use oxc_syntax::module_record::{
+    ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
+};
 use oxc_syntax::symbol::SymbolFlags;
 
 #[derive(Debug, Clone)]
@@ -102,7 +104,12 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         if let Some(l) = &local_name {
             exported_contract_locals.insert(l.clone());
         }
-        let row = ExportRow { export_name, local_name, from_request: None, from_name: None };
+        let row = ExportRow {
+            export_name,
+            local_name,
+            from_request: None,
+            from_name: None,
+        };
         g.contract_exports.push(row.clone());
         if entry.is_type {
             continue;
@@ -113,7 +120,9 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         g.exports.push(row);
     }
     for entry in &record.indirect_export_entries {
-        let Some(request) = &entry.module_request else { continue };
+        let Some(request) = &entry.module_request else {
+            continue;
+        };
         let export_name = match &entry.export_name {
             ExportExportName::Name(n) => n.name.to_string(),
             ExportExportName::Default(_) => "default".to_string(),
@@ -146,7 +155,9 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         });
     }
     for entry in &record.star_export_entries {
-        let Some(request) = &entry.module_request else { continue };
+        let Some(request) = &entry.module_request else {
+            continue;
+        };
         let row = ExportRow {
             export_name: "*".to_string(),
             local_name: None,
@@ -159,7 +170,11 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         }
     }
     g.entity_sites = crate::entity::extract(&ret.program, &exported_contract_locals);
-    g.requests = record.requested_modules.keys().map(|s| s.to_string()).collect();
+    g.requests = record
+        .requested_modules
+        .keys()
+        .map(|s| s.to_string())
+        .collect();
 
     // ---- CommonJS + dynamic-import heuristics ----
     for r in &heur.requires {
@@ -343,10 +358,10 @@ fn classify_reference<'a>(
             AstKind::Class(c)
                 if c.super_class
                     .as_ref()
-                    .is_some_and(|s| s.span().contains_inclusive(ref_span))
-                => {
-                    return ("extend", member_prop);
-                }
+                    .is_some_and(|s| s.span().contains_inclusive(ref_span)) =>
+            {
+                return ("extend", member_prop);
+            }
             _ => {}
         }
     }

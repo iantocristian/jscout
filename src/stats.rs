@@ -25,9 +25,14 @@ impl<'a> Visit<'a> for StatsVisitor {
         self.stats.functions += 1;
         if self.is_jsx_file
             && let Some(id) = &func.id
-                && id.name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-                    self.stats.jsx_components_defined += 1;
-                }
+            && id
+                .name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            self.stats.jsx_components_defined += 1;
+        }
         oxc_ast_visit::walk::walk_function(self, func, flags);
     }
 

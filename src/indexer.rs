@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
@@ -67,11 +67,17 @@ pub(crate) fn resolver_options(
         ],
         // TS convention: `./x.js` in source may mean `./x.ts` on disk.
         extension_alias: vec![
-            (".js".into(), vec![".ts".into(), ".tsx".into(), ".js".into(), ".jsx".into()]),
+            (
+                ".js".into(),
+                vec![".ts".into(), ".tsx".into(), ".js".into(), ".jsx".into()],
+            ),
             (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
             (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
         ],
-        condition_names: RESOLVE_CONDITIONS.iter().map(|c| (*c).to_string()).collect(),
+        condition_names: RESOLVE_CONDITIONS
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
         main_fields: vec!["module".into(), "main".into()],
         tsconfig,
         ..ResolveOptions::default()
@@ -108,9 +114,8 @@ pub fn index_repo_with_options(
     };
 
     let existing: HashMap<String, (i64, String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT path, id, hash, role FROM files WHERE origin!='dependency'",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -127,7 +132,11 @@ pub fn index_repo_with_options(
     let mut seen: std::collections::HashSet<String> = Default::default();
     conn.execute_batch("BEGIN")?;
     for file in &files {
-        let rel = file.strip_prefix(&root).unwrap_or(file).to_string_lossy().into_owned();
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .into_owned();
         seen.insert(rel.clone());
         let Ok(source) = std::fs::read_to_string(file) else {
             outcome.failed += 1;
@@ -136,13 +145,14 @@ pub fn index_repo_with_options(
         let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
         let role = file_role::classify(Path::new(&rel), &source);
         if let Some((id, old_hash, old_role)) = existing.get(&rel)
-            && *old_hash == hash {
-                if old_role != role {
-                    conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
-                }
-                outcome.unchanged += 1;
-                continue;
+            && *old_hash == hash
+        {
+            if old_role != role {
+                conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
             }
+            outcome.unchanged += 1;
+            continue;
+        }
         if std::env::var_os("JSCOUT_DEBUG").is_some() {
             eprintln!("extracting {rel}");
         }
@@ -187,12 +197,7 @@ pub fn index_repo_with_options(
     conn.execute_batch("COMMIT")?;
 
     let workspace = crate::workspace::WorkspaceMap::build(&root);
-    let discovered = dependency::discover(
-        &root,
-        conn,
-        &options.dependencies,
-        &workspace,
-    )?;
+    let discovered = dependency::discover(&root, conn, &options.dependencies, &workspace)?;
     let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
     let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
     index_dependency_files(conn, &plans, &instances, &mut outcome)?;
@@ -207,7 +212,10 @@ pub fn index_repo_with_options(
     let projection_started = std::time::Instant::now();
     crate::structural::rebuild_projection(conn, &snapshot)?;
     if std::env::var_os("JSCOUT_TIMING").is_some() {
-        eprintln!("timing structural-projection={:?}", projection_started.elapsed());
+        eprintln!(
+            "timing structural-projection={:?}",
+            projection_started.elapsed()
+        );
     }
     Ok(outcome)
 }
@@ -228,7 +236,10 @@ fn ensure_extraction_version(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash=''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -251,7 +262,11 @@ fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
         let chunker = Chunker::new(Path::new(rel), source, ret);
         let chunks = chunker.chunk_program(&ret.program, &ret.program.comments);
         let graph = graph::extract(ret, semantic);
-        FileData { chunks, graph, lines: LineIndex::new(source) }
+        FileData {
+            chunks,
+            graph,
+            lines: LineIndex::new(source),
+        }
     })
 }
 
@@ -286,7 +301,10 @@ fn insert_file(
             "INSERT INTO chunks_fts(rowid, content, name, symbols, path) VALUES(?1, ?2, ?3, ?4, ?5)",
         )?;
         for c in &data.chunks {
-            let kind = serde_json::to_value(c.kind)?.as_str().unwrap_or("module").to_string();
+            let kind = serde_json::to_value(c.kind)?
+                .as_str()
+                .unwrap_or("module")
+                .to_string();
             ins_chunk.execute(params![
                 file_id,
                 kind,
@@ -349,7 +367,13 @@ fn insert_file(
         "INSERT INTO exports(file_id, export_name, local_name, from_request, from_name) VALUES(?1,?2,?3,?4,?5)",
     )?;
     for e in &data.graph.exports {
-        ins_exp.execute(params![file_id, e.export_name, e.local_name, e.from_request, e.from_name])?;
+        ins_exp.execute(params![
+            file_id,
+            e.export_name,
+            e.local_name,
+            e.from_request,
+            e.from_name
+        ])?;
     }
 
     let mut ins_contract_imp = conn.prepare_cached(
@@ -503,9 +527,9 @@ fn index_dependency_files(
                 plan.source_basis,
                 plan.status,
             ));
-            let package_id = *instances
-                .get(&plan.package.canonical_root)
-                .ok_or_else(|| anyhow::anyhow!("dependency package instance was not synchronized"))?;
+            let package_id = *instances.get(&plan.package.canonical_root).ok_or_else(|| {
+                anyhow::anyhow!("dependency package instance was not synchronized")
+            })?;
             for file in &plan.files {
                 let display = dependency_display_path(&plan.package, &file.package_path);
                 let source = match std::fs::read_to_string(&file.source_path) {
@@ -635,16 +659,17 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
         let mut by_id = HashMap::new();
         for row in rows {
             let (id, path, origin, package_path, package_instance, package_root) = row?;
-            let physical = if origin == "dependency" {
-                PathBuf::from(package_root.ok_or_else(|| {
-                    anyhow::anyhow!("dependency file {path} has no package root")
-                })?)
-                .join(package_path.ok_or_else(|| {
-                    anyhow::anyhow!("dependency file {path} has no package path")
-                })?)
-            } else {
-                root.join(path)
-            };
+            let physical =
+                if origin == "dependency" {
+                    PathBuf::from(package_root.ok_or_else(|| {
+                        anyhow::anyhow!("dependency file {path} has no package root")
+                    })?)
+                    .join(package_path.ok_or_else(|| {
+                        anyhow::anyhow!("dependency file {path} has no package path")
+                    })?)
+                } else {
+                    root.join(path)
+                };
             let physical = physical.canonicalize().unwrap_or(physical);
             by_path.insert(physical.clone(), (id, package_instance));
             by_id.insert(id, (physical, origin == "dependency"));
@@ -657,7 +682,10 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
             "SELECT canonical_root, id FROM package_instances WHERE origin='dependency'",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((PathBuf::from(row.get::<_, String>(0)?), row.get::<_, i64>(1)?))
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, i64>(1)?,
+            ))
         })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
@@ -698,7 +726,12 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
            from_file, request, to_file, package, resolution, package_instance_id, type_only
          ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
     )?;
-    type Resolved = (Option<i64>, Option<String>, Option<&'static str>, Option<i64>);
+    type Resolved = (
+        Option<i64>,
+        Option<String>,
+        Option<&'static str>,
+        Option<i64>,
+    );
     let mut cache: HashMap<(PathBuf, String), Resolved> = HashMap::new();
     for (file_id, request, type_only) in pairs {
         let (importer, dependency_importer) = importer_paths
@@ -708,33 +741,35 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
         let key = (importer.clone(), request.clone());
         let (to_file, package, resolution, package_instance) = cache
             .entry(key)
-            .or_insert_with(|| match if dependency_importer {
-                dependency_resolver.resolve_file(&importer, &request)
-            } else {
-                resolver
-                    .resolve_file(&importer, &request)
-                    .or_else(|_| no_tsconfig.resolve_file(&importer, &request))
-            } {
-                Ok(resolution) => {
-                    let path = resolution.path().to_path_buf();
-                    let path = path.canonicalize().unwrap_or(path);
-                    match file_ids.get(&path) {
-                        Some((id, package_instance)) => (
-                            Some(*id),
-                            None,
-                            Some(workspace.classify(&request)),
-                            *package_instance,
-                        ),
-                        None => {
-                            let package_instance = package_roots
-                                .iter()
-                                .find(|(root, _)| path.starts_with(root))
-                                .map(|(_, id)| *id);
-                            (None, Some(package_name(&request)), None, package_instance)
+            .or_insert_with(|| {
+                match if dependency_importer {
+                    dependency_resolver.resolve_file(&importer, &request)
+                } else {
+                    resolver
+                        .resolve_file(&importer, &request)
+                        .or_else(|_| no_tsconfig.resolve_file(&importer, &request))
+                } {
+                    Ok(resolution) => {
+                        let path = resolution.path().to_path_buf();
+                        let path = path.canonicalize().unwrap_or(path);
+                        match file_ids.get(&path) {
+                            Some((id, package_instance)) => (
+                                Some(*id),
+                                None,
+                                Some(workspace.classify(&request)),
+                                *package_instance,
+                            ),
+                            None => {
+                                let package_instance = package_roots
+                                    .iter()
+                                    .find(|(root, _)| path.starts_with(root))
+                                    .map(|(_, id)| *id);
+                                (None, Some(package_name(&request)), None, package_instance)
+                            }
                         }
                     }
+                    Err(_) => (None, Some(package_name(&request)), None, None),
                 }
-                Err(_) => (None, Some(package_name(&request)), None, None),
             })
             .clone();
         ins.execute(params![
@@ -821,7 +856,10 @@ mod tests {
             app.join("src/main.ts"),
             "import { helper } from 'src/helper';\nexport const main = () => helper();\n",
         )?;
-        fs::write(app.join("src/helper.ts"), "export const helper = () => 1;\n")?;
+        fs::write(
+            app.join("src/helper.ts"),
+            "export const helper = () => 1;\n",
+        )?;
 
         let conn = store::open(repo.path())?;
         index_repo(repo.path(), &conn)?;
@@ -841,7 +879,10 @@ mod tests {
     #[test]
     fn resolves_workspace_package_imports_to_internal_files() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")?;
+        fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
 
         // Library package: main points at untracked dist output, but the
         // module field names the source entry directly (manifest truth).
@@ -851,8 +892,14 @@ mod tests {
             lib.join("package.json"),
             r#"{"name": "@acme/lib", "main": "dist/index.js", "module": "src/index.ts"}"#,
         )?;
-        fs::write(lib.join("src/index.ts"), "export const greet = () => 'hi';\n")?;
-        fs::write(lib.join("src/utils/format.ts"), "export const fmt = (s: string) => s;\n")?;
+        fs::write(
+            lib.join("src/index.ts"),
+            "export const greet = () => 'hi';\n",
+        )?;
+        fs::write(
+            lib.join("src/utils/format.ts"),
+            "export const fmt = (s: string) => s;\n",
+        )?;
 
         // Subpath-only package (no "." export, no root entry) whose wildcard
         // export re-roots the tree: src/scrub.ts is a decoy the generic src/
@@ -864,7 +911,10 @@ mod tests {
             r#"{"name": "@acme/tools", "exports": {"./*": "./dist/inner/*.js"}}"#,
         )?;
         fs::write(tools.join("src/scrub.ts"), "export const decoy = 1;\n")?;
-        fs::write(tools.join("src/inner/scrub.ts"), "export const scrub = (s: string) => s;\n")?;
+        fs::write(
+            tools.join("src/inner/scrub.ts"),
+            "export const scrub = (s: string) => s;\n",
+        )?;
 
         let app = repo.path().join("packages/app");
         fs::create_dir_all(app.join("src"))?;
@@ -897,7 +947,11 @@ mod tests {
         // Bare package import -> the manifest-named source entry: certain.
         assert_eq!(
             edge("@acme/lib")?,
-            (Some("packages/lib/src/index.ts".into()), None, Some("workspace".into()))
+            (
+                Some("packages/lib/src/index.ts".into()),
+                None,
+                Some("workspace".into())
+            )
         );
         // Subpath through the src/ layout heuristic: internal but inferred.
         assert_eq!(
@@ -957,7 +1011,10 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(fmt_call, ("likely".into(), "semantic+resolver-inferred".into()));
+        assert_eq!(
+            fmt_call,
+            ("likely".into(), "semantic+resolver-inferred".into())
+        );
         let greet_call: (String, String) = conn.query_row(
             "SELECT confidence, provenance FROM resolved_edges
              WHERE kind='call' AND detail_json LIKE '%\"targetName\":\"greet\"%'
@@ -972,7 +1029,10 @@ mod tests {
     #[test]
     fn unloadable_tsconfig_degrades_to_plain_resolution() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        fs::write(repo.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")?;
+        fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
 
         let lib = repo.path().join("packages/lib");
         fs::create_dir_all(lib.join("src"))?;
@@ -988,7 +1048,10 @@ mod tests {
             app.join("tsconfig.json"),
             r#"{"extends": "@acme/tsconfig/base.json", "include": ["src"]}"#,
         )?;
-        fs::write(app.join("src/helper.ts"), "export const helper = () => 1;\n")?;
+        fs::write(
+            app.join("src/helper.ts"),
+            "export const helper = () => 1;\n",
+        )?;
         fs::write(
             app.join("src/main.ts"),
             "import { helper } from './helper';\n\
@@ -1009,8 +1072,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?)
         };
-        assert_eq!(edge("./helper")?, (Some("packages/app/src/helper.ts".into()), None));
-        assert_eq!(edge("@acme/lib")?, (Some("packages/lib/src/index.ts".into()), None));
+        assert_eq!(
+            edge("./helper")?,
+            (Some("packages/app/src/helper.ts".into()), None)
+        );
+        assert_eq!(
+            edge("@acme/lib")?,
+            (Some("packages/lib/src/index.ts".into()), None)
+        );
         Ok(())
     }
 
@@ -1058,13 +1127,19 @@ mod tests {
             dependency.join("package.json"),
             r#"{"name":"@scope/pkg","version":"2.0.0","main":"index.js"}"#,
         )?;
-        fs::write(dependency.join("index.js"), "export const scoped = () => 2;\n")?;
+        fs::write(
+            dependency.join("index.js"),
+            "export const scoped = () => 2;\n",
+        )?;
 
         let conn = store::open(repo.path())?;
         index_repo_with_options(
             repo.path(),
             &conn,
-            &IndexOptions { dependencies: vec!["@scope/pkg".into()], ..Default::default() },
+            &IndexOptions {
+                dependencies: vec!["@scope/pkg".into()],
+                ..Default::default()
+            },
         )?;
         let resolved: (String, String, String) = conn.query_row(
             "SELECT package.name, package.version, target.package_path
@@ -1076,7 +1151,10 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(resolved, ("@scope/pkg".into(), "2.0.0".into(), "index.js".into()));
+        assert_eq!(
+            resolved,
+            ("@scope/pkg".into(), "2.0.0".into(), "index.js".into())
+        );
         Ok(())
     }
 
@@ -1119,7 +1197,10 @@ mod tests {
         let first = index_repo_with_options(
             repo.path(),
             &conn,
-            &IndexOptions { dependencies: selected.clone(), ..Default::default() },
+            &IndexOptions {
+                dependencies: selected.clone(),
+                ..Default::default()
+            },
         )?;
         assert_eq!(first.dependency_packages, 1);
         assert_eq!(first.dependency_files, 2);
@@ -1130,7 +1211,10 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(package, ("dependency".into(), "selected-dep".into(), "1.2.3".into()));
+        assert_eq!(
+            package,
+            ("dependency".into(), "selected-dep".into(), "1.2.3".into())
+        );
         let dependency_files: Vec<(String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT origin, package_path FROM files
@@ -1217,25 +1301,15 @@ mod tests {
                 .all(|hit| hit.file_origin == "dependency")
         );
         assert!(
-            query::find_symbols_in_origins(
-                &conn,
-                "dependencyOnlyMarker",
-                &origin::defaults(),
-            )?
-            .is_empty()
+            query::find_symbols_in_origins(&conn, "dependencyOnlyMarker", &origin::defaults(),)?
+                .is_empty()
         );
-        let dependency_definitions = query::find_symbols_in_origins(
-            &conn,
-            "dependencyOnlyMarker",
-            &["dependency".into()],
-        )?;
+        let dependency_definitions =
+            query::find_symbols_in_origins(&conn, "dependencyOnlyMarker", &["dependency".into()])?;
         assert_eq!(dependency_definitions.len(), 1);
         assert_eq!(dependency_definitions[0].file_origin, "dependency");
-        let first_party_anchor = structural::resolve_current_anchor_in_origins(
-            &conn,
-            "internal",
-            &origin::defaults(),
-        )?;
+        let first_party_anchor =
+            structural::resolve_current_anchor_in_origins(&conn, "internal", &origin::defaults())?;
         assert!(first_party_anchor.starts_with("sym:main.ts#::internal@"));
         assert!(structural::resolve_current_anchor(&conn, "internal").is_err());
 
@@ -1247,7 +1321,12 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert!(default_boundary.nodes.iter().any(|node| node.key == package_hub.0));
+        assert!(
+            default_boundary
+                .nodes
+                .iter()
+                .any(|node| node.key == package_hub.0)
+        );
         assert!(
             default_boundary
                 .nodes
@@ -1273,7 +1352,10 @@ mod tests {
         let second = index_repo_with_options(
             repo.path(),
             &conn,
-            &IndexOptions { dependencies: selected, ..Default::default() },
+            &IndexOptions {
+                dependencies: selected,
+                ..Default::default()
+            },
         )?;
         assert_eq!(second.dependency_files, 2);
         assert_eq!(second.indexed, 0);
@@ -1340,10 +1422,11 @@ mod tests {
         };
         index_repo_with_options(repo.path(), &conn, &options)?;
         let old_snapshot: String =
-            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| row.get(0))?;
+            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                row.get(0)
+            })?;
 
-        let changed =
-            "import value from 'selected-dep';\nexport const after = value + 1;\n";
+        let changed = "import value from 'selected-dep';\nexport const after = value + 1;\n";
         fs::write(&main, changed)?;
         fs::remove_dir_all(&dependency)?;
         let error = index_repo_with_options(repo.path(), &conn, &options)
@@ -1351,19 +1434,24 @@ mod tests {
             .expect("missing selected dependency must fail the run");
         assert!(error.to_string().contains("not installed or resolvable"));
 
-        let committed_hash: String = conn.query_row(
-            "SELECT hash FROM files WHERE path='main.ts'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(committed_hash, blake3::hash(changed.as_bytes()).to_hex().to_string());
+        let committed_hash: String =
+            conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            committed_hash,
+            blake3::hash(changed.as_bytes()).to_hex().to_string()
+        );
         let public_snapshot_rows: i64 = conn.query_row(
             "SELECT count(*) FROM meta
              WHERE key IN ('snapshot', 'projection_version')",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(public_snapshot_rows, 0, "stale snapshot remained public: {old_snapshot}");
+        assert_eq!(
+            public_snapshot_rows, 0,
+            "stale snapshot remained public: {old_snapshot}"
+        );
         Ok(())
     }
 }

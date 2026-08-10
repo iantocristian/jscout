@@ -87,10 +87,8 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
     }
     let allowed_types: HashSet<&str> = options.entity_types.iter().map(String::as_str).collect();
     let allowed_roles: HashSet<&str> = options.roles.iter().map(String::as_str).collect();
-    let allowed_file_roles: HashSet<&str> =
-        options.file_roles.iter().map(String::as_str).collect();
-    let allowed_origins: HashSet<&str> =
-        options.file_origins.iter().map(String::as_str).collect();
+    let allowed_file_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
+    let allowed_origins: HashSet<&str> = options.file_origins.iter().map(String::as_str).collect();
     let query = options.query.to_ascii_lowercase();
 
     let mut stmt = conn.prepare(
@@ -322,14 +320,16 @@ pub fn overview(
         *totals.get_mut("symbols").expect("total exists") += symbols;
         *totals.get_mut("entity_occurrences").expect("total exists") += occurrences;
         let area_path = repository_area(&path);
-        let area = areas.entry(area_path.clone()).or_insert_with(|| AreaOverview {
-            path: area_path,
-            files: 0,
-            chunks: 0,
-            symbols: 0,
-            entity_occurrences: 0,
-            roles: BTreeMap::new(),
-        });
+        let area = areas
+            .entry(area_path.clone())
+            .or_insert_with(|| AreaOverview {
+                path: area_path,
+                files: 0,
+                chunks: 0,
+                symbols: 0,
+                entity_occurrences: 0,
+                roles: BTreeMap::new(),
+            });
         area.files += 1;
         area.chunks += chunks;
         area.symbols += symbols;
@@ -414,8 +414,9 @@ pub fn overview(
 fn repository_area(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
-        [root @ ("packages" | "apps" | "services"), scope, name, ..]
-            if scope.starts_with('@') => format!("{root}/{scope}/{name}"),
+        [root @ ("packages" | "apps" | "services"), scope, name, ..] if scope.starts_with('@') => {
+            format!("{root}/{scope}/{name}")
+        }
         [root @ ("packages" | "apps" | "services"), name, ..] => {
             format!("{root}/{name}")
         }

@@ -250,11 +250,7 @@ impl EntityVisitor {
         }
     }
 
-    fn extract_arrow_contracts(
-        &mut self,
-        owner: &str,
-        arrow: &ArrowFunctionExpression<'_>,
-    ) {
+    fn extract_arrow_contracts(&mut self, owner: &str, arrow: &ArrowFunctionExpression<'_>) {
         let bound_names = type_parameter_names(arrow.type_parameters.as_deref()).collect();
         for (index, parameter) in arrow.params.items.iter().enumerate() {
             if let Some(annotation) = &parameter.type_annotation {
@@ -315,8 +311,12 @@ impl EntityVisitor {
     }
 
     fn extract_logic_function(&mut self, call: &CallExpression<'_>) {
-        let Some(config) = first_object_argument(call) else { return };
-        let Some(identifier) = object_value(config, "universalIdentifier") else { return };
+        let Some(config) = first_object_argument(call) else {
+            return;
+        };
+        let Some(identifier) = object_value(config, "universalIdentifier") else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) = self.identity(identifier) else {
             return;
         };
@@ -343,7 +343,9 @@ impl EntityVisitor {
         else {
             return;
         };
-        let Some(event_name_expression) = object_value(settings, "eventName") else { return };
+        let Some(event_name_expression) = object_value(settings, "eventName") else {
+            return;
+        };
         let Some(event_name) = static_string(event_name_expression, &self.static_strings) else {
             return;
         };
@@ -366,14 +368,22 @@ impl EntityVisitor {
     }
 
     fn extract_mutation(&mut self, call: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &call.callee else { return };
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return;
+        };
         if member.property.name != "mutation" {
             return;
         }
-        let Some(mutation) = first_object_argument(call) else { return };
+        let Some(mutation) = first_object_argument(call) else {
+            return;
+        };
         for property in &mutation.properties {
-            let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
-            let Some(operation) = property.key.static_name() else { continue };
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(operation) = property.key.static_name() else {
+                continue;
+            };
             let Some((action, resource)) = mutation_resource(operation.as_ref()) else {
                 continue;
             };
@@ -402,7 +412,9 @@ impl EntityVisitor {
     }
 
     fn extract_job_call(&mut self, call: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &call.callee else { return };
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return;
+        };
         let method = member.property.name.as_str();
         if !matches!(
             method,
@@ -410,7 +422,9 @@ impl EntityVisitor {
         ) {
             return;
         }
-        let Some(object) = member_path(&member.object) else { return };
+        let Some(object) = member_path(&member.object) else {
+            return;
+        };
         let object_lower = object.to_ascii_lowercase();
         if !["queue", "job", "worker", "cron", "schedul", "producer"]
             .iter()
@@ -423,7 +437,9 @@ impl EntityVisitor {
         } else {
             call.arguments.first().and_then(Argument::as_expression)
         };
-        let Some(identity_expression) = identity_expression else { return };
+        let Some(identity_expression) = identity_expression else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) =
             self.identity(identity_expression)
         else {
@@ -501,8 +517,12 @@ impl EntityVisitor {
             && let Some(config) = first_object_argument(call)
         {
             for property in &config.properties {
-                let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
-                let Some(operation) = property.key.static_name() else { continue };
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    continue;
+                };
+                let Some(operation) = property.key.static_name() else {
+                    continue;
+                };
                 self.push_general(GeneralSiteSpec {
                     entity_type: "graphql_operation",
                     role: "graphql_operation",
@@ -520,7 +540,10 @@ impl EntityVisitor {
 
         if matches!(callee_name, "get" | "require" | "getEnv" | "requireEnv")
             && callee_path.as_deref().is_some_and(|path| {
-                matches!(path, "Deno.env.get" | "env.get" | "config.get" | "getEnv" | "requireEnv")
+                matches!(
+                    path,
+                    "Deno.env.get" | "env.get" | "config.get" | "getEnv" | "requireEnv"
+                )
             })
             && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(name) = static_string(expression, &self.static_strings)
@@ -542,8 +565,7 @@ impl EntityVisitor {
         if is_feature_flag_callee(callee_name)
             && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some((kind, name, start)) = self.identity(expression).or_else(|| {
-                member_path(expression)
-                    .map(|name| ("literal", name, expression.span().start))
+                member_path(expression).map(|name| ("literal", name, expression.span().start))
             })
         {
             self.push_general(GeneralSiteSpec {
@@ -603,13 +625,21 @@ impl EntityVisitor {
         let controller_prefix = class
             .decorators
             .iter()
-            .find_map(|decorator| decorator_static_argument(decorator, "Controller", &self.static_strings))
+            .find_map(|decorator| {
+                decorator_static_argument(decorator, "Controller", &self.static_strings)
+            })
             .unwrap_or_default();
         for element in &class.body.body {
-            let ClassElement::MethodDefinition(method) = element else { continue };
-            let Some(method_name) = method.key.static_name() else { continue };
+            let ClassElement::MethodDefinition(method) = element else {
+                continue;
+            };
+            let Some(method_name) = method.key.static_name() else {
+                continue;
+            };
             for decorator in &method.decorators {
-                let Some((decorator_name, call)) = decorator_call(decorator) else { continue };
+                let Some((decorator_name, call)) = decorator_call(decorator) else {
+                    continue;
+                };
                 let terminal = decorator_name.rsplit('.').next().unwrap_or(&decorator_name);
                 if let Some(http_method) = http_method(terminal) {
                     let method_path = call
@@ -664,11 +694,15 @@ impl EntityVisitor {
     }
 
     fn extract_provider(&mut self, object: &ObjectExpression<'_>) {
-        let Some(token) = object_value(object, "provide") else { return };
+        let Some(token) = object_value(object, "provide") else {
+            return;
+        };
         let implementation = ["useClass", "useFactory", "useExisting"]
             .into_iter()
             .find_map(|field| object_value(object, field).map(|value| (field, value)));
-        let Some((binding, implementation)) = implementation else { return };
+        let Some((binding, implementation)) = implementation else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) = self.identity(token) else {
             return;
         };
@@ -692,8 +726,12 @@ impl EntityVisitor {
     }
 
     fn extract_decorator(&mut self, decorator: &Decorator<'_>) {
-        let Expression::CallExpression(call) = &decorator.expression else { return };
-        let Expression::Identifier(callee) = &call.callee else { return };
+        let Expression::CallExpression(call) = &decorator.expression else {
+            return;
+        };
+        let Expression::Identifier(callee) = &call.callee else {
+            return;
+        };
         let Some(identity_expression) = call.arguments.first().and_then(Argument::as_expression)
         else {
             return;
@@ -735,7 +773,8 @@ impl<'a> Visit<'a> for EntityVisitor {
             && let Some(initializer) = &declaration.init
         {
             if let Some(value) = static_string(initializer, &self.static_strings) {
-                self.static_strings.insert(identifier.name.to_string(), value);
+                self.static_strings
+                    .insert(identifier.name.to_string(), value);
             }
             if self.exported.contains(identifier.name.as_str())
                 && let Expression::ArrowFunctionExpression(arrow) = initializer
@@ -760,11 +799,7 @@ impl<'a> Visit<'a> for EntityVisitor {
         oxc_ast_visit::walk::walk_variable_declarator(self, declaration);
     }
 
-    fn visit_function(
-        &mut self,
-        function: &Function<'a>,
-        flags: oxc_syntax::scope::ScopeFlags,
-    ) {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         if let Some(identifier) = &function.id
             && self.exported.contains(identifier.name.as_str())
         {
@@ -920,8 +955,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        if is_process_env(&member.object)
-        {
+        if is_process_env(&member.object) {
             self.push_general(GeneralSiteSpec {
                 entity_type: "environment_variable",
                 role: "environment_read",
@@ -962,8 +996,10 @@ impl<'a> Visit<'a> for EntityVisitor {
         if matches!(
             &expression.callee,
             Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "Worker" | "QueueWorker")
-        ) && let Some(identity_expression) =
-            expression.arguments.first().and_then(Argument::as_expression)
+        ) && let Some(identity_expression) = expression
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
             && let Some((identity_kind, identity_name, identity_start)) =
                 self.identity(identity_expression)
         {
@@ -1108,7 +1144,9 @@ fn decorator_reference(expression: &Expression<'_>) -> Option<(String, u32)> {
 }
 
 fn validation_schema_callee(expression: &Expression<'_>, binding: &str) -> Option<String> {
-    let Expression::CallExpression(call) = expression else { return None };
+    let Expression::CallExpression(call) = expression else {
+        return None;
+    };
     let path = member_path(&call.callee)?;
     let recognized = matches!(
         path.as_str(),
@@ -1128,7 +1166,9 @@ fn validation_schema_callee(expression: &Expression<'_>, binding: &str) -> Optio
 }
 
 fn class_is_contract_schema(class: &Class<'_>) -> bool {
-    let Some(identifier) = &class.id else { return false };
+    let Some(identifier) = &class.id else {
+        return false;
+    };
     let lower = identifier.name.to_ascii_lowercase();
     if lower.ends_with("dto") {
         return true;
@@ -1163,7 +1203,9 @@ fn first_object_argument<'a>(call: &'a CallExpression<'a>) -> Option<&'a ObjectE
 
 fn object_value<'a>(object: &'a ObjectExpression<'a>, name: &str) -> Option<&'a Expression<'a>> {
     object.properties.iter().find_map(|property| {
-        let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
         (property.key.static_name().as_deref() == Some(name)).then_some(&property.value)
     })
 }
@@ -1203,7 +1245,9 @@ fn join_route_path(prefix: &str, path: &str) -> String {
 }
 
 fn decorator_call<'a>(decorator: &'a Decorator<'a>) -> Option<(String, &'a CallExpression<'a>)> {
-    let Expression::CallExpression(call) = &decorator.expression else { return None };
+    let Expression::CallExpression(call) = &decorator.expression else {
+        return None;
+    };
     let name = member_path(&call.callee)?;
     Some((name, call))
 }
@@ -1300,7 +1344,9 @@ fn database_call(
         };
         return Some((name, "read"));
     }
-    let Expression::StaticMemberExpression(member) = &call.callee else { return None };
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return None;
+    };
     let method = member.property.name.as_str();
     let access = if matches!(
         method,
@@ -1372,7 +1418,10 @@ fn is_external_call(path: Option<&str>, name: &str) -> bool {
         || path.is_some_and(|path| {
             let root = path.split('.').next().unwrap_or_default();
             matches!(root, "axios" | "got" | "request")
-                && matches!(name, "get" | "post" | "put" | "patch" | "delete" | "request")
+                && matches!(
+                    name,
+                    "get" | "post" | "put" | "patch" | "delete" | "request"
+                )
         })
 }
 
@@ -1434,9 +1483,11 @@ fn member_path(expression: &Expression<'_>) -> Option<String> {
     match expression {
         Expression::ThisExpression(_) => Some("this".into()),
         Expression::Identifier(identifier) => Some(identifier.name.to_string()),
-        Expression::StaticMemberExpression(member) => {
-            Some(format!("{}.{}", member_path(&member.object)?, member.property.name))
-        }
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            member_path(&member.object)?,
+            member.property.name
+        )),
         _ => None,
     }
 }
@@ -1604,7 +1655,14 @@ mod tests {
              export const save = (input: User): UserResult => input;\n\
              export const userSchema = z.object({ id: z.string() });\n\
              @InputType() class CreateUserDto { @IsString() name: string; }\n",
-            ["User", "UserResult", "UserState", "load", "save", "userSchema"],
+            [
+                "User",
+                "UserResult",
+                "UserState",
+                "load",
+                "save",
+                "userSchema",
+            ],
         )?;
         for (entity_type, name) in [
             ("interface", "User"),
@@ -1620,24 +1678,32 @@ mod tests {
                     && site.identity_name == name
             }));
         }
-        assert!(extracted.iter().any(|site| {
-            site.role == "parameter_contract" && site.identity_name == "User"
-        }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "return_contract" && site.identity_name == "UserResult"
-        }));
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "parameter_contract" && site.identity_name == "User" })
+        );
+        assert!(
+            extracted.iter().any(|site| {
+                site.role == "return_contract" && site.identity_name == "UserResult"
+            })
+        );
         assert!(!extracted.iter().any(|site| {
             matches!(
                 site.role,
                 "parameter_contract" | "return_contract" | "contract_reference"
             ) && site.identity_name == "Promise"
         }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "decorator_use" && site.identity_name == "InputType"
-        }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "decorator_use" && site.identity_name == "IsString"
-        }));
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "decorator_use" && site.identity_name == "InputType" })
+        );
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "decorator_use" && site.identity_name == "IsString" })
+        );
         Ok(())
     }
 
@@ -1692,7 +1758,11 @@ mod tests {
             ("route", "route_handler", "GET /users/:id"),
             ("route", "route_handler", "POST /jobs"),
             ("graphql_operation", "graphql_handler", "mutation:saveUser"),
-            ("graphql_operation", "graphql_operation", "query:currentUser"),
+            (
+                "graphql_operation",
+                "graphql_operation",
+                "query:currentUser",
+            ),
             ("environment_variable", "environment_read", "API_KEY"),
             ("environment_variable", "environment_read", "REGION"),
             ("environment_variable", "environment_read", "TOKEN"),
@@ -1701,12 +1771,15 @@ mod tests {
             ("feature_flag", "feature_flag_check", "new-ui"),
             ("external_host", "external_host_call", "api.example.com"),
         ] {
-            assert!(extracted.iter().any(|site| {
-                site.plane == "general"
-                    && site.entity_type == entity_type
-                    && site.role == role
-                    && site.identity_name == identity
-            }), "missing {entity_type}/{role}/{identity}");
+            assert!(
+                extracted.iter().any(|site| {
+                    site.plane == "general"
+                        && site.entity_type == entity_type
+                        && site.role == role
+                        && site.identity_name == identity
+                }),
+                "missing {entity_type}/{role}/{identity}"
+            );
         }
         assert!(!extracted.iter().any(|site| {
             site.entity_type == "database_resource" && site.identity_name == "repository"
