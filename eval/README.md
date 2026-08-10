@@ -353,6 +353,9 @@ fixture are recorded in
 The route, GraphQL, environment, database, feature-flag, and external-host
 entity implementation is recorded in
 [`results/general-entities-2026-08-10.md`](results/general-entities-2026-08-10.md).
+The deterministic repository overview, entity lookup, bounded paths, and the
+known-workflow regression rerun are recorded in
+[`results/agent-surfaces-2026-08-10.md`](results/agent-surfaces-2026-08-10.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
