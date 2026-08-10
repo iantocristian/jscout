@@ -5,7 +5,7 @@ use ignore::WalkBuilder;
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
 
 /// Directories that are almost never worth indexing even when not gitignored.
-const SKIP_DIRS: &[&str] = &["node_modules", "dist", "build", ".next", "coverage", "out"];
+pub const SKIP_DIRS: &[&str] = &["node_modules", "dist", "build", ".next", "coverage", "out"];
 
 pub fn is_indexable(path: &Path) -> bool {
     // .d.ts files are pure type declarations — nothing at runtime, skip entirely.

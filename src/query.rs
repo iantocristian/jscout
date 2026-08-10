@@ -11,10 +11,12 @@ struct ExportEntry {
     from_name: Option<String>,
 }
 
-/// In-memory view of the module graph for export-chain resolution.
+/// In-memory view of the module graph for export-chain resolution. Each edge
+/// remembers whether its resolution was heuristic (workspace-inferred) so
+/// consumers can downgrade confidence for paths that cross such edges.
 pub struct ModuleGraph {
     exports: HashMap<i64, Vec<ExportEntry>>,
-    edges: HashMap<(i64, String), Option<i64>>,
+    edges: HashMap<(i64, String), (Option<i64>, bool)>,
     pub paths: HashMap<i64, String>,
 }
 
@@ -39,10 +41,17 @@ impl ModuleGraph {
             exports.entry(id).or_default().push(e);
         }
 
-        let mut edges: HashMap<(i64, String), Option<i64>> = HashMap::new();
-        let mut stmt = conn.prepare("SELECT from_file, request, to_file FROM module_edges")?;
+        let mut edges: HashMap<(i64, String), (Option<i64>, bool)> = HashMap::new();
+        let mut stmt =
+            conn.prepare("SELECT from_file, request, to_file, resolution FROM module_edges")?;
         let rows = stmt.query_map([], |r| {
-            Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), r.get::<_, Option<i64>>(2)?))
+            Ok((
+                (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
+                (
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?.as_deref() == Some("workspace-inferred"),
+                ),
+            ))
         })?;
         for row in rows {
             let (k, v) = row?;
@@ -60,13 +69,30 @@ impl ModuleGraph {
     }
 
     pub fn edge(&self, file: i64, request: &str) -> Option<i64> {
-        self.edges.get(&(file, request.to_string())).copied().flatten()
+        self.edges.get(&(file, request.to_string())).and_then(|(target, _)| *target)
+    }
+
+    /// Whether the module edge for (file, request) was resolved through a
+    /// heuristic workspace mapping rather than direct resolution.
+    pub fn edge_inferred(&self, file: i64, request: &str) -> bool {
+        self.edges
+            .get(&(file, request.to_string()))
+            .is_some_and(|(_, inferred)| *inferred)
     }
 
     /// Follow export chains (aliases, re-exports, barrels, stars) from
     /// (file, export_name) to the defining (file, local_name).
     pub fn resolve_export(&self, file: i64, name: &str) -> Option<(i64, String)> {
-        self.resolve_export_inner(file, name, &mut HashSet::new())
+        self.resolve_export_traced(file, name).map(|(f, n, _)| (f, n))
+    }
+
+    /// Like [`Self::resolve_export`], additionally reporting whether any hop
+    /// on the successful chain crossed a heuristically resolved module edge.
+    pub fn resolve_export_traced(&self, file: i64, name: &str) -> Option<(i64, String, bool)> {
+        let mut inferred = false;
+        let (file, name) =
+            self.resolve_export_inner(file, name, &mut HashSet::new(), &mut inferred)?;
+        Some((file, name, inferred))
     }
 
     fn resolve_export_inner(
@@ -74,6 +100,7 @@ impl ModuleGraph {
         file: i64,
         name: &str,
         visited: &mut HashSet<(i64, String)>,
+        inferred: &mut bool,
     ) -> Option<(i64, String)> {
         if !visited.insert((file, name.to_string())) {
             return None; // cycle
@@ -89,23 +116,33 @@ impl ModuleGraph {
                 (None, None, _) => return Some((file, "default".to_string())),
                 (None, Some(req), Some(from)) => {
                     let target = self.edge(file, req)?;
+                    if self.edge_inferred(file, req) {
+                        *inferred = true;
+                    }
                     if from == "*" {
                         // `export * as ns from` — the namespace itself.
                         return Some((target, "*".to_string()));
                     }
-                    return self.resolve_export_inner(target, from, visited);
+                    return self.resolve_export_inner(target, from, visited, inferred);
                 }
                 _ => return None,
             }
         }
-        // Star re-exports: try each source module.
+        // Star re-exports: try each source module. A failing branch must not
+        // taint the flag, so restore it before moving to the next source.
         for e in entries {
             if e.export_name == "*"
                 && let Some(request) = e.from_request.as_deref()
                 && let Some(target) = self.edge(file, request)
-                && let Some(hit) = self.resolve_export_inner(target, name, visited)
             {
-                return Some(hit);
+                let before = *inferred;
+                if self.edge_inferred(file, request) {
+                    *inferred = true;
+                }
+                if let Some(hit) = self.resolve_export_inner(target, name, visited, inferred) {
+                    return Some(hit);
+                }
+                *inferred = before;
             }
         }
         None

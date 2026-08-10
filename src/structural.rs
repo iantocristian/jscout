@@ -371,7 +371,7 @@ fn project_module_edges(
 ) -> Result<()> {
     let mut packages = HashSet::new();
     let mut stmt = conn.prepare(
-        "SELECT from_file, request, to_file, package FROM module_edges
+        "SELECT from_file, request, to_file, package, resolution FROM module_edges
          ORDER BY from_file, request",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -380,10 +380,11 @@ fn project_module_edges(
             r.get::<_, String>(1)?,
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     for row in rows {
-        let (from_id, request, to_id, package) = row?;
+        let (from_id, request, to_id, package, resolution) = row?;
         let Some(from_path) = files.get(&from_id) else {
             continue;
         };
@@ -409,12 +410,20 @@ fn project_module_edges(
         } else {
             continue;
         };
+        // Heuristic workspace mappings (mirrored dist layouts, source-name
+        // search) are honest leads, not proven links — never project them as
+        // certain.
+        let (confidence, provenance) = match resolution.as_deref() {
+            Some("workspace-inferred") => ("likely", "workspace-inferred"),
+            Some("workspace") => ("certain", "workspace"),
+            _ => ("certain", "resolver"),
+        };
         insert_edge.execute(params![
             file_key(from_path),
             destination,
             "import",
-            "certain",
-            "resolver",
+            confidence,
+            provenance,
             from_id,
             Option::<i64>::None,
             Option::<i64>::None,
@@ -482,18 +491,29 @@ fn project_references(
             .map(|s| s.key.clone())
             .unwrap_or_else(|| file_key(path));
 
+        // References that reach their target across a heuristically resolved
+        // module edge (workspace-inferred) must not project as certain.
+        let mut via_inferred = false;
         let targets = if local {
             projected_symbols(root_symbol.get(&(file_id, name.clone())))
         } else if let Some(request) = request.as_deref() {
             match graph.edge(file_id, request) {
-                Some(target_file) if name == "*" => graph
-                    .paths
-                    .get(&target_file)
-                    .map(|path| ProjectedTargets::exact(file_key(path)))
-                    .unwrap_or_default(),
+                Some(target_file) if name == "*" => {
+                    via_inferred = graph.edge_inferred(file_id, request);
+                    graph
+                        .paths
+                        .get(&target_file)
+                        .map(|path| ProjectedTargets::exact(file_key(path)))
+                        .unwrap_or_default()
+                }
                 Some(target_file) => {
+                    via_inferred = graph.edge_inferred(file_id, request);
                     let resolved = graph
-                        .resolve_export(target_file, &name)
+                        .resolve_export_traced(target_file, &name)
+                        .map(|(resolved_file, resolved_name, chain_inferred)| {
+                            via_inferred |= chain_inferred;
+                            (resolved_file, resolved_name)
+                        })
                         .or_else(|| Some((target_file, name.clone())));
                     resolved.map_or_else(ProjectedTargets::default, |(resolved_file, resolved_name)| {
                         if resolved_name == "*" {
@@ -520,11 +540,15 @@ fn project_references(
         }
         let projected_confidence = if targets.ambiguous {
             "possible"
+        } else if via_inferred && confidence == "certain" {
+            "likely"
         } else {
             confidence.as_str()
         };
         let provenance = if targets.ambiguous {
             "semantic+resolver-candidate"
+        } else if via_inferred {
+            "semantic+resolver-inferred"
         } else {
             "semantic+resolver"
         };

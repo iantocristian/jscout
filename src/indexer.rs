@@ -23,8 +23,16 @@ struct FileData {
     lines: LineIndex,
 }
 
-pub fn make_resolver() -> Resolver {
-    Resolver::new(ResolveOptions {
+/// Export conditions the resolver enables. The workspace layer mirrors these
+/// when it translates package.json `exports` targets, so alias-mapped entries
+/// agree with what the resolver itself would pick.
+pub(crate) const RESOLVE_CONDITIONS: &[&str] = &["import", "require", "node", "default"];
+
+fn resolver_options(alias: oxc_resolver::Alias, tsconfig: Option<TsconfigDiscovery>) -> ResolveOptions {
+    ResolveOptions {
+        // Workspace package names -> in-repo source, so monorepo cross-package
+        // imports resolve to indexed files instead of missing/dist targets.
+        alias,
         extensions: vec![
             ".ts".into(),
             ".tsx".into(),
@@ -42,11 +50,11 @@ pub fn make_resolver() -> Resolver {
             (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
             (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
         ],
-        condition_names: vec!["import".into(), "require".into(), "node".into(), "default".into()],
+        condition_names: RESOLVE_CONDITIONS.iter().map(|c| (*c).to_string()).collect(),
         main_fields: vec!["module".into(), "main".into()],
-        tsconfig: Some(TsconfigDiscovery::Auto),
+        tsconfig,
         ..ResolveOptions::default()
-    })
+    }
 }
 
 /// Index (or re-index) a repository. Files whose content hash is unchanged
@@ -298,7 +306,16 @@ fn insert_file(
 
 /// Resolve every (file, request) pair to an in-repo file or external package.
 pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
-    let resolver = make_resolver();
+    let workspace = crate::workspace::WorkspaceMap::build(root);
+    let resolver = Resolver::new(resolver_options(
+        workspace.aliases.clone(),
+        Some(TsconfigDiscovery::Auto),
+    ));
+    // A tsconfig that fails to load fails every resolution under it — e.g.
+    // `extends: "@scope/tsconfig-pkg/..."` in a monorepo without node_modules
+    // installed. Retry such failures without tsconfig discovery so a broken
+    // tsconfig degrades resolution instead of dropping the whole file's edges.
+    let no_tsconfig = Resolver::new(resolver_options(workspace.aliases.clone(), None));
     let file_ids: HashMap<PathBuf, i64> = {
         let mut stmt = conn.prepare("SELECT path, id FROM files")?;
         let rows = stmt.query_map([], |r| Ok((PathBuf::from(r.get::<_, String>(0)?), r.get::<_, i64>(1)?)))?;
@@ -322,26 +339,31 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN")?;
     conn.execute("DELETE FROM module_edges", [])?;
     let mut ins = conn.prepare_cached(
-        "INSERT INTO module_edges(from_file, request, to_file, package) VALUES(?1,?2,?3,?4)",
+        "INSERT INTO module_edges(from_file, request, to_file, package, resolution)
+         VALUES(?1,?2,?3,?4,?5)",
     )?;
-    let mut cache: HashMap<(PathBuf, String), (Option<i64>, Option<String>)> = HashMap::new();
+    type Resolved = (Option<i64>, Option<String>, Option<&'static str>);
+    let mut cache: HashMap<(PathBuf, String), Resolved> = HashMap::new();
     for (file_id, rel_path, request) in pairs {
         let importer = root.join(&rel_path);
         let key = (importer.clone(), request.clone());
-        let (to_file, package) = cache
+        let (to_file, package, resolution) = cache
             .entry(key)
-            .or_insert_with(|| match resolver.resolve_file(&importer, &request) {
+            .or_insert_with(|| match resolver
+                .resolve_file(&importer, &request)
+                .or_else(|_| no_tsconfig.resolve_file(&importer, &request))
+            {
                 Ok(resolution) => {
                     let p = resolution.path().to_path_buf();
                     match file_ids.get(&p) {
-                        Some(id) => (Some(*id), None),
-                        None => (None, Some(package_name(&request))),
+                        Some(id) => (Some(*id), None, Some(workspace.classify(&request))),
+                        None => (None, Some(package_name(&request)), None),
                     }
                 }
-                Err(_) => (None, Some(package_name(&request))),
+                Err(_) => (None, Some(package_name(&request)), None),
             })
             .clone();
-        ins.execute(params![file_id, request, to_file, package])?;
+        ins.execute(params![file_id, request, to_file, package, resolution])?;
     }
     drop(ins);
     conn.execute_batch("COMMIT")?;
@@ -400,6 +422,182 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(resolved, (Some("packages/app/src/helper.ts".into()), None));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_workspace_package_imports_to_internal_files() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")?;
+
+        // Library package: main points at untracked dist output, but the
+        // module field names the source entry directly (manifest truth).
+        let lib = repo.path().join("packages/lib");
+        fs::create_dir_all(lib.join("src/utils"))?;
+        fs::write(
+            lib.join("package.json"),
+            r#"{"name": "@acme/lib", "main": "dist/index.js", "module": "src/index.ts"}"#,
+        )?;
+        fs::write(lib.join("src/index.ts"), "export const greet = () => 'hi';\n")?;
+        fs::write(lib.join("src/utils/format.ts"), "export const fmt = (s: string) => s;\n")?;
+
+        // Subpath-only package (no "." export, no root entry) whose wildcard
+        // export re-roots the tree: src/scrub.ts is a decoy the generic src/
+        // prefix would pick; the exported file is src/inner/scrub.ts.
+        let tools = repo.path().join("packages/tools");
+        fs::create_dir_all(tools.join("src/inner"))?;
+        fs::write(
+            tools.join("package.json"),
+            r#"{"name": "@acme/tools", "exports": {"./*": "./dist/inner/*.js"}}"#,
+        )?;
+        fs::write(tools.join("src/scrub.ts"), "export const decoy = 1;\n")?;
+        fs::write(tools.join("src/inner/scrub.ts"), "export const scrub = (s: string) => s;\n")?;
+
+        let app = repo.path().join("packages/app");
+        fs::create_dir_all(app.join("src"))?;
+        fs::write(app.join("package.json"), r#"{"name": "@acme/app"}"#)?;
+        fs::write(
+            app.join("src/main.ts"),
+            "import { greet } from '@acme/lib';\n\
+             import { fmt } from '@acme/lib/utils/format';\n\
+             import { fmt as distFmt } from '@acme/lib/dist/utils/format';\n\
+             import { scrub } from '@acme/tools/scrub';\n\
+             import { readFile } from 'node:fs';\n\
+             import lodash from 'lodash';\n\
+             export const main = () => scrub(fmt(greet())) + distFmt('');\n",
+        )?;
+
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        type Edge = (Option<String>, Option<String>, Option<String>);
+        let edge = |request: &str| -> Result<Edge> {
+            Ok(conn.query_row(
+                "SELECT target.path, edge.package, edge.resolution
+                 FROM module_edges edge
+                 JOIN files source ON source.id=edge.from_file
+                 LEFT JOIN files target ON target.id=edge.to_file
+                 WHERE source.path='packages/app/src/main.ts' AND edge.request=?1",
+                [request],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        };
+        // Bare package import -> the manifest-named source entry: certain.
+        assert_eq!(
+            edge("@acme/lib")?,
+            (Some("packages/lib/src/index.ts".into()), None, Some("workspace".into()))
+        );
+        // Subpath through the src/ layout heuristic: internal but inferred.
+        assert_eq!(
+            edge("@acme/lib/utils/format")?,
+            (
+                Some("packages/lib/src/utils/format.ts".into()),
+                None,
+                Some("workspace-inferred".into())
+            )
+        );
+        // Wildcard export translation beats the generic src/ prefix (which
+        // would have picked the decoy src/scrub.ts).
+        assert_eq!(
+            edge("@acme/tools/scrub")?,
+            (
+                Some("packages/tools/src/inner/scrub.ts".into()),
+                None,
+                Some("workspace-inferred".into())
+            )
+        );
+        // Imports naming build output land on the mirrored source tree.
+        assert_eq!(
+            edge("@acme/lib/dist/utils/format")?,
+            (
+                Some("packages/lib/src/utils/format.ts".into()),
+                None,
+                Some("workspace-inferred".into())
+            )
+        );
+        // Non-workspace imports keep their external package classification.
+        assert_eq!(edge("lodash")?, (None, Some("lodash".into()), None));
+        assert_eq!(edge("node:fs")?, (None, Some("node:fs".into()), None));
+
+        // The structural projection downgrades heuristic mappings: the
+        // manifest-backed import stays certain, inferred ones cap at likely —
+        // including references that cross an inferred edge.
+        let projected = |detail: &str| -> Result<(String, String)> {
+            Ok(conn.query_row(
+                "SELECT confidence, provenance FROM resolved_edges
+                 WHERE kind='import' AND detail_json=?1",
+                [detail],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        };
+        assert_eq!(
+            projected(r#"{"request":"@acme/lib"}"#)?,
+            ("certain".into(), "workspace".into())
+        );
+        assert_eq!(
+            projected(r#"{"request":"@acme/lib/utils/format"}"#)?,
+            ("likely".into(), "workspace-inferred".into())
+        );
+        let fmt_call: (String, String) = conn.query_row(
+            "SELECT confidence, provenance FROM resolved_edges
+             WHERE kind='call' AND detail_json LIKE '%\"targetName\":\"fmt\"%'
+               AND provenance LIKE 'semantic+%' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(fmt_call, ("likely".into(), "semantic+resolver-inferred".into()));
+        let greet_call: (String, String) = conn.query_row(
+            "SELECT confidence, provenance FROM resolved_edges
+             WHERE kind='call' AND detail_json LIKE '%\"targetName\":\"greet\"%'
+               AND provenance LIKE 'semantic+%' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(greet_call, ("certain".into(), "semantic+resolver".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn unloadable_tsconfig_degrades_to_plain_resolution() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")?;
+
+        let lib = repo.path().join("packages/lib");
+        fs::create_dir_all(lib.join("src"))?;
+        fs::write(lib.join("package.json"), r#"{"name": "@acme/lib"}"#)?;
+        fs::write(lib.join("src/index.ts"), "export const lib = 1;\n")?;
+
+        // The n8n shape: tsconfig extends a workspace package by bare name,
+        // which cannot resolve without node_modules installed.
+        let app = repo.path().join("packages/app");
+        fs::create_dir_all(app.join("src"))?;
+        fs::write(app.join("package.json"), r#"{"name": "@acme/app"}"#)?;
+        fs::write(
+            app.join("tsconfig.json"),
+            r#"{"extends": "@acme/tsconfig/base.json", "include": ["src"]}"#,
+        )?;
+        fs::write(app.join("src/helper.ts"), "export const helper = () => 1;\n")?;
+        fs::write(
+            app.join("src/main.ts"),
+            "import { helper } from './helper';\n\
+             import { lib } from '@acme/lib';\n\
+             export const main = () => helper() + lib;\n",
+        )?;
+
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let edge = |request: &str| -> Result<(Option<String>, Option<String>)> {
+            Ok(conn.query_row(
+                "SELECT target.path, edge.package
+                 FROM module_edges edge
+                 JOIN files source ON source.id=edge.from_file
+                 LEFT JOIN files target ON target.id=edge.to_file
+                 WHERE source.path='packages/app/src/main.ts' AND edge.request=?1",
+                [request],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        };
+        assert_eq!(edge("./helper")?, (Some("packages/app/src/helper.ts".into()), None));
+        assert_eq!(edge("@acme/lib")?, (Some("packages/lib/src/index.ts".into()), None));
         Ok(())
     }
 }
