@@ -1,0 +1,17 @@
+{
+  "name": "@jscout/pi-ai-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "jscout model sidecar: versioned JSONL-over-stdio adapter for @earendil-works/pi-ai",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "src/main.mjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.1"
+  }
+}

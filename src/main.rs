@@ -7,12 +7,14 @@ mod file_role;
 mod graph;
 mod heur;
 mod indexer;
+mod llm;
 mod mcp;
 mod origin;
 mod package_exports;
 mod parse;
 mod query;
 mod scout;
+mod scouting;
 mod search;
 mod semantic;
 mod stats;
@@ -265,6 +267,74 @@ enum Command {
         #[arg(long)]
         install: Option<PathBuf>,
     },
+    /// Model-gateway operations (generative calls run in a Node sidecar)
+    Llm {
+        #[command(subcommand)]
+        command: LlmCommand,
+    },
+    /// Generative scouting over deterministic candidates (pi-ai gateway)
+    Scout {
+        #[command(subcommand)]
+        command: ScoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScoutCommand {
+    /// Candidate-closed workflow classification for explicit seed anchors
+    Workflows {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Seed symbol anchors or uniquely resolvable symbol names (repeatable)
+        #[arg(long = "seed", required = true)]
+        seeds: Vec<String>,
+        /// Exact pi-ai model as provider:model; falls back to JSCOUT_LLM_MODEL
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level request budget
+        #[arg(long, default_value_t = 1)]
+        max_calls: usize,
+        /// Maximum serialized evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Deterministic candidate traversal depth
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// Maximum deterministic candidates
+        #[arg(long, default_value_t = semantic::MAX_WORKFLOW_CANDIDATES)]
+        candidate_limit: usize,
+        /// Supersede a completed identical run instead of reusing it
+        #[arg(long)]
+        rebuild: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LlmCommand {
+    /// Diagnose node, gateway, provider, and model availability
+    Doctor {
+        /// Exact pi-ai model as provider:model (e.g. openai-codex:gpt-5.6-terra)
+        #[arg(long)]
+        model: Option<String>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -436,6 +506,43 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Llm { command } => match command {
+            LlmCommand::Doctor {
+                model,
+                gateway_path,
+            } => llm::doctor(model.as_deref(), gateway_path.as_deref()),
+        },
+        Command::Scout { command } => match command {
+            ScoutCommand::Workflows {
+                root,
+                seeds,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                max_calls,
+                context_bytes,
+                depth,
+                candidate_limit,
+                rebuild,
+                database,
+                gateway_path,
+            } => cmd_scout_workflows(
+                &root,
+                database.as_deref(),
+                gateway_path.as_deref(),
+                scouting::WorkflowScoutOptions {
+                    seeds,
+                    depth,
+                    candidate_limit,
+                    model: llm::config::resolve_model(model.as_deref())?,
+                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                    service_tier,
+                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                    rebuild,
+                },
+            ),
+        },
     }
 }
 
@@ -755,6 +862,43 @@ fn cmd_stats(root: &Path) -> Result<()> {
             f.display(),
             e.lines().next().unwrap_or("")
         );
+    }
+    Ok(())
+}
+
+fn cmd_scout_workflows(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    options: scouting::WorkflowScoutOptions,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let report = scouting::scout_workflows(root, &conn, &mut gateway, &options)?;
+    println!(
+        "run {}: {} ({} candidates, billing path {})",
+        report.run_id, report.status, report.candidate_count, report.billing_path
+    );
+    if let Some(started) = &report.started {
+        println!(
+            "  model: {}:{} via {} (auth {})",
+            started.provider, started.model, started.api, started.auth_source
+        );
+    }
+    for (decision, count) in &report.decisions {
+        println!("  {decision}: {count}");
+    }
+    if let Some(usage) = &report.usage {
+        println!(
+            "  usage: {} in / {} out / {} total tokens",
+            usage.input_tokens, usage.output_tokens, usage.total_tokens
+        );
+    }
+    if let Some(reason) = &report.incomplete_reason {
+        println!("  incomplete: {reason}");
+    }
+    if let Some(artifact) = report.artifact_id {
+        println!("  artifact: {artifact}");
     }
     Ok(())
 }

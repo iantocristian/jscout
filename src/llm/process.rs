@@ -1,0 +1,588 @@
+//! Child-process gateway client: spawn `node <gateway-path>` with argument
+//! arrays, speak versioned JSONL over its stdio, and fail the current request
+//! on EOF, malformed frames, timeouts, or an unexpected exit. The child never
+//! outlives the client: drop sends `shutdown`, then kills after a grace
+//! period.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::time::Instant;
+
+use super::config;
+use super::protocol::{
+    CompleteRequest, GatewayVersions, Inbound, ModelCapabilities, Outbound, PROTOCOL_VERSION,
+    ProviderSummary, encode,
+};
+use super::{CompletionOutcome, GatewayError, LlmGateway, StartedInfo};
+
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+pub struct ProcessGateway {
+    child: Child,
+    writer: Arc<GatewayWriter>,
+    inbound: Receiver<Result<Inbound, GatewayError>>,
+    active_request: Arc<Mutex<Option<String>>>,
+    pub versions: GatewayVersions,
+    poisoned: bool,
+}
+
+struct GatewayWriter {
+    stdin: Mutex<ChildStdin>,
+    next_id: AtomicU64,
+}
+
+/// Independent write-side handle. It can be moved to a signal/control thread
+/// while the main client is blocked waiting for a completion response.
+#[derive(Clone)]
+#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+pub struct GatewayControl {
+    writer: Arc<GatewayWriter>,
+    active_request: Arc<Mutex<Option<String>>>,
+}
+
+#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+impl GatewayControl {
+    /// Send cancellation for the current completion, if one is active.
+    pub fn cancel_active(&self) -> Result<bool, GatewayError> {
+        let target_id = self
+            .active_request
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))?
+            .clone();
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+        self.writer.send(&Outbound::Cancel { target_id })?;
+        Ok(true)
+    }
+}
+
+impl GatewayWriter {
+    fn send(&self, message: &Outbound) -> Result<String, GatewayError> {
+        let sequence = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("r{sequence}");
+        let line = encode(&id, message)
+            .map_err(|error| GatewayError::Protocol(format!("encode failure: {error}")))?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway stdin lock poisoned".into()))?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+            .map_err(|error| GatewayError::ChildExited(format!("gateway stdin closed: {error}")))?;
+        Ok(id)
+    }
+}
+
+struct ActiveRequestGuard {
+    active_request: Arc<Mutex<Option<String>>>,
+}
+
+impl ActiveRequestGuard {
+    fn set(active_request: Arc<Mutex<Option<String>>>, id: String) -> Result<Self, GatewayError> {
+        *active_request
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))? =
+            Some(id);
+        Ok(Self { active_request })
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_request.lock() {
+            *active = None;
+        }
+    }
+}
+
+impl ProcessGateway {
+    /// Spawn and complete the `hello`/`ready` handshake.
+    pub fn spawn(node: &Path, gateway: &Path) -> Result<Self, GatewayError> {
+        let mut child = Command::new(node)
+            .arg(gateway)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                GatewayError::Spawn(format!(
+                    "failed to launch `{} {}`: {error}",
+                    node.display(),
+                    gateway.display()
+                ))
+            })?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let (sender, inbound) = channel();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let message = match line {
+                    Ok(text) if text.trim().is_empty() => continue,
+                    Ok(text) => serde_json::from_str::<Inbound>(&text).map_err(|error| {
+                        GatewayError::Protocol(format!("malformed gateway message: {error}"))
+                    }),
+                    Err(error) => Err(GatewayError::Io(format!("gateway stdout: {error}"))),
+                };
+                let failed = message.is_err();
+                if sender.send(message).is_err() || failed {
+                    return;
+                }
+            }
+            // EOF: the receiver observes the disconnect as ChildExited.
+        });
+        std::thread::spawn(move || {
+            // Sanitized diagnostics only; forwarded line-by-line for doctor
+            // output and operator logs.
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("pi-ai-gateway: {line}");
+            }
+        });
+
+        let mut gateway_client = Self {
+            child,
+            writer: Arc::new(GatewayWriter {
+                stdin: Mutex::new(stdin),
+                next_id: AtomicU64::new(0),
+            }),
+            inbound,
+            active_request: Arc::new(Mutex::new(None)),
+            versions: GatewayVersions {
+                gateway: String::new(),
+                pi_ai: String::new(),
+                node: String::new(),
+                protocol: 0,
+            },
+            poisoned: false,
+        };
+        let id = gateway_client.send(&Outbound::Hello)?;
+        match gateway_client.receive_for(&id, HELLO_TIMEOUT)? {
+            Inbound::Ready { versions, .. } => {
+                if versions.protocol != PROTOCOL_VERSION {
+                    return Err(GatewayError::Protocol(format!(
+                        "gateway speaks protocol {}, this jscout requires {PROTOCOL_VERSION}",
+                        versions.protocol
+                    )));
+                }
+                gateway_client.versions = versions;
+                Ok(gateway_client)
+            }
+            Inbound::Error { error, .. } => Err(GatewayError::from_remote(error)),
+            other => Err(unexpected("ready", &other)),
+        }
+    }
+
+    /// Convenience: resolve node + gateway from config and spawn.
+    pub fn launch(gateway_path: Option<&Path>) -> anyhow::Result<Self> {
+        let node = config::resolve_node()?;
+        let gateway = config::resolve_gateway(gateway_path)?;
+        Ok(Self::spawn(&node, &gateway)?)
+    }
+
+    fn send(&mut self, message: &Outbound) -> Result<String, GatewayError> {
+        self.writer
+            .send(message)
+            .inspect_err(|_| self.poisoned = true)
+    }
+
+    /// Receive the next message for `id` within `timeout`. Messages for other
+    /// ids indicate a protocol bug under the one-at-a-time contract and fail
+    /// the request instead of being silently dropped.
+    fn receive_for(&mut self, id: &str, timeout: Duration) -> Result<Inbound, GatewayError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.poisoned = true;
+                return Err(GatewayError::Timeout(timeout));
+            }
+            match self.inbound.recv_timeout(remaining) {
+                Ok(Ok(message)) if message.id() == id => return Ok(message),
+                // Control handles do not wait on acknowledgements; consume
+                // them here while preserving the completion's total timeout.
+                Ok(Ok(Inbound::CancelResult { .. })) => continue,
+                Ok(Ok(message)) => {
+                    self.poisoned = true;
+                    return Err(GatewayError::Protocol(format!(
+                        "message for unexpected request id {}",
+                        message.id()
+                    )));
+                }
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.poisoned = true;
+                    return Err(GatewayError::Timeout(timeout));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.poisoned = true;
+                    return Err(self.exit_error());
+                }
+            }
+        }
+    }
+
+    fn exit_error(&mut self) -> GatewayError {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited with {status}"),
+            Ok(None) => "closed its stdout while still running".to_string(),
+            Err(error) => format!("could not be inspected: {error}"),
+        };
+        GatewayError::ChildExited(format!("gateway {status}"))
+    }
+
+    /// A poisoned client saw a framing/timeout failure and can no longer
+    /// trust request correlation; callers must discard it.
+    #[allow(dead_code)] // consumed by the sidecar restart policy (follow-up layer)
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    #[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+    pub fn control(&self) -> GatewayControl {
+        GatewayControl {
+            writer: Arc::clone(&self.writer),
+            active_request: Arc::clone(&self.active_request),
+        }
+    }
+}
+
+impl LlmGateway for ProcessGateway {
+    fn capabilities(
+        &mut self,
+        model: Option<&str>,
+    ) -> Result<(ProviderSummary, Option<ModelCapabilities>), GatewayError> {
+        let id = self.send(&Outbound::Capabilities {
+            model: model.map(str::to_string),
+        })?;
+        match self.receive_for(&id, HELLO_TIMEOUT)? {
+            Inbound::CapabilitiesResult {
+                providers, model, ..
+            } => Ok((providers, model)),
+            Inbound::Error { error, .. } => Err(GatewayError::from_remote(error)),
+            other => Err(unexpected("capabilities_result", &other)),
+        }
+    }
+
+    fn complete(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        // The gateway enforces the request timeout; the client allows a grace
+        // margin so the remote timeout error arrives instead of a local one.
+        self.complete_with_grace(request, timeout, Duration::from_secs(5))
+    }
+}
+
+impl ProcessGateway {
+    fn complete_with_grace(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+        grace: Duration,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        let id = self.send(&Outbound::Complete(Box::new(request.clone())))?;
+        let _active = ActiveRequestGuard::set(Arc::clone(&self.active_request), id.clone())?;
+        let wire_timeout = timeout + grace;
+        let started = match self.receive_for(&id, wire_timeout)? {
+            Inbound::Started {
+                provider,
+                model,
+                api,
+                billing_path,
+                auth_source,
+                ..
+            } => StartedInfo {
+                provider,
+                model,
+                api,
+                billing_path,
+                auth_source,
+            },
+            Inbound::Error { error, .. } => return Err(GatewayError::from_remote(error)),
+            Inbound::Canceled { reason, .. } => {
+                return Err(GatewayError::Canceled(reason.unwrap_or_default()));
+            }
+            other => return Err(unexpected("started", &other)),
+        };
+        match self.receive_for(&id, wire_timeout)? {
+            Inbound::Result {
+                tool_call,
+                stop_reason,
+                usage,
+                response_model,
+                ..
+            } => Ok(CompletionOutcome {
+                started,
+                tool_call,
+                stop_reason,
+                usage,
+                response_model,
+            }),
+            Inbound::Error { error, .. } => Err(GatewayError::from_remote(error)),
+            Inbound::Canceled { reason, .. } => {
+                Err(GatewayError::Canceled(reason.unwrap_or_default()))
+            }
+            other => Err(unexpected("result", &other)),
+        }
+    }
+}
+
+impl Drop for ProcessGateway {
+    fn drop(&mut self) {
+        if !self.poisoned {
+            let _ = self.send(&Outbound::Shutdown);
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while Instant::now() < deadline {
+                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn unexpected(expected: &str, actual: &Inbound) -> GatewayError {
+    GatewayError::Protocol(format!(
+        "expected {expected}, received {} for request {}",
+        kind_name(actual),
+        actual.id()
+    ))
+}
+
+fn kind_name(message: &Inbound) -> &'static str {
+    match message {
+        Inbound::Ready { .. } => "ready",
+        Inbound::CapabilitiesResult { .. } => "capabilities_result",
+        Inbound::Started { .. } => "started",
+        Inbound::Result { .. } => "result",
+        Inbound::Error { .. } => "error",
+        Inbound::Canceled { .. } => "canceled",
+        Inbound::CancelResult { .. } => "cancel_result",
+        Inbound::ShutdownResult { .. } => "shutdown_result",
+    }
+}
+
+#[cfg(test)]
+pub use fake::write_fake_gateway;
+
+#[cfg(test)]
+mod fake {
+    use std::path::{Path, PathBuf};
+
+    /// Write an executable fake gateway (a /bin/sh script) that answers the
+    /// protocol from canned case patterns. Tests inject it as the "node"
+    /// binary with the script as the gateway path, so the process client is
+    /// exercised without Node or network access.
+    pub fn write_fake_gateway(dir: &Path, body: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-gateway.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}"))?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        Ok((PathBuf::from("/bin/sh"), script))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::super::protocol::{ChatMessage, CompleteRequest, SubmitTool};
+    use super::super::{GatewayError, LlmGateway};
+    use super::{ProcessGateway, write_fake_gateway};
+
+    const READY: &str = r#"{"protocol":1,"id":"r1","kind":"ready","versions":{"gateway":"0.0.0","pi_ai":"0.0.0","node":"22.19.0","protocol":1}}"#;
+
+    fn complete_request() -> CompleteRequest {
+        CompleteRequest {
+            model: "faux:faux-model".into(),
+            reasoning: None,
+            system: Some("system".into()),
+            messages: vec![ChatMessage {
+                role: "user",
+                content: "hello".into(),
+            }],
+            tool: SubmitTool {
+                name: "submit".into(),
+                description: "submit".into(),
+                parameters: json!({"type": "object"}),
+            },
+            timeout_ms: Some(5_000),
+            max_tokens: None,
+            session_id: None,
+            provider_options: None,
+        }
+    }
+
+    fn spawn_with(body: &str) -> anyhow::Result<ProcessGateway> {
+        let dir = tempfile::tempdir()?;
+        let (node, script) = write_fake_gateway(dir.path(), body)?;
+        let gateway = ProcessGateway::spawn(&node, &script)?;
+        // The tempdir may be deleted once the script is running.
+        drop(dir);
+        Ok(gateway)
+    }
+
+    #[test]
+    fn completes_through_a_fake_gateway_and_shuts_down() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      echo '{{"protocol":1,"id":"r2","kind":"result","tool_call":{{"name":"submit","arguments":{{"ok":true}}}},"stop_reason":"toolUse","usage":{{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":3,"cost_total":0}},"response_model":"faux-model"}}'
+      ;;
+    *'"kind":"shutdown"'*) echo '{{"protocol":1,"id":"r3","kind":"shutdown_result"}}'; exit 0 ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        assert_eq!(gateway.versions.node, "22.19.0");
+        let outcome = gateway.complete(&complete_request(), Duration::from_secs(5))?;
+        assert_eq!(outcome.started.billing_path, "api");
+        assert_eq!(outcome.tool_call.name, "submit");
+        assert_eq!(outcome.tool_call.arguments, json!({"ok": true}));
+        assert_eq!(outcome.usage.total_tokens, 3);
+        drop(gateway); // shutdown path must not hang
+        Ok(())
+    }
+
+    #[test]
+    fn remote_errors_carry_code_and_retryability() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"error","error":{{"code":"capacity","message":"rate limited","retryable":true,"capacity":true}}}}'
+      ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("remote error");
+        let GatewayError::Remote(remote) = error else {
+            panic!("expected remote error, got {error:?}");
+        };
+        assert_eq!(remote.code, "capacity");
+        assert!(remote.retryable && remote.capacity);
+        Ok(())
+    }
+
+    #[test]
+    fn control_handle_cancels_while_completion_waits() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      ;;
+    *'"kind":"cancel"'*)
+      echo '{{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}}'
+      echo '{{"protocol":1,"id":"r2","kind":"canceled","reason":"canceled"}}'
+      ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let control = gateway.control();
+        let canceler = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            control.cancel_active()
+        });
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("completion should be canceled");
+        assert!(matches!(error, GatewayError::Canceled(_)), "got {error:?}");
+        assert!(canceler.join().expect("cancel thread")?);
+        assert!(!gateway.poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn child_death_mid_request_fails_the_request() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*) exit 7 ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("child exit");
+        assert!(
+            matches!(error, GatewayError::ChildExited(_)),
+            "got {error:?}"
+        );
+        assert!(gateway.poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_frames_and_stalls_fail_closed() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*) echo 'not json at all' ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("malformed frame");
+        assert!(matches!(error, GatewayError::Protocol(_)), "got {error:?}");
+        assert!(gateway.poisoned());
+
+        // A gateway that accepts the request but never answers trips the
+        // client-side timeout and poisons the connection.
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*) sleep 60 ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let error = gateway
+            .complete_with_grace(
+                &complete_request(),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            )
+            .expect_err("stall");
+        assert!(matches!(error, GatewayError::Timeout(_)), "got {error:?}");
+        assert!(gateway.poisoned());
+        Ok(())
+    }
+}

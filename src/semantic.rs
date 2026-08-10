@@ -9,7 +9,9 @@ use serde_json::Value;
 use crate::structural;
 
 const MAX_BODY_BYTES: usize = 12_000;
-const MAX_SUPPORTS: usize = 32;
+// Generated workflows may carry four evidence spans for each of 31
+// candidates, plus workflow-level name/description supports.
+const MAX_SUPPORTS: usize = 160;
 pub const MAX_WORKFLOW_CANDIDATES: usize = 31;
 const WORKFLOW_TRAVERSAL_NODE_LIMIT: usize = 100;
 const WORKFLOW_TRAVERSAL_EDGE_LIMIT: usize = 400;
@@ -153,16 +155,16 @@ pub struct WorkflowCandidateSet {
     pub candidates: Vec<WorkflowCandidate>,
 }
 
-struct ValidatedSupport {
-    claim_path: String,
-    anchor: String,
-    role: Option<String>,
-    evidence_file: String,
-    evidence_start_line: i64,
-    evidence_end_line: i64,
-    source_hash: String,
-    context_hash: String,
-    confidence: String,
+pub(crate) struct ValidatedSupport {
+    pub(crate) claim_path: String,
+    pub(crate) anchor: String,
+    pub(crate) role: Option<String>,
+    pub(crate) evidence_file: String,
+    pub(crate) evidence_start_line: i64,
+    pub(crate) evidence_end_line: i64,
+    pub(crate) source_hash: String,
+    pub(crate) context_hash: String,
+    pub(crate) confidence: String,
 }
 
 pub fn workflow_candidates(
@@ -331,7 +333,7 @@ pub fn annotate_request(
             confidence,
             snapshot,
             supersedes,
-        } => workflow_request(name, participants, confidence, snapshot, supersedes)?,
+        } => workflow_request(name, None, participants, confidence, snapshot, supersedes)?,
         AnnotateRequest::Annotation {
             name,
             body,
@@ -352,8 +354,9 @@ pub fn annotate_request(
     annotate(root, conn, &input)
 }
 
-fn workflow_request(
+pub(crate) fn workflow_request(
     name: String,
+    description: Option<String>,
     participants: Vec<WorkflowParticipantInput>,
     confidence: String,
     snapshot: String,
@@ -382,15 +385,22 @@ fn workflow_request(
         evidence_end_line: participant.evidence_end_line,
         confidence: participant.confidence.clone(),
     };
-    let mut supports = Vec::with_capacity(participants.len() + 1);
+    let mut supports = Vec::with_capacity(participants.len() + 2);
     supports.push(support("/name".into(), name_evidence));
+    let body = match &description {
+        Some(text) => {
+            supports.push(support("/description".into(), name_evidence));
+            serde_json::json!({ "description": text, "participants": participant_body })
+        }
+        None => serde_json::json!({ "participants": participant_body }),
+    };
     for (index, participant) in participants.iter().enumerate() {
         supports.push(support(format!("/participants/{index}/role"), participant));
     }
     Ok(AnnotateInput {
         artifact_type: "workflow".into(),
         name: Some(name),
-        body: serde_json::json!({ "participants": participant_body }),
+        body,
         supports,
         confidence,
         snapshot,
@@ -399,6 +409,50 @@ fn workflow_request(
 }
 
 pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result<SemanticArtifact> {
+    let (snapshot, supports) = validate_annotate_input(root, conn, input)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let inserted = persist_validated_artifact(
+        conn,
+        input,
+        &snapshot,
+        &supports,
+        &ArtifactProvenance {
+            model: "agent-reported",
+            prompt_version: "annotate/v2",
+            scout_run_id: None,
+            input_fingerprint: None,
+        },
+    );
+    let artifact_id = match inserted {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            id
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    };
+    load_artifact(conn, artifact_id)?.context("inserted semantic artifact is missing")
+}
+
+/// Generated-artifact provenance. Agent annotations carry no run identity;
+/// scouted artifacts must supply both run id and input fingerprint.
+pub(crate) struct ArtifactProvenance<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) prompt_version: &'a str,
+    pub(crate) scout_run_id: Option<i64>,
+    pub(crate) input_fingerprint: Option<&'a str>,
+}
+
+/// Shared validation for every artifact write path: body/support shape,
+/// snapshot currency, supersession rules, exact current anchors, on-disk
+/// file-hash currency, and span bounds.
+pub(crate) fn validate_annotate_input(
+    root: &Path,
+    conn: &Connection,
+    input: &AnnotateInput,
+) -> Result<(String, Vec<ValidatedSupport>)> {
     validate_input(input)?;
     let snapshot = structural::current_snapshot(conn)?;
     if input.snapshot != snapshot {
@@ -531,21 +585,68 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         });
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let inserted = (|| -> Result<i64> {
+    Ok((snapshot, supports))
+}
+
+/// Insert the artifact, its fingerprint, and its supports. No transaction
+/// control: callers own BEGIN/COMMIT so publication can be atomic with the
+/// run ledger.
+pub(crate) fn persist_validated_artifact(
+    conn: &Connection,
+    input: &AnnotateInput,
+    snapshot: &str,
+    supports: &[ValidatedSupport],
+    provenance: &ArtifactProvenance<'_>,
+) -> Result<i64> {
+    let body_json = serde_json::to_string(&input.body)?;
+    let mut support_rows: Vec<Vec<String>> = supports
+        .iter()
+        .map(|support| {
+            vec![
+                support.claim_path.clone(),
+                support.anchor.clone(),
+                support.role.clone().unwrap_or_default(),
+                support.evidence_file.clone(),
+                support.evidence_start_line.to_string(),
+                support.evidence_end_line.to_string(),
+                support.source_hash.clone(),
+                support.context_hash.clone(),
+                support.confidence.clone(),
+            ]
+        })
+        .collect();
+    let artifact_fingerprint = crate::store::artifact_fingerprint(
+        &crate::store::ArtifactIdentity {
+            artifact_type: &input.artifact_type,
+            canonical_name: input.name.as_deref(),
+            body_json: &body_json,
+            model: provenance.model,
+            prompt_version: provenance.prompt_version,
+            confidence: &input.confidence,
+            source_snapshot: snapshot,
+        },
+        &mut support_rows,
+    );
+    (|| -> Result<i64> {
         conn.execute(
             "INSERT INTO semantic_artifacts(
                supersedes_artifact_id, artifact_type, canonical_name, body_json,
-               model, prompt_version, confidence, source_snapshot, created_at
-             ) VALUES(?1,?2,?3,?4,'agent-reported','annotate/v2',?5,?6,
-                      strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+               model, prompt_version, confidence, source_snapshot, created_at,
+               scout_run_id, input_fingerprint, artifact_fingerprint
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now'),?9,?10,?11)",
             params![
                 input.supersedes,
                 input.artifact_type,
                 input.name,
-                serde_json::to_string(&input.body)?,
+                body_json,
+                provenance.model,
+                provenance.prompt_version,
                 input.confidence,
                 snapshot,
+                provenance.scout_run_id,
+                provenance.input_fingerprint,
+                artifact_fingerprint,
             ],
         )?;
         let artifact_id = conn.last_insert_rowid();
@@ -555,7 +656,7 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
                evidence_start_line, evidence_end_line, source_hash, context_hash, confidence
              ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         )?;
-        for support in &supports {
+        for support in supports {
             statement.execute(params![
                 artifact_id,
                 support.claim_path,
@@ -570,18 +671,7 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
             ])?;
         }
         Ok(artifact_id)
-    })();
-    let artifact_id = match inserted {
-        Ok(id) => {
-            conn.execute_batch("COMMIT")?;
-            id
-        }
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    };
-    load_artifact(conn, artifact_id)?.context("inserted semantic artifact is missing")
+    })()
 }
 
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SemanticArtifact>> {
