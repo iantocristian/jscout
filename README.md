@@ -27,6 +27,13 @@ jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood
                                #   who_uses, definition, file_outline, events, annotate
 jscout memory <root> [query]   # inspect persistent semantic artifacts + freshness
 jscout annotate <root> in.json # write a validated semantic artifact
+jscout llm doctor --model P:M  # verify Node, pi-ai, provider, auth, and model capabilities
+jscout scout workflows R       # auto-select deterministic workflow entry surfaces
+  --model P:M --max-calls N    #   explicit command-level model-call budget
+jscout scout workflows R       # classify one agent-supplied workflow boundary
+  --seed ANCHOR --model P:M    #   repeat --seed to define one multi-seed boundary
+jscout scout refresh R         # replace stale/degraded generated workflows
+  --max-calls N                #   reuses each workflow's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
@@ -49,6 +56,26 @@ Traversal defaults to `certain`/`likely` edges. Use
 explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
+
+## Semantic scouting
+
+`jscout scout workflows` makes candidate-closed model calls through the bundled
+pi-ai gateway. Without `--seed`, it derives bounded seeds from routes, GraphQL
+operations, runtime handlers/producers, lifecycle/job/DI boundaries, and
+exported package/application entry files. Equal deterministic candidate
+fingerprints are collapsed before any call. Automatic mode requires an
+explicit `--max-calls`; completed matching runs are reused before that budget
+is spent. `--dry-run` prints the exact resolved seeds, candidate fingerprints,
+candidate counts, evidence file counts, and evidence bytes without starting
+Node or contacting a model.
+
+Generated workflows record their resolved seeds, traversal limits, service
+tier, model, and reasoning policy in the run ledger. After indexing exposes
+source or structural-context drift, `jscout scout refresh --max-calls N`
+selects current stale/degraded generated workflows and publishes immutable
+successors. Index and watch never make model calls. Runs created before replay
+configuration was stored remain visible but are reported as non-refreshable;
+jscout does not guess their original boundary.
 
 ## Search anchors and expansion
 
