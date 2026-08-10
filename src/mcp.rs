@@ -455,7 +455,9 @@ fn call_tool(
                     .ok();
                 let rendered = chunk
                     .map(|(content, start, end, indexed_hash)| {
-                        let disk_source = std::fs::read_to_string(root.join(&t.file)).ok();
+                        let disk_source = store::file_source_path(conn, root, t.file_id)
+                            .ok()
+                            .and_then(|path| std::fs::read_to_string(path).ok());
                         let current = disk_source.as_deref().is_some_and(|source| {
                             blake3::hash(source.as_bytes()).to_hex().as_str() == indexed_hash
                         });

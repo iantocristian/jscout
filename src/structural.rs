@@ -160,22 +160,35 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-structural-snapshot\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
-    let mut stmt = conn.prepare("SELECT path, hash, role FROM files ORDER BY path")?;
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.hash, f.role, f.origin, COALESCE(f.package_path, ''),
+                COALESCE(p.origin, ''), COALESCE(p.name, ''),
+                COALESCE(p.version, ''), COALESCE(p.locator, ''),
+                COALESCE(p.manifest_hash, ''), COALESCE(p.status, '')
+         FROM files f
+         LEFT JOIN package_instances p ON p.id = f.package_instance_id
+         ORDER BY f.path",
+    )?;
     let rows = stmt.query_map([], |r| {
-        Ok((
+        Ok([
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
-        ))
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
+            r.get::<_, String>(9)?,
+            r.get::<_, String>(10)?,
+        ])
     })?;
     for row in rows {
-        let (path, hash, role) = row?;
-        hasher.update(b"\0");
-        hasher.update(path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(hash.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(role.as_bytes());
+        for value in row? {
+            hasher.update(b"\0");
+            hasher.update(value.as_bytes());
+        }
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

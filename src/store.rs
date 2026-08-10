@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 pub const DB_FILE: &str = ".jscout.db";
@@ -30,11 +30,29 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 
+CREATE TABLE IF NOT EXISTS package_instances(
+  id INTEGER PRIMARY KEY,
+  origin TEXT NOT NULL CHECK(origin IN ('workspace', 'dependency')),
+  name TEXT NOT NULL,
+  version TEXT,
+  canonical_root TEXT UNIQUE NOT NULL,
+  locator TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'complete'
+    CHECK(status IN ('complete', 'truncated', 'failed'))
+);
+CREATE INDEX IF NOT EXISTS idx_package_instances_name
+  ON package_instances(name, origin);
+
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE NOT NULL,
   hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'unknown'
+  role TEXT NOT NULL DEFAULT 'unknown',
+  origin TEXT NOT NULL DEFAULT 'repository'
+    CHECK(origin IN ('repository', 'workspace', 'dependency')),
+  package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE CASCADE,
+  package_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks(
@@ -97,7 +115,8 @@ CREATE TABLE IF NOT EXISTS module_edges(
   request TEXT NOT NULL,
   to_file INTEGER,                -- resolved in-repo file
   package TEXT,                   -- external package name
-  resolution TEXT                 -- resolver | workspace | workspace-inferred
+  resolution TEXT,                -- resolver | workspace | workspace-inferred
+  package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_module_edges_from ON module_edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_module_edges_to ON module_edges(to_file);
@@ -215,6 +234,14 @@ CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
 "#,
     )?;
     migrate(conn)?;
+    // These indexes refer to columns introduced by migrations, so create them
+    // only after legacy tables have been upgraded.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_files_origin ON files(origin);
+         CREATE INDEX IF NOT EXISTS idx_files_package_instance ON files(package_instance_id);
+         CREATE INDEX IF NOT EXISTS idx_module_edges_package_instance
+           ON module_edges(package_instance_id);",
+    )?;
     Ok(())
 }
 
@@ -373,8 +400,40 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    // v7 -> v8: package instances become the ownership boundary for
+    // workspace and dependency files. Existing repository files remain
+    // first-party by default; the next index operation can refine workspace
+    // membership without forcing unchanged source through extraction again.
+    if version < 8 {
+        if !has_column(conn, "files", "origin")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN origin TEXT NOT NULL DEFAULT 'repository'
+                 CHECK(origin IN ('repository', 'workspace', 'dependency'))",
+                [],
+            )?;
+        }
+        if !has_column(conn, "files", "package_instance_id")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN package_instance_id INTEGER
+                 REFERENCES package_instances(id) ON DELETE CASCADE",
+                [],
+            )?;
+        }
+        if !has_column(conn, "files", "package_path")? {
+            conn.execute("ALTER TABLE files ADD COLUMN package_path TEXT", [])?;
+        }
+        if !has_column(conn, "module_edges", "package_instance_id")? {
+            conn.execute(
+                "ALTER TABLE module_edges ADD COLUMN package_instance_id INTEGER
+                 REFERENCES package_instances(id) ON DELETE SET NULL",
+                [],
+            )?;
+        }
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','7')
+        "INSERT INTO meta(key, value) VALUES('schema_version','8')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -399,12 +458,44 @@ pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Resolve an indexed file's display identity to the physical source path.
+/// Repository and workspace paths remain root-relative. Dependency paths are
+/// virtual display keys, so their package-relative path is joined to the
+/// canonical package-instance root instead.
+pub fn file_source_path(conn: &Connection, root: &Path, file_id: i64) -> Result<PathBuf> {
+    let (path, origin, package_path, package_root): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT f.path, f.origin, f.package_path, p.canonical_root
+             FROM files f
+             LEFT JOIN package_instances p ON p.id = f.package_instance_id
+             WHERE f.id = ?1",
+            [file_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .with_context(|| format!("indexed file {file_id} does not exist"))?;
+
+    match origin.as_str() {
+        "repository" | "workspace" => Ok(root.join(path)),
+        "dependency" => {
+            let package_path = package_path.context("dependency file has no package-relative path")?;
+            let package_root = package_root.context("dependency file has no package instance")?;
+            Ok(PathBuf::from(package_root).join(package_path))
+        }
+        other => bail!("indexed file {file_id} has invalid origin `{other}`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::{open, open_path};
+    use super::{file_source_path, open, open_path};
 
     #[test]
     fn opens_an_index_database_outside_the_repository_root() -> Result<()> {
@@ -416,7 +507,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         assert!(database.is_file());
         Ok(())
     }
@@ -453,7 +544,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -496,7 +587,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -562,7 +653,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -591,7 +682,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -605,6 +696,93 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v7_with_first_party_origin_and_package_identity_columns() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '7');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
+               role TEXT NOT NULL DEFAULT 'unknown'
+             );
+             INSERT INTO files VALUES(1, 'src/old.ts', 'old-hash', 'production');
+             CREATE TABLE module_edges(
+               from_file INTEGER NOT NULL, request TEXT NOT NULL,
+               to_file INTEGER, package TEXT, resolution TEXT
+             );",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "8");
+        let identity: (String, Option<i64>, Option<String>) = conn.query_row(
+            "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(identity, ("repository".into(), None, None));
+        let package_column = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('module_edges')
+             WHERE name='package_instance_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(package_column, 1);
+        let snapshots: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_repository_and_dependency_file_source_paths() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        conn.execute(
+            "INSERT INTO files(path, hash, role) VALUES('src/main.ts', 'a', 'production')",
+            [],
+        )?;
+        let repository_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO package_instances(
+               origin, name, version, canonical_root, locator, manifest_hash, status
+             ) VALUES('dependency', 'left-pad', '1.3.0', ?1, 'node_modules/left-pad', 'm', 'complete')",
+            [dependency.path().to_string_lossy()],
+        )?;
+        let package = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO files(
+               path, hash, role, origin, package_instance_id, package_path
+             ) VALUES('dependency:left-pad@1.3.0/index.js', 'b', 'production',
+                      'dependency', ?1, 'index.js')",
+            [package],
+        )?;
+        let dependency_file = conn.last_insert_rowid();
+
+        assert_eq!(
+            file_source_path(&conn, repo.path(), repository_file)?,
+            repo.path().join("src/main.ts")
+        );
+        assert_eq!(
+            file_source_path(&conn, repo.path(), dependency_file)?,
+            dependency.path().join("index.js")
+        );
         Ok(())
     }
 }
