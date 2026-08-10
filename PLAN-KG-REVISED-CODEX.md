@@ -801,7 +801,7 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **SC-2a** | Complete: bounded workflow memory, semantic storage/freshness, validated `annotate` write-back, and fixed-snapshot response-budget replay | SC-1 | Passed registered replay 2026-08-09; remains opt-in |
 | **RB-1** | Runtime-boundary entities: registry dispatch, data lifecycle, jobs/queues/crons, and DI providers | RI-1 | First deterministic slice implemented 2026-08-10; known Recall/Slack candidate misses are now explicit two-hop paths |
 | **CP-1** | Separate contract anchors: declarations, exported API types, decorators, DTO/schemas, and referenced contract names | RB-1 | Implemented 2026-08-10 with type-only barrel resolution; documentary edges remain distinct from runtime edges |
-| **EN-1** | Routes, env, tables, services, event migration | RI-1; enriches SC-1/2 | 1–2 days |
+| **EN-1** | Routes, GraphQL operations, environment variables, database resources, feature flags, and external-service hosts | CP-1; enriches SC-1/2 | Implemented 2026-08-10 with explicit extraction-version invalidation and bounded API provenance |
 | **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; EN-1 improves workflow seeds | Free-form producer blocked in preflight 2026-08-09 |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
