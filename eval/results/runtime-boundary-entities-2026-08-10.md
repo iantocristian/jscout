@@ -20,10 +20,15 @@ edges. A direct caller of a lifecycle/job producer may receive a synthetic
 ordinary helper hop so a depth-two workflow query can cross the runtime
 boundary; it does not claim that the caller performs the underlying write.
 
+Runtime entity hubs have no backing file and remain traversable across corpus
+boundaries. Their occurrence and symbol endpoints retain origin gating, so a
+cross-boundary identity does not expose dependency internals unless dependency
+origin is requested.
+
 ## Automated validation
 
 ```text
-cargo test: 77 passed
+cargo test: 78 passed
 cargo clippy --all-targets --all-features -- -D warnings: passed
 ```
 
@@ -32,8 +37,11 @@ Fixtures cover:
 - one imported registry identifier shared by dispatch and registration files;
 - GraphQL record creation paired with a database-event listener;
 - a caller one helper above the record write reaching the listener in two hops;
-- queue producer/worker matching;
+- Twenty-style `this.messageQueueService.add(Job.name, ...)` and
+  `addCron({ jobName: Job.name, ... })` producer/handler matching;
 - DI token injection/provider matching;
+- repeated entity occurrences retaining separate evidence without duplicate
+  traversal relationships;
 - schema-v8 migration forcing entity re-extraction and snapshot invalidation.
 
 ## Fresh Twenty index
@@ -46,13 +54,26 @@ Database: isolated under `/tmp`; dependency internals excluded.
 75,095 chunks
 298,700 references
 0 extraction failures
-31.28 s total indexing
-58.12 ms entity materialization/projection
+10.83 s total indexing (warm filesystem-cache validation run)
+20.82 ms entity materialization/projection
 ```
 
 The first-pass registry/lifecycle index produced 102 registry entities and 47
 data-lifecycle entities from 101 registered handlers, 15 dispatch sites, 21
 lifecycle listeners, and 137 lifecycle producers.
+
+After adding the Twenty/NestJS queue shapes, the same index produced 97 job
+entities from 140 producer and 94 handler occurrences; 88 job identities had
+both sides. It also produced 30 DI-token entities from 25 injection and 24
+provider occurrences. The resolved projection contained no duplicate
+`(source, target, kind)` runtime-entity relationships. When a decorator or
+registration site has no explicit target expression, its owner fallback is now
+labelled `registration-site-fallback` (or `provider-site-fallback`) instead of
+reusing the framework-pattern provenance.
+
+Template/static-string resolution remains a file-global, visit-order
+approximation rather than scope-aware constant evaluation. These identities
+remain `likely`, and the limitation is explicit in the extractor.
 
 The two misses that blocked the frozen Twenty workflow-candidate gate are now
 explicit paths:

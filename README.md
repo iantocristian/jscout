@@ -140,6 +140,11 @@ the structural graph still exposes a versioned package-instance boundary hub;
 indexed modules sit behind that hub and enter traversal only when their origin
 is allowed.
 
+Canonical runtime-entity nodes are also file-less boundary hubs. Their source
+occurrences and symbol endpoints retain file origin, so an entity identity can
+join first- and third-party evidence without making dependency-backed endpoint
+code visible unless `dependency` is included in the caller's origin filter.
+
 ## Embeddings (optional)
 
 Search works BM25-only out of the box. For hybrid semantic search set one of:
