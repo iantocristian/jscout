@@ -9,6 +9,7 @@ Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level co
 ```
 jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
                                #   --database PATH isolates index/memory state
+                               #   --deps pkg,@scope/pkg indexes named dependency internals
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   add --expand for a bounded structural context pack
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
@@ -16,6 +17,7 @@ jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
+                               #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
 jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
                                #   who_uses, definition, file_outline, events, annotate
@@ -87,6 +89,56 @@ symbols, the traversal projection emits every candidate at `possible`
 confidence and includes ambiguity details instead of dropping the edge.
 
 Event wiring (`emit('x')` ↔ `on('x')`) is surfaced by the `events` tool/command.
+
+## Scoped dependency indexing
+
+Dependency internals are opt-in and package-scoped. jscout never walks all of
+`node_modules`:
+
+```bash
+jscout index /path/to/repo --deps zod,lodash
+```
+
+The selector list is authoritative. A later `jscout index` without `--deps`
+removes the dependency corpus; use the same `--deps` values with `jscout watch`
+to retain it. Discovery starts from real indexed importers and Node resolution,
+so distinct installed versions become distinct package instances. An unused
+root installation may also be selected by its exact package name. Package
+roots and resolved modules are canonicalized before identity is assigned:
+pnpm store links deduplicate to one physical instance, while declared
+workspace links remain first-party code.
+
+Each package is independently bounded to 10,000 files, 100 MiB total source,
+and 2 MiB per file. Hidden directories, nested `node_modules`, minified names,
+and strongly bundled long-line artifacts are skipped; a package entry point is
+retained even when it looks bundled so the boundary does not disappear. When
+the manifest exposes a `source` field or `source` export condition, that source
+tree is preferred. Otherwise the active `exports`/`module`/`main` runtime tree
+is indexed. Source-map reconstruction and Yarn Plug'n'Play zip archives are not
+supported yet; PnP is rejected explicitly instead of being treated as a
+missing package.
+
+Indexed dependency files remain invisible to normal retrieval. All read
+surfaces default to `repository,workspace`; include `dependency` explicitly:
+
+```bash
+# Dependency internals only
+jscout search /path/to/repo "parse object schema" --origin dependency
+
+# Cross the first-party/package boundary in one expansion
+jscout search /path/to/repo "validate credentials" --expand --json \
+  --origin repository,workspace,dependency
+
+# Create vectors for dependency chunks (content-hash dedup still applies)
+jscout embed /path/to/repo --origin dependency
+```
+
+The same `origins` allowlist is available on MCP search, definition,
+who-uses, file-outline, events, and neighborhood calls. Search filtering is
+applied before BM25/vector candidate ranking. Without dependency visibility,
+the structural graph still exposes a versioned package-instance boundary hub;
+indexed modules sit behind that hub and enter traversal only when their origin
+is allowed.
 
 ## Embeddings (optional)
 
@@ -184,7 +236,10 @@ references, event/member-call sites, embeddings, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
 after indexing so barrel changes can reroute references in otherwise unchanged
 files without leaving stale graph edges behind. File roles live on canonical
-file rows and are refreshed even when source hashes are unchanged.
+file rows and are refreshed even when source hashes are unchanged. Files also
+carry `repository`, `workspace`, or `dependency` origin plus optional package
+instance/path identity. Package instances record canonical root, name, version,
+locator, manifest hash, and completeness status.
 
 Agent-authored `workflow` and `annotation` records live in separate
 `semantic_artifacts`/`semantic_supports` tables; they never become structural

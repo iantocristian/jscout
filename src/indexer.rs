@@ -84,6 +84,7 @@ pub(crate) fn resolver_options(
 
 /// Index (or re-index) a repository. Files whose content hash is unchanged
 /// are skipped; changed files are fully replaced.
+#[cfg(test)]
 pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     index_repo_with_options(root, conn, &IndexOptions::default())
 }

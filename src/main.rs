@@ -202,6 +202,9 @@ enum Command {
         /// Also embed new/changed chunks on each re-index (needs a provider)
         #[arg(long)]
         embed: bool,
+        /// Keep these installed dependency packages in the watched index
+        #[arg(long = "deps", value_delimiter = ',')]
+        dependencies: Vec<String>,
     },
     /// Show all usages of a symbol: NAME or path-substring:NAME
     WhoUses {
@@ -359,7 +362,9 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&candidates)?);
             Ok(())
         }
-        Command::Watch { root, embed } => watch::watch(&root, embed),
+        Command::Watch { root, embed, dependencies } => {
+            watch::watch(&root, embed, &dependencies)
+        }
         Command::WhoUses { root, spec, json, file_origins } => {
             cmd_who_uses(&root, &spec, json, &file_origins)
         }
