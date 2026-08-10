@@ -9,7 +9,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(dead_code)] // Cancel is constructed by scouting cancellation (G4)
+#[allow(dead_code)] // Cancel is sent by interactive cancellation (follow-up layer)
 pub enum Outbound {
     Hello,
     Capabilities {
@@ -155,7 +155,6 @@ pub struct ModelCapabilities {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // consumed by scouting validation (G4)
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
@@ -174,7 +173,7 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // retryability drives scouting retry policy (G4)
+#[allow(dead_code)] // retryability classification drives the S7 retry policy
 pub struct RemoteError {
     pub code: String,
     pub message: String,

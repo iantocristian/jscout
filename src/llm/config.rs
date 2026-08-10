@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 pub const MODEL_ENV: &str = "JSCOUT_LLM_MODEL";
-#[allow(dead_code)] // consumed by scouting CLI (G4)
 pub const REASONING_ENV: &str = "JSCOUT_LLM_REASONING";
 pub const GATEWAY_ENV: &str = "JSCOUT_PI_AI_GATEWAY";
 pub const NODE_ENV: &str = "JSCOUT_NODE";
@@ -56,7 +55,6 @@ pub fn resolve_model(cli: Option<&str>) -> Result<ModelSpec> {
 }
 
 /// `--reasoning`, then `JSCOUT_LLM_REASONING`; None means provider default.
-#[allow(dead_code)] // consumed by scouting CLI (G4)
 pub fn resolve_reasoning(cli: Option<&str>) -> Option<String> {
     if let Some(value) = cli {
         return Some(value.to_string());
@@ -147,7 +145,6 @@ pub fn resolve_node() -> Result<PathBuf> {
 
 /// Per-command request policy shared by scouting commands.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by scouting commands (G4)
 pub struct RequestPolicy {
     pub timeout: Duration,
     pub max_calls: usize,
@@ -155,7 +152,6 @@ pub struct RequestPolicy {
 }
 
 impl RequestPolicy {
-    #[allow(dead_code)] // consumed by scouting commands (G4)
     pub fn new(timeout_secs: u64, max_calls: usize, context_bytes: usize) -> Result<Self> {
         if timeout_secs == 0 {
             bail!("--timeout must be greater than zero seconds");

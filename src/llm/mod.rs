@@ -17,7 +17,6 @@ use protocol::{CompleteRequest, ModelCapabilities, ProviderSummary, RemoteError,
 /// Provider/model/billing identity the gateway resolved before any network
 /// wait. `auth_source` is a category label, never a credential value.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // persisted by the scout run ledger (G4)
 pub struct StartedInfo {
     pub provider: String,
     pub model: String,
@@ -27,7 +26,6 @@ pub struct StartedInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // persisted by the scout run ledger (G4)
 pub struct CompletionOutcome {
     pub started: StartedInfo,
     pub tool_call: ToolCall,
@@ -37,7 +35,6 @@ pub struct CompletionOutcome {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Canceled is constructed by scouting cancellation (G4)
 pub enum GatewayError {
     /// Launch failure: missing node, missing gateway file, exec error.
     Spawn(String),
@@ -61,7 +58,6 @@ impl GatewayError {
     }
 
     /// Stable code for the run ledger.
-    #[allow(dead_code)] // persisted by the scout run ledger (G4)
     pub fn code(&self) -> String {
         match self {
             GatewayError::Spawn(_) => "spawn".into(),
@@ -111,7 +107,6 @@ impl std::error::Error for GatewayError {}
 
 /// The seam scouting code depends on; the process client implements it and
 /// tests substitute a scripted double.
-#[allow(dead_code)] // consumed by scouting orchestration (G4)
 pub trait LlmGateway {
     fn capabilities(
         &mut self,

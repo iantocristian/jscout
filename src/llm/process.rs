@@ -107,7 +107,6 @@ impl ProcessGateway {
     }
 
     /// Convenience: resolve node + gateway from config and spawn.
-    #[allow(dead_code)] // consumed by scouting orchestration (G4)
     pub fn launch(gateway_path: Option<&Path>) -> anyhow::Result<Self> {
         let node = config::resolve_node()?;
         let gateway = config::resolve_gateway(gateway_path)?;
@@ -169,13 +168,13 @@ impl ProcessGateway {
 
     /// A poisoned client saw a framing/timeout failure and can no longer
     /// trust request correlation; callers must discard it.
-    #[allow(dead_code)] // consumed by scouting restart policy (G4)
+    #[allow(dead_code)] // consumed by the sidecar restart policy (follow-up layer)
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
 
     /// Cancel the in-flight completion with the given request id.
-    #[allow(dead_code)] // consumed by scouting cancellation (G4)
+    #[allow(dead_code)] // wired by interactive cancellation (follow-up layer)
     pub fn cancel(&mut self, target_id: &str) -> Result<(), GatewayError> {
         let target_id = target_id.to_string();
         self.send(&Outbound::Cancel { target_id })?;
