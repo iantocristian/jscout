@@ -1,5 +1,6 @@
 mod agent;
 mod chunk;
+pub mod dependency;
 mod embed;
 mod file_role;
 mod graph;

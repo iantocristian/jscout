@@ -28,7 +28,10 @@ struct FileData {
 /// agree with what the resolver itself would pick.
 pub(crate) const RESOLVE_CONDITIONS: &[&str] = &["import", "require", "node", "default"];
 
-fn resolver_options(alias: oxc_resolver::Alias, tsconfig: Option<TsconfigDiscovery>) -> ResolveOptions {
+pub(crate) fn resolver_options(
+    alias: oxc_resolver::Alias,
+    tsconfig: Option<TsconfigDiscovery>,
+) -> ResolveOptions {
     ResolveOptions {
         // Workspace package names -> in-repo source, so monorepo cross-package
         // imports resolve to indexed files instead of missing/dist targets.
@@ -371,7 +374,7 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
 }
 
 /// "@scope/pkg/sub/path" -> "@scope/pkg"; "./x" stays as-is (unresolved relative).
-fn package_name(request: &str) -> String {
+pub(crate) fn package_name(request: &str) -> String {
     if request.starts_with('.') || request.starts_with('/') {
         return request.to_string();
     }

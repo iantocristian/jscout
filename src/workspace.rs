@@ -28,8 +28,19 @@ enum Origin {
 }
 
 /// Workspace alias table plus the provenance needed to classify resolutions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspacePackage {
+    pub name: String,
+    pub version: Option<String>,
+    pub canonical_root: PathBuf,
+    pub manifest_hash: String,
+}
+
 pub struct WorkspaceMap {
     pub aliases: Alias,
+    /// Declared first-party package roots. Canonical roots, rather than the
+    /// path used to reach them through node_modules, establish ownership.
+    pub packages: Vec<WorkspacePackage>,
     /// Exact specifiers (bare names, declared subpaths) whose mapping came
     /// straight from manifest data.
     manifest_specifiers: HashSet<String>,
@@ -45,6 +56,7 @@ impl WorkspaceMap {
     pub fn build(root: &Path) -> Self {
         let mut map = WorkspaceMap {
             aliases: Vec::new(),
+            packages: Vec::new(),
             manifest_specifiers: HashSet::new(),
             package_names: HashSet::new(),
         };
@@ -59,6 +71,13 @@ impl WorkspaceMap {
             if name.is_empty() || name.starts_with('.') || name.starts_with('/') {
                 continue;
             }
+            let canonical_root = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            map.packages.push(WorkspacePackage {
+                name: name.to_string(),
+                version: pkg.get("version").and_then(|v| v.as_str()).map(str::to_string),
+                canonical_root,
+                manifest_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+            });
             map.add_package(name, &dir, &pkg);
         }
         // A matched-but-failing prefix entry stops resolution, so each
@@ -67,7 +86,17 @@ impl WorkspaceMap {
         // "name/…" first.
         map.aliases.sort_by(|a, b| b.0.cmp(&a.0));
         map.aliases.dedup_by(|a, b| a.0 == b.0);
+        map.packages.sort_by(|a, b| a.canonical_root.cmp(&b.canonical_root));
+        map.packages.dedup_by(|a, b| a.canonical_root == b.canonical_root);
         map
+    }
+
+    pub fn package_named(&self, name: &str) -> Option<&WorkspacePackage> {
+        self.packages.iter().find(|package| package.name == name)
+    }
+
+    pub fn package_at_root(&self, root: &Path) -> Option<&WorkspacePackage> {
+        self.packages.iter().find(|package| package.canonical_root == root)
     }
 
     /// Provenance for a successfully resolved request: `resolver` when the
