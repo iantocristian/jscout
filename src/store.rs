@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 pub const DB_FILE: &str = ".jscout.db";
 
@@ -289,6 +289,49 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
+-- One row per generative model run. Failures, exclusions, cost, and
+-- provenance stay attributable; artifacts reference the run that produced
+-- them. Statuses: running | completed | incomplete | failed | canceled |
+-- superseded. Billing paths (plan | api | custom) are never pooled.
+CREATE TABLE IF NOT EXISTS scout_runs(
+  id INTEGER PRIMARY KEY,
+  scout_kind TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'running', 'completed', 'incomplete', 'failed', 'canceled', 'superseded'
+  )),
+  gateway_protocol INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  billing_path TEXT NOT NULL CHECK(billing_path IN ('plan', 'api', 'custom')),
+  reasoning TEXT,
+  prompt_version TEXT NOT NULL,
+  source_snapshot TEXT NOT NULL,
+  input_fingerprint TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  usage_json TEXT,
+  error_code TEXT,
+  started_at TEXT NOT NULL,
+  completed_at TEXT
+);
+-- One live claim per input: a second scout of the same inputs either reuses
+-- the completed run or fails loudly against the in-flight one. --rebuild
+-- supersedes the completed run first.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scout_runs_active
+  ON scout_runs(scout_kind, input_fingerprint)
+  WHERE status IN ('running', 'completed');
+CREATE INDEX IF NOT EXISTS idx_scout_runs_status ON scout_runs(status, scout_kind);
+
+-- Every deterministic candidate's decision for a run, including exclusions
+-- (which never become semantic supports).
+CREATE TABLE IF NOT EXISTS scout_classifications(
+  run_id INTEGER NOT NULL REFERENCES scout_runs(id) ON DELETE CASCADE,
+  anchor_key TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('defining', 'supporting', 'excluded')),
+  role TEXT,
+  evidence_json TEXT NOT NULL,
+  PRIMARY KEY(run_id, anchor_key)
+);
+
 CREATE TABLE IF NOT EXISTS semantic_artifacts(
   id INTEGER PRIMARY KEY,
   supersedes_artifact_id INTEGER REFERENCES semantic_artifacts(id),
@@ -299,8 +342,27 @@ CREATE TABLE IF NOT EXISTS semantic_artifacts(
   prompt_version TEXT NOT NULL,
   confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
   source_snapshot TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  scout_run_id INTEGER REFERENCES scout_runs(id),
+  input_fingerprint TEXT,
+  artifact_fingerprint TEXT
 );
+
+-- Artifact-to-artifact dependencies that source spans cannot express
+-- (summaries over child artifacts, concept links). `dst_fingerprint` pins
+-- the dependent's view of the child so a changed child degrades the parent
+-- even when leaf source lines did not change.
+CREATE TABLE IF NOT EXISTS semantic_relations(
+  src_artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id) ON DELETE CASCADE,
+  dst_artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id),
+  relation TEXT NOT NULL CHECK(relation IN ('summarizes', 'names_concept', 'related_to')),
+  claim_path TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  dst_fingerprint TEXT NOT NULL,
+  PRIMARY KEY(src_artifact_id, dst_artifact_id, relation, claim_path)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_relations_dst
+  ON semantic_relations(dst_artifact_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_artifacts_type_name
   ON semantic_artifacts(artifact_type, canonical_name);
 CREATE INDEX IF NOT EXISTS idx_semantic_artifacts_supersedes
@@ -678,12 +740,161 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v12 -> v13: the scout run ledger and semantic relations land through
+    // the idempotent schema batch; existing semantic artifacts gain run and
+    // fingerprint identity. Fingerprints are backfilled from the canonical
+    // serialized body, provenance, and sorted supports so parent artifacts
+    // can depend on children by content, not by id alone. Semantic rows are
+    // canonical, so nothing structural is invalidated.
+    if version < 13 {
+        for (column, definition) in [
+            (
+                "scout_run_id",
+                "scout_run_id INTEGER REFERENCES scout_runs(id)",
+            ),
+            ("input_fingerprint", "input_fingerprint TEXT"),
+            ("artifact_fingerprint", "artifact_fingerprint TEXT"),
+        ] {
+            if !has_column(conn, "semantic_artifacts", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE semantic_artifacts ADD COLUMN {definition}"),
+                    [],
+                )?;
+            }
+        }
+        backfill_artifact_fingerprints(conn)?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','12')
+        "INSERT INTO meta(key, value) VALUES('schema_version','13')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
     Ok(())
+}
+
+/// Canonical provenance fields of one semantic artifact.
+pub(crate) struct ArtifactIdentity<'a> {
+    pub artifact_type: &'a str,
+    pub canonical_name: Option<&'a str>,
+    pub body_json: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub confidence: &'a str,
+    pub source_snapshot: &'a str,
+}
+
+/// Canonical content identity of a semantic artifact: serialized body,
+/// provenance, confidence, snapshot, and every support in sorted order.
+/// Shared by the migration backfill and every new artifact write.
+pub(crate) fn artifact_fingerprint(
+    identity: &ArtifactIdentity<'_>,
+    supports: &mut [Vec<String>],
+) -> String {
+    supports.sort();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-semantic-artifact\0");
+    for part in [
+        identity.artifact_type,
+        identity.canonical_name.unwrap_or(""),
+        identity.body_json,
+        identity.model,
+        identity.prompt_version,
+        identity.confidence,
+        identity.source_snapshot,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    for support in supports {
+        for field in support.iter() {
+            hasher.update(field.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"\x01");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+type ArtifactRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn backfill_artifact_fingerprints(conn: &Connection) -> Result<()> {
+    let artifacts: Vec<ArtifactRow> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, artifact_type, canonical_name, body_json, model,
+                    prompt_version, confidence, source_snapshot
+             FROM semantic_artifacts WHERE artifact_fingerprint IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for (id, artifact_type, canonical_name, body, model, prompt_version, confidence, snapshot) in
+        artifacts
+    {
+        let mut supports = load_support_fingerprint_rows(conn, id)?;
+        let fingerprint = artifact_fingerprint(
+            &ArtifactIdentity {
+                artifact_type: &artifact_type,
+                canonical_name: canonical_name.as_deref(),
+                body_json: &body,
+                model: &model,
+                prompt_version: &prompt_version,
+                confidence: &confidence,
+                source_snapshot: &snapshot,
+            },
+            &mut supports,
+        );
+        conn.execute(
+            "UPDATE semantic_artifacts SET artifact_fingerprint=?1 WHERE id=?2",
+            params![fingerprint, id],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn load_support_fingerprint_rows(
+    conn: &Connection,
+    artifact_id: i64,
+) -> Result<Vec<Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT claim_path, anchor_key, COALESCE(role, ''), evidence_file,
+                evidence_start_line, evidence_end_line, source_hash, context_hash, confidence
+         FROM semantic_supports WHERE artifact_id=?1",
+    )?;
+    let rows = stmt.query_map([artifact_id], |row| {
+        Ok(vec![
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?.to_string(),
+            row.get::<_, i64>(5)?.to_string(),
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ])
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -752,7 +963,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         assert!(database.is_file());
         Ok(())
     }
@@ -789,7 +1000,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -832,7 +1043,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -896,7 +1107,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -925,7 +1136,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -969,7 +1180,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1019,7 +1230,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1085,7 +1296,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1133,7 +1344,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1181,9 +1392,101 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v12_with_run_ledger_and_backfilled_artifact_fingerprints() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '12');
+             CREATE TABLE semantic_artifacts(
+               id INTEGER PRIMARY KEY,
+               supersedes_artifact_id INTEGER,
+               artifact_type TEXT NOT NULL,
+               canonical_name TEXT,
+               body_json TEXT NOT NULL,
+               model TEXT NOT NULL,
+               prompt_version TEXT NOT NULL,
+               confidence TEXT NOT NULL,
+               source_snapshot TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO semantic_artifacts VALUES(
+               1, NULL, 'workflow', 'invoice retry', '{\"claim\":1}',
+               'agent-reported', 'annotate/v2', 'likely', 'snap-1', '2026-08-01T00:00:00Z'
+             );
+             CREATE TABLE semantic_supports(
+               artifact_id INTEGER NOT NULL,
+               claim_path TEXT NOT NULL,
+               anchor_key TEXT NOT NULL,
+               role TEXT,
+               evidence_file TEXT NOT NULL,
+               evidence_start_line INTEGER NOT NULL,
+               evidence_end_line INTEGER NOT NULL,
+               source_hash TEXT NOT NULL,
+               context_hash TEXT NOT NULL,
+               confidence TEXT NOT NULL
+             );
+             INSERT INTO semantic_supports VALUES(
+               1, '/claim', 'sym:a.ts#::run@1', NULL, 'a.ts', 1, 4, 'h1', 'c1', 'likely'
+             );",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "13");
+
+        // The backfilled fingerprint equals a recomputation from canonical parts.
+        let stored: String = conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut supports = super::load_support_fingerprint_rows(&conn, 1)?;
+        let expected = super::artifact_fingerprint(
+            &super::ArtifactIdentity {
+                artifact_type: "workflow",
+                canonical_name: Some("invoice retry"),
+                body_json: "{\"claim\":1}",
+                model: "agent-reported",
+                prompt_version: "annotate/v2",
+                confidence: "likely",
+                source_snapshot: "snap-1",
+            },
+            &mut supports,
+        );
+        assert_eq!(stored, expected);
+
+        // Run-ledger tables exist with their claim index.
+        let objects: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN (
+               'scout_runs', 'scout_classifications', 'semantic_relations',
+               'idx_scout_runs_active'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(objects, 4);
+
+        // Agent-authored rows keep run identity NULL after migration.
+        let identity: (Option<i64>, Option<String>) = conn.query_row(
+            "SELECT scout_run_id, input_fingerprint FROM semantic_artifacts WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(identity, (None, None));
         Ok(())
     }
 

@@ -14,6 +14,7 @@ mod package_exports;
 mod parse;
 mod query;
 mod scout;
+mod scouting;
 mod search;
 mod semantic;
 mod stats;

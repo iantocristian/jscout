@@ -531,21 +531,56 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         });
     }
 
+    // Agent-authored artifacts have no scout run or input fingerprint, but
+    // every artifact carries a content fingerprint so relations can pin the
+    // exact version they depended on.
+    let body_json = serde_json::to_string(&input.body)?;
+    let mut support_rows: Vec<Vec<String>> = supports
+        .iter()
+        .map(|support| {
+            vec![
+                support.claim_path.clone(),
+                support.anchor.clone(),
+                support.role.clone().unwrap_or_default(),
+                support.evidence_file.clone(),
+                support.evidence_start_line.to_string(),
+                support.evidence_end_line.to_string(),
+                support.source_hash.clone(),
+                support.context_hash.clone(),
+                support.confidence.clone(),
+            ]
+        })
+        .collect();
+    let artifact_fingerprint = crate::store::artifact_fingerprint(
+        &crate::store::ArtifactIdentity {
+            artifact_type: &input.artifact_type,
+            canonical_name: input.name.as_deref(),
+            body_json: &body_json,
+            model: "agent-reported",
+            prompt_version: "annotate/v2",
+            confidence: &input.confidence,
+            source_snapshot: &snapshot,
+        },
+        &mut support_rows,
+    );
+
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let inserted = (|| -> Result<i64> {
         conn.execute(
             "INSERT INTO semantic_artifacts(
                supersedes_artifact_id, artifact_type, canonical_name, body_json,
-               model, prompt_version, confidence, source_snapshot, created_at
+               model, prompt_version, confidence, source_snapshot, created_at,
+               artifact_fingerprint
              ) VALUES(?1,?2,?3,?4,'agent-reported','annotate/v2',?5,?6,
-                      strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                      strftime('%Y-%m-%dT%H:%M:%fZ','now'),?7)",
             params![
                 input.supersedes,
                 input.artifact_type,
                 input.name,
-                serde_json::to_string(&input.body)?,
+                body_json,
                 input.confidence,
                 snapshot,
+                artifact_fingerprint,
             ],
         )?;
         let artifact_id = conn.last_insert_rowid();
