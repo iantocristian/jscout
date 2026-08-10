@@ -29,6 +29,9 @@ pub struct EntitySite {
 
 struct EntityVisitor {
     sites: Vec<EntitySite>,
+    // Deliberately file-global and single-pass: this is a cheap static-string
+    // approximation, not scope-aware constant evaluation or declaration
+    // hoisting. Confidence remains `likely` where it contributes identity.
     static_strings: HashMap<String, String>,
 }
 
@@ -40,6 +43,19 @@ impl EntityVisitor {
                 identifier.name.to_string(),
                 identifier.span.start,
             )),
+            Expression::StaticMemberExpression(member)
+                if member.property.name == "name"
+                    && matches!(&member.object, Expression::Identifier(_)) =>
+            {
+                let Expression::Identifier(identifier) = &member.object else {
+                    unreachable!("guard requires an identifier")
+                };
+                Some((
+                    "reference",
+                    identifier.name.to_string(),
+                    identifier.span.start,
+                ))
+            }
             _ => static_string(expression, &self.static_strings)
                 .map(|value| ("literal", value, expression.span().start)),
         }
@@ -69,7 +85,7 @@ impl EntityVisitor {
             identity_name,
             identity_start,
             target_name: target.as_ref().map(|(name, _)| name.clone()),
-            target_start: target.map(|(_, start)| start),
+            target_start: target.as_ref().map(|(_, start)| *start),
             span_start: call.span.start,
             span_end: call.span.end,
             extractor: "twenty-define-logic-function",
@@ -83,21 +99,19 @@ impl EntityVisitor {
         else {
             return;
         };
-        let Some(event_name) = object_value(settings, "eventName") else { return };
-        let Some(event_name) = static_string(event_name, &self.static_strings) else { return };
+        let Some(event_name_expression) = object_value(settings, "eventName") else { return };
+        let Some(event_name) = static_string(event_name_expression, &self.static_strings) else {
+            return;
+        };
         self.sites.push(EntitySite {
             plane: "runtime",
             entity_type: "data_lifecycle",
             role: "lifecycle_listener",
             identity_kind: "literal",
             identity_name: event_name,
-            identity_start: event_name_span(settings).unwrap_or(call.span.start),
-            target_name: object_value(config, "handler")
-                .and_then(Self::target)
-                .map(|(name, _)| name),
-            target_start: object_value(config, "handler")
-                .and_then(Self::target)
-                .map(|(_, start)| start),
+            identity_start: event_name_expression.span().start,
+            target_name: target.as_ref().map(|(name, _)| name.clone()),
+            target_start: target.as_ref().map(|(_, start)| *start),
             span_start: settings.span.start,
             span_end: settings.span.end,
             extractor: "twenty-database-event-trigger",
@@ -146,7 +160,10 @@ impl EntityVisitor {
     fn extract_job_call(&mut self, call: &CallExpression<'_>) {
         let Expression::StaticMemberExpression(member) = &call.callee else { return };
         let method = member.property.name.as_str();
-        if !matches!(method, "add" | "addBulk" | "enqueue" | "publish" | "schedule") {
+        if !matches!(
+            method,
+            "add" | "addBulk" | "addCron" | "enqueue" | "publish" | "schedule"
+        ) {
             return;
         }
         let Some(object) = member_path(&member.object) else { return };
@@ -157,10 +174,12 @@ impl EntityVisitor {
         {
             return;
         }
-        let Some(identity_expression) = call.arguments.first().and_then(Argument::as_expression)
-        else {
-            return;
+        let identity_expression = if method == "addCron" {
+            first_object_argument(call).and_then(|options| object_value(options, "jobName"))
+        } else {
+            call.arguments.first().and_then(Argument::as_expression)
         };
+        let Some(identity_expression) = identity_expression else { return };
         let Some((identity_kind, identity_name, identity_start)) =
             self.identity(identity_expression)
         else {
@@ -218,6 +237,43 @@ impl EntityVisitor {
             provenance: "provider-object-pattern",
             confidence: "likely",
             detail: json!({ "binding": binding }),
+        });
+    }
+
+    fn extract_decorator(&mut self, decorator: &Decorator<'_>) {
+        let Expression::CallExpression(call) = &decorator.expression else { return };
+        let Expression::Identifier(callee) = &call.callee else { return };
+        let Some(identity_expression) = call.arguments.first().and_then(Argument::as_expression)
+        else {
+            return;
+        };
+        let Some((identity_kind, identity_name, identity_start)) =
+            self.identity(identity_expression)
+        else {
+            return;
+        };
+        let (entity_type, role, extractor) = match callee.name.as_str() {
+            "Inject" => ("di_token", "injection_site", "di-inject-decorator"),
+            "Cron" | "Interval" | "Timeout" | "Process" | "Processor" | "Job" => {
+                ("job", "job_handler", "job-handler-decorator")
+            }
+            _ => return,
+        };
+        self.sites.push(EntitySite {
+            plane: "runtime",
+            entity_type,
+            role,
+            identity_kind,
+            identity_name,
+            identity_start,
+            target_name: None,
+            target_start: None,
+            span_start: decorator.span.start,
+            span_end: decorator.span.end,
+            extractor,
+            provenance: "decorator-pattern",
+            confidence: "likely",
+            detail: json!({ "decorator": callee.name.as_str() }),
         });
     }
 }
@@ -307,51 +363,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_decorator(&mut self, decorator: &Decorator<'a>) {
-        let Expression::CallExpression(call) = &decorator.expression else {
-            oxc_ast_visit::walk::walk_decorator(self, decorator);
-            return;
-        };
-        let Expression::Identifier(callee) = &call.callee else {
-            oxc_ast_visit::walk::walk_decorator(self, decorator);
-            return;
-        };
-        let Some(identity_expression) = call.arguments.first().and_then(Argument::as_expression)
-        else {
-            oxc_ast_visit::walk::walk_decorator(self, decorator);
-            return;
-        };
-        let Some((identity_kind, identity_name, identity_start)) =
-            self.identity(identity_expression)
-        else {
-            oxc_ast_visit::walk::walk_decorator(self, decorator);
-            return;
-        };
-        let (entity_type, role, extractor) = match callee.name.as_str() {
-            "Inject" => ("di_token", "injection_site", "di-inject-decorator"),
-            "Cron" | "Interval" | "Timeout" | "Process" | "Processor" | "Job" => {
-                ("job", "job_handler", "job-handler-decorator")
-            }
-            _ => {
-                oxc_ast_visit::walk::walk_decorator(self, decorator);
-                return;
-            }
-        };
-        self.sites.push(EntitySite {
-            plane: "runtime",
-            entity_type,
-            role,
-            identity_kind,
-            identity_name,
-            identity_start,
-            target_name: None,
-            target_start: None,
-            span_start: decorator.span.start,
-            span_end: decorator.span.end,
-            extractor,
-            provenance: "decorator-pattern",
-            confidence: "likely",
-            detail: json!({ "decorator": callee.name.as_str() }),
-        });
+        self.extract_decorator(decorator);
         oxc_ast_visit::walk::walk_decorator(self, decorator);
     }
 }
@@ -380,10 +392,6 @@ fn object_value<'a>(object: &'a ObjectExpression<'a>, name: &str) -> Option<&'a 
         let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
         (property.key.static_name().as_deref() == Some(name)).then_some(&property.value)
     })
-}
-
-fn event_name_span(settings: &ObjectExpression<'_>) -> Option<u32> {
-    object_value(settings, "eventName").map(|expression| expression.span().start)
 }
 
 fn static_string(
@@ -431,6 +439,7 @@ fn mutation_resource(operation: &str) -> Option<(&'static str, String)> {
 
 fn member_path(expression: &Expression<'_>) -> Option<String> {
     match expression {
+        Expression::ThisExpression(_) => Some("this".into()),
         Expression::Identifier(identifier) => Some(identifier.name.to_string()),
         Expression::StaticMemberExpression(member) => {
             Some(format!("{}.{}", member_path(&member.object)?, member.property.name))
@@ -538,6 +547,46 @@ mod tests {
                 && site.role == "injection_site"
                 && site.identity_name == "TOKEN"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_twenty_this_qualified_queue_and_cron_calls() -> Result<()> {
+        let extracted = sites(
+            "class Producer {\n\
+               enqueue(payload) {\n\
+                 this.messageQueueService.add(EmailJob.name, payload);\n\
+               }\n\
+               schedule() {\n\
+                 this.messageQueueService.addCron({\n\
+                   jobName: CleanupJob.name,\n\
+                   data: undefined,\n\
+                   options: { repeat: { pattern: '0 0 * * *' } },\n\
+                 });\n\
+               }\n\
+             }\n\
+             class Consumer {\n\
+               @Process(EmailJob.name) handleEmail() {}\n\
+               @Process(CleanupJob.name) handleCleanup() {}\n\
+             }\n",
+        )?;
+
+        for (identity, method) in [("EmailJob", "add"), ("CleanupJob", "addCron")] {
+            assert!(extracted.iter().any(|site| {
+                site.entity_type == "job"
+                    && site.role == "job_producer"
+                    && site.identity_kind == "reference"
+                    && site.identity_name == identity
+                    && site.detail["object"] == "this.messageQueueService"
+                    && site.detail["method"] == method
+            }));
+            assert!(extracted.iter().any(|site| {
+                site.entity_type == "job"
+                    && site.role == "job_handler"
+                    && site.identity_kind == "reference"
+                    && site.identity_name == identity
+            }));
+        }
         Ok(())
     }
 }
