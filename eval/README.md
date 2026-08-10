@@ -347,6 +347,9 @@ decision to require explicit runtime-boundary entities are recorded in
 The first runtime-boundary implementation and its real-repository regression
 check are recorded in
 [`results/runtime-boundary-entities-2026-08-10.md`](results/runtime-boundary-entities-2026-08-10.md).
+The separate contract-plane implementation, scale cost, and type-only barrel
+fixture are recorded in
+[`results/contract-plane-2026-08-10.md`](results/contract-plane-2026-08-10.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
