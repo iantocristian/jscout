@@ -1,5 +1,9 @@
 # Workflow logical-routing regression — 2026-08-10
 
+> Post-merge hub-threshold, DI fan-out, degree-cache, and seed-contract fixes
+> are recorded in
+> [`workflow-logical-routing-followups-2026-08-10.md`](workflow-logical-routing-followups-2026-08-10.md).
+
 ## Scope
 
 The generic structural neighborhood has been replaced inside

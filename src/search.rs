@@ -165,9 +165,10 @@ fn bm25_ranking(
          ORDER BY r LIMIT ?5",
     )?;
     let flags = origin_flags(file_origins);
-    let rows = stmt.query_map(rusqlite::params![fq, flags.0, flags.1, flags.2, limit as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![fq, flags.0, flags.1, flags.2, limit as i64],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+    )?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
@@ -194,9 +195,10 @@ fn vector_ranking(
             OR (?4 AND f.origin='dependency')",
     )?;
     let flags = origin_flags(file_origins);
-    let rows = stmt.query_map(rusqlite::params![provider.model, flags.0, flags.1, flags.2], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![provider.model, flags.0, flags.1, flags.2],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+    )?;
     let mut scored: Vec<(i64, f64)> = rows
         .filter_map(|r| r.ok())
         .map(|(id, blob)| (id, embed::cosine(&qv, &embed::blob_to_vec(&blob)) as f64))
@@ -225,7 +227,10 @@ pub struct Reranker {
 impl Reranker {
     pub fn from_env() -> Option<Self> {
         let url = std::env::var("JSCOUT_RERANK_URL").ok()?;
-        Some(Self { url, model: std::env::var("JSCOUT_RERANK_MODEL").ok() })
+        Some(Self {
+            url,
+            model: std::env::var("JSCOUT_RERANK_MODEL").ok(),
+        })
     }
 
     fn rerank(&self, query: &str, candidates: &[(i64, String)]) -> Result<Vec<(i64, f64)>> {
@@ -511,9 +516,9 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
                     .unwrap_or(expansion.nodes.len() - 1);
                 let removed = expansion.nodes.remove(removable);
                 let edge_count = expansion.edges.len();
-                expansion.edges.retain(|edge| {
-                    edge.source != removed.key && edge.target != removed.key
-                });
+                expansion
+                    .edges
+                    .retain(|edge| edge.source != removed.key && edge.target != removed.key);
                 expansion.truncated = true;
                 result.response_budget.omitted_nodes += 1;
                 result.response_budget.omitted_edges += edge_count - expansion.edges.len();
@@ -557,15 +562,30 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
             continue;
         }
 
-        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| !hit.used_by.is_empty()) {
+        if let Some(hit) = result
+            .hits
+            .iter_mut()
+            .rev()
+            .find(|hit| !hit.used_by.is_empty())
+        {
             hit.used_by.pop();
             continue;
         }
-        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| !hit.uses.is_empty()) {
+        if let Some(hit) = result
+            .hits
+            .iter_mut()
+            .rev()
+            .find(|hit| !hit.uses.is_empty())
+        {
             hit.uses.pop();
             continue;
         }
-        if let Some(hit) = result.hits.iter_mut().rev().find(|hit| hit.anchors.len() > 1) {
+        if let Some(hit) = result
+            .hits
+            .iter_mut()
+            .rev()
+            .find(|hit| hit.anchors.len() > 1)
+        {
             hit.anchors.pop();
             continue;
         }
@@ -677,7 +697,10 @@ fn project_chunk_anchors(
 
 fn dedup(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
-    values.into_iter().filter(|value| seen.insert(value.clone())).collect()
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
 }
 
 fn expand_hits(
@@ -777,7 +800,9 @@ fn expand_hits(
 
     let mut ranked_nodes: Vec<_> = candidate_nodes.into_values().collect();
     ranked_nodes.sort_by(|a, b| {
-        b.relevance.total_cmp(&a.relevance).then_with(|| a.key.cmp(&b.key))
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| a.key.cmp(&b.key))
     });
     let mut ranked_edges: Vec<_> = candidate_edges.into_values().collect();
     ranked_edges.sort_by(|a, b| {
@@ -803,8 +828,7 @@ fn expand_hits(
 
     let mut edges = Vec::new();
     for edge in ranked_edges {
-        if !selected_node_keys.contains(&edge.source)
-            || !selected_node_keys.contains(&edge.target)
+        if !selected_node_keys.contains(&edge.source) || !selected_node_keys.contains(&edge.target)
         {
             truncated = true;
             continue;
@@ -842,8 +866,9 @@ mod tests {
         SearchOptions, SearchResult, apply_response_budget, search,
     };
     use crate::{
-        file_role, indexer, origin, store,
+        file_role, indexer, origin,
         semantic::SemanticArtifact,
+        store,
         structural::{GraphEdge, GraphNode},
     };
 
@@ -865,7 +890,10 @@ mod tests {
             &conn,
             None,
             "greet",
-            &SearchOptions { limit: 8, ..Default::default() },
+            &SearchOptions {
+                limit: 8,
+                ..Default::default()
+            },
         )?;
         assert_eq!(result.snapshot.len(), 64);
         let definition = result
@@ -938,7 +966,10 @@ mod tests {
                 include_memory: true,
                 memory_limit: 4,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
-                expansion: ExpansionOptions { byte_limit: 1, ..Default::default() },
+                expansion: ExpansionOptions {
+                    byte_limit: 1,
+                    ..Default::default()
+                },
             },
         )?
         .expansion
@@ -953,10 +984,7 @@ mod tests {
     #[test]
     fn response_budget_caps_the_complete_rendered_search_envelope() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        let source = format!(
-            "export const needle = '{}';\n",
-            "x".repeat(12_000)
-        );
+        let source = format!("export const needle = '{}';\n", "x".repeat(12_000));
         fs::write(repo.path().join("large.ts"), source)?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;

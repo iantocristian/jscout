@@ -63,7 +63,9 @@ pub fn render_source(
     if byte_limit < 64 {
         bail!("source byte limit must be at least 64 bytes");
     }
-    if start > end || end > full_source.len() || !full_source.is_char_boundary(start)
+    if start > end
+        || end > full_source.len()
+        || !full_source.is_char_boundary(start)
         || !full_source.is_char_boundary(end)
     {
         bail!("source span {start}..{end} is outside the indexed file");
@@ -101,7 +103,10 @@ fn render_elided(
 ) -> Result<(String, Vec<ElidedRange>)> {
     let line_index = LineIndex::new(full_source);
     let line_count = full_source.lines().count() + usize::from(full_source.ends_with('\n'));
-    let mut visitor = ElisionVisitor { line_index: &line_index, keep: vec![false; line_count.max(1)] };
+    let mut visitor = ElisionVisitor {
+        line_index: &line_index,
+        keep: vec![false; line_count.max(1)],
+    };
     let clean_parse = parse::with_parsed(full_source, path, |ret, _| {
         if !ret.diagnostics.is_empty() {
             return false;
@@ -128,7 +133,12 @@ fn render_elided(
             || trimmed.starts_with("catch")
             || trimmed.starts_with("finally");
         selected_keep.push(
-            visitor.keep.get(first_global_line + index).copied().unwrap_or(false) || structural,
+            visitor
+                .keep
+                .get(first_global_line + index)
+                .copied()
+                .unwrap_or(false)
+                || structural,
         );
     }
     if let Some(first) = selected_keep.iter_mut().position(|_| true) {
@@ -157,12 +167,14 @@ fn render_elided(
             .collect();
         let start_line = first_global_line as u32 + range_start as u32 + 1;
         let end_line = first_global_line as u32 + index as u32;
-        let marker = format!(
-            "{indent}/* … jscout elided source lines {start_line}-{end_line} … */\n"
-        );
+        let marker =
+            format!("{indent}/* … jscout elided source lines {start_line}-{end_line} … */\n");
         if marker.len() < original.len() {
             output.push_str(&marker);
-            elisions.push(ElidedRange { start_line, end_line });
+            elisions.push(ElidedRange {
+                start_line,
+                end_line,
+            });
         } else {
             output.push_str(&original);
         }
@@ -391,7 +403,11 @@ mod tests {
         assert!(rendered.text.contains("inventory.reserve"));
         assert!(rendered.text.contains("catch (error)"));
         assert!(rendered.text.contains("return order"));
-        assert!(!rendered.text.contains("localPlumbingWithAnIntentionallyLongName"));
+        assert!(
+            !rendered
+                .text
+                .contains("localPlumbingWithAnIntentionallyLongName")
+        );
         assert!(!rendered.elisions.is_empty());
         assert!(rendered.rendered_bytes < rendered.original_bytes);
         Ok(())
@@ -401,14 +417,8 @@ mod tests {
     fn both_views_obey_the_same_source_byte_ceiling() -> Result<()> {
         let source = format!("export const value = '{}';\n", "x".repeat(2_000));
         for view in [SourceView::Full, SourceView::Elided] {
-            let rendered = render_source(
-                Path::new("large.ts"),
-                &source,
-                0,
-                source.len(),
-                view,
-                256,
-            )?;
+            let rendered =
+                render_source(Path::new("large.ts"), &source, 0, source.len(), view, 256)?;
             assert!(rendered.rendered_bytes <= 256);
             assert!(rendered.budget_truncated);
         }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 pub const DB_FILE: &str = ".jscout.db";
@@ -136,7 +136,8 @@ CREATE TABLE IF NOT EXISTS module_edges(
   to_file INTEGER,                -- resolved in-repo file
   package TEXT,                   -- external package name
   resolution TEXT,                -- resolver | workspace | workspace-inferred
-  package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE SET NULL
+  package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE SET NULL,
+  type_only INTEGER NOT NULL DEFAULT 0 CHECK(type_only IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_module_edges_from ON module_edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_module_edges_to ON module_edges(to_file);
@@ -352,9 +353,7 @@ pub(crate) fn with_read_snapshot<T>(
             Ok(value)
         }
         Err(error) => {
-            let _ = conn.execute_batch(&format!(
-                "ROLLBACK TO {savepoint}; RELEASE {savepoint}"
-            ));
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {savepoint}; RELEASE {savepoint}"));
             Err(error)
         }
     }
@@ -364,7 +363,11 @@ pub(crate) fn with_read_snapshot<T>(
 /// projections are disposable and are rebuilt by the next index operation.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: u32 = conn
-        .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
         .ok()
         .and_then(|v: String| v.parse().ok())
         .unwrap_or(0);
@@ -445,7 +448,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     if version < 4 {
@@ -462,7 +468,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     if version < 5 {
@@ -474,7 +483,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         // Role-aware result payloads must not appear current until every file
         // has passed through the classifier on the next index operation.
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // The idempotent schema batch creates v6 semantic tables. Preserve their
@@ -490,7 +502,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         if !has_column(conn, "module_edges", "resolution")? {
             conn.execute("ALTER TABLE module_edges ADD COLUMN resolution TEXT", [])?;
         }
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v7 -> v8: package instances become the ownership boundary for
@@ -522,7 +537,10 @@ fn migrate(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v8 -> v9: runtime/general entities preserve per-site spans and trust
@@ -532,7 +550,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v9 -> v10: the contract plane shares the evidence/occurrence machinery
@@ -617,7 +638,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     // v10 -> v11: deterministic general-entity extractors were added without
@@ -629,11 +653,33 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("UPDATE files SET hash = ''", [])?;
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
+    }
+
+    // v11 -> v12: module resolution remains shared by the runtime and
+    // contract planes, but projection must distinguish requests that occur
+    // only in type/documentary bindings. Module edges are disposable and are
+    // rebuilt on the next index operation.
+    if version < 12 {
+        if !has_column(conn, "module_edges", "type_only")? {
+            conn.execute(
+                "ALTER TABLE module_edges
+                 ADD COLUMN type_only INTEGER NOT NULL DEFAULT 0
+                 CHECK(type_only IN (0, 1))",
+                [],
+            )?;
+        }
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
     }
 
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','11')
+        "INSERT INTO meta(key, value) VALUES('schema_version','12')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -641,9 +687,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
-    );
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)");
     Ok(conn.query_row(&sql, [column], |r| r.get::<_, i64>(0))? != 0)
 }
 
@@ -682,7 +726,8 @@ pub fn file_source_path(conn: &Connection, root: &Path, file_id: i64) -> Result<
     match origin.as_str() {
         "repository" | "workspace" => Ok(root.join(path)),
         "dependency" => {
-            let package_path = package_path.context("dependency file has no package-relative path")?;
+            let package_path =
+                package_path.context("dependency file has no package-relative path")?;
             let package_root = package_root.context("dependency file has no package instance")?;
             Ok(PathBuf::from(package_root).join(package_path))
         }
@@ -707,7 +752,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         assert!(database.is_file());
         Ok(())
     }
@@ -744,7 +789,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -787,7 +832,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -843,17 +888,15 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        let artifacts: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_artifacts",
-            [],
-            |row| row.get(0),
-        )?;
-        let supports: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_supports",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "11");
+        let artifacts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        let supports: i64 =
+            conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(version, "12");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -882,7 +925,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -926,7 +969,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -976,7 +1019,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1042,7 +1085,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1090,7 +1133,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1099,6 +1142,47 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
+        assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v11_with_type_only_module_edge_classification() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '11');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '7');
+             CREATE TABLE module_edges(
+               from_file INTEGER NOT NULL, request TEXT NOT NULL,
+               to_file INTEGER, package TEXT, resolution TEXT,
+               package_instance_id INTEGER
+             );
+             INSERT INTO module_edges VALUES(1, './types', 2, NULL, 'resolver', NULL);",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let type_only: i64 = conn.query_row(
+            "SELECT type_only FROM module_edges WHERE from_file=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let snapshots: i64 = conn.query_row(
+            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "12");
+        assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
     }

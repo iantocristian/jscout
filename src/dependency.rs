@@ -129,7 +129,9 @@ pub fn discover(
         }
 
         if !found.values().any(|package| package.name == selector) {
-            bail!("selected dependency `{selector}` is not installed or resolvable from an indexed importer");
+            bail!(
+                "selected dependency `{selector}` is not installed or resolvable from an indexed importer"
+            );
         }
     }
 
@@ -191,7 +193,10 @@ pub fn synchronize_instances(
                  WHERE origin IN ('workspace', 'dependency')",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, PathBuf::from(row.get::<_, String>(1)?)))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
             })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
@@ -201,9 +206,8 @@ pub fn synchronize_instances(
                 // Remove instance-owned files through the canonical deletion
                 // path before deleting the package instance itself.
                 let file_ids: Vec<i64> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT id FROM files WHERE package_instance_id=?1",
-                    )?;
+                    let mut stmt =
+                        conn.prepare("SELECT id FROM files WHERE package_instance_id=?1")?;
                     let rows = stmt.query_map([id], |row| row.get(0))?;
                     rows.collect::<std::result::Result<_, _>>()?
                 };
@@ -219,8 +223,12 @@ pub fn synchronize_instances(
         let mut workspace_roots: Vec<_> = workspace.packages.iter().collect();
         workspace_roots.sort_by_key(|package| package.canonical_root.components().count());
         for package in workspace_roots {
-            let Some(id) = instances.get(&package.canonical_root) else { continue };
-            let Ok(relative) = package.canonical_root.strip_prefix(root) else { continue };
+            let Some(id) = instances.get(&package.canonical_root) else {
+                continue;
+            };
+            let Ok(relative) = package.canonical_root.strip_prefix(root) else {
+                continue;
+            };
             let prefix = relative.to_string_lossy().replace('\\', "/");
             let subtree_prefix = format!("{prefix}/");
             conn.execute(
@@ -288,7 +296,10 @@ pub fn should_skip_minified(path: &Path, source: &str, forced_entry: bool) -> bo
     if forced_entry {
         return false;
     }
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
     if name.contains(".min.") {
         return true;
     }
@@ -320,7 +331,9 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .is_some_and(|path| forced_entries.contains(&path))
         };
-        is_forced(right).cmp(&is_forced(left)).then_with(|| left.cmp(right))
+        is_forced(right)
+            .cmp(&is_forced(left))
+            .then_with(|| left.cmp(right))
     });
 
     let mut files = Vec::new();
@@ -332,7 +345,9 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
             continue;
         };
         let package_path = package_path.to_string_lossy().replace('\\', "/");
-        let bytes = fs::metadata(&source_path).map(|meta| meta.len()).unwrap_or(0);
+        let bytes = fs::metadata(&source_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         if bytes > limits.max_file_bytes
             || files.len() >= limits.max_files
             || selected_bytes.saturating_add(bytes) > limits.max_bytes
@@ -349,7 +364,11 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
             bytes,
         });
     }
-    let status = if skipped_files == 0 { "complete" } else { "truncated" };
+    let status = if skipped_files == 0 {
+        "complete"
+    } else {
+        "truncated"
+    };
     Ok(PackagePlan {
         package: package.clone(),
         files,
@@ -395,7 +414,11 @@ fn analysis_roots(
             "runtime".into(),
         );
     }
-    (vec![package.canonical_root.clone()], BTreeSet::new(), "package-root".into())
+    (
+        vec![package.canonical_root.clone()],
+        BTreeSet::new(),
+        "package-root".into(),
+    )
 }
 
 fn collect_named_condition(value: Option<&serde_json::Value>, name: &str, out: &mut Vec<String>) {
@@ -484,7 +507,10 @@ fn roots_for_targets(package_root: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for target in targets {
         let relative = target.strip_prefix(package_root).unwrap_or(target);
-        let first = relative.components().next().map(|component| component.as_os_str());
+        let first = relative
+            .components()
+            .next()
+            .map(|component| component.as_os_str());
         let root = match first {
             Some(first) if relative.components().count() > 1 => package_root.join(first),
             _ if target.is_dir() => target.clone(),
@@ -513,9 +539,13 @@ fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) {
         }
         return;
     }
-    let Ok(entries) = fs::read_dir(root) else { return };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || name == "node_modules" {
@@ -566,13 +596,18 @@ fn importer_requests(root: &Path, conn: &Connection) -> Result<Vec<(PathBuf, Str
          ORDER BY f.path, requests.request",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok((root.join(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+        Ok((
+            root.join(row.get::<_, String>(0)?),
+            row.get::<_, String>(1)?,
+        ))
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn owning_package_root(resolved: &Path, expected_name: &str) -> Result<Option<PathBuf>> {
-    let resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.to_path_buf());
+    let resolved = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| resolved.to_path_buf());
     let mut current = if resolved.is_dir() {
         resolved
     } else {
@@ -595,7 +630,11 @@ fn owning_package_root(resolved: &Path, expected_name: &str) -> Result<Option<Pa
     }
 }
 
-fn read_instance(root: &Path, package_root: &Path, workspace: &WorkspaceMap) -> Result<DiscoveredPackage> {
+fn read_instance(
+    root: &Path,
+    package_root: &Path,
+    workspace: &WorkspaceMap,
+) -> Result<DiscoveredPackage> {
     let canonical_root = package_root
         .canonicalize()
         .with_context(|| format!("canonicalize package root {}", package_root.display()))?;
@@ -616,7 +655,10 @@ fn read_instance(root: &Path, package_root: &Path, workspace: &WorkspaceMap) -> 
     Ok(DiscoveredPackage {
         origin: origin.into(),
         name: name.into(),
-        version: package.get("version").and_then(|value| value.as_str()).map(str::to_string),
+        version: package
+            .get("version")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
         locator: display_locator(root, &canonical_root),
         canonical_root,
         manifest_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
@@ -650,7 +692,9 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{DependencyLimits, DiscoveredPackage, discover, plan_packages, should_skip_minified};
+    use super::{
+        DependencyLimits, DiscoveredPackage, discover, plan_packages, should_skip_minified,
+    };
     use crate::{store, workspace::WorkspaceMap};
 
     fn write(path: &Path, content: &str) -> Result<()> {
@@ -660,7 +704,10 @@ mod tests {
     }
 
     fn importer(conn: &rusqlite::Connection, root: &Path, path: &str, request: &str) -> Result<()> {
-        write(&root.join(path), &format!("import value from '{request}';\n"))?;
+        write(
+            &root.join(path),
+            &format!("import value from '{request}';\n"),
+        )?;
         conn.execute(
             "INSERT INTO files(path, hash, role) VALUES(?1, 'hash', 'production')",
             [path],
@@ -681,12 +728,18 @@ mod tests {
 
         let repo = tempfile::tempdir()?;
         let root = repo.path();
-        write(&root.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")?;
+        write(
+            &root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
         write(
             &root.join("packages/work/package.json"),
             r#"{"name":"work","version":"0.1.0","main":"src/index.ts"}"#,
         )?;
-        write(&root.join("packages/work/src/index.ts"), "export default 1;\n")?;
+        write(
+            &root.join("packages/work/src/index.ts"),
+            "export default 1;\n",
+        )?;
 
         let external = root.join("node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad");
         write(
@@ -701,21 +754,25 @@ mod tests {
         let conn = store::open(root)?;
         importer(&conn, root, "src/main.ts", "left-pad")?;
         let workspace = WorkspaceMap::build(root);
-        let packages = discover(
-            root,
-            &conn,
-            &["left-pad".into(), "work".into()],
-            &workspace,
-        )?;
+        let packages = discover(root, &conn, &["left-pad".into(), "work".into()], &workspace)?;
 
         assert_eq!(packages.len(), 2);
-        let dependency = packages.iter().find(|package| package.name == "left-pad").unwrap();
+        let dependency = packages
+            .iter()
+            .find(|package| package.name == "left-pad")
+            .unwrap();
         assert_eq!(dependency.origin, "dependency");
         assert_eq!(dependency.version.as_deref(), Some("1.3.0"));
         assert_eq!(dependency.canonical_root, external.canonicalize()?);
-        let work = packages.iter().find(|package| package.name == "work").unwrap();
+        let work = packages
+            .iter()
+            .find(|package| package.name == "work")
+            .unwrap();
         assert_eq!(work.origin, "workspace");
-        assert_eq!(work.canonical_root, root.join("packages/work").canonicalize()?);
+        assert_eq!(
+            work.canonical_root,
+            root.join("packages/work").canonicalize()?
+        );
         Ok(())
     }
 
@@ -731,15 +788,20 @@ mod tests {
                 &base.join("node_modules/dep/package.json"),
                 &format!(r#"{{"name":"dep","version":"{version}","main":"index.js"}}"#),
             )?;
-            write(&base.join("node_modules/dep/index.js"), "module.exports = 1;\n")?;
+            write(
+                &base.join("node_modules/dep/index.js"),
+                "module.exports = 1;\n",
+            )?;
         }
         let conn = store::open(root)?;
         importer(&conn, root, "src/root.ts", "dep")?;
         importer(&conn, root, "packages/app/src/app.ts", "dep")?;
 
         let packages = discover(root, &conn, &["dep".into()], &WorkspaceMap::build(root))?;
-        let versions: BTreeSet<_> =
-            packages.iter().filter_map(|package| package.version.as_deref()).collect();
+        let versions: BTreeSet<_> = packages
+            .iter()
+            .filter_map(|package| package.version.as_deref())
+            .collect();
         assert_eq!(versions, BTreeSet::from(["1.0.0", "2.0.0"]));
         Ok(())
     }
@@ -767,9 +829,18 @@ mod tests {
             &package_root.path().join("package.json"),
             r#"{"name":"dep","version":"1.0.0","source":"src/z-entry.ts","main":"dist/index.js"}"#,
         )?;
-        write(&package_root.path().join("src/a.ts"), "export const a = 1;\n")?;
-        write(&package_root.path().join("src/z-entry.ts"), "export const entry = 1;\n")?;
-        write(&package_root.path().join("dist/index.js"), "exports.entry = 1;\n")?;
+        write(
+            &package_root.path().join("src/a.ts"),
+            "export const a = 1;\n",
+        )?;
+        write(
+            &package_root.path().join("src/z-entry.ts"),
+            "export const entry = 1;\n",
+        )?;
+        write(
+            &package_root.path().join("dist/index.js"),
+            "exports.entry = 1;\n",
+        )?;
         let package = DiscoveredPackage {
             origin: "dependency".into(),
             name: "dep".into(),
@@ -781,7 +852,11 @@ mod tests {
 
         let plans = plan_packages(
             &[package],
-            DependencyLimits { max_files: 1, max_bytes: 1024, max_file_bytes: 1024 },
+            DependencyLimits {
+                max_files: 1,
+                max_bytes: 1024,
+                max_file_bytes: 1024,
+            },
         )?;
         let plan = &plans[0];
         assert_eq!(plan.source_basis, "manifest-source");
@@ -790,7 +865,12 @@ mod tests {
         assert!(plan.files[0].forced_entry);
         assert_eq!(plan.skipped_files, 1);
         assert_eq!(plan.status, "truncated");
-        assert!(!plan.files.iter().any(|file| file.package_path.starts_with("dist/")));
+        assert!(
+            !plan
+                .files
+                .iter()
+                .any(|file| file.package_path.starts_with("dist/"))
+        );
         Ok(())
     }
 
@@ -802,9 +882,14 @@ mod tests {
             r#"{"name":"dep","version":"1.0.0","exports":{"./*":"./dist/*.js"}}"#,
         )?;
         write(&package_root.path().join("dist/a.js"), "exports.a = 1;\n")?;
-        write(&package_root.path().join("src/a.ts"), "export const a = 1;\n")?;
         write(
-            &package_root.path().join("dist/node_modules/nested/index.js"),
+            &package_root.path().join("src/a.ts"),
+            "export const a = 1;\n",
+        )?;
+        write(
+            &package_root
+                .path()
+                .join("dist/node_modules/nested/index.js"),
             "module.exports = 1;\n",
         )?;
         let package = DiscoveredPackage {
@@ -817,8 +902,11 @@ mod tests {
         };
 
         let plans = plan_packages(&[package], DependencyLimits::default())?;
-        let paths: Vec<&str> =
-            plans[0].files.iter().map(|file| file.package_path.as_str()).collect();
+        let paths: Vec<&str> = plans[0]
+            .files
+            .iter()
+            .map(|file| file.package_path.as_str())
+            .collect();
         assert_eq!(plans[0].source_basis, "runtime");
         assert_eq!(paths, vec!["dist/a.js"]);
         assert!(should_skip_minified(Path::new("bundle.min.js"), "x", false));
@@ -851,8 +939,11 @@ mod tests {
         };
 
         let plans = plan_packages(&[package], DependencyLimits::default())?;
-        let paths: Vec<&str> =
-            plans[0].files.iter().map(|file| file.package_path.as_str()).collect();
+        let paths: Vec<&str> = plans[0]
+            .files
+            .iter()
+            .map(|file| file.package_path.as_str())
+            .collect();
         assert_eq!(paths, ["fallback/index.js"]);
         Ok(())
     }

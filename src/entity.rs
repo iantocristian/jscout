@@ -11,7 +11,7 @@ use serde_json::json;
 
 /// Bump whenever deterministic extraction semantics change in a way that
 /// requires unchanged files to be parsed again.
-pub const EXTRACTION_VERSION: &str = "1";
+pub const EXTRACTION_VERSION: &str = "3";
 
 #[derive(Debug, Clone)]
 pub struct EntitySite {
@@ -63,12 +63,13 @@ struct TypeReference {
 #[derive(Default)]
 struct TypeReferenceVisitor {
     references: Vec<TypeReference>,
+    bound_names: Vec<HashSet<String>>,
 }
 
 impl<'a> Visit<'a> for TypeReferenceVisitor {
     fn visit_ts_type_reference(&mut self, reference: &TSTypeReference<'a>) {
         let name = reference.type_name.to_string();
-        if !is_builtin_contract_wrapper(&name) {
+        if !is_builtin_contract_wrapper(&name) && !self.is_bound(&name) {
             self.references.push(TypeReference {
                 name,
                 start: reference.type_name.span().start,
@@ -76,6 +77,58 @@ impl<'a> Visit<'a> for TypeReferenceVisitor {
             });
         }
         oxc_ast_visit::walk::walk_ts_type_reference(self, reference);
+    }
+
+    fn visit_ts_function_type(&mut self, function: &TSFunctionType<'a>) {
+        self.with_type_parameters(function.type_parameters.as_deref(), |visitor| {
+            oxc_ast_visit::walk::walk_ts_function_type(visitor, function);
+        });
+    }
+
+    fn visit_ts_constructor_type(&mut self, constructor: &TSConstructorType<'a>) {
+        self.with_type_parameters(constructor.type_parameters.as_deref(), |visitor| {
+            oxc_ast_visit::walk::walk_ts_constructor_type(visitor, constructor);
+        });
+    }
+
+    fn visit_ts_mapped_type(&mut self, mapped: &TSMappedType<'a>) {
+        self.with_bound_names([mapped.key.name.as_str()], |visitor| {
+            oxc_ast_visit::walk::walk_ts_mapped_type(visitor, mapped);
+        });
+    }
+}
+
+impl TypeReferenceVisitor {
+    fn with_type_parameters<'a>(
+        &mut self,
+        parameters: Option<&TSTypeParameterDeclaration<'a>>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        self.with_bound_names(
+            parameters
+                .into_iter()
+                .flat_map(|declaration| declaration.params.iter())
+                .map(|parameter| parameter.name.name.as_str()),
+            visit,
+        );
+    }
+
+    fn with_bound_names<'a>(
+        &mut self,
+        names: impl IntoIterator<Item = &'a str>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let names: HashSet<String> = names.into_iter().map(str::to_string).collect();
+        self.bound_names.push(names);
+        visit(self);
+        self.bound_names.pop();
+    }
+
+    fn is_bound(&self, name: &str) -> bool {
+        self.bound_names
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 }
 
@@ -158,12 +211,16 @@ impl EntityVisitor {
         owner: &str,
         owner_kind: &'static str,
         function: &Function<'_>,
+        outer_type_parameters: Option<&TSTypeParameterDeclaration<'_>>,
     ) {
+        let bound_names = type_parameter_names(outer_type_parameters)
+            .chain(type_parameter_names(function.type_parameters.as_deref()))
+            .collect::<HashSet<_>>();
         for (index, parameter) in function.params.items.iter().enumerate() {
             if let Some(annotation) = &parameter.type_annotation {
                 let before = self.sites.len();
                 self.push_contract_references(
-                    collect_type_references(annotation),
+                    collect_type_references(annotation, &bound_names),
                     "parameter_contract",
                     owner,
                     owner_kind,
@@ -177,7 +234,7 @@ impl EntityVisitor {
             && let Some(annotation) = &rest.type_annotation
         {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "parameter_contract",
                 owner,
                 owner_kind,
@@ -185,7 +242,7 @@ impl EntityVisitor {
         }
         if let Some(annotation) = &function.return_type {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "return_contract",
                 owner,
                 owner_kind,
@@ -193,16 +250,13 @@ impl EntityVisitor {
         }
     }
 
-    fn extract_arrow_contracts(
-        &mut self,
-        owner: &str,
-        arrow: &ArrowFunctionExpression<'_>,
-    ) {
+    fn extract_arrow_contracts(&mut self, owner: &str, arrow: &ArrowFunctionExpression<'_>) {
+        let bound_names = type_parameter_names(arrow.type_parameters.as_deref()).collect();
         for (index, parameter) in arrow.params.items.iter().enumerate() {
             if let Some(annotation) = &parameter.type_annotation {
                 let before = self.sites.len();
                 self.push_contract_references(
-                    collect_type_references(annotation),
+                    collect_type_references(annotation, &bound_names),
                     "parameter_contract",
                     owner,
                     "exported_arrow",
@@ -214,7 +268,7 @@ impl EntityVisitor {
         }
         if let Some(annotation) = &arrow.return_type {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "return_contract",
                 owner,
                 "exported_arrow",
@@ -257,8 +311,12 @@ impl EntityVisitor {
     }
 
     fn extract_logic_function(&mut self, call: &CallExpression<'_>) {
-        let Some(config) = first_object_argument(call) else { return };
-        let Some(identifier) = object_value(config, "universalIdentifier") else { return };
+        let Some(config) = first_object_argument(call) else {
+            return;
+        };
+        let Some(identifier) = object_value(config, "universalIdentifier") else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) = self.identity(identifier) else {
             return;
         };
@@ -285,7 +343,9 @@ impl EntityVisitor {
         else {
             return;
         };
-        let Some(event_name_expression) = object_value(settings, "eventName") else { return };
+        let Some(event_name_expression) = object_value(settings, "eventName") else {
+            return;
+        };
         let Some(event_name) = static_string(event_name_expression, &self.static_strings) else {
             return;
         };
@@ -308,14 +368,22 @@ impl EntityVisitor {
     }
 
     fn extract_mutation(&mut self, call: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &call.callee else { return };
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return;
+        };
         if member.property.name != "mutation" {
             return;
         }
-        let Some(mutation) = first_object_argument(call) else { return };
+        let Some(mutation) = first_object_argument(call) else {
+            return;
+        };
         for property in &mutation.properties {
-            let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
-            let Some(operation) = property.key.static_name() else { continue };
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(operation) = property.key.static_name() else {
+                continue;
+            };
             let Some((action, resource)) = mutation_resource(operation.as_ref()) else {
                 continue;
             };
@@ -344,7 +412,9 @@ impl EntityVisitor {
     }
 
     fn extract_job_call(&mut self, call: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &call.callee else { return };
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return;
+        };
         let method = member.property.name.as_str();
         if !matches!(
             method,
@@ -352,7 +422,9 @@ impl EntityVisitor {
         ) {
             return;
         }
-        let Some(object) = member_path(&member.object) else { return };
+        let Some(object) = member_path(&member.object) else {
+            return;
+        };
         let object_lower = object.to_ascii_lowercase();
         if !["queue", "job", "worker", "cron", "schedul", "producer"]
             .iter()
@@ -365,7 +437,9 @@ impl EntityVisitor {
         } else {
             call.arguments.first().and_then(Argument::as_expression)
         };
-        let Some(identity_expression) = identity_expression else { return };
+        let Some(identity_expression) = identity_expression else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) =
             self.identity(identity_expression)
         else {
@@ -411,9 +485,7 @@ impl EntityVisitor {
 
         if let Some(path) = callee_path.as_deref()
             && let Some(method) = http_method(callee_name)
-            && path
-                .split('.')
-                .any(|part| matches!(part, "app" | "router" | "server" | "route"))
+            && path.split('.').any(is_router_holder)
             && let Some(path_expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(route_path) = static_string(path_expression, &self.static_strings)
         {
@@ -441,10 +513,15 @@ impl EntityVisitor {
             && let Some(path) = callee_path.as_deref()
             && path.to_ascii_lowercase().contains("client")
             && let Some(config) = first_object_argument(call)
+            && !is_graphql_options_object(config)
         {
             for property in &config.properties {
-                let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
-                let Some(operation) = property.key.static_name() else { continue };
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    continue;
+                };
+                let Some(operation) = property.key.static_name() else {
+                    continue;
+                };
                 self.push_general(GeneralSiteSpec {
                     entity_type: "graphql_operation",
                     role: "graphql_operation",
@@ -462,7 +539,7 @@ impl EntityVisitor {
 
         if matches!(callee_name, "get" | "require" | "getEnv" | "requireEnv")
             && callee_path.as_deref().is_some_and(|path| {
-                matches!(path, "Deno.env.get" | "env.get" | "config.get" | "getEnv" | "requireEnv")
+                matches!(path, "Deno.env.get" | "env.get" | "getEnv" | "requireEnv")
             })
             && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(name) = static_string(expression, &self.static_strings)
@@ -481,11 +558,29 @@ impl EntityVisitor {
             });
         }
 
+        if matches!(callee_name, "get" | "require")
+            && callee_path.as_deref().is_some_and(is_config_api_path)
+            && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(name) = static_string(expression, &self.static_strings)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "config_key",
+                role: "config_read",
+                identity_kind: "literal",
+                identity_name: name,
+                identity_start: expression.span().start,
+                span: call.span,
+                target: None,
+                extractor: "configuration-api-call",
+                provenance: "configuration-api-pattern",
+                detail: json!({ "callee": callee_path }),
+            });
+        }
+
         if is_feature_flag_callee(callee_name)
             && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some((kind, name, start)) = self.identity(expression).or_else(|| {
-                member_path(expression)
-                    .map(|name| ("literal", name, expression.span().start))
+                member_path(expression).map(|name| ("literal", name, expression.span().start))
             })
         {
             self.push_general(GeneralSiteSpec {
@@ -505,10 +600,10 @@ impl EntityVisitor {
         if let Some((resource, access)) = database_call(call, &self.static_strings) {
             self.push_general(GeneralSiteSpec {
                 entity_type: "database_resource",
-                role: if access == "write" {
-                    "database_write"
-                } else {
-                    "database_read"
+                role: match access {
+                    "write" => "database_write",
+                    "read" => "database_read",
+                    _ => "database_acquire",
                 },
                 identity_kind: "literal",
                 identity_name: resource,
@@ -545,13 +640,21 @@ impl EntityVisitor {
         let controller_prefix = class
             .decorators
             .iter()
-            .find_map(|decorator| decorator_static_argument(decorator, "Controller", &self.static_strings))
+            .find_map(|decorator| {
+                decorator_static_argument(decorator, "Controller", &self.static_strings)
+            })
             .unwrap_or_default();
         for element in &class.body.body {
-            let ClassElement::MethodDefinition(method) = element else { continue };
-            let Some(method_name) = method.key.static_name() else { continue };
+            let ClassElement::MethodDefinition(method) = element else {
+                continue;
+            };
+            let Some(method_name) = method.key.static_name() else {
+                continue;
+            };
             for decorator in &method.decorators {
-                let Some((decorator_name, call)) = decorator_call(decorator) else { continue };
+                let Some((decorator_name, call)) = decorator_call(decorator) else {
+                    continue;
+                };
                 let terminal = decorator_name.rsplit('.').next().unwrap_or(&decorator_name);
                 if let Some(http_method) = http_method(terminal) {
                     let method_path = call
@@ -606,11 +709,15 @@ impl EntityVisitor {
     }
 
     fn extract_provider(&mut self, object: &ObjectExpression<'_>) {
-        let Some(token) = object_value(object, "provide") else { return };
+        let Some(token) = object_value(object, "provide") else {
+            return;
+        };
         let implementation = ["useClass", "useFactory", "useExisting"]
             .into_iter()
             .find_map(|field| object_value(object, field).map(|value| (field, value)));
-        let Some((binding, implementation)) = implementation else { return };
+        let Some((binding, implementation)) = implementation else {
+            return;
+        };
         let Some((identity_kind, identity_name, identity_start)) = self.identity(token) else {
             return;
         };
@@ -634,8 +741,12 @@ impl EntityVisitor {
     }
 
     fn extract_decorator(&mut self, decorator: &Decorator<'_>) {
-        let Expression::CallExpression(call) = &decorator.expression else { return };
-        let Expression::Identifier(callee) = &call.callee else { return };
+        let Expression::CallExpression(call) = &decorator.expression else {
+            return;
+        };
+        let Expression::Identifier(callee) = &call.callee else {
+            return;
+        };
         let Some(identity_expression) = call.arguments.first().and_then(Argument::as_expression)
         else {
             return;
@@ -677,7 +788,8 @@ impl<'a> Visit<'a> for EntityVisitor {
             && let Some(initializer) = &declaration.init
         {
             if let Some(value) = static_string(initializer, &self.static_strings) {
-                self.static_strings.insert(identifier.name.to_string(), value);
+                self.static_strings
+                    .insert(identifier.name.to_string(), value);
             }
             if self.exported.contains(identifier.name.as_str())
                 && let Expression::ArrowFunctionExpression(arrow) = initializer
@@ -702,11 +814,7 @@ impl<'a> Visit<'a> for EntityVisitor {
         oxc_ast_visit::walk::walk_variable_declarator(self, declaration);
     }
 
-    fn visit_function(
-        &mut self,
-        function: &Function<'a>,
-        flags: oxc_syntax::scope::ScopeFlags,
-    ) {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
         if let Some(identifier) = &function.id
             && self.exported.contains(identifier.name.as_str())
         {
@@ -714,6 +822,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 identifier.name.as_str(),
                 "exported_function",
                 function,
+                None,
             );
         }
         oxc_ast_visit::walk::walk_function(self, function, flags);
@@ -732,7 +841,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 "exported": self.exported.contains(name),
             }),
         );
-        let mut collector = TypeReferenceVisitor::default();
+        let mut collector = type_reference_visitor(declaration.type_parameters.as_deref());
         oxc_ast_visit::walk::walk_ts_interface_declaration(&mut collector, declaration);
         self.push_contract_references(
             collector.references,
@@ -756,7 +865,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 "exported": self.exported.contains(name),
             }),
         );
-        let mut collector = TypeReferenceVisitor::default();
+        let mut collector = type_reference_visitor(declaration.type_parameters.as_deref());
         oxc_ast_visit::walk::walk_ts_type_alias_declaration(&mut collector, declaration);
         self.push_contract_references(
             collector.references,
@@ -811,6 +920,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                             &format!("{name}.{method_name}"),
                             "exported_method",
                             &method.value,
+                            class.type_parameters.as_deref(),
                         );
                     }
                 }
@@ -860,8 +970,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        if is_process_env(&member.object)
-        {
+        if is_process_env(&member.object) {
             self.push_general(GeneralSiteSpec {
                 entity_type: "environment_variable",
                 role: "environment_read",
@@ -902,8 +1011,10 @@ impl<'a> Visit<'a> for EntityVisitor {
         if matches!(
             &expression.callee,
             Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "Worker" | "QueueWorker")
-        ) && let Some(identity_expression) =
-            expression.arguments.first().and_then(Argument::as_expression)
+        ) && let Some(identity_expression) = expression
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
             && let Some((identity_kind, identity_name, identity_start)) =
                 self.identity(identity_expression)
         {
@@ -969,10 +1080,34 @@ pub fn extract(program: &Program<'_>, exported: &HashSet<String>) -> Vec<EntityS
     visitor.sites
 }
 
-fn collect_type_references<'a>(annotation: &'a TSTypeAnnotation<'a>) -> Vec<TypeReference> {
-    let mut visitor = TypeReferenceVisitor::default();
+fn collect_type_references<'a>(
+    annotation: &'a TSTypeAnnotation<'a>,
+    bound_names: &HashSet<String>,
+) -> Vec<TypeReference> {
+    let mut visitor = TypeReferenceVisitor {
+        references: Vec::new(),
+        bound_names: vec![bound_names.clone()],
+    };
     visitor.visit_ts_type_annotation(annotation);
     visitor.references
+}
+
+fn type_reference_visitor(
+    parameters: Option<&TSTypeParameterDeclaration<'_>>,
+) -> TypeReferenceVisitor {
+    TypeReferenceVisitor {
+        references: Vec::new(),
+        bound_names: vec![type_parameter_names(parameters).collect()],
+    }
+}
+
+fn type_parameter_names<'a>(
+    parameters: Option<&'a TSTypeParameterDeclaration<'a>>,
+) -> impl Iterator<Item = String> + 'a {
+    parameters
+        .into_iter()
+        .flat_map(|declaration| declaration.params.iter())
+        .map(|parameter| parameter.name.name.to_string())
 }
 
 fn is_builtin_contract_wrapper(name: &str) -> bool {
@@ -1024,7 +1159,9 @@ fn decorator_reference(expression: &Expression<'_>) -> Option<(String, u32)> {
 }
 
 fn validation_schema_callee(expression: &Expression<'_>, binding: &str) -> Option<String> {
-    let Expression::CallExpression(call) = expression else { return None };
+    let Expression::CallExpression(call) = expression else {
+        return None;
+    };
     let path = member_path(&call.callee)?;
     let recognized = matches!(
         path.as_str(),
@@ -1044,7 +1181,9 @@ fn validation_schema_callee(expression: &Expression<'_>, binding: &str) -> Optio
 }
 
 fn class_is_contract_schema(class: &Class<'_>) -> bool {
-    let Some(identifier) = &class.id else { return false };
+    let Some(identifier) = &class.id else {
+        return false;
+    };
     let lower = identifier.name.to_ascii_lowercase();
     if lower.ends_with("dto") {
         return true;
@@ -1079,7 +1218,9 @@ fn first_object_argument<'a>(call: &'a CallExpression<'a>) -> Option<&'a ObjectE
 
 fn object_value<'a>(object: &'a ObjectExpression<'a>, name: &str) -> Option<&'a Expression<'a>> {
     object.properties.iter().find_map(|property| {
-        let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
         (property.key.static_name().as_deref() == Some(name)).then_some(&property.value)
     })
 }
@@ -1096,6 +1237,57 @@ fn http_method(name: &str) -> Option<&'static str> {
         "all" => Some("ALL"),
         _ => None,
     }
+}
+
+fn is_router_holder(segment: &str) -> bool {
+    let segment = segment.to_ascii_lowercase();
+    matches!(segment.as_str(), "app" | "router" | "server" | "route") || segment.ends_with("router")
+}
+
+fn is_graphql_options_object(object: &ObjectExpression<'_>) -> bool {
+    object.properties.iter().any(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return false;
+        };
+        property.key.static_name().is_some_and(|name| {
+            matches!(
+                name.as_ref(),
+                "query"
+                    | "mutation"
+                    | "subscription"
+                    | "variables"
+                    | "fetchPolicy"
+                    | "errorPolicy"
+                    | "context"
+                    | "refetchQueries"
+                    | "awaitRefetchQueries"
+                    | "optimisticResponse"
+                    | "update"
+                    | "onCompleted"
+                    | "onError"
+                    | "pollInterval"
+                    | "notifyOnNetworkStatusChange"
+                    | "returnPartialData"
+                    | "skip"
+                    | "client"
+                    | "ssr"
+            )
+        })
+    })
+}
+
+fn is_config_api_path(path: &str) -> bool {
+    let mut segments = path.rsplit('.');
+    let Some(method) = segments.next() else {
+        return false;
+    };
+    if !matches!(method, "get" | "require") {
+        return false;
+    }
+    segments.next().is_some_and(|receiver| {
+        let receiver = receiver.to_ascii_lowercase();
+        receiver == "config" || receiver.ends_with("configservice")
+    })
 }
 
 fn normalize_route_path(path: &str) -> String {
@@ -1119,7 +1311,9 @@ fn join_route_path(prefix: &str, path: &str) -> String {
 }
 
 fn decorator_call<'a>(decorator: &'a Decorator<'a>) -> Option<(String, &'a CallExpression<'a>)> {
-    let Expression::CallExpression(call) = &decorator.expression else { return None };
+    let Expression::CallExpression(call) = &decorator.expression else {
+        return None;
+    };
     let name = member_path(&call.callee)?;
     Some((name, call))
 }
@@ -1214,9 +1408,11 @@ fn database_call(
             Expression::Identifier(identifier) => identifier.name.to_string(),
             _ => static_string(resource, constants)?,
         };
-        return Some((name, "read"));
+        return Some((name, "acquire"));
     }
-    let Expression::StaticMemberExpression(member) = &call.callee else { return None };
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return None;
+    };
     let method = member.property.name.as_str();
     let access = if matches!(
         method,
@@ -1251,28 +1447,52 @@ fn database_call(
     };
     let object = member_path(&member.object)?;
     let segments: Vec<&str> = object.split('.').collect();
-    let database_api = segments.iter().any(|segment| {
-        matches!(
-            segment.to_ascii_lowercase().as_str(),
-            "db" | "database" | "prisma" | "repository" | "repo" | "model"
-        )
-    });
-    if !database_api {
+    if let Some(resource) = segments
+        .iter()
+        .rev()
+        .find_map(|segment| database_holder_resource(segment))
+    {
+        return Some((resource, access));
+    }
+    let holder_index = segments
+        .iter()
+        .position(|segment| is_database_api_segment(segment))?;
+    if let Some(resource) = segments
+        .get(holder_index + 1..)
+        .and_then(|tail| tail.last())
+        .filter(|resource| !is_database_api_segment(resource))
+    {
+        return Some(((*resource).to_string(), access));
+    }
+    let holder = segments[holder_index].to_ascii_lowercase();
+    if !matches!(holder.as_str(), "db" | "database" | "prisma") {
         return None;
     }
-    let resource = if segments.len() > 1 {
-        segments.last()?.to_string()
-    } else {
-        let expression = call.arguments.first()?.as_expression()?;
-        match expression {
-            Expression::Identifier(identifier) => identifier.name.to_string(),
-            _ => static_string(expression, constants)?,
-        }
+    let expression = call.arguments.first()?.as_expression()?;
+    let resource = match expression {
+        Expression::Identifier(identifier) => identifier.name.to_string(),
+        _ => static_string(expression, constants)?,
     };
-    if is_database_api_segment(&resource) {
-        return None;
-    }
-    Some((resource, access))
+    (!is_database_api_segment(&resource)).then_some((resource, access))
+}
+
+fn database_holder_resource(holder: &str) -> Option<String> {
+    ["repository", "repo", "model"]
+        .into_iter()
+        .find_map(|suffix| {
+            let prefix_len = holder.len().checked_sub(suffix.len())?;
+            let (prefix, candidate_suffix) = holder.split_at(prefix_len);
+            (!prefix.is_empty() && candidate_suffix.eq_ignore_ascii_case(suffix))
+                .then(|| lower_first(prefix))
+        })
+}
+
+fn lower_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
 }
 
 fn is_database_api_segment(name: &str) -> bool {
@@ -1288,7 +1508,10 @@ fn is_external_call(path: Option<&str>, name: &str) -> bool {
         || path.is_some_and(|path| {
             let root = path.split('.').next().unwrap_or_default();
             matches!(root, "axios" | "got" | "request")
-                && matches!(name, "get" | "post" | "put" | "patch" | "delete" | "request")
+                && matches!(
+                    name,
+                    "get" | "post" | "put" | "patch" | "delete" | "request"
+                )
         })
 }
 
@@ -1350,9 +1573,11 @@ fn member_path(expression: &Expression<'_>) -> Option<String> {
     match expression {
         Expression::ThisExpression(_) => Some("this".into()),
         Expression::Identifier(identifier) => Some(identifier.name.to_string()),
-        Expression::StaticMemberExpression(member) => {
-            Some(format!("{}.{}", member_path(&member.object)?, member.property.name))
-        }
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            member_path(&member.object)?,
+            member.property.name
+        )),
         _ => None,
     }
 }
@@ -1520,7 +1745,14 @@ mod tests {
              export const save = (input: User): UserResult => input;\n\
              export const userSchema = z.object({ id: z.string() });\n\
              @InputType() class CreateUserDto { @IsString() name: string; }\n",
-            ["User", "UserResult", "UserState", "load", "save", "userSchema"],
+            [
+                "User",
+                "UserResult",
+                "UserState",
+                "load",
+                "save",
+                "userSchema",
+            ],
         )?;
         for (entity_type, name) in [
             ("interface", "User"),
@@ -1536,24 +1768,60 @@ mod tests {
                     && site.identity_name == name
             }));
         }
-        assert!(extracted.iter().any(|site| {
-            site.role == "parameter_contract" && site.identity_name == "User"
-        }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "return_contract" && site.identity_name == "UserResult"
-        }));
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "parameter_contract" && site.identity_name == "User" })
+        );
+        assert!(
+            extracted.iter().any(|site| {
+                site.role == "return_contract" && site.identity_name == "UserResult"
+            })
+        );
         assert!(!extracted.iter().any(|site| {
             matches!(
                 site.role,
                 "parameter_contract" | "return_contract" | "contract_reference"
             ) && site.identity_name == "Promise"
         }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "decorator_use" && site.identity_name == "InputType"
-        }));
-        assert!(extracted.iter().any(|site| {
-            site.role == "decorator_use" && site.identity_name == "IsString"
-        }));
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "decorator_use" && site.identity_name == "InputType" })
+        );
+        assert!(
+            extracted
+                .iter()
+                .any(|site| { site.role == "decorator_use" && site.identity_name == "IsString" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_scoped_generic_parameters_from_contract_references() -> Result<()> {
+        let extracted = sites_with_exports(
+            "export interface Page<T extends Entity> { value: T; next: Page<T> }\n\
+             export type Mapper<T> = <U>(value: T, other: U) => Pair<T, U>;\n\
+             export function pick<T>(value: T): T { return value; }\n\
+             export const identity = <T>(value: T): T => value;\n\
+             export class Box<T> { map<U>(value: T, fn: (item: T) => U): U { throw Error(); } }\n",
+            ["Page", "Mapper", "pick", "identity", "Box"],
+        )?;
+
+        let references: Vec<&str> = extracted
+            .iter()
+            .filter(|site| {
+                matches!(
+                    site.role,
+                    "parameter_contract" | "return_contract" | "contract_reference"
+                )
+            })
+            .map(|site| site.identity_name.as_str())
+            .collect();
+        assert!(!references.iter().any(|name| matches!(*name, "T" | "U")));
+        assert!(references.contains(&"Entity"));
+        assert!(references.contains(&"Page"));
+        assert!(references.contains(&"Pair"));
         Ok(())
     }
 
@@ -1580,7 +1848,11 @@ mod tests {
             ("route", "route_handler", "GET /users/:id"),
             ("route", "route_handler", "POST /jobs"),
             ("graphql_operation", "graphql_handler", "mutation:saveUser"),
-            ("graphql_operation", "graphql_operation", "query:currentUser"),
+            (
+                "graphql_operation",
+                "graphql_operation",
+                "query:currentUser",
+            ),
             ("environment_variable", "environment_read", "API_KEY"),
             ("environment_variable", "environment_read", "REGION"),
             ("environment_variable", "environment_read", "TOKEN"),
@@ -1589,15 +1861,102 @@ mod tests {
             ("feature_flag", "feature_flag_check", "new-ui"),
             ("external_host", "external_host_call", "api.example.com"),
         ] {
-            assert!(extracted.iter().any(|site| {
-                site.plane == "general"
-                    && site.entity_type == entity_type
-                    && site.role == role
-                    && site.identity_name == identity
-            }), "missing {entity_type}/{role}/{identity}");
+            assert!(
+                extracted.iter().any(|site| {
+                    site.plane == "general"
+                        && site.entity_type == entity_type
+                        && site.role == role
+                        && site.identity_name == identity
+                }),
+                "missing {entity_type}/{role}/{identity}"
+            );
         }
         assert!(!extracted.iter().any(|site| {
             site.entity_type == "database_resource" && site.identity_name == "repository"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_named_routers_without_treating_graphql_options_as_operations() -> Result<()> {
+        let extracted = sites(
+            "usersRouter.get('/users', listUsers);\n\
+             client.query({ query: GET_USER, variables: { id: 1 }, fetchPolicy: 'cache-first' });\n\
+             client.query({ currentUser: { id: true } });\n",
+        )?;
+
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "route"
+                && site.identity_name == "GET /users"
+                && site.target_name.as_deref() == Some("listUsers")
+        }));
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "graphql_operation" && site.identity_name == "query:currentUser"
+        }));
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "graphql_operation"
+                && matches!(
+                    site.identity_name.as_str(),
+                    "query:query" | "query:variables" | "query:fetchPolicy"
+                )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_qualified_database_holders_and_labels_handle_acquisition() -> Result<()> {
+        let extracted = sites(
+            "this.db.insert(users);\n\
+             ctx.db.insert(accounts);\n\
+             this.userRepository.save(data);\n\
+             this.InvoiceModel.findMany();\n\
+             this.repository.save(data);\n\
+             getRepository(User);\n",
+        )?;
+
+        for (resource, role) in [
+            ("users", "database_write"),
+            ("accounts", "database_write"),
+            ("user", "database_write"),
+            ("invoice", "database_read"),
+            ("User", "database_acquire"),
+        ] {
+            assert!(
+                extracted.iter().any(|site| {
+                    site.entity_type == "database_resource"
+                        && site.identity_name == resource
+                        && site.role == role
+                }),
+                "missing {resource}/{role}"
+            );
+        }
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "database_resource"
+                && matches!(site.identity_name.as_str(), "repository" | "data")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn separates_configuration_keys_from_environment_variables() -> Result<()> {
+        let extracted = sites(
+            "config.get('database.host');\n\
+             this.configService.get('PORT');\n\
+             Deno.env.get('TOKEN');\n",
+        )?;
+
+        for key in ["database.host", "PORT"] {
+            assert!(extracted.iter().any(|site| {
+                site.entity_type == "config_key"
+                    && site.role == "config_read"
+                    && site.identity_name == key
+            }));
+            assert!(!extracted.iter().any(|site| {
+                site.entity_type == "environment_variable" && site.identity_name == key
+            }));
+        }
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "environment_variable" && site.identity_name == "TOKEN"
         }));
         Ok(())
     }

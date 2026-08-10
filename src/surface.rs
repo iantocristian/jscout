@@ -85,89 +85,88 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
     {
         bail!("unknown entity plane `{invalid}`");
     }
-    let allowed_types: HashSet<&str> = options.entity_types.iter().map(String::as_str).collect();
-    let allowed_roles: HashSet<&str> = options.roles.iter().map(String::as_str).collect();
-    let allowed_file_roles: HashSet<&str> =
-        options.file_roles.iter().map(String::as_str).collect();
-    let allowed_origins: HashSet<&str> =
-        options.file_origins.iter().map(String::as_str).collect();
-    let query = options.query.to_ascii_lowercase();
+    let planes = serde_json::to_string(&options.planes)?;
+    let entity_types = serde_json::to_string(&options.entity_types)?;
+    let roles = serde_json::to_string(&options.roles)?;
+    let file_roles = serde_json::to_string(&options.file_roles)?;
+    let file_origins = serde_json::to_string(&options.file_origins)?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, entity_key, plane, entity_type, name, identity_anchor, meta_json
-         FROM entities ORDER BY plane, entity_type, name, entity_key",
+        "WITH ranked AS (
+           SELECT entity.id, entity.entity_key, entity.plane, entity.entity_type,
+                  entity.name, entity.identity_anchor, entity.meta_json,
+                  count(occurrence.id) AS occurrence_count,
+                  CASE WHEN ?1 <> '' AND lower(entity.name)=lower(?1) THEN 1 ELSE 0 END AS exact
+           FROM entities entity
+           JOIN entity_occurrences occurrence ON occurrence.entity_id=entity.id
+           JOIN files file ON file.id=occurrence.file_id
+           WHERE (?2 OR entity.plane IN (SELECT value FROM json_each(?3)))
+             AND (?4 OR entity.entity_type IN (SELECT value FROM json_each(?5)))
+             AND (?1 = '' OR instr(lower(entity.name), lower(?1)) > 0
+                          OR instr(lower(entity.entity_key), lower(?1)) > 0)
+             AND (?6 OR occurrence.role IN (SELECT value FROM json_each(?7)))
+             AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))
+             AND file.origin IN (SELECT value FROM json_each(?10))
+           GROUP BY entity.id, entity.entity_key, entity.plane, entity.entity_type,
+                    entity.name, entity.identity_anchor, entity.meta_json
+         )
+         SELECT id, entity_key, plane, entity_type, name, identity_anchor, meta_json,
+                occurrence_count, exact, count(*) OVER () AS matched_entities
+         FROM ranked
+         ORDER BY exact DESC, occurrence_count DESC,
+                  plane, entity_type, name, entity_key
+         LIMIT ?11",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    let mut candidates = Vec::new();
+    let rows = stmt.query_map(
+        params![
+            options.query,
+            options.planes.is_empty(),
+            planes,
+            options.entity_types.is_empty(),
+            entity_types,
+            options.roles.is_empty(),
+            roles,
+            options.file_roles.is_empty(),
+            file_roles,
+            file_origins,
+            options.limit as i64,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        },
+    )?;
+    let mut entities = Vec::new();
+    let mut matched_entities = 0;
     for row in rows {
-        let (id, key, plane, entity_type, name, identity_anchor, meta) = row?;
-        if (!allowed_planes.is_empty() && !allowed_planes.contains(plane.as_str()))
-            || (!allowed_types.is_empty() && !allowed_types.contains(entity_type.as_str()))
-            || (!query.is_empty()
-                && !name.to_ascii_lowercase().contains(&query)
-                && !key.to_ascii_lowercase().contains(&query))
-        {
-            continue;
-        }
-        let occurrences = load_occurrences(
-            conn,
-            id,
-            &allowed_roles,
-            &allowed_file_roles,
-            &allowed_origins,
-        )?;
-        if occurrences.is_empty() {
-            continue;
-        }
-        let exact = !query.is_empty() && name.eq_ignore_ascii_case(&options.query);
-        candidates.push((
-            exact,
-            EntityRecord {
-                anchor: key,
-                plane,
-                entity_type,
-                name,
-                identity_anchor,
-                occurrence_count: occurrences.len(),
-                occurrences: occurrences
-                    .iter()
-                    .take(options.occurrences_per_entity)
-                    .cloned()
-                    .collect(),
-                occurrences_truncated: occurrences.len() > options.occurrences_per_entity,
-                meta: serde_json::from_str(&meta).unwrap_or(Value::Null),
-            },
-        ));
+        let (id, key, plane, entity_type, name, identity_anchor, meta, occurrence_count, _, total) =
+            row?;
+        matched_entities = total as usize;
+        let mut occurrences = load_occurrences(conn, id, options)?;
+        let occurrences_truncated = occurrence_count as usize > options.occurrences_per_entity;
+        occurrences.truncate(options.occurrences_per_entity);
+        entities.push(EntityRecord {
+            anchor: key,
+            plane,
+            entity_type,
+            name,
+            identity_anchor,
+            occurrence_count: occurrence_count as usize,
+            occurrences,
+            occurrences_truncated,
+            meta: serde_json::from_str(&meta).unwrap_or(Value::Null),
+        });
     }
-    candidates.sort_by(|(left_exact, left), (right_exact, right)| {
-        right_exact
-            .cmp(left_exact)
-            .then_with(|| right.occurrence_count.cmp(&left.occurrence_count))
-            .then_with(|| {
-                (&left.plane, &left.entity_type, &left.name, &left.anchor).cmp(&(
-                    &right.plane,
-                    &right.entity_type,
-                    &right.name,
-                    &right.anchor,
-                ))
-            })
-    });
-    let matched_entities = candidates.len();
-    let entities = candidates
-        .into_iter()
-        .take(options.limit)
-        .map(|(_, entity)| entity)
-        .collect();
     Ok(EntityLookup {
         snapshot: structural::current_snapshot(conn)?,
         entities,
@@ -179,10 +178,11 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
 fn load_occurrences(
     conn: &Connection,
     entity_id: i64,
-    allowed_roles: &HashSet<&str>,
-    allowed_file_roles: &HashSet<&str>,
-    allowed_origins: &HashSet<&str>,
+    options: &EntityLookupOptions,
 ) -> Result<Vec<EntityOccurrence>> {
+    let roles = serde_json::to_string(&options.roles)?;
+    let file_roles = serde_json::to_string(&options.file_roles)?;
+    let file_origins = serde_json::to_string(&options.file_origins)?;
     let mut stmt = conn.prepare(
         "SELECT file.path, file.role, file.origin,
                 occurrence.line, occurrence.end_line,
@@ -192,36 +192,43 @@ fn load_occurrences(
          FROM entity_occurrences occurrence
          JOIN files file ON file.id=occurrence.file_id
          WHERE occurrence.entity_id=?1
+           AND (?2 OR occurrence.role IN (SELECT value FROM json_each(?3)))
+           AND (?4 OR file.role IN (SELECT value FROM json_each(?5)))
+           AND file.origin IN (SELECT value FROM json_each(?6))
          ORDER BY occurrence.confidence='certain' DESC,
                   occurrence.confidence='likely' DESC,
-                  file.path, occurrence.start, occurrence.id",
+                  file.path, occurrence.start, occurrence.id
+         LIMIT ?7",
     )?;
-    let rows = stmt.query_map([entity_id], |row| {
-        let detail: String = row.get(11)?;
-        Ok(EntityOccurrence {
-            file: row.get(0)?,
-            file_role: row.get(1)?,
-            file_origin: row.get(2)?,
-            lines: [row.get(3)?, row.get(4)?],
-            span: [row.get(5)?, row.get(6)?],
-            role: row.get(7)?,
-            confidence: row.get(8)?,
-            extractor: row.get(9)?,
-            provenance: row.get(10)?,
-            detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![
+            entity_id,
+            options.roles.is_empty(),
+            roles,
+            options.file_roles.is_empty(),
+            file_roles,
+            file_origins,
+            options.occurrences_per_entity.saturating_add(1) as i64,
+        ],
+        |row| {
+            let detail: String = row.get(11)?;
+            Ok(EntityOccurrence {
+                file: row.get(0)?,
+                file_role: row.get(1)?,
+                file_origin: row.get(2)?,
+                lines: [row.get(3)?, row.get(4)?],
+                span: [row.get(5)?, row.get(6)?],
+                role: row.get(7)?,
+                confidence: row.get(8)?,
+                extractor: row.get(9)?,
+                provenance: row.get(10)?,
+                detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+            })
+        },
+    )?;
     let mut occurrences = Vec::new();
     for row in rows {
-        let occurrence = row?;
-        if (!allowed_roles.is_empty() && !allowed_roles.contains(occurrence.role.as_str()))
-            || (!allowed_file_roles.is_empty()
-                && !allowed_file_roles.contains(occurrence.file_role.as_str()))
-            || !allowed_origins.contains(occurrence.file_origin.as_str())
-        {
-            continue;
-        }
-        occurrences.push(occurrence);
+        occurrences.push(row?);
     }
     Ok(occurrences)
 }
@@ -322,14 +329,16 @@ pub fn overview(
         *totals.get_mut("symbols").expect("total exists") += symbols;
         *totals.get_mut("entity_occurrences").expect("total exists") += occurrences;
         let area_path = repository_area(&path);
-        let area = areas.entry(area_path.clone()).or_insert_with(|| AreaOverview {
-            path: area_path,
-            files: 0,
-            chunks: 0,
-            symbols: 0,
-            entity_occurrences: 0,
-            roles: BTreeMap::new(),
-        });
+        let area = areas
+            .entry(area_path.clone())
+            .or_insert_with(|| AreaOverview {
+                path: area_path,
+                files: 0,
+                chunks: 0,
+                symbols: 0,
+                entity_occurrences: 0,
+                roles: BTreeMap::new(),
+            });
         area.files += 1;
         area.chunks += chunks;
         area.symbols += symbols;
@@ -412,10 +421,21 @@ pub fn overview(
 }
 
 fn repository_area(path: &str) -> String {
+    if let Some(dependency_path) = path.strip_prefix("dependency:") {
+        let mut parts = dependency_path.split('/');
+        let first = parts.next().unwrap_or(dependency_path);
+        if first.starts_with('@')
+            && let Some(package) = parts.next()
+        {
+            return format!("dependency:{first}/{package}");
+        }
+        return format!("dependency:{first}");
+    }
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
-        [root @ ("packages" | "apps" | "services"), scope, name, ..]
-            if scope.starts_with('@') => format!("{root}/{scope}/{name}"),
+        [root @ ("packages" | "apps" | "services"), scope, name, ..] if scope.starts_with('@') => {
+            format!("{root}/{scope}/{name}")
+        }
         [root @ ("packages" | "apps" | "services"), name, ..] => {
             format!("{root}/{name}")
         }
@@ -431,7 +451,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{EntityLookupOptions, entities, overview};
+    use super::{EntityLookupOptions, entities, overview, repository_area};
     use crate::{indexer, store};
 
     #[test]
@@ -440,7 +460,7 @@ mod tests {
         fs::create_dir_all(repo.path().join("packages/api/src"))?;
         fs::write(
             repo.path().join("packages/api/src/main.ts"),
-            "export function run() { return process.env.API_KEY; }\n",
+            "export function run() { return process.env.API_KEY + process.env.OTHER_KEY; }\n",
         )?;
         fs::create_dir_all(repo.path().join("packages/api/test"))?;
         fs::write(
@@ -462,11 +482,35 @@ mod tests {
         assert_eq!(result.entities[0].occurrence_count, 1);
         assert_eq!(result.entities[0].occurrences[0].file_role, "production");
 
+        let bounded = entities(
+            &conn,
+            &EntityLookupOptions {
+                planes: vec!["general".into()],
+                limit: 1,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(bounded.entities.len(), 1);
+        assert_eq!(bounded.matched_entities, 2);
+        assert!(bounded.truncated);
+
         let overview = overview(&conn, &crate::origin::defaults(), 1, 2)?;
         assert_eq!(overview.areas.len(), 1);
         assert_eq!(overview.areas[0].path, "packages/api");
         assert!(overview.relations.len() <= 2);
         assert_eq!(overview.totals["files"], 2);
         Ok(())
+    }
+
+    #[test]
+    fn dependency_areas_preserve_the_package_instance_prefix() {
+        assert_eq!(
+            repository_area("dependency:lodash@4.17.21#abc123/lodash.js"),
+            "dependency:lodash@4.17.21#abc123"
+        );
+        assert_eq!(
+            repository_area("dependency:@scope/pkg@2.0.0#def456/src/index.ts"),
+            "dependency:@scope/pkg@2.0.0#def456"
+        );
     }
 }

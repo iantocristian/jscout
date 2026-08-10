@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, params};
 use serde_json::json;
 
 /// A pluggable embedding backend. Selected from environment:
@@ -41,8 +41,8 @@ impl Provider {
         let model_override = std::env::var("JSCOUT_EMBED_MODEL").ok();
 
         let pick_voyage = choice == "voyage" || (choice.is_empty() && voyage_key.is_some());
-        let pick_openai =
-            choice == "openai" || (choice.is_empty() && (openai_key.is_some() || custom_url.is_some()));
+        let pick_openai = choice == "openai"
+            || (choice.is_empty() && (openai_key.is_some() || custom_url.is_some()));
 
         if choice == "none" {
             return None;
@@ -68,8 +68,7 @@ impl Provider {
                 query_prefix: query_prefix(&model),
                 name: "openai-compat".into(),
                 model,
-                url: custom_url
-                    .unwrap_or_else(|| "https://api.openai.com/v1/embeddings".into()),
+                url: custom_url.unwrap_or_else(|| "https://api.openai.com/v1/embeddings".into()),
                 key: std::env::var("JSCOUT_EMBED_KEY").ok().or(openai_key),
                 is_voyage: false,
             });
@@ -97,7 +96,10 @@ impl Provider {
                 }
                 Err(e) => {
                     if attempt < 3 {
-                        eprintln!("embed request failed (attempt {}): {e}; retrying", attempt + 1);
+                        eprintln!(
+                            "embed request failed (attempt {}): {e}; retrying",
+                            attempt + 1
+                        );
                     }
                     last_err = Some(e.into());
                 }
@@ -126,7 +128,11 @@ impl Provider {
             out.push(v);
         }
         if out.len() != texts.len() {
-            bail!("embedding count mismatch: {} in, {} out", texts.len(), out.len());
+            bail!(
+                "embedding count mismatch: {} in, {} out",
+                texts.len(),
+                out.len()
+            );
         }
         Ok(out)
     }
@@ -153,7 +159,9 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -174,7 +182,13 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// The text actually embedded: a small contextual header + the chunk body.
-pub fn embed_text(path: &str, scope: &str, name: Option<&str>, imports: &str, content: &str) -> String {
+pub fn embed_text(
+    path: &str,
+    scope: &str,
+    name: Option<&str>,
+    imports: &str,
+    content: &str,
+) -> String {
     let mut header = format!("// file: {path}\n");
     if !scope.is_empty() {
         header.push_str(&format!("// scope: {scope}\n"));
@@ -200,7 +214,11 @@ pub fn embed_text(path: &str, scope: &str, name: Option<&str>, imports: &str, co
 /// Embed all chunks that don't yet have an embedding under this model.
 /// Embeddings are keyed by chunk content hash, so unchanged chunks are
 /// never re-embedded across re-indexes.
-pub fn embed_missing(conn: &Connection, provider: &Provider, batch_size: usize) -> Result<(usize, usize)> {
+pub fn embed_missing(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+) -> Result<(usize, usize)> {
     embed_missing_for_origins(conn, provider, batch_size, &crate::origin::defaults())
 }
 
@@ -225,9 +243,10 @@ pub fn embed_missing_for_origins(
                  OR (?3 AND f.origin='workspace')
                  OR (?4 AND f.origin='dependency'))",
         )?;
-        let r = stmt.query_map(params![&provider.model, repository, workspace, dependency], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
+        let r = stmt.query_map(
+            params![&provider.model, repository, workspace, dependency],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
         r.collect::<std::result::Result<_, _>>()?
     };
     let total = rows.len();

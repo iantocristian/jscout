@@ -32,6 +32,8 @@ pub fn with_parsed<T>(
             .with_context(|| path.display().to_string());
     }
     // Node store enabled: reference classification walks node ancestors.
-    let semantic_ret = SemanticBuilder::new().with_build_nodes(true).build(&ret.program);
+    let semantic_ret = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&ret.program);
     Ok(f(&ret, &semantic_ret.semantic))
 }

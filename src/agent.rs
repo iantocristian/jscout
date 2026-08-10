@@ -14,7 +14,9 @@ pub fn install(root: &Path) -> Result<PathBuf> {
     if target.exists() {
         bail!("agent guide already exists: {}", target.display());
     }
-    let parent = target.parent().context("agent guide has no parent directory")?;
+    let parent = target
+        .parent()
+        .context("agent guide has no parent directory")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create agent skill directory {}", parent.display()))?;
     let mut file = OpenOptions::new()
@@ -38,7 +40,12 @@ mod tests {
         let repo = tempfile::tempdir()?;
         let target = install(repo.path())?;
         assert_eq!(std::fs::read_to_string(&target)?, GUIDE);
-        assert!(install(repo.path()).unwrap_err().to_string().contains("already exists"));
+        assert!(
+            install(repo.path())
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
         Ok(())
     }
 }

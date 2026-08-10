@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "7";
+pub const PROJECTION_VERSION: &str = "9";
+const WORKFLOW_HUB_DEGREE_LIMIT: usize = 12;
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -261,6 +262,10 @@ impl Ord for WorkflowRankedNode {
     }
 }
 
+pub const MAX_PATH_NODE_LIMIT: usize = 200;
+pub const MAX_PATH_EDGE_LIMIT: usize = 800;
+pub const MAX_PATH_SEARCH_STATES: usize = 50_000;
+
 #[derive(Debug, Clone)]
 pub struct PathOptions {
     pub expected_snapshot: Option<String>,
@@ -281,8 +286,8 @@ impl Default for PathOptions {
             expected_snapshot: None,
             max_depth: 4,
             path_limit: 8,
-            node_limit: 200,
-            edge_limit: 800,
+            node_limit: MAX_PATH_NODE_LIMIT,
+            edge_limit: MAX_PATH_EDGE_LIMIT,
             direction: "both".into(),
             min_confidence: "likely".into(),
             kinds: Vec::new(),
@@ -299,6 +304,8 @@ impl Default for PathOptions {
 pub struct PathStep {
     pub from: String,
     pub to: String,
+    /// True when the path traverses the underlying directed edge target-to-source.
+    pub reversed: bool,
     pub edge: GraphEdge,
 }
 
@@ -321,6 +328,7 @@ pub struct PathSearch {
     pub paths: Vec<GraphPath>,
     pub searched_nodes: usize,
     pub searched_edges: usize,
+    pub searched_states: usize,
     pub truncated: bool,
 }
 
@@ -371,7 +379,7 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 /// Rebuild the disposable structural graph from canonical extraction tables.
 pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let files = load_files(conn)?;
-    let graph = ModuleGraph::load(conn)?;
+    let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
     let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
     for symbol in &symbols {
@@ -463,13 +471,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             eprintln!("timing project-entities={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
-        project_member_calls(
-            conn,
-            &files,
-            &symbols,
-            &mut insert_node,
-            &mut insert_edge,
-        )?;
+        project_member_calls(conn, &files, &symbols, &mut insert_node, &mut insert_edge)?;
         if timing {
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
@@ -576,7 +578,7 @@ fn project_module_edges(
     let mut stmt = conn.prepare(
         "SELECT edge.from_file, edge.request, edge.to_file, edge.package, edge.resolution,
                 edge.package_instance_id, package.origin, package.name, package.version,
-                package.locator, package.status, source.package_instance_id
+                package.locator, package.status, source.package_instance_id, edge.type_only
          FROM module_edges edge
          JOIN files source ON source.id=edge.from_file
          LEFT JOIN package_instances package ON package.id=edge.package_instance_id
@@ -596,6 +598,7 @@ fn project_module_edges(
             r.get::<_, Option<String>>(9)?,
             r.get::<_, Option<String>>(10)?,
             r.get::<_, Option<i64>>(11)?,
+            r.get::<_, i64>(12)? != 0,
         ))
     })?;
     for row in rows {
@@ -612,6 +615,7 @@ fn project_module_edges(
             instance_locator,
             instance_status,
             source_package_instance_id,
+            type_only,
         ) = row?;
         let Some(from_path) = files.get(&from_id) else {
             continue;
@@ -645,7 +649,11 @@ fn project_module_edges(
                     "package",
                     "package_instances",
                     instance_id,
-                    format!("{}@{}", name, instance_version.as_deref().unwrap_or("unknown")),
+                    format!(
+                        "{}@{}",
+                        name,
+                        instance_version.as_deref().unwrap_or("unknown")
+                    ),
                     Option::<i64>::None,
                     Option::<i64>::None,
                     json!({
@@ -703,15 +711,18 @@ fn project_module_edges(
         // Heuristic workspace mappings (mirrored dist layouts, source-name
         // search) are honest leads, not proven links — never project them as
         // certain.
-        let (confidence, provenance) = match resolution.as_deref() {
-            Some("workspace-inferred") => ("likely", "workspace-inferred"),
-            Some("workspace") => ("certain", "workspace"),
-            _ => ("certain", "resolver"),
+        let (confidence, provenance) = match (type_only, resolution.as_deref()) {
+            (true, Some("workspace-inferred")) => ("likely", "type-workspace-inferred"),
+            (true, Some("workspace")) => ("certain", "type-workspace"),
+            (true, _) => ("certain", "type-resolver"),
+            (false, Some("workspace-inferred")) => ("likely", "workspace-inferred"),
+            (false, Some("workspace")) => ("certain", "workspace"),
+            (false, _) => ("certain", "resolver"),
         };
         insert_edge.execute(params![
             file_key(from_path),
             destination,
-            "import",
+            if type_only { "imports_types" } else { "import" },
             confidence,
             provenance,
             from_id,
@@ -726,7 +737,11 @@ fn project_module_edges(
             insert_edge.execute(params![
                 file_key(from_path),
                 hub,
-                "imports_package",
+                if type_only {
+                    "imports_package_types"
+                } else {
+                    "imports_package"
+                },
                 confidence,
                 provenance,
                 from_id,
@@ -778,10 +793,7 @@ fn project_references(
         } else {
             package_key(&package)
         };
-        Ok((
-            (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
-            target,
-        ))
+        Ok(((r.get::<_, i64>(0)?, r.get::<_, String>(1)?), target))
     })?;
     for row in package_rows {
         let (key, package) = row?;
@@ -840,17 +852,20 @@ fn project_references(
                             (resolved_file, resolved_name)
                         })
                         .or_else(|| Some((target_file, name.clone())));
-                    resolved.map_or_else(ProjectedTargets::default, |(resolved_file, resolved_name)| {
-                        if resolved_name == "*" {
-                            graph
-                                .paths
-                                .get(&resolved_file)
-                                .map(|path| ProjectedTargets::exact(file_key(path)))
-                                .unwrap_or_default()
-                        } else {
-                            projected_symbols(root_symbol.get(&(resolved_file, resolved_name)))
-                        }
-                    })
+                    resolved.map_or_else(
+                        ProjectedTargets::default,
+                        |(resolved_file, resolved_name)| {
+                            if resolved_name == "*" {
+                                graph
+                                    .paths
+                                    .get(&resolved_file)
+                                    .map(|path| ProjectedTargets::exact(file_key(path)))
+                                    .unwrap_or_default()
+                            } else {
+                                projected_symbols(root_symbol.get(&(resolved_file, resolved_name)))
+                            }
+                        },
+                    )
                 }
                 None => package_for
                     .get(&(file_id, request.to_string()))
@@ -914,7 +929,10 @@ fn project_entities(
 ) -> Result<()> {
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
-        symbols_by_file.entry(symbol.file_id).or_default().push(symbol);
+        symbols_by_file
+            .entry(symbol.file_id)
+            .or_default()
+            .push(symbol);
     }
     let sites = load_entity_sites(conn)?;
     let contract_catalog = ContractCatalog::build(conn, &sites, files)?;
@@ -947,7 +965,9 @@ fn project_entities(
     )?;
 
     for site in sites {
-        let Some(path) = files.get(&site.file_id) else { continue };
+        let Some(path) = files.get(&site.file_id) else {
+            continue;
+        };
         if site.plane == "contract" {
             project_contract_site(
                 conn,
@@ -969,7 +989,11 @@ fn project_entities(
         let identity = resolve_entity_identity(conn, &site, path, graph, root_symbol)?;
         let occurrence_confidence = lower_confidence(
             &site.confidence,
-            if identity.ambiguous { "possible" } else { &site.confidence },
+            if identity.ambiguous {
+                "possible"
+            } else {
+                &site.confidence
+            },
         );
         let entity_key = match site.identity_kind.as_str() {
             "literal" => entity_key(&site.entity_type, &site.identity_name),
@@ -1049,15 +1073,9 @@ fn project_entities(
         });
 
         match site.role.as_str() {
-            "dispatch_site"
-            | "lifecycle_producer"
-            | "job_producer"
-            | "injection_site"
-            | "graphql_operation"
-            | "environment_read"
-            | "database_read"
-            | "database_write"
-            | "feature_flag_check"
+            "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site"
+            | "graphql_operation" | "environment_read" | "config_read" | "database_read"
+            | "database_write" | "database_acquire" | "feature_flag_check"
             | "external_host_call" => {
                 let kind = match site.role.as_str() {
                     "dispatch_site" => "dispatches",
@@ -1066,8 +1084,10 @@ fn project_entities(
                     "injection_site" => "injects",
                     "graphql_operation" => "invokes_graphql",
                     "environment_read" => "reads_env",
+                    "config_read" => "reads_config",
                     "database_read" => "reads_resource",
                     "database_write" => "writes_resource",
+                    "database_acquire" => "acquires_resource",
                     "feature_flag_check" => "checks_flag",
                     _ => "calls_host",
                 };
@@ -1079,11 +1099,7 @@ fn project_entities(
                     site.provenance,
                     graph_detail.to_string(),
                 ])?;
-                if projected_edges.insert((
-                    source.clone(),
-                    entity_key.clone(),
-                    kind.to_string(),
-                )) {
+                if projected_edges.insert((source.clone(), entity_key.clone(), kind.to_string())) {
                     insert_edge.execute(params![
                         source,
                         entity_key,
@@ -1113,14 +1129,23 @@ fn project_entities(
                     )?;
                 }
             }
-            "registered_handler"
-            | "lifecycle_listener"
-            | "job_handler"
-            | "provider"
-            | "route_handler"
-            | "graphql_handler" => {
+            "registered_handler" | "lifecycle_listener" | "job_handler" | "provider"
+            | "route_handler" | "graphql_handler" => {
                 let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
                 let target_fallback = targets.keys.is_empty();
+                if target_fallback
+                    && matches!(site.role.as_str(), "route_handler" | "graphql_handler")
+                    && !matches!(
+                        site.extractor.as_str(),
+                        "http-route-decorator" | "graphql-operation-decorator"
+                    )
+                {
+                    // Inline or otherwise unresolved API-call handlers have no
+                    // honest symbol target. Preserve the entity occurrence but
+                    // do not fabricate a handler edge to the containing file or
+                    // the next declaration.
+                    continue;
+                }
                 if target_fallback {
                     targets = ProjectedTargets::exact(source.clone());
                 }
@@ -1139,7 +1164,11 @@ fn project_entities(
                 }
                 let edge_confidence = lower_confidence(
                     &occurrence_confidence,
-                    if targets.ambiguous { "possible" } else { &occurrence_confidence },
+                    if targets.ambiguous {
+                        "possible"
+                    } else {
+                        &occurrence_confidence
+                    },
                 );
                 let kind = match site.role.as_str() {
                     "registered_handler" => "registered_handler",
@@ -1194,7 +1223,9 @@ impl ContractCatalog {
             if site.plane != "contract" || site.role != "contract_declaration" {
                 continue;
             }
-            let Some(path) = files.get(&site.file_id) else { continue };
+            let Some(path) = files.get(&site.file_id) else {
+                continue;
+            };
             let definition = ContractDefinition {
                 site_id: site.id,
                 file_id: site.file_id,
@@ -1211,7 +1242,11 @@ impl ContractCatalog {
                 .entry((site.file_id, site.identity_name.clone()))
                 .or_default()
                 .push(definition.clone());
-            catalog.by_file.entry(site.file_id).or_default().push(definition);
+            catalog
+                .by_file
+                .entry(site.file_id)
+                .or_default()
+                .push(definition);
         }
         let mut stmt = conn.prepare(
             "SELECT file_id, local_name, imported_name, request
@@ -1290,7 +1325,11 @@ fn project_contract_site(
             &site.confidence
         },
     );
-    let backing_file = if targets.len() == 1 { targets.first() } else { None };
+    let backing_file = if targets.len() == 1 {
+        targets.first()
+    } else {
+        None
+    };
     let backing_file_id = backing_file.and_then(|target| target.file_id);
     let backing_line = backing_file.and_then(|target| target.line);
     let (entity_key, entity_type, display_name, identity_anchor) = match targets.as_slice() {
@@ -1309,7 +1348,10 @@ fn project_contract_site(
         candidates => (
             contract_reference_key(
                 &site.entity_type,
-                &candidates.iter().map(|target| target.key.clone()).collect::<Vec<_>>(),
+                &candidates
+                    .iter()
+                    .map(|target| target.key.clone())
+                    .collect::<Vec<_>>(),
                 path,
                 &site.identity_name,
             ),
@@ -1440,15 +1482,20 @@ fn site_source_symbol<'a>(
     if let Some(owner) = owner_at(symbols, site.start) {
         return Some(&owner.key);
     }
-    if !matches!(site.role.as_str(), "decorator_use" | "route_handler" | "graphql_handler") {
+    if !matches!(
+        site.extractor.as_str(),
+        "decorator-contract" | "http-route-decorator" | "graphql-operation-decorator"
+    ) {
         return None;
     }
+    // Decorators precede their class/method declaration, so they fall outside
+    // the declaration span used by `owner_at`. Bound the forward association
+    // to 512 bytes to avoid attaching a distant symbol; large decorator
+    // payloads intentionally degrade to the containing file as their source.
     symbols?
         .iter()
         .copied()
-        .filter(|symbol| {
-            symbol.decl_start >= site.start && symbol.decl_start - site.start <= 512
-        })
+        .filter(|symbol| symbol.decl_start >= site.start && symbol.decl_start - site.start <= 512)
         .min_by_key(|symbol| symbol.decl_start - site.start)
         .map(|symbol| &symbol.key)
 }
@@ -1486,11 +1533,16 @@ fn resolve_contract_targets(
             imported.as_str()
         };
         let Some(target_file) = graph.edge(site.file_id, &request) else {
+            let external = is_external_module_request(&request);
             targets.push(ContractTarget {
-                key: contract_external_key(&site.entity_type, &request, target_name),
+                key: if external {
+                    contract_external_key(&site.entity_type, &request, target_name)
+                } else {
+                    contract_unresolved_key(&site.entity_type, &request, target_name)
+                },
                 entity_type: site.entity_type.clone(),
                 name: target_name.to_string(),
-                identity_anchor: Some(format!("pkg:{request}#{target_name}")),
+                identity_anchor: external.then(|| format!("pkg:{request}#{target_name}")),
                 inferred: false,
                 file_id: None,
                 line: None,
@@ -1681,7 +1733,9 @@ fn resolve_reference_at(
     if local {
         return Ok(projected_symbols(root_symbol.get(&(file_id, name))));
     }
-    let Some(request) = request else { return Ok(ProjectedTargets::default()) };
+    let Some(request) = request else {
+        return Ok(ProjectedTargets::default());
+    };
     let Some(target_file) = graph.edge(file_id, &request) else {
         return Ok(ProjectedTargets::default());
     };
@@ -1721,11 +1775,7 @@ fn project_entity_callers(
     for row in rows {
         let (caller, call_confidence, source_file_id, line) = row?;
         let confidence = lower_confidence(occurrence_confidence, &call_confidence);
-        if !projected_edges.insert((
-            caller.clone(),
-            entity_key.to_string(),
-            via_kind.to_string(),
-        )) {
+        if !projected_edges.insert((caller.clone(), entity_key.to_string(), via_kind.to_string())) {
             continue;
         }
         insert_edge.execute(params![
@@ -1753,7 +1803,12 @@ fn lower_confidence(left: &str, right: &str) -> String {
         "likely" => 1,
         _ => 0,
     };
-    if rank(left) <= rank(right) { left } else { right }.to_string()
+    if rank(left) <= rank(right) {
+        left
+    } else {
+        right
+    }
+    .to_string()
 }
 
 fn project_member_calls(
@@ -2000,8 +2055,7 @@ fn neighborhood_in_snapshot(
         &allowed_file_origins,
     )?;
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
-    let allowed_file_roles: HashSet<&str> =
-        options.file_roles.iter().map(String::as_str).collect();
+    let allowed_file_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
     let min_rank = confidence_rank(&options.min_confidence).unwrap();
     let mut discovered = HashSet::from([resolved_anchor.clone()]);
     let mut node_relevance = HashMap::from([(resolved_anchor.clone(), 1.0_f64)]);
@@ -2079,13 +2133,15 @@ fn neighborhood_in_snapshot(
         nodes.push(node);
     }
     nodes.sort_by(|a, b| {
-        b.relevance.total_cmp(&a.relevance).then_with(|| a.key.cmp(&b.key))
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| a.key.cmp(&b.key))
     });
     let mut edges: Vec<GraphEdge> = edges_by_id.into_values().collect();
     edges.sort_by(|a, b| {
-        b.relevance.total_cmp(&a.relevance).then_with(|| {
-            (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target))
-        })
+        b.relevance
+            .total_cmp(&a.relevance)
+            .then_with(|| (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target)))
     });
     Ok(Neighborhood {
         snapshot,
@@ -2125,7 +2181,13 @@ pub fn workflow_neighborhood(
 
     let mut nodes = HashMap::from([(root.key.clone(), root)]);
     let mut relevance = HashMap::from([(anchor.to_string(), 1.0_f64)]);
+    // The same node may be rediscovered at another depth through a stronger
+    // runtime-crossing route. Keep depth in the expansion identity so that
+    // route can propagate its score, while suppressing weaker repeats at the
+    // same depth.
     let mut expanded: HashMap<(String, usize), f64> = HashMap::new();
+    let mut direct_degree_cache = HashMap::new();
+    let mut entity_degree_cache = HashMap::new();
     let mut frontier = BinaryHeap::from([WorkflowRankedNode {
         key: anchor.to_string(),
         depth: 0,
@@ -2150,7 +2212,13 @@ pub fn workflow_neighborhood(
         if state.depth >= depth {
             continue;
         }
-        let steps = workflow_logical_steps(conn, &state.key, &allowed_origins)?;
+        let steps = workflow_logical_steps(
+            conn,
+            &state.key,
+            &allowed_origins,
+            &mut direct_degree_cache,
+            &mut entity_degree_cache,
+        )?;
         for step in steps {
             if traversed_edges >= edge_limit {
                 truncated = true;
@@ -2168,17 +2236,16 @@ pub fn workflow_neighborhood(
             let hub_floor = state.hub_floor.min(step.hub_floor);
             let crossed_runtime = state.crossed_runtime || step.runtime_boundary;
             let score = round_score(
-                confidence_floor
-                    * relation_floor
-                    * distance_decay(next_depth)
-                    * hub_floor
+                confidence_floor * relation_floor * distance_decay(next_depth) * hub_floor
                     + if crossed_runtime { 1.0 } else { 0.0 },
             );
             relevance
                 .entry(step.other.key.clone())
                 .and_modify(|existing| *existing = existing.max(score))
                 .or_insert(score);
-            nodes.entry(step.other.key.clone()).or_insert(step.other.clone());
+            nodes
+                .entry(step.other.key.clone())
+                .or_insert(step.other.clone());
             if !step.terminal {
                 frontier.push(WorkflowRankedNode {
                     key: step.other.key,
@@ -2206,13 +2273,19 @@ pub fn workflow_neighborhood(
             .total_cmp(&left.relevance)
             .then_with(|| left.key.cmp(&right.key))
     });
-    Ok(WorkflowNeighborhood { nodes, traversed_edges, truncated })
+    Ok(WorkflowNeighborhood {
+        nodes,
+        traversed_edges,
+        truncated,
+    })
 }
 
 fn workflow_logical_steps(
     conn: &Connection,
     node: &str,
     allowed_origins: &HashSet<&str>,
+    direct_degree_cache: &mut HashMap<String, usize>,
+    entity_degree_cache: &mut HashMap<String, usize>,
 ) -> Result<Vec<WorkflowLogicalStep>> {
     let mut stmt = conn.prepare_cached(
         "SELECT src_key, dst_key, kind, confidence
@@ -2235,7 +2308,9 @@ fn workflow_logical_steps(
             continue;
         }
         let other_key = if source == node { &target } else { &source };
-        let Some(other) = load_node(conn, other_key)? else { continue };
+        let Some(other) = load_node(conn, other_key)? else {
+            continue;
+        };
         if workflow_direct_kind(&kind) && workflow_symbol_allowed(&other, allowed_origins) {
             let step = WorkflowLogicalStep {
                 // Symbol degree includes documentary and file-projection edges
@@ -2243,7 +2318,12 @@ fn workflow_logical_steps(
                 hub_floor: 1.0,
                 confidence_floor: confidence_weight(&confidence),
                 relation_floor: relation_weight(&kind),
-                terminal: workflow_direct_degree(conn, &other.key, allowed_origins)? > 12,
+                terminal: cached_workflow_direct_degree(
+                    conn,
+                    &other.key,
+                    allowed_origins,
+                    direct_degree_cache,
+                )? > WORKFLOW_HUB_DEGREE_LIMIT,
                 other,
                 runtime_boundary: false,
             };
@@ -2254,6 +2334,7 @@ fn workflow_logical_steps(
             && other.kind == "entity"
             && other.meta.get("plane").and_then(Value::as_str) == Some("general")
         {
+            let entity_degree = cached_graph_degree(conn, &other.key, entity_degree_cache)?;
             collect_general_workflow_steps(
                 conn,
                 node,
@@ -2261,6 +2342,7 @@ fn workflow_logical_steps(
                 &kind,
                 &confidence,
                 &other,
+                entity_degree,
                 allowed_origins,
                 &mut by_target,
             )?;
@@ -2271,6 +2353,17 @@ fn workflow_logical_steps(
         };
         if other.kind != "entity"
             || other.meta.get("plane").and_then(Value::as_str) != Some("runtime")
+        {
+            continue;
+        }
+        // A high-degree DI token is commonly infrastructure wiring. Walking
+        // from its provider side to every injection site would spend the
+        // candidate budget on an inverse-usage fan-out. Keep the useful
+        // consumer -> provider resolution, but suppress that reverse bridge.
+        if family == "di"
+            && !side
+            && cached_graph_degree(conn, &other.key, entity_degree_cache)?
+                > WORKFLOW_HUB_DEGREE_LIMIT
         {
             continue;
         }
@@ -2290,8 +2383,7 @@ fn workflow_logical_steps(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (peer_source, peer_target, peer_kind, peer_confidence) in entity_edges {
-            let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind)
-            else {
+            let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind) else {
                 continue;
             };
             if family != peer_family
@@ -2309,7 +2401,9 @@ fn workflow_logical_steps(
             if peer_key == node {
                 continue;
             }
-            let Some(peer) = load_node(conn, peer_key)? else { continue };
+            let Some(peer) = load_node(conn, peer_key)? else {
+                continue;
+            };
             if !workflow_symbol_allowed(&peer, allowed_origins) {
                 continue;
             }
@@ -2345,14 +2439,14 @@ fn collect_general_workflow_steps(
     kind: &str,
     confidence: &str,
     entity: &GraphNode,
+    entity_degree: usize,
     allowed_origins: &HashSet<&str>,
     steps: &mut HashMap<String, WorkflowLogicalStep>,
 ) -> Result<()> {
-    let entity_degree = graph_degree(conn, &entity.key)?;
     // Shared configuration/data identities are associative clues, not hard
     // handoffs. High-degree identities are repository-wide hubs and do not
     // belong in a bounded workflow candidate set.
-    if entity_degree > 12 {
+    if entity_degree > WORKFLOW_HUB_DEGREE_LIMIT {
         return Ok(());
     }
     let mut stmt = conn.prepare_cached(
@@ -2372,16 +2466,21 @@ fn collect_general_workflow_steps(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (source, target, peer_kind, peer_confidence) in peers {
         if workflow_general_association_kind(&peer_kind) != Some(family)
-            || confidence_rank(&peer_confidence).unwrap_or(0)
-                < confidence_rank("likely").unwrap()
+            || confidence_rank(&peer_confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
         }
-        let peer_key = if source == entity.key { &target } else { &source };
+        let peer_key = if source == entity.key {
+            &target
+        } else {
+            &source
+        };
         if peer_key == node {
             continue;
         }
-        let Some(peer) = load_node(conn, peer_key)? else { continue };
+        let Some(peer) = load_node(conn, peer_key)? else {
+            continue;
+        };
         if !workflow_symbol_allowed(&peer, allowed_origins) {
             continue;
         }
@@ -2406,7 +2505,8 @@ fn retain_stronger_workflow_step(
     candidate: WorkflowLogicalStep,
 ) {
     match steps.get(&candidate.other.key) {
-        Some(existing) if workflow_step_strength(existing) >= workflow_step_strength(&candidate) => {}
+        Some(existing)
+            if workflow_step_strength(existing) >= workflow_step_strength(&candidate) => {}
         _ => {
             steps.insert(candidate.other.key.clone(), candidate);
         }
@@ -2449,8 +2549,7 @@ fn workflow_direct_degree(
     for row in incident {
         let (source, target, kind, confidence) = row?;
         if !workflow_direct_kind(&kind)
-            || confidence_rank(&confidence).unwrap_or(0)
-                < confidence_rank("likely").unwrap()
+            || confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
         }
@@ -2464,6 +2563,33 @@ fn workflow_direct_degree(
     Ok(neighbors.len())
 }
 
+fn cached_workflow_direct_degree(
+    conn: &Connection,
+    node: &str,
+    allowed_origins: &HashSet<&str>,
+    cache: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    if let Some(degree) = cache.get(node) {
+        return Ok(*degree);
+    }
+    let degree = workflow_direct_degree(conn, node, allowed_origins)?;
+    cache.insert(node.to_string(), degree);
+    Ok(degree)
+}
+
+fn cached_graph_degree(
+    conn: &Connection,
+    node: &str,
+    cache: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    if let Some(degree) = cache.get(node) {
+        return Ok(*degree);
+    }
+    let degree = graph_degree(conn, node)?;
+    cache.insert(node.to_string(), degree);
+    Ok(degree)
+}
+
 fn workflow_direct_kind(kind: &str) -> bool {
     matches!(kind, "call" | "render" | "extend")
 }
@@ -2471,8 +2597,9 @@ fn workflow_direct_kind(kind: &str) -> bool {
 fn workflow_general_association_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "handles_graphql" | "invokes_graphql" => Some("graphql"),
-        "reads_resource" | "writes_resource" => Some("resource"),
+        "reads_resource" | "writes_resource" | "acquires_resource" => Some("resource"),
         "reads_env" => Some("environment"),
+        "reads_config" => Some("configuration"),
         "checks_flag" => Some("feature_flag"),
         "calls_host" => Some("external_host"),
         _ => None,
@@ -2495,17 +2622,18 @@ fn workflow_runtime_boundary_kind(kind: &str) -> Option<(&'static str, bool)> {
     }
 }
 
-pub fn paths(
-    conn: &Connection,
-    from: &str,
-    to: &str,
-    options: &PathOptions,
-) -> Result<PathSearch> {
+pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> Result<PathSearch> {
     if options.max_depth == 0 || options.max_depth > 8 {
         bail!("path depth must be between 1 and 8");
     }
     if options.path_limit == 0 || options.path_limit > 50 {
         bail!("path limit must be between 1 and 50");
+    }
+    if options.node_limit == 0 || options.node_limit > MAX_PATH_NODE_LIMIT {
+        bail!("path node limit must be between 1 and {MAX_PATH_NODE_LIMIT}");
+    }
+    if options.edge_limit == 0 || options.edge_limit > MAX_PATH_EDGE_LIMIT {
+        bail!("path edge limit must be between 1 and {MAX_PATH_EDGE_LIMIT}");
     }
     origin::validate_all(&options.file_origins)?;
     file_role::validate_all(&options.file_roles)?;
@@ -2545,29 +2673,34 @@ pub fn paths(
     {
         node_by_key.insert(resolved_to.clone(), node);
     }
-    let mut adjacency: HashMap<String, Vec<(String, GraphEdge)>> = HashMap::new();
+    let mut adjacency: HashMap<String, Vec<(String, GraphEdge, bool)>> = HashMap::new();
     for edge in &neighborhood.edges {
         if options.direction != "in" {
-            adjacency
-                .entry(edge.source.clone())
-                .or_default()
-                .push((edge.target.clone(), edge.clone()));
+            adjacency.entry(edge.source.clone()).or_default().push((
+                edge.target.clone(),
+                edge.clone(),
+                false,
+            ));
         }
         if options.direction != "out" {
-            adjacency
-                .entry(edge.target.clone())
-                .or_default()
-                .push((edge.source.clone(), edge.clone()));
+            adjacency.entry(edge.target.clone()).or_default().push((
+                edge.source.clone(),
+                edge.clone(),
+                true,
+            ));
         }
     }
     for edges in adjacency.values_mut() {
-        edges.sort_by(|(left_node, left), (right_node, right)| {
-            right
-                .relevance
-                .total_cmp(&left.relevance)
-                .then_with(|| left_node.cmp(right_node))
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
+        edges.sort_by(
+            |(left_node, left, left_reversed), (right_node, right, right_reversed)| {
+                right
+                    .relevance
+                    .total_cmp(&left.relevance)
+                    .then_with(|| left_node.cmp(right_node))
+                    .then_with(|| left.kind.cmp(&right.kind))
+                    .then_with(|| left_reversed.cmp(right_reversed))
+            },
+        );
     }
 
     #[derive(Clone)]
@@ -2577,7 +2710,10 @@ pub fn paths(
         score: f64,
     }
 
-    let candidate_limit = options.path_limit.saturating_mul(32).max(options.path_limit);
+    let candidate_limit = options
+        .path_limit
+        .saturating_mul(32)
+        .max(options.path_limit);
     let mut stack = vec![Candidate {
         nodes: vec![neighborhood.resolved_anchor.clone()],
         steps: Vec::new(),
@@ -2585,7 +2721,13 @@ pub fn paths(
     }];
     let mut candidates = Vec::new();
     let mut enumeration_truncated = false;
+    let mut searched_states = 0;
     while let Some(candidate) = stack.pop() {
+        if searched_states >= MAX_PATH_SEARCH_STATES {
+            enumeration_truncated = true;
+            break;
+        }
+        searched_states += 1;
         let current = candidate.nodes.last().expect("path has a node");
         if current == &resolved_to {
             candidates.push(candidate);
@@ -2598,8 +2740,10 @@ pub fn paths(
         if candidate.steps.len() >= options.max_depth {
             continue;
         }
-        let Some(edges) = adjacency.get(current) else { continue };
-        for (next, edge) in edges.iter().rev() {
+        let Some(edges) = adjacency.get(current) else {
+            continue;
+        };
+        for (next, edge, reversed) in edges.iter().rev() {
             if candidate.nodes.contains(next) {
                 continue;
             }
@@ -2608,6 +2752,7 @@ pub fn paths(
             next_candidate.steps.push(PathStep {
                 from: current.clone(),
                 to: next.clone(),
+                reversed: *reversed,
                 edge: edge.clone(),
             });
             next_candidate.score = round_score(candidate.score.min(edge.relevance));
@@ -2631,7 +2776,11 @@ pub fn paths(
                 .iter()
                 .filter_map(|key| node_by_key.get(key).cloned())
                 .collect();
-            GraphPath { score: candidate.score, nodes, steps: candidate.steps }
+            GraphPath {
+                score: candidate.score,
+                nodes,
+                steps: candidate.steps,
+            }
         })
         .collect();
     Ok(PathSearch {
@@ -2645,6 +2794,7 @@ pub fn paths(
         paths,
         searched_nodes: neighborhood.nodes.len(),
         searched_edges: neighborhood.edges.len(),
+        searched_states,
         truncated: neighborhood.truncated
             || enumeration_truncated
             || matched_paths > options.path_limit,
@@ -2807,9 +2957,10 @@ fn relation_weight(kind: &str) -> f64 {
         | "handles_route"
         | "handles_graphql" => 1.0,
         "invokes_graphql" | "reads_resource" | "writes_resource" => 0.9,
-        "reads_env" | "checks_flag" | "calls_host" => 0.8,
+        "acquires_resource" | "reads_env" | "reads_config" | "checks_flag" | "calls_host" => 0.8,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
+        "imports_types" | "imports_package_types" => 0.6,
         "decorated_by" => 0.7,
         "accepts_contract" | "returns_contract" | "references_contract" => 0.65,
         "declares_contract" => 0.55,
@@ -2954,11 +3105,13 @@ fn allowed_candidates(
 ) -> Result<Vec<String>> {
     candidates
         .into_iter()
-        .filter_map(|candidate| match node_origin_allowed(conn, &candidate, allowed_origins) {
-            Ok(true) => Some(Ok(candidate)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
+        .filter_map(
+            |candidate| match node_origin_allowed(conn, &candidate, allowed_origins) {
+                Ok(true) => Some(Ok(candidate)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
         .collect()
 }
 
@@ -3049,7 +3202,11 @@ fn package_key(package: &str) -> String {
 fn package_instance_key(name: &str, version: Option<&str>, locator: &str) -> String {
     let identity = format!("{name}\0{}\0{locator}", version.unwrap_or("unknown"));
     let digest = blake3::hash(identity.as_bytes()).to_hex();
-    format!("pkg:{name}@{}#{}", version.unwrap_or("unknown"), &digest[..8])
+    format!(
+        "pkg:{name}@{}#{}",
+        version.unwrap_or("unknown"),
+        &digest[..8]
+    )
 }
 
 fn event_key(name: &str) -> String {
@@ -3093,6 +3250,18 @@ fn contract_external_key(entity_type: &str, request: &str, name: &str) -> String
         encode_key_component(request),
         encode_key_component(name)
     )
+}
+
+fn contract_unresolved_key(entity_type: &str, request: &str, name: &str) -> String {
+    format!(
+        "contract:{entity_type}:unresolved:{}#{}",
+        encode_key_component(request),
+        encode_key_component(name)
+    )
+}
+
+fn is_external_module_request(request: &str) -> bool {
+    !request.starts_with('.') && !request.starts_with('/')
 }
 
 fn reference_entity_key(
@@ -3224,6 +3393,104 @@ mod tests {
     }
 
     #[test]
+    fn paths_marks_reverse_traversal_explicitly() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "flow.ts",
+            "export function finish() {}\n\
+             export function middle() { finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let result = super::paths(
+            &conn,
+            "flow.ts:finish",
+            "flow.ts:middle",
+            &super::PathOptions {
+                direction: "both".into(),
+                max_depth: 1,
+                kinds: vec!["call".into()],
+                ..Default::default()
+            },
+        )?;
+        let step = &result.paths[0].steps[0];
+        assert!(step.reversed);
+        assert_eq!(step.from, step.edge.target);
+        assert_eq!(step.to, step.edge.source);
+        Ok(())
+    }
+
+    #[test]
+    fn paths_caps_explored_prefix_states() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "flow.ts",
+            "export function root() {}\nexport function target() {}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let root: String = conn.query_row(
+            "SELECT node_key FROM graph_nodes WHERE node_kind='symbol' AND display_name='root'",
+            [],
+            |row| row.get(0),
+        )?;
+        let target: String = conn.query_row(
+            "SELECT node_key FROM graph_nodes WHERE node_kind='symbol' AND display_name='target'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        for layer in 0..4 {
+            for index in 0..15 {
+                let key = format!("dense:{layer}:{index}");
+                conn.execute(
+                    "INSERT INTO graph_nodes(node_key, node_kind, display_name, meta_json)
+                     VALUES(?1, 'candidate', ?1, '{}')",
+                    [&key],
+                )?;
+                if layer == 0 {
+                    conn.execute(
+                        "INSERT INTO resolved_edges(
+                           src_key, dst_key, kind, confidence, provenance, detail_json
+                         ) VALUES(?1, ?2, 'call', 'certain', 'test', '{}')",
+                        rusqlite::params![root, key],
+                    )?;
+                } else {
+                    for parent in 0..15 {
+                        let parent_key = format!("dense:{}:{parent}", layer - 1);
+                        conn.execute(
+                            "INSERT INTO resolved_edges(
+                               src_key, dst_key, kind, confidence, provenance, detail_json
+                             ) VALUES(?1, ?2, 'call', 'certain', 'test', '{}')",
+                            rusqlite::params![parent_key, key],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let result = super::paths(
+            &conn,
+            &root,
+            &target,
+            &super::PathOptions {
+                direction: "out".into(),
+                max_depth: 4,
+                path_limit: 1,
+                kinds: vec!["call".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(result.paths.is_empty());
+        assert_eq!(result.searched_states, super::MAX_PATH_SEARCH_STATES);
+        assert!(result.truncated);
+        Ok(())
+    }
+
+    #[test]
     fn registry_entity_connects_dispatch_to_imported_registered_handler() -> Result<()> {
         let repo = tempfile::tempdir()?;
         write(
@@ -3295,8 +3562,18 @@ mod tests {
             40,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "processHandler"));
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "continueWorkflow"));
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "processHandler")
+        );
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "continueWorkflow")
+        );
         assert!(!workflow.truncated);
         Ok(())
     }
@@ -3364,7 +3641,10 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(producer_edges, 1, "occurrences must not duplicate traversal edges");
+        assert_eq!(
+            producer_edges, 1,
+            "occurrences must not duplicate traversal edges"
+        );
         let collapsed_edges: i64 = conn.query_row(
             "SELECT count(*) FROM resolved_edges
              WHERE src_key LIKE '%enqueue.ts#::enqueueRequest@1'
@@ -3373,7 +3653,10 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(collapsed_edges, 1, "caller collapse must also be deduplicated");
+        assert_eq!(
+            collapsed_edges, 1,
+            "caller collapse must also be deduplicated"
+        );
 
         let result = neighborhood(
             &conn,
@@ -3402,8 +3685,18 @@ mod tests {
             40,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "enqueueRequest"));
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "workerHandler"));
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "enqueueRequest")
+        );
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "workerHandler")
+        );
         assert!(!workflow.truncated);
         Ok(())
     }
@@ -3439,12 +3732,71 @@ mod tests {
             400,
             &origin::defaults(),
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "shared"));
         assert!(
-            !workflow.nodes.iter().any(|node| node.display_name == "caller0"),
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "shared")
+        );
+        assert!(
+            !workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "caller0"),
             "a high-degree helper is evidence but must not bridge to every caller"
         );
         assert!(!workflow.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_neighborhood_rejects_only_high_degree_general_entity_hubs() -> Result<()> {
+        let build = |reader_count: usize| -> Result<(i64, super::WorkflowNeighborhood)> {
+            let repo = tempfile::tempdir()?;
+            for index in 0..reader_count {
+                write(
+                    repo.path(),
+                    &format!("reader-{index}.ts"),
+                    &format!(
+                        "export function reader{index}() {{ return process.env.SHARED_KEY; }}\n"
+                    ),
+                )?;
+            }
+            let conn = store::open(repo.path())?;
+            indexer::index_repo(repo.path(), &conn)?;
+            let degree: i64 = conn.query_row(
+                "SELECT count(*) FROM resolved_edges edge
+                 JOIN entities entity
+                   ON entity.entity_key=edge.src_key OR entity.entity_key=edge.dst_key
+                 WHERE entity.entity_type='environment_variable'
+                   AND entity.name='SHARED_KEY'",
+                [],
+                |row| row.get(0),
+            )?;
+            let workflow = workflow_neighborhood(
+                &conn,
+                "sym:reader-0.ts#::reader0@1",
+                1,
+                100,
+                400,
+                &origin::defaults(),
+            )?;
+            Ok((degree, workflow))
+        };
+
+        let (low_degree, low) = build(5)?;
+        assert_eq!(low_degree, 5);
+        assert_eq!(low.nodes.len(), 5, "four low-degree peers should be clues");
+        assert!(!low.truncated);
+
+        let (high_degree, high) = build(14)?;
+        assert_eq!(high_degree, 14);
+        assert_eq!(
+            high.nodes.len(),
+            1,
+            "the shared hub must not associate peers"
+        );
+        assert!(!high.truncated);
         Ok(())
     }
 
@@ -3482,7 +3834,11 @@ mod tests {
                }\n\
              }\n",
         )?;
-        write(repo.path(), "token.ts", "export const MAILER = Symbol('mailer');\n")?;
+        write(
+            repo.path(),
+            "token.ts",
+            "export const MAILER = Symbol('mailer');\n",
+        )?;
         write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
         write(
             repo.path(),
@@ -3532,11 +3888,15 @@ mod tests {
         )?;
         assert!(cron.edges.iter().any(|edge| {
             edge.kind == "produces_job"
-                && edge.source.contains("producer.ts#Producer::scheduleCleanup@1")
+                && edge
+                    .source
+                    .contains("producer.ts#Producer::scheduleCleanup@1")
         }));
         assert!(cron.edges.iter().any(|edge| {
             edge.kind == "job_handler"
-                && edge.target.contains("jobs.ts#JobConsumer::cleanupHandler@1")
+                && edge
+                    .target
+                    .contains("jobs.ts#JobConsumer::cleanupHandler@1")
         }));
 
         let provider: (String, String) = conn.query_row(
@@ -3557,6 +3917,72 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(injections, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_neighborhood_suppresses_only_inverse_high_degree_di_fanout() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "token.ts",
+            "export const MAILER = Symbol('mailer');\n",
+        )?;
+        write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
+        write(
+            repo.path(),
+            "module.ts",
+            "import { MAILER } from './token';\n\
+             import { MailerService } from './mailer';\n\
+             export const providers = [{ provide: MAILER, useClass: MailerService }];\n",
+        )?;
+        for index in 0..15 {
+            write(
+                repo.path(),
+                &format!("consumer-{index}.ts"),
+                &format!(
+                    "import {{ MAILER }} from './token';\n\
+                     export class Consumer{index} {{ constructor(@Inject(MAILER) mailer) {{}} }}\n"
+                ),
+            )?;
+        }
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let (entity, provider): (String, String) = conn.query_row(
+            "SELECT edge.src_key, edge.dst_key FROM resolved_edges edge
+             WHERE edge.kind='provides'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(super::graph_degree(&conn, &entity)?, 16);
+        let injector: String = conn.query_row(
+            "SELECT edge.src_key FROM resolved_edges edge
+             JOIN graph_nodes node ON node.node_key=edge.src_key
+             JOIN files file ON file.id=node.file_id
+             WHERE edge.kind='injects' AND edge.dst_key=?1
+               AND file.path='consumer-0.ts'",
+            [&entity],
+            |row| row.get(0),
+        )?;
+
+        let from_provider =
+            workflow_neighborhood(&conn, &provider, 1, 100, 400, &origin::defaults())?;
+        assert_eq!(
+            from_provider.nodes.len(),
+            1,
+            "a common provider must not fan out to every injection site"
+        );
+        assert!(!from_provider.truncated);
+
+        let from_consumer =
+            workflow_neighborhood(&conn, &injector, 1, 100, 400, &origin::defaults())?;
+        assert!(
+            from_consumer.nodes.iter().any(|node| node.key == provider),
+            "a consumer must still resolve its concrete provider"
+        );
+        assert_eq!(from_consumer.nodes.len(), 2);
+        assert!(!from_consumer.truncated);
         Ok(())
     }
 
@@ -3584,6 +4010,12 @@ mod tests {
              export const save = (input: User): UserResult => input;\n\
              export class UserApi { get(input: User): UserResult { return input; } }\n",
         )?;
+        write(
+            repo.path(),
+            "unresolved.ts",
+            "import type { Ghost } from './missing-barrel';\n\
+             export function haunted(input: Ghost): Ghost { return input; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
 
@@ -3605,20 +4037,15 @@ mod tests {
                 && edge.detail["documentary"] == true
         }));
         assert!(result.edges.iter().any(|edge| {
-            edge.kind == "returns_contract"
-                && edge.target == alias
-                && edge.confidence == "certain"
+            edge.kind == "returns_contract" && edge.target == alias && edge.confidence == "certain"
         }));
-        let workflow = workflow_neighborhood(
-            &conn,
-            "sym:api.ts#::load@1",
-            2,
-            20,
-            40,
-            &origin::defaults(),
-        )?;
+        let workflow =
+            workflow_neighborhood(&conn, "sym:api.ts#::load@1", 2, 20, 40, &origin::defaults())?;
         assert!(
-            !workflow.nodes.iter().any(|node| node.display_name == "save"),
+            !workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "save"),
             "shared contracts are documentary and must not create workflow candidates"
         );
         let contract_file: String = conn.query_row(
@@ -3647,6 +4074,41 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(runtime_type_edges, 0);
+        let type_only_module: (i64, i64, i64) = conn.query_row(
+            "SELECT edge.type_only,
+                    EXISTS(
+                      SELECT 1 FROM resolved_edges projected
+                      WHERE projected.src_key='file:api.ts'
+                        AND projected.dst_key='file:barrel.ts'
+                        AND projected.kind='imports_types'
+                        AND projected.provenance='type-resolver'
+                    ),
+                    EXISTS(
+                      SELECT 1 FROM resolved_edges projected
+                      WHERE projected.src_key='file:api.ts'
+                        AND projected.dst_key='file:barrel.ts'
+                        AND projected.kind='import'
+                    )
+             FROM module_edges edge
+             JOIN files source ON source.id=edge.from_file
+             WHERE source.path='api.ts' AND edge.request='./barrel'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(type_only_module, (1, 1, 0));
+        let unresolved_contract: (String, Option<String>) = conn.query_row(
+            "SELECT entity_key, identity_anchor FROM entities
+             WHERE plane='contract' AND name='Ghost'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            unresolved_contract,
+            (
+                "contract:reference:unresolved:./missing-barrel#Ghost".into(),
+                None
+            )
+        );
         let enum_count: i64 = conn.query_row(
             "SELECT count(*) FROM entities
              WHERE plane='contract' AND entity_type='enum' AND name='UserState'",
@@ -3672,8 +4134,10 @@ mod tests {
              }\n\
              export function run() {\n\
                process.env.API_KEY;\n\
+               config.get('database.host');\n\
                prisma.user.findMany();\n\
                prisma.user.create({ data: {} });\n\
+               getRepository(User);\n\
                flags.isEnabled('new-ui');\n\
                fetch('https://api.example.com/v1');\n\
                client.query({ currentUser: { id: true } });\n\
@@ -3691,8 +4155,10 @@ mod tests {
             ("graphql_operation", "query:user", "handles_graphql"),
             ("graphql_operation", "query:currentUser", "invokes_graphql"),
             ("environment_variable", "API_KEY", "reads_env"),
+            ("config_key", "database.host", "reads_config"),
             ("database_resource", "user", "reads_resource"),
             ("database_resource", "user", "writes_resource"),
+            ("database_resource", "User", "acquires_resource"),
             ("feature_flag", "new-ui", "checks_flag"),
             ("external_host", "api.example.com", "calls_host"),
         ] {
@@ -3717,15 +4183,59 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(handler_target, "getUser");
-        let workflow = workflow_neighborhood(
-            &conn,
-            "sym:app.ts#::run@1",
-            1,
-            20,
-            40,
-            &origin::defaults(),
+        let workflow =
+            workflow_neighborhood(&conn, "sym:app.ts#::run@1", 1, 20, 40, &origin::defaults())?;
+        assert!(
+            workflow
+                .nodes
+                .iter()
+                .any(|node| node.display_name == "followup")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_route_handlers_do_not_attach_to_the_next_declaration() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "app.ts",
+            "export function listUsers() {}\n\
+             usersRouter.get('/users', listUsers);\n\
+             router.post('/webhooks', async (request) => request.body);\n\
+             export function unrelatedNearbyFunction() {}\n",
         )?;
-        assert!(workflow.nodes.iter().any(|node| node.display_name == "followup"));
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let named_handler: String = conn.query_row(
+            "SELECT target.display_name FROM resolved_edges edge
+             JOIN entities route ON route.entity_key=edge.src_key
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='GET /users' AND edge.kind='handles_route'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(named_handler, "listUsers");
+        let inline_occurrences: i64 = conn.query_row(
+            "SELECT count(*) FROM entity_occurrences occurrence
+             JOIN entities route ON route.id=occurrence.entity_id
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='POST /webhooks'",
+            [],
+            |row| row.get(0),
+        )?;
+        let inline_handler_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges edge
+             JOIN entities route ON route.entity_key=edge.src_key
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='POST /webhooks' AND edge.kind='handles_route'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(inline_occurrences, 1);
+        assert_eq!(inline_handler_edges, 0);
         Ok(())
     }
 
@@ -3798,8 +4308,18 @@ mod tests {
             },
         )?;
         assert!(result.truncated);
-        assert!(result.nodes.iter().any(|node| node.key == "candidate:z-high"));
-        assert!(!result.nodes.iter().any(|node| node.key == "candidate:a-low"));
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| node.key == "candidate:z-high")
+        );
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|node| node.key == "candidate:a-low")
+        );
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].kind, "import");
         assert!(result.edges[0].relevance > 0.0);
@@ -3816,11 +4336,10 @@ mod tests {
         )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
-        let file_id: i64 = conn.query_row(
-            "SELECT id FROM files WHERE path='ambiguous.js'",
-            [],
-            |r| r.get(0),
-        )?;
+        let file_id: i64 =
+            conn.query_row("SELECT id FROM files WHERE path='ambiguous.js'", [], |r| {
+                r.get(0)
+            })?;
         conn.execute(
             "INSERT INTO symbols(
                file_id, name, kind, start, end, decl_start, decl_end,
@@ -3873,9 +4392,12 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert!(!default_result.edges.iter().any(|edge| {
-            edge.kind == "member_call" || edge.kind == "member_candidate"
-        }));
+        assert!(
+            !default_result
+                .edges
+                .iter()
+                .any(|edge| { edge.kind == "member_call" || edge.kind == "member_candidate" })
+        );
 
         let result = neighborhood(
             &conn,

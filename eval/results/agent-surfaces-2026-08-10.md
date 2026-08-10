@@ -1,5 +1,9 @@
 # Deterministic agent-surface validation — 2026-08-10
 
+> Post-merge availability, query-shape, traversal-direction, and dependency
+> area fixes are recorded in
+> [`agent-surfaces-followups-2026-08-10.md`](agent-surfaces-followups-2026-08-10.md).
+
 ## Scope
 
 This slice exposes the deterministic graph through three structural-profile MCP

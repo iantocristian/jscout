@@ -59,9 +59,23 @@ pub struct Heuristics {
     pub methods: Vec<MethodDef>,
 }
 
-const EMIT_METHODS: &[&str] = &["emit", "publish", "dispatch", "dispatchEvent", "trigger", "send"];
-const LISTEN_METHODS: &[&str] =
-    &["on", "once", "off", "addListener", "addEventListener", "subscribe", "handle"];
+const EMIT_METHODS: &[&str] = &[
+    "emit",
+    "publish",
+    "dispatch",
+    "dispatchEvent",
+    "trigger",
+    "send",
+];
+const LISTEN_METHODS: &[&str] = &[
+    "on",
+    "once",
+    "off",
+    "addListener",
+    "addEventListener",
+    "subscribe",
+    "handle",
+];
 
 struct HeurVisitor {
     out: Heuristics,
@@ -78,8 +92,12 @@ fn string_arg(args: &[Argument<'_>]) -> Option<String> {
 }
 
 fn require_request(expr: &Expression<'_>) -> Option<String> {
-    let Expression::CallExpression(call) = expr else { return None };
-    let Expression::Identifier(callee) = &call.callee else { return None };
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    let Expression::Identifier(callee) = &call.callee else {
+        return None;
+    };
     if callee.name != "require" {
         return None;
     }
@@ -89,31 +107,32 @@ fn require_request(expr: &Expression<'_>) -> Option<String> {
 impl<'a> Visit<'a> for HeurVisitor {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
         if let Some(init) = &decl.init
-            && let Some(request) = require_request(init) {
-                match &decl.id {
-                    BindingPattern::BindingIdentifier(id) => {
-                        self.out.requires.push(RequireBinding {
-                            local: id.name.to_string(),
-                            imported: "*".into(),
-                            request,
-                        });
-                    }
-                    BindingPattern::ObjectPattern(obj) => {
-                        for prop in &obj.properties {
-                            if let (Some(key), BindingPattern::BindingIdentifier(local)) =
-                                (prop.key.static_name(), &prop.value)
-                            {
-                                self.out.requires.push(RequireBinding {
-                                    local: local.name.to_string(),
-                                    imported: key.to_string(),
-                                    request: request.clone(),
-                                });
-                            }
+            && let Some(request) = require_request(init)
+        {
+            match &decl.id {
+                BindingPattern::BindingIdentifier(id) => {
+                    self.out.requires.push(RequireBinding {
+                        local: id.name.to_string(),
+                        imported: "*".into(),
+                        request,
+                    });
+                }
+                BindingPattern::ObjectPattern(obj) => {
+                    for prop in &obj.properties {
+                        if let (Some(key), BindingPattern::BindingIdentifier(local)) =
+                            (prop.key.static_name(), &prop.value)
+                        {
+                            self.out.requires.push(RequireBinding {
+                                local: local.name.to_string(),
+                                imported: key.to_string(),
+                                request: request.clone(),
+                            });
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
+        }
         oxc_ast_visit::walk::walk_variable_declarator(self, decl);
     }
 
@@ -137,17 +156,18 @@ impl<'a> Visit<'a> for HeurVisitor {
                     if let Expression::ObjectExpression(obj) = &expr.right {
                         for p in &obj.properties {
                             if let ObjectPropertyKind::ObjectProperty(op) = p
-                                && let Some(name) = op.key.static_name() {
-                                    let local = match &op.value {
-                                        Expression::Identifier(id) => Some(id.name.to_string()),
-                                        _ if op.shorthand => Some(name.to_string()),
-                                        _ => None,
-                                    };
-                                    self.out.cjs_exports.push(CjsExport {
-                                        export_name: name.to_string(),
-                                        local_name: local,
-                                    });
-                                }
+                                && let Some(name) = op.key.static_name()
+                            {
+                                let local = match &op.value {
+                                    Expression::Identifier(id) => Some(id.name.to_string()),
+                                    _ if op.shorthand => Some(name.to_string()),
+                                    _ => None,
+                                };
+                                self.out.cjs_exports.push(CjsExport {
+                                    export_name: name.to_string(),
+                                    local_name: local,
+                                });
+                            }
                         }
                     }
                 }
@@ -197,14 +217,15 @@ impl<'a> Visit<'a> for HeurVisitor {
             let class_name = id.name.to_string();
             for member in &class.body.body {
                 if let ClassElement::MethodDefinition(m) = member
-                    && let Some(name) = m.key.static_name() {
-                        self.out.methods.push(MethodDef {
-                            class: class_name.clone(),
-                            name: name.to_string(),
-                            span_start: m.span().start,
-                            span_end: m.span().end,
-                        });
-                    }
+                    && let Some(name) = m.key.static_name()
+                {
+                    self.out.methods.push(MethodDef {
+                        class: class_name.clone(),
+                        name: name.to_string(),
+                        span_start: m.span().start,
+                        span_end: m.span().end,
+                    });
+                }
             }
         }
         oxc_ast_visit::walk::walk_class(self, class);
@@ -219,14 +240,19 @@ impl<'a> Visit<'a> for HeurVisitor {
             _ => None,
         };
         if let Some(request) = request {
-            self.out.dynamic_imports.push(DynamicImport { request, span_start: expr.span.start });
+            self.out.dynamic_imports.push(DynamicImport {
+                request,
+                span_start: expr.span.start,
+            });
         }
         oxc_ast_visit::walk::walk_import_expression(self, expr);
     }
 }
 
 pub fn extract(program: &Program<'_>) -> Heuristics {
-    let mut v = HeurVisitor { out: Heuristics::default() };
+    let mut v = HeurVisitor {
+        out: Heuristics::default(),
+    };
     v.visit_program(program);
     v.out
 }

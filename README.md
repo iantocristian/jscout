@@ -1,8 +1,12 @@
 # jscout
 
-A fast, runtime-level JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on [oxc](https://oxc.rs).
+A fast JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on [oxc](https://oxc.rs).
 
-Philosophy: **TypeScript is for humans.** TS syntax is parsed, but type-level constructs (interfaces, type aliases, `declare`, type-only imports/exports) are erased — the index covers the *runtime value graph*: functions, classes, components, calls, renders, module edges. This makes the indexer equally precise on plain JavaScript.
+The runtime value graph remains primary: functions, classes, components, calls,
+renders, and executable module edges work the same way for JavaScript and
+TypeScript. Type-only bindings never become runtime edges. A separate
+documentary contract plane indexes interfaces, aliases, enums, decorators,
+schemas, and exported API types without claiming they execute.
 
 ## Commands
 
@@ -16,7 +20,7 @@ jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confide
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
-jscout watch <root> [--embed]  # re-index on file change (ms-scale for single edits)
+jscout watch <root> [--embed]  # hash-incremental parse; projection is currently rebuilt
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
 jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
@@ -30,6 +34,10 @@ jscout agent-guide --install R # install a project-local jscout skill
 ```
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
+
+Workflow-candidate seeds must each resolve uniquely to a symbol.
+File anchors are rejected because a file can contain multiple unrelated
+operations; choose an exported symbol or pass its exact returned `sym:` anchor.
 
 `A` accepts a returned node key, a repo-relative file path, a symbol name, or
 `path-substring:NAME`. Every neighborhood includes the current repository
@@ -240,7 +248,9 @@ Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
 references, event/member-call sites, embeddings, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
 after indexing so barrel changes can reroute references in otherwise unchanged
-files without leaving stale graph edges behind. File roles live on canonical
+files without leaving stale graph edges behind. Runtime module links use
+`import`/`imports_package`; requests found only in type bindings use the
+documentary `imports_types`/`imports_package_types` kinds. File roles live on canonical
 file rows and are refreshed even when source hashes are unchanged. Files also
 carry `repository`, `workspace`, or `dependency` origin plus optional package
 instance/path identity. Package instances record canonical root, name, version,

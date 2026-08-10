@@ -23,9 +23,21 @@ pub struct ModuleGraph {
 
 impl ModuleGraph {
     pub fn load(conn: &Connection) -> Result<Self> {
+        Self::load_inner(conn, false)
+    }
+
+    /// Load the documentary export plane for structural contract resolution.
+    /// Runtime-only consumers such as `who_uses` use [`Self::load`] and avoid
+    /// scanning contract exports they cannot consume.
+    pub(crate) fn load_with_contracts(conn: &Connection) -> Result<Self> {
+        Self::load_inner(conn, true)
+    }
+
+    fn load_inner(conn: &Connection, include_contracts: bool) -> Result<Self> {
         let mut exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
-        let mut stmt =
-            conn.prepare("SELECT file_id, export_name, local_name, from_request, from_name FROM exports")?;
+        let mut stmt = conn.prepare(
+            "SELECT file_id, export_name, local_name, from_request, from_name FROM exports",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -43,24 +55,26 @@ impl ModuleGraph {
         }
 
         let mut contract_exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
-        let mut stmt = conn.prepare(
-            "SELECT file_id, export_name, local_name, from_request, from_name
-             FROM contract_exports",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                ExportEntry {
-                    export_name: r.get(1)?,
-                    local_name: r.get(2)?,
-                    from_request: r.get(3)?,
-                    from_name: r.get(4)?,
-                },
-            ))
-        })?;
-        for row in rows {
-            let (id, entry) = row?;
-            contract_exports.entry(id).or_default().push(entry);
+        if include_contracts {
+            let mut stmt = conn.prepare(
+                "SELECT file_id, export_name, local_name, from_request, from_name
+                 FROM contract_exports",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    ExportEntry {
+                        export_name: r.get(1)?,
+                        local_name: r.get(2)?,
+                        from_request: r.get(3)?,
+                        from_name: r.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, entry) = row?;
+                contract_exports.entry(id).or_default().push(entry);
+            }
         }
 
         let mut edges: HashMap<(i64, String), (Option<i64>, bool)> = HashMap::new();
@@ -87,11 +101,18 @@ impl ModuleGraph {
             let (id, path) = row?;
             paths.insert(id, path);
         }
-        Ok(Self { exports, contract_exports, edges, paths })
+        Ok(Self {
+            exports,
+            contract_exports,
+            edges,
+            paths,
+        })
     }
 
     pub fn edge(&self, file: i64, request: &str) -> Option<i64> {
-        self.edges.get(&(file, request.to_string())).and_then(|(target, _)| *target)
+        self.edges
+            .get(&(file, request.to_string()))
+            .and_then(|(target, _)| *target)
     }
 
     /// Whether the module edge for (file, request) was resolved through a
@@ -105,7 +126,8 @@ impl ModuleGraph {
     /// Follow export chains (aliases, re-exports, barrels, stars) from
     /// (file, export_name) to the defining (file, local_name).
     pub fn resolve_export(&self, file: i64, name: &str) -> Option<(i64, String)> {
-        self.resolve_export_traced(file, name).map(|(f, n, _)| (f, n))
+        self.resolve_export_traced(file, name)
+            .map(|(f, n, _)| (f, n))
     }
 
     /// Like [`Self::resolve_export`], additionally reporting whether any hop
@@ -246,16 +268,17 @@ pub fn find_symbols_in_origins(
     let rows = stmt.query_map(
         rusqlite::params![&name, repository, workspace, dependency],
         |r| {
-        Ok(SymbolTarget {
-            file: r.get(0)?,
-            file_origin: r.get(1)?,
-            file_id: r.get(2)?,
-            name: r.get(3)?,
-            kind: r.get(4)?,
-            line: r.get(5)?,
-            exported: r.get::<_, i64>(6)? != 0,
-        })
-    })?;
+            Ok(SymbolTarget {
+                file: r.get(0)?,
+                file_origin: r.get(1)?,
+                file_id: r.get(2)?,
+                name: r.get(3)?,
+                kind: r.get(4)?,
+                line: r.get(5)?,
+                exported: r.get::<_, i64>(6)? != 0,
+            })
+        },
+    )?;
     for row in rows {
         let t = row?;
         if path_filter.as_deref().is_none_or(|p| t.file.contains(p)) {
@@ -275,19 +298,20 @@ pub fn find_symbols_in_origins(
         let rows = stmt.query_map(
             rusqlite::params![&name, repository, workspace, dependency],
             |r| {
-            Ok((
-                SymbolTarget {
-                    file: r.get(0)?,
-                    file_origin: r.get(1)?,
-                    file_id: r.get(2)?,
-                    name: name.clone(),
-                    kind: "method".into(),
-                    line: r.get(4)?,
-                    exported: false,
-                },
-                r.get::<_, String>(5)?,
-            ))
-        })?;
+                Ok((
+                    SymbolTarget {
+                        file: r.get(0)?,
+                        file_origin: r.get(1)?,
+                        file_id: r.get(2)?,
+                        name: name.clone(),
+                        kind: "method".into(),
+                        line: r.get(4)?,
+                        exported: false,
+                    },
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (mut t, scope) = row?;
             if !scope.is_empty() {
@@ -355,7 +379,9 @@ pub fn who_uses_in_origins(
         if target_name == "*" {
             continue; // bare namespace use; not symbol-specific
         }
-        let Some(target_file) = graph.edge(ref_file, &request) else { continue };
+        let Some(target_file) = graph.edge(ref_file, &request) else {
+            continue;
+        };
         let resolved = if target_file == file_id && target_name == name {
             // direct hit even without export rows (defensive)
             Some((file_id, name.to_string()))
@@ -369,8 +395,7 @@ pub fn who_uses_in_origins(
 
     // Tier 3: member-call name matches (`x.name(...)`), minus sites already
     // matched precisely above.
-    let seen: HashSet<(String, i64)> =
-        usages.iter().map(|u| (u.file.clone(), u.line)).collect();
+    let seen: HashSet<(String, i64)> = usages.iter().map(|u| (u.file.clone(), u.line)).collect();
     let mut stmt = conn.prepare(
         "SELECT f.path, f.origin, m.line, m.object, c.name
          FROM member_calls m JOIN files f ON m.file_id = f.id
@@ -383,14 +408,15 @@ pub fn who_uses_in_origins(
     let rows = stmt.query_map(
         rusqlite::params![name, repository, workspace, dependency],
         |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    })?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
     for row in rows {
         let (file, file_origin, line, object, chunk_name) = row?;
         if seen.contains(&(file.clone(), line)) {
@@ -443,16 +469,17 @@ pub fn events_in_origins(
     let rows = stmt.query_map(
         rusqlite::params![filter, repository, workspace, dependency],
         |r| {
-        Ok(EventSite {
-            file: r.get(0)?,
-            file_origin: r.get(1)?,
-            line: r.get(2)?,
-            role: r.get(3)?,
-            name: r.get(4)?,
-            method: r.get(5)?,
-            chunk_name: r.get(6)?,
-        })
-    })?;
+            Ok(EventSite {
+                file: r.get(0)?,
+                file_origin: r.get(1)?,
+                line: r.get(2)?,
+                role: r.get(3)?,
+                name: r.get(4)?,
+                method: r.get(5)?,
+                chunk_name: r.get(6)?,
+            })
+        },
+    )?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 

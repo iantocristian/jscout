@@ -350,15 +350,27 @@ check are recorded in
 The separate contract-plane implementation, scale cost, and type-only barrel
 fixture are recorded in
 [`results/contract-plane-2026-08-10.md`](results/contract-plane-2026-08-10.md).
+The post-merge fixes for documentary module-edge labeling, scoped generic
+parameters, and contract graph load cost are recorded in
+[`results/contract-plane-followups-2026-08-10.md`](results/contract-plane-followups-2026-08-10.md).
 The route, GraphQL, environment, database, feature-flag, and external-host
 entity implementation is recorded in
 [`results/general-entities-2026-08-10.md`](results/general-entities-2026-08-10.md).
+The post-merge recognizer corrections for handler attribution, named routers,
+database holders, GraphQL option objects, and configuration keys are recorded
+in [`results/general-entities-followups-2026-08-10.md`](results/general-entities-followups-2026-08-10.md).
 The deterministic repository overview, entity lookup, bounded paths, and the
 known-workflow regression rerun are recorded in
 [`results/agent-surfaces-2026-08-10.md`](results/agent-surfaces-2026-08-10.md).
+The post-merge path availability bound, SQL-ranked entity lookup, explicit
+reverse steps, and dependency-area coverage are recorded in
+[`results/agent-surfaces-followups-2026-08-10.md`](results/agent-surfaces-followups-2026-08-10.md).
 The workflow-specific logical traversal and its 24/24 known-regression result
 are recorded in
 [`results/workflow-logical-routing-2026-08-10.md`](results/workflow-logical-routing-2026-08-10.md).
+The post-merge hub-threshold fixture, directional DI fan-out rule, degree
+memoization, and symbol-only seed contract are recorded in
+[`results/workflow-logical-routing-followups-2026-08-10.md`](results/workflow-logical-routing-followups-2026-08-10.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

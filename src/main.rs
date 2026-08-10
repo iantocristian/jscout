@@ -12,8 +12,8 @@ mod origin;
 mod package_exports;
 mod parse;
 mod query;
-mod search;
 mod scout;
+mod search;
 mod semantic;
 mod stats;
 mod store;
@@ -29,7 +29,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "jscout", about = "Runtime-level JS/TS codebase indexer for RAG")]
+#[command(
+    name = "jscout",
+    about = "Runtime-level JS/TS codebase indexer for RAG"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -182,7 +185,7 @@ enum Command {
     WorkflowCandidates {
         /// Repository root used to resolve candidate evidence
         root: PathBuf,
-        /// Current workflow seed anchors or uniquely resolvable symbol names
+        /// Current symbol anchors or uniquely resolvable symbol names; file anchors are rejected
         #[arg(required = true)]
         seeds: Vec<String>,
         /// Optional expected structural snapshot
@@ -269,10 +272,16 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
-        Command::Index { root, database, dependencies } => {
-            cmd_index(&root, database.as_deref(), &dependencies)
-        }
-        Command::Embed { root, batch, file_origins } => cmd_embed(&root, batch, &file_origins),
+        Command::Index {
+            root,
+            database,
+            dependencies,
+        } => cmd_index(&root, database.as_deref(), &dependencies),
+        Command::Embed {
+            root,
+            batch,
+            file_origins,
+        } => cmd_embed(&root, batch, &file_origins),
         Command::Search {
             root,
             query,
@@ -317,27 +326,41 @@ fn main() -> Result<()> {
                 },
             },
         ),
-        Command::Events { root, name, file_origins } => {
-            cmd_events(&root, name.as_deref(), &file_origins)
-        }
-        Command::Mcp { root, database, telemetry, profile, source_view } => {
-            mcp::serve(
-                &root,
-                database.as_deref(),
-                telemetry.as_deref(),
-                mcp::ToolProfile::parse(&profile)?,
-                scout::SourceView::parse(&source_view)?,
-            )
-        }
-        Command::Annotate { root, input, database } => {
+        Command::Events {
+            root,
+            name,
+            file_origins,
+        } => cmd_events(&root, name.as_deref(), &file_origins),
+        Command::Mcp {
+            root,
+            database,
+            telemetry,
+            profile,
+            source_view,
+        } => mcp::serve(
+            &root,
+            database.as_deref(),
+            telemetry.as_deref(),
+            mcp::ToolProfile::parse(&profile)?,
+            scout::SourceView::parse(&source_view)?,
+        ),
+        Command::Annotate {
+            root,
+            input,
+            database,
+        } => {
             let conn = open_database(&root, database.as_deref())?;
-            let input: semantic::AnnotateRequest =
-                serde_json::from_slice(&std::fs::read(&input)?)?;
+            let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
             let artifact = semantic::annotate_request(&root, &conn, input)?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
             Ok(())
         }
-        Command::Memory { root, query, limit, database } => {
+        Command::Memory {
+            root,
+            query,
+            limit,
+            database,
+        } => {
             let conn = open_database(&root, database.as_deref())?;
             let artifacts = semantic::search(&conn, &query, limit)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
@@ -365,12 +388,17 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&candidates)?);
             Ok(())
         }
-        Command::Watch { root, embed, dependencies } => {
-            watch::watch(&root, embed, &dependencies)
-        }
-        Command::WhoUses { root, spec, json, file_origins } => {
-            cmd_who_uses(&root, &spec, json, &file_origins)
-        }
+        Command::Watch {
+            root,
+            embed,
+            dependencies,
+        } => watch::watch(&root, embed, &dependencies),
+        Command::WhoUses {
+            root,
+            spec,
+            json,
+            file_origins,
+        } => cmd_who_uses(&root, &spec, json, &file_origins),
         Command::Neighborhood {
             root,
             anchor,
@@ -451,7 +479,11 @@ fn cmd_search(
     options: search::SearchOptions,
 ) -> Result<()> {
     let conn = store::open(root)?;
-    let provider = if no_vector { None } else { embed::Provider::from_env() };
+    let provider = if no_vector {
+        None
+    } else {
+        embed::Provider::from_env()
+    };
     let result = search::search(&conn, provider.as_ref(), query, &options)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -463,7 +495,11 @@ fn cmd_search(
         return Ok(());
     }
     for (i, h) in result.hits.iter().enumerate() {
-        let name = h.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+        let name = h
+            .name
+            .as_deref()
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default();
         println!(
             "{:2}. {}:{}-{} [{}{}] score={:.4}",
             i + 1,
@@ -491,7 +527,11 @@ fn cmd_search(
             expansion.nodes.len(),
             expansion.edges.len(),
             expansion.payload_bytes,
-            if expansion.truncated { " (truncated)" } else { "" }
+            if expansion.truncated {
+                " (truncated)"
+            } else {
+                ""
+            }
         );
         for edge in &expansion.edges {
             println!(
@@ -516,7 +556,12 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     )?;
     println!(
         "indexed {} files ({} unchanged, {} failed) — {} chunks, {} refs in {:?}",
-        o.indexed, o.unchanged, o.failed, o.chunks, o.refs, started.elapsed()
+        o.indexed,
+        o.unchanged,
+        o.failed,
+        o.chunks,
+        o.refs,
+        started.elapsed()
     );
     if !dependencies.is_empty() {
         println!(
@@ -547,8 +592,15 @@ fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Resul
             current = s.name.clone();
             println!("\nevent '{current}'");
         }
-        let ctx = s.chunk_name.as_deref().map(|n| format!(" in {n}")).unwrap_or_default();
-        println!("  [{}] {}:{} .{}(){}", s.role, s.file, s.line, s.method, ctx);
+        let ctx = s
+            .chunk_name
+            .as_deref()
+            .map(|n| format!(" in {n}"))
+            .unwrap_or_default();
+        println!(
+            "  [{}] {}:{} .{}(){}",
+            s.role, s.file, s.line, s.method, ctx
+        );
     }
     Ok(())
 }
@@ -562,18 +614,9 @@ fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) ->
         std::process::exit(1);
     }
     for t in &targets {
-        let usages = query::who_uses_in_origins(
-            &conn,
-            &graph,
-            t.file_id,
-            &t.name,
-            file_origins,
-        )?;
+        let usages = query::who_uses_in_origins(&conn, &graph, t.file_id, &t.name, file_origins)?;
         if json {
-            println!(
-                "{}",
-                serde_json::json!({ "target": t, "usages": usages })
-            );
+            println!("{}", serde_json::json!({ "target": t, "usages": usages }));
             continue;
         }
         println!(
@@ -583,7 +626,11 @@ fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) ->
             t.file,
             t.line,
             if t.exported { "exported" } else { "internal" },
-            if usages.is_empty() { ", no usages found" } else { "" },
+            if usages.is_empty() {
+                ", no usages found"
+            } else {
+                ""
+            },
         );
         let mut by_conf: std::collections::BTreeMap<&str, Vec<&query::Usage>> = Default::default();
         for u in &usages {
@@ -593,8 +640,16 @@ fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) ->
             if let Some(list) = by_conf.get(conf) {
                 println!("  [{conf}]");
                 for u in list {
-                    let ctx = u.chunk_name.as_deref().map(|n| format!(" in {n}")).unwrap_or_default();
-                    let det = u.detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+                    let ctx = u
+                        .chunk_name
+                        .as_deref()
+                        .map(|n| format!(" in {n}"))
+                        .unwrap_or_default();
+                    let det = u
+                        .detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default();
                     println!("    {}:{} {}{}{}", u.file, u.line, u.kind, ctx, det);
                 }
             }
@@ -611,10 +666,13 @@ fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
     for file in &files {
         let rel = file.strip_prefix(root).unwrap_or(file);
         if let Some(f) = filter
-            && !rel.to_string_lossy().contains(f) {
-                continue;
-            }
-        let Ok(source) = std::fs::read_to_string(file) else { continue };
+            && !rel.to_string_lossy().contains(f)
+        {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(file) else {
+            continue;
+        };
         let chunks = parse::with_parsed(&source, file, |ret, _| {
             let chunker = chunk::Chunker::new(rel, &source, ret);
             chunker.chunk_program(&ret.program, &ret.program.comments)
@@ -667,18 +725,36 @@ fn cmd_stats(root: &Path) -> Result<()> {
 
     let elapsed = started.elapsed();
     println!("root:            {}", root.display());
-    println!("files:           {} ({} parsed, {} failed)", files.len(), parsed_files, failed.len());
-    println!("source size:     {:.1} MB", total_bytes as f64 / 1_048_576.0);
+    println!(
+        "files:           {} ({} parsed, {} failed)",
+        files.len(),
+        parsed_files,
+        failed.len()
+    );
+    println!(
+        "source size:     {:.1} MB",
+        total_bytes as f64 / 1_048_576.0
+    );
     println!("functions:       {}", total.functions);
     println!("arrow functions: {}", total.arrow_functions);
-    println!("classes:         {} ({} methods)", total.classes, total.methods);
+    println!(
+        "classes:         {} ({} methods)",
+        total.classes, total.methods
+    );
     println!("jsx components:  {}", total.jsx_components_defined);
     println!("imports:         {}", total.imports);
     println!("exports:         {}", total.exports);
-    println!("type-only nodes: {} (will be erased)", total.type_only_nodes);
+    println!(
+        "type-only nodes: {} (will be erased)",
+        total.type_only_nodes
+    );
     println!("elapsed:         {:?}", elapsed);
     for (f, e) in failed.iter().take(5) {
-        eprintln!("  fail: {}: {}", f.display(), e.lines().next().unwrap_or(""));
+        eprintln!(
+            "  fail: {}: {}",
+            f.display(),
+            e.lines().next().unwrap_or("")
+        );
     }
     Ok(())
 }

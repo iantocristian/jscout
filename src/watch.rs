@@ -50,7 +50,11 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
         outcome.unchanged,
         root.display()
     );
-    let provider = if embed_on_change { embed::Provider::from_env() } else { None };
+    let provider = if embed_on_change {
+        embed::Provider::from_env()
+    } else {
+        None
+    };
     if embed_on_change && provider.is_none() {
         eprintln!("warning: --embed set but no provider configured; skipping embeddings");
     }
