@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "5";
+pub const PROJECTION_VERSION: &str = "6";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -45,6 +45,32 @@ struct EntitySiteNode {
     provenance: String,
     confidence: String,
     detail: Value,
+}
+
+#[derive(Debug, Clone)]
+struct ContractDefinition {
+    site_id: i64,
+    start: i64,
+    end: i64,
+    entity_type: String,
+    name: String,
+    key: String,
+}
+
+#[derive(Debug, Default)]
+struct ContractCatalog {
+    by_site: HashMap<i64, ContractDefinition>,
+    by_local: HashMap<(i64, String), Vec<ContractDefinition>>,
+    by_file: HashMap<i64, Vec<ContractDefinition>>,
+}
+
+#[derive(Debug, Clone)]
+struct ContractTarget {
+    key: String,
+    entity_type: String,
+    name: String,
+    identity_anchor: Option<String>,
+    inferred: bool,
 }
 
 #[derive(Debug, Default)]
@@ -770,6 +796,7 @@ fn project_entities(
         symbols_by_file.entry(symbol.file_id).or_default().push(symbol);
     }
     let sites = load_entity_sites(conn)?;
+    let contract_catalog = ContractCatalog::build(&sites, files);
     let mut inserted_nodes = HashSet::new();
     // Occurrence tables retain every evidence site. The disposable traversal
     // graph keeps one navigational edge per relationship so repeated writes in
@@ -800,6 +827,24 @@ fn project_entities(
 
     for site in sites {
         let Some(path) = files.get(&site.file_id) else { continue };
+        if site.plane == "contract" {
+            project_contract_site(
+                conn,
+                &site,
+                path,
+                graph,
+                root_symbol,
+                &symbols_by_file,
+                &contract_catalog,
+                &mut inserted_nodes,
+                &mut insert_entity,
+                &mut insert_occurrence,
+                &mut insert_entity_edge,
+                insert_node,
+                insert_edge,
+            )?;
+            continue;
+        }
         let identity = resolve_entity_identity(conn, &site, path, graph, root_symbol)?;
         let occurrence_confidence = lower_confidence(
             &site.confidence,
@@ -993,6 +1038,374 @@ fn project_entities(
         }
     }
     Ok(())
+}
+
+impl ContractCatalog {
+    fn build(sites: &[EntitySiteNode], files: &HashMap<i64, String>) -> Self {
+        let mut catalog = Self::default();
+        for site in sites {
+            if site.plane != "contract" || site.role != "contract_declaration" {
+                continue;
+            }
+            let Some(path) = files.get(&site.file_id) else { continue };
+            let definition = ContractDefinition {
+                site_id: site.id,
+                start: site.start,
+                end: site.end,
+                entity_type: site.entity_type.clone(),
+                name: site.identity_name.clone(),
+                key: contract_definition_key(path, &site.entity_type, &site.identity_name),
+            };
+            catalog.by_site.insert(site.id, definition.clone());
+            catalog
+                .by_local
+                .entry((site.file_id, site.identity_name.clone()))
+                .or_default()
+                .push(definition.clone());
+            catalog.by_file.entry(site.file_id).or_default().push(definition);
+        }
+        catalog
+    }
+
+    fn local(&self, file_id: i64, name: &str) -> Vec<ContractTarget> {
+        self.by_local
+            .get(&(file_id, name.to_string()))
+            .into_iter()
+            .flatten()
+            .map(contract_target_from_definition)
+            .collect()
+    }
+
+    fn enclosing(&self, file_id: i64, offset: i64, excluded_site: i64) -> Option<&str> {
+        self.by_file
+            .get(&file_id)?
+            .iter()
+            .filter(|definition| {
+                definition.site_id != excluded_site
+                    && definition.start <= offset
+                    && offset < definition.end
+            })
+            .min_by_key(|definition| definition.end - definition.start)
+            .map(|definition| definition.key.as_str())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_contract_site(
+    conn: &Connection,
+    site: &EntitySiteNode,
+    path: &str,
+    graph: &ModuleGraph,
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+    symbols_by_file: &HashMap<i64, Vec<&SymbolNode>>,
+    catalog: &ContractCatalog,
+    inserted_nodes: &mut HashSet<String>,
+    insert_entity: &mut rusqlite::CachedStatement<'_>,
+    insert_occurrence: &mut rusqlite::CachedStatement<'_>,
+    insert_entity_edge: &mut rusqlite::CachedStatement<'_>,
+    insert_node: &mut rusqlite::CachedStatement<'_>,
+    insert_edge: &mut rusqlite::CachedStatement<'_>,
+) -> Result<()> {
+    let mut targets = resolve_contract_targets(conn, site, graph, root_symbol, catalog)?;
+    targets.sort_by(|left, right| left.key.cmp(&right.key));
+    targets.dedup_by(|left, right| left.key == right.key);
+    let ambiguous = targets.len() > 1;
+    let inferred = targets.iter().any(|target| target.inferred);
+    let confidence = lower_confidence(
+        &site.confidence,
+        if ambiguous {
+            "possible"
+        } else if inferred {
+            "likely"
+        } else {
+            &site.confidence
+        },
+    );
+    let (entity_key, entity_type, display_name, identity_anchor) = match targets.as_slice() {
+        [target] => (
+            target.key.clone(),
+            target.entity_type.clone(),
+            target.name.clone(),
+            target.identity_anchor.clone(),
+        ),
+        [] => (
+            contract_reference_key(&site.entity_type, &[], path, &site.identity_name),
+            site.entity_type.clone(),
+            site.identity_name.clone(),
+            None,
+        ),
+        candidates => (
+            contract_reference_key(
+                &site.entity_type,
+                &candidates.iter().map(|target| target.key.clone()).collect::<Vec<_>>(),
+                path,
+                &site.identity_name,
+            ),
+            site.entity_type.clone(),
+            site.identity_name.clone(),
+            None,
+        ),
+    };
+    let candidate_keys: Vec<&str> = targets.iter().map(|target| target.key.as_str()).collect();
+    let entity_meta = json!({
+        "plane": "contract",
+        "type": entity_type,
+        "identityKind": site.identity_kind,
+        "identityAnchor": identity_anchor,
+        "identityCandidates": ambiguous.then_some(&candidate_keys),
+        "documentary": true,
+    });
+    insert_entity.execute(params![
+        entity_key,
+        "contract",
+        entity_type,
+        display_name,
+        identity_anchor,
+        entity_meta.to_string(),
+    ])?;
+    let entity_id: i64 = conn.query_row(
+        "SELECT id FROM entities WHERE entity_key=?1",
+        [&entity_key],
+        |row| row.get(0),
+    )?;
+    if inserted_nodes.insert(entity_key.clone()) {
+        insert_node.execute(params![
+            entity_key,
+            "contract",
+            "entities",
+            entity_id,
+            display_name,
+            Option::<i64>::None,
+            Option::<i64>::None,
+            entity_meta.to_string(),
+        ])?;
+    }
+
+    let occurrence_detail = json!({
+        "site": site.detail,
+        "identityName": site.identity_name,
+        "identityAnchor": identity_anchor,
+        "identityCandidates": ambiguous.then_some(&candidate_keys),
+        "documentary": true,
+    });
+    insert_occurrence.execute(params![
+        entity_id,
+        site.id,
+        site.file_id,
+        site.chunk_id,
+        site.start,
+        site.end,
+        site.line,
+        site.end_line,
+        site.role,
+        site.extractor,
+        site.provenance,
+        confidence,
+        occurrence_detail.to_string(),
+    ])?;
+    let occurrence_id = conn.last_insert_rowid();
+    let source = if site.role == "contract_declaration" {
+        file_key(path)
+    } else if site.role == "contract_reference" {
+        catalog
+            .enclosing(site.file_id, site.start, site.id)
+            .map(str::to_string)
+            .or_else(|| contract_source_symbol(symbols_by_file.get(&site.file_id), site).cloned())
+            .unwrap_or_else(|| file_key(path))
+    } else {
+        contract_source_symbol(symbols_by_file.get(&site.file_id), site)
+            .cloned()
+            .unwrap_or_else(|| file_key(path))
+    };
+    let kind = match site.role.as_str() {
+        "contract_declaration" => "declares_contract",
+        "parameter_contract" => "accepts_contract",
+        "return_contract" => "returns_contract",
+        "decorator_use" => "decorated_by",
+        _ => "references_contract",
+    };
+    let graph_detail = json!({
+        "entityOccurrenceId": occurrence_id,
+        "entitySiteId": site.id,
+        "extractor": site.extractor,
+        "role": site.role,
+        "documentary": true,
+        "evidence": {
+            "start": site.start,
+            "end": site.end,
+            "endLine": site.end_line,
+        },
+        "detail": site.detail,
+    });
+    insert_entity_edge.execute(params![
+        occurrence_id,
+        entity_key,
+        kind,
+        confidence,
+        site.provenance,
+        graph_detail.to_string(),
+    ])?;
+    if source != entity_key {
+        insert_edge.execute(params![
+            source,
+            entity_key,
+            kind,
+            confidence,
+            site.provenance,
+            site.file_id,
+            Option::<i64>::None,
+            site.line,
+            graph_detail.to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn contract_source_symbol<'a>(
+    symbols: Option<&Vec<&'a SymbolNode>>,
+    site: &EntitySiteNode,
+) -> Option<&'a String> {
+    if let Some(owner) = owner_at(symbols, site.start) {
+        return Some(&owner.key);
+    }
+    if site.role != "decorator_use" {
+        return None;
+    }
+    symbols?
+        .iter()
+        .copied()
+        .filter(|symbol| {
+            symbol.decl_start >= site.start && symbol.decl_start - site.start <= 512
+        })
+        .min_by_key(|symbol| symbol.decl_start - site.start)
+        .map(|symbol| &symbol.key)
+}
+
+fn resolve_contract_targets(
+    conn: &Connection,
+    site: &EntitySiteNode,
+    graph: &ModuleGraph,
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+    catalog: &ContractCatalog,
+) -> Result<Vec<ContractTarget>> {
+    if site.role == "contract_declaration" {
+        return Ok(catalog
+            .by_site
+            .get(&site.id)
+            .map(contract_target_from_definition)
+            .into_iter()
+            .collect());
+    }
+    if site.entity_type == "decorator" {
+        let runtime = resolve_reference_at(
+            conn,
+            graph,
+            root_symbol,
+            site.file_id,
+            site.identity_start,
+            site.identity_name.split('.').next().unwrap_or(&site.identity_name),
+        )?;
+        return Ok(runtime
+            .keys
+            .into_iter()
+            .map(|anchor| contract_target_from_anchor("decorator", &site.identity_name, anchor))
+            .collect());
+    }
+
+    let (import_local, qualified_name) = site
+        .identity_name
+        .split_once('.')
+        .map_or((site.identity_name.as_str(), None), |(local, name)| {
+            (local, Some(name))
+        });
+    let imports: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT imported_name, request FROM contract_imports
+             WHERE file_id=?1 AND local_name=?2 ORDER BY request, imported_name",
+        )?;
+        let rows = stmt.query_map(params![site.file_id, import_local], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut targets = Vec::new();
+    for (imported, request) in imports {
+        let target_name = if imported == "*" {
+            qualified_name.unwrap_or("*")
+        } else {
+            imported.as_str()
+        };
+        let Some(target_file) = graph.edge(site.file_id, &request) else {
+            targets.push(ContractTarget {
+                key: contract_external_key(&request, target_name),
+                entity_type: "external".into(),
+                name: target_name.to_string(),
+                identity_anchor: Some(format!("pkg:{request}#{target_name}")),
+                inferred: false,
+            });
+            continue;
+        };
+        let (resolved_file, resolved_name, inferred) = graph
+            .resolve_contract_export_traced(target_file, target_name)
+            .unwrap_or((target_file, target_name.to_string(), false));
+        let mut resolved = catalog.local(resolved_file, &resolved_name);
+        if resolved.is_empty() {
+            resolved.extend(contract_symbol_targets(
+                root_symbol.get(&(resolved_file, resolved_name.clone())),
+                &resolved_name,
+            ));
+        }
+        for target in &mut resolved {
+            target.inferred |= inferred || graph.edge_inferred(site.file_id, &request);
+        }
+        targets.extend(resolved);
+    }
+    if targets.is_empty() {
+        targets.extend(catalog.local(site.file_id, &site.identity_name));
+    }
+    if targets.is_empty() {
+        targets.extend(contract_symbol_targets(
+            root_symbol.get(&(site.file_id, site.identity_name.clone())),
+            &site.identity_name,
+        ));
+    }
+    Ok(targets)
+}
+
+fn contract_target_from_definition(definition: &ContractDefinition) -> ContractTarget {
+    ContractTarget {
+        key: definition.key.clone(),
+        entity_type: definition.entity_type.clone(),
+        name: definition.name.clone(),
+        identity_anchor: Some(definition.key.clone()),
+        inferred: false,
+    }
+}
+
+fn contract_symbol_targets(
+    symbols: Option<&Vec<&SymbolNode>>,
+    name: &str,
+) -> Vec<ContractTarget> {
+    symbols
+        .into_iter()
+        .flatten()
+        .map(|symbol| contract_target_from_anchor("class", name, symbol.key.clone()))
+        .collect()
+}
+
+fn contract_target_from_anchor(
+    entity_type: &str,
+    name: &str,
+    anchor: String,
+) -> ContractTarget {
+    let digest = blake3::hash(anchor.as_bytes()).to_hex();
+    ContractTarget {
+        key: format!("contract:{entity_type}:ref-{}", &digest[..16]),
+        entity_type: entity_type.to_string(),
+        name: name.to_string(),
+        identity_anchor: Some(anchor),
+        inferred: false,
+    }
 }
 
 fn load_entity_sites(conn: &Connection) -> Result<Vec<EntitySiteNode>> {
@@ -1673,6 +2086,9 @@ fn relation_weight(kind: &str) -> f64 {
         | "provides" => 1.0,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
+        "decorated_by" => 0.7,
+        "accepts_contract" | "returns_contract" | "references_contract" => 0.65,
+        "declares_contract" => 0.55,
         "emits" | "listens" => 0.7,
         "contains_event" => 0.6,
         _ => 0.5,
@@ -1922,6 +2338,37 @@ fn member_key(name: &str) -> String {
 
 fn entity_key(entity_type: &str, name: &str) -> String {
     format!("entity:{entity_type}:{}", encode_key_component(name))
+}
+
+fn contract_definition_key(path: &str, entity_type: &str, name: &str) -> String {
+    format!(
+        "contract:{entity_type}:{}#{}",
+        encode_key_component(path),
+        encode_key_component(name)
+    )
+}
+
+fn contract_reference_key(
+    entity_type: &str,
+    targets: &[String],
+    path: &str,
+    fallback_name: &str,
+) -> String {
+    let identity = if targets.is_empty() {
+        format!("{path}\0{fallback_name}")
+    } else {
+        targets.join("\0")
+    };
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    format!("contract:{entity_type}:ref-{}", &digest[..16])
+}
+
+fn contract_external_key(request: &str, name: &str) -> String {
+    format!(
+        "contract:external:{}#{}",
+        encode_key_component(request),
+        encode_key_component(name)
+    )
 }
 
 fn reference_entity_key(
@@ -2283,6 +2730,83 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(injections, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn contract_plane_resolves_type_only_barrels_without_runtime_edges() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "contracts.ts",
+            "export interface User { id: string }\n\
+             export type UserResult = User | null;\n\
+             export enum UserState { Active }\n",
+        )?;
+        write(
+            repo.path(),
+            "barrel.ts",
+            "export type { User, UserResult } from './contracts';\n\
+             export { UserState } from './contracts';\n",
+        )?;
+        write(
+            repo.path(),
+            "api.ts",
+            "import type { User, UserResult } from './barrel';\n\
+             export function load(input: User): Promise<UserResult> { throw Error(); }\n\
+             export const save = (input: User): UserResult => input;\n\
+             export class UserApi { get(input: User): UserResult { return input; } }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let interface = "contract:interface:contracts.ts#User";
+        let alias = "contract:type_alias:contracts.ts#UserResult";
+        let result = neighborhood(
+            &conn,
+            "api.ts:load",
+            &NeighborhoodOptions {
+                depth: 1,
+                kinds: vec!["accepts_contract".into(), "returns_contract".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "accepts_contract"
+                && edge.target == interface
+                && edge.confidence == "certain"
+                && edge.detail["documentary"] == true
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "returns_contract"
+                && edge.target == alias
+                && edge.confidence == "certain"
+        }));
+        let alias_reference: i64 = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM resolved_edges
+               WHERE src_key=?1 AND dst_key=?2 AND kind='references_contract'
+             )",
+            rusqlite::params![alias, interface],
+            |row| row.get(0),
+        )?;
+        assert_eq!(alias_reference, 1);
+        let runtime_type_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE source_ref_id IN (
+               SELECT id FROM refs WHERE file_id=(SELECT id FROM files WHERE path='api.ts')
+             ) AND dst_key IN (?1, ?2)",
+            rusqlite::params![interface, alias],
+            |row| row.get(0),
+        )?;
+        assert_eq!(runtime_type_edges, 0);
+        let enum_count: i64 = conn.query_row(
+            "SELECT count(*) FROM entities
+             WHERE plane='contract' AND entity_type='enum' AND name='UserState'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(enum_count, 1);
         Ok(())
     }
 
