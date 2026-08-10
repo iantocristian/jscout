@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "6";
+pub const PROJECTION_VERSION: &str = "7";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -916,8 +916,8 @@ fn project_entities(
             occurrence_detail.to_string(),
         ])?;
         let occurrence_id = conn.last_insert_rowid();
-        let source = owner_at(symbols_by_file.get(&site.file_id), site.start)
-            .map(|symbol| symbol.key.clone())
+        let source = site_source_symbol(symbols_by_file.get(&site.file_id), &site)
+            .cloned()
             .unwrap_or_else(|| file_key(path));
         let graph_detail = json!({
             "entityOccurrenceId": occurrence_id,
@@ -933,12 +933,27 @@ fn project_entities(
         });
 
         match site.role.as_str() {
-            "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site" => {
+            "dispatch_site"
+            | "lifecycle_producer"
+            | "job_producer"
+            | "injection_site"
+            | "graphql_operation"
+            | "environment_read"
+            | "database_read"
+            | "database_write"
+            | "feature_flag_check"
+            | "external_host_call" => {
                 let kind = match site.role.as_str() {
                     "dispatch_site" => "dispatches",
                     "lifecycle_producer" => "produces_lifecycle",
                     "job_producer" => "produces_job",
-                    _ => "injects",
+                    "injection_site" => "injects",
+                    "graphql_operation" => "invokes_graphql",
+                    "environment_read" => "reads_env",
+                    "database_read" => "reads_resource",
+                    "database_write" => "writes_resource",
+                    "feature_flag_check" => "checks_flag",
+                    _ => "calls_host",
                 };
                 insert_entity_edge.execute(params![
                     occurrence_id,
@@ -982,7 +997,12 @@ fn project_entities(
                     )?;
                 }
             }
-            "registered_handler" | "lifecycle_listener" | "job_handler" | "provider" => {
+            "registered_handler"
+            | "lifecycle_listener"
+            | "job_handler"
+            | "provider"
+            | "route_handler"
+            | "graphql_handler" => {
                 let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
                 let target_fallback = targets.keys.is_empty();
                 if target_fallback {
@@ -1009,7 +1029,9 @@ fn project_entities(
                     "registered_handler" => "registered_handler",
                     "lifecycle_listener" => "lifecycle_listener",
                     "job_handler" => "job_handler",
-                    _ => "provides",
+                    "provider" => "provides",
+                    "route_handler" => "handles_route",
+                    _ => "handles_graphql",
                 };
                 for target in &targets.keys {
                     insert_entity_edge.execute(params![
@@ -1244,10 +1266,10 @@ fn project_contract_site(
         catalog
             .enclosing(site.file_id, site.start, site.id)
             .map(str::to_string)
-            .or_else(|| contract_source_symbol(symbols_by_file.get(&site.file_id), site).cloned())
+            .or_else(|| site_source_symbol(symbols_by_file.get(&site.file_id), site).cloned())
             .unwrap_or_else(|| file_key(path))
     } else {
-        contract_source_symbol(symbols_by_file.get(&site.file_id), site)
+        site_source_symbol(symbols_by_file.get(&site.file_id), site)
             .cloned()
             .unwrap_or_else(|| file_key(path))
     };
@@ -1295,14 +1317,14 @@ fn project_contract_site(
     Ok(())
 }
 
-fn contract_source_symbol<'a>(
+fn site_source_symbol<'a>(
     symbols: Option<&Vec<&'a SymbolNode>>,
     site: &EntitySiteNode,
 ) -> Option<&'a String> {
     if let Some(owner) = owner_at(symbols, site.start) {
         return Some(&owner.key);
     }
-    if site.role != "decorator_use" {
+    if !matches!(site.role.as_str(), "decorator_use" | "route_handler" | "graphql_handler") {
         return None;
     }
     symbols?
@@ -2112,7 +2134,11 @@ fn relation_weight(kind: &str) -> f64 {
         | "produces_job_via"
         | "job_handler"
         | "injects"
-        | "provides" => 1.0,
+        | "provides"
+        | "handles_route"
+        | "handles_graphql" => 1.0,
+        "invokes_graphql" | "reads_resource" | "writes_resource" => 0.9,
+        "reads_env" | "checks_flag" | "calls_host" => 0.8,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
         "decorated_by" => 0.7,
@@ -2844,6 +2870,66 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(enum_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn general_entities_project_endpoint_configuration_data_and_host_edges() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "app.ts",
+            "export function createJob() {}\n\
+             router.post('/jobs', createJob);\n\
+             @Controller('/users')\n\
+             export class UsersController {\n\
+               @Get(':id') getUser() {}\n\
+               @Query('user') user() {}\n\
+             }\n\
+             export function run() {\n\
+               process.env.API_KEY;\n\
+               prisma.user.findMany();\n\
+               prisma.user.create({ data: {} });\n\
+               flags.isEnabled('new-ui');\n\
+               fetch('https://api.example.com/v1');\n\
+               client.query({ currentUser: { id: true } });\n\
+             }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        for (entity_type, name, kind) in [
+            ("route", "POST /jobs", "handles_route"),
+            ("route", "GET /users/:id", "handles_route"),
+            ("graphql_operation", "query:user", "handles_graphql"),
+            ("graphql_operation", "query:currentUser", "invokes_graphql"),
+            ("environment_variable", "API_KEY", "reads_env"),
+            ("database_resource", "user", "reads_resource"),
+            ("database_resource", "user", "writes_resource"),
+            ("feature_flag", "new-ui", "checks_flag"),
+            ("external_host", "api.example.com", "calls_host"),
+        ] {
+            let edge_count: i64 = conn.query_row(
+                "SELECT count(*) FROM resolved_edges edge
+                 JOIN entities entity
+                   ON entity.entity_key=edge.src_key OR entity.entity_key=edge.dst_key
+                 WHERE entity.plane='general' AND entity.entity_type=?1
+                   AND entity.name=?2 AND edge.kind=?3",
+                rusqlite::params![entity_type, name, kind],
+                |row| row.get(0),
+            )?;
+            assert!(edge_count > 0, "missing {entity_type}/{name}/{kind}");
+        }
+        let handler_target: String = conn.query_row(
+            "SELECT target.display_name FROM resolved_edges edge
+             JOIN entities route ON route.entity_key=edge.src_key
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='GET /users/:id' AND edge.kind='handles_route'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(handler_target, "getUser");
         Ok(())
     }
 

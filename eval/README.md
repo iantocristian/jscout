@@ -350,6 +350,9 @@ check are recorded in
 The separate contract-plane implementation, scale cost, and type-only barrel
 fixture are recorded in
 [`results/contract-plane-2026-08-10.md`](results/contract-plane-2026-08-10.md).
+The route, GraphQL, environment, database, feature-flag, and external-host
+entity implementation is recorded in
+[`results/general-entities-2026-08-10.md`](results/general-entities-2026-08-10.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in

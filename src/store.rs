@@ -620,8 +620,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    // v10 -> v11: deterministic general-entity extractors were added without
+    // changing their generic evidence schema. Force unchanged files through
+    // extraction once so an upgraded index cannot look current while lacking
+    // routes, GraphQL operations, environment variables, database resources,
+    // feature flags, and external hosts.
+    if version < 11 {
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','10')
+        "INSERT INTO meta(key, value) VALUES('schema_version','11')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -695,7 +707,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         assert!(database.is_file());
         Ok(())
     }
@@ -732,7 +744,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -775,7 +787,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -841,7 +853,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -870,7 +882,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -914,7 +926,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -964,7 +976,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1030,7 +1042,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1041,6 +1053,47 @@ mod tests {
                       'Old', NULL, '{}')",
             [],
         )?;
+        let snapshots: i64 = conn.query_row(
+            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v10_by_forcing_general_entity_extraction() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '10');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '6');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
+               role TEXT NOT NULL DEFAULT 'unknown',
+               origin TEXT NOT NULL DEFAULT 'repository',
+               package_instance_id INTEGER, package_path TEXT
+             );
+             INSERT INTO files VALUES(
+               1, 'src/old.ts', 'old-hash', 'production', 'repository', NULL, NULL
+             );",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "11");
+        let hash: String =
+            conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
+        assert!(hash.is_empty());
         let snapshots: i64 = conn.query_row(
             "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
             [],

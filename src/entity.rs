@@ -9,6 +9,10 @@ use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 use serde_json::json;
 
+/// Bump whenever deterministic extraction semantics change in a way that
+/// requires unchanged files to be parsed again.
+pub const EXTRACTION_VERSION: &str = "1";
+
 #[derive(Debug, Clone)]
 pub struct EntitySite {
     pub plane: &'static str,
@@ -25,6 +29,19 @@ pub struct EntitySite {
     pub provenance: &'static str,
     pub confidence: &'static str,
     pub detail: serde_json::Value,
+}
+
+struct GeneralSiteSpec {
+    entity_type: &'static str,
+    role: &'static str,
+    identity_kind: &'static str,
+    identity_name: String,
+    identity_start: u32,
+    span: Span,
+    target: Option<(String, u32)>,
+    extractor: &'static str,
+    provenance: &'static str,
+    detail: serde_json::Value,
 }
 
 struct EntityVisitor {
@@ -63,6 +80,25 @@ impl<'a> Visit<'a> for TypeReferenceVisitor {
 }
 
 impl EntityVisitor {
+    fn push_general(&mut self, site: GeneralSiteSpec) {
+        self.sites.push(EntitySite {
+            plane: "general",
+            entity_type: site.entity_type,
+            role: site.role,
+            identity_kind: site.identity_kind,
+            identity_name: site.identity_name,
+            identity_start: site.identity_start,
+            target_name: site.target.as_ref().map(|(name, _)| name.clone()),
+            target_start: site.target.map(|(_, start)| start),
+            span_start: site.span.start,
+            span_end: site.span.end,
+            extractor: site.extractor,
+            provenance: site.provenance,
+            confidence: "likely",
+            detail: site.detail,
+        });
+    }
+
     fn push_contract_declaration(
         &mut self,
         entity_type: &'static str,
@@ -362,6 +398,213 @@ impl EntityVisitor {
         });
     }
 
+    fn extract_general_call(&mut self, call: &CallExpression<'_>) {
+        let callee_name = match &call.callee {
+            Expression::Identifier(identifier) => identifier.name.as_str(),
+            Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+            _ => return,
+        };
+        if !is_general_callee(callee_name) {
+            return;
+        }
+        let callee_path = member_path(&call.callee);
+
+        if let Some(path) = callee_path.as_deref()
+            && let Some(method) = http_method(callee_name)
+            && path
+                .split('.')
+                .any(|part| matches!(part, "app" | "router" | "server" | "route"))
+            && let Some(path_expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(route_path) = static_string(path_expression, &self.static_strings)
+        {
+            let target = call
+                .arguments
+                .iter()
+                .rev()
+                .find_map(Argument::as_expression)
+                .and_then(Self::target);
+            self.push_general(GeneralSiteSpec {
+                entity_type: "route",
+                role: "route_handler",
+                identity_kind: "literal",
+                identity_name: format!("{method} {}", normalize_route_path(&route_path)),
+                identity_start: path_expression.span().start,
+                span: call.span,
+                target,
+                extractor: "http-router-call",
+                provenance: "routing-api-pattern",
+                detail: json!({ "callee": path }),
+            });
+        }
+
+        if matches!(callee_name, "query" | "mutation" | "subscription")
+            && let Some(path) = callee_path.as_deref()
+            && path.to_ascii_lowercase().contains("client")
+            && let Some(config) = first_object_argument(call)
+        {
+            for property in &config.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
+                let Some(operation) = property.key.static_name() else { continue };
+                self.push_general(GeneralSiteSpec {
+                    entity_type: "graphql_operation",
+                    role: "graphql_operation",
+                    identity_kind: "literal",
+                    identity_name: format!("{callee_name}:{operation}"),
+                    identity_start: property.key.span().start,
+                    span: property.span,
+                    target: None,
+                    extractor: "graphql-client-operation",
+                    provenance: "graphql-api-pattern",
+                    detail: json!({ "operationType": callee_name, "operation": operation }),
+                });
+            }
+        }
+
+        if matches!(callee_name, "get" | "require" | "getEnv" | "requireEnv")
+            && callee_path.as_deref().is_some_and(|path| {
+                matches!(path, "Deno.env.get" | "env.get" | "config.get" | "getEnv" | "requireEnv")
+            })
+            && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(name) = static_string(expression, &self.static_strings)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "environment_variable",
+                role: "environment_read",
+                identity_kind: "literal",
+                identity_name: name,
+                identity_start: expression.span().start,
+                span: call.span,
+                target: None,
+                extractor: "environment-api-call",
+                provenance: "environment-api-pattern",
+                detail: json!({ "callee": callee_path }),
+            });
+        }
+
+        if is_feature_flag_callee(callee_name)
+            && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some((kind, name, start)) = self.identity(expression).or_else(|| {
+                member_path(expression)
+                    .map(|name| ("literal", name, expression.span().start))
+            })
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "feature_flag",
+                role: "feature_flag_check",
+                identity_kind: kind,
+                identity_name: name,
+                identity_start: start,
+                span: call.span,
+                target: None,
+                extractor: "feature-flag-call",
+                provenance: "feature-flag-api-pattern",
+                detail: json!({ "callee": callee_path }),
+            });
+        }
+
+        if let Some((resource, access)) = database_call(call, &self.static_strings) {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "database_resource",
+                role: if access == "write" {
+                    "database_write"
+                } else {
+                    "database_read"
+                },
+                identity_kind: "literal",
+                identity_name: resource,
+                identity_start: call.callee.span().start,
+                span: call.span,
+                target: None,
+                extractor: "database-api-call",
+                provenance: "database-api-pattern",
+                detail: json!({ "callee": callee_path, "access": access }),
+            });
+        }
+
+        if is_external_call(callee_path.as_deref(), callee_name)
+            && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(url) = static_string(expression, &self.static_strings)
+            && let Some(host) = url_host(&url)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "external_host",
+                role: "external_host_call",
+                identity_kind: "literal",
+                identity_name: host,
+                identity_start: expression.span().start,
+                span: call.span,
+                target: None,
+                extractor: "static-url-call",
+                provenance: "network-api-pattern",
+                detail: json!({ "callee": callee_path, "url": url }),
+            });
+        }
+    }
+
+    fn extract_class_endpoints(&mut self, class: &Class<'_>) {
+        let controller_prefix = class
+            .decorators
+            .iter()
+            .find_map(|decorator| decorator_static_argument(decorator, "Controller", &self.static_strings))
+            .unwrap_or_default();
+        for element in &class.body.body {
+            let ClassElement::MethodDefinition(method) = element else { continue };
+            let Some(method_name) = method.key.static_name() else { continue };
+            for decorator in &method.decorators {
+                let Some((decorator_name, call)) = decorator_call(decorator) else { continue };
+                let terminal = decorator_name.rsplit('.').next().unwrap_or(&decorator_name);
+                if let Some(http_method) = http_method(terminal) {
+                    let method_path = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|expression| static_string(expression, &self.static_strings))
+                        .unwrap_or_default();
+                    let route_path = join_route_path(&controller_prefix, &method_path);
+                    self.push_general(GeneralSiteSpec {
+                        entity_type: "route",
+                        role: "route_handler",
+                        identity_kind: "literal",
+                        identity_name: format!("{http_method} {route_path}"),
+                        identity_start: decorator.span.start,
+                        span: decorator.span,
+                        target: None,
+                        extractor: "http-route-decorator",
+                        provenance: "routing-decorator-pattern",
+                        detail: json!({
+                            "class": class.id.as_ref().map(|identifier| identifier.name.as_str()),
+                            "method": method_name,
+                            "decorator": terminal,
+                        }),
+                    });
+                }
+                if matches!(terminal, "Query" | "Mutation" | "Subscription") {
+                    let operation_name = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|expression| static_string(expression, &self.static_strings))
+                        .unwrap_or_else(|| method_name.to_string());
+                    self.push_general(GeneralSiteSpec {
+                        entity_type: "graphql_operation",
+                        role: "graphql_handler",
+                        identity_kind: "literal",
+                        identity_name: format!(
+                            "{}:{operation_name}",
+                            terminal.to_ascii_lowercase()
+                        ),
+                        identity_start: decorator.span.start,
+                        span: decorator.span,
+                        target: None,
+                        extractor: "graphql-operation-decorator",
+                        provenance: "graphql-decorator-pattern",
+                        detail: json!({ "method": method_name, "decorator": terminal }),
+                    });
+                }
+            }
+        }
+    }
+
     fn extract_provider(&mut self, object: &ObjectExpression<'_>) {
         let Some(token) = object_value(object, "provide") else { return };
         let implementation = ["useClass", "useFactory", "useExisting"]
@@ -542,6 +785,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_class(&mut self, class: &Class<'a>) {
+        self.extract_class_endpoints(class);
         if let Some(identifier) = &class.id {
             let name = identifier.name.as_str();
             if class_is_contract_schema(class) {
@@ -611,7 +855,47 @@ impl<'a> Visit<'a> for EntityVisitor {
         }
         self.extract_mutation(call);
         self.extract_job_call(call);
+        self.extract_general_call(call);
         oxc_ast_visit::walk::walk_call_expression(self, call);
+    }
+
+    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
+        if is_process_env(&member.object)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "environment_variable",
+                role: "environment_read",
+                identity_kind: "literal",
+                identity_name: member.property.name.to_string(),
+                identity_start: member.property.span.start,
+                span: member.span,
+                target: None,
+                extractor: "process-env-member",
+                provenance: "environment-syntax",
+                detail: json!({ "object": "process.env" }),
+            });
+        }
+        oxc_ast_visit::walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if is_process_env(&member.object)
+            && let Some(name) = static_string(&member.expression, &self.static_strings)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "environment_variable",
+                role: "environment_read",
+                identity_kind: "literal",
+                identity_name: name,
+                identity_start: member.expression.span().start,
+                span: member.span,
+                target: None,
+                extractor: "process-env-computed-member",
+                provenance: "environment-syntax",
+                detail: json!({ "object": "process.env" }),
+            });
+        }
+        oxc_ast_visit::walk::walk_computed_member_expression(self, member);
     }
 
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
@@ -798,6 +1082,225 @@ fn object_value<'a>(object: &'a ObjectExpression<'a>, name: &str) -> Option<&'a 
         let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
         (property.key.static_name().as_deref() == Some(name)).then_some(&property.value)
     })
+}
+
+fn http_method(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "get" => Some("GET"),
+        "post" => Some("POST"),
+        "put" => Some("PUT"),
+        "patch" => Some("PATCH"),
+        "delete" => Some("DELETE"),
+        "options" => Some("OPTIONS"),
+        "head" => Some("HEAD"),
+        "all" => Some("ALL"),
+        _ => None,
+    }
+}
+
+fn normalize_route_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        "/".to_string()
+    } else {
+        format!("/{}", trimmed.trim_matches('/'))
+    }
+}
+
+fn join_route_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    let path = path.trim_matches('/');
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (false, true) => format!("/{prefix}"),
+        (true, false) => format!("/{path}"),
+        (false, false) => format!("/{prefix}/{path}"),
+    }
+}
+
+fn decorator_call<'a>(decorator: &'a Decorator<'a>) -> Option<(String, &'a CallExpression<'a>)> {
+    let Expression::CallExpression(call) = &decorator.expression else { return None };
+    let name = member_path(&call.callee)?;
+    Some((name, call))
+}
+
+fn decorator_static_argument(
+    decorator: &Decorator<'_>,
+    expected: &str,
+    constants: &HashMap<String, String>,
+) -> Option<String> {
+    let (name, call) = decorator_call(decorator)?;
+    if name.rsplit('.').next() != Some(expected) {
+        return None;
+    }
+    match call.arguments.first() {
+        None => Some(String::new()),
+        Some(argument) => static_string(argument.as_expression()?, constants),
+    }
+}
+
+fn is_feature_flag_callee(name: &str) -> bool {
+    matches!(
+        name,
+        "isEnabled"
+            | "isFeatureEnabled"
+            | "isFeatureFlagEnabled"
+            | "hasFeature"
+            | "useFeatureFlag"
+            | "featureFlag"
+    )
+}
+
+fn is_general_callee(name: &str) -> bool {
+    http_method(name).is_some()
+        || matches!(
+            name,
+            "query"
+                | "mutation"
+                | "subscription"
+                | "require"
+                | "getEnv"
+                | "requireEnv"
+                | "getRepository"
+                | "getModel"
+                | "create"
+                | "createMany"
+                | "insert"
+                | "insertMany"
+                | "save"
+                | "update"
+                | "updateMany"
+                | "upsert"
+                | "deleteMany"
+                | "remove"
+                | "find"
+                | "findOne"
+                | "findFirst"
+                | "findMany"
+                | "findUnique"
+                | "select"
+                | "count"
+                | "aggregate"
+                | "exists"
+                | "fetch"
+                | "axios"
+                | "got"
+                | "request"
+        )
+        || is_feature_flag_callee(name)
+}
+
+fn is_process_env(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression,
+        Expression::StaticMemberExpression(member)
+            if member.property.name == "env"
+                && matches!(
+                    &member.object,
+                    Expression::Identifier(identifier) if identifier.name == "process"
+                )
+    )
+}
+
+fn database_call(
+    call: &CallExpression<'_>,
+    constants: &HashMap<String, String>,
+) -> Option<(String, &'static str)> {
+    if let Expression::Identifier(callee) = &call.callee
+        && matches!(callee.name.as_str(), "getRepository" | "getModel")
+    {
+        let resource = call.arguments.first()?.as_expression()?;
+        let name = match resource {
+            Expression::Identifier(identifier) => identifier.name.to_string(),
+            _ => static_string(resource, constants)?,
+        };
+        return Some((name, "read"));
+    }
+    let Expression::StaticMemberExpression(member) = &call.callee else { return None };
+    let method = member.property.name.as_str();
+    let access = if matches!(
+        method,
+        "create"
+            | "createMany"
+            | "insert"
+            | "insertMany"
+            | "save"
+            | "update"
+            | "updateMany"
+            | "upsert"
+            | "delete"
+            | "deleteMany"
+            | "remove"
+    ) {
+        "write"
+    } else if matches!(
+        method,
+        "find"
+            | "findOne"
+            | "findFirst"
+            | "findMany"
+            | "findUnique"
+            | "select"
+            | "count"
+            | "aggregate"
+            | "exists"
+    ) {
+        "read"
+    } else {
+        return None;
+    };
+    let object = member_path(&member.object)?;
+    let segments: Vec<&str> = object.split('.').collect();
+    let database_api = segments.iter().any(|segment| {
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "db" | "database" | "prisma" | "repository" | "repo" | "model"
+        )
+    });
+    if !database_api {
+        return None;
+    }
+    let resource = if segments.len() > 1 {
+        segments.last()?.to_string()
+    } else {
+        let expression = call.arguments.first()?.as_expression()?;
+        match expression {
+            Expression::Identifier(identifier) => identifier.name.to_string(),
+            _ => static_string(expression, constants)?,
+        }
+    };
+    if is_database_api_segment(&resource) {
+        return None;
+    }
+    Some((resource, access))
+}
+
+fn is_database_api_segment(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "db" | "database" | "prisma" | "repository" | "repo" | "model" | "entitymanager"
+    )
+}
+
+fn is_external_call(path: Option<&str>, name: &str) -> bool {
+    name == "fetch"
+        || matches!(path, Some("axios" | "got" | "request"))
+        || path.is_some_and(|path| {
+            let root = path.split('.').next().unwrap_or_default();
+            matches!(root, "axios" | "got" | "request")
+                && matches!(name, "get" | "post" | "put" | "patch" | "delete" | "request")
+        })
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    let host = if authority.starts_with('[') {
+        authority.split(']').next()?.trim_start_matches('[')
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 fn static_string(
@@ -1050,6 +1553,51 @@ mod tests {
         }));
         assert!(extracted.iter().any(|site| {
             site.role == "decorator_use" && site.identity_name == "IsString"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_routes_graphql_env_database_flags_and_external_hosts() -> Result<()> {
+        let extracted = sites(
+            "@Controller('/users')\n\
+             class UsersController {\n\
+               @Get(':id') getUser() {}\n\
+               @Mutation('saveUser') saveUser() {}\n\
+             }\n\
+             router.post('/jobs', createJob);\n\
+             client.query({ currentUser: { id: true } });\n\
+             const apiKey = process.env.API_KEY;\n\
+             const region = process.env['REGION'];\n\
+             const token = Deno.env.get('TOKEN');\n\
+             prisma.user.findMany();\n\
+             prisma.user.create({ data });\n\
+             this.repository.save(data);\n\
+             flags.isEnabled('new-ui');\n\
+             fetch('https://api.example.com/v1/users');\n",
+        )?;
+        for (entity_type, role, identity) in [
+            ("route", "route_handler", "GET /users/:id"),
+            ("route", "route_handler", "POST /jobs"),
+            ("graphql_operation", "graphql_handler", "mutation:saveUser"),
+            ("graphql_operation", "graphql_operation", "query:currentUser"),
+            ("environment_variable", "environment_read", "API_KEY"),
+            ("environment_variable", "environment_read", "REGION"),
+            ("environment_variable", "environment_read", "TOKEN"),
+            ("database_resource", "database_read", "user"),
+            ("database_resource", "database_write", "user"),
+            ("feature_flag", "feature_flag_check", "new-ui"),
+            ("external_host", "external_host_call", "api.example.com"),
+        ] {
+            assert!(extracted.iter().any(|site| {
+                site.plane == "general"
+                    && site.entity_type == entity_type
+                    && site.role == role
+                    && site.identity_name == identity
+            }), "missing {entity_type}/{role}/{identity}");
+        }
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "database_resource" && site.identity_name == "repository"
         }));
         Ok(())
     }
