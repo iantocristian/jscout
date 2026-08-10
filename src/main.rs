@@ -8,6 +8,7 @@ mod heur;
 mod indexer;
 mod mcp;
 mod origin;
+mod package_exports;
 mod parse;
 mod query;
 mod search;

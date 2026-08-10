@@ -14,6 +14,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::indexer::{package_name, resolver_options};
+use crate::package_exports::collect_active_targets;
 use crate::store;
 use crate::walk;
 use crate::workspace::{WorkspaceMap, WorkspacePackage};
@@ -221,7 +222,7 @@ pub fn synchronize_instances(
             let Some(id) = instances.get(&package.canonical_root) else { continue };
             let Ok(relative) = package.canonical_root.strip_prefix(root) else { continue };
             let prefix = relative.to_string_lossy().replace('\\', "/");
-            let like = format!("{prefix}/%");
+            let subtree_prefix = format!("{prefix}/");
             conn.execute(
                 "UPDATE files
                  SET origin='workspace', package_instance_id=?1,
@@ -229,8 +230,15 @@ pub fn synchronize_instances(
                        WHEN path=?2 THEN ''
                        ELSE substr(path, ?3)
                      END
-                 WHERE origin!='dependency' AND (path=?2 OR path LIKE ?4)",
-                params![id, prefix, prefix.len() as i64 + 2, like],
+                 WHERE origin!='dependency'
+                   AND (path=?2 OR substr(path, 1, ?5)=?4)",
+                params![
+                    id,
+                    prefix,
+                    prefix.len() as i64 + 2,
+                    subtree_prefix,
+                    subtree_prefix.len() as i64,
+                ],
             )?;
         }
         Ok(instances)
@@ -302,6 +310,18 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
     }
     candidates.sort();
     candidates.dedup();
+    // Boundary entries consume the bounded budget first. Without this
+    // ordering a lexically late entry could disappear behind unrelated files
+    // even though it is the package target first-party imports resolve to.
+    candidates.sort_by(|left, right| {
+        let is_forced = |path: &Path| {
+            path.strip_prefix(&package.canonical_root)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .is_some_and(|path| forced_entries.contains(&path))
+        };
+        is_forced(right).cmp(&is_forced(left)).then_with(|| left.cmp(right))
+    });
 
     let mut files = Vec::new();
     let mut selected_bytes = 0_u64;
@@ -412,14 +432,7 @@ fn collect_runtime_targets(value: &serde_json::Value, out: &mut Vec<String>) {
                 collect_runtime_targets(value, out);
             }
         }
-        serde_json::Value::Object(map) => {
-            for condition in crate::indexer::RESOLVE_CONDITIONS {
-                if let Some(value) = map.get(*condition) {
-                    collect_runtime_targets(value, out);
-                    break;
-                }
-            }
-        }
+        serde_json::Value::Object(_) => collect_active_targets(value, out),
         _ => {}
     }
 }
@@ -752,10 +765,10 @@ mod tests {
         let package_root = tempfile::tempdir()?;
         write(
             &package_root.path().join("package.json"),
-            r#"{"name":"dep","version":"1.0.0","source":"src/index.ts","main":"dist/index.js"}"#,
+            r#"{"name":"dep","version":"1.0.0","source":"src/z-entry.ts","main":"dist/index.js"}"#,
         )?;
-        write(&package_root.path().join("src/index.ts"), "export const entry = 1;\n")?;
-        write(&package_root.path().join("src/z.ts"), "export const z = 1;\n")?;
+        write(&package_root.path().join("src/a.ts"), "export const a = 1;\n")?;
+        write(&package_root.path().join("src/z-entry.ts"), "export const entry = 1;\n")?;
         write(&package_root.path().join("dist/index.js"), "exports.entry = 1;\n")?;
         let package = DiscoveredPackage {
             origin: "dependency".into(),
@@ -773,7 +786,7 @@ mod tests {
         let plan = &plans[0];
         assert_eq!(plan.source_basis, "manifest-source");
         assert_eq!(plan.files.len(), 1);
-        assert_eq!(plan.files[0].package_path, "src/index.ts");
+        assert_eq!(plan.files[0].package_path, "src/z-entry.ts");
         assert!(plan.files[0].forced_entry);
         assert_eq!(plan.skipped_files, 1);
         assert_eq!(plan.status, "truncated");
@@ -810,6 +823,37 @@ mod tests {
         assert_eq!(paths, vec!["dist/a.js"]);
         assert!(should_skip_minified(Path::new("bundle.min.js"), "x", false));
         assert!(!should_skip_minified(Path::new("bundle.min.js"), "x", true));
+        Ok(())
+    }
+
+    #[test]
+    fn planning_uses_declaration_order_for_active_export_conditions() -> Result<()> {
+        let package_root = tempfile::tempdir()?;
+        write(
+            &package_root.path().join("package.json"),
+            r#"{"name":"dep","version":"1.0.0","exports":{".":{"default":"./fallback/index.js","import":"./esm/index.js"}}}"#,
+        )?;
+        write(
+            &package_root.path().join("fallback/index.js"),
+            "export const selected = true;\n",
+        )?;
+        write(
+            &package_root.path().join("esm/index.js"),
+            "export const skipped = true;\n",
+        )?;
+        let package = DiscoveredPackage {
+            origin: "dependency".into(),
+            name: "dep".into(),
+            version: Some("1.0.0".into()),
+            canonical_root: package_root.path().canonicalize()?,
+            locator: "node_modules/dep".into(),
+            manifest_hash: "hash".into(),
+        };
+
+        let plans = plan_packages(&[package], DependencyLimits::default())?;
+        let paths: Vec<&str> =
+            plans[0].files.iter().map(|file| file.package_path.as_str()).collect();
+        assert_eq!(paths, ["fallback/index.js"]);
         Ok(())
     }
 }

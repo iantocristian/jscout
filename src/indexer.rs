@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
 use crate::graph::{self, FileGraph};
+use crate::package_exports::RESOLVE_CONDITIONS;
 use crate::{file_role, parse, store, walk};
 
 #[derive(Debug, Clone, Default)]
@@ -44,11 +45,6 @@ struct FileIdentity<'a> {
     package_instance_id: Option<i64>,
     package_path: Option<&'a str>,
 }
-
-/// Export conditions the resolver enables. The workspace layer mirrors these
-/// when it translates package.json `exports` targets, so alias-mapped entries
-/// agree with what the resolver itself would pick.
-pub(crate) const RESOLVE_CONDITIONS: &[&str] = &["import", "require", "node", "default"];
 
 pub(crate) fn resolver_options(
     alias: oxc_resolver::Alias,
@@ -420,12 +416,17 @@ fn index_dependency_files(
                 let source = match std::fs::read_to_string(&file.source_path) {
                     Ok(source) => source,
                     Err(_) => {
+                        // Preserve the last successfully indexed row on a
+                        // transient read failure; a later successful cycle can
+                        // replace it without first losing known-good data.
                         seen.insert(display);
                         outcome.failed += 1;
                         continue;
                     }
                 };
                 if dependency::should_skip_minified(&file.source_path, &source, file.forced_entry) {
+                    // Policy exclusions are intentionally not seen: cleanup
+                    // below removes a row that no longer belongs in the corpus.
                     outcome.dependency_skipped += 1;
                     continue;
                 }
@@ -867,6 +868,72 @@ mod tests {
         };
         assert_eq!(edge("./helper")?, (Some("packages/app/src/helper.ts".into()), None));
         assert_eq!(edge("@acme/lib")?, (Some("packages/lib/src/index.ts".into()), None));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_ownership_uses_literal_path_prefixes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/my_pkg\n",
+        )?;
+        let workspace = repo.path().join("packages/my_pkg");
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::write(
+            workspace.join("package.json"),
+            r#"{"name":"my-pkg","version":"1.0.0"}"#,
+        )?;
+        fs::write(workspace.join("src/index.ts"), "export const owned = 1;\n")?;
+        let sibling = repo.path().join("packages/my1pkg/src");
+        fs::create_dir_all(&sibling)?;
+        fs::write(sibling.join("index.ts"), "export const sibling = 1;\n")?;
+
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let origins: (String, String) = conn.query_row(
+            "SELECT
+               (SELECT origin FROM files WHERE path='packages/my_pkg/src/index.ts'),
+               (SELECT origin FROM files WHERE path='packages/my1pkg/src/index.ts')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(origins, ("workspace".into(), "repository".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn indexes_scoped_dependency_selected_by_exact_name() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { scoped } from '@scope/pkg';\nexport const result = scoped();\n",
+        )?;
+        let dependency = repo.path().join("node_modules/@scope/pkg");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"@scope/pkg","version":"2.0.0","main":"index.js"}"#,
+        )?;
+        fs::write(dependency.join("index.js"), "export const scoped = () => 2;\n")?;
+
+        let conn = store::open(repo.path())?;
+        index_repo_with_options(
+            repo.path(),
+            &conn,
+            &IndexOptions { dependencies: vec!["@scope/pkg".into()], ..Default::default() },
+        )?;
+        let resolved: (String, String, String) = conn.query_row(
+            "SELECT package.name, package.version, target.package_path
+             FROM module_edges edge
+             JOIN package_instances package ON package.id=edge.package_instance_id
+             JOIN files target ON target.id=edge.to_file
+             JOIN files source ON source.id=edge.from_file
+             WHERE source.path='main.ts' AND edge.request='@scope/pkg'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(resolved, ("@scope/pkg".into(), "2.0.0".into(), "index.js".into()));
         Ok(())
     }
 
