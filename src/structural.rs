@@ -261,6 +261,10 @@ impl Ord for WorkflowRankedNode {
     }
 }
 
+pub const MAX_PATH_NODE_LIMIT: usize = 200;
+pub const MAX_PATH_EDGE_LIMIT: usize = 800;
+pub const MAX_PATH_SEARCH_STATES: usize = 50_000;
+
 #[derive(Debug, Clone)]
 pub struct PathOptions {
     pub expected_snapshot: Option<String>,
@@ -281,8 +285,8 @@ impl Default for PathOptions {
             expected_snapshot: None,
             max_depth: 4,
             path_limit: 8,
-            node_limit: 200,
-            edge_limit: 800,
+            node_limit: MAX_PATH_NODE_LIMIT,
+            edge_limit: MAX_PATH_EDGE_LIMIT,
             direction: "both".into(),
             min_confidence: "likely".into(),
             kinds: Vec::new(),
@@ -299,6 +303,8 @@ impl Default for PathOptions {
 pub struct PathStep {
     pub from: String,
     pub to: String,
+    /// True when the path traverses the underlying directed edge target-to-source.
+    pub reversed: bool,
     pub edge: GraphEdge,
 }
 
@@ -321,6 +327,7 @@ pub struct PathSearch {
     pub paths: Vec<GraphPath>,
     pub searched_nodes: usize,
     pub searched_edges: usize,
+    pub searched_states: usize,
     pub truncated: bool,
 }
 
@@ -2562,6 +2569,12 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     if options.path_limit == 0 || options.path_limit > 50 {
         bail!("path limit must be between 1 and 50");
     }
+    if options.node_limit == 0 || options.node_limit > MAX_PATH_NODE_LIMIT {
+        bail!("path node limit must be between 1 and {MAX_PATH_NODE_LIMIT}");
+    }
+    if options.edge_limit == 0 || options.edge_limit > MAX_PATH_EDGE_LIMIT {
+        bail!("path edge limit must be between 1 and {MAX_PATH_EDGE_LIMIT}");
+    }
     origin::validate_all(&options.file_origins)?;
     file_role::validate_all(&options.file_roles)?;
     let allowed_origins: HashSet<&str> = options.file_origins.iter().map(String::as_str).collect();
@@ -2600,29 +2613,34 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     {
         node_by_key.insert(resolved_to.clone(), node);
     }
-    let mut adjacency: HashMap<String, Vec<(String, GraphEdge)>> = HashMap::new();
+    let mut adjacency: HashMap<String, Vec<(String, GraphEdge, bool)>> = HashMap::new();
     for edge in &neighborhood.edges {
         if options.direction != "in" {
-            adjacency
-                .entry(edge.source.clone())
-                .or_default()
-                .push((edge.target.clone(), edge.clone()));
+            adjacency.entry(edge.source.clone()).or_default().push((
+                edge.target.clone(),
+                edge.clone(),
+                false,
+            ));
         }
         if options.direction != "out" {
-            adjacency
-                .entry(edge.target.clone())
-                .or_default()
-                .push((edge.source.clone(), edge.clone()));
+            adjacency.entry(edge.target.clone()).or_default().push((
+                edge.source.clone(),
+                edge.clone(),
+                true,
+            ));
         }
     }
     for edges in adjacency.values_mut() {
-        edges.sort_by(|(left_node, left), (right_node, right)| {
-            right
-                .relevance
-                .total_cmp(&left.relevance)
-                .then_with(|| left_node.cmp(right_node))
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
+        edges.sort_by(
+            |(left_node, left, left_reversed), (right_node, right, right_reversed)| {
+                right
+                    .relevance
+                    .total_cmp(&left.relevance)
+                    .then_with(|| left_node.cmp(right_node))
+                    .then_with(|| left.kind.cmp(&right.kind))
+                    .then_with(|| left_reversed.cmp(right_reversed))
+            },
+        );
     }
 
     #[derive(Clone)]
@@ -2643,7 +2661,13 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     }];
     let mut candidates = Vec::new();
     let mut enumeration_truncated = false;
+    let mut searched_states = 0;
     while let Some(candidate) = stack.pop() {
+        if searched_states >= MAX_PATH_SEARCH_STATES {
+            enumeration_truncated = true;
+            break;
+        }
+        searched_states += 1;
         let current = candidate.nodes.last().expect("path has a node");
         if current == &resolved_to {
             candidates.push(candidate);
@@ -2659,7 +2683,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
         let Some(edges) = adjacency.get(current) else {
             continue;
         };
-        for (next, edge) in edges.iter().rev() {
+        for (next, edge, reversed) in edges.iter().rev() {
             if candidate.nodes.contains(next) {
                 continue;
             }
@@ -2668,6 +2692,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
             next_candidate.steps.push(PathStep {
                 from: current.clone(),
                 to: next.clone(),
+                reversed: *reversed,
                 edge: edge.clone(),
             });
             next_candidate.score = round_score(candidate.score.min(edge.relevance));
@@ -2709,6 +2734,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
         paths,
         searched_nodes: neighborhood.nodes.len(),
         searched_edges: neighborhood.edges.len(),
+        searched_states,
         truncated: neighborhood.truncated
             || enumeration_truncated
             || matched_paths > options.path_limit,
@@ -3303,6 +3329,104 @@ mod tests {
         assert!(result.paths[0].score > 0.0);
         assert_eq!(result.paths[0].nodes[0].display_name, "start");
         assert_eq!(result.paths[0].nodes[2].display_name, "finish");
+        Ok(())
+    }
+
+    #[test]
+    fn paths_marks_reverse_traversal_explicitly() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "flow.ts",
+            "export function finish() {}\n\
+             export function middle() { finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let result = super::paths(
+            &conn,
+            "flow.ts:finish",
+            "flow.ts:middle",
+            &super::PathOptions {
+                direction: "both".into(),
+                max_depth: 1,
+                kinds: vec!["call".into()],
+                ..Default::default()
+            },
+        )?;
+        let step = &result.paths[0].steps[0];
+        assert!(step.reversed);
+        assert_eq!(step.from, step.edge.target);
+        assert_eq!(step.to, step.edge.source);
+        Ok(())
+    }
+
+    #[test]
+    fn paths_caps_explored_prefix_states() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "flow.ts",
+            "export function root() {}\nexport function target() {}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let root: String = conn.query_row(
+            "SELECT node_key FROM graph_nodes WHERE node_kind='symbol' AND display_name='root'",
+            [],
+            |row| row.get(0),
+        )?;
+        let target: String = conn.query_row(
+            "SELECT node_key FROM graph_nodes WHERE node_kind='symbol' AND display_name='target'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        for layer in 0..4 {
+            for index in 0..15 {
+                let key = format!("dense:{layer}:{index}");
+                conn.execute(
+                    "INSERT INTO graph_nodes(node_key, node_kind, display_name, meta_json)
+                     VALUES(?1, 'candidate', ?1, '{}')",
+                    [&key],
+                )?;
+                if layer == 0 {
+                    conn.execute(
+                        "INSERT INTO resolved_edges(
+                           src_key, dst_key, kind, confidence, provenance, detail_json
+                         ) VALUES(?1, ?2, 'call', 'certain', 'test', '{}')",
+                        rusqlite::params![root, key],
+                    )?;
+                } else {
+                    for parent in 0..15 {
+                        let parent_key = format!("dense:{}:{parent}", layer - 1);
+                        conn.execute(
+                            "INSERT INTO resolved_edges(
+                               src_key, dst_key, kind, confidence, provenance, detail_json
+                             ) VALUES(?1, ?2, 'call', 'certain', 'test', '{}')",
+                            rusqlite::params![parent_key, key],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let result = super::paths(
+            &conn,
+            &root,
+            &target,
+            &super::PathOptions {
+                direction: "out".into(),
+                max_depth: 4,
+                path_limit: 1,
+                kinds: vec!["call".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(result.paths.is_empty());
+        assert_eq!(result.searched_states, super::MAX_PATH_SEARCH_STATES);
+        assert!(result.truncated);
         Ok(())
     }
 

@@ -283,8 +283,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "snapshot": { "type": "string" },
                     "max_depth": { "type": "integer", "default": 4, "minimum": 1, "maximum": 8 },
                     "path_limit": { "type": "integer", "default": 8, "minimum": 1, "maximum": 50 },
-                    "node_limit": { "type": "integer", "default": 200 },
-                    "edge_limit": { "type": "integer", "default": 800 },
+                    "node_limit": { "type": "integer", "default": 200, "minimum": 1, "maximum": 200 },
+                    "edge_limit": { "type": "integer", "default": 800, "minimum": 1, "maximum": 800 },
                     "direction": { "type": "string", "enum": ["in", "out", "both"], "default": "both" },
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
@@ -658,8 +658,16 @@ fn call_tool(
                     expected_snapshot: args["snapshot"].as_str().map(str::to_string),
                     max_depth: args["max_depth"].as_u64().unwrap_or(4) as usize,
                     path_limit: args["path_limit"].as_u64().unwrap_or(8) as usize,
-                    node_limit: args["node_limit"].as_u64().unwrap_or(200) as usize,
-                    edge_limit: args["edge_limit"].as_u64().unwrap_or(800) as usize,
+                    node_limit: args["node_limit"]
+                        .as_u64()
+                        .unwrap_or(200)
+                        .min(structural::MAX_PATH_NODE_LIMIT as u64)
+                        as usize,
+                    edge_limit: args["edge_limit"]
+                        .as_u64()
+                        .unwrap_or(800)
+                        .min(structural::MAX_PATH_EDGE_LIMIT as u64)
+                        as usize,
                     direction: args["direction"].as_str().unwrap_or("both").to_string(),
                     min_confidence: args["min_confidence"]
                         .as_str()
@@ -691,6 +699,8 @@ fn call_tool(
                 (args["area_limit"].as_u64().unwrap_or(20) as usize).min(100),
                 (args["relation_limit"].as_u64().unwrap_or(30) as usize).min(100),
             )?;
+            // Preserve the compact inventory longest: relation counts are easiest to
+            // re-derive, followed by area detail, when the whole-response budget binds.
             render_bounded_object_arrays(
                 serde_json::to_value(result)?,
                 &["relations", "areas", "entity_inventory"],
@@ -1034,6 +1044,20 @@ mod tests {
     }
 
     #[test]
+    fn paths_schema_caps_graph_scope() {
+        let structural = tool_defs(ToolProfile::Structural);
+        let paths = structural
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == "paths")
+            .expect("paths definition");
+        let properties = &paths["inputSchema"]["properties"];
+        assert_eq!(properties["node_limit"]["maximum"], 200);
+        assert_eq!(properties["edge_limit"]["maximum"], 800);
+    }
+
+    #[test]
     fn annotate_schema_exposes_workflow_participant_scope() {
         let structural = tool_defs(ToolProfile::Structural);
         let annotate = structural
@@ -1242,6 +1266,8 @@ mod tests {
                 "to": "flow.ts:finish",
                 "direction": "out",
                 "kinds": ["call"],
+                "node_limit": 100000,
+                "edge_limit": 100000,
                 "response_bytes": 4000
             }),
         )?;
