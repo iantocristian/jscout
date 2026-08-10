@@ -657,7 +657,7 @@ mod tests {
     use anyhow::Result;
 
     use super::{IndexOptions, index_repo, index_repo_with_options};
-    use crate::store;
+    use crate::{origin, query, search, store, structural};
 
     #[test]
     fn resolves_paths_from_the_importers_nearest_tsconfig() -> Result<()> {
@@ -873,7 +873,9 @@ mod tests {
         let repo = tempfile::tempdir()?;
         fs::write(
             repo.path().join("main.ts"),
-            "import { publicApi } from 'selected-dep';\nexport const result = publicApi();\n",
+            "import { publicApi } from 'selected-dep';\n\
+             export const internal = () => 'first-party';\n\
+             export const result = publicApi();\n",
         )?;
 
         let dependency = repo.path().join("node_modules/selected-dep");
@@ -886,7 +888,11 @@ mod tests {
             dependency.join("dist/index.js"),
             "export { internal as publicApi } from './internal.js';\n",
         )?;
-        fs::write(dependency.join("dist/internal.js"), "export const internal = () => 42;\n")?;
+        fs::write(
+            dependency.join("dist/internal.js"),
+            "export const internal = () => 42;\n\
+             export const dependencyOnlyMarker = true;\n",
+        )?;
 
         let ignored = repo.path().join("node_modules/ignored-dep");
         fs::create_dir_all(&ignored)?;
@@ -938,6 +944,119 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(edge.0, "dist/index.js");
+        let package_hub: (String, String) = conn.query_row(
+            "SELECT node_key, meta_json FROM graph_nodes
+             WHERE native_table='package_instances' AND native_id=?1",
+            [edge.1],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(package_hub.0.starts_with("pkg:selected-dep@1.2.3#"));
+        assert!(package_hub.1.contains(r#""origin":"dependency""#));
+        let boundary_edges: Vec<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT kind, dst_key FROM resolved_edges
+                 WHERE (kind='imports_package' AND src_key='file:main.ts')
+                    OR (kind='contains_module' AND src_key=?1)
+                 ORDER BY kind, dst_key",
+            )?;
+            let rows = stmt.query_map([&package_hub.0], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        assert_eq!(
+            boundary_edges,
+            vec![
+                (
+                    "contains_module".into(),
+                    format!(
+                        "file:{}",
+                        conn.query_row(
+                            "SELECT path FROM files WHERE package_instance_id=?1
+                             AND package_path='dist/index.js'",
+                            [edge.1],
+                            |row| row.get::<_, String>(0),
+                        )?
+                    ),
+                ),
+                ("imports_package".into(), package_hub.0.clone()),
+            ]
+        );
+
+        let default_search = search::search(
+            &conn,
+            None,
+            "dependencyOnlyMarker",
+            &search::SearchOptions::default(),
+        )?;
+        assert!(default_search.hits.is_empty());
+        let dependency_search = search::search(
+            &conn,
+            None,
+            "dependencyOnlyMarker",
+            &search::SearchOptions {
+                file_origins: vec!["dependency".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(!dependency_search.hits.is_empty());
+        assert!(
+            dependency_search
+                .hits
+                .iter()
+                .all(|hit| hit.file_origin == "dependency")
+        );
+        assert!(
+            query::find_symbols_in_origins(
+                &conn,
+                "dependencyOnlyMarker",
+                &origin::defaults(),
+            )?
+            .is_empty()
+        );
+        let dependency_definitions = query::find_symbols_in_origins(
+            &conn,
+            "dependencyOnlyMarker",
+            &["dependency".into()],
+        )?;
+        assert_eq!(dependency_definitions.len(), 1);
+        assert_eq!(dependency_definitions[0].file_origin, "dependency");
+        let first_party_anchor = structural::resolve_current_anchor_in_origins(
+            &conn,
+            "internal",
+            &origin::defaults(),
+        )?;
+        assert!(first_party_anchor.starts_with("sym:main.ts#::internal@"));
+        assert!(structural::resolve_current_anchor(&conn, "internal").is_err());
+
+        let default_boundary = structural::neighborhood(
+            &conn,
+            "file:main.ts",
+            &structural::NeighborhoodOptions {
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(default_boundary.nodes.iter().any(|node| node.key == package_hub.0));
+        assert!(
+            default_boundary
+                .nodes
+                .iter()
+                .all(|node| node.file_origin.as_deref() != Some("dependency"))
+        );
+        let dependency_boundary = structural::neighborhood(
+            &conn,
+            "file:main.ts",
+            &structural::NeighborhoodOptions {
+                direction: "out".into(),
+                file_origins: vec!["repository".into(), "dependency".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            dependency_boundary
+                .nodes
+                .iter()
+                .any(|node| node.file_origin.as_deref() == Some("dependency"))
+        );
 
         let second = index_repo_with_options(
             repo.path(),

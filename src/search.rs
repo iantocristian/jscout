@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, file_role, semantic, store, structural};
+use crate::{embed, file_role, origin, semantic, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -19,6 +19,8 @@ pub struct ExpansionOptions {
     pub min_confidence: String,
     /// Eligible file-backed expansion roles. Empty means all roles.
     pub file_roles: Vec<String>,
+    /// Eligible backing-file origins. Dependency files require explicit opt-in.
+    pub file_origins: Vec<String>,
 }
 
 impl Default for ExpansionOptions {
@@ -34,6 +36,7 @@ impl Default for ExpansionOptions {
                 .iter()
                 .map(|role| (*role).to_string())
                 .collect(),
+            file_origins: origin::defaults(),
         }
     }
 }
@@ -47,6 +50,8 @@ pub struct SearchOptions {
     pub response_byte_limit: usize,
     /// Optional role allowlist for primary hits. Empty preserves normal recall.
     pub file_roles: Vec<String>,
+    /// Backing-file origin allowlist. Defaults to first-party origins.
+    pub file_origins: Vec<String>,
     pub include_memory: bool,
     pub memory_limit: usize,
     pub expansion: ExpansionOptions,
@@ -59,6 +64,7 @@ impl Default for SearchOptions {
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
+            file_origins: origin::defaults(),
             include_memory: true,
             memory_limit: 4,
             expansion: ExpansionOptions::default(),
@@ -99,6 +105,7 @@ pub struct SearchExpansion {
     pub edge_limit: usize,
     pub byte_limit: usize,
     pub file_roles: Vec<String>,
+    pub file_origins: Vec<String>,
     pub payload_bytes: usize,
     pub truncated: bool,
 }
@@ -108,6 +115,7 @@ pub struct Hit {
     pub chunk_id: i64,
     pub file: String,
     pub file_role: String,
+    pub file_origin: String,
     pub kind: String,
     pub name: Option<String>,
     pub start_line: i64,
@@ -135,16 +143,29 @@ fn fts_query(q: &str) -> String {
     tokens.join(" OR ")
 }
 
-fn bm25_ranking(conn: &Connection, q: &str, limit: usize) -> Result<Vec<(i64, f64)>> {
+fn bm25_ranking(
+    conn: &Connection,
+    q: &str,
+    limit: usize,
+    file_origins: &[String],
+) -> Result<Vec<(i64, f64)>> {
     let fq = fts_query(q);
     if fq.is_empty() {
         return Ok(vec![]);
     }
     let mut stmt = conn.prepare(
-        "SELECT rowid, bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0) AS r
-         FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY r LIMIT ?2",
+        "SELECT chunks_fts.rowid, bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0) AS r
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE chunks_fts MATCH ?1
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+         ORDER BY r LIMIT ?5",
     )?;
-    let rows = stmt.query_map(rusqlite::params![fq, limit as i64], |r| {
+    let flags = origin_flags(file_origins);
+    let rows = stmt.query_map(rusqlite::params![fq, flags.0, flags.1, flags.2, limit as i64], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -155,6 +176,7 @@ fn vector_ranking(
     provider: &embed::Provider,
     q: &str,
     limit: usize,
+    file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
     let t = std::time::Instant::now();
     let qv = provider.embed_query(q)?;
@@ -163,9 +185,16 @@ fn vector_ranking(
     }
     // Brute-force cosine over all embedded chunks; dedup hash -> best chunk.
     let mut stmt = conn.prepare(
-        "SELECT c.id, e.vec FROM chunks c JOIN embeddings e ON e.chunk_hash = c.hash AND e.model = ?1",
+        "SELECT c.id, e.vec
+         FROM chunks c
+         JOIN files f ON f.id=c.file_id
+         JOIN embeddings e ON e.chunk_hash=c.hash AND e.model=?1
+         WHERE (?2 AND f.origin='repository')
+            OR (?3 AND f.origin='workspace')
+            OR (?4 AND f.origin='dependency')",
     )?;
-    let rows = stmt.query_map([&provider.model], |r| {
+    let flags = origin_flags(file_origins);
+    let rows = stmt.query_map(rusqlite::params![provider.model, flags.0, flags.1, flags.2], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
     let mut scored: Vec<(i64, f64)> = rows
@@ -175,6 +204,14 @@ fn vector_ranking(
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(limit);
     Ok(scored)
+}
+
+fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
+    (
+        origins.iter().any(|origin| origin == "repository"),
+        origins.iter().any(|origin| origin == "workspace"),
+        origins.iter().any(|origin| origin == "dependency"),
+    )
 }
 
 /// Optional cross-encoder rerank stage (dms-style service:
@@ -242,9 +279,18 @@ pub fn search(
 ) -> Result<SearchResult> {
     file_role::validate_all(&options.file_roles)?;
     file_role::validate_all(&options.expansion.file_roles)?;
+    origin::validate_all(&options.file_origins)?;
+    origin::validate_all(&options.expansion.file_origins)?;
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let hits = ranked_hits(conn, provider, q, options.limit, &options.file_roles)?;
+        let hits = ranked_hits(
+            conn,
+            provider,
+            q,
+            options.limit,
+            &options.file_roles,
+            &options.file_origins,
+        )?;
         let semantic_artifacts = if options.include_memory {
             semantic::search(conn, q, options.memory_limit)?
         } else {
@@ -275,17 +321,18 @@ fn ranked_hits(
     q: &str,
     limit: usize,
     file_roles: &[String],
+    file_origins: &[String],
 ) -> Result<Vec<Hit>> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
     let t0 = std::time::Instant::now();
-    let mut rankings = vec![bm25_ranking(conn, q, pool)?];
+    let mut rankings = vec![bm25_ranking(conn, q, pool, file_origins)?];
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
     }
     if let Some(p) = provider {
         let t = std::time::Instant::now();
-        match vector_ranking(conn, p, q, pool) {
+        match vector_ranking(conn, p, q, pool, file_origins) {
             Ok(r) => rankings.push(r),
             Err(e) => eprintln!("vector search unavailable: {e}"),
         }
@@ -359,7 +406,8 @@ fn ranked_hits(
 fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
-            "SELECT f.path, f.role, c.kind, c.name, c.start_line, c.end_line, c.content, c.symbols, c.file_id
+            "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
+                    c.content, c.symbols, c.file_id
              FROM chunks c JOIN files f ON c.file_id = f.id WHERE c.id = ?1",
             [chunk_id],
             |r| {
@@ -367,17 +415,30 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                     r.get::<_, i64>(5)?,
-                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(6)?,
                     r.get::<_, String>(7)?,
-                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
                 ))
             },
         )
         .ok();
-    let Some((file, role, kind, name, start_line, end_line, content, symbols, _file_id)) = row else {
+    let Some((
+        file,
+        role,
+        file_origin,
+        kind,
+        name,
+        start_line,
+        end_line,
+        content,
+        symbols,
+        _file_id,
+    )) = row
+    else {
         return Ok(None);
     };
     let anchors = project_chunk_anchors(conn, chunk_id, &file, name.as_deref())?;
@@ -412,6 +473,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         chunk_id,
         file,
         file_role: role,
+        file_origin,
         kind,
         name,
         start_line,
@@ -679,6 +741,7 @@ fn expand_hits(
                 min_confidence: options.min_confidence.clone(),
                 kinds: Vec::new(),
                 file_roles: options.file_roles.clone(),
+                file_origins: options.file_origins.clone(),
                 penalize_file_roles: true,
             },
         )?;
@@ -762,6 +825,7 @@ fn expand_hits(
         edge_limit: options.edge_limit,
         byte_limit: options.byte_limit,
         file_roles: options.file_roles.clone(),
+        file_origins: options.file_origins.clone(),
         payload_bytes,
         truncated,
     })
@@ -778,7 +842,7 @@ mod tests {
         SearchOptions, SearchResult, apply_response_budget, search,
     };
     use crate::{
-        file_role, indexer, store,
+        file_role, indexer, origin, store,
         semantic::SemanticArtifact,
         structural::{GraphEdge, GraphNode},
     };
@@ -837,6 +901,7 @@ mod tests {
                 limit: 8,
                 expand: true,
                 file_roles: Vec::new(),
+                file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
@@ -851,6 +916,7 @@ mod tests {
                         .iter()
                         .map(|role| (*role).to_string())
                         .collect(),
+                    file_origins: origin::defaults(),
                 },
             },
         )?;
@@ -868,6 +934,7 @@ mod tests {
                 limit: 8,
                 expand: true,
                 file_roles: Vec::new(),
+                file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
@@ -922,6 +989,7 @@ mod tests {
             display_name: key.into(),
             file: None,
             file_role: None,
+            file_origin: None,
             line: None,
             meta: serde_json::json!({}),
             relevance,
@@ -949,6 +1017,7 @@ mod tests {
                 edge_limit: 2,
                 byte_limit: 10_000,
                 file_roles: vec!["production".into(), "unknown".into()],
+                file_origins: origin::defaults(),
                 payload_bytes: 0,
                 truncated: false,
             }),
@@ -976,6 +1045,7 @@ mod tests {
                 chunk_id: 1,
                 file: "src/large.ts".into(),
                 file_role: "production".into(),
+                file_origin: "repository".into(),
                 kind: "function".into(),
                 name: Some("largeHit".into()),
                 start_line: 1,

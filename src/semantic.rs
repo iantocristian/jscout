@@ -186,7 +186,9 @@ pub fn workflow_candidates(
     }
     let mut resolved_seeds = seeds
         .iter()
-        .map(|seed| structural::resolve_current_anchor(conn, seed))
+        .map(|seed| {
+            structural::resolve_current_anchor_in_origins(conn, seed, &crate::origin::defaults())
+        })
         .collect::<Result<Vec<_>>>()?;
     resolved_seeds.sort();
     resolved_seeds.dedup();
@@ -206,6 +208,7 @@ pub fn workflow_candidates(
                 min_confidence: "likely".into(),
                 kinds: Vec::new(),
                 file_roles: vec!["production".into()],
+                file_origins: crate::origin::defaults(),
                 penalize_file_roles: true,
             },
         )?;

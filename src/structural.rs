@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{file_role, query::ModuleGraph, store};
+use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "3";
+pub const PROJECTION_VERSION: &str = "4";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -47,6 +47,8 @@ pub struct GraphNode {
     pub file: Option<String>,
     /// Deterministic role of the backing file; absent for package/event hubs.
     pub file_role: Option<String>,
+    /// Corpus origin of the backing file; absent for package/event hubs.
+    pub file_origin: Option<String>,
     pub line: Option<i64>,
     pub meta: Value,
     /// Query-local path relevance; not part of persistent graph identity.
@@ -118,6 +120,8 @@ pub struct NeighborhoodOptions {
     pub kinds: Vec<String>,
     /// Empty means every role. Hubs without a backing file always remain eligible.
     pub file_roles: Vec<String>,
+    /// Eligible backing-file origins. Hubs remain eligible; dependencies require opt-in.
+    pub file_origins: Vec<String>,
     /// Apply deterministic non-production penalties before traversal budgets.
     pub penalize_file_roles: bool,
 }
@@ -133,6 +137,7 @@ impl Default for NeighborhoodOptions {
             min_confidence: "likely".into(),
             kinds: Vec::new(),
             file_roles: Vec::new(),
+            file_origins: origin::defaults(),
             penalize_file_roles: false,
         }
     }
@@ -382,10 +387,16 @@ fn project_module_edges(
     insert_node: &mut rusqlite::CachedStatement<'_>,
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
-    let mut packages = HashSet::new();
+    let mut package_hubs = HashSet::new();
+    let mut contained_modules = HashSet::new();
     let mut stmt = conn.prepare(
-        "SELECT from_file, request, to_file, package, resolution FROM module_edges
-         ORDER BY from_file, request",
+        "SELECT edge.from_file, edge.request, edge.to_file, edge.package, edge.resolution,
+                edge.package_instance_id, package.origin, package.name, package.version,
+                package.locator, package.status, source.package_instance_id
+         FROM module_edges edge
+         JOIN files source ON source.id=edge.from_file
+         LEFT JOIN package_instances package ON package.id=edge.package_instance_id
+         ORDER BY edge.from_file, edge.request",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -394,22 +405,104 @@ fn project_module_edges(
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+            r.get::<_, Option<String>>(10)?,
+            r.get::<_, Option<i64>>(11)?,
         ))
     })?;
     for row in rows {
-        let (from_id, request, to_id, package, resolution) = row?;
+        let (
+            from_id,
+            request,
+            to_id,
+            package,
+            resolution,
+            package_instance_id,
+            package_origin,
+            instance_name,
+            instance_version,
+            instance_locator,
+            instance_status,
+            source_package_instance_id,
+        ) = row?;
         let Some(from_path) = files.get(&from_id) else {
             continue;
         };
+        let dependency_instance = if package_origin.as_deref() == Some("dependency") {
+            match (
+                package_instance_id,
+                instance_name.as_deref(),
+                instance_locator.as_deref(),
+            ) {
+                (Some(id), Some(name), Some(locator)) => Some((
+                    id,
+                    name,
+                    package_instance_key(name, instance_version.as_deref(), locator),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let crosses_dependency_boundary = dependency_instance
+            .as_ref()
+            .is_some_and(|(id, _, _)| source_package_instance_id != Some(*id));
+
+        if crosses_dependency_boundary
+            && let Some((instance_id, name, hub)) = dependency_instance.as_ref()
+        {
+            if package_hubs.insert(hub.clone()) {
+                insert_node.execute(params![
+                    hub,
+                    "package",
+                    "package_instances",
+                    instance_id,
+                    format!("{}@{}", name, instance_version.as_deref().unwrap_or("unknown")),
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    json!({
+                        "origin": "dependency",
+                        "package": name,
+                        "version": instance_version,
+                        "locator": instance_locator,
+                        "status": instance_status,
+                    })
+                    .to_string(),
+                ])?;
+            }
+            if let Some(to_id) = to_id
+                && let Some(to_path) = files.get(&to_id)
+                && contained_modules.insert((hub.clone(), to_id))
+            {
+                insert_edge.execute(params![
+                    hub,
+                    file_key(to_path),
+                    "contains_module",
+                    "certain",
+                    "dependency-index",
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    json!({ "packageInstanceId": instance_id }).to_string(),
+                ])?;
+            }
+        }
         let destination = if let Some(to_id) = to_id {
             let Some(to_path) = files.get(&to_id) else {
                 continue;
             };
             file_key(to_path)
+        } else if let Some((_, _, hub)) = dependency_instance.as_ref() {
+            hub.clone()
         } else if let Some(package) = package {
-            if packages.insert(package.clone()) {
+            let hub = package_key(&package);
+            if package_hubs.insert(hub.clone()) {
                 insert_node.execute(params![
-                    package_key(&package),
+                    hub,
                     "package",
                     Option::<String>::None,
                     Option::<i64>::None,
@@ -442,6 +535,22 @@ fn project_module_edges(
             Option::<i64>::None,
             json!({ "request": request }).to_string(),
         ])?;
+        if crosses_dependency_boundary
+            && to_id.is_some()
+            && let Some((instance_id, _, hub)) = dependency_instance.as_ref()
+        {
+            insert_edge.execute(params![
+                file_key(from_path),
+                hub,
+                "imports_package",
+                confidence,
+                provenance,
+                from_id,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                json!({ "request": request, "packageInstanceId": instance_id }).to_string(),
+            ])?;
+        }
     }
     Ok(())
 }
@@ -463,12 +572,31 @@ fn project_references(
     }
     let mut package_for: HashMap<(i64, String), String> = HashMap::new();
     let mut package_stmt = conn.prepare(
-        "SELECT from_file, request, package FROM module_edges WHERE package IS NOT NULL",
+        "SELECT edge.from_file, edge.request, edge.package, package.origin,
+                package.name, package.version, package.locator
+         FROM module_edges edge
+         LEFT JOIN package_instances package ON package.id=edge.package_instance_id
+         WHERE edge.package IS NOT NULL",
     )?;
     let package_rows = package_stmt.query_map([], |r| {
+        let package = r.get::<_, String>(2)?;
+        let target = if r.get::<_, Option<String>>(3)?.as_deref() == Some("dependency") {
+            match (
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ) {
+                (Some(name), version, Some(locator)) => {
+                    package_instance_key(&name, version.as_deref(), &locator)
+                }
+                _ => package_key(&package),
+            }
+        } else {
+            package_key(&package)
+        };
         Ok((
             (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
-            r.get::<_, String>(2)?,
+            target,
         ))
     })?;
     for row in package_rows {
@@ -542,7 +670,7 @@ fn project_references(
                 }
                 None => package_for
                     .get(&(file_id, request.to_string()))
-                    .map(|package| ProjectedTargets::exact(package_key(package)))
+                    .map(|package| ProjectedTargets::exact(package.clone()))
                     .unwrap_or_default(),
             }
         } else {
@@ -820,15 +948,19 @@ fn neighborhood_in_snapshot(
         bail!("min confidence must be one of: certain, likely, possible");
     }
     file_role::validate_all(&options.file_roles)?;
+    origin::validate_all(&options.file_origins)?;
     if options.node_limit == 0 || options.edge_limit == 0 {
         bail!("node and edge limits must be greater than zero");
     }
     let snapshot = current_snapshot(conn)?;
+    let allowed_file_origins: HashSet<&str> =
+        options.file_origins.iter().map(String::as_str).collect();
     let (resolved_anchor, anchor_status) = resolve_anchor(
         conn,
         anchor,
         options.expected_snapshot.as_deref(),
         &snapshot,
+        &allowed_file_origins,
     )?;
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
     let allowed_file_roles: HashSet<&str> =
@@ -857,6 +989,7 @@ fn neighborhood_in_snapshot(
             min_rank,
             &allowed_kinds,
             &allowed_file_roles,
+            &allowed_file_origins,
             &mut degree_cache,
             &mut frontier,
         )?;
@@ -894,6 +1027,7 @@ fn neighborhood_in_snapshot(
                 min_rank,
                 &allowed_kinds,
                 &allowed_file_roles,
+                &allowed_file_origins,
                 &mut degree_cache,
                 &mut frontier,
             )?;
@@ -940,6 +1074,7 @@ fn enqueue_ranked_steps(
     min_rank: u8,
     allowed_kinds: &HashSet<&str>,
     allowed_file_roles: &HashSet<&str>,
+    allowed_file_origins: &HashSet<&str>,
     degree_cache: &mut HashMap<String, usize>,
     frontier: &mut BinaryHeap<RankedStep>,
 ) -> Result<()> {
@@ -951,7 +1086,7 @@ fn enqueue_ranked_steps(
     for direction in directions {
         let sql = if *direction == "out" {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json, other_file.role
+                    f.path, e.line, e.detail_json, other_file.role, other_file.origin
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.dst_key
@@ -959,7 +1094,7 @@ fn enqueue_ranked_steps(
              WHERE e.src_key = ?1"
         } else {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json, other_file.role
+                    f.path, e.line, e.detail_json, other_file.role, other_file.origin
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.src_key
@@ -983,16 +1118,20 @@ fn enqueue_ranked_steps(
                     relevance: 0.0,
                 },
                 r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
             ))
         })?;
         for row in rows {
-            let (edge_id, mut edge, other_file_role) = row?;
+            let (edge_id, mut edge, other_file_role, other_file_origin) = row?;
             if confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
                 || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
                 || (!allowed_file_roles.is_empty()
                     && other_file_role
                         .as_deref()
                         .is_some_and(|role| !allowed_file_roles.contains(role)))
+                || other_file_origin
+                    .as_deref()
+                    .is_some_and(|origin| !allowed_file_origins.contains(origin))
             {
                 continue;
             }
@@ -1087,8 +1226,20 @@ fn round_score(score: f64) -> f64 {
 /// durable semantic support. Ambiguity remains an error; stored supports use
 /// the returned exact node key.
 pub fn resolve_current_anchor(conn: &Connection, anchor: &str) -> Result<String> {
+    let all = origin::ALL.iter().copied().collect();
     let snapshot = current_snapshot(conn)?;
-    resolve_anchor(conn, anchor, None, &snapshot).map(|(resolved, _)| resolved)
+    resolve_anchor(conn, anchor, None, &snapshot, &all).map(|(resolved, _)| resolved)
+}
+
+pub fn resolve_current_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    file_origins: &[String],
+) -> Result<String> {
+    origin::validate_all(file_origins)?;
+    let allowed = file_origins.iter().map(String::as_str).collect();
+    let snapshot = current_snapshot(conn)?;
+    resolve_anchor(conn, anchor, None, &snapshot, &allowed).map(|(resolved, _)| resolved)
 }
 
 fn resolve_anchor(
@@ -1096,15 +1247,23 @@ fn resolve_anchor(
     anchor: &str,
     expected_snapshot: Option<&str>,
     current_snapshot: &str,
+    allowed_origins: &HashSet<&str>,
 ) -> Result<(String, String)> {
     let stale = expected_snapshot.is_some_and(|snapshot| snapshot != current_snapshot);
     if anchor.starts_with("sym:") && stale {
         let (path, scope, name, _) = parse_symbol_key(anchor)
             .with_context(|| format!("cannot re-resolve malformed stale anchor `{anchor}`"))?;
-        let candidates = symbol_candidates(conn, Some(&path), Some(&scope), &name)?;
+        let candidates = allowed_candidates(
+            conn,
+            symbol_candidates(conn, Some(&path), Some(&scope), &name)?,
+            allowed_origins,
+        )?;
         return unique_anchor(anchor, candidates, "re-resolved");
     }
     if graph_node_exists(conn, anchor)? {
+        if !node_origin_allowed(conn, anchor, allowed_origins)? {
+            bail!("anchor `{anchor}` is outside the requested file origins");
+        }
         return Ok((
             anchor.to_string(),
             if stale { "re-resolved" } else { "exact" }.into(),
@@ -1112,7 +1271,7 @@ fn resolve_anchor(
     }
 
     if let Some(path) = anchor.strip_prefix("file:") {
-        let candidates = file_candidates(conn, path)?;
+        let candidates = allowed_candidates(conn, file_candidates(conn, path)?, allowed_origins)?;
         return unique_anchor(
             anchor,
             candidates,
@@ -1120,7 +1279,7 @@ fn resolve_anchor(
         );
     }
     if !anchor.contains(':') {
-        let files = file_candidates(conn, anchor)?;
+        let files = allowed_candidates(conn, file_candidates(conn, anchor)?, allowed_origins)?;
         if files.len() == 1 {
             return Ok((files[0].clone(), "resolved".into()));
         }
@@ -1128,7 +1287,11 @@ fn resolve_anchor(
     let (path, name) = anchor
         .rsplit_once(':')
         .map_or((None, anchor), |(path, name)| (Some(path), name));
-    let candidates = symbol_candidates(conn, path, None, name)?;
+    let candidates = allowed_candidates(
+        conn,
+        symbol_candidates(conn, path, None, name)?,
+        allowed_origins,
+    )?;
     unique_anchor(
         anchor,
         candidates,
@@ -1153,6 +1316,39 @@ fn graph_node_exists(conn: &Connection, key: &str) -> Result<bool> {
         [key],
         |r| r.get::<_, i64>(0),
     )? != 0)
+}
+
+fn node_origin_allowed(
+    conn: &Connection,
+    key: &str,
+    allowed_origins: &HashSet<&str>,
+) -> Result<bool> {
+    let origin = conn
+        .query_row(
+            "SELECT file.origin
+             FROM graph_nodes node
+             JOIN files file ON file.id=node.file_id
+             WHERE node.node_key=?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(origin.is_none_or(|origin| allowed_origins.contains(origin.as_str())))
+}
+
+fn allowed_candidates(
+    conn: &Connection,
+    candidates: Vec<String>,
+    allowed_origins: &HashSet<&str>,
+) -> Result<Vec<String>> {
+    candidates
+        .into_iter()
+        .filter_map(|candidate| match node_origin_allowed(conn, &candidate, allowed_origins) {
+            Ok(true) => Some(Ok(candidate)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn symbol_candidates(
@@ -1199,19 +1395,21 @@ fn file_candidates(conn: &Connection, path: &str) -> Result<Vec<String>> {
 
 fn load_node(conn: &Connection, key: &str) -> Result<Option<GraphNode>> {
     let mut stmt = conn.prepare(
-        "SELECT g.node_key, g.node_kind, g.display_name, f.path, f.role, g.line, g.meta_json
+        "SELECT g.node_key, g.node_kind, g.display_name, f.path, f.role, f.origin,
+                g.line, g.meta_json
          FROM graph_nodes g LEFT JOIN files f ON g.file_id=f.id WHERE g.node_key=?1",
     )?;
     let node = stmt
         .query_row([key], |r| {
-            let meta: String = r.get(6)?;
+            let meta: String = r.get(7)?;
             Ok(GraphNode {
                 key: r.get(0)?,
                 kind: r.get(1)?,
                 display_name: r.get(2)?,
                 file: r.get(3)?,
                 file_role: r.get(4)?,
-                line: r.get(5)?,
+                file_origin: r.get(5)?,
+                line: r.get(6)?,
                 meta: serde_json::from_str(&meta).unwrap_or(Value::Null),
                 relevance: 0.0,
             })
@@ -1235,6 +1433,12 @@ fn file_key(path: &str) -> String {
 
 fn package_key(package: &str) -> String {
     format!("pkg:{package}")
+}
+
+fn package_instance_key(name: &str, version: Option<&str>, locator: &str) -> String {
+    let identity = format!("{name}\0{}\0{locator}", version.unwrap_or("unknown"));
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    format!("pkg:{name}@{}#{}", version.unwrap_or("unknown"), &digest[..8])
 }
 
 fn event_key(name: &str) -> String {
@@ -1266,7 +1470,7 @@ mod tests {
     use anyhow::Result;
 
     use super::{NeighborhoodOptions, compute_snapshot, neighborhood, rebuild_projection};
-    use crate::{indexer, store};
+    use crate::{indexer, origin, store};
 
     fn write(root: &Path, path: &str, source: &str) -> Result<()> {
         let path = root.join(path);
@@ -1376,6 +1580,7 @@ mod tests {
                 kinds: Vec::new(),
                 expected_snapshot: None,
                 file_roles: Vec::new(),
+                file_origins: origin::defaults(),
                 penalize_file_roles: false,
             },
         )?;

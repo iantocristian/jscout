@@ -7,6 +7,7 @@ mod graph;
 mod heur;
 mod indexer;
 mod mcp;
+mod origin;
 mod parse;
 mod query;
 mod search;
@@ -64,6 +65,9 @@ enum Command {
         /// Batch size per API call
         #[arg(long, default_value_t = 64)]
         batch: usize,
+        /// Restrict embeddings to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        file_origins: Vec<String>,
     },
     /// Hybrid search over the indexed repository
     Search {
@@ -77,6 +81,9 @@ enum Command {
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
+        /// Restrict hits and expansion to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        file_origins: Vec<String>,
         /// Do not attach matching persistent semantic memory
         #[arg(long)]
         no_memory: bool,
@@ -123,6 +130,9 @@ enum Command {
         root: PathBuf,
         /// Only show sites for this event name
         name: Option<String>,
+        /// Restrict sites to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        file_origins: Vec<String>,
     },
     /// Serve the index over MCP (stdio) for agent integration
     Mcp {
@@ -202,6 +212,9 @@ enum Command {
         /// Output JSON instead of text
         #[arg(long)]
         json: bool,
+        /// Restrict targets and usages to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        file_origins: Vec<String>,
     },
     /// Traverse the snapshot-safe structural graph around a file or symbol
     Neighborhood {
@@ -233,6 +246,9 @@ enum Command {
         /// Restrict traversal to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
+        /// Restrict traversal to backing-file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        file_origins: Vec<String>,
     },
     /// Print or install the jscout agent-integration skill
     AgentGuide {
@@ -250,12 +266,13 @@ fn main() -> Result<()> {
         Command::Index { root, database, dependencies } => {
             cmd_index(&root, database.as_deref(), &dependencies)
         }
-        Command::Embed { root, batch } => cmd_embed(&root, batch),
+        Command::Embed { root, batch, file_origins } => cmd_embed(&root, batch, &file_origins),
         Command::Search {
             root,
             query,
             limit,
             file_roles,
+            file_origins,
             no_memory,
             memory_limit,
             response_bytes,
@@ -278,6 +295,7 @@ fn main() -> Result<()> {
                 limit,
                 expand,
                 file_roles,
+                file_origins: file_origins.clone(),
                 include_memory: !no_memory,
                 memory_limit,
                 response_byte_limit: response_bytes,
@@ -289,10 +307,13 @@ fn main() -> Result<()> {
                     byte_limit: expand_bytes,
                     min_confidence: expand_min_confidence,
                     file_roles: expand_file_roles,
+                    file_origins,
                 },
             },
         ),
-        Command::Events { root, name } => cmd_events(&root, name.as_deref()),
+        Command::Events { root, name, file_origins } => {
+            cmd_events(&root, name.as_deref(), &file_origins)
+        }
         Command::Mcp { root, database, telemetry, profile, source_view } => {
             mcp::serve(
                 &root,
@@ -339,7 +360,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Watch { root, embed } => watch::watch(&root, embed),
-        Command::WhoUses { root, spec, json } => cmd_who_uses(&root, &spec, json),
+        Command::WhoUses { root, spec, json, file_origins } => {
+            cmd_who_uses(&root, &spec, json, &file_origins)
+        }
         Command::Neighborhood {
             root,
             anchor,
@@ -351,6 +374,7 @@ fn main() -> Result<()> {
             min_confidence,
             kinds,
             file_roles,
+            file_origins,
         } => cmd_neighborhood(
             &root,
             &anchor,
@@ -364,6 +388,7 @@ fn main() -> Result<()> {
                 kinds,
                 penalize_file_roles: !file_roles.is_empty(),
                 file_roles,
+                file_origins,
             },
         ),
         Command::AgentGuide { install } => {
@@ -396,7 +421,7 @@ fn cmd_neighborhood(
     Ok(())
 }
 
-fn cmd_embed(root: &Path, batch: usize) -> Result<()> {
+fn cmd_embed(root: &Path, batch: usize, file_origins: &[String]) -> Result<()> {
     let conn = store::open(root)?;
     let Some(provider) = embed::Provider::from_env() else {
         anyhow::bail!(
@@ -405,7 +430,7 @@ fn cmd_embed(root: &Path, batch: usize) -> Result<()> {
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
-    let (done, total) = embed::embed_missing(&conn, &provider, batch)?;
+    let (done, total) = embed::embed_missing_for_origins(&conn, &provider, batch, file_origins)?;
     println!("embedded {done}/{total} chunks");
     Ok(())
 }
@@ -501,9 +526,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     Ok(())
 }
 
-fn cmd_events(root: &Path, name: Option<&str>) -> Result<()> {
+fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Result<()> {
     let conn = store::open(root)?;
-    let sites = query::events(&conn, name)?;
+    let sites = query::events_in_origins(&conn, name, file_origins)?;
     if sites.is_empty() {
         println!("no event sites found");
         return Ok(());
@@ -520,16 +545,22 @@ fn cmd_events(root: &Path, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_who_uses(root: &Path, spec: &str, json: bool) -> Result<()> {
+fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) -> Result<()> {
     let conn = store::open(root)?;
     let graph = query::ModuleGraph::load(&conn)?;
-    let targets = query::find_symbols(&conn, spec)?;
+    let targets = query::find_symbols_in_origins(&conn, spec, file_origins)?;
     if targets.is_empty() {
         eprintln!("no symbol found for '{spec}'");
         std::process::exit(1);
     }
     for t in &targets {
-        let usages = query::who_uses(&conn, &graph, t.file_id, &t.name)?;
+        let usages = query::who_uses_in_origins(
+            &conn,
+            &graph,
+            t.file_id,
+            &t.name,
+            file_origins,
+        )?;
         if json {
             println!(
                 "{}",

@@ -152,6 +152,7 @@ impl ModuleGraph {
 #[derive(Debug, serde::Serialize)]
 pub struct Usage {
     pub file: String,
+    pub file_origin: String,
     pub line: i64,
     pub kind: String,
     pub confidence: String,
@@ -162,6 +163,7 @@ pub struct Usage {
 #[derive(Debug, serde::Serialize)]
 pub struct SymbolTarget {
     pub file: String,
+    pub file_origin: String,
     pub file_id: i64,
     pub name: String,
     pub kind: String,
@@ -169,25 +171,41 @@ pub struct SymbolTarget {
     pub exported: bool,
 }
 
-/// Find symbols matching "Name" or "path-substring:Name".
-pub fn find_symbols(conn: &Connection, spec: &str) -> Result<Vec<SymbolTarget>> {
+/// Find symbols matching "Name" or "path-substring:Name" within an origin allowlist.
+pub fn find_symbols_in_origins(
+    conn: &Connection,
+    spec: &str,
+    file_origins: &[String],
+) -> Result<Vec<SymbolTarget>> {
+    crate::origin::validate_all(file_origins)?;
+    let repository = file_origins.iter().any(|origin| origin == "repository");
+    let workspace = file_origins.iter().any(|origin| origin == "workspace");
+    let dependency = file_origins.iter().any(|origin| origin == "dependency");
     let (path_filter, name) = match spec.rsplit_once(':') {
         Some((p, n)) => (Some(p.to_string()), n.to_string()),
         None => (None, spec.to_string()),
     };
     let mut out = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.id, s.name, s.kind, s.line, s.exported
-         FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1 ORDER BY s.exported DESC",
+        "SELECT f.path, f.origin, f.id, s.name, s.kind, s.line, s.exported
+         FROM symbols s JOIN files f ON s.file_id = f.id
+         WHERE s.name = ?1
+           AND ((?2 AND f.origin='repository')
+             OR (?3 AND f.origin='workspace')
+             OR (?4 AND f.origin='dependency'))
+         ORDER BY s.exported DESC",
     )?;
-    let rows = stmt.query_map([&name], |r| {
+    let rows = stmt.query_map(
+        rusqlite::params![&name, repository, workspace, dependency],
+        |r| {
         Ok(SymbolTarget {
             file: r.get(0)?,
-            file_id: r.get(1)?,
-            name: r.get(2)?,
-            kind: r.get(3)?,
-            line: r.get(4)?,
-            exported: r.get::<_, i64>(5)? != 0,
+            file_origin: r.get(1)?,
+            file_id: r.get(2)?,
+            name: r.get(3)?,
+            kind: r.get(4)?,
+            line: r.get(5)?,
+            exported: r.get::<_, i64>(6)? != 0,
         })
     })?;
     for row in rows {
@@ -199,21 +217,27 @@ pub fn find_symbols(conn: &Connection, spec: &str) -> Result<Vec<SymbolTarget>> 
     // Class methods aren't root symbols; they exist as method chunks.
     if out.is_empty() {
         let mut stmt = conn.prepare(
-            "SELECT f.path, f.id, c.name, c.start_line, c.scope_chain
+            "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain
              FROM chunks c JOIN files f ON c.file_id = f.id
-             WHERE c.name = ?1 AND c.kind = 'method'",
+             WHERE c.name = ?1 AND c.kind = 'method'
+               AND ((?2 AND f.origin='repository')
+                 OR (?3 AND f.origin='workspace')
+                 OR (?4 AND f.origin='dependency'))",
         )?;
-        let rows = stmt.query_map([&name], |r| {
+        let rows = stmt.query_map(
+            rusqlite::params![&name, repository, workspace, dependency],
+            |r| {
             Ok((
                 SymbolTarget {
                     file: r.get(0)?,
-                    file_id: r.get(1)?,
+                    file_origin: r.get(1)?,
+                    file_id: r.get(2)?,
                     name: name.clone(),
                     kind: "method".into(),
-                    line: r.get(3)?,
+                    line: r.get(4)?,
                     exported: false,
                 },
-                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         for row in rows {
@@ -229,33 +253,53 @@ pub fn find_symbols(conn: &Connection, spec: &str) -> Result<Vec<SymbolTarget>> 
     Ok(out)
 }
 
-/// All usages of the symbol `name` defined in `file_id`.
-pub fn who_uses(conn: &Connection, graph: &ModuleGraph, file_id: i64, name: &str) -> Result<Vec<Usage>> {
+/// All usages of the symbol `name` defined in `file_id`, filtered by origin.
+pub fn who_uses_in_origins(
+    conn: &Connection,
+    graph: &ModuleGraph,
+    file_id: i64,
+    name: &str,
+    file_origins: &[String],
+) -> Result<Vec<Usage>> {
+    crate::origin::validate_all(file_origins)?;
+    let repository = file_origins.iter().any(|origin| origin == "repository");
+    let workspace = file_origins.iter().any(|origin| origin == "workspace");
+    let dependency = file_origins.iter().any(|origin| origin == "dependency");
     let mut usages = Vec::new();
 
     // Same-file references.
     let mut stmt = conn.prepare(
-        "SELECT f.path, r.line, r.kind, r.confidence, r.detail, c.name
+        "SELECT f.path, f.origin, r.line, r.kind, r.confidence, r.detail, c.name
          FROM refs r JOIN files f ON r.file_id = f.id
          LEFT JOIN chunks c ON r.chunk_id = c.id
-         WHERE r.local = 1 AND r.file_id = ?1 AND r.target_name = ?2",
+         WHERE r.local = 1 AND r.file_id = ?1 AND r.target_name = ?2
+           AND ((?3 AND f.origin='repository')
+             OR (?4 AND f.origin='workspace')
+             OR (?5 AND f.origin='dependency'))",
     )?;
-    let rows = stmt.query_map(rusqlite::params![file_id, name], row_to_usage)?;
+    let rows = stmt.query_map(
+        rusqlite::params![file_id, name, repository, workspace, dependency],
+        row_to_usage,
+    )?;
     usages.extend(rows.filter_map(|r| r.ok()));
 
     // Cross-file: refs through imports whose export chain lands on (file_id, name).
     let mut stmt = conn.prepare(
-        "SELECT f.path, r.line, r.kind, r.confidence, r.detail, c.name, r.file_id, r.target_request, r.target_name
+        "SELECT f.path, f.origin, r.line, r.kind, r.confidence, r.detail, c.name,
+                r.file_id, r.target_request, r.target_name
          FROM refs r JOIN files f ON r.file_id = f.id
          LEFT JOIN chunks c ON r.chunk_id = c.id
-         WHERE r.local = 0 AND r.target_request IS NOT NULL",
+         WHERE r.local = 0 AND r.target_request IS NOT NULL
+           AND ((?1 AND f.origin='repository')
+             OR (?2 AND f.origin='workspace')
+             OR (?3 AND f.origin='dependency'))",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(rusqlite::params![repository, workspace, dependency], |r| {
         Ok((
             row_to_usage(r)?,
-            r.get::<_, i64>(6)?,
-            r.get::<_, String>(7)?,
+            r.get::<_, i64>(7)?,
             r.get::<_, String>(8)?,
+            r.get::<_, String>(9)?,
         ))
     })?;
     for row in rows {
@@ -280,26 +324,33 @@ pub fn who_uses(conn: &Connection, graph: &ModuleGraph, file_id: i64, name: &str
     let seen: HashSet<(String, i64)> =
         usages.iter().map(|u| (u.file.clone(), u.line)).collect();
     let mut stmt = conn.prepare(
-        "SELECT f.path, m.line, m.object, c.name
+        "SELECT f.path, f.origin, m.line, m.object, c.name
          FROM member_calls m JOIN files f ON m.file_id = f.id
          LEFT JOIN chunks c ON m.chunk_id = c.id
-         WHERE m.prop = ?1",
+         WHERE m.prop = ?1
+           AND ((?2 AND f.origin='repository')
+             OR (?3 AND f.origin='workspace')
+             OR (?4 AND f.origin='dependency'))",
     )?;
-    let rows = stmt.query_map([name], |r| {
+    let rows = stmt.query_map(
+        rusqlite::params![name, repository, workspace, dependency],
+        |r| {
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     for row in rows {
-        let (file, line, object, chunk_name) = row?;
+        let (file, file_origin, line, object, chunk_name) = row?;
         if seen.contains(&(file.clone(), line)) {
             continue;
         }
         usages.push(Usage {
             file,
+            file_origin,
             line,
             kind: "call".into(),
             confidence: "possible".into(),
@@ -313,6 +364,7 @@ pub fn who_uses(conn: &Connection, graph: &ModuleGraph, file_id: i64, name: &str
 #[derive(Debug, serde::Serialize)]
 pub struct EventSite {
     pub file: String,
+    pub file_origin: String,
     pub line: i64,
     pub role: String,
     pub name: String,
@@ -320,23 +372,37 @@ pub struct EventSite {
     pub chunk_name: Option<String>,
 }
 
-/// Event wiring: emit/listen sites, optionally filtered by event name.
-pub fn events(conn: &Connection, filter: Option<&str>) -> Result<Vec<EventSite>> {
+/// Event wiring filtered by event name and file origin.
+pub fn events_in_origins(
+    conn: &Connection,
+    filter: Option<&str>,
+    file_origins: &[String],
+) -> Result<Vec<EventSite>> {
+    crate::origin::validate_all(file_origins)?;
+    let repository = file_origins.iter().any(|origin| origin == "repository");
+    let workspace = file_origins.iter().any(|origin| origin == "workspace");
+    let dependency = file_origins.iter().any(|origin| origin == "dependency");
     let mut stmt = conn.prepare(
-        "SELECT f.path, e.line, e.role, e.name, e.method, c.name
+        "SELECT f.path, f.origin, e.line, e.role, e.name, e.method, c.name
          FROM events e JOIN files f ON e.file_id = f.id
          LEFT JOIN chunks c ON e.chunk_id = c.id
          WHERE (?1 IS NULL OR e.name = ?1)
+           AND ((?2 AND f.origin='repository')
+             OR (?3 AND f.origin='workspace')
+             OR (?4 AND f.origin='dependency'))
          ORDER BY e.name, e.role DESC, f.path, e.line",
     )?;
-    let rows = stmt.query_map([filter], |r| {
+    let rows = stmt.query_map(
+        rusqlite::params![filter, repository, workspace, dependency],
+        |r| {
         Ok(EventSite {
             file: r.get(0)?,
-            line: r.get(1)?,
-            role: r.get(2)?,
-            name: r.get(3)?,
-            method: r.get(4)?,
-            chunk_name: r.get(5)?,
+            file_origin: r.get(1)?,
+            line: r.get(2)?,
+            role: r.get(3)?,
+            name: r.get(4)?,
+            method: r.get(5)?,
+            chunk_name: r.get(6)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -345,10 +411,11 @@ pub fn events(conn: &Connection, filter: Option<&str>) -> Result<Vec<EventSite>>
 fn row_to_usage(r: &rusqlite::Row<'_>) -> rusqlite::Result<Usage> {
     Ok(Usage {
         file: r.get(0)?,
-        line: r.get(1)?,
-        kind: r.get(2)?,
-        confidence: r.get(3)?,
-        detail: r.get(4)?,
-        chunk_name: r.get(5)?,
+        file_origin: r.get(1)?,
+        line: r.get(2)?,
+        kind: r.get(3)?,
+        confidence: r.get(4)?,
+        detail: r.get(5)?,
+        chunk_name: r.get(6)?,
     })
 }

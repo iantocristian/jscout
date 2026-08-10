@@ -186,6 +186,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
                     "limit": { "type": "integer", "default": 8 },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional primary-hit role allowlist; omitted means all roles" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Hit and expansion origin allowlist. Dependency internals are excluded unless explicitly included" },
                     "include_memory": { "type": "boolean", "default": true, "description": "Attach matching persistent semantic artifacts with freshness and evidence" },
                     "memory_limit": { "type": "integer", "default": 4 },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered result, including hits, expansion, metadata, and JSON overhead" },
@@ -207,7 +208,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": { "type": "string", "description": "NAME or path-substring:NAME, e.g. 'getUser' or 'services/user:getUser'" }
+                    "symbol": { "type": "string", "description": "NAME or path-substring:NAME, e.g. 'getUser' or 'services/user:getUser'" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Target origin allowlist. Dependency symbols are excluded unless explicitly included" }
                 },
                 "required": ["symbol"]
             }
@@ -219,6 +221,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "symbol": { "type": "string", "description": "NAME or path-substring:NAME" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Definition origin allowlist. Dependency definitions are excluded unless explicitly included" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
                     "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" }
                 },
@@ -232,6 +235,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Repo-relative path (or unique suffix)" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Outline origin allowlist. Dependency files are excluded unless explicitly included" },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered outline response" }
                 },
                 "required": ["path"]
@@ -243,7 +247,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Optional event name filter" }
+                    "name": { "type": "string", "description": "Optional event name filter" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Event-site origin allowlist. Dependency sites are excluded unless explicitly included" }
                 }
             }
         },
@@ -330,7 +335,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "edge_limit": { "type": "integer", "default": 200 },
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
                     "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
-                    "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" }
+                    "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Backing-file origin allowlist. Dependency nodes are excluded unless explicitly included" }
                 },
                 "required": ["anchor"]
             }
@@ -388,6 +394,7 @@ fn call_tool(
                     limit,
                     expand,
                     file_roles: json_string_array(args, "file_roles"),
+                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
                     include_memory: profile == ToolProfile::Structural
                         && args["include_memory"].as_bool().unwrap_or(true),
                     memory_limit: args["memory_limit"].as_u64().unwrap_or(4) as usize,
@@ -413,6 +420,11 @@ fn call_tool(
                                 .map(|role| (*role).to_string())
                                 .collect()
                         },
+                        file_origins: json_string_array_or(
+                            args,
+                            "origins",
+                            crate::origin::defaults,
+                        ),
                     },
                 },
             )?;
@@ -421,10 +433,12 @@ fn call_tool(
         "who_uses" => {
             let spec = args["symbol"].as_str().unwrap_or("");
             let graph = query::ModuleGraph::load(conn)?;
-            let targets = query::find_symbols(conn, spec)?;
+            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let targets = query::find_symbols_in_origins(conn, spec, &origins)?;
             let mut results = Vec::new();
             for t in &targets {
-                let usages = query::who_uses(conn, &graph, t.file_id, &t.name)?;
+                let usages =
+                    query::who_uses_in_origins(conn, &graph, t.file_id, &t.name, &origins)?;
                 results.push(json!({ "target": t, "usages": usages }));
             }
             Ok(serde_json::to_string_pretty(&results)?)
@@ -440,7 +454,11 @@ fn call_tool(
                 .as_u64()
                 .unwrap_or(scout::DEFAULT_SOURCE_BYTE_LIMIT as u64)
                 as usize;
-            let targets = query::find_symbols(conn, spec)?;
+            let targets = query::find_symbols_in_origins(
+                conn,
+                spec,
+                &json_string_array_or(args, "origins", crate::origin::defaults),
+            )?;
             let mut results = Vec::new();
             for t in targets.iter().take(5) {
                 let chunk: Option<(String, i64, i64, String)> = conn
@@ -494,23 +512,35 @@ fn call_tool(
         }
         "file_outline" => {
             let path = args["path"].as_str().unwrap_or("");
+            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            crate::origin::validate_all(&origins)?;
+            let repository = origins.iter().any(|origin| origin == "repository");
+            let workspace = origins.iter().any(|origin| origin == "workspace");
+            let dependency = origins.iter().any(|origin| origin == "dependency");
             let response_bytes = args["response_bytes"]
                 .as_u64()
                 .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
                 as usize;
             let mut stmt = conn.prepare(
-                "SELECT f.path, c.kind, c.name, c.scope_chain, c.start_line, c.end_line, c.id
+                "SELECT f.path, f.origin, c.kind, c.name, c.scope_chain,
+                        c.start_line, c.end_line, c.id
                  FROM chunks c JOIN files f ON c.file_id = f.id
-                 WHERE f.path = ?1 OR f.path LIKE '%' || ?1
+                 WHERE (f.path = ?1 OR f.path LIKE '%' || ?1)
+                   AND ((?2 AND f.origin='repository')
+                     OR (?3 AND f.origin='workspace')
+                     OR (?4 AND f.origin='dependency'))
                  ORDER BY f.path, c.start",
             )?;
-            let rows = stmt.query_map([path], |r| {
+            let rows = stmt.query_map(
+                rusqlite::params![path, repository, workspace, dependency],
+                |r| {
                 Ok(json!({
                     "file": r.get::<_, String>(0)?,
-                    "kind": r.get::<_, String>(1)?,
-                    "name": r.get::<_, Option<String>>(2)?,
-                    "scope": r.get::<_, String>(3)?,
-                    "lines": [r.get::<_, i64>(4)?, r.get::<_, i64>(5)?],
+                    "file_origin": r.get::<_, String>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "name": r.get::<_, Option<String>>(3)?,
+                    "scope": r.get::<_, String>(4)?,
+                    "lines": [r.get::<_, i64>(5)?, r.get::<_, i64>(6)?],
                 }))
             })?;
             let outline: Vec<Value> = rows.filter_map(|r| r.ok()).collect();
@@ -518,7 +548,8 @@ fn call_tool(
         }
         "events" => {
             let filter = args["name"].as_str();
-            let sites = query::events(conn, filter)?;
+            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let sites = query::events_in_origins(conn, filter, &origins)?;
             Ok(serde_json::to_string_pretty(&sites)?)
         }
         "annotate" => {
@@ -558,6 +589,7 @@ fn call_tool(
                     })
                     .unwrap_or_default(),
                 file_roles: json_string_array(args, "file_roles"),
+                file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
                 penalize_file_roles: args["file_roles"]
                     .as_array()
                     .is_some_and(|roles| !roles.is_empty()),
@@ -580,6 +612,18 @@ fn json_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn json_string_array_or(
+    args: &Value,
+    key: &str,
+    default: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    if args.get(key).is_some() {
+        json_string_array(args, key)
+    } else {
+        default()
+    }
 }
 
 fn render_bounded_items(field: &str, items: Vec<Value>, byte_limit: usize) -> Result<String> {
