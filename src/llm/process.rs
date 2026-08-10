@@ -7,7 +7,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -23,11 +25,83 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 pub struct ProcessGateway {
     child: Child,
-    stdin: ChildStdin,
+    writer: Arc<GatewayWriter>,
     inbound: Receiver<Result<Inbound, GatewayError>>,
-    next_id: u64,
+    active_request: Arc<Mutex<Option<String>>>,
     pub versions: GatewayVersions,
     poisoned: bool,
+}
+
+struct GatewayWriter {
+    stdin: Mutex<ChildStdin>,
+    next_id: AtomicU64,
+}
+
+/// Independent write-side handle. It can be moved to a signal/control thread
+/// while the main client is blocked waiting for a completion response.
+#[derive(Clone)]
+#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+pub struct GatewayControl {
+    writer: Arc<GatewayWriter>,
+    active_request: Arc<Mutex<Option<String>>>,
+}
+
+#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+impl GatewayControl {
+    /// Send cancellation for the current completion, if one is active.
+    pub fn cancel_active(&self) -> Result<bool, GatewayError> {
+        let target_id = self
+            .active_request
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))?
+            .clone();
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+        self.writer.send(&Outbound::Cancel { target_id })?;
+        Ok(true)
+    }
+}
+
+impl GatewayWriter {
+    fn send(&self, message: &Outbound) -> Result<String, GatewayError> {
+        let sequence = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("r{sequence}");
+        let line = encode(&id, message)
+            .map_err(|error| GatewayError::Protocol(format!("encode failure: {error}")))?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway stdin lock poisoned".into()))?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+            .map_err(|error| GatewayError::ChildExited(format!("gateway stdin closed: {error}")))?;
+        Ok(id)
+    }
+}
+
+struct ActiveRequestGuard {
+    active_request: Arc<Mutex<Option<String>>>,
+}
+
+impl ActiveRequestGuard {
+    fn set(active_request: Arc<Mutex<Option<String>>>, id: String) -> Result<Self, GatewayError> {
+        *active_request
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))? =
+            Some(id);
+        Ok(Self { active_request })
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_request.lock() {
+            *active = None;
+        }
+    }
 }
 
 impl ProcessGateway {
@@ -78,9 +152,12 @@ impl ProcessGateway {
 
         let mut gateway_client = Self {
             child,
-            stdin,
+            writer: Arc::new(GatewayWriter {
+                stdin: Mutex::new(stdin),
+                next_id: AtomicU64::new(0),
+            }),
             inbound,
-            next_id: 0,
+            active_request: Arc::new(Mutex::new(None)),
             versions: GatewayVersions {
                 gateway: String::new(),
                 pi_ai: String::new(),
@@ -114,45 +191,46 @@ impl ProcessGateway {
     }
 
     fn send(&mut self, message: &Outbound) -> Result<String, GatewayError> {
-        self.next_id += 1;
-        let id = format!("r{}", self.next_id);
-        let line = encode(&id, message)
-            .map_err(|error| GatewayError::Protocol(format!("encode failure: {error}")))?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .map_err(|error| {
-                self.poisoned = true;
-                GatewayError::ChildExited(format!("gateway stdin closed: {error}"))
-            })?;
-        Ok(id)
+        self.writer
+            .send(message)
+            .inspect_err(|_| self.poisoned = true)
     }
 
     /// Receive the next message for `id` within `timeout`. Messages for other
     /// ids indicate a protocol bug under the one-at-a-time contract and fail
     /// the request instead of being silently dropped.
     fn receive_for(&mut self, id: &str, timeout: Duration) -> Result<Inbound, GatewayError> {
-        match self.inbound.recv_timeout(timeout) {
-            Ok(Ok(message)) if message.id() == id => Ok(message),
-            Ok(Ok(message)) => {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 self.poisoned = true;
-                Err(GatewayError::Protocol(format!(
-                    "message for unexpected request id {}",
-                    message.id()
-                )))
+                return Err(GatewayError::Timeout(timeout));
             }
-            Ok(Err(error)) => {
-                self.poisoned = true;
-                Err(error)
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                self.poisoned = true;
-                Err(GatewayError::Timeout(timeout))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.poisoned = true;
-                Err(self.exit_error())
+            match self.inbound.recv_timeout(remaining) {
+                Ok(Ok(message)) if message.id() == id => return Ok(message),
+                // Control handles do not wait on acknowledgements; consume
+                // them here while preserving the completion's total timeout.
+                Ok(Ok(Inbound::CancelResult { .. })) => continue,
+                Ok(Ok(message)) => {
+                    self.poisoned = true;
+                    return Err(GatewayError::Protocol(format!(
+                        "message for unexpected request id {}",
+                        message.id()
+                    )));
+                }
+                Ok(Err(error)) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.poisoned = true;
+                    return Err(GatewayError::Timeout(timeout));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.poisoned = true;
+                    return Err(self.exit_error());
+                }
             }
         }
     }
@@ -173,12 +251,12 @@ impl ProcessGateway {
         self.poisoned
     }
 
-    /// Cancel the in-flight completion with the given request id.
-    #[allow(dead_code)] // wired by interactive cancellation (follow-up layer)
-    pub fn cancel(&mut self, target_id: &str) -> Result<(), GatewayError> {
-        let target_id = target_id.to_string();
-        self.send(&Outbound::Cancel { target_id })?;
-        Ok(())
+    #[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
+    pub fn control(&self) -> GatewayControl {
+        GatewayControl {
+            writer: Arc::clone(&self.writer),
+            active_request: Arc::clone(&self.active_request),
+        }
     }
 }
 
@@ -218,6 +296,7 @@ impl ProcessGateway {
         grace: Duration,
     ) -> Result<CompletionOutcome, GatewayError> {
         let id = self.send(&Outbound::Complete(Box::new(request.clone())))?;
+        let _active = ActiveRequestGuard::set(Arc::clone(&self.active_request), id.clone())?;
         let wire_timeout = timeout + grace;
         let started = match self.receive_for(&id, wire_timeout)? {
             Inbound::Started {
@@ -323,6 +402,7 @@ mod fake {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
     use serde_json::json;
@@ -409,6 +489,38 @@ done"#
         };
         assert_eq!(remote.code, "capacity");
         assert!(remote.retryable && remote.capacity);
+        Ok(())
+    }
+
+    #[test]
+    fn control_handle_cancels_while_completion_waits() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      ;;
+    *'"kind":"cancel"'*)
+      echo '{{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}}'
+      echo '{{"protocol":1,"id":"r2","kind":"canceled","reason":"canceled"}}'
+      ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let control = gateway.control();
+        let canceler = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            control.cancel_active()
+        });
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("completion should be canceled");
+        assert!(matches!(error, GatewayError::Canceled(_)), "got {error:?}");
+        assert!(canceler.join().expect("cancel thread")?);
+        assert!(!gateway.poisoned());
         Ok(())
     }
 
