@@ -799,12 +799,13 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **RI-1** | Complete: whole-search and outline response budgets, identity, materialized graph, candidate projection, ranked neighborhood, stale anchors, chunk projection, opt-in expansion, and core fixtures | P0 | Done 2026-08-07; broader per-tool envelope coverage remains incremental |
 | **SC-1** | First full-source vs deterministic-elided A/B complete: equal correctness, no selected-artifact compression, worse observed calls/bytes; full remains default and custom IR is not earned | RI-1 | Current renderer rejected 2026-08-07; iterate only behind another gate |
 | **SC-2a** | Complete: bounded workflow memory, semantic storage/freshness, validated `annotate` write-back, and fixed-snapshot response-budget replay | SC-1 | Passed registered replay 2026-08-09; remains opt-in |
-| **RB-1** | Runtime-boundary entities: registry dispatch, data lifecycle, jobs/queues/crons, and DI providers | RI-1 | First deterministic slice implemented 2026-08-10; known Recall/Slack candidate misses are now explicit two-hop paths |
+| **RB-1** | Runtime-boundary entities: registry dispatch, data lifecycle, jobs/queues/crons, and DI providers | RI-1 | First deterministic slice implemented 2026-08-10; known Recall/Slack handoffs are now explicit runtime paths |
 | **CP-1** | Separate contract anchors: declarations, exported API types, decorators, DTO/schemas, and referenced contract names | RB-1 | Implemented 2026-08-10 with type-only barrel resolution; documentary edges remain distinct from runtime edges |
 | **EN-1** | Routes, GraphQL operations, environment variables, database resources, feature flags, and external-service hosts | CP-1; enriches SC-1/2 | Implemented 2026-08-10 with explicit extraction-version invalidation and bounded API provenance |
+| **AS-1** | Agent surfaces: deterministic repository overview, evidence-bearing entity lookup, and ranked bounded paths | EN-1 | Implemented 2026-08-10 as structural-profile MCP tools under whole-response budgets |
 | **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; EN-1 improves workflow seeds | Free-form producer blocked in preflight 2026-08-09 |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
-| **RI-2** | Paths, graph export, ranking tuning, scale work earned by benchmarks | RI-1/SC-1 | Incremental |
+| **RI-2** | Graph export, ranking tuning, and scale work earned by benchmarks | RI-1/SC-1 | Bounded ranked paths landed in AS-1; remaining work is incremental |
 
 The contamination-probed n8n/Twenty suite is complete: 72 Terra/high runs over
 eight post-cutoff tasks and three trials. Grep scored 24/24; baseline and
@@ -821,9 +822,11 @@ artifact in 4/18 warm runs. Its single pre-registered fixed-snapshot revision
 delivered memory in 18/18 and passed: 36.40% median session-2 token reduction,
 17/18 warm correctness versus 14/18 frozen cold, and artifact reads in every
 correct token win. This accepts opt-in workflow memory, not default retrieval
-or broad scouting. The remaining Recall regression requires defining
-participants to be separated from evidence-only helpers before SC-2b expands
-coverage.
+or broad scouting. After AS-1, the known workflow regression reached 22/24
+participants but still failed on truncation and two continuations beyond
+runtime handoffs. Workflow candidate generation must count a two-edge entity
+handoff as one logical transition and keep documentary/general planes out of
+the default candidate walk before SC-2b expands coverage.
 The first participant-scope preflight then showed that scope labels alone do
 not prevent omissions: two direct-write smokes omitted both later-needed
 synchronous operations, including after explicit complete-stage guidance. No
