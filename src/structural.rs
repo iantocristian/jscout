@@ -50,8 +50,10 @@ struct EntitySiteNode {
 #[derive(Debug, Clone)]
 struct ContractDefinition {
     site_id: i64,
+    file_id: i64,
     start: i64,
     end: i64,
+    line: i64,
     entity_type: String,
     name: String,
     key: String,
@@ -62,6 +64,7 @@ struct ContractCatalog {
     by_site: HashMap<i64, ContractDefinition>,
     by_local: HashMap<(i64, String), Vec<ContractDefinition>>,
     by_file: HashMap<i64, Vec<ContractDefinition>>,
+    imports: HashMap<(i64, String), Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +74,8 @@ struct ContractTarget {
     name: String,
     identity_anchor: Option<String>,
     inferred: bool,
+    file_id: Option<i64>,
+    line: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -796,7 +801,7 @@ fn project_entities(
         symbols_by_file.entry(symbol.file_id).or_default().push(symbol);
     }
     let sites = load_entity_sites(conn)?;
-    let contract_catalog = ContractCatalog::build(&sites, files);
+    let contract_catalog = ContractCatalog::build(conn, &sites, files)?;
     let mut inserted_nodes = HashSet::new();
     // Occurrence tables retain every evidence site. The disposable traversal
     // graph keeps one navigational edge per relationship so repeated writes in
@@ -1041,7 +1046,11 @@ fn project_entities(
 }
 
 impl ContractCatalog {
-    fn build(sites: &[EntitySiteNode], files: &HashMap<i64, String>) -> Self {
+    fn build(
+        conn: &Connection,
+        sites: &[EntitySiteNode],
+        files: &HashMap<i64, String>,
+    ) -> Result<Self> {
         let mut catalog = Self::default();
         for site in sites {
             if site.plane != "contract" || site.role != "contract_declaration" {
@@ -1050,8 +1059,10 @@ impl ContractCatalog {
             let Some(path) = files.get(&site.file_id) else { continue };
             let definition = ContractDefinition {
                 site_id: site.id,
+                file_id: site.file_id,
                 start: site.start,
                 end: site.end,
+                line: site.line,
                 entity_type: site.entity_type.clone(),
                 name: site.identity_name.clone(),
                 key: contract_definition_key(path, &site.entity_type, &site.identity_name),
@@ -1064,7 +1075,27 @@ impl ContractCatalog {
                 .push(definition.clone());
             catalog.by_file.entry(site.file_id).or_default().push(definition);
         }
-        catalog
+        let mut stmt = conn.prepare(
+            "SELECT file_id, local_name, imported_name, request
+             FROM contract_imports ORDER BY file_id, local_name, request, imported_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (file_id, local, imported, request) = row?;
+            catalog
+                .imports
+                .entry((file_id, local))
+                .or_default()
+                .push((imported, request));
+        }
+        Ok(catalog)
     }
 
     fn local(&self, file_id: i64, name: &str) -> Vec<ContractTarget> {
@@ -1106,7 +1137,7 @@ fn project_contract_site(
     insert_node: &mut rusqlite::CachedStatement<'_>,
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
-    let mut targets = resolve_contract_targets(conn, site, graph, root_symbol, catalog)?;
+    let mut targets = resolve_contract_targets(site, graph, root_symbol, catalog);
     targets.sort_by(|left, right| left.key.cmp(&right.key));
     targets.dedup_by(|left, right| left.key == right.key);
     let ambiguous = targets.len() > 1;
@@ -1121,6 +1152,9 @@ fn project_contract_site(
             &site.confidence
         },
     );
+    let backing_file = if targets.len() == 1 { targets.first() } else { None };
+    let backing_file_id = backing_file.and_then(|target| target.file_id);
+    let backing_line = backing_file.and_then(|target| target.line);
     let (entity_key, entity_type, display_name, identity_anchor) = match targets.as_slice() {
         [target] => (
             target.key.clone(),
@@ -1175,8 +1209,8 @@ fn project_contract_site(
             "entities",
             entity_id,
             display_name,
-            Option::<i64>::None,
-            Option::<i64>::None,
+            backing_file_id,
+            backing_line,
             entity_meta.to_string(),
         ])?;
     }
@@ -1282,52 +1316,30 @@ fn contract_source_symbol<'a>(
 }
 
 fn resolve_contract_targets(
-    conn: &Connection,
     site: &EntitySiteNode,
     graph: &ModuleGraph,
     root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
     catalog: &ContractCatalog,
-) -> Result<Vec<ContractTarget>> {
+) -> Vec<ContractTarget> {
     if site.role == "contract_declaration" {
-        return Ok(catalog
+        return catalog
             .by_site
             .get(&site.id)
             .map(contract_target_from_definition)
             .into_iter()
-            .collect());
+            .collect();
     }
-    if site.entity_type == "decorator" {
-        let runtime = resolve_reference_at(
-            conn,
-            graph,
-            root_symbol,
-            site.file_id,
-            site.identity_start,
-            site.identity_name.split('.').next().unwrap_or(&site.identity_name),
-        )?;
-        return Ok(runtime
-            .keys
-            .into_iter()
-            .map(|anchor| contract_target_from_anchor("decorator", &site.identity_name, anchor))
-            .collect());
-    }
-
     let (import_local, qualified_name) = site
         .identity_name
         .split_once('.')
         .map_or((site.identity_name.as_str(), None), |(local, name)| {
             (local, Some(name))
         });
-    let imports: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT imported_name, request FROM contract_imports
-             WHERE file_id=?1 AND local_name=?2 ORDER BY request, imported_name",
-        )?;
-        let rows = stmt.query_map(params![site.file_id, import_local], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
+    let imports = catalog
+        .imports
+        .get(&(site.file_id, import_local.to_string()))
+        .cloned()
+        .unwrap_or_default();
     let mut targets = Vec::new();
     for (imported, request) in imports {
         let target_name = if imported == "*" {
@@ -1337,11 +1349,13 @@ fn resolve_contract_targets(
         };
         let Some(target_file) = graph.edge(site.file_id, &request) else {
             targets.push(ContractTarget {
-                key: contract_external_key(&request, target_name),
-                entity_type: "external".into(),
+                key: contract_external_key(&site.entity_type, &request, target_name),
+                entity_type: site.entity_type.clone(),
                 name: target_name.to_string(),
                 identity_anchor: Some(format!("pkg:{request}#{target_name}")),
                 inferred: false,
+                file_id: None,
+                line: None,
             });
             continue;
         };
@@ -1353,6 +1367,11 @@ fn resolve_contract_targets(
             resolved.extend(contract_symbol_targets(
                 root_symbol.get(&(resolved_file, resolved_name.clone())),
                 &resolved_name,
+                if site.entity_type == "decorator" {
+                    "decorator"
+                } else {
+                    "class"
+                },
             ));
         }
         for target in &mut resolved {
@@ -1367,9 +1386,14 @@ fn resolve_contract_targets(
         targets.extend(contract_symbol_targets(
             root_symbol.get(&(site.file_id, site.identity_name.clone())),
             &site.identity_name,
+            if site.entity_type == "decorator" {
+                "decorator"
+            } else {
+                "class"
+            },
         ));
     }
-    Ok(targets)
+    targets
 }
 
 fn contract_target_from_definition(definition: &ContractDefinition) -> ContractTarget {
@@ -1379,32 +1403,37 @@ fn contract_target_from_definition(definition: &ContractDefinition) -> ContractT
         name: definition.name.clone(),
         identity_anchor: Some(definition.key.clone()),
         inferred: false,
+        file_id: Some(definition.file_id),
+        line: Some(definition.line),
     }
 }
 
 fn contract_symbol_targets(
     symbols: Option<&Vec<&SymbolNode>>,
     name: &str,
+    entity_type: &str,
 ) -> Vec<ContractTarget> {
     symbols
         .into_iter()
         .flatten()
-        .map(|symbol| contract_target_from_anchor("class", name, symbol.key.clone()))
+        .map(|symbol| contract_target_from_anchor(entity_type, name, symbol))
         .collect()
 }
 
 fn contract_target_from_anchor(
     entity_type: &str,
     name: &str,
-    anchor: String,
+    symbol: &SymbolNode,
 ) -> ContractTarget {
-    let digest = blake3::hash(anchor.as_bytes()).to_hex();
+    let digest = blake3::hash(symbol.key.as_bytes()).to_hex();
     ContractTarget {
         key: format!("contract:{entity_type}:ref-{}", &digest[..16]),
         entity_type: entity_type.to_string(),
         name: name.to_string(),
-        identity_anchor: Some(anchor),
+        identity_anchor: Some(symbol.key.clone()),
         inferred: false,
+        file_id: Some(symbol.file_id),
+        line: Some(symbol.line),
     }
 }
 
@@ -2363,9 +2392,9 @@ fn contract_reference_key(
     format!("contract:{entity_type}:ref-{}", &digest[..16])
 }
 
-fn contract_external_key(request: &str, name: &str) -> String {
+fn contract_external_key(entity_type: &str, request: &str, name: &str) -> String {
     format!(
-        "contract:external:{}#{}",
+        "contract:{entity_type}:external:{}#{}",
         encode_key_component(request),
         encode_key_component(name)
     )
@@ -2782,6 +2811,14 @@ mod tests {
                 && edge.target == alias
                 && edge.confidence == "certain"
         }));
+        let contract_file: String = conn.query_row(
+            "SELECT files.path FROM graph_nodes
+             JOIN files ON files.id=graph_nodes.file_id
+             WHERE graph_nodes.node_key=?1",
+            [interface],
+            |row| row.get(0),
+        )?;
+        assert_eq!(contract_file, "contracts.ts");
         let alias_reference: i64 = conn.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM resolved_edges
