@@ -16,6 +16,7 @@ mod store;
 mod structural;
 mod walk;
 mod watch;
+mod workspace;
 
 use std::path::{Path, PathBuf};
 
