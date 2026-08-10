@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import { PassThrough } from "node:stream";
 import {
@@ -11,6 +15,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { createGatewayState, handleMessage } from "../src/server.mjs";
 import { LineOverflowError, MAX_LINE_BYTES, parseMessage, readLines } from "../src/protocol.mjs";
+import { buildRegistry } from "../src/registry.mjs";
 
 const VERSIONS = { gateway: "0.1.0-test", pi_ai: "0.84.1", node: process.versions.node };
 
@@ -284,3 +289,57 @@ test("readLines splits frames and reports oversized lines without resync", async
   assert.deepEqual(lines, ['{"a":1}', '{"b":2}']);
   assert.ok(overflow instanceof LineOverflowError);
 });
+
+test("custom providers cannot shadow built-in provider and billing identities", () => {
+  assert.throws(
+    () =>
+      buildRegistry({
+        authFile: "/unused",
+        credentialStore: { read: async () => undefined, list: async () => [] },
+        customProviders: [
+          {
+            id: "openai-codex",
+            name: "shadow",
+            baseUrl: "https://example.test/v1",
+            models: [
+              {
+                id: "gpt-5.6-terra",
+                name: "shadow",
+                input: ["text"],
+                reasoning: false,
+                contextWindow: 1_000,
+                maxTokens: 100,
+              },
+            ],
+          },
+        ],
+      }),
+    /collides with a built-in provider/,
+  );
+});
+
+test("credential read-modify-write is serialized across gateway processes", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "jscout-credentials-"));
+  const file = path.join(directory, "auth.json");
+  const writer = path.join(import.meta.dirname, "..", "test-fixtures", "credential-writer.mjs");
+  await Promise.all([
+    run(process.execPath, [writer, file, "provider-a"]),
+    run(process.execPath, [writer, file, "provider-b"]),
+  ]);
+  const credentials = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(Object.keys(credentials).sort(), ["provider-a", "provider-b"]);
+});
+
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`credential writer exited ${code}: ${stderr}`));
+    });
+  });
+}

@@ -6,8 +6,10 @@
 // raggazzi-ingestion-eval/lib/pi.mjs, which this gateway owns going forward.
 
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createProvider, hasApi } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
@@ -31,6 +33,8 @@ const GOOGLE_THINKING_LEVELS = Object.freeze({
   high: "HIGH",
 });
 const SERVICE_TIER_APIS = new Set(["openai-responses", "openai-codex-responses"]);
+const CREDENTIAL_LOCK_STALE_MS = 60_000;
+const CREDENTIAL_LOCK_HEARTBEAT_MS = 5_000;
 
 export class RegistryError extends Error {
   constructor(code, message) {
@@ -154,8 +158,15 @@ export function parseOpenAICompatibleProviders(value, envName) {
 export function buildRegistry({ authFile, customProviders = [], credentialStore }) {
   const credentials = credentialStore ?? new JsonCredentialStore(resolveAuthPath(authFile));
   const models = builtinModels({ credentials });
+  const builtinProviderIds = new Set(models.getProviders().map((provider) => provider.id));
   const customProviderIds = new Set();
   for (const provider of customProviders) {
+    if (builtinProviderIds.has(provider.id)) {
+      throw new RegistryError(
+        "invalid_request",
+        `custom provider id ${provider.id} collides with a built-in provider`,
+      );
+    }
     customProviderIds.add(provider.id);
     models.setProvider(
       createProvider({
@@ -250,13 +261,13 @@ function isPlainObject(value) {
 }
 
 // One-time adaptation of the BVB/raggazzi credential store; owned here.
-// Serialized writes per provider protect concurrent OAuth refreshes within
-// this process; the atomic tmp+rename write protects the file across
-// processes.
+// The lock covers the complete read-modify-write operation. Atomic rename
+// protects readers from torn JSON; it does not by itself prevent two gateway
+// processes from overwriting each other's provider entries.
 export class JsonCredentialStore {
   constructor(filePath) {
     this.filePath = filePath;
-    this.writeChains = new Map();
+    this.lockPath = `${filePath}.lock`;
   }
 
   async read(providerId) {
@@ -271,40 +282,24 @@ export class JsonCredentialStore {
     }));
   }
 
-  async modify(providerId, fn) {
-    let result;
-    const previous = this.writeChains.get(providerId) ?? Promise.resolve();
-    const operation = previous.catch(() => {}).then(async () => {
+  async modify(providerId, fn, options = {}) {
+    return this.withWriteLock(async () => {
       const credentials = await this.readAll();
       const next = await fn(credentials[providerId]);
       if (next !== undefined) {
         credentials[providerId] = next;
         await this.writeAll(credentials);
       }
-      result = next ?? credentials[providerId];
-    });
-    this.writeChains.set(providerId, operation);
-    try {
-      await operation;
-      return result;
-    } finally {
-      if (this.writeChains.get(providerId) === operation) this.writeChains.delete(providerId);
-    }
+      return next ?? credentials[providerId];
+    }, options.signal);
   }
 
-  async delete(providerId) {
-    const previous = this.writeChains.get(providerId) ?? Promise.resolve();
-    const operation = previous.catch(() => {}).then(async () => {
+  async delete(providerId, options = {}) {
+    await this.withWriteLock(async () => {
       const credentials = await this.readAll();
       delete credentials[providerId];
       await this.writeAll(credentials);
-    });
-    this.writeChains.set(providerId, operation);
-    try {
-      await operation;
-    } finally {
-      if (this.writeChains.get(providerId) === operation) this.writeChains.delete(providerId);
-    }
+    }, options.signal);
   }
 
   async readAll() {
@@ -318,11 +313,61 @@ export class JsonCredentialStore {
 
   async writeAll(credentials) {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
+    const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
     await fs.writeFile(temporaryPath, `${JSON.stringify(credentials, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
     });
     await fs.rename(temporaryPath, this.filePath);
+  }
+
+  async withWriteLock(operation, signal) {
+    const release = await this.acquireWriteLock(signal);
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  }
+
+  async acquireWriteLock(signal) {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    const token = `${process.pid}:${randomUUID()}`;
+    const ownerPath = path.join(this.lockPath, "owner");
+    for (;;) {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("aborted", "AbortError");
+      try {
+        await fs.mkdir(this.lockPath, { mode: 0o700 });
+        await fs.writeFile(ownerPath, token, { encoding: "utf8", mode: 0o600 });
+        const heartbeat = setInterval(() => {
+          const now = new Date();
+          void fs.utimes(this.lockPath, now, now).catch(() => {});
+        }, CREDENTIAL_LOCK_HEARTBEAT_MS);
+        heartbeat.unref?.();
+        return async () => {
+          clearInterval(heartbeat);
+          const owner = await fs.readFile(ownerPath, "utf8").catch(() => null);
+          if (owner === token) await fs.rm(this.lockPath, { recursive: true, force: true });
+        };
+      } catch (error) {
+        if (error?.code !== "EEXIST") {
+          await fs.rm(this.lockPath, { recursive: true, force: true }).catch(() => {});
+          throw error;
+        }
+      }
+
+      const stat = await fs.stat(this.lockPath).catch(() => null);
+      if (stat && Date.now() - stat.mtimeMs > CREDENTIAL_LOCK_STALE_MS) {
+        const stalePath = `${this.lockPath}.stale.${process.pid}.${randomUUID()}`;
+        try {
+          await fs.rename(this.lockPath, stalePath);
+          await fs.rm(stalePath, { recursive: true, force: true });
+          continue;
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+      await sleep(25 + Math.floor(Math.random() * 25), undefined, { signal });
+    }
   }
 }
