@@ -43,6 +43,23 @@ unresolvable to indexed files: `.vue` components, `.json` imports
 packages with no tracked source, and one absent subpath
 (`twenty-sdk/front-component-renderer/build`).
 
+## Resolution provenance
+
+Workspace mappings are heuristics of varying strength, so every module edge
+records how it was resolved (`module_edges.resolution`) and the structural
+projector downgrades heuristic mappings from `certain` to `likely` —
+including references that reach their target across such an edge:
+
+| Repo | `resolver` (direct) | `workspace` (manifest-backed) | `workspace-inferred` (heuristic) | external |
+|---|---:|---:|---:|---:|
+| n8n | 30,055 | 5,293 | 6,212 | 22,995 |
+| Twenty | 67,426 | 0 | 11,929 | 18,306 |
+
+`workspace` means the package.json named the source file itself (e.g. n8n's
+`module: src/index.ts` fields); `workspace-inferred` covers source
+conventions, dist-mirroring, and unique-name search. Twenty's manifests only
+ever point at dist, so all its cross-package mappings are inferred.
+
 Twenty's baseline internal count was already high because its relative
 imports resolved; its cross-package edges were still absent. n8n's baseline
 was pathological (both defects compounding): even relative imports failed.

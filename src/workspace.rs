@@ -5,43 +5,116 @@
 //! those specifiers don't resolve — and even installed, they resolve into
 //! symlinked or `dist/` paths that are never indexed. This module maps each
 //! workspace package name to its in-repo source so the resolver can land such
-//! imports on indexed files.
+//! imports on indexed files, and records which mappings came straight from
+//! manifest data versus layout heuristics so edges carry honest provenance.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use oxc_resolver::{Alias, AliasValue};
 
+use crate::indexer::RESOLVE_CONDITIONS;
 use crate::walk;
 
-/// Resolver aliases for every workspace package, three kinds per package:
-///
-/// - `name/sub$` (exact) for each non-wildcard subpath export, mapped from
-///   its dist target back to the source file it was built from;
-/// - `name/dist/*` (wildcard) so imports that name build output by path land
-///   on the mirrored source tree;
-/// - `name` (prefix) -> [source entry file, `src/` dir, package dir], keeping
-///   whichever exist. Subpath-only packages (exports like `"./*"` with no
-///   `"."`) get no entry file but still resolve subpaths through `src/`.
-pub fn workspace_aliases(root: &Path) -> Alias {
-    let globs = workspace_globs(root);
-    if globs.is_empty() {
-        return Vec::new();
-    }
-    let mut aliases: Alias = Vec::new();
-    for dir in package_dirs(root, &globs) {
-        let Ok(text) = fs::read_to_string(dir.join("package.json")) else { continue };
-        let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else { continue };
-        if name.is_empty() || name.starts_with('.') || name.starts_with('/') {
-            continue;
+/// How a workspace mapping was established. `Manifest` mappings use a target
+/// the package.json names directly (modulo TS extension aliasing, which the
+/// resolver itself applies); `Inferred` mappings come from layout heuristics
+/// (source conventions, dist-mirroring, unique-name search).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    Manifest,
+    Inferred,
+}
+
+/// Workspace alias table plus the provenance needed to classify resolutions.
+pub struct WorkspaceMap {
+    pub aliases: Alias,
+    /// Exact specifiers (bare names, declared subpaths) whose mapping came
+    /// straight from manifest data.
+    manifest_specifiers: HashSet<String>,
+    /// Every aliased workspace package name.
+    package_names: HashSet<String>,
+}
+
+impl WorkspaceMap {
+    /// Build the map for a repository root. Empty when the root declares no
+    /// workspaces. Only the indexing root is consulted: when indexing a
+    /// sub-package, cross-package targets live outside the root and could
+    /// never match indexed files anyway.
+    pub fn build(root: &Path) -> Self {
+        let mut map = WorkspaceMap {
+            aliases: Vec::new(),
+            manifest_specifiers: HashSet::new(),
+            package_names: HashSet::new(),
+        };
+        let globs = workspace_globs(root);
+        if globs.is_empty() {
+            return map;
         }
-        subpath_export_aliases(name, &dir, &pkg, &mut aliases);
+        for dir in package_dirs(root, &globs) {
+            let Ok(text) = fs::read_to_string(dir.join("package.json")) else { continue };
+            let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else { continue };
+            if name.is_empty() || name.starts_with('.') || name.starts_with('/') {
+                continue;
+            }
+            map.add_package(name, &dir, &pkg);
+        }
+        // A matched-but-failing prefix entry stops resolution, so each
+        // package's exact/wildcard subpath entries must be consulted before
+        // its bare-name prefix entry: descending key order puts every
+        // "name/…" first.
+        map.aliases.sort_by(|a, b| b.0.cmp(&a.0));
+        map.aliases.dedup_by(|a, b| a.0 == b.0);
+        map
+    }
+
+    /// Provenance for a successfully resolved request: `resolver` when the
+    /// workspace machinery wasn't involved, `workspace` for an exact
+    /// manifest-backed mapping, `workspace-inferred` for heuristic mappings.
+    pub fn classify(&self, request: &str) -> &'static str {
+        if !self.is_workspace_request(request) {
+            "resolver"
+        } else if self.manifest_specifiers.contains(request) {
+            "workspace"
+        } else {
+            "workspace-inferred"
+        }
+    }
+
+    fn is_workspace_request(&self, request: &str) -> bool {
+        if request.starts_with('.') || request.starts_with('/') {
+            return false;
+        }
+        if self.package_names.contains(request) {
+            return true;
+        }
+        request
+            .match_indices('/')
+            .any(|(i, _)| self.package_names.contains(&request[..i]))
+    }
+
+    /// Alias entries for one package, three kinds:
+    ///
+    /// - `name/sub$` (exact) for each non-wildcard subpath export, mapped
+    ///   from its dist target back to the source it was built from;
+    /// - `name/…*…` (wildcard) for wildcard subpath exports and the implicit
+    ///   `name/dist/*`, landing build-output paths on the source tree;
+    /// - `name` (prefix) -> [source entry file, `src/` dir, package dir],
+    ///   keeping whichever exist. Subpath-only packages (exports like `"./*"`
+    ///   with no `"."`) get no entry file but still resolve through `src/`.
+    fn add_package(&mut self, name: &str, dir: &Path, pkg: &serde_json::Value) {
+        self.package_names.insert(name.to_string());
+        self.subpath_export_aliases(name, dir, pkg);
 
         let src = dir.join("src");
         let mut dist_values = Vec::new();
         let mut values = Vec::new();
-        if let Some(entry) = package_entry(&dir, &pkg) {
+        if let Some((entry, origin)) = package_entry(dir, pkg) {
+            if origin == Origin::Manifest {
+                self.manifest_specifiers.insert(name.to_string());
+            }
             values.push(AliasValue::Path(entry.to_string_lossy().into_owned()));
         }
         if src.is_dir() {
@@ -50,135 +123,43 @@ pub fn workspace_aliases(root: &Path) -> Alias {
         }
         dist_values.push(AliasValue::Path(format!("{}/*", dir.to_string_lossy())));
         values.push(AliasValue::Path(dir.to_string_lossy().into_owned()));
-        aliases.push((format!("{name}/dist/*"), dist_values));
-        aliases.push((name.to_string(), values));
+        self.aliases.push((format!("{name}/dist/*"), dist_values));
+        self.aliases.push((name.to_string(), values));
     }
-    // A matched-but-failing prefix entry stops resolution, so each package's
-    // exact/wildcard subpath entries must be consulted before its bare-name
-    // prefix entry: descending key order puts every "name/…" first.
-    aliases.sort_by(|a, b| b.0.cmp(&a.0));
-    aliases.dedup_by(|a, b| a.0 == b.0);
-    aliases
-}
 
-/// Exact aliases for declared subpath exports (`"./tool": {...}`), pointing
-/// each at the source file its dist target was built from.
-fn subpath_export_aliases(name: &str, dir: &Path, pkg: &serde_json::Value, out: &mut Alias) {
-    let Some(serde_json::Value::Object(map)) = pkg.get("exports") else { return };
-    if !map.keys().any(|k| k.starts_with('.')) {
-        return; // Condition object: describes "." only.
-    }
-    for (key, target) in map {
-        let Some(sub) = key.strip_prefix("./") else { continue };
-        if sub.is_empty() || sub == "package.json" || sub.contains('*') {
-            continue;
+    /// Aliases for declared subpath exports (`"./tool": {...}`), pointing
+    /// each at the source its dist target was built from.
+    fn subpath_export_aliases(&mut self, name: &str, dir: &Path, pkg: &serde_json::Value) {
+        let Some(serde_json::Value::Object(map)) = pkg.get("exports") else { return };
+        if !map.keys().any(|k| k.starts_with('.')) {
+            return; // Condition object: describes "." only.
         }
-        let mut targets = Vec::new();
-        collect_export_strings(target, &mut targets);
-        if let Some(source) = subpath_source(dir, sub, &targets) {
-            out.push((
-                format!("{name}/{sub}$"),
-                vec![AliasValue::Path(source.to_string_lossy().into_owned())],
-            ));
-        }
-    }
-}
-
-/// Directories bundlers insert between `dist/` and the mirrored source tree.
-const DIST_FLAVOR_DIRS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "lib", "types"];
-
-/// Find the source file behind one subpath export. Dist targets usually
-/// mirror the source tree (`dist[/flavor]/x.js` -> `src/x.ts` or `x.ts`);
-/// when they don't, fall back to a unique source dir/file named after the
-/// subpath (`"./define"` -> `src/sdk/define/index.ts`).
-fn subpath_source(dir: &Path, sub: &str, targets: &[String]) -> Option<PathBuf> {
-    for target in targets {
-        let path = target.trim_start_matches("./");
-        let mut segments = path.split('/');
-        let Some(first) = segments.next() else { continue };
-        let tail: Vec<&str> = segments.collect();
-        let mut tails: Vec<String> = Vec::new();
-        if walk::SKIP_DIRS.contains(&first) {
-            if !tail.is_empty() {
-                tails.push(tail.join("/"));
-                if tail.len() > 1 && DIST_FLAVOR_DIRS.contains(&tail[0]) {
-                    tails.push(tail[1..].join("/"));
-                }
-            }
-        } else {
-            tails.push(path.to_string());
-        }
-        for t in &tails {
-            for base in ["src/", ""] {
-                for candidate in entry_candidates(&format!("{base}{t}")) {
-                    let p = dir.join(candidate);
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-    }
-    unique_source_match(&dir.join("src"), sub)
-}
-
-/// The single dir (with an index file) or module file under `src/` whose
-/// path ends with `sub` — None when absent or ambiguous.
-fn unique_source_match(src: &Path, sub: &str) -> Option<PathBuf> {
-    let mut matches = Vec::new();
-    collect_source_matches(src, src, sub, 0, &mut matches);
-    if matches.len() == 1 { matches.pop() } else { None }
-}
-
-fn collect_source_matches(
-    base: &Path,
-    dir: &Path,
-    sub: &str,
-    depth: usize,
-    out: &mut Vec<PathBuf>,
-) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(rel) = path.strip_prefix(base) else { continue };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if file_type.is_dir() {
-            if walk::SKIP_DIRS.contains(&name) {
+        for (key, value) in map {
+            let Some(sub) = key.strip_prefix("./") else { continue };
+            if sub.is_empty() || sub == "package.json" {
                 continue;
             }
-            if rel == sub || rel.ends_with(&format!("/{sub}")) {
-                for ext in ENTRY_EXTENSIONS {
-                    let index = path.join(format!("index.{ext}"));
-                    if index.is_file() {
-                        out.push(index);
-                        break;
-                    }
+            let mut targets = Vec::new();
+            export_targets(value, &mut targets);
+            if sub.contains('*') {
+                if let Some(entry) = wildcard_subpath_alias(name, dir, sub, &targets) {
+                    self.aliases.push(entry);
                 }
+            } else if let Some((source, origin)) = subpath_source(dir, sub, &targets) {
+                if origin == Origin::Manifest {
+                    self.manifest_specifiers.insert(format!("{name}/{sub}"));
+                }
+                self.aliases.push((
+                    format!("{name}/{sub}$"),
+                    vec![AliasValue::Path(source.to_string_lossy().into_owned())],
+                ));
             }
-            collect_source_matches(base, &path, sub, depth + 1, out);
-        } else if file_type.is_file()
-            && let Some((stem, ext)) = rel.rsplit_once('.')
-            && ENTRY_EXTENSIONS.contains(&ext)
-            && (stem == sub || stem.ends_with(&format!("/{sub}")))
-        {
-            out.push(path);
         }
     }
 }
 
 /// Workspace globs from `pnpm-workspace.yaml` or the root `package.json`
-/// `workspaces` field (array or `{ "packages": [...] }`). Only the indexing
-/// root is consulted: when indexing a sub-package, cross-package targets live
-/// outside the root and could never match indexed files anyway.
+/// `workspaces` field (array or `{ "packages": [...] }`).
 fn workspace_globs(root: &Path) -> Vec<String> {
     if let Ok(yaml) = fs::read_to_string(root.join("pnpm-workspace.yaml")) {
         let globs = pnpm_workspace_globs(&yaml);
@@ -377,61 +358,91 @@ fn segment_match(pattern: &str, name: &str) -> bool {
     true
 }
 
+/// Resolve an exports value to its target strings under the resolver's
+/// active conditions, mirroring Node semantics: condition objects are
+/// evaluated in declaration order and the first active condition is committed
+/// to (no backtracking); arrays contribute candidates in order; `null` and
+/// inactive-only objects yield nothing. `types` never matches — declaration
+/// files aren't indexed. Requires serde_json `preserve_order`: condition
+/// order is significant.
+fn export_targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                export_targets(v, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (condition, v) in map {
+                if RESOLVE_CONDITIONS.contains(&condition.as_str()) {
+                    export_targets(v, out);
+                    return;
+                }
+            }
+        }
+        _ => {} // null -> explicitly not exported
+    }
+}
+
+/// Targets of the package's root export: `exports` itself when it is a bare
+/// target/condition object, or its `"."` entry in a subpath map.
+fn root_export_targets(pkg: &serde_json::Value) -> Vec<String> {
+    let Some(exports) = pkg.get("exports") else { return Vec::new() };
+    let value = match exports {
+        serde_json::Value::Object(map) if map.keys().any(|k| k.starts_with('.')) => {
+            match map.get(".") {
+                Some(dot) => dot,
+                None => return Vec::new(),
+            }
+        }
+        other => other,
+    };
+    let mut out = Vec::new();
+    export_targets(value, &mut out);
+    out
+}
+
 const ENTRY_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
-/// Pick the package's source entry file. package.json fields usually point at
-/// build output (`dist/…`) that is gitignored — and never indexed even when
-/// present (walk skips those dirs) — so candidates there are dropped and the
-/// search falls back to source conventions (`src/index.*`, `index.*`).
-fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<PathBuf> {
-    let mut fields: Vec<String> = Vec::new();
-    if let Some(exports) = pkg.get("exports") {
-        collect_export_strings(exports, &mut fields);
-    }
-    for field in ["source", "module", "main", "browser"] {
+/// Pick the package's source entry file. Manifest targets (root export,
+/// `source`/`module`/`main`) win when they name an existing source file;
+/// package.json fields usually point at build output (`dist/…`) that is
+/// gitignored — and never indexed even when present (walk skips those dirs) —
+/// so such candidates are dropped and the search falls back to heuristics:
+/// the `browser` field (not a resolver main field) and source conventions
+/// (`src/index.*`, `index.*`).
+fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<(PathBuf, Origin)> {
+    let mut manifest_fields = root_export_targets(pkg);
+    for field in ["source", "module", "main"] {
         if let Some(s) = pkg.get(field).and_then(|v| v.as_str()) {
-            fields.push(s.to_string());
+            manifest_fields.push(s.to_string());
         }
     }
-    fields.push("src/index".to_string());
-    fields.push("index".to_string());
-    for field in &fields {
-        for candidate in entry_candidates(field) {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
+    for field in &manifest_fields {
+        if let Some(path) = first_existing(dir, field) {
+            return Some((path, Origin::Manifest));
+        }
+    }
+    let mut inferred_fields = Vec::new();
+    if let Some(s) = pkg.get("browser").and_then(|v| v.as_str()) {
+        inferred_fields.push(s.to_string());
+    }
+    inferred_fields.push("src/index".to_string());
+    inferred_fields.push("index".to_string());
+    for field in &inferred_fields {
+        if let Some(path) = first_existing(dir, field) {
+            return Some((path, Origin::Inferred));
         }
     }
     None
 }
 
-/// String targets of the package's root export (`exports` itself, or its `"."`
-/// subpath), walking condition objects. `types` conditions are skipped —
-/// declaration files are never indexed.
-fn collect_export_strings(exports: &serde_json::Value, out: &mut Vec<String>) {
-    match exports {
-        serde_json::Value::String(s) => out.push(s.clone()),
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                collect_export_strings(v, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            if map.keys().any(|k| k.starts_with('.')) {
-                if let Some(dot) = map.get(".") {
-                    collect_export_strings(dot, out);
-                }
-            } else {
-                for (condition, v) in map {
-                    if condition != "types" {
-                        collect_export_strings(v, out);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
+fn first_existing(dir: &Path, field: &str) -> Option<PathBuf> {
+    entry_candidates(field)
+        .into_iter()
+        .map(|candidate| dir.join(candidate))
+        .find(|path| path.is_file())
 }
 
 /// On-disk paths a package.json field value could denote, in preference
@@ -467,12 +478,183 @@ fn entry_candidates(field: &str) -> Vec<String> {
     ENTRY_EXTENSIONS.iter().map(|ext| format!("{path}.{ext}")).collect()
 }
 
+/// Directories bundlers insert between `dist/` and the mirrored source tree.
+const DIST_FLAVOR_DIRS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "lib", "types"];
+
+/// Find the source file behind one subpath export. A target that names an
+/// existing source file is manifest truth. Otherwise dist targets usually
+/// mirror the source tree (`dist[/flavor]/x.js` -> `src/x.ts` or `x.ts`);
+/// when they don't, fall back to a unique source dir/file named after the
+/// subpath (`"./define"` -> `src/sdk/define/index.ts`). Both fallbacks are
+/// heuristic and reported as such.
+fn subpath_source(dir: &Path, sub: &str, targets: &[String]) -> Option<(PathBuf, Origin)> {
+    for target in targets {
+        if let Some(path) = first_existing(dir, target) {
+            return Some((path, Origin::Manifest));
+        }
+    }
+    for target in targets {
+        for tail in mirror_tails(target) {
+            for base in ["src/", ""] {
+                if let Some(path) = first_existing(dir, &format!("{base}{tail}")) {
+                    return Some((path, Origin::Inferred));
+                }
+            }
+        }
+    }
+    unique_source_match(&dir.join("src"), sub).map(|path| (path, Origin::Inferred))
+}
+
+/// Source-relative tails a build-output target may mirror:
+/// `dist/esm/utils/x.js` -> [`esm/utils/x.js`, `utils/x.js`]. Empty for
+/// targets outside build-output dirs.
+fn mirror_tails(target: &str) -> Vec<String> {
+    let path = target.trim_start_matches("./");
+    let mut segments = path.split('/');
+    let Some(first) = segments.next() else { return Vec::new() };
+    let tail: Vec<&str> = segments.collect();
+    if !walk::SKIP_DIRS.contains(&first) || tail.is_empty() {
+        return Vec::new();
+    }
+    let mut tails = vec![tail.join("/")];
+    if tail.len() > 1 && DIST_FLAVOR_DIRS.contains(&tail[0]) {
+        tails.push(tail[1..].join("/"));
+    }
+    tails
+}
+
+/// Wildcard subpath export -> wildcard alias:
+/// `"./*": "./dist/sdk/*.js"` becomes `name/*` -> [`<dir>/src/sdk/*`, …].
+/// The target's prefix is translated the same way exact subpaths are, and
+/// its suffix dropped so resolver extension/index handling picks the source
+/// file. Trailing generic values keep specifiers outside the translated tree
+/// resolvable (a matched-but-failing alias would otherwise block them).
+fn wildcard_subpath_alias(
+    name: &str,
+    dir: &Path,
+    sub: &str,
+    targets: &[String],
+) -> Option<(String, Vec<AliasValue>)> {
+    if sub.matches('*').count() != 1 {
+        return None;
+    }
+    let dir_str = dir.to_string_lossy();
+    let mut values: Vec<String> = Vec::new();
+    for target in targets {
+        let path = target.trim_start_matches("./");
+        if path.matches('*').count() != 1 {
+            continue;
+        }
+        let Some((prefix, _suffix)) = path.split_once('*') else { continue };
+        for translated in translate_wildcard_prefix(prefix) {
+            values.push(format!("{dir_str}/{translated}*"));
+        }
+    }
+    if dir.join("src").is_dir() {
+        values.push(format!("{dir_str}/src/*"));
+    }
+    values.push(format!("{dir_str}/*"));
+    let mut seen = HashSet::new();
+    values.retain(|v| seen.insert(v.clone()));
+    Some((format!("{name}/{sub}"), values.into_iter().map(AliasValue::Path).collect()))
+}
+
+/// Package-relative prefixes the wildcard target prefix may correspond to in
+/// the source tree: `dist/sdk/` -> [`src/sdk/`, `sdk/`]; `src/foo/` stays
+/// as-is. The prefix may end mid-segment (`dist/mod-`), which is preserved.
+fn translate_wildcard_prefix(prefix: &str) -> Vec<String> {
+    let (dirs, partial) = prefix.rsplit_once('/').map_or(("", prefix), |(d, p)| (d, p));
+    let segs: Vec<&str> = dirs.split('/').filter(|s| !s.is_empty()).collect();
+    let dir_variants: Vec<String> = match segs.first() {
+        Some(first) if walk::SKIP_DIRS.contains(first) => {
+            let rest = &segs[1..];
+            let mut tails: Vec<&[&str]> = vec![rest];
+            if let Some(flavor) = rest.first()
+                && DIST_FLAVOR_DIRS.contains(flavor)
+            {
+                tails.push(&rest[1..]);
+            }
+            tails
+                .into_iter()
+                .flat_map(|tail| {
+                    ["src", ""].into_iter().map(move |base| {
+                        let mut parts: Vec<&str> = Vec::new();
+                        if !base.is_empty() {
+                            parts.push(base);
+                        }
+                        parts.extend(tail);
+                        parts.join("/")
+                    })
+                })
+                .collect()
+        }
+        _ => vec![dirs.to_string()],
+    };
+    dir_variants
+        .into_iter()
+        .map(|d| if d.is_empty() { partial.to_string() } else { format!("{d}/{partial}") })
+        .collect()
+}
+
+/// The single dir (with an index file) or module file under `src/` whose
+/// path ends with `sub` — None when absent or ambiguous.
+fn unique_source_match(src: &Path, sub: &str) -> Option<PathBuf> {
+    let mut matches = Vec::new();
+    collect_source_matches(src, src, sub, 0, &mut matches);
+    if matches.len() == 1 { matches.pop() } else { None }
+}
+
+fn collect_source_matches(
+    base: &Path,
+    dir: &Path,
+    sub: &str,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(base) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if file_type.is_dir() {
+            if walk::SKIP_DIRS.contains(&name) {
+                continue;
+            }
+            if rel == sub || rel.ends_with(&format!("/{sub}")) {
+                for ext in ENTRY_EXTENSIONS {
+                    let index = path.join(format!("index.{ext}"));
+                    if index.is_file() {
+                        out.push(index);
+                        break;
+                    }
+                }
+            }
+            collect_source_matches(base, &path, sub, depth + 1, out);
+        } else if file_type.is_file()
+            && let Some((stem, ext)) = rel.rsplit_once('.')
+            && ENTRY_EXTENSIONS.contains(&ext)
+            && (stem == sub || stem.ends_with(&format!("/{sub}")))
+        {
+            out.push(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{pnpm_workspace_globs, workspace_aliases};
+    use super::{WorkspaceMap, pnpm_workspace_globs};
     use oxc_resolver::AliasValue;
 
     fn write(path: &Path, content: &str) {
@@ -559,10 +741,10 @@ catalog:
             r#"{"name": "acme-binary", "main": "dist/index.js"}"#,
         );
 
-        let aliases = workspace_aliases(root);
+        let map = WorkspaceMap::build(root);
         // Descending key order: every "name/…" entry precedes its bare-name
         // prefix entry, so subpath/dist aliases win before the prefix matches.
-        let names: Vec<&str> = aliases.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<&str> = map.aliases.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
             vec![
@@ -577,11 +759,11 @@ catalog:
             ]
         );
         assert_eq!(
-            alias_paths(&aliases, "acme-binary"),
+            alias_paths(&map.aliases, "acme-binary"),
             vec![root.join("packages/binary-only").to_string_lossy().to_string()]
         );
 
-        let workflow = alias_paths(&aliases, "acme-workflow");
+        let workflow = alias_paths(&map.aliases, "acme-workflow");
         assert_eq!(
             workflow,
             vec![
@@ -590,8 +772,17 @@ catalog:
                 root.join("packages/workflow").to_string_lossy().to_string(),
             ]
         );
-        let api = alias_paths(&aliases, "@scope/api");
+        let api = alias_paths(&map.aliases, "@scope/api");
         assert_eq!(api[0], root.join("packages/@scope/api/src/index.ts").to_string_lossy());
+
+        // Provenance: a field naming source directly is manifest truth; a
+        // convention-recovered entry, any subpath, and non-workspace
+        // requests classify accordingly.
+        assert_eq!(map.classify("@scope/api"), "workspace");
+        assert_eq!(map.classify("acme-workflow"), "workspace-inferred");
+        assert_eq!(map.classify("acme-workflow/utils/x"), "workspace-inferred");
+        assert_eq!(map.classify("lodash"), "resolver");
+        assert_eq!(map.classify("./local"), "resolver");
     }
 
     #[test]
@@ -605,6 +796,7 @@ catalog:
                 "./tool": {"types": "./dist/sdk/tool.d.ts", "default": "./dist/sdk/tool.js"},
                 "./text-editor": {"import": "./dist/esm/utils/text-editor.js"},
                 "./define": {"import": "./dist/define/index.mjs"},
+                "./direct": {"import": "./src/direct.ts"},
                 "./missing": {"import": "./dist/nowhere.js"}
             }}"#,
         );
@@ -615,22 +807,84 @@ catalog:
         // "./define": dist does NOT mirror src; found as the unique dir named
         // "define" with an index file.
         write(&root.join("packages/sdk/src/sdk/define/index.ts"), "export const d = 1;\n");
+        // "./direct": target names the source file itself.
+        write(&root.join("packages/sdk/src/direct.ts"), "export const x = 1;\n");
 
-        let aliases = workspace_aliases(root);
+        let map = WorkspaceMap::build(root);
         assert_eq!(
-            alias_paths(&aliases, "acme-sdk/tool$"),
+            alias_paths(&map.aliases, "acme-sdk/tool$"),
             vec![root.join("packages/sdk/src/sdk/tool.ts").to_string_lossy().to_string()]
         );
         assert_eq!(
-            alias_paths(&aliases, "acme-sdk/text-editor$"),
+            alias_paths(&map.aliases, "acme-sdk/text-editor$"),
             vec![root.join("packages/sdk/src/utils/text-editor.ts").to_string_lossy().to_string()]
         );
         assert_eq!(
-            alias_paths(&aliases, "acme-sdk/define$"),
+            alias_paths(&map.aliases, "acme-sdk/define$"),
             vec![root.join("packages/sdk/src/sdk/define/index.ts").to_string_lossy().to_string()]
         );
         // Unmappable subpath -> no exact alias for it.
-        assert!(!aliases.iter().any(|(k, _)| k == "acme-sdk/missing$"));
+        assert!(!map.aliases.iter().any(|(k, _)| k == "acme-sdk/missing$"));
+
+        // Mirrored/searched mappings are inferred; direct targets are
+        // manifest-backed.
+        assert_eq!(map.classify("acme-sdk/tool"), "workspace-inferred");
+        assert_eq!(map.classify("acme-sdk/define"), "workspace-inferred");
+        assert_eq!(map.classify("acme-sdk/direct"), "workspace");
+    }
+
+    #[test]
+    fn wildcard_exports_map_into_the_translated_source_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(&root.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+        write(
+            &root.join("packages/lib/package.json"),
+            r#"{"name": "acme-lib", "exports": {"./*": "./dist/sdk/*.js"}}"#,
+        );
+        // The decoy: without wildcard translation the generic src/ prefix
+        // would pick src/foo.ts over the exported src/sdk/foo.ts.
+        write(&root.join("packages/lib/src/foo.ts"), "export const wrong = 1;\n");
+        write(&root.join("packages/lib/src/sdk/foo.ts"), "export const right = 1;\n");
+
+        let map = WorkspaceMap::build(root);
+        let dir = root.join("packages/lib");
+        assert_eq!(
+            alias_paths(&map.aliases, "acme-lib/*"),
+            vec![
+                format!("{}/src/sdk/*", dir.to_string_lossy()),
+                format!("{}/sdk/*", dir.to_string_lossy()),
+                format!("{}/src/*", dir.to_string_lossy()),
+                format!("{}/*", dir.to_string_lossy()),
+            ]
+        );
+    }
+
+    #[test]
+    fn conditional_exports_follow_resolver_conditions() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(&root.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+        // browser is not an active resolver condition; node is. Declaration
+        // order puts browser first — it must still lose.
+        write(
+            &root.join("packages/dual/package.json"),
+            r#"{"name": "acme-dual", "exports": {
+                ".": {"browser": "./src/browser.ts", "node": "./src/node.ts"},
+                "./blocked": null
+            }}"#,
+        );
+        write(&root.join("packages/dual/src/browser.ts"), "export const b = 1;\n");
+        write(&root.join("packages/dual/src/node.ts"), "export const n = 1;\n");
+
+        let map = WorkspaceMap::build(root);
+        assert_eq!(
+            alias_paths(&map.aliases, "acme-dual")[0],
+            root.join("packages/dual/src/node.ts").to_string_lossy()
+        );
+        assert_eq!(map.classify("acme-dual"), "workspace");
+        // A null target is explicitly not exported: no exact alias.
+        assert!(!map.aliases.iter().any(|(k, _)| k == "acme-dual/blocked$"));
     }
 
     #[test]
@@ -646,10 +900,13 @@ catalog:
         write(&root.join("packages/star-two/package.json"), r#"{"name": "two"}"#);
         write(&root.join("packages/star-two/src/index.tsx"), "export const two = 2;\n");
 
-        let aliases = workspace_aliases(root);
-        assert_eq!(alias_paths(&aliases, "one")[0], root.join("packages/one/index.ts").to_string_lossy());
+        let map = WorkspaceMap::build(root);
         assert_eq!(
-            alias_paths(&aliases, "two")[0],
+            alias_paths(&map.aliases, "one")[0],
+            root.join("packages/one/index.ts").to_string_lossy()
+        );
+        assert_eq!(
+            alias_paths(&map.aliases, "two")[0],
             root.join("packages/star-two/src/index.tsx").to_string_lossy()
         );
     }
@@ -658,6 +915,8 @@ catalog:
     fn no_workspace_manifest_yields_no_aliases() {
         let repo = tempfile::tempdir().unwrap();
         write(&repo.path().join("package.json"), r#"{"name": "plain"}"#);
-        assert!(workspace_aliases(repo.path()).is_empty());
+        let map = WorkspaceMap::build(repo.path());
+        assert!(map.aliases.is_empty());
+        assert_eq!(map.classify("anything"), "resolver");
     }
 }

@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS module_edges(
   from_file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   request TEXT NOT NULL,
   to_file INTEGER,                -- resolved in-repo file
-  package TEXT                    -- external package name
+  package TEXT,                   -- external package name
+  resolution TEXT                 -- resolver | workspace | workspace-inferred
 );
 CREATE INDEX IF NOT EXISTS idx_module_edges_from ON module_edges(from_file);
 CREATE INDEX IF NOT EXISTS idx_module_edges_to ON module_edges(to_file);
@@ -360,8 +361,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     // rows across later source indexing so support fingerprints can expose
     // stale and degraded memory instead of silently deleting it.
 
+    // v6 -> v7: module_edges gains resolution provenance so the projector can
+    // distinguish heuristic workspace mappings from direct resolver results.
+    // Edges are rebuilt on every index; only invalidate the public snapshot so
+    // stale certain-labelled projections stop serving. (Fresh databases get
+    // the column from the schema batch; has_column makes this idempotent.)
+    if version < 7 {
+        if !has_column(conn, "module_edges", "resolution")? {
+            conn.execute("ALTER TABLE module_edges ADD COLUMN resolution TEXT", [])?;
+        }
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','6')
+        "INSERT INTO meta(key, value) VALUES('schema_version','7')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -403,7 +416,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         assert!(database.is_file());
         Ok(())
     }
@@ -440,7 +453,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -483,7 +496,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -549,8 +562,49 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "6");
+        assert_eq!(version, "7");
         assert_eq!((artifacts, supports), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v6_by_adding_module_edge_resolution_provenance() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '6');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '2');
+             CREATE TABLE module_edges(
+               from_file INTEGER NOT NULL, request TEXT NOT NULL,
+               to_file INTEGER, package TEXT
+             );
+             INSERT INTO module_edges VALUES(1, './x', 2, NULL);",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(version, "7");
+        // Legacy rows read as NULL resolution (treated as plain resolver).
+        let resolution: Option<String> = conn.query_row(
+            "SELECT resolution FROM module_edges WHERE from_file=1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(resolution, None);
+        let snapshots: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(snapshots, 0);
         Ok(())
     }
 }
