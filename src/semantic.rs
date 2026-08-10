@@ -1184,6 +1184,14 @@ mod tests {
         )?;
         assert_eq!(limited.candidates.len(), 2);
         assert!(limited.candidate_truncated);
+
+        let file_seed = workflow_candidates(repo.path(), &conn, &["entry.ts".into()], &options)
+            .expect_err("file seeds must not silently choose an operation");
+        assert!(
+            file_seed
+                .to_string()
+                .contains("workflow seed must resolve to a symbol anchor")
+        );
         Ok(())
     }
 

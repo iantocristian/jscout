@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::{file_role, origin, query::ModuleGraph, store};
 
 pub const PROJECTION_VERSION: &str = "9";
+const WORKFLOW_HUB_DEGREE_LIMIT: usize = 12;
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -2180,7 +2181,13 @@ pub fn workflow_neighborhood(
 
     let mut nodes = HashMap::from([(root.key.clone(), root)]);
     let mut relevance = HashMap::from([(anchor.to_string(), 1.0_f64)]);
+    // The same node may be rediscovered at another depth through a stronger
+    // runtime-crossing route. Keep depth in the expansion identity so that
+    // route can propagate its score, while suppressing weaker repeats at the
+    // same depth.
     let mut expanded: HashMap<(String, usize), f64> = HashMap::new();
+    let mut direct_degree_cache = HashMap::new();
+    let mut entity_degree_cache = HashMap::new();
     let mut frontier = BinaryHeap::from([WorkflowRankedNode {
         key: anchor.to_string(),
         depth: 0,
@@ -2205,7 +2212,13 @@ pub fn workflow_neighborhood(
         if state.depth >= depth {
             continue;
         }
-        let steps = workflow_logical_steps(conn, &state.key, &allowed_origins)?;
+        let steps = workflow_logical_steps(
+            conn,
+            &state.key,
+            &allowed_origins,
+            &mut direct_degree_cache,
+            &mut entity_degree_cache,
+        )?;
         for step in steps {
             if traversed_edges >= edge_limit {
                 truncated = true;
@@ -2271,6 +2284,8 @@ fn workflow_logical_steps(
     conn: &Connection,
     node: &str,
     allowed_origins: &HashSet<&str>,
+    direct_degree_cache: &mut HashMap<String, usize>,
+    entity_degree_cache: &mut HashMap<String, usize>,
 ) -> Result<Vec<WorkflowLogicalStep>> {
     let mut stmt = conn.prepare_cached(
         "SELECT src_key, dst_key, kind, confidence
@@ -2303,7 +2318,12 @@ fn workflow_logical_steps(
                 hub_floor: 1.0,
                 confidence_floor: confidence_weight(&confidence),
                 relation_floor: relation_weight(&kind),
-                terminal: workflow_direct_degree(conn, &other.key, allowed_origins)? > 12,
+                terminal: cached_workflow_direct_degree(
+                    conn,
+                    &other.key,
+                    allowed_origins,
+                    direct_degree_cache,
+                )? > WORKFLOW_HUB_DEGREE_LIMIT,
                 other,
                 runtime_boundary: false,
             };
@@ -2314,6 +2334,7 @@ fn workflow_logical_steps(
             && other.kind == "entity"
             && other.meta.get("plane").and_then(Value::as_str) == Some("general")
         {
+            let entity_degree = cached_graph_degree(conn, &other.key, entity_degree_cache)?;
             collect_general_workflow_steps(
                 conn,
                 node,
@@ -2321,6 +2342,7 @@ fn workflow_logical_steps(
                 &kind,
                 &confidence,
                 &other,
+                entity_degree,
                 allowed_origins,
                 &mut by_target,
             )?;
@@ -2331,6 +2353,17 @@ fn workflow_logical_steps(
         };
         if other.kind != "entity"
             || other.meta.get("plane").and_then(Value::as_str) != Some("runtime")
+        {
+            continue;
+        }
+        // A high-degree DI token is commonly infrastructure wiring. Walking
+        // from its provider side to every injection site would spend the
+        // candidate budget on an inverse-usage fan-out. Keep the useful
+        // consumer -> provider resolution, but suppress that reverse bridge.
+        if family == "di"
+            && !side
+            && cached_graph_degree(conn, &other.key, entity_degree_cache)?
+                > WORKFLOW_HUB_DEGREE_LIMIT
         {
             continue;
         }
@@ -2406,14 +2439,14 @@ fn collect_general_workflow_steps(
     kind: &str,
     confidence: &str,
     entity: &GraphNode,
+    entity_degree: usize,
     allowed_origins: &HashSet<&str>,
     steps: &mut HashMap<String, WorkflowLogicalStep>,
 ) -> Result<()> {
-    let entity_degree = graph_degree(conn, &entity.key)?;
     // Shared configuration/data identities are associative clues, not hard
     // handoffs. High-degree identities are repository-wide hubs and do not
     // belong in a bounded workflow candidate set.
-    if entity_degree > 12 {
+    if entity_degree > WORKFLOW_HUB_DEGREE_LIMIT {
         return Ok(());
     }
     let mut stmt = conn.prepare_cached(
@@ -2528,6 +2561,33 @@ fn workflow_direct_degree(
         }
     }
     Ok(neighbors.len())
+}
+
+fn cached_workflow_direct_degree(
+    conn: &Connection,
+    node: &str,
+    allowed_origins: &HashSet<&str>,
+    cache: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    if let Some(degree) = cache.get(node) {
+        return Ok(*degree);
+    }
+    let degree = workflow_direct_degree(conn, node, allowed_origins)?;
+    cache.insert(node.to_string(), degree);
+    Ok(degree)
+}
+
+fn cached_graph_degree(
+    conn: &Connection,
+    node: &str,
+    cache: &mut HashMap<String, usize>,
+) -> Result<usize> {
+    if let Some(degree) = cache.get(node) {
+        return Ok(*degree);
+    }
+    let degree = graph_degree(conn, node)?;
+    cache.insert(node.to_string(), degree);
+    Ok(degree)
 }
 
 fn workflow_direct_kind(kind: &str) -> bool {
@@ -3690,6 +3750,57 @@ mod tests {
     }
 
     #[test]
+    fn workflow_neighborhood_rejects_only_high_degree_general_entity_hubs() -> Result<()> {
+        let build = |reader_count: usize| -> Result<(i64, super::WorkflowNeighborhood)> {
+            let repo = tempfile::tempdir()?;
+            for index in 0..reader_count {
+                write(
+                    repo.path(),
+                    &format!("reader-{index}.ts"),
+                    &format!(
+                        "export function reader{index}() {{ return process.env.SHARED_KEY; }}\n"
+                    ),
+                )?;
+            }
+            let conn = store::open(repo.path())?;
+            indexer::index_repo(repo.path(), &conn)?;
+            let degree: i64 = conn.query_row(
+                "SELECT count(*) FROM resolved_edges edge
+                 JOIN entities entity
+                   ON entity.entity_key=edge.src_key OR entity.entity_key=edge.dst_key
+                 WHERE entity.entity_type='environment_variable'
+                   AND entity.name='SHARED_KEY'",
+                [],
+                |row| row.get(0),
+            )?;
+            let workflow = workflow_neighborhood(
+                &conn,
+                "sym:reader-0.ts#::reader0@1",
+                1,
+                100,
+                400,
+                &origin::defaults(),
+            )?;
+            Ok((degree, workflow))
+        };
+
+        let (low_degree, low) = build(5)?;
+        assert_eq!(low_degree, 5);
+        assert_eq!(low.nodes.len(), 5, "four low-degree peers should be clues");
+        assert!(!low.truncated);
+
+        let (high_degree, high) = build(14)?;
+        assert_eq!(high_degree, 14);
+        assert_eq!(
+            high.nodes.len(),
+            1,
+            "the shared hub must not associate peers"
+        );
+        assert!(!high.truncated);
+        Ok(())
+    }
+
+    #[test]
     fn job_and_di_entities_join_producers_handlers_tokens_and_implementations() -> Result<()> {
         let repo = tempfile::tempdir()?;
         write(
@@ -3806,6 +3917,72 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(injections, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_neighborhood_suppresses_only_inverse_high_degree_di_fanout() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "token.ts",
+            "export const MAILER = Symbol('mailer');\n",
+        )?;
+        write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
+        write(
+            repo.path(),
+            "module.ts",
+            "import { MAILER } from './token';\n\
+             import { MailerService } from './mailer';\n\
+             export const providers = [{ provide: MAILER, useClass: MailerService }];\n",
+        )?;
+        for index in 0..15 {
+            write(
+                repo.path(),
+                &format!("consumer-{index}.ts"),
+                &format!(
+                    "import {{ MAILER }} from './token';\n\
+                     export class Consumer{index} {{ constructor(@Inject(MAILER) mailer) {{}} }}\n"
+                ),
+            )?;
+        }
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let (entity, provider): (String, String) = conn.query_row(
+            "SELECT edge.src_key, edge.dst_key FROM resolved_edges edge
+             WHERE edge.kind='provides'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(super::graph_degree(&conn, &entity)?, 16);
+        let injector: String = conn.query_row(
+            "SELECT edge.src_key FROM resolved_edges edge
+             JOIN graph_nodes node ON node.node_key=edge.src_key
+             JOIN files file ON file.id=node.file_id
+             WHERE edge.kind='injects' AND edge.dst_key=?1
+               AND file.path='consumer-0.ts'",
+            [&entity],
+            |row| row.get(0),
+        )?;
+
+        let from_provider =
+            workflow_neighborhood(&conn, &provider, 1, 100, 400, &origin::defaults())?;
+        assert_eq!(
+            from_provider.nodes.len(),
+            1,
+            "a common provider must not fan out to every injection site"
+        );
+        assert!(!from_provider.truncated);
+
+        let from_consumer =
+            workflow_neighborhood(&conn, &injector, 1, 100, 400, &origin::defaults())?;
+        assert!(
+            from_consumer.nodes.iter().any(|node| node.key == provider),
+            "a consumer must still resolve its concrete provider"
+        );
+        assert_eq!(from_consumer.nodes.len(), 2);
+        assert!(!from_consumer.truncated);
         Ok(())
     }
 

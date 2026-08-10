@@ -185,7 +185,7 @@ enum Command {
     WorkflowCandidates {
         /// Repository root used to resolve candidate evidence
         root: PathBuf,
-        /// Current workflow seed anchors or uniquely resolvable symbol names
+        /// Current symbol anchors or uniquely resolvable symbol names; file anchors are rejected
         #[arg(required = true)]
         seeds: Vec<String>,
         /// Optional expected structural snapshot
