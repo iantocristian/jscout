@@ -11,7 +11,7 @@ use serde_json::json;
 
 /// Bump whenever deterministic extraction semantics change in a way that
 /// requires unchanged files to be parsed again.
-pub const EXTRACTION_VERSION: &str = "2";
+pub const EXTRACTION_VERSION: &str = "3";
 
 #[derive(Debug, Clone)]
 pub struct EntitySite {
@@ -485,9 +485,7 @@ impl EntityVisitor {
 
         if let Some(path) = callee_path.as_deref()
             && let Some(method) = http_method(callee_name)
-            && path
-                .split('.')
-                .any(|part| matches!(part, "app" | "router" | "server" | "route"))
+            && path.split('.').any(is_router_holder)
             && let Some(path_expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(route_path) = static_string(path_expression, &self.static_strings)
         {
@@ -515,6 +513,7 @@ impl EntityVisitor {
             && let Some(path) = callee_path.as_deref()
             && path.to_ascii_lowercase().contains("client")
             && let Some(config) = first_object_argument(call)
+            && !is_graphql_options_object(config)
         {
             for property in &config.properties {
                 let ObjectPropertyKind::ObjectProperty(property) = property else {
@@ -540,10 +539,7 @@ impl EntityVisitor {
 
         if matches!(callee_name, "get" | "require" | "getEnv" | "requireEnv")
             && callee_path.as_deref().is_some_and(|path| {
-                matches!(
-                    path,
-                    "Deno.env.get" | "env.get" | "config.get" | "getEnv" | "requireEnv"
-                )
+                matches!(path, "Deno.env.get" | "env.get" | "getEnv" | "requireEnv")
             })
             && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(name) = static_string(expression, &self.static_strings)
@@ -558,6 +554,25 @@ impl EntityVisitor {
                 target: None,
                 extractor: "environment-api-call",
                 provenance: "environment-api-pattern",
+                detail: json!({ "callee": callee_path }),
+            });
+        }
+
+        if matches!(callee_name, "get" | "require")
+            && callee_path.as_deref().is_some_and(is_config_api_path)
+            && let Some(expression) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(name) = static_string(expression, &self.static_strings)
+        {
+            self.push_general(GeneralSiteSpec {
+                entity_type: "config_key",
+                role: "config_read",
+                identity_kind: "literal",
+                identity_name: name,
+                identity_start: expression.span().start,
+                span: call.span,
+                target: None,
+                extractor: "configuration-api-call",
+                provenance: "configuration-api-pattern",
                 detail: json!({ "callee": callee_path }),
             });
         }
@@ -585,10 +600,10 @@ impl EntityVisitor {
         if let Some((resource, access)) = database_call(call, &self.static_strings) {
             self.push_general(GeneralSiteSpec {
                 entity_type: "database_resource",
-                role: if access == "write" {
-                    "database_write"
-                } else {
-                    "database_read"
+                role: match access {
+                    "write" => "database_write",
+                    "read" => "database_read",
+                    _ => "database_acquire",
                 },
                 identity_kind: "literal",
                 identity_name: resource,
@@ -1224,6 +1239,57 @@ fn http_method(name: &str) -> Option<&'static str> {
     }
 }
 
+fn is_router_holder(segment: &str) -> bool {
+    let segment = segment.to_ascii_lowercase();
+    matches!(segment.as_str(), "app" | "router" | "server" | "route") || segment.ends_with("router")
+}
+
+fn is_graphql_options_object(object: &ObjectExpression<'_>) -> bool {
+    object.properties.iter().any(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return false;
+        };
+        property.key.static_name().is_some_and(|name| {
+            matches!(
+                name.as_ref(),
+                "query"
+                    | "mutation"
+                    | "subscription"
+                    | "variables"
+                    | "fetchPolicy"
+                    | "errorPolicy"
+                    | "context"
+                    | "refetchQueries"
+                    | "awaitRefetchQueries"
+                    | "optimisticResponse"
+                    | "update"
+                    | "onCompleted"
+                    | "onError"
+                    | "pollInterval"
+                    | "notifyOnNetworkStatusChange"
+                    | "returnPartialData"
+                    | "skip"
+                    | "client"
+                    | "ssr"
+            )
+        })
+    })
+}
+
+fn is_config_api_path(path: &str) -> bool {
+    let mut segments = path.rsplit('.');
+    let Some(method) = segments.next() else {
+        return false;
+    };
+    if !matches!(method, "get" | "require") {
+        return false;
+    }
+    segments.next().is_some_and(|receiver| {
+        let receiver = receiver.to_ascii_lowercase();
+        receiver == "config" || receiver.ends_with("configservice")
+    })
+}
+
 fn normalize_route_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "/" {
@@ -1342,7 +1408,7 @@ fn database_call(
             Expression::Identifier(identifier) => identifier.name.to_string(),
             _ => static_string(resource, constants)?,
         };
-        return Some((name, "read"));
+        return Some((name, "acquire"));
     }
     let Expression::StaticMemberExpression(member) = &call.callee else {
         return None;
@@ -1381,28 +1447,52 @@ fn database_call(
     };
     let object = member_path(&member.object)?;
     let segments: Vec<&str> = object.split('.').collect();
-    let database_api = segments.iter().any(|segment| {
-        matches!(
-            segment.to_ascii_lowercase().as_str(),
-            "db" | "database" | "prisma" | "repository" | "repo" | "model"
-        )
-    });
-    if !database_api {
+    if let Some(resource) = segments
+        .iter()
+        .rev()
+        .find_map(|segment| database_holder_resource(segment))
+    {
+        return Some((resource, access));
+    }
+    let holder_index = segments
+        .iter()
+        .position(|segment| is_database_api_segment(segment))?;
+    if let Some(resource) = segments
+        .get(holder_index + 1..)
+        .and_then(|tail| tail.last())
+        .filter(|resource| !is_database_api_segment(resource))
+    {
+        return Some(((*resource).to_string(), access));
+    }
+    let holder = segments[holder_index].to_ascii_lowercase();
+    if !matches!(holder.as_str(), "db" | "database" | "prisma") {
         return None;
     }
-    let resource = if segments.len() > 1 {
-        segments.last()?.to_string()
-    } else {
-        let expression = call.arguments.first()?.as_expression()?;
-        match expression {
-            Expression::Identifier(identifier) => identifier.name.to_string(),
-            _ => static_string(expression, constants)?,
-        }
+    let expression = call.arguments.first()?.as_expression()?;
+    let resource = match expression {
+        Expression::Identifier(identifier) => identifier.name.to_string(),
+        _ => static_string(expression, constants)?,
     };
-    if is_database_api_segment(&resource) {
-        return None;
-    }
-    Some((resource, access))
+    (!is_database_api_segment(&resource)).then_some((resource, access))
+}
+
+fn database_holder_resource(holder: &str) -> Option<String> {
+    ["repository", "repo", "model"]
+        .into_iter()
+        .find_map(|suffix| {
+            let prefix_len = holder.len().checked_sub(suffix.len())?;
+            let (prefix, candidate_suffix) = holder.split_at(prefix_len);
+            (!prefix.is_empty() && candidate_suffix.eq_ignore_ascii_case(suffix))
+                .then(|| lower_first(prefix))
+        })
+}
+
+fn lower_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
 }
 
 fn is_database_api_segment(name: &str) -> bool {
@@ -1783,6 +1873,90 @@ mod tests {
         }
         assert!(!extracted.iter().any(|site| {
             site.entity_type == "database_resource" && site.identity_name == "repository"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_named_routers_without_treating_graphql_options_as_operations() -> Result<()> {
+        let extracted = sites(
+            "usersRouter.get('/users', listUsers);\n\
+             client.query({ query: GET_USER, variables: { id: 1 }, fetchPolicy: 'cache-first' });\n\
+             client.query({ currentUser: { id: true } });\n",
+        )?;
+
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "route"
+                && site.identity_name == "GET /users"
+                && site.target_name.as_deref() == Some("listUsers")
+        }));
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "graphql_operation" && site.identity_name == "query:currentUser"
+        }));
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "graphql_operation"
+                && matches!(
+                    site.identity_name.as_str(),
+                    "query:query" | "query:variables" | "query:fetchPolicy"
+                )
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_qualified_database_holders_and_labels_handle_acquisition() -> Result<()> {
+        let extracted = sites(
+            "this.db.insert(users);\n\
+             ctx.db.insert(accounts);\n\
+             this.userRepository.save(data);\n\
+             this.InvoiceModel.findMany();\n\
+             this.repository.save(data);\n\
+             getRepository(User);\n",
+        )?;
+
+        for (resource, role) in [
+            ("users", "database_write"),
+            ("accounts", "database_write"),
+            ("user", "database_write"),
+            ("invoice", "database_read"),
+            ("User", "database_acquire"),
+        ] {
+            assert!(
+                extracted.iter().any(|site| {
+                    site.entity_type == "database_resource"
+                        && site.identity_name == resource
+                        && site.role == role
+                }),
+                "missing {resource}/{role}"
+            );
+        }
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "database_resource"
+                && matches!(site.identity_name.as_str(), "repository" | "data")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn separates_configuration_keys_from_environment_variables() -> Result<()> {
+        let extracted = sites(
+            "config.get('database.host');\n\
+             this.configService.get('PORT');\n\
+             Deno.env.get('TOKEN');\n",
+        )?;
+
+        for key in ["database.host", "PORT"] {
+            assert!(extracted.iter().any(|site| {
+                site.entity_type == "config_key"
+                    && site.role == "config_read"
+                    && site.identity_name == key
+            }));
+            assert!(!extracted.iter().any(|site| {
+                site.entity_type == "environment_variable" && site.identity_name == key
+            }));
+        }
+        assert!(extracted.iter().any(|site| {
+            site.entity_type == "environment_variable" && site.identity_name == "TOKEN"
         }));
         Ok(())
     }

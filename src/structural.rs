@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "8";
+pub const PROJECTION_VERSION: &str = "9";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -1066,8 +1066,9 @@ fn project_entities(
 
         match site.role.as_str() {
             "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site"
-            | "graphql_operation" | "environment_read" | "database_read" | "database_write"
-            | "feature_flag_check" | "external_host_call" => {
+            | "graphql_operation" | "environment_read" | "config_read" | "database_read"
+            | "database_write" | "database_acquire" | "feature_flag_check"
+            | "external_host_call" => {
                 let kind = match site.role.as_str() {
                     "dispatch_site" => "dispatches",
                     "lifecycle_producer" => "produces_lifecycle",
@@ -1075,8 +1076,10 @@ fn project_entities(
                     "injection_site" => "injects",
                     "graphql_operation" => "invokes_graphql",
                     "environment_read" => "reads_env",
+                    "config_read" => "reads_config",
                     "database_read" => "reads_resource",
                     "database_write" => "writes_resource",
+                    "database_acquire" => "acquires_resource",
                     "feature_flag_check" => "checks_flag",
                     _ => "calls_host",
                 };
@@ -1122,6 +1125,19 @@ fn project_entities(
             | "route_handler" | "graphql_handler" => {
                 let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
                 let target_fallback = targets.keys.is_empty();
+                if target_fallback
+                    && matches!(site.role.as_str(), "route_handler" | "graphql_handler")
+                    && !matches!(
+                        site.extractor.as_str(),
+                        "http-route-decorator" | "graphql-operation-decorator"
+                    )
+                {
+                    // Inline or otherwise unresolved API-call handlers have no
+                    // honest symbol target. Preserve the entity occurrence but
+                    // do not fabricate a handler edge to the containing file or
+                    // the next declaration.
+                    continue;
+                }
                 if target_fallback {
                     targets = ProjectedTargets::exact(source.clone());
                 }
@@ -1459,8 +1475,8 @@ fn site_source_symbol<'a>(
         return Some(&owner.key);
     }
     if !matches!(
-        site.role.as_str(),
-        "decorator_use" | "route_handler" | "graphql_handler"
+        site.extractor.as_str(),
+        "decorator-contract" | "http-route-decorator" | "graphql-operation-decorator"
     ) {
         return None;
     }
@@ -2514,8 +2530,9 @@ fn workflow_direct_kind(kind: &str) -> bool {
 fn workflow_general_association_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "handles_graphql" | "invokes_graphql" => Some("graphql"),
-        "reads_resource" | "writes_resource" => Some("resource"),
+        "reads_resource" | "writes_resource" | "acquires_resource" => Some("resource"),
         "reads_env" => Some("environment"),
+        "reads_config" => Some("configuration"),
         "checks_flag" => Some("feature_flag"),
         "calls_host" => Some("external_host"),
         _ => None,
@@ -2854,7 +2871,7 @@ fn relation_weight(kind: &str) -> f64 {
         | "handles_route"
         | "handles_graphql" => 1.0,
         "invokes_graphql" | "reads_resource" | "writes_resource" => 0.9,
-        "reads_env" | "checks_flag" | "calls_host" => 0.8,
+        "acquires_resource" | "reads_env" | "reads_config" | "checks_flag" | "calls_host" => 0.8,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
         "imports_types" | "imports_package_types" => 0.6,
@@ -3816,8 +3833,10 @@ mod tests {
              }\n\
              export function run() {\n\
                process.env.API_KEY;\n\
+               config.get('database.host');\n\
                prisma.user.findMany();\n\
                prisma.user.create({ data: {} });\n\
+               getRepository(User);\n\
                flags.isEnabled('new-ui');\n\
                fetch('https://api.example.com/v1');\n\
                client.query({ currentUser: { id: true } });\n\
@@ -3835,8 +3854,10 @@ mod tests {
             ("graphql_operation", "query:user", "handles_graphql"),
             ("graphql_operation", "query:currentUser", "invokes_graphql"),
             ("environment_variable", "API_KEY", "reads_env"),
+            ("config_key", "database.host", "reads_config"),
             ("database_resource", "user", "reads_resource"),
             ("database_resource", "user", "writes_resource"),
+            ("database_resource", "User", "acquires_resource"),
             ("feature_flag", "new-ui", "checks_flag"),
             ("external_host", "api.example.com", "calls_host"),
         ] {
@@ -3869,6 +3890,51 @@ mod tests {
                 .iter()
                 .any(|node| node.display_name == "followup")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inline_route_handlers_do_not_attach_to_the_next_declaration() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "app.ts",
+            "export function listUsers() {}\n\
+             usersRouter.get('/users', listUsers);\n\
+             router.post('/webhooks', async (request) => request.body);\n\
+             export function unrelatedNearbyFunction() {}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let named_handler: String = conn.query_row(
+            "SELECT target.display_name FROM resolved_edges edge
+             JOIN entities route ON route.entity_key=edge.src_key
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='GET /users' AND edge.kind='handles_route'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(named_handler, "listUsers");
+        let inline_occurrences: i64 = conn.query_row(
+            "SELECT count(*) FROM entity_occurrences occurrence
+             JOIN entities route ON route.id=occurrence.entity_id
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='POST /webhooks'",
+            [],
+            |row| row.get(0),
+        )?;
+        let inline_handler_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges edge
+             JOIN entities route ON route.entity_key=edge.src_key
+             WHERE route.plane='general' AND route.entity_type='route'
+               AND route.name='POST /webhooks' AND edge.kind='handles_route'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(inline_occurrences, 1);
+        assert_eq!(inline_handler_edges, 0);
         Ok(())
     }
 
