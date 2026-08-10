@@ -91,6 +91,7 @@ pub fn index_repo_with_options(
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
+    ensure_extraction_version(conn)?;
     let files = walk::source_files(&root);
     let mut outcome = IndexOutcome {
         indexed: 0,
@@ -209,6 +210,40 @@ pub fn index_repo_with_options(
         eprintln!("timing structural-projection={:?}", projection_started.elapsed());
     }
     Ok(outcome)
+}
+
+fn ensure_extraction_version(conn: &Connection) -> Result<()> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='extraction_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    if current.as_deref() == Some(crate::entity::EXTRACTION_VERSION) {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute("UPDATE files SET hash=''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [crate::entity::EXTRACTION_VERSION],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
@@ -724,6 +759,37 @@ mod tests {
 
     use super::{IndexOptions, index_repo, index_repo_with_options};
     use crate::{origin, query, search, store, structural};
+
+    #[test]
+    fn extraction_version_change_forces_unchanged_files_through_extraction() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "export function run() { return process.env.API_KEY; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        let first = index_repo(repo.path(), &conn)?;
+        assert_eq!(first.indexed, 1);
+        let second = index_repo(repo.path(), &conn)?;
+        assert_eq!((second.indexed, second.unchanged), (0, 1));
+
+        conn.execute(
+            "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
+            [],
+        )?;
+        let third = index_repo(repo.path(), &conn)?;
+        assert_eq!((third.indexed, third.unchanged), (1, 0));
+        let environment_occurrences: i64 = conn.query_row(
+            "SELECT count(*) FROM entity_occurrences occurrence
+             JOIN entities entity ON entity.id=occurrence.entity_id
+             WHERE entity.plane='general' AND entity.entity_type='environment_variable'
+               AND entity.name='API_KEY'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(environment_occurrences, 1);
+        Ok(())
+    }
 
     #[test]
     fn resolves_paths_from_the_importers_nearest_tsconfig() -> Result<()> {

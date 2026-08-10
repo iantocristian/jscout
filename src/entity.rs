@@ -9,6 +9,10 @@ use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 use serde_json::json;
 
+/// Bump whenever deterministic extraction semantics change in a way that
+/// requires unchanged files to be parsed again.
+pub const EXTRACTION_VERSION: &str = "1";
+
 #[derive(Debug, Clone)]
 pub struct EntitySite {
     pub plane: &'static str,
@@ -1265,7 +1269,17 @@ fn database_call(
             _ => static_string(expression, constants)?,
         }
     };
+    if is_database_api_segment(&resource) {
+        return None;
+    }
     Some((resource, access))
+}
+
+fn is_database_api_segment(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "db" | "database" | "prisma" | "repository" | "repo" | "model" | "entitymanager"
+    )
 }
 
 fn is_external_call(path: Option<&str>, name: &str) -> bool {
@@ -1558,6 +1572,7 @@ mod tests {
              const token = Deno.env.get('TOKEN');\n\
              prisma.user.findMany();\n\
              prisma.user.create({ data });\n\
+             this.repository.save(data);\n\
              flags.isEnabled('new-ui');\n\
              fetch('https://api.example.com/v1/users');\n",
         )?;
@@ -1581,6 +1596,9 @@ mod tests {
                     && site.identity_name == identity
             }), "missing {entity_type}/{role}/{identity}");
         }
+        assert!(!extracted.iter().any(|site| {
+            site.entity_type == "database_resource" && site.identity_name == "repository"
+        }));
         Ok(())
     }
 }
