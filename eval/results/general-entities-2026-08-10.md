@@ -1,5 +1,9 @@
 # General deterministic entity validation — 2026-08-10
 
+> Post-merge recognizer findings and corrected large-repository counts are
+> recorded in
+> [`general-entities-followups-2026-08-10.md`](general-entities-followups-2026-08-10.md).
+
 ## Scope
 
 This slice adds six deterministic entity families to the structural graph:

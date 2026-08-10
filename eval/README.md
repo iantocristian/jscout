@@ -356,6 +356,9 @@ parameters, and contract graph load cost are recorded in
 The route, GraphQL, environment, database, feature-flag, and external-host
 entity implementation is recorded in
 [`results/general-entities-2026-08-10.md`](results/general-entities-2026-08-10.md).
+The post-merge recognizer corrections for handler attribution, named routers,
+database holders, GraphQL option objects, and configuration keys are recorded
+in [`results/general-entities-followups-2026-08-10.md`](results/general-entities-followups-2026-08-10.md).
 The deterministic repository overview, entity lookup, bounded paths, and the
 known-workflow regression rerun are recorded in
 [`results/agent-surfaces-2026-08-10.md`](results/agent-surfaces-2026-08-10.md).
