@@ -344,6 +344,9 @@ stops the experiment before any Terra classification run.
 The failed Stage A run, resolver diagnosis, deterministic repair rerun, and
 decision to require explicit runtime-boundary entities are recorded in
 [`results/twenty-workflow-candidate-gate-2026-08-09.md`](results/twenty-workflow-candidate-gate-2026-08-09.md).
+The first runtime-boundary implementation and its real-repository regression
+check are recorded in
+[`results/runtime-boundary-entities-2026-08-10.md`](results/runtime-boundary-entities-2026-08-10.md).
 The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
