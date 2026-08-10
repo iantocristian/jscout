@@ -50,6 +50,10 @@ pub struct FileGraph {
     pub symbols: Vec<SymbolRow>,
     pub imports: Vec<ImportRow>,
     pub exports: Vec<ExportRow>,
+    /// Type/documentary bindings, including declarations imported through a
+    /// runtime import. Kept separate so they cannot affect call projection.
+    pub contract_imports: Vec<ImportRow>,
+    pub contract_exports: Vec<ExportRow>,
     pub refs: Vec<RefRow>,
     /// All module requests (for resolution), including re-export sources.
     pub requests: Vec<String>,
@@ -62,31 +66,29 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
     let mut g = FileGraph::default();
     let record = &ret.module_record;
     let heur = crate::heur::extract(&ret.program);
-    g.entity_sites = crate::entity::extract(&ret.program);
 
     // ---- imports ----
     for entry in &record.import_entries {
-        if entry.is_type {
-            continue;
-        }
         let imported = match &entry.import_name {
             ImportImportName::Name(n) => n.name.to_string(),
             ImportImportName::NamespaceObject => "*".to_string(),
             ImportImportName::Default(_) => "default".to_string(),
         };
-        g.imports.push(ImportRow {
+        let row = ImportRow {
             local: entry.local_name.name.to_string(),
             imported,
             request: entry.module_request.name.to_string(),
-        });
+        };
+        g.contract_imports.push(row.clone());
+        if !entry.is_type {
+            g.imports.push(row);
+        }
     }
 
     // ---- exports ----
     let mut exported_locals: std::collections::HashSet<String> = Default::default();
+    let mut exported_contract_locals: std::collections::HashSet<String> = Default::default();
     for entry in &record.local_export_entries {
-        if entry.is_type {
-            continue;
-        }
         let export_name = match &entry.export_name {
             ExportExportName::Name(n) => n.name.to_string(),
             ExportExportName::Default(_) => "default".to_string(),
@@ -98,14 +100,19 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
             ExportLocalName::Null => None,
         };
         if let Some(l) = &local_name {
-            exported_locals.insert(l.clone());
+            exported_contract_locals.insert(l.clone());
         }
-        g.exports.push(ExportRow { export_name, local_name, from_request: None, from_name: None });
-    }
-    for entry in &record.indirect_export_entries {
+        let row = ExportRow { export_name, local_name, from_request: None, from_name: None };
+        g.contract_exports.push(row.clone());
         if entry.is_type {
             continue;
         }
+        if let Some(l) = &row.local_name {
+            exported_locals.insert(l.clone());
+        }
+        g.exports.push(row);
+    }
+    for entry in &record.indirect_export_entries {
         let Some(request) = &entry.module_request else { continue };
         let export_name = match &entry.export_name {
             ExportExportName::Name(n) => n.name.to_string(),
@@ -117,12 +124,17 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
             ExportImportName::All | ExportImportName::AllButDefault => "*".to_string(),
             ExportImportName::Null => continue,
         };
-        g.exports.push(ExportRow {
+        let row = ExportRow {
             export_name,
             local_name: None,
             from_request: Some(request.name.to_string()),
             from_name: Some(from_name.clone()),
-        });
+        };
+        g.contract_exports.push(row.clone());
+        if entry.is_type {
+            continue;
+        }
+        g.exports.push(row);
         g.refs.push(RefRow {
             span_start: entry.span.start,
             kind: "reexport",
@@ -134,17 +146,19 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         });
     }
     for entry in &record.star_export_entries {
-        if entry.is_type {
-            continue;
-        }
         let Some(request) = &entry.module_request else { continue };
-        g.exports.push(ExportRow {
+        let row = ExportRow {
             export_name: "*".to_string(),
             local_name: None,
             from_request: Some(request.name.to_string()),
             from_name: Some("*".to_string()),
-        });
+        };
+        g.contract_exports.push(row.clone());
+        if !entry.is_type {
+            g.exports.push(row);
+        }
     }
+    g.entity_sites = crate::entity::extract(&ret.program, &exported_contract_locals);
     g.requests = record.requested_modules.keys().map(|s| s.to_string()).collect();
 
     // ---- CommonJS + dynamic-import heuristics ----

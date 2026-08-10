@@ -317,6 +317,34 @@ fn insert_file(
         ins_exp.execute(params![file_id, e.export_name, e.local_name, e.from_request, e.from_name])?;
     }
 
+    let mut ins_contract_imp = conn.prepare_cached(
+        "INSERT INTO contract_imports(file_id, local_name, imported_name, request)
+         VALUES(?1,?2,?3,?4)",
+    )?;
+    for import in &data.graph.contract_imports {
+        ins_contract_imp.execute(params![
+            file_id,
+            import.local,
+            import.imported,
+            import.request,
+        ])?;
+    }
+
+    let mut ins_contract_exp = conn.prepare_cached(
+        "INSERT INTO contract_exports(
+           file_id, export_name, local_name, from_request, from_name
+         ) VALUES(?1,?2,?3,?4,?5)",
+    )?;
+    for export in &data.graph.contract_exports {
+        ins_contract_exp.execute(params![
+            file_id,
+            export.export_name,
+            export.local_name,
+            export.from_request,
+            export.from_name,
+        ])?;
+    }
+
     let mut ins_event = conn.prepare_cached(
         "INSERT INTO events(file_id, chunk_id, line, role, name, method) VALUES(?1,?2,?3,?4,?5,?6)",
     )?;
@@ -605,6 +633,9 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
             "SELECT DISTINCT f.id, r.request FROM files f
              JOIN (SELECT file_id, request FROM imports
                    UNION SELECT file_id, from_request FROM exports WHERE from_request IS NOT NULL
+                   UNION SELECT file_id, request FROM contract_imports
+                   UNION SELECT file_id, from_request FROM contract_exports
+                     WHERE from_request IS NOT NULL
                    UNION SELECT file_id, target_request FROM refs WHERE target_request IS NOT NULL) r
              ON r.file_id = f.id",
         )?;

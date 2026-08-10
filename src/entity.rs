@@ -2,11 +2,11 @@
 //! boundaries. Extraction records source-local sites first; resolution later
 //! groups those sites under snapshot-canonical entities.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
 use serde_json::json;
 
 #[derive(Debug, Clone)]
@@ -33,9 +33,159 @@ struct EntityVisitor {
     // approximation, not scope-aware constant evaluation or declaration
     // hoisting. Confidence remains `likely` where it contributes identity.
     static_strings: HashMap<String, String>,
+    exported: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct TypeReference {
+    name: String,
+    start: u32,
+    end: u32,
+}
+
+#[derive(Default)]
+struct TypeReferenceVisitor {
+    references: Vec<TypeReference>,
+}
+
+impl<'a> Visit<'a> for TypeReferenceVisitor {
+    fn visit_ts_type_reference(&mut self, reference: &TSTypeReference<'a>) {
+        let name = reference.type_name.to_string();
+        if !is_builtin_contract_wrapper(&name) {
+            self.references.push(TypeReference {
+                name,
+                start: reference.type_name.span().start,
+                end: reference.type_name.span().end,
+            });
+        }
+        oxc_ast_visit::walk::walk_ts_type_reference(self, reference);
+    }
 }
 
 impl EntityVisitor {
+    fn push_contract_declaration(
+        &mut self,
+        entity_type: &'static str,
+        name: &str,
+        name_span: Span,
+        declaration_span: Span,
+        trust: (&'static str, &'static str),
+        detail: serde_json::Value,
+    ) {
+        self.sites.push(EntitySite {
+            plane: "contract",
+            entity_type,
+            role: "contract_declaration",
+            identity_kind: "reference",
+            identity_name: name.to_string(),
+            identity_start: name_span.start,
+            target_name: None,
+            target_start: None,
+            span_start: declaration_span.start,
+            span_end: declaration_span.end,
+            extractor: "contract-declaration",
+            provenance: trust.0,
+            confidence: trust.1,
+            detail,
+        });
+    }
+
+    fn push_contract_references(
+        &mut self,
+        references: Vec<TypeReference>,
+        role: &'static str,
+        owner: &str,
+        owner_kind: &'static str,
+    ) {
+        for reference in references {
+            self.sites.push(EntitySite {
+                plane: "contract",
+                entity_type: "reference",
+                role,
+                identity_kind: "reference",
+                identity_name: reference.name,
+                identity_start: reference.start,
+                target_name: None,
+                target_start: None,
+                span_start: reference.start,
+                span_end: reference.end,
+                extractor: "typescript-contract-reference",
+                provenance: "type-syntax",
+                confidence: "certain",
+                detail: json!({ "owner": owner, "ownerKind": owner_kind }),
+            });
+        }
+    }
+
+    fn extract_function_contracts(
+        &mut self,
+        owner: &str,
+        owner_kind: &'static str,
+        function: &Function<'_>,
+    ) {
+        for (index, parameter) in function.params.items.iter().enumerate() {
+            if let Some(annotation) = &parameter.type_annotation {
+                let before = self.sites.len();
+                self.push_contract_references(
+                    collect_type_references(annotation),
+                    "parameter_contract",
+                    owner,
+                    owner_kind,
+                );
+                for site in &mut self.sites[before..] {
+                    site.detail["parameterIndex"] = json!(index);
+                }
+            }
+        }
+        if let Some(rest) = &function.params.rest
+            && let Some(annotation) = &rest.type_annotation
+        {
+            self.push_contract_references(
+                collect_type_references(annotation),
+                "parameter_contract",
+                owner,
+                owner_kind,
+            );
+        }
+        if let Some(annotation) = &function.return_type {
+            self.push_contract_references(
+                collect_type_references(annotation),
+                "return_contract",
+                owner,
+                owner_kind,
+            );
+        }
+    }
+
+    fn extract_arrow_contracts(
+        &mut self,
+        owner: &str,
+        arrow: &ArrowFunctionExpression<'_>,
+    ) {
+        for (index, parameter) in arrow.params.items.iter().enumerate() {
+            if let Some(annotation) = &parameter.type_annotation {
+                let before = self.sites.len();
+                self.push_contract_references(
+                    collect_type_references(annotation),
+                    "parameter_contract",
+                    owner,
+                    "exported_arrow",
+                );
+                for site in &mut self.sites[before..] {
+                    site.detail["parameterIndex"] = json!(index);
+                }
+            }
+        }
+        if let Some(annotation) = &arrow.return_type {
+            self.push_contract_references(
+                collect_type_references(annotation),
+                "return_contract",
+                owner,
+                "exported_arrow",
+            );
+        }
+    }
+
     fn identity(&self, expression: &Expression<'_>) -> Option<(&'static str, String, u32)> {
         match expression {
             Expression::Identifier(identifier) => Some((
@@ -282,11 +432,147 @@ impl<'a> Visit<'a> for EntityVisitor {
     fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(identifier) = &declaration.id
             && let Some(initializer) = &declaration.init
-            && let Some(value) = static_string(initializer, &self.static_strings)
         {
-            self.static_strings.insert(identifier.name.to_string(), value);
+            if let Some(value) = static_string(initializer, &self.static_strings) {
+                self.static_strings.insert(identifier.name.to_string(), value);
+            }
+            if self.exported.contains(identifier.name.as_str())
+                && let Expression::ArrowFunctionExpression(arrow) = initializer
+            {
+                self.extract_arrow_contracts(identifier.name.as_str(), arrow);
+            }
+            if let Some(callee) = validation_schema_callee(initializer, identifier.name.as_str()) {
+                self.push_contract_declaration(
+                    "schema",
+                    identifier.name.as_str(),
+                    identifier.span,
+                    declaration.span,
+                    ("validation-schema-pattern", "likely"),
+                    json!({
+                        "declarationKind": "validation_schema",
+                        "callee": callee,
+                        "exported": self.exported.contains(identifier.name.as_str()),
+                    }),
+                );
+            }
         }
         oxc_ast_visit::walk::walk_variable_declarator(self, declaration);
+    }
+
+    fn visit_function(
+        &mut self,
+        function: &Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if let Some(identifier) = &function.id
+            && self.exported.contains(identifier.name.as_str())
+        {
+            self.extract_function_contracts(
+                identifier.name.as_str(),
+                "exported_function",
+                function,
+            );
+        }
+        oxc_ast_visit::walk::walk_function(self, function, flags);
+    }
+
+    fn visit_ts_interface_declaration(&mut self, declaration: &TSInterfaceDeclaration<'a>) {
+        let name = declaration.id.name.as_str();
+        self.push_contract_declaration(
+            "interface",
+            name,
+            declaration.id.span,
+            declaration.span,
+            ("type-declaration", "certain"),
+            json!({
+                "declarationKind": "interface",
+                "exported": self.exported.contains(name),
+            }),
+        );
+        let mut collector = TypeReferenceVisitor::default();
+        oxc_ast_visit::walk::walk_ts_interface_declaration(&mut collector, declaration);
+        self.push_contract_references(
+            collector.references,
+            "contract_reference",
+            name,
+            "interface",
+        );
+        oxc_ast_visit::walk::walk_ts_interface_declaration(self, declaration);
+    }
+
+    fn visit_ts_type_alias_declaration(&mut self, declaration: &TSTypeAliasDeclaration<'a>) {
+        let name = declaration.id.name.as_str();
+        self.push_contract_declaration(
+            "type_alias",
+            name,
+            declaration.id.span,
+            declaration.span,
+            ("type-declaration", "certain"),
+            json!({
+                "declarationKind": "type_alias",
+                "exported": self.exported.contains(name),
+            }),
+        );
+        let mut collector = TypeReferenceVisitor::default();
+        oxc_ast_visit::walk::walk_ts_type_alias_declaration(&mut collector, declaration);
+        self.push_contract_references(
+            collector.references,
+            "contract_reference",
+            name,
+            "type_alias",
+        );
+        oxc_ast_visit::walk::walk_ts_type_alias_declaration(self, declaration);
+    }
+
+    fn visit_ts_enum_declaration(&mut self, declaration: &TSEnumDeclaration<'a>) {
+        let name = declaration.id.name.as_str();
+        self.push_contract_declaration(
+            "enum",
+            name,
+            declaration.id.span,
+            declaration.span,
+            ("type-declaration", "certain"),
+            json!({
+                "declarationKind": "enum",
+                "exported": self.exported.contains(name),
+                "const": declaration.r#const,
+            }),
+        );
+        oxc_ast_visit::walk::walk_ts_enum_declaration(self, declaration);
+    }
+
+    fn visit_class(&mut self, class: &Class<'a>) {
+        if let Some(identifier) = &class.id {
+            let name = identifier.name.as_str();
+            if class_is_contract_schema(class) {
+                self.push_contract_declaration(
+                    "schema",
+                    name,
+                    identifier.span,
+                    class.span,
+                    ("dto-schema-pattern", "likely"),
+                    json!({
+                        "declarationKind": "dto_schema",
+                        "exported": self.exported.contains(name),
+                    }),
+                );
+            }
+            if self.exported.contains(name) {
+                for element in &class.body.body {
+                    if let ClassElement::MethodDefinition(method) = element
+                        && method.accessibility != Some(TSAccessibility::Private)
+                        && let Some(method_name) = method.key.static_name()
+                    {
+                        self.extract_function_contracts(
+                            &format!("{name}.{method_name}"),
+                            "exported_method",
+                            &method.value,
+                        );
+                    }
+                }
+            }
+        }
+        oxc_ast_visit::walk::walk_class(self, class);
     }
 
     fn visit_object_expression(&mut self, object: &ObjectExpression<'a>) {
@@ -363,6 +649,24 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_decorator(&mut self, decorator: &Decorator<'a>) {
+        if let Some((name, start)) = decorator_reference(&decorator.expression) {
+            self.sites.push(EntitySite {
+                plane: "contract",
+                entity_type: "decorator",
+                role: "decorator_use",
+                identity_kind: "reference",
+                identity_name: name,
+                identity_start: start,
+                target_name: None,
+                target_start: None,
+                span_start: decorator.span.start,
+                span_end: decorator.span.end,
+                extractor: "decorator-contract",
+                provenance: "decorator-syntax",
+                confidence: "certain",
+                detail: json!({ "syntax": "decorator" }),
+            });
+        }
         self.extract_decorator(decorator);
         oxc_ast_visit::walk::walk_decorator(self, decorator);
     }
@@ -371,13 +675,115 @@ impl<'a> Visit<'a> for EntityVisitor {
 /// Extract source-local entity evidence. Recognizers are deliberately narrow:
 /// each emitted site names its framework/convention and remains below
 /// `certain` unless syntax alone proves the relationship.
-pub fn extract(program: &Program<'_>) -> Vec<EntitySite> {
+pub fn extract(program: &Program<'_>, exported: &HashSet<String>) -> Vec<EntitySite> {
     let mut visitor = EntityVisitor {
         sites: Vec::new(),
         static_strings: HashMap::new(),
+        exported: exported.clone(),
     };
     visitor.visit_program(program);
     visitor.sites
+}
+
+fn collect_type_references<'a>(annotation: &'a TSTypeAnnotation<'a>) -> Vec<TypeReference> {
+    let mut visitor = TypeReferenceVisitor::default();
+    visitor.visit_ts_type_annotation(annotation);
+    visitor.references
+}
+
+fn is_builtin_contract_wrapper(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "ReadonlyArray"
+            | "Promise"
+            | "PromiseLike"
+            | "Record"
+            | "Partial"
+            | "Required"
+            | "Readonly"
+            | "Pick"
+            | "Omit"
+            | "Exclude"
+            | "Extract"
+            | "NonNullable"
+            | "Parameters"
+            | "ConstructorParameters"
+            | "ReturnType"
+            | "InstanceType"
+            | "Awaited"
+            | "Map"
+            | "ReadonlyMap"
+            | "WeakMap"
+            | "Set"
+            | "ReadonlySet"
+            | "WeakSet"
+            | "Date"
+            | "Error"
+            | "RegExp"
+    )
+}
+
+fn decorator_reference(expression: &Expression<'_>) -> Option<(String, u32)> {
+    match expression {
+        Expression::Identifier(identifier) => {
+            Some((identifier.name.to_string(), identifier.span.start))
+        }
+        Expression::CallExpression(call) => match &call.callee {
+            Expression::Identifier(identifier) => {
+                Some((identifier.name.to_string(), identifier.span.start))
+            }
+            expression => Some((member_path(expression)?, expression.span().start)),
+        },
+        expression => Some((member_path(expression)?, expression.span().start)),
+    }
+}
+
+fn validation_schema_callee(expression: &Expression<'_>, binding: &str) -> Option<String> {
+    let Expression::CallExpression(call) = expression else { return None };
+    let path = member_path(&call.callee)?;
+    let recognized = matches!(
+        path.as_str(),
+        "z.object"
+            | "z.strictObject"
+            | "yup.object"
+            | "Joi.object"
+            | "Type.Object"
+            | "v.object"
+            | "valibot.object"
+    ) || (binding.to_ascii_lowercase().ends_with("schema")
+        && matches!(
+            path.rsplit('.').next(),
+            Some("object" | "strictObject" | "createSchema" | "defineSchema" | "schema")
+        ));
+    recognized.then_some(path)
+}
+
+fn class_is_contract_schema(class: &Class<'_>) -> bool {
+    let Some(identifier) = &class.id else { return false };
+    let lower = identifier.name.to_ascii_lowercase();
+    if lower.ends_with("dto") {
+        return true;
+    }
+    class.decorators.iter().any(|decorator| {
+        decorator_reference(&decorator.expression).is_some_and(|(name, _)| {
+            matches!(
+                name.rsplit('.').next(),
+                Some("InputType" | "ObjectType" | "ArgsType" | "Schema")
+            )
+        })
+    }) || class.body.body.iter().any(|element| match element {
+        ClassElement::PropertyDefinition(property) => property.decorators.iter().any(|decorator| {
+            decorator_reference(&decorator.expression).is_some_and(|(name, _)| {
+                name.rsplit('.').next().is_some_and(|name| {
+                    name.starts_with("Is")
+                        || name.starts_with("Validate")
+                        || matches!(name, "ApiProperty" | "Field")
+                })
+            })
+        }),
+        _ => false,
+    })
 }
 
 fn first_object_argument<'a>(call: &'a CallExpression<'a>) -> Option<&'a ObjectExpression<'a>> {
@@ -450,6 +856,7 @@ fn member_path(expression: &Expression<'_>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
 
     use anyhow::Result;
@@ -458,7 +865,17 @@ mod tests {
 
     fn sites(source: &str) -> Result<Vec<super::EntitySite>> {
         crate::parse::with_parsed(source, Path::new("fixture.ts"), |ret, _| {
-            extract(&ret.program)
+            extract(&ret.program, &HashSet::new())
+        })
+    }
+
+    fn sites_with_exports(
+        source: &str,
+        exported: impl IntoIterator<Item = &'static str>,
+    ) -> Result<Vec<super::EntitySite>> {
+        let exported = exported.into_iter().map(str::to_string).collect();
+        crate::parse::with_parsed(source, Path::new("fixture.ts"), |ret, _| {
+            extract(&ret.program, &exported)
         })
     }
 
@@ -587,6 +1004,53 @@ mod tests {
                     && site.identity_name == identity
             }));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_contract_declarations_exported_api_types_decorators_and_schemas() -> Result<()> {
+        let extracted = sites_with_exports(
+            "export interface User extends Entity { id: string }\n\
+             export type UserResult = Promise<User>;\n\
+             export enum UserState { Active }\n\
+             export function load(input: User): Promise<UserResult> { throw Error(); }\n\
+             export const save = (input: User): UserResult => input;\n\
+             export const userSchema = z.object({ id: z.string() });\n\
+             @InputType() class CreateUserDto { @IsString() name: string; }\n",
+            ["User", "UserResult", "UserState", "load", "save", "userSchema"],
+        )?;
+        for (entity_type, name) in [
+            ("interface", "User"),
+            ("type_alias", "UserResult"),
+            ("enum", "UserState"),
+            ("schema", "userSchema"),
+            ("schema", "CreateUserDto"),
+        ] {
+            assert!(extracted.iter().any(|site| {
+                site.plane == "contract"
+                    && site.role == "contract_declaration"
+                    && site.entity_type == entity_type
+                    && site.identity_name == name
+            }));
+        }
+        assert!(extracted.iter().any(|site| {
+            site.role == "parameter_contract" && site.identity_name == "User"
+        }));
+        assert!(extracted.iter().any(|site| {
+            site.role == "return_contract" && site.identity_name == "UserResult"
+        }));
+        assert!(!extracted.iter().any(|site| {
+            matches!(
+                site.role,
+                "parameter_contract" | "return_contract" | "contract_reference"
+            ) && site.identity_name == "Promise"
+        }));
+        assert!(extracted.iter().any(|site| {
+            site.role == "decorator_use" && site.identity_name == "InputType"
+        }));
+        assert!(extracted.iter().any(|site| {
+            site.role == "decorator_use" && site.identity_name == "IsString"
+        }));
         Ok(())
     }
 }

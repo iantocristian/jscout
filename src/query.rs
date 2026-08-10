@@ -16,6 +16,7 @@ struct ExportEntry {
 /// consumers can downgrade confidence for paths that cross such edges.
 pub struct ModuleGraph {
     exports: HashMap<i64, Vec<ExportEntry>>,
+    contract_exports: HashMap<i64, Vec<ExportEntry>>,
     edges: HashMap<(i64, String), (Option<i64>, bool)>,
     pub paths: HashMap<i64, String>,
 }
@@ -39,6 +40,27 @@ impl ModuleGraph {
         for row in rows {
             let (id, e) = row?;
             exports.entry(id).or_default().push(e);
+        }
+
+        let mut contract_exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT file_id, export_name, local_name, from_request, from_name
+             FROM contract_exports",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                ExportEntry {
+                    export_name: r.get(1)?,
+                    local_name: r.get(2)?,
+                    from_request: r.get(3)?,
+                    from_name: r.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, entry) = row?;
+            contract_exports.entry(id).or_default().push(entry);
         }
 
         let mut edges: HashMap<(i64, String), (Option<i64>, bool)> = HashMap::new();
@@ -65,7 +87,7 @@ impl ModuleGraph {
             let (id, path) = row?;
             paths.insert(id, path);
         }
-        Ok(Self { exports, edges, paths })
+        Ok(Self { exports, contract_exports, edges, paths })
     }
 
     pub fn edge(&self, file: i64, request: &str) -> Option<i64> {
@@ -90,13 +112,37 @@ impl ModuleGraph {
     /// on the successful chain crossed a heuristically resolved module edge.
     pub fn resolve_export_traced(&self, file: i64, name: &str) -> Option<(i64, String, bool)> {
         let mut inferred = false;
-        let (file, name) =
-            self.resolve_export_inner(file, name, &mut HashSet::new(), &mut inferred)?;
+        let (file, name) = self.resolve_export_inner(
+            &self.exports,
+            file,
+            name,
+            &mut HashSet::new(),
+            &mut inferred,
+        )?;
+        Some((file, name, inferred))
+    }
+
+    /// Resolve a documentary/type export chain without allowing type-only
+    /// bindings to influence runtime reference projection.
+    pub fn resolve_contract_export_traced(
+        &self,
+        file: i64,
+        name: &str,
+    ) -> Option<(i64, String, bool)> {
+        let mut inferred = false;
+        let (file, name) = self.resolve_export_inner(
+            &self.contract_exports,
+            file,
+            name,
+            &mut HashSet::new(),
+            &mut inferred,
+        )?;
         Some((file, name, inferred))
     }
 
     fn resolve_export_inner(
         &self,
+        exports: &HashMap<i64, Vec<ExportEntry>>,
         file: i64,
         name: &str,
         visited: &mut HashSet<(i64, String)>,
@@ -105,7 +151,7 @@ impl ModuleGraph {
         if !visited.insert((file, name.to_string())) {
             return None; // cycle
         }
-        let entries = self.exports.get(&file)?;
+        let entries = exports.get(&file)?;
         // Exact export first.
         for e in entries {
             if e.export_name != name {
@@ -123,7 +169,7 @@ impl ModuleGraph {
                         // `export * as ns from` — the namespace itself.
                         return Some((target, "*".to_string()));
                     }
-                    return self.resolve_export_inner(target, from, visited, inferred);
+                    return self.resolve_export_inner(exports, target, from, visited, inferred);
                 }
                 _ => return None,
             }
@@ -139,7 +185,9 @@ impl ModuleGraph {
                 if self.edge_inferred(file, request) {
                     *inferred = true;
                 }
-                if let Some(hit) = self.resolve_export_inner(target, name, visited, inferred) {
+                if let Some(hit) =
+                    self.resolve_export_inner(exports, target, name, visited, inferred)
+                {
                     return Some(hit);
                 }
                 *inferred = before;
