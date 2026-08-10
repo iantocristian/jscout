@@ -4,13 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::evidence::EvidencePack;
 use super::ledger::ClassificationRow;
-use crate::semantic::{WorkflowCandidate, WorkflowParticipantInput};
+use crate::semantic::{AnnotateInput, SupportInput, WorkflowCandidate};
 
 pub const PROMPT_VERSION: &str = "workflow-scout/v1";
 pub const SUBMIT_TOOL_NAME: &str = "submit_workflow_classification";
@@ -137,9 +137,19 @@ pub struct LineRange {
 pub struct ValidatedWorkflow {
     pub name: String,
     pub description: String,
-    pub participants: Vec<WorkflowParticipantInput>,
+    pub participants: Vec<ValidatedParticipant>,
     pub classifications: Vec<ClassificationRow>,
     pub incomplete: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedParticipant {
+    pub anchor: String,
+    pub role: String,
+    pub scope: String,
+    pub evidence_file: String,
+    pub evidence: Vec<LineRange>,
+    pub confidence: String,
 }
 
 pub fn validate(
@@ -251,17 +261,16 @@ pub fn validate(
                             file.line_count
                         );
                     }
-                    participants.push(WorkflowParticipantInput {
-                        anchor: known_candidate.anchor.clone(),
-                        role: role.to_string(),
-                        scope: candidate.decision.clone(),
-                        evidence_file: known_candidate.file.clone(),
-                        evidence_start_line: range.start_line,
-                        evidence_end_line: range.end_line,
-                        // Generated claims never exceed `likely`.
-                        confidence: "likely".into(),
-                    });
                 }
+                participants.push(ValidatedParticipant {
+                    anchor: known_candidate.anchor.clone(),
+                    role: role.to_string(),
+                    scope: candidate.decision.clone(),
+                    evidence_file: known_candidate.file.clone(),
+                    evidence: ranges.to_vec(),
+                    // Generated claims never exceed `likely`.
+                    confidence: "likely".into(),
+                });
             }
             "excluded" => {
                 let reason = candidate
@@ -313,6 +322,84 @@ pub fn validate(
         participants,
         classifications: classification_rows(submission, candidates)?,
         incomplete: None,
+    })
+}
+
+/// Convert a validated model submission into the generic semantic write
+/// shape. Participants and supports are intentionally separate: one workflow
+/// participant may cite several evidence spans without becoming several body
+/// entries.
+pub fn annotate_input(
+    workflow: &ValidatedWorkflow,
+    snapshot: String,
+    supersedes: Option<i64>,
+) -> Result<AnnotateInput> {
+    let body_participants: Vec<Value> = workflow
+        .participants
+        .iter()
+        .map(|participant| {
+            json!({
+                "anchor": participant.anchor,
+                "role": participant.role,
+                "scope": participant.scope,
+            })
+        })
+        .collect();
+    let support =
+        |claim_path: String, participant: &ValidatedParticipant, range: &LineRange| SupportInput {
+            claim_path,
+            anchor: participant.anchor.clone(),
+            role: None,
+            evidence_file: participant.evidence_file.clone(),
+            evidence_start_line: range.start_line,
+            evidence_end_line: range.end_line,
+            confidence: participant.confidence.clone(),
+        };
+
+    let defining: Vec<&ValidatedParticipant> = workflow
+        .participants
+        .iter()
+        .filter(|participant| participant.scope == "defining")
+        .collect();
+    let first_defining = defining
+        .first()
+        .context("validated workflow requires a defining participant")?;
+    let first_range = first_defining
+        .evidence
+        .first()
+        .context("validated workflow participant requires evidence")?;
+    let mut supports = Vec::new();
+    supports.push(support("/name".into(), first_defining, first_range));
+    // A workflow description summarizes its defining boundary. Ground it in
+    // every defining stage rather than arbitrarily assigning it to the first.
+    for participant in defining {
+        let range = participant
+            .evidence
+            .first()
+            .context("validated workflow participant requires evidence")?;
+        supports.push(support("/description".into(), participant, range));
+    }
+    for (index, participant) in workflow.participants.iter().enumerate() {
+        for range in &participant.evidence {
+            supports.push(support(
+                format!("/participants/{index}/role"),
+                participant,
+                range,
+            ));
+        }
+    }
+
+    Ok(AnnotateInput {
+        artifact_type: "workflow".into(),
+        name: Some(workflow.name.clone()),
+        body: json!({
+            "description": workflow.description,
+            "participants": body_participants,
+        }),
+        supports,
+        confidence: "likely".into(),
+        snapshot,
+        supersedes,
     })
 }
 

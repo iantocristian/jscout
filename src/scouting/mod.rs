@@ -27,9 +27,8 @@ use evidence::EvidencePack;
 use ledger::{ClassificationRow, RunClaim, RunOutcome, RunSpec};
 
 const ORPHAN_SWEEP_MINUTES: i64 = 24 * 60;
-/// Rough bytes-per-token floor used only to reject packs that cannot
-/// possibly fit the selected model's reported context window.
-const MIN_BYTES_PER_TOKEN: usize = 3;
+const BASE_OUTPUT_TOKENS: u64 = 2_048;
+const OUTPUT_TOKENS_PER_CANDIDATE: u64 = 512;
 
 #[derive(Debug, Clone)]
 pub struct WorkflowScoutOptions {
@@ -97,8 +96,14 @@ pub fn scout_workflows(
         Ok((candidate_set, evidence))
     })?;
 
-    let request = build_request(&candidate_set, &evidence, options)?;
-    enforce_context_budget(gateway, &request, &evidence, options)?;
+    let mut request = build_request(&candidate_set, &evidence, options)?;
+    enforce_context_budget(
+        gateway,
+        &mut request,
+        &evidence,
+        candidate_set.candidates.len(),
+        options,
+    )?;
 
     let input_fingerprint = input_fingerprint(&candidate_set, &evidence, &request, options);
     let request_hash = blake3::hash(serde_json::to_string(&request)?.as_bytes())
@@ -117,11 +122,14 @@ pub fn scout_workflows(
         request_hash,
     };
 
-    let run_id = match ledger::claim_run(conn, &spec, options.rebuild)? {
+    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
         RunClaim::Reused(run_id) => {
             return reuse_report(conn, run_id, &candidate_set, &spec);
         }
-        RunClaim::Claimed(run_id) => run_id,
+        RunClaim::Claimed {
+            run_id,
+            supersedes_artifact_id,
+        } => (run_id, supersedes_artifact_id),
     };
 
     let outcome = match gateway.complete(&request, options.policy.timeout) {
@@ -216,13 +224,10 @@ pub fn scout_workflows(
     // Semantic validation reuses the annotate rules: exact current anchors,
     // on-disk file-hash currency, span bounds, and snapshot currency against
     // the candidate snapshot.
-    let annotate_input = semantic::workflow_request(
-        validated.name.clone(),
-        Some(validated.description.clone()),
-        validated.participants.clone(),
-        "likely".into(),
+    let annotate_input = workflow::annotate_input(
+        &validated,
         candidate_set.snapshot.clone(),
-        None,
+        supersedes_artifact_id,
     )?;
     let validated_artifact = match semantic::validate_annotate_input(root, conn, &annotate_input) {
         Ok(parts) => parts,
@@ -365,10 +370,28 @@ fn build_request(
 /// context window the pack must plausibly fit it too.
 fn enforce_context_budget(
     gateway: &mut dyn LlmGateway,
-    request: &CompleteRequest,
+    request: &mut CompleteRequest,
     evidence: &EvidencePack,
+    candidate_count: usize,
     options: &WorkflowScoutOptions,
 ) -> Result<()> {
+    let (_, capabilities) = gateway.capabilities(Some(&options.model.spec))?;
+    let Some(capabilities) = capabilities else {
+        bail!(
+            "model {} is not known to the gateway; run `jscout llm doctor --model {}`",
+            options.model.spec,
+            options.model.spec,
+        );
+    };
+    let desired_output = BASE_OUTPUT_TOKENS.saturating_add(
+        OUTPUT_TOKENS_PER_CANDIDATE
+            .saturating_mul(u64::try_from(candidate_count).unwrap_or(u64::MAX)),
+    );
+    let output_tokens = capabilities
+        .max_tokens
+        .map_or(desired_output, |maximum| desired_output.min(maximum));
+    request.max_tokens = Some(output_tokens);
+
     let request_bytes = serde_json::to_string(request)?.len();
     if request_bytes > options.policy.context_bytes {
         bail!(
@@ -378,20 +401,16 @@ fn enforce_context_budget(
             evidence.files.len(),
         );
     }
-    let (_, capabilities) = gateway.capabilities(Some(&options.model.spec))?;
-    let Some(capabilities) = capabilities else {
-        bail!(
-            "model {} is not known to the gateway; run `jscout llm doctor --model {}`",
-            options.model.spec,
-            options.model.spec,
-        );
-    };
     if let Some(window) = capabilities.context_window {
-        let estimated_tokens = (request_bytes / MIN_BYTES_PER_TOKEN) as u64;
-        if estimated_tokens >= window {
+        // pi-ai exposes no common tokenizer. UTF-8 byte length is a
+        // conservative upper bound for byte-level provider tokenizers; an
+        // average bytes/token divisor can undercount punctuation-heavy code.
+        let input_token_ceiling = request_bytes as u64;
+        if input_token_ceiling.saturating_add(output_tokens) > window {
             bail!(
-                "evidence pack (~{estimated_tokens} tokens) cannot fit the {} context window \
-                 of {}; narrow the seeds or choose a larger-context model",
+                "evidence pack requires at most {input_token_ceiling} input tokens plus \
+                 {output_tokens} reserved output tokens, over the {} context window of {}; \
+                 narrow the seeds or choose a larger-context model",
                 window,
                 options.model.spec,
             );
@@ -434,6 +453,7 @@ fn input_fingerprint(
         hasher.update(b"\0");
     }
     hasher.update(&PROTOCOL_VERSION.to_le_bytes());
+    hasher.update(&request.max_tokens.unwrap_or_default().to_le_bytes());
     if let Ok(schema) = serde_json::to_string(&request.tool.parameters) {
         hasher.update(schema.as_bytes());
     }
@@ -564,6 +584,7 @@ mod tests {
     struct FakeGateway {
         results: VecDeque<Result<CompletionOutcome, GatewayError>>,
         calls: usize,
+        last_max_tokens: Option<u64>,
         on_complete: Option<Box<dyn FnMut()>>,
     }
 
@@ -572,6 +593,7 @@ mod tests {
             Self {
                 results: results.into(),
                 calls: 0,
+                last_max_tokens: None,
                 on_complete: None,
             }
         }
@@ -602,10 +624,11 @@ mod tests {
 
         fn complete(
             &mut self,
-            _request: &CompleteRequest,
+            request: &CompleteRequest,
             _timeout: Duration,
         ) -> Result<CompletionOutcome, GatewayError> {
             self.calls += 1;
+            self.last_max_tokens = request.max_tokens;
             if let Some(hook) = self.on_complete.as_mut() {
                 hook();
             }
@@ -714,6 +737,7 @@ mod tests {
 
         let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
         let report = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())?;
+        assert_eq!(gateway.last_max_tokens, Some(3_072));
         assert_eq!(report.status, "completed");
         assert_eq!(report.candidate_count, 2);
         assert_eq!(report.decisions["defining"], 1);
@@ -760,6 +784,115 @@ mod tests {
         assert_eq!(reused.status, "reused");
         assert_eq!(reused.artifact_id, Some(artifact_id));
         assert_eq!(idle_gateway.calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn publishes_multiple_evidence_ranges_as_supports_for_one_participant() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let anchors = candidate_anchors(&conn, repo.path())?;
+        let mut submission = full_submission(&anchors);
+        let start = submission["candidates"]
+            .as_array_mut()
+            .expect("candidate array")
+            .iter_mut()
+            .find(|candidate| {
+                candidate["anchor"]
+                    .as_str()
+                    .is_some_and(|anchor| anchor.contains("::start@"))
+            })
+            .expect("start candidate");
+        start["evidence"] = json!([
+            {"start_line": 2, "end_line": 2},
+            {"start_line": 1, "end_line": 2}
+        ]);
+        let start_anchor = start["anchor"].as_str().expect("start anchor").to_string();
+
+        let mut gateway = FakeGateway::new(vec![Ok(outcome(submission))]);
+        let report = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())?;
+        let artifact_id = report.artifact_id.expect("published artifact");
+        let body: String = conn.query_row(
+            "SELECT body_json FROM semantic_artifacts WHERE id=?1",
+            [artifact_id],
+            |row| row.get(0),
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            body["participants"].as_array().expect("participants").len(),
+            2
+        );
+        assert_eq!(
+            body["participants"]
+                .as_array()
+                .expect("participants")
+                .iter()
+                .filter(|participant| participant["anchor"] == start_anchor)
+                .count(),
+            1
+        );
+        let role_supports: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_supports
+             WHERE artifact_id=?1 AND anchor_key=?2 AND claim_path LIKE '/participants/%/role'",
+            rusqlite::params![artifact_id, start_anchor],
+            |row| row.get(0),
+        )?;
+        assert_eq!(role_supports, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_supersedes_the_prior_artifact_in_default_search() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let anchors = candidate_anchors(&conn, repo.path())?;
+        let mut first_gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+        let first = scout_workflows(repo.path(), &conn, &mut first_gateway, &scout_options())?;
+
+        let mut rebuild = scout_options();
+        rebuild.rebuild = true;
+        let mut second_gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+        let second = scout_workflows(repo.path(), &conn, &mut second_gateway, &rebuild)?;
+
+        let first_id = first.artifact_id.expect("first artifact");
+        let second_id = second.artifact_id.expect("successor artifact");
+        let supersedes: i64 = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [second_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, first_id);
+        let visible = crate::semantic::search(&conn, "start-finish", 10)?;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, second_id);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_after_failed_rebuild_still_supersedes_the_prior_artifact() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let anchors = candidate_anchors(&conn, repo.path())?;
+        let mut first_gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+        let first = scout_workflows(repo.path(), &conn, &mut first_gateway, &scout_options())?;
+
+        let mut rebuild = scout_options();
+        rebuild.rebuild = true;
+        let mut failed_gateway = FakeGateway::new(vec![Err(GatewayError::Canceled("test".into()))]);
+        scout_workflows(repo.path(), &conn, &mut failed_gateway, &rebuild)
+            .expect_err("rebuild failure");
+
+        let mut retry_gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+        let retry = scout_workflows(repo.path(), &conn, &mut retry_gateway, &scout_options())?;
+        let first_id = first.artifact_id.expect("first artifact");
+        let retry_id = retry.artifact_id.expect("retry artifact");
+        let supersedes: i64 = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [retry_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, first_id);
+        assert_eq!(crate::semantic::search(&conn, "start-finish", 10)?.len(), 1);
         Ok(())
     }
 

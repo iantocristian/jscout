@@ -4,7 +4,7 @@
 //! reuse the completed run or fail loudly against the in-flight one.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, Clone)]
 pub struct RunSpec {
@@ -25,7 +25,10 @@ pub enum RunClaim {
     /// A completed run with identical inputs exists; reuse its outputs.
     Reused(i64),
     /// This process now owns the only live run for these inputs.
-    Claimed(i64),
+    Claimed {
+        run_id: i64,
+        supersedes_artifact_id: Option<i64>,
+    },
 }
 
 /// Terminal states. `Completed` is the only reusable state; everything else
@@ -65,15 +68,22 @@ pub struct ClassificationRow {
 pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<RunClaim> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let claim = (|| -> Result<RunClaim> {
-        if rebuild {
+        let current_artifact = current_artifact_for_input(conn, spec)?;
+        let supersedes_artifact_id = if rebuild {
             conn.execute(
                 "UPDATE scout_runs SET status='superseded'
                  WHERE scout_kind=?1 AND input_fingerprint=?2 AND status='completed'",
                 params![spec.scout_kind, spec.input_fingerprint],
             )?;
+            current_artifact
         } else if let Some(existing) = reusable_run(conn, spec)? {
             return Ok(RunClaim::Reused(existing));
-        }
+        } else {
+            // A previous rebuild attempt may have superseded the run before
+            // failing. Its artifact remains current and the retry must still
+            // replace it rather than creating a parallel current record.
+            current_artifact
+        };
         let inserted = conn.execute(
             "INSERT INTO scout_runs(
                scout_kind, status, gateway_protocol, provider, model, billing_path,
@@ -95,7 +105,10 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
             ],
         );
         match inserted {
-            Ok(_) => Ok(RunClaim::Claimed(conn.last_insert_rowid())),
+            Ok(_) => Ok(RunClaim::Claimed {
+                run_id: conn.last_insert_rowid(),
+                supersedes_artifact_id,
+            }),
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -118,6 +131,24 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
             Err(error)
         }
     }
+}
+
+fn current_artifact_for_input(conn: &Connection, spec: &RunSpec) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT artifact.id
+             FROM semantic_artifacts artifact
+             JOIN scout_runs run ON run.id=artifact.scout_run_id
+             WHERE run.scout_kind=?1 AND run.input_fingerprint=?2
+               AND NOT EXISTS(
+                 SELECT 1 FROM semantic_artifacts successor
+                 WHERE successor.supersedes_artifact_id=artifact.id
+               )
+             ORDER BY artifact.id DESC LIMIT 1",
+            params![spec.scout_kind, spec.input_fingerprint],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 fn reusable_run(conn: &Connection, spec: &RunSpec) -> Result<Option<i64>> {
@@ -220,7 +251,11 @@ mod tests {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
 
-        let RunClaim::Claimed(first) = claim_run(&conn, &spec("f1"), false)? else {
+        let RunClaim::Claimed {
+            run_id: first,
+            supersedes_artifact_id: None,
+        } = claim_run(&conn, &spec("f1"), false)?
+        else {
             panic!("expected a fresh claim");
         };
         // A second claim against the in-flight run fails loudly.
@@ -240,7 +275,11 @@ mod tests {
         );
 
         // --rebuild supersedes the completed run and claims a fresh one.
-        let RunClaim::Claimed(second) = claim_run(&conn, &spec("f1"), true)? else {
+        let RunClaim::Claimed {
+            run_id: second,
+            supersedes_artifact_id: None,
+        } = claim_run(&conn, &spec("f1"), true)?
+        else {
             panic!("expected a rebuild claim");
         };
         assert_ne!(first, second);
@@ -253,7 +292,11 @@ mod tests {
 
         // Failed runs release the fingerprint without becoming reusable.
         finish_run(&conn, second, RunOutcome::Failed, None, Some("timeout"))?;
-        let RunClaim::Claimed(third) = claim_run(&conn, &spec("f1"), false)? else {
+        let RunClaim::Claimed {
+            run_id: third,
+            supersedes_artifact_id: None,
+        } = claim_run(&conn, &spec("f1"), false)?
+        else {
             panic!("expected a fresh claim after failure");
         };
         assert_ne!(second, third);
@@ -268,7 +311,11 @@ mod tests {
     fn records_every_candidate_decision_including_exclusions() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
-        let RunClaim::Claimed(run) = claim_run(&conn, &spec("f2"), false)? else {
+        let RunClaim::Claimed {
+            run_id: run,
+            supersedes_artifact_id: None,
+        } = claim_run(&conn, &spec("f2"), false)?
+        else {
             panic!("expected a claim");
         };
         super::record_classifications(
@@ -320,7 +367,11 @@ mod tests {
     fn sweeps_only_long_dead_running_rows() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
-        let RunClaim::Claimed(fresh) = claim_run(&conn, &spec("f3"), false)? else {
+        let RunClaim::Claimed {
+            run_id: fresh,
+            supersedes_artifact_id: None,
+        } = claim_run(&conn, &spec("f3"), false)?
+        else {
             panic!("expected a claim");
         };
         conn.execute(

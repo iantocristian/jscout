@@ -9,7 +9,9 @@ use serde_json::Value;
 use crate::structural;
 
 const MAX_BODY_BYTES: usize = 12_000;
-const MAX_SUPPORTS: usize = 32;
+// Generated workflows may carry four evidence spans for each of 31
+// candidates, plus workflow-level name/description supports.
+const MAX_SUPPORTS: usize = 160;
 pub const MAX_WORKFLOW_CANDIDATES: usize = 31;
 const WORKFLOW_TRAVERSAL_NODE_LIMIT: usize = 100;
 const WORKFLOW_TRAVERSAL_EDGE_LIMIT: usize = 400;
