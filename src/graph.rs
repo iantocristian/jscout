@@ -55,12 +55,14 @@ pub struct FileGraph {
     pub requests: Vec<String>,
     pub events: Vec<crate::heur::EventSite>,
     pub member_calls: Vec<crate::heur::MemberCall>,
+    pub entity_sites: Vec<crate::entity::EntitySite>,
 }
 
 pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
     let mut g = FileGraph::default();
     let record = &ret.module_record;
     let heur = crate::heur::extract(&ret.program);
+    g.entity_sites = crate::entity::extract(&ret.program);
 
     // ---- imports ----
     for entry in &record.import_entries {
