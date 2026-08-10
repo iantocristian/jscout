@@ -35,6 +35,10 @@ jscout agent-guide --install R # install a project-local jscout skill
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
+Workflow-candidate seeds must each resolve uniquely to a symbol.
+File anchors are rejected because a file can contain multiple unrelated
+operations; choose an exported symbol or pass its exact returned `sym:` anchor.
+
 `A` accepts a returned node key, a repo-relative file path, a symbol name, or
 `path-substring:NAME`. Every neighborhood includes the current repository
 snapshot. When reusing an anchor after edits, pass that value with `--snapshot`;
