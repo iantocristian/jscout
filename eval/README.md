@@ -362,6 +362,9 @@ in [`results/general-entities-followups-2026-08-10.md`](results/general-entities
 The deterministic repository overview, entity lookup, bounded paths, and the
 known-workflow regression rerun are recorded in
 [`results/agent-surfaces-2026-08-10.md`](results/agent-surfaces-2026-08-10.md).
+The post-merge path availability bound, SQL-ranked entity lookup, explicit
+reverse steps, and dependency-area coverage are recorded in
+[`results/agent-surfaces-followups-2026-08-10.md`](results/agent-surfaces-followups-2026-08-10.md).
 The workflow-specific logical traversal and its 24/24 known-regression result
 are recorded in
 [`results/workflow-logical-routing-2026-08-10.md`](results/workflow-logical-routing-2026-08-10.md).
