@@ -14,6 +14,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::indexer::{package_name, resolver_options};
+use crate::store;
 use crate::walk;
 use crate::workspace::{WorkspaceMap, WorkspacePackage};
 
@@ -195,6 +196,19 @@ pub fn synchronize_instances(
         };
         for (id, canonical_root) in stale {
             if !desired.contains(&canonical_root) {
+                // FTS5 does not participate in SQLite foreign-key cascades.
+                // Remove instance-owned files through the canonical deletion
+                // path before deleting the package instance itself.
+                let file_ids: Vec<i64> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id FROM files WHERE package_instance_id=?1",
+                    )?;
+                    let rows = stmt.query_map([id], |row| row.get(0))?;
+                    rows.collect::<std::result::Result<_, _>>()?
+                };
+                for file_id in file_ids {
+                    store::delete_file(conn, file_id)?;
+                }
                 conn.execute("DELETE FROM package_instances WHERE id=?1", [id])?;
             }
         }

@@ -179,6 +179,14 @@ pub fn index_repo_with_options(
             store::delete_file(conn, *id)?;
         }
     }
+
+    // Commit canonical rows and snapshot invalidation atomically. Every
+    // following dependency/resolution step can fail, so the previous graph
+    // must stop being public before control enters that phase.
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+        [],
+    )?;
     conn.execute_batch("COMMIT")?;
 
     let workspace = crate::workspace::WorkspaceMap::build(&root);
@@ -192,13 +200,6 @@ pub fn index_repo_with_options(
     let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
     index_dependency_files(conn, &plans, &instances, &mut outcome)?;
 
-    // Canonical rows are now newer than the traversal projection. Remove the
-    // public snapshot before resolution so readers fail closed instead of
-    // receiving an old graph under a current-looking anchor contract.
-    conn.execute(
-        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-        [],
-    )?;
     resolve_module_edges(&root, conn)?;
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('root', ?1)
@@ -1080,6 +1081,21 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!((remaining_dependencies, remaining_instances), (0, 0));
+        let chunk_counts: (i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM chunks),
+               (SELECT count(*) FROM chunks_fts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(chunk_counts.0, chunk_counts.1);
+        let orphan_match: i64 = conn.query_row(
+            "SELECT count(*) FROM chunks_fts
+             WHERE chunks_fts MATCH 'dependencyOnlyMarker'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(orphan_match, 0);
         let fallback: (Option<i64>, Option<String>) = conn.query_row(
             "SELECT edge.to_file, edge.package FROM module_edges edge
              JOIN files source ON source.id=edge.from_file
@@ -1088,6 +1104,56 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(fallback, (None, Some("selected-dep".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_failure_invalidates_snapshot_after_first_party_commit() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let main = repo.path().join("main.ts");
+        fs::write(
+            &main,
+            "import value from 'selected-dep';\nexport const before = value;\n",
+        )?;
+        let dependency = repo.path().join("node_modules/selected-dep");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        fs::write(dependency.join("index.js"), "export default 1;\n")?;
+
+        let conn = store::open(repo.path())?;
+        let options = IndexOptions {
+            dependencies: vec!["selected-dep".into()],
+            ..Default::default()
+        };
+        index_repo_with_options(repo.path(), &conn, &options)?;
+        let old_snapshot: String =
+            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| row.get(0))?;
+
+        let changed =
+            "import value from 'selected-dep';\nexport const after = value + 1;\n";
+        fs::write(&main, changed)?;
+        fs::remove_dir_all(&dependency)?;
+        let error = index_repo_with_options(repo.path(), &conn, &options)
+            .err()
+            .expect("missing selected dependency must fail the run");
+        assert!(error.to_string().contains("not installed or resolvable"));
+
+        let committed_hash: String = conn.query_row(
+            "SELECT hash FROM files WHERE path='main.ts'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(committed_hash, blake3::hash(changed.as_bytes()).to_hex().to_string());
+        let public_snapshot_rows: i64 = conn.query_row(
+            "SELECT count(*) FROM meta
+             WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(public_snapshot_rows, 0, "stale snapshot remained public: {old_snapshot}");
         Ok(())
     }
 }
