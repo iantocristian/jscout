@@ -879,11 +879,12 @@ fn project_entities(
         });
 
         match site.role.as_str() {
-            "dispatch_site" | "lifecycle_producer" => {
-                let kind = if site.role == "dispatch_site" {
-                    "dispatches"
-                } else {
-                    "produces_lifecycle"
+            "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site" => {
+                let kind = match site.role.as_str() {
+                    "dispatch_site" => "dispatches",
+                    "lifecycle_producer" => "produces_lifecycle",
+                    "job_producer" => "produces_job",
+                    _ => "injects",
                 };
                 insert_entity_edge.execute(params![
                     occurrence_id,
@@ -904,28 +905,36 @@ fn project_entities(
                     site.line,
                     graph_detail.to_string(),
                 ])?;
-                if site.role == "lifecycle_producer" {
+                if matches!(site.role.as_str(), "lifecycle_producer" | "job_producer") {
                     project_entity_callers(
                         conn,
                         &source,
                         &entity_key,
                         occurrence_id,
                         &occurrence_confidence,
-                        &site,
+                        if site.role == "lifecycle_producer" {
+                            "produces_lifecycle_via"
+                        } else {
+                            "produces_job_via"
+                        },
                         insert_edge,
                     )?;
                 }
             }
-            "registered_handler" | "lifecycle_listener" => {
-                let targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
+            "registered_handler" | "lifecycle_listener" | "job_handler" | "provider" => {
+                let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
+                if targets.keys.is_empty() {
+                    targets = ProjectedTargets::exact(source.clone());
+                }
                 let edge_confidence = lower_confidence(
                     &occurrence_confidence,
                     if targets.ambiguous { "possible" } else { &occurrence_confidence },
                 );
-                let kind = if site.role == "registered_handler" {
-                    "registered_handler"
-                } else {
-                    "lifecycle_listener"
+                let kind = match site.role.as_str() {
+                    "registered_handler" => "registered_handler",
+                    "lifecycle_listener" => "lifecycle_listener",
+                    "job_handler" => "job_handler",
+                    _ => "provides",
                 };
                 for target in &targets.keys {
                     insert_entity_edge.execute(params![
@@ -1079,7 +1088,7 @@ fn project_entity_callers(
     entity_key: &str,
     occurrence_id: i64,
     occurrence_confidence: &str,
-    site: &EntitySiteNode,
+    via_kind: &str,
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
@@ -1102,7 +1111,7 @@ fn project_entity_callers(
         insert_edge.execute(params![
             caller,
             entity_key,
-            "produces_lifecycle_via",
+            via_kind,
             confidence,
             "entity-boundary-collapse",
             source_file_id,
@@ -1111,7 +1120,6 @@ fn project_entity_callers(
             json!({
                 "entityOccurrenceId": occurrence_id,
                 "producer": producer,
-                "extractor": site.extractor,
             })
             .to_string(),
         ])?;
@@ -1617,7 +1625,12 @@ fn relation_weight(kind: &str) -> f64 {
         | "registered_handler"
         | "produces_lifecycle"
         | "produces_lifecycle_via"
-        | "lifecycle_listener" => 1.0,
+        | "lifecycle_listener"
+        | "produces_job"
+        | "produces_job_via"
+        | "job_handler"
+        | "injects"
+        | "provides" => 1.0,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
         "emits" | "listens" => 0.7,
@@ -2092,6 +2105,80 @@ mod tests {
                 && edge.source == "entity:data_lifecycle:slackAssistantRequest.created"
                 && edge.target.contains("worker.ts#::workerHandler@1")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn job_and_di_entities_join_producers_handlers_tokens_and_implementations() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "jobs.ts",
+            "export const emailHandler = (job) => job.data;\n\
+             new Worker('email', emailHandler);\n",
+        )?;
+        write(
+            repo.path(),
+            "producer.ts",
+            "export const enqueueEmail = (emailQueue, payload) =>\n\
+               emailQueue.add('email', payload);\n",
+        )?;
+        write(repo.path(), "token.ts", "export const MAILER = Symbol('mailer');\n")?;
+        write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
+        write(
+            repo.path(),
+            "module.ts",
+            "import { MAILER } from './token';\n\
+             import { MailerService } from './mailer';\n\
+             export const providers = [{ provide: MAILER, useClass: MailerService }];\n",
+        )?;
+        write(
+            repo.path(),
+            "consumer.ts",
+            "import { MAILER } from './token';\n\
+             export class Consumer { constructor(@Inject(MAILER) mailer) {} }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let job = neighborhood(
+            &conn,
+            "enqueueEmail",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(job.edges.iter().any(|edge| {
+            edge.kind == "produces_job"
+                && edge.source.contains("producer.ts#::enqueueEmail@1")
+                && edge.target == "entity:job:email"
+        }));
+        assert!(job.edges.iter().any(|edge| {
+            edge.kind == "job_handler"
+                && edge.source == "entity:job:email"
+                && edge.target.contains("jobs.ts#::emailHandler@1")
+        }));
+
+        let provider: (String, String) = conn.query_row(
+            "SELECT source.node_key, target.node_key
+             FROM resolved_edges edge
+             JOIN graph_nodes source ON source.node_key=edge.src_key
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE edge.kind='provides' AND source.node_kind='entity'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(provider.0.starts_with("entity:di_token:ref-"));
+        assert!(provider.1.contains("mailer.ts#::MailerService@1"));
+        let injections: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind='injects' AND dst_key=?1",
+            [&provider.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(injections, 1);
         Ok(())
     }
 
