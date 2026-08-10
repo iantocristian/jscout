@@ -284,6 +284,7 @@ fn candidate_boundary_fingerprint(set: &WorkflowCandidateSet) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use rusqlite::params;
 
     use crate::{indexer, store};
 
@@ -307,12 +308,97 @@ mod tests {
         );
         assert_eq!(first.mode, "automatic");
         assert!(!first.items.is_empty());
-        assert!(first.duplicate_candidate_sets_skipped > 0);
         assert!(
             first
                 .items
                 .iter()
                 .all(|item| item.sources == ["exported-entry-point"])
+        );
+        let original = &first.items[0].candidate_set;
+        let mut alternate_seed = original.clone();
+        alternate_seed.seeds = vec!["sym:index.ts#::alternate@1".into()];
+        for candidate in &mut alternate_seed.candidates {
+            candidate.seed = !candidate.seed;
+        }
+        assert_eq!(
+            super::candidate_boundary_fingerprint(original),
+            super::candidate_boundary_fingerprint(&alternate_seed),
+            "automatic dedupe must use the closed member set, not seed identity",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_seed_directions_follow_runtime_boundary_roles() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = store::open(repo.path())?;
+        conn.execute(
+            "INSERT INTO files(path, hash, role) VALUES('runtime.ts','h','production')",
+            [],
+        )?;
+        let production_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO files(path, hash, role) VALUES('runtime.test.ts','t','test')",
+            [],
+        )?;
+        let test_file = conn.last_insert_rowid();
+        for (key, kind, file) in [
+            (
+                "sym:runtime.ts#::dispatch@1",
+                "symbol",
+                Some(production_file),
+            ),
+            ("sym:runtime.ts#::handle@2", "symbol", Some(production_file)),
+            (
+                "sym:runtime.test.ts#::testOnly@1",
+                "symbol",
+                Some(test_file),
+            ),
+            ("entity:registry:job", "entity", None),
+        ] {
+            conn.execute(
+                "INSERT INTO graph_nodes(node_key,node_kind,display_name,file_id,meta_json)
+                 VALUES(?1,?2,?1,?3,'{}')",
+                params![key, kind, file],
+            )?;
+        }
+        for (src, dst, kind) in [
+            (
+                "sym:runtime.ts#::dispatch@1",
+                "entity:registry:job",
+                "dispatches",
+            ),
+            (
+                "entity:registry:job",
+                "sym:runtime.ts#::handle@2",
+                "registered_handler",
+            ),
+            (
+                "entity:registry:job",
+                "sym:runtime.ts#::handle@2",
+                "handles_route",
+            ),
+            (
+                "sym:runtime.test.ts#::testOnly@1",
+                "entity:registry:job",
+                "produces_job",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO resolved_edges(src_key,dst_key,kind,confidence,provenance)
+                 VALUES(?1,?2,?3,'certain','test')",
+                params![src, dst, kind],
+            )?;
+        }
+
+        let seeds = super::automatic_seeds(repo.path(), &conn)?;
+        assert_eq!(seeds.len(), 2, "test-role endpoints stay out of auto seeds");
+        assert_eq!(seeds[0].0, "sym:runtime.ts#::dispatch@1");
+        assert_eq!(seeds[0].1, ["runtime:dispatches"]);
+        assert_eq!(seeds[1].0, "sym:runtime.ts#::handle@2");
+        assert_eq!(
+            seeds[1].1,
+            ["runtime:handles_route", "runtime:registered_handler"]
         );
         Ok(())
     }
