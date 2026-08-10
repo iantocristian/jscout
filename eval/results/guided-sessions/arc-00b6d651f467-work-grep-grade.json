@@ -1,0 +1,60 @@
+{
+  "sha": "00b6d651f467f1e0f62eff5f8d82cb9fb29b53ea",
+  "subject": "fix(front): preserve currency decimals when opening the field editor (#23874)",
+  "changes": [
+    {
+      "file": ".yarn/install-state.gz",
+      "status": "added"
+    },
+    {
+      "file": "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/components/CurrencyFieldInput.tsx",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-front/src/modules/ui/field/input/components/CurrencyInput.tsx",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-front/src/modules/ui/field/input/utils/__tests__/getCurrencyInputMaskOptions.test.ts",
+      "status": "added"
+    },
+    {
+      "file": "packages/twenty-front/src/modules/ui/field/input/utils/getCurrencyInputMaskOptions.ts",
+      "status": "added"
+    }
+  ],
+  "layer1": {
+    "status": "not-eligible"
+  },
+  "coverage": {
+    "gold_total": 5,
+    "patched": {
+      "matched": [
+        "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/components/CurrencyFieldInput.tsx",
+        "packages/twenty-front/src/modules/ui/field/input/components/CurrencyInput.tsx"
+      ],
+      "extraneous": [
+        ".yarn/install-state.gz",
+        "packages/twenty-front/src/modules/ui/field/input/utils/__tests__/getCurrencyInputMaskOptions.test.ts",
+        "packages/twenty-front/src/modules/ui/field/input/utils/getCurrencyInputMaskOptions.ts"
+      ],
+      "adjudicated": {
+        "omission": [],
+        "alternative_covered": [
+          "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/utils/hasCurrencyValueChanged.ts",
+          "packages/twenty-front/src/modules/ui/field/input/utils/getSafeScaleForCurrencyInput.ts"
+        ],
+        "not_required": [
+          "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/components/__stories__/CurrencyFieldInput.stories.tsx"
+        ]
+      },
+      "pending_adjudication": [],
+      "confirmed_omission_rate": 0
+    },
+    "plan_mentioned": {
+      "matched": [],
+      "count": 0
+    }
+  },
+  "adjudication_queue": []
+}

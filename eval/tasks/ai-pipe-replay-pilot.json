@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "suite": "pr-replay",
+  "status": "draft-stories",
+  "repository": { "name": "ai-pipe" },
+  "notes": [
+    "Stories are drafted from commit subjects and branch names only (commit bodies are empty in this repository). story_source records that. Before the registered run, the original author should enrich each story to true symptom level from memory — the retroactive bug report — without consulting the diffs.",
+    "gold.files lists non-test code files from the real change; the snapshot tool's gold/task.json is authoritative at run time.",
+    "Layer-1 (fail-to-pass tests) is deferred for this pilot: the root `node --test` command requires installed dependencies and does not cover tradebook workspaces, so test verification would conflate missing-deps failures with behavioral failures. Snapshot runs use no --test-command; layer1_eligible is false; grading is layers 2-3. A future --setup-command (dependency install) unlocks layer 1.",
+    "Certify every story with eval-anchor-certify.mjs before the registered run; required status: not `anchored`."
+  ],
+  "tasks": [
+    {
+      "id": "replay-ohlc-bars",
+      "sha": "ddbe9f634a367ccd97726712e5f05f1bdd183c8f",
+      "parent": "035e74c3bfa7365620a15a463ebf5f23a4195c73",
+      "story_source": "commit-subject",
+      "story": "On the execution price chart in the tradebook web app, bars do not render as proper candlesticks: the open/high/low/close structure of each bar is drawn incorrectly, so the chart misrepresents price action within each interval. Fix the chart rendering so every bar correctly shows its open, high, low, and close.",
+      "gold": { "files": ["tradebook/web/src/features/provenance/ExecutionChart.tsx"] }
+    },
+    {
+      "id": "replay-flex-fallback",
+      "sha": "6d898995421941d81e7798d3d3cb469adbf79900",
+      "parent": "9727375a4291a7d38ed00087277aa26eaf43a910",
+      "story_source": "commit-subject",
+      "story": "The tradebook reconciles executions from the broker's detailed report when available, and falls back to a secondary source when it is not. The fallback path currently produces wrong results: executions can be missed or matched incorrectly when the detailed report is unavailable. Fix the fallback so reconciliation stays correct in that case.",
+      "gold": { "files": ["tradebook/api/src/domain/execution-reconciliation.ts"] }
+    },
+    {
+      "id": "replay-fill-clarity",
+      "sha": "d43fe0a78a17668f283322a2265f5c51f8b71494",
+      "parent": "1320bb16b03c3111d50f652663a971a0853afce4",
+      "story_source": "commit-subject",
+      "story": "On tradebook charts it is hard to tell where orders actually filled: fill markers are visually ambiguous and do not clearly convey side, price, or quantity. Improve the chart presentation so execution fills are immediately distinguishable and informative.",
+      "gold": { "files": [
+        "tradebook/web/src/features/provenance/CampaignPage.tsx",
+        "tradebook/web/src/features/provenance/ExecutionChart.tsx",
+        "tradebook/web/src/features/provenance/ExecutionLedger.tsx",
+        "tradebook/web/src/features/provenance/execution-side.ts"
+      ] }
+    },
+    {
+      "id": "replay-extended-hours",
+      "sha": "1320bb16b03c3111d50f652663a971a0853afce4",
+      "parent": "af15050ae7f62b1be2f9c2a470675ebdf58c87fc",
+      "story_source": "commit-subject",
+      "story": "Tradebook price charts only display regular-session data. Trading activity outside regular hours is invisible, so fills that happen before the open or after the close lack surrounding price context. Show pre-market and after-hours data on the charts.",
+      "gold": { "files": ["tradebook/web/src/features/provenance/market-data-query.ts"] }
+    },
+    {
+      "id": "replay-campaign-events",
+      "sha": "237ddc27a30d504475c1f5c37de80138a5fb8129",
+      "parent": "58c5a7ffd06028f27d57f5118b293468f5b74884",
+      "story_source": "commit-subject",
+      "story": "Campaign pages in the tradebook web app do not show what actually happened during a campaign: the individual execution events are not surfaced anywhere in the campaign view. Surface campaign execution events in the UI so a user can follow what the campaign did and when.",
+      "gold": { "files": [
+        "tradebook/web/src/features/overview/OverviewPage.tsx",
+        "tradebook/web/src/features/provenance/CampaignPage.tsx",
+        "tradebook/web/src/features/provenance/ExecutionChart.tsx",
+        "tradebook/web/src/features/provenance/ExecutionLedger.tsx"
+      ] }
+    },
+    {
+      "id": "replay-classifier-gate",
+      "sha": "fd3aceea071492b4b114822160d301ce988cbd9f",
+      "parent": "4fd0e722ef0a0c4947bf1b31588eb71bb54737a0",
+      "story_source": "commit-subject+branch-name",
+      "story": "In the X (Twitter) follow pipeline, posts are being sent to the AI classification step even when they should not be: there is no effective gate, so ineligible posts waste classification calls and can produce spurious downstream signals. Add correct gating so only eligible posts reach classification, and make the gating configurable where the workflow is configured.",
+      "gold": { "files": [
+        "scripts/_patch-xfollow-v9.mjs",
+        "scripts/_reask-asts-2026-07-14.mjs",
+        "scripts/strategyPositionCaps.mjs",
+        "server/db.mjs",
+        "server/seedDefaults.mjs",
+        "server/strategies/templates/socialSignalV1.mjs",
+        "src/components/WorkflowOptionsPanel.tsx",
+        "src/workspace.ts"
+      ] }
+    }
+  ]
+}

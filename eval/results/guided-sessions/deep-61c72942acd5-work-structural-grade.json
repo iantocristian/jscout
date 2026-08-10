@@ -1,0 +1,97 @@
+{
+  "sha": "b7e556bcfc5060397f854a14edefdda462014cac",
+  "subject": "fix(workflow): make core-consistency drift check trustworthy for rollout (#23807)",
+  "changes": [
+    {
+      "file": "packages/twenty-client-sdk/src/metadata/generated/schema.graphql",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-client-sdk/src/metadata/generated/schema.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-front/src/generated-admin/graphql.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-front/src/generated-metadata/graphql.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/engine/twenty-orm/entity-manager/workspace-entity-manager.spec.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/__tests__/workflow-core-consistency.service.spec.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/workflow-core-consistency.service.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/automated-trigger.module.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/__tests__/workflow-cron-trigger-cron.job.spec.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/workflow-cron-trigger-cron.job.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/__tests__/workflow-database-event-trigger.listener.spec.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/workflow-database-event-trigger.listener.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/twenty-shared/src/types/FeatureFlagKey.ts",
+      "status": "modified"
+    }
+  ],
+  "layer1": {
+    "status": "not-eligible"
+  },
+  "coverage": {
+    "gold_total": 9,
+    "patched": {
+      "matched": [
+        "packages/twenty-client-sdk/src/metadata/generated/schema.ts",
+        "packages/twenty-front/src/generated-admin/graphql.ts",
+        "packages/twenty-front/src/generated-metadata/graphql.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/workflow-core-consistency.service.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/automated-trigger.module.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/workflow-cron-trigger-cron.job.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/workflow-database-event-trigger.listener.ts",
+        "packages/twenty-shared/src/types/FeatureFlagKey.ts"
+      ],
+      "extraneous": [
+        "packages/twenty-client-sdk/src/metadata/generated/schema.graphql",
+        "packages/twenty-server/src/engine/twenty-orm/entity-manager/workspace-entity-manager.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/__tests__/workflow-core-consistency.service.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/__tests__/workflow-cron-trigger-cron.job.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/__tests__/workflow-database-event-trigger.listener.spec.ts"
+      ],
+      "adjudicated": {
+        "omission": [],
+        "alternative_covered": [
+          "packages/twenty-server/src/engine/core-modules/workflow/utils/cached-workflow-automated-trigger.util.ts"
+        ],
+        "not_required": []
+      },
+      "pending_adjudication": [],
+      "confirmed_omission_rate": 0
+    },
+    "plan_mentioned": {
+      "matched": [],
+      "count": 0
+    }
+  },
+  "adjudication_queue": []
+}

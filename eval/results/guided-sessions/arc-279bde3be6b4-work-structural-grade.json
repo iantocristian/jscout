@@ -1,0 +1,105 @@
+{
+  "sha": "279bde3be6b42067e7d24306f2e026d2b514ee5e",
+  "subject": "fix: Use caller's timezone for Insights date range boundaries (#33989)",
+  "changes": [
+    {
+      "file": ".claude/plugins/n8n/skills/jscout/SKILL.md",
+      "status": "added"
+    },
+    {
+      "file": "packages/@n8n/api-types/src/dto/insights/__tests__/date-filter.dto.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/@n8n/api-types/src/dto/insights/__tests__/list-workflow-query.dto.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/@n8n/api-types/src/dto/insights/date-filter.dto.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/@n8n/api-types/src/dto/insights/list-workflow-query.dto.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/__tests__/insights.controller.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/__tests__/insights.service.integration.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/database/repositories/__tests__/insights-by-period-query.helper.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/database/repositories/insights-by-period-query.helper.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/database/repositories/insights-by-period.repository.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/insights.controller.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/modules/insights/insights.service.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/cli/src/public-api/v1/handlers/insights/insights.handler.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/frontend/editor-ui/src/features/execution/insights/insights.api.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/frontend/editor-ui/src/features/execution/insights/insights.api.ts",
+      "status": "modified"
+    }
+  ],
+  "layer1": {
+    "status": "not-eligible"
+  },
+  "coverage": {
+    "gold_total": 7,
+    "patched": {
+      "matched": [
+        "packages/@n8n/api-types/src/dto/insights/date-filter.dto.ts",
+        "packages/@n8n/api-types/src/dto/insights/list-workflow-query.dto.ts",
+        "packages/cli/src/modules/insights/database/repositories/insights-by-period-query.helper.ts",
+        "packages/cli/src/modules/insights/database/repositories/insights-by-period.repository.ts",
+        "packages/cli/src/modules/insights/insights.controller.ts",
+        "packages/cli/src/modules/insights/insights.service.ts",
+        "packages/frontend/editor-ui/src/features/execution/insights/insights.api.ts"
+      ],
+      "extraneous": [
+        ".claude/plugins/n8n/skills/jscout/SKILL.md",
+        "packages/@n8n/api-types/src/dto/insights/__tests__/date-filter.dto.test.ts",
+        "packages/@n8n/api-types/src/dto/insights/__tests__/list-workflow-query.dto.test.ts",
+        "packages/cli/src/modules/insights/__tests__/insights.controller.test.ts",
+        "packages/cli/src/modules/insights/__tests__/insights.service.integration.test.ts",
+        "packages/cli/src/modules/insights/database/repositories/__tests__/insights-by-period-query.helper.test.ts",
+        "packages/cli/src/public-api/v1/handlers/insights/insights.handler.ts",
+        "packages/frontend/editor-ui/src/features/execution/insights/insights.api.test.ts"
+      ],
+      "adjudicated": {
+        "omission": [],
+        "alternative_covered": [],
+        "not_required": []
+      },
+      "pending_adjudication": [],
+      "confirmed_omission_rate": 0
+    },
+    "plan_mentioned": {
+      "matched": [],
+      "count": 0
+    }
+  },
+  "adjudication_queue": []
+}

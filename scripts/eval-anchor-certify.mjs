@@ -16,6 +16,7 @@
 // An anchor-free suite is the discriminating instrument for graph retrieval;
 // `--require anchor-free` gates admission in CI.
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -126,12 +127,23 @@ function main() {
       const goldContents = [];
       for (const file of task.gold?.files ?? []) {
         const absolute = path.join(repository, file);
-        if (!fs.existsSync(absolute)) {
+        if (fs.existsSync(absolute)) {
+          goldContents.push([file, fs.readFileSync(absolute, "utf8")]);
+        } else if (task.sha) {
+          // Later refactors may have moved the file; read it at the task's
+          // own end commit, which is the state grading runs against.
+          goldContents.push([
+            file,
+            execFileSync("git", ["-C", repository, "show", `${task.sha}:${file}`], {
+              encoding: "utf8",
+              maxBuffer: 64 * 1024 * 1024,
+            }),
+          ]);
+        } else {
           throw new Error(`task ${task.id}: gold file missing from repository: ${file}`);
         }
-        goldContents.push([file, fs.readFileSync(absolute, "utf8")]);
       }
-      const certificate = certifyTask(task.prompt, goldContents);
+      const certificate = certifyTask(task.prompt ?? task.story ?? "", goldContents);
       results.push({
         task_id: task.id,
         status: certificate.status,

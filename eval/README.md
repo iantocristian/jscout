@@ -348,3 +348,99 @@ The three-seed, post-cutoff n8n/Twenty follow-up is recorded in
 [`results/n8n-twenty-post-cutoff-2026-08-09.md`](results/n8n-twenty-post-cutoff-2026-08-09.md).
 The pre-registered file-role re-run is recorded in
 [`results/file-roles-rerun-2026-08-09.md`](results/file-roles-rerun-2026-08-09.md).
+
+## PR-replay suite (primary value suite)
+
+Design and pre-registration sketch:
+[`value-hypotheses-2026-08-09.md`](value-hypotheses-2026-08-09.md). Real
+merged changes are replayed from a story; the agent implements them in a
+history-free snapshot; grading compares against the real implementation.
+
+1. **Mine** candidates (scaffolds only — no diff content, so the story
+   author is never staring at the answer):
+
+   ```bash
+   node scripts/eval-pr-mine.mjs --repository /path/to/repo \
+     --since 2026-01-01 --output eval/tasks/repo-replay-candidates.json
+   ```
+
+2. **Author stories** from the symptom/issue text — never the diff — then
+   certify each story against the gold patch files with
+   `eval-anchor-certify.mjs` (must not be `anchored`).
+
+3. **Snapshot** each admitted task. The workspace is a `git archive` export
+   with **no `.git`** (a parent checkout still contains the real commit in
+   its object store); the gold bundle lives outside the agent sandbox and
+   must never be mounted into it. `--test-command` runs the fail-to-pass
+   admission gate: the test-only patch must apply independently and FAIL on
+   the parent, else the task is layer-1 ineligible:
+
+   ```bash
+   node scripts/eval-pr-snapshot.mjs --repository /path/to/repo \
+     --sha <merged-sha> --workspace /runs/<task>/workspace \
+     --gold /runs/<task>/gold --test-command "npm test"
+   ```
+
+   Keep a pristine copy of the workspace before the agent touches it.
+
+4. **Run** the agent in the workspace (± jscout arms, counterbalanced,
+   ≥2 trials), then **grade**:
+
+   ```bash
+   node scripts/eval-pr-grade.mjs --pristine /runs/<task>/pristine \
+     --workspace /runs/<task>/workspace --gold /runs/<task>/gold \
+     --response /runs/<task>/response.json \
+     --adjudications /runs/<task>/adjudications.jsonl \
+     --test-command "npm test" --output /runs/<task>/grade.json
+   ```
+
+   Grading discipline: layer 1 applies the admitted fail-to-pass tests to
+   the agent's workspace; layer 2 **adjudicates before scoring** — every
+   unpatched gold file is a pending row (`omission | alternative_covered |
+   not_required`, blind Sol-style) and `confirmed_omission_rate` stays null
+   until the queue is empty. `patched` and `plan_mentioned` metrics are
+   reported separately and never combined. Navigation metrics from these
+   runs inherit the H1 instrumentation caveat (self-reported
+   `inspected_files` must be audited against Codex event artifacts before
+   registered claims).
+
+5. **Batch runs** use the dedicated runner (write-sandbox, per-run workspace
+   copies, per-arm indexing, automatic grading; `--codex` is overridable for
+   stubbed tests):
+
+   ```bash
+   node scripts/eval-run-replay.mjs \
+     --tasks eval/tasks/ai-pipe-replay-pilot.json \
+     --runs-root /Users/cristian/git/jscout-replay-runs/ai-pipe \
+     --jscout "$PWD/target/release/jscout" \
+     --responses /tmp/replay-responses.jsonl \
+     --telemetry /tmp/replay-telemetry.jsonl \
+     --artifacts /tmp/replay-artifacts \
+     --profiles grep,structural --trial 001
+   ```
+
+The task unit is a **change arc**, not a single PR/commit: seed + every
+semantically related follow-up until the feature stabilized (see
+[`value-hypotheses-2026-08-09.md`](value-hypotheses-2026-08-09.md)). Arc
+rules: membership is semantic (file overlap alone is hot-file
+contamination); open arcs are excluded; **members before the model cutoff
+are prehistory** — they already exist in the baseline workspace, so replay
+scope is post-cutoff members only. Arc snapshots pass
+`--members <sha,...>` so gold is restricted to the union of member files
+(interleaved unrelated commits never leak in) and per-member patches land in
+`gold/members/` as adjudication provenance.
+
+**Primary corpus**: [`tasks/n8n-arc-pilot.json`](tasks/n8n-arc-pilot.json)
+(3 arcs, incl. one 3-commit arc) and
+[`tasks/twenty-arc-pilot.json`](tasks/twenty-arc-pilot.json) (2 arcs) —
+human-authored code, post-cutoff, discovered by an Opus workflow
+(mechanical mining → seed filtering → arc tracing → adversarial member
+verification; the verifier caught one missed member and one unclosed arc).
+All stories certify `weak` or better; snapshots under
+`~/git/jscout-replay-runs/{n8n,twenty}/`.
+
+**Harness-validation corpus only**:
+[`tasks/ai-pipe-replay-pilot.json`](tasks/ai-pipe-replay-pilot.json) — ai-pipe
+is mostly AI-generated code, so it validates the pipeline, not product value.
+Layer 1 is deferred for all pilots (test commands need installed
+dependencies); a future `--setup-command` unlocks it.

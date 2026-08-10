@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "suite": "pr-replay-arc-deep",
+  "status": "stories-traced",
+  "repository": {
+    "name": "twenty"
+  },
+  "notes": [
+    "Deep multi-package arcs (admission: gold spans >=3 packages). Discovered/verified by Opus workflow; gold recomputed from git; __stories__ and playwright paths now classify as test-like (fix from guided-session findings).",
+    "Separate file from the pilot suites: the arc-replay pre-registration froze those; deep tasks are a new suite requiring their own registration before registered runs."
+  ],
+  "tasks": [
+    {
+      "id": "deep-61c72942acd5",
+      "sha": "b7e556bcfc5060397f854a14edefdda462014cac",
+      "parent": "42aa566e32eaaa42151f32c2d44c526faf12f6cc",
+      "members": [
+        "61c72942acd57ff96d247997eb012e052a5dcdc8",
+        "b7e556bcfc5060397f854a14edefdda462014cac"
+      ],
+      "story_source": "arc-tracer (subjects/bodies only); verifier-audited",
+      "story": "Automated workflows \u2014 CRON schedules and database-event triggers \u2014 are dispatched by reading a workspace-side denormalized trigger table that is populated from the workspace copy of the workflow. As workflow data moves into core and those workspace writes are retired, that table would go blank and scheduled/event-driven workflows would silently stop firing for customers. The arc makes dispatch able to source its triggers from the core-derived trigger map instead, gated per workspace by a default-off feature flag so the switch can be rolled out tenant by tenant with identical firing behavior. It then repairs the drift-monitoring signal that gates that rollout, which was reporting permanent phantom drift for soft-deleted automated workflows while never inspecting the workspaces whose core mirror had failed entirely \u2014 making the one metric operators rely on to decide when flipping is safe untrustworthy in both directions.",
+      "gold": {
+        "files": [
+          "packages/twenty-client-sdk/src/metadata/generated/schema.ts",
+          "packages/twenty-front/src/generated-admin/graphql.ts",
+          "packages/twenty-front/src/generated-metadata/graphql.ts",
+          "packages/twenty-server/src/engine/core-modules/workflow/utils/cached-workflow-automated-trigger.util.ts",
+          "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/workflow-core-consistency.service.ts",
+          "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/automated-trigger.module.ts",
+          "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/workflow-cron-trigger-cron.job.ts",
+          "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/workflow-database-event-trigger.listener.ts",
+          "packages/twenty-shared/src/types/FeatureFlagKey.ts"
+        ]
+      },
+      "test_files": [
+        "packages/twenty-server/src/engine/twenty-orm/entity-manager/workspace-entity-manager.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-core-consistency/services/__tests__/workflow-core-consistency.service.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/crons/jobs/__tests__/workflow-cron-trigger-cron.job.spec.ts",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/automated-trigger/listeners/__tests__/workflow-database-event-trigger.listener.spec.ts"
+      ],
+      "arc_notes": "Deliberate exclusions (file/epic overlap is not membership): (1) 48730df0d2 \"scaffold core workflowVersion entity + trigger cache (phase 0) (#21674)\" created the core automated-trigger map/cache and compute util the seed reads, but its story is the epic's phase-0 scaffold under a different flag (IS_WORKFLOW_VERSION_IN_CORE_ENABLED) with explicitly \"no behavior change \u2014 nothing reads or writes the new core entity yet\"; the seed is the first commit of the dispatch read-switch story. (2) 96a2456367 \"periodic core-consistency check (#23103)\" introduced the drift cron that b7e556bcfc later fixes, b"
+    },
+    {
+      "id": "deep-ded3f1efb397",
+      "sha": "ded3f1efb3973f08de1ba61d967bbf6c8d058afd",
+      "parent": "0b817e3bc0e749f35c905e5e38bdc0a4a4e775d7",
+      "members": [
+        "ded3f1efb3973f08de1ba61d967bbf6c8d058afd"
+      ],
+      "story_source": "arc-tracer draft, de-anchored after certification",
+      "story": "Apps invoking an agent through the public agent-execution API could only hand it a single one-shot instruction string, so chat-style bots (Slack, Discord, Teams) had no way to pass the preceding thread history - each reply was produced with no memory of what had already been said in the conversation. Extend that public surface so a caller supplies either the single instruction string or an ordered array of user/assistant messages, mirroring the AI SDK's either-or shape, and enforce that exactly one of the two is provided. Thread the new shape through the shared application types, the API schema and SDK inputs and their regenerated clients, and the app-developer docs, while existing single-string callers keep working unchanged.",
+      "gold": {
+        "files": [
+          "packages/twenty-client-sdk/src/metadata/generated/schema.ts",
+          "packages/twenty-client-sdk/src/metadata/generated/types.ts",
+          "packages/twenty-front/src/generated-metadata/graphql.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/dtos/run-agent-message.input.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/dtos/run-agent.input.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/enums/run-agent-message-role.enum.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/services/agent-async-executor.service.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/services/agent-run.service.ts",
+          "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-monitor/jobs/run-evaluation-input.job.ts",
+          "packages/twenty-server/src/modules/workflow/workflow-executor/workflow-actions/ai-agent/ai-agent.workflow-action.ts",
+          "packages/twenty-shared/src/application/index.ts",
+          "packages/twenty-shared/src/application/runAgentType.ts"
+        ]
+      },
+      "test_files": [
+        "packages/twenty-sdk/src/sdk/logic-function/agents/__tests__/run-agent.spec.ts",
+        "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/services/__tests__/agent-async-executor.service.spec.ts",
+        "packages/twenty-server/src/engine/metadata-modules/ai/ai-agent-execution/services/__tests__/agent-run.service.spec.ts"
+      ],
+      "arc_notes": "Single-commit arc on main. Deliberate exclusions (all share files with the seed but are different stories):\n\n- 9e3c3131f7 \"feat(run-agent): let apps run an agent on behalf of a workspace member (#23470)\" (2026-08-07, same author, touches run-agent.input.ts, agent-run.service.ts, agent-async-executor.service.ts, runAgentType.ts, skills-and-agents.mdx and the same generated artifacts). Its body describes an orthogonal need \u2014 scoping a run to the triggering person's role via a new `runAsWorkspaceMemberId` field plus permission-intersection and auth fixes. It adds a field beside `messages` rather "
+    },
+    {
+      "id": "deep-2389b4f807f6",
+      "sha": "2389b4f807f6b5d8ac2d95b68c9fdf16931171c1",
+      "parent": "96ea1e1ffc85d7b16cea989a15d4a2ad13f3175a",
+      "members": [
+        "2389b4f807f6b5d8ac2d95b68c9fdf16931171c1"
+      ],
+      "story_source": "arc-tracer (subjects/bodies only); verifier-audited",
+      "story": "Anyone on the internet could hit the \"forgot password\" request endpoint unlimited times, so bots could pump password-reset emails at arbitrary addresses and spam people who never asked for a reset \u2014 it was the one email-taking auth mutation with no captcha in front of it. The same endpoint also told callers whether an address had an account, both in what it said (a found vs. not-found message) and in how long it took to answer, giving an easy way to harvest which emails are registered. Separately, requesting a new link could revoke a link the user already held if the write failed partway, leaving the user unable to recover their account. The arc gates the request behind a captcha, caps reset emails per address (3 per 15 minutes) with a clear rate-limit message, makes the response identical and equally fast whether or not the address exists, and keeps an already-issued link valid when rotation fails.",
+      "gold": {
+        "files": [
+          "packages/twenty-client-sdk/src/metadata/generated/schema.ts",
+          "packages/twenty-client-sdk/src/metadata/generated/types.ts",
+          "packages/twenty-front/src/generated-metadata/graphql.ts",
+          "packages/twenty-front/src/modules/auth/graphql/mutations/emailPasswordResetLink.ts",
+          "packages/twenty-front/src/modules/auth/sign-in-up/hooks/useHandleResetPassword.ts",
+          "packages/twenty-front/src/modules/captcha/constants/CaptchaProtectedPaths.ts",
+          "packages/twenty-server/src/engine/core-modules/auth/auth.module.ts",
+          "packages/twenty-server/src/engine/core-modules/auth/auth.resolver.ts",
+          "packages/twenty-server/src/engine/core-modules/auth/dto/email-password-reset-link.input.ts",
+          "packages/twenty-server/src/engine/core-modules/auth/services/reset-password.service.ts",
+          "packages/twenty-server/src/engine/core-modules/auth/types/password-reset-token-generation-result.type.ts",
+          "packages/twenty-server/src/engine/core-modules/throttler/filters/throttler-graphql-api-exception.filter.ts"
+        ]
+      },
+      "test_files": [
+        "packages/twenty-front/src/modules/auth/sign-in-up/hooks/__tests__/useHandleResetPassword.test.ts",
+        "packages/twenty-server/src/engine/core-modules/auth/auth.resolver.spec.ts",
+        "packages/twenty-server/src/engine/core-modules/auth/services/reset-password.service.spec.ts"
+      ],
+      "arc_notes": "Arc is a single squashed PR; no follow-ups, no fixes, no reverts in the 125 commits to HEAD. ~13 git commands used.\n\nExcluded candidates (semantic, not file-overlap, judgments):\n- 22a01dc1c6 \"Fix: password reset link returns FORBIDDEN for logged-in users (#21248) (#23335)\" (Jul 27, one week before the seed): same feature area (password reset) and the nearest-looking earlier-member candidate, but a different story \u2014 an Authorization header leaking onto the public reset operations after tokens moved into localStorage. Touches only apollo.factory.ts and PasswordReset.tsx: zero file overlap with t"
+    }
+  ]
+}

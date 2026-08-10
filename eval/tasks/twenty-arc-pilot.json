@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "suite": "pr-replay-arc",
+  "status": "stories-traced",
+  "repository": {
+    "name": "twenty"
+  },
+  "notes": [
+    "Arcs discovered by Opus workflow (mining -> seed filter -> trace -> adversarial verify); members verifier-confirmed plus verifier-found missed members; gold recomputed from git (incl. .vue).",
+    "Cutoff rule: members before 2026-01-01 are prehistory and stay in the baseline workspace; replay scope is post-cutoff members only.",
+    "Stories authored from subjects/bodies only; certified with eval-anchor-certify.mjs."
+  ],
+  "tasks": [
+    {
+      "id": "arc-13a2e3ebe89a",
+      "sha": "13a2e3ebe89a8d3585131af90cd36e79a014c751",
+      "parent": "6d83018b6f0eef4f873954b308cb1c9bc8e03f90",
+      "members": [
+        "13a2e3ebe89a8d3585131af90cd36e79a014c751"
+      ],
+      "story_source": "arc-tracer (subjects/bodies only); verifier-audited",
+      "story": "When an AI agent used the draft_email or send_email tools without naming a connected account \u2014 which it does whenever it has no way to know the id \u2014 the email was composed from an arbitrary connected account belonging to the workspace rather than from the person the agent was acting for. In practice a customer email drafted on one user's behalf landed in a different user's mailbox, and the same fallback would send mail from a colleague's address; the tool reported success, so nothing surfaced the mix-up. The arc makes the no-id path resolve to the caller's own connected account, then to an account explicitly shared with the workspace, and otherwise fail loudly instead of silently borrowing someone else's mailbox. Callers with no account of their own in a workspace with no shared account now get an error where the call previously appeared to succeed.",
+      "gold": {
+        "files": [
+          "packages/twenty-server/src/engine/core-modules/tool/tools/email-tool/email-composer.service.ts",
+          "packages/twenty-server/src/engine/core-modules/tool/tools/email-tool/utils/select-connected-account-id-for-caller.util.ts",
+          "packages/twenty-server/src/engine/metadata-modules/connected-account/connected-account-metadata.service.ts",
+          "packages/twenty-server/src/engine/metadata-modules/connected-account/utils/is-connected-account-usable-by-caller.util.ts"
+        ]
+      },
+      "test_files": [
+        "packages/twenty-server/src/engine/core-modules/tool/tools/email-tool/__tests__/email-composer.service.spec.ts",
+        "packages/twenty-server/src/engine/core-modules/tool/tools/email-tool/utils/__tests__/select-connected-account-id-for-caller.util.spec.ts",
+        "packages/twenty-server/src/engine/metadata-modules/connected-account/utils/__tests__/is-connected-account-usable-by-caller.util.spec.ts",
+        "packages/twenty-server/test/integration/email-tool/suites/email-composer-connected-account.integration-spec.ts"
+      ],
+      "arc_notes": "Single-commit arc. Deliberately excluded despite file overlap on email-composer.service.ts: 1d755983ff (#23657) and 29e68a7f87 (#23782) are consecutive layers of a separate editor/outbound-content-compilation stack (29e68a7f87's own body lists the stack: #23657 \u2192 #23782 \u2192 #23783 \u2192 #23790 \u2192 #23791) and change only how the email body is rendered/compiled, not which account sends it. Also excluded: c"
+    },
+    {
+      "id": "arc-00b6d651f467",
+      "sha": "00b6d651f467f1e0f62eff5f8d82cb9fb29b53ea",
+      "parent": "10ee130eb951d397c7f0c428749ba8c05a0777e5",
+      "members": [
+        "00b6d651f467f1e0f62eff5f8d82cb9fb29b53ea"
+      ],
+      "story_source": "arc-tracer (subjects/bodies only); verifier-audited",
+      "story": "Users editing a currency field found the stored amount silently corrupted just by opening and closing the editor, with no keystroke involved: an amount of 458.64 on a field whose decimals setting was 0 came back as 45864 under the 1.234,56 number format and as 458 under 1,234.56. Because every exit path (including pressing escape) wrote the mangled number back, the record was updated and a timeline entry created even though the user changed nothing. The arc makes the currency editor open on the correct number, stop treating the editor's own mount-time reformatting as user input, and skip persisting entirely when the value on close is identical to the stored one.",
+      "gold": {
+        "files": [
+          "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/components/CurrencyFieldInput.tsx",
+          "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/components/__stories__/CurrencyFieldInput.stories.tsx",
+          "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/utils/hasCurrencyValueChanged.ts",
+          "packages/twenty-front/src/modules/ui/field/input/components/CurrencyInput.tsx",
+          "packages/twenty-front/src/modules/ui/field/input/utils/getSafeScaleForCurrencyInput.ts"
+        ]
+      },
+      "test_files": [
+        "packages/twenty-front/src/modules/object-record/record-field/ui/meta-types/input/utils/__tests__/hasCurrencyValueChanged.test.ts",
+        "packages/twenty-front/src/modules/ui/field/input/utils/__tests__/getSafeScaleForCurrencyInput.test.ts"
+      ],
+      "arc_notes": "Single-commit arc. Deliberately excluded, despite touching the same two components: (a) 25d9f2fcce \"fix: respect number format in currency input (#18469)\" \u2014 a different symptom (edit mode forced US separators and rejected comma as decimal, issue #18355), not the open/close corruption; (b) c020f71ba1 'Add \"number of decimal\" on currency field. (#16439)' \u2014 the feature that introduced the decimals se"
+    }
+  ]
+}

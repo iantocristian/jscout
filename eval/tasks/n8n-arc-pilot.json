@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "suite": "pr-replay-arc",
+  "status": "stories-traced",
+  "repository": {
+    "name": "n8n"
+  },
+  "notes": [
+    "Arcs discovered by Opus workflow (mining -> seed filter -> trace -> adversarial verify); members verifier-confirmed plus verifier-found missed members; gold recomputed from git (incl. .vue).",
+    "Cutoff rule: members before 2026-01-01 are prehistory and stay in the baseline workspace; replay scope is post-cutoff members only.",
+    "Stories authored from subjects/bodies only; certified with eval-anchor-certify.mjs."
+  ],
+  "tasks": [
+    {
+      "id": "arc-92ef31fdbd76",
+      "sha": "92ef31fdbd76d292bb8d623d186c329f743a9947",
+      "parent": "d2066ed97aa5d28bc182dbe07d4e0973f25e7e33",
+      "members": [
+        "92ef31fdbd76d292bb8d623d186c329f743a9947"
+      ],
+      "story_source": "arc-tracer draft, de-anchored after certification",
+      "story": "When a user pasted nodes onto the canvas or imported a workflow (for example a JSON export from another instance or one shared by a colleague), the nodes arrived with no credential attached and immediately showed missing-credential warnings, even when the instance already had a perfectly usable credential of the right type. The user had to open every node one by one just to pick the credential that would have been auto-selected anyway when adding the node manually. Make the editor pick a sensible existing credential automatically for such credential-less nodes, while deliberately skipping generic HTTP request authentication where a silent guess would likely be wrong, and inform the user which credential was chosen so they can verify it.",
+      "gold": {
+        "files": [
+          "packages/frontend/editor-ui/src/app/composables/useCanvasOperations.ts",
+          "packages/frontend/editor-ui/src/features/credentials/components/NodeCredentials.vue",
+          "packages/frontend/editor-ui/src/features/credentials/composables/useNodeCredentialOptions.ts",
+          "packages/frontend/editor-ui/src/features/credentials/credentials.utils.ts"
+        ]
+      },
+      "test_files": [
+        "packages/frontend/editor-ui/src/app/composables/useCanvasOperations.test.ts",
+        "packages/frontend/editor-ui/src/features/credentials/components/NodeCredentials.test.ts",
+        "packages/frontend/editor-ui/src/features/credentials/credentials.utils.test.ts"
+      ],
+      "arc_notes": "Single-commit arc on mainline. Two on-topic commits exist in the repo but only on the UNMERGED branch origin/ado-5618-community-issue-imported-workflow-shows-missing-credentials: ba53bba439 \"fix(editor): Re-match imported credentials by name before removing them\" (2026-07-22) and a9ca5bf5a5 \"fix(editor): Auto-assign an existing credential of the type on import when none matches\" (2026-07-22), both"
+    },
+    {
+      "id": "arc-279bde3be6b4",
+      "sha": "279bde3be6b42067e7d24306f2e026d2b514ee5e",
+      "parent": "377fd156365bb4921b79de7d0bbafe740c4af963",
+      "members": [
+        "4ef9944ef6211cf630bf031c48a1e66b0857ec69",
+        "b8c75a21991e8583a61016ad04da3860de74829d",
+        "279bde3be6b42067e7d24306f2e026d2b514ee5e"
+      ],
+      "story_source": "arc-tracer draft, de-anchored after certification",
+      "story": "The insights dashboard decides what the current day and each day boundary mean using the server's own UTC clock rather than the clock of the person looking at the page. A viewer outside UTC asking for a date range gets a window shifted off the days they actually picked, so the numbers do not match the selected period; related integration coverage was also flaky depending on when and in which timezone it ran, near midnight or at range edges. Make the day-boundary decision honor the caller's timezone so requested ranges line up with the viewer's calendar days.",
+      "gold": {
+        "files": [
+          "packages/@n8n/api-types/src/dto/insights/date-filter.dto.ts",
+          "packages/@n8n/api-types/src/dto/insights/list-workflow-query.dto.ts",
+          "packages/cli/src/modules/insights/database/repositories/insights-by-period-query.helper.ts",
+          "packages/cli/src/modules/insights/database/repositories/insights-by-period.repository.ts",
+          "packages/cli/src/modules/insights/insights.controller.ts",
+          "packages/cli/src/modules/insights/insights.service.ts",
+          "packages/frontend/editor-ui/src/features/execution/insights/insights.api.ts"
+        ]
+      },
+      "test_files": [
+        "packages/@n8n/api-types/src/dto/insights/__tests__/date-filter.dto.test.ts",
+        "packages/@n8n/api-types/src/dto/insights/__tests__/list-workflow-query.dto.test.ts",
+        "packages/cli/src/modules/insights/__tests__/insights.controller.test.ts",
+        "packages/cli/src/modules/insights/__tests__/insights.service.integration.test.ts",
+        "packages/cli/src/modules/insights/__tests__/insights.service.test.ts",
+        "packages/cli/src/modules/insights/database/repositories/__tests__/insights-by-period-query.helper.test.ts",
+        "packages/cli/src/modules/insights/database/repositories/__tests__/insights-by-period.repository.integration.test.ts",
+        "packages/frontend/editor-ui/src/features/execution/insights/insights.api.test.ts"
+      ],
+      "arc_notes": "Excluded despite file overlap: f4e7016c0c (#33180, alert when the selected insights time range has no data) touches insights-by-period.repository.ts but is a separate empty-state feature; 91ca220f3a and 980c9bd6ea touch the insights frontend folder as part of repo-wide editor refactors. Also excluded is the older, separately-closed 2025-10/11 cluster (dc72c23d6a #20543, 440e83bdfc #21368, 1a70592b"
+    },
+    {
+      "id": "arc-76fb3bcfacce",
+      "sha": "76fb3bcfacce38b1c5900124aa237b6980b1dea1",
+      "parent": "145863c58e56bd886feee110e202091649e643c9",
+      "members": [
+        "76fb3bcfacce38b1c5900124aa237b6980b1dea1"
+      ],
+      "story_source": "arc-tracer draft, de-anchored after certification",
+      "story": "Data table row endpoints let callers ask for a preview of which rows an operation would affect without actually changing the table. For row deletion, that preview request was not honored: a request marked as preview-only still permanently removed every matching row, so users and workflow nodes asking to see what would happen destroyed their data instead. Make the delete endpoint honor the preview flag, reporting which rows would have been removed while leaving the table untouched.",
+      "gold": {
+        "files": [
+          "packages/cli/src/modules/data-table/data-table.controller.ts",
+          "packages/cli/src/modules/data-table/data-table.service.ts",
+          "packages/cli/src/public-api/v1/handlers/data-tables/data-tables.rows.handler.ts"
+        ]
+      },
+      "test_files": [
+        "packages/cli/src/modules/data-table/__tests__/data-table.controller.integration.test.ts"
+      ],
+      "arc_notes": "Pre-cutoff prehistory members dropped (in baseline workspace): c62892ce62db, a49432d4c742. File renames matter for this arc: the earlier member predates the `data-store` \u2192 `data-table` renames (a2aca5e7a4 and later refactors), so its paths appear as `data-store.service.ts`, `data-store-rows.repository.ts`, `data-store-proxy.service.ts`, `dto/data-store/delete-data-table-rows.dto.ts`, `packages/workflow/src/data-store.types.ts` and `__tests__/data-store.service.integration.test.ts`; at t"
+    }
+  ]
+}

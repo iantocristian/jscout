@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "suite": "pr-replay-arc-deep",
+  "status": "stories-traced",
+  "repository": {
+    "name": "n8n"
+  },
+  "notes": [
+    "Deep multi-package arcs (admission: gold spans >=3 packages). Discovered/verified by Opus workflow; gold recomputed from git; __stories__ and playwright paths now classify as test-like (fix from guided-session findings).",
+    "Separate file from the pilot suites: the arc-replay pre-registration froze those; deep tasks are a new suite requiring their own registration before registered runs."
+  ],
+  "tasks": [
+    {
+      "id": "deep-242da024ac04",
+      "sha": "242da024ac04d26f58208400e97e94a95a4b2538",
+      "parent": "83f8aa28bcdc5b68eb1a6c8b443e0f4fa2f4c15b",
+      "members": [
+        "242da024ac04d26f58208400e97e94a95a4b2538"
+      ],
+      "story_source": "arc-tracer draft, de-anchored after certification",
+      "story": "A workflow can be set to redact its execution data so that sensitive values are not shown to viewers, and instance admins can enforce a redaction floor on top of that. Console output written from inside code-running nodes was never covered by that policy: whatever a user logged from any of the code-executing node types (the modern code node, its AI-focused variant, and the two legacy function-style nodes) was still streamed verbatim into the manual-execution UI and into the server's stdout log. Sensitive data therefore kept escaping through the log channel on workflows whose redaction policy said it should be hidden, and unlike persisted execution data this output has no reveal or permission path at all. Make every console sink honour the run's resolved redaction policy for the channel it executes on, substituting an explicit redaction marker for the logged arguments.",
+      "gold": {
+        "files": [
+          "packages/@n8n/nodes-langchain/nodes/code/Code.node.ts",
+          "packages/cli/src/modules/redaction/redaction-context-hook.ts",
+          "packages/core/src/execution-engine/node-execution-context/base-execute-context.ts",
+          "packages/core/src/execution-engine/node-execution-context/execute-context.ts",
+          "packages/core/src/execution-engine/node-execution-context/supply-data-context.ts",
+          "packages/nodes-base/nodes/Function/Function.node.ts",
+          "packages/nodes-base/nodes/FunctionItem/FunctionItem.node.ts",
+          "packages/workflow/src/interfaces.ts",
+          "packages/workflow/src/redaction-channels.ts"
+        ]
+      },
+      "test_files": [
+        "packages/@n8n/nodes-langchain/nodes/code/Code.node.test.ts",
+        "packages/cli/src/modules/redaction/__tests__/redaction-context-hook.integration.test.ts",
+        "packages/cli/src/modules/redaction/__tests__/redaction-context-hook.test.ts",
+        "packages/cli/src/modules/redaction/executions/__tests__/execution-redaction.service.test.ts",
+        "packages/core/src/execution-engine/node-execution-context/__tests__/execute-context.test.ts",
+        "packages/core/src/execution-engine/node-execution-context/__tests__/supply-data-context.test.ts",
+        "packages/nodes-base/nodes/Function/test/Function.node.test.ts",
+        "packages/nodes-base/nodes/FunctionItem/test/FunctionItem.node.test.ts",
+        "packages/testing/playwright/tests/e2e/redaction-enforcement/redaction-enforcement.spec.ts",
+        "packages/testing/playwright/tests/e2e/redaction-enforcement/redaction-helpers.ts",
+        "packages/workflow/test/redaction-channels.test.ts"
+      ],
+      "arc_notes": "Deliberately excluded, despite heavy file overlap with the seed: (1) d8d89cc381 \"fix(core): Redact a sub-workflow's own execution record per its own policy (#34621)\" \u2014 touches four of the same files (redaction-context-hook.ts + its two tests, redaction-channels.ts + test) and is the immediately preceding commit in those files' history, but its symptom is a child execution's record being redacted under the parent's policy instead of its own, i.e. inheritance of the snapshot, not an unredacted output sink; (2) 72ab6d770b \"fix(editor): Preserve workflow redaction policy under instance floor (#319"
+    }
+  ]
+}

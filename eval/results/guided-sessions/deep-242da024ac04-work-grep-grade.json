@@ -1,0 +1,81 @@
+{
+  "sha": "242da024ac04d26f58208400e97e94a95a4b2538",
+  "subject": "fix(core): Apply redaction policy to Code node console output (#35121)",
+  "changes": [
+    {
+      "file": "packages/@n8n/nodes-langchain/nodes/code/Code.node.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/core/src/execution-engine/node-execution-context/__tests__/execute-context.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/core/src/execution-engine/node-execution-context/__tests__/supply-data-context.test.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/core/src/execution-engine/node-execution-context/execute-context.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/core/src/execution-engine/node-execution-context/supply-data-context.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/nodes-base/nodes/Function/Function.node.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/nodes-base/nodes/FunctionItem/FunctionItem.node.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/workflow/src/redaction-channels.ts",
+      "status": "modified"
+    },
+    {
+      "file": "packages/workflow/test/redaction-channels.test.ts",
+      "status": "modified"
+    }
+  ],
+  "layer1": {
+    "status": "not-eligible"
+  },
+  "coverage": {
+    "gold_total": 9,
+    "patched": {
+      "matched": [
+        "packages/@n8n/nodes-langchain/nodes/code/Code.node.ts",
+        "packages/core/src/execution-engine/node-execution-context/execute-context.ts",
+        "packages/core/src/execution-engine/node-execution-context/supply-data-context.ts",
+        "packages/nodes-base/nodes/Function/Function.node.ts",
+        "packages/nodes-base/nodes/FunctionItem/FunctionItem.node.ts",
+        "packages/workflow/src/redaction-channels.ts"
+      ],
+      "extraneous": [
+        "packages/core/src/execution-engine/node-execution-context/__tests__/execute-context.test.ts",
+        "packages/core/src/execution-engine/node-execution-context/__tests__/supply-data-context.test.ts",
+        "packages/workflow/test/redaction-channels.test.ts"
+      ],
+      "adjudicated": {
+        "omission": [
+          "packages/cli/src/modules/redaction/redaction-context-hook.ts"
+        ],
+        "alternative_covered": [
+          "packages/core/src/execution-engine/node-execution-context/base-execute-context.ts"
+        ],
+        "not_required": [
+          "packages/workflow/src/interfaces.ts"
+        ]
+      },
+      "pending_adjudication": [],
+      "confirmed_omission_rate": 0.125
+    },
+    "plan_mentioned": {
+      "matched": [],
+      "count": 0
+    }
+  },
+  "adjudication_queue": []
+}
