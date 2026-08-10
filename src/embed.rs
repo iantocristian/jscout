@@ -201,13 +201,31 @@ pub fn embed_text(path: &str, scope: &str, name: Option<&str>, imports: &str, co
 /// Embeddings are keyed by chunk content hash, so unchanged chunks are
 /// never re-embedded across re-indexes.
 pub fn embed_missing(conn: &Connection, provider: &Provider, batch_size: usize) -> Result<(usize, usize)> {
+    embed_missing_for_origins(conn, provider, batch_size, &crate::origin::defaults())
+}
+
+pub fn embed_missing_for_origins(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+    file_origins: &[String],
+) -> Result<(usize, usize)> {
+    crate::origin::validate_all(file_origins)?;
+    let repository = file_origins.iter().any(|origin| origin == "repository");
+    let workspace = file_origins.iter().any(|origin| origin == "workspace");
+    let dependency = file_origins.iter().any(|origin| origin == "dependency");
     let rows: Vec<(String, String, String, Option<String>, String)> = {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT c.hash, f.path, c.scope_chain, c.name, c.content
              FROM chunks c JOIN files f ON c.file_id = f.id
-             WHERE NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.chunk_hash = c.hash AND e.model = ?1)",
+             WHERE NOT EXISTS (
+               SELECT 1 FROM embeddings e WHERE e.chunk_hash = c.hash AND e.model = ?1
+             )
+               AND ((?2 AND f.origin='repository')
+                 OR (?3 AND f.origin='workspace')
+                 OR (?4 AND f.origin='dependency'))",
         )?;
-        let r = stmt.query_map([&provider.model], |r| {
+        let r = stmt.query_map(params![&provider.model, repository, workspace, dependency], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?;
         r.collect::<std::result::Result<_, _>>()?

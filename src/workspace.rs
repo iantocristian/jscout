@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use oxc_resolver::{Alias, AliasValue};
 
-use crate::indexer::RESOLVE_CONDITIONS;
+use crate::package_exports::collect_active_targets;
 use crate::walk;
 
 /// How a workspace mapping was established. `Manifest` mappings use a target
@@ -28,8 +28,19 @@ enum Origin {
 }
 
 /// Workspace alias table plus the provenance needed to classify resolutions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspacePackage {
+    pub name: String,
+    pub version: Option<String>,
+    pub canonical_root: PathBuf,
+    pub manifest_hash: String,
+}
+
 pub struct WorkspaceMap {
     pub aliases: Alias,
+    /// Declared first-party package roots. Canonical roots, rather than the
+    /// path used to reach them through node_modules, establish ownership.
+    pub packages: Vec<WorkspacePackage>,
     /// Exact specifiers (bare names, declared subpaths) whose mapping came
     /// straight from manifest data.
     manifest_specifiers: HashSet<String>,
@@ -45,6 +56,7 @@ impl WorkspaceMap {
     pub fn build(root: &Path) -> Self {
         let mut map = WorkspaceMap {
             aliases: Vec::new(),
+            packages: Vec::new(),
             manifest_specifiers: HashSet::new(),
             package_names: HashSet::new(),
         };
@@ -59,6 +71,13 @@ impl WorkspaceMap {
             if name.is_empty() || name.starts_with('.') || name.starts_with('/') {
                 continue;
             }
+            let canonical_root = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            map.packages.push(WorkspacePackage {
+                name: name.to_string(),
+                version: pkg.get("version").and_then(|v| v.as_str()).map(str::to_string),
+                canonical_root,
+                manifest_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+            });
             map.add_package(name, &dir, &pkg);
         }
         // A matched-but-failing prefix entry stops resolution, so each
@@ -67,7 +86,17 @@ impl WorkspaceMap {
         // "name/…" first.
         map.aliases.sort_by(|a, b| b.0.cmp(&a.0));
         map.aliases.dedup_by(|a, b| a.0 == b.0);
+        map.packages.sort_by(|a, b| a.canonical_root.cmp(&b.canonical_root));
+        map.packages.dedup_by(|a, b| a.canonical_root == b.canonical_root);
         map
+    }
+
+    pub fn package_named(&self, name: &str) -> Option<&WorkspacePackage> {
+        self.packages.iter().find(|package| package.name == name)
+    }
+
+    pub fn package_at_root(&self, root: &Path) -> Option<&WorkspacePackage> {
+        self.packages.iter().find(|package| package.canonical_root == root)
     }
 
     /// Provenance for a successfully resolved request: `resolver` when the
@@ -140,7 +169,7 @@ impl WorkspaceMap {
                 continue;
             }
             let mut targets = Vec::new();
-            export_targets(value, &mut targets);
+            collect_active_targets(value, &mut targets);
             if sub.contains('*') {
                 if let Some(entry) = wildcard_subpath_alias(name, dir, sub, &targets) {
                     self.aliases.push(entry);
@@ -358,33 +387,6 @@ fn segment_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-/// Resolve an exports value to its target strings under the resolver's
-/// active conditions, mirroring Node semantics: condition objects are
-/// evaluated in declaration order and the first active condition is committed
-/// to (no backtracking); arrays contribute candidates in order; `null` and
-/// inactive-only objects yield nothing. `types` never matches — declaration
-/// files aren't indexed. Requires serde_json `preserve_order`: condition
-/// order is significant.
-fn export_targets(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(s) => out.push(s.clone()),
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                export_targets(v, out);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (condition, v) in map {
-                if RESOLVE_CONDITIONS.contains(&condition.as_str()) {
-                    export_targets(v, out);
-                    return;
-                }
-            }
-        }
-        _ => {} // null -> explicitly not exported
-    }
-}
-
 /// Targets of the package's root export: `exports` itself when it is a bare
 /// target/condition object, or its `"."` entry in a subpath map.
 fn root_export_targets(pkg: &serde_json::Value) -> Vec<String> {
@@ -399,7 +401,7 @@ fn root_export_targets(pkg: &serde_json::Value) -> Vec<String> {
         other => other,
     };
     let mut out = Vec::new();
-    export_targets(value, &mut out);
+    collect_active_targets(value, &mut out);
     out
 }
 

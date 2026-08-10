@@ -15,7 +15,12 @@ fn is_relevant(path: &Path) -> bool {
     }
     matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some("package.json") | Some("tsconfig.json") | Some("jsconfig.json")
+        Some("package.json")
+            | Some("package-lock.json")
+            | Some("pnpm-lock.yaml")
+            | Some("yarn.lock")
+            | Some("tsconfig.json")
+            | Some("jsconfig.json")
     )
 }
 
@@ -31,10 +36,14 @@ fn is_noise(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(store::DB_FILE))
 }
 
-pub fn watch(root: &Path, embed_on_change: bool) -> Result<()> {
+pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = store::open(&root)?;
-    let outcome = indexer::index_repo(&root, &conn)?;
+    let options = indexer::IndexOptions {
+        dependencies: dependencies.to_vec(),
+        ..Default::default()
+    };
+    let outcome = indexer::index_repo_with_options(&root, &conn, &options)?;
     eprintln!(
         "initial: {} indexed, {} unchanged — watching {} for changes (ctrl-c to stop)",
         outcome.indexed,
@@ -71,7 +80,7 @@ pub fn watch(root: &Path, embed_on_change: bool) -> Result<()> {
             continue;
         }
         let started = std::time::Instant::now();
-        match indexer::index_repo(&root, &conn) {
+        match indexer::index_repo_with_options(&root, &conn, &options) {
             Ok(o) if o.indexed > 0 || o.failed > 0 => {
                 eprintln!(
                     "re-indexed {} files ({} failed) in {:?}",
@@ -92,4 +101,20 @@ pub fn watch(root: &Path, embed_on_change: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{is_noise, is_relevant};
+
+    #[test]
+    fn lockfiles_trigger_reconciliation_without_watching_node_modules() {
+        assert!(is_relevant(Path::new("pnpm-lock.yaml")));
+        assert!(is_relevant(Path::new("package-lock.json")));
+        assert!(is_relevant(Path::new("yarn.lock")));
+        assert!(is_noise(Path::new("node_modules/dep/index.js")));
+        assert!(!is_noise(Path::new("pnpm-lock.yaml")));
+    }
 }
