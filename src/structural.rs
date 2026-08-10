@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "7";
+pub const PROJECTION_VERSION: &str = "8";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -371,7 +371,7 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 /// Rebuild the disposable structural graph from canonical extraction tables.
 pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let files = load_files(conn)?;
-    let graph = ModuleGraph::load(conn)?;
+    let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
     let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
     for symbol in &symbols {
@@ -576,7 +576,7 @@ fn project_module_edges(
     let mut stmt = conn.prepare(
         "SELECT edge.from_file, edge.request, edge.to_file, edge.package, edge.resolution,
                 edge.package_instance_id, package.origin, package.name, package.version,
-                package.locator, package.status, source.package_instance_id
+                package.locator, package.status, source.package_instance_id, edge.type_only
          FROM module_edges edge
          JOIN files source ON source.id=edge.from_file
          LEFT JOIN package_instances package ON package.id=edge.package_instance_id
@@ -596,6 +596,7 @@ fn project_module_edges(
             r.get::<_, Option<String>>(9)?,
             r.get::<_, Option<String>>(10)?,
             r.get::<_, Option<i64>>(11)?,
+            r.get::<_, i64>(12)? != 0,
         ))
     })?;
     for row in rows {
@@ -612,6 +613,7 @@ fn project_module_edges(
             instance_locator,
             instance_status,
             source_package_instance_id,
+            type_only,
         ) = row?;
         let Some(from_path) = files.get(&from_id) else {
             continue;
@@ -703,15 +705,18 @@ fn project_module_edges(
         // Heuristic workspace mappings (mirrored dist layouts, source-name
         // search) are honest leads, not proven links — never project them as
         // certain.
-        let (confidence, provenance) = match resolution.as_deref() {
-            Some("workspace-inferred") => ("likely", "workspace-inferred"),
-            Some("workspace") => ("certain", "workspace"),
-            _ => ("certain", "resolver"),
+        let (confidence, provenance) = match (type_only, resolution.as_deref()) {
+            (true, Some("workspace-inferred")) => ("likely", "type-workspace-inferred"),
+            (true, Some("workspace")) => ("certain", "type-workspace"),
+            (true, _) => ("certain", "type-resolver"),
+            (false, Some("workspace-inferred")) => ("likely", "workspace-inferred"),
+            (false, Some("workspace")) => ("certain", "workspace"),
+            (false, _) => ("certain", "resolver"),
         };
         insert_edge.execute(params![
             file_key(from_path),
             destination,
-            "import",
+            if type_only { "imports_types" } else { "import" },
             confidence,
             provenance,
             from_id,
@@ -726,7 +731,7 @@ fn project_module_edges(
             insert_edge.execute(params![
                 file_key(from_path),
                 hub,
-                "imports_package",
+                if type_only { "imports_package_types" } else { "imports_package" },
                 confidence,
                 provenance,
                 from_id,
@@ -1443,6 +1448,10 @@ fn site_source_symbol<'a>(
     if !matches!(site.role.as_str(), "decorator_use" | "route_handler" | "graphql_handler") {
         return None;
     }
+    // Decorators precede their class/method declaration, so they fall outside
+    // the declaration span used by `owner_at`. Bound the forward association
+    // to 512 bytes to avoid attaching a distant symbol; large decorator
+    // payloads intentionally degrade to the containing file as their source.
     symbols?
         .iter()
         .copied()
@@ -1486,11 +1495,16 @@ fn resolve_contract_targets(
             imported.as_str()
         };
         let Some(target_file) = graph.edge(site.file_id, &request) else {
+            let external = is_external_module_request(&request);
             targets.push(ContractTarget {
-                key: contract_external_key(&site.entity_type, &request, target_name),
+                key: if external {
+                    contract_external_key(&site.entity_type, &request, target_name)
+                } else {
+                    contract_unresolved_key(&site.entity_type, &request, target_name)
+                },
                 entity_type: site.entity_type.clone(),
                 name: target_name.to_string(),
-                identity_anchor: Some(format!("pkg:{request}#{target_name}")),
+                identity_anchor: external.then(|| format!("pkg:{request}#{target_name}")),
                 inferred: false,
                 file_id: None,
                 line: None,
@@ -2810,6 +2824,7 @@ fn relation_weight(kind: &str) -> f64 {
         "reads_env" | "checks_flag" | "calls_host" => 0.8,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
+        "imports_types" | "imports_package_types" => 0.6,
         "decorated_by" => 0.7,
         "accepts_contract" | "returns_contract" | "references_contract" => 0.65,
         "declares_contract" => 0.55,
@@ -3093,6 +3108,18 @@ fn contract_external_key(entity_type: &str, request: &str, name: &str) -> String
         encode_key_component(request),
         encode_key_component(name)
     )
+}
+
+fn contract_unresolved_key(entity_type: &str, request: &str, name: &str) -> String {
+    format!(
+        "contract:{entity_type}:unresolved:{}#{}",
+        encode_key_component(request),
+        encode_key_component(name)
+    )
+}
+
+fn is_external_module_request(request: &str) -> bool {
+    !request.starts_with('.') && !request.starts_with('/')
 }
 
 fn reference_entity_key(
@@ -3584,6 +3611,12 @@ mod tests {
              export const save = (input: User): UserResult => input;\n\
              export class UserApi { get(input: User): UserResult { return input; } }\n",
         )?;
+        write(
+            repo.path(),
+            "unresolved.ts",
+            "import type { Ghost } from './missing-barrel';\n\
+             export function haunted(input: Ghost): Ghost { return input; }\n",
+        )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
 
@@ -3647,6 +3680,41 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(runtime_type_edges, 0);
+        let type_only_module: (i64, i64, i64) = conn.query_row(
+            "SELECT edge.type_only,
+                    EXISTS(
+                      SELECT 1 FROM resolved_edges projected
+                      WHERE projected.src_key='file:api.ts'
+                        AND projected.dst_key='file:barrel.ts'
+                        AND projected.kind='imports_types'
+                        AND projected.provenance='type-resolver'
+                    ),
+                    EXISTS(
+                      SELECT 1 FROM resolved_edges projected
+                      WHERE projected.src_key='file:api.ts'
+                        AND projected.dst_key='file:barrel.ts'
+                        AND projected.kind='import'
+                    )
+             FROM module_edges edge
+             JOIN files source ON source.id=edge.from_file
+             WHERE source.path='api.ts' AND edge.request='./barrel'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(type_only_module, (1, 1, 0));
+        let unresolved_contract: (String, Option<String>) = conn.query_row(
+            "SELECT entity_key, identity_anchor FROM entities
+             WHERE plane='contract' AND name='Ghost'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            unresolved_contract,
+            (
+                "contract:reference:unresolved:./missing-barrel#Ghost".into(),
+                None
+            )
+        );
         let enum_count: i64 = conn.query_row(
             "SELECT count(*) FROM entities
              WHERE plane='contract' AND entity_type='enum' AND name='UserState'",

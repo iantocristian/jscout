@@ -11,7 +11,7 @@ use serde_json::json;
 
 /// Bump whenever deterministic extraction semantics change in a way that
 /// requires unchanged files to be parsed again.
-pub const EXTRACTION_VERSION: &str = "1";
+pub const EXTRACTION_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct EntitySite {
@@ -63,12 +63,13 @@ struct TypeReference {
 #[derive(Default)]
 struct TypeReferenceVisitor {
     references: Vec<TypeReference>,
+    bound_names: Vec<HashSet<String>>,
 }
 
 impl<'a> Visit<'a> for TypeReferenceVisitor {
     fn visit_ts_type_reference(&mut self, reference: &TSTypeReference<'a>) {
         let name = reference.type_name.to_string();
-        if !is_builtin_contract_wrapper(&name) {
+        if !is_builtin_contract_wrapper(&name) && !self.is_bound(&name) {
             self.references.push(TypeReference {
                 name,
                 start: reference.type_name.span().start,
@@ -76,6 +77,58 @@ impl<'a> Visit<'a> for TypeReferenceVisitor {
             });
         }
         oxc_ast_visit::walk::walk_ts_type_reference(self, reference);
+    }
+
+    fn visit_ts_function_type(&mut self, function: &TSFunctionType<'a>) {
+        self.with_type_parameters(function.type_parameters.as_deref(), |visitor| {
+            oxc_ast_visit::walk::walk_ts_function_type(visitor, function);
+        });
+    }
+
+    fn visit_ts_constructor_type(&mut self, constructor: &TSConstructorType<'a>) {
+        self.with_type_parameters(constructor.type_parameters.as_deref(), |visitor| {
+            oxc_ast_visit::walk::walk_ts_constructor_type(visitor, constructor);
+        });
+    }
+
+    fn visit_ts_mapped_type(&mut self, mapped: &TSMappedType<'a>) {
+        self.with_bound_names([mapped.key.name.as_str()], |visitor| {
+            oxc_ast_visit::walk::walk_ts_mapped_type(visitor, mapped);
+        });
+    }
+}
+
+impl TypeReferenceVisitor {
+    fn with_type_parameters<'a>(
+        &mut self,
+        parameters: Option<&TSTypeParameterDeclaration<'a>>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        self.with_bound_names(
+            parameters
+                .into_iter()
+                .flat_map(|declaration| declaration.params.iter())
+                .map(|parameter| parameter.name.name.as_str()),
+            visit,
+        );
+    }
+
+    fn with_bound_names<'a>(
+        &mut self,
+        names: impl IntoIterator<Item = &'a str>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let names: HashSet<String> = names.into_iter().map(str::to_string).collect();
+        self.bound_names.push(names);
+        visit(self);
+        self.bound_names.pop();
+    }
+
+    fn is_bound(&self, name: &str) -> bool {
+        self.bound_names
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 }
 
@@ -158,12 +211,16 @@ impl EntityVisitor {
         owner: &str,
         owner_kind: &'static str,
         function: &Function<'_>,
+        outer_type_parameters: Option<&TSTypeParameterDeclaration<'_>>,
     ) {
+        let bound_names = type_parameter_names(outer_type_parameters)
+            .chain(type_parameter_names(function.type_parameters.as_deref()))
+            .collect::<HashSet<_>>();
         for (index, parameter) in function.params.items.iter().enumerate() {
             if let Some(annotation) = &parameter.type_annotation {
                 let before = self.sites.len();
                 self.push_contract_references(
-                    collect_type_references(annotation),
+                    collect_type_references(annotation, &bound_names),
                     "parameter_contract",
                     owner,
                     owner_kind,
@@ -177,7 +234,7 @@ impl EntityVisitor {
             && let Some(annotation) = &rest.type_annotation
         {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "parameter_contract",
                 owner,
                 owner_kind,
@@ -185,7 +242,7 @@ impl EntityVisitor {
         }
         if let Some(annotation) = &function.return_type {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "return_contract",
                 owner,
                 owner_kind,
@@ -198,11 +255,12 @@ impl EntityVisitor {
         owner: &str,
         arrow: &ArrowFunctionExpression<'_>,
     ) {
+        let bound_names = type_parameter_names(arrow.type_parameters.as_deref()).collect();
         for (index, parameter) in arrow.params.items.iter().enumerate() {
             if let Some(annotation) = &parameter.type_annotation {
                 let before = self.sites.len();
                 self.push_contract_references(
-                    collect_type_references(annotation),
+                    collect_type_references(annotation, &bound_names),
                     "parameter_contract",
                     owner,
                     "exported_arrow",
@@ -214,7 +272,7 @@ impl EntityVisitor {
         }
         if let Some(annotation) = &arrow.return_type {
             self.push_contract_references(
-                collect_type_references(annotation),
+                collect_type_references(annotation, &bound_names),
                 "return_contract",
                 owner,
                 "exported_arrow",
@@ -714,6 +772,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 identifier.name.as_str(),
                 "exported_function",
                 function,
+                None,
             );
         }
         oxc_ast_visit::walk::walk_function(self, function, flags);
@@ -732,7 +791,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 "exported": self.exported.contains(name),
             }),
         );
-        let mut collector = TypeReferenceVisitor::default();
+        let mut collector = type_reference_visitor(declaration.type_parameters.as_deref());
         oxc_ast_visit::walk::walk_ts_interface_declaration(&mut collector, declaration);
         self.push_contract_references(
             collector.references,
@@ -756,7 +815,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                 "exported": self.exported.contains(name),
             }),
         );
-        let mut collector = TypeReferenceVisitor::default();
+        let mut collector = type_reference_visitor(declaration.type_parameters.as_deref());
         oxc_ast_visit::walk::walk_ts_type_alias_declaration(&mut collector, declaration);
         self.push_contract_references(
             collector.references,
@@ -811,6 +870,7 @@ impl<'a> Visit<'a> for EntityVisitor {
                             &format!("{name}.{method_name}"),
                             "exported_method",
                             &method.value,
+                            class.type_parameters.as_deref(),
                         );
                     }
                 }
@@ -969,10 +1029,34 @@ pub fn extract(program: &Program<'_>, exported: &HashSet<String>) -> Vec<EntityS
     visitor.sites
 }
 
-fn collect_type_references<'a>(annotation: &'a TSTypeAnnotation<'a>) -> Vec<TypeReference> {
-    let mut visitor = TypeReferenceVisitor::default();
+fn collect_type_references<'a>(
+    annotation: &'a TSTypeAnnotation<'a>,
+    bound_names: &HashSet<String>,
+) -> Vec<TypeReference> {
+    let mut visitor = TypeReferenceVisitor {
+        references: Vec::new(),
+        bound_names: vec![bound_names.clone()],
+    };
     visitor.visit_ts_type_annotation(annotation);
     visitor.references
+}
+
+fn type_reference_visitor(
+    parameters: Option<&TSTypeParameterDeclaration<'_>>,
+) -> TypeReferenceVisitor {
+    TypeReferenceVisitor {
+        references: Vec::new(),
+        bound_names: vec![type_parameter_names(parameters).collect()],
+    }
+}
+
+fn type_parameter_names<'a>(
+    parameters: Option<&'a TSTypeParameterDeclaration<'a>>,
+) -> impl Iterator<Item = String> + 'a {
+    parameters
+        .into_iter()
+        .flat_map(|declaration| declaration.params.iter())
+        .map(|parameter| parameter.name.name.to_string())
 }
 
 fn is_builtin_contract_wrapper(name: &str) -> bool {
@@ -1554,6 +1638,34 @@ mod tests {
         assert!(extracted.iter().any(|site| {
             site.role == "decorator_use" && site.identity_name == "IsString"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_scoped_generic_parameters_from_contract_references() -> Result<()> {
+        let extracted = sites_with_exports(
+            "export interface Page<T extends Entity> { value: T; next: Page<T> }\n\
+             export type Mapper<T> = <U>(value: T, other: U) => Pair<T, U>;\n\
+             export function pick<T>(value: T): T { return value; }\n\
+             export const identity = <T>(value: T): T => value;\n\
+             export class Box<T> { map<U>(value: T, fn: (item: T) => U): U { throw Error(); } }\n",
+            ["Page", "Mapper", "pick", "identity", "Box"],
+        )?;
+
+        let references: Vec<&str> = extracted
+            .iter()
+            .filter(|site| {
+                matches!(
+                    site.role,
+                    "parameter_contract" | "return_contract" | "contract_reference"
+                )
+            })
+            .map(|site| site.identity_name.as_str())
+            .collect();
+        assert!(!references.iter().any(|name| matches!(*name, "T" | "U")));
+        assert!(references.contains(&"Entity"));
+        assert!(references.contains(&"Page"));
+        assert!(references.contains(&"Pair"));
         Ok(())
     }
 

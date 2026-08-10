@@ -23,6 +23,17 @@ pub struct ModuleGraph {
 
 impl ModuleGraph {
     pub fn load(conn: &Connection) -> Result<Self> {
+        Self::load_inner(conn, false)
+    }
+
+    /// Load the documentary export plane for structural contract resolution.
+    /// Runtime-only consumers such as `who_uses` use [`Self::load`] and avoid
+    /// scanning contract exports they cannot consume.
+    pub(crate) fn load_with_contracts(conn: &Connection) -> Result<Self> {
+        Self::load_inner(conn, true)
+    }
+
+    fn load_inner(conn: &Connection, include_contracts: bool) -> Result<Self> {
         let mut exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
         let mut stmt =
             conn.prepare("SELECT file_id, export_name, local_name, from_request, from_name FROM exports")?;
@@ -43,24 +54,26 @@ impl ModuleGraph {
         }
 
         let mut contract_exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
-        let mut stmt = conn.prepare(
-            "SELECT file_id, export_name, local_name, from_request, from_name
-             FROM contract_exports",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                ExportEntry {
-                    export_name: r.get(1)?,
-                    local_name: r.get(2)?,
-                    from_request: r.get(3)?,
-                    from_name: r.get(4)?,
-                },
-            ))
-        })?;
-        for row in rows {
-            let (id, entry) = row?;
-            contract_exports.entry(id).or_default().push(entry);
+        if include_contracts {
+            let mut stmt = conn.prepare(
+                "SELECT file_id, export_name, local_name, from_request, from_name
+                 FROM contract_exports",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    ExportEntry {
+                        export_name: r.get(1)?,
+                        local_name: r.get(2)?,
+                        from_request: r.get(3)?,
+                        from_name: r.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, entry) = row?;
+                contract_exports.entry(id).or_default().push(entry);
+            }
         }
 
         let mut edges: HashMap<(i64, String), (Option<i64>, bool)> = HashMap::new();

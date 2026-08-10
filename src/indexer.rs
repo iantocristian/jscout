@@ -663,18 +663,31 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     };
     package_roots.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
 
-    let pairs: Vec<(i64, String)> = {
+    let pairs: Vec<(i64, String, bool)> = {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT f.id, r.request FROM files f
-             JOIN (SELECT file_id, request FROM imports
-                   UNION SELECT file_id, from_request FROM exports WHERE from_request IS NOT NULL
-                   UNION SELECT file_id, request FROM contract_imports
-                   UNION SELECT file_id, from_request FROM contract_exports
-                     WHERE from_request IS NOT NULL
-                   UNION SELECT file_id, target_request FROM refs WHERE target_request IS NOT NULL) r
-             ON r.file_id = f.id",
+            "SELECT f.id, requests.request, max(requests.is_runtime) = 0
+             FROM files f
+             JOIN (
+               SELECT file_id, request, 1 AS is_runtime FROM imports
+               UNION ALL
+               SELECT file_id, from_request, 1 FROM exports WHERE from_request IS NOT NULL
+               UNION ALL
+               SELECT file_id, target_request, 1 FROM refs WHERE target_request IS NOT NULL
+               UNION ALL
+               SELECT file_id, request, 0 FROM contract_imports
+               UNION ALL
+               SELECT file_id, from_request, 0 FROM contract_exports
+                 WHERE from_request IS NOT NULL
+             ) requests ON requests.file_id = f.id
+             GROUP BY f.id, requests.request",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? != 0,
+            ))
+        })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
 
@@ -682,12 +695,12 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM module_edges", [])?;
     let mut ins = conn.prepare_cached(
         "INSERT INTO module_edges(
-           from_file, request, to_file, package, resolution, package_instance_id
-         ) VALUES(?1,?2,?3,?4,?5,?6)",
+           from_file, request, to_file, package, resolution, package_instance_id, type_only
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
     )?;
     type Resolved = (Option<i64>, Option<String>, Option<&'static str>, Option<i64>);
     let mut cache: HashMap<(PathBuf, String), Resolved> = HashMap::new();
-    for (file_id, request) in pairs {
+    for (file_id, request, type_only) in pairs {
         let (importer, dependency_importer) = importer_paths
             .get(&file_id)
             .ok_or_else(|| anyhow::anyhow!("indexed importer {file_id} has no physical path"))?
@@ -731,6 +744,7 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
             package,
             resolution,
             package_instance,
+            type_only,
         ])?;
     }
     drop(ins);
