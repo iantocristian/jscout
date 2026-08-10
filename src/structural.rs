@@ -208,6 +208,69 @@ pub struct Neighborhood {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PathOptions {
+    pub expected_snapshot: Option<String>,
+    pub max_depth: usize,
+    pub path_limit: usize,
+    pub node_limit: usize,
+    pub edge_limit: usize,
+    pub direction: String,
+    pub min_confidence: String,
+    pub kinds: Vec<String>,
+    pub file_roles: Vec<String>,
+    pub file_origins: Vec<String>,
+}
+
+impl Default for PathOptions {
+    fn default() -> Self {
+        Self {
+            expected_snapshot: None,
+            max_depth: 4,
+            path_limit: 8,
+            node_limit: 200,
+            edge_limit: 800,
+            direction: "both".into(),
+            min_confidence: "likely".into(),
+            kinds: Vec::new(),
+            file_roles: file_role::DEFAULT_EXPANSION
+                .iter()
+                .map(|role| (*role).to_string())
+                .collect(),
+            file_origins: origin::defaults(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathStep {
+    pub from: String,
+    pub to: String,
+    pub edge: GraphEdge,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphPath {
+    pub score: f64,
+    pub nodes: Vec<GraphNode>,
+    pub steps: Vec<PathStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathSearch {
+    pub snapshot: String,
+    pub requested_from: String,
+    pub requested_to: String,
+    pub resolved_from: String,
+    pub resolved_to: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub paths: Vec<GraphPath>,
+    pub searched_nodes: usize,
+    pub searched_edges: usize,
+    pub truncated: bool,
+}
+
 pub fn current_snapshot(conn: &Connection) -> Result<String> {
     conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |r| {
         r.get(0)
@@ -1982,6 +2045,162 @@ fn neighborhood_in_snapshot(
     })
 }
 
+pub fn paths(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    options: &PathOptions,
+) -> Result<PathSearch> {
+    if options.max_depth == 0 || options.max_depth > 8 {
+        bail!("path depth must be between 1 and 8");
+    }
+    if options.path_limit == 0 || options.path_limit > 50 {
+        bail!("path limit must be between 1 and 50");
+    }
+    origin::validate_all(&options.file_origins)?;
+    file_role::validate_all(&options.file_roles)?;
+    let allowed_origins: HashSet<&str> = options.file_origins.iter().map(String::as_str).collect();
+    let snapshot = current_snapshot(conn)?;
+    let (resolved_to, to_status) = resolve_anchor(
+        conn,
+        to,
+        options.expected_snapshot.as_deref(),
+        &snapshot,
+        &allowed_origins,
+    )?;
+    let neighborhood = neighborhood(
+        conn,
+        from,
+        &NeighborhoodOptions {
+            expected_snapshot: options.expected_snapshot.clone(),
+            depth: options.max_depth,
+            direction: options.direction.clone(),
+            node_limit: options.node_limit,
+            edge_limit: options.edge_limit,
+            min_confidence: options.min_confidence.clone(),
+            kinds: options.kinds.clone(),
+            file_roles: options.file_roles.clone(),
+            file_origins: options.file_origins.clone(),
+            penalize_file_roles: true,
+        },
+    )?;
+    let mut node_by_key: HashMap<String, GraphNode> = neighborhood
+        .nodes
+        .iter()
+        .cloned()
+        .map(|node| (node.key.clone(), node))
+        .collect();
+    if !node_by_key.contains_key(&resolved_to)
+        && let Some(node) = load_node(conn, &resolved_to)?
+    {
+        node_by_key.insert(resolved_to.clone(), node);
+    }
+    let mut adjacency: HashMap<String, Vec<(String, GraphEdge)>> = HashMap::new();
+    for edge in &neighborhood.edges {
+        if options.direction != "in" {
+            adjacency
+                .entry(edge.source.clone())
+                .or_default()
+                .push((edge.target.clone(), edge.clone()));
+        }
+        if options.direction != "out" {
+            adjacency
+                .entry(edge.target.clone())
+                .or_default()
+                .push((edge.source.clone(), edge.clone()));
+        }
+    }
+    for edges in adjacency.values_mut() {
+        edges.sort_by(|(left_node, left), (right_node, right)| {
+            right
+                .relevance
+                .total_cmp(&left.relevance)
+                .then_with(|| left_node.cmp(right_node))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+    }
+
+    #[derive(Clone)]
+    struct Candidate {
+        nodes: Vec<String>,
+        steps: Vec<PathStep>,
+        score: f64,
+    }
+
+    let candidate_limit = options.path_limit.saturating_mul(32).max(options.path_limit);
+    let mut stack = vec![Candidate {
+        nodes: vec![neighborhood.resolved_anchor.clone()],
+        steps: Vec::new(),
+        score: 1.0,
+    }];
+    let mut candidates = Vec::new();
+    let mut enumeration_truncated = false;
+    while let Some(candidate) = stack.pop() {
+        let current = candidate.nodes.last().expect("path has a node");
+        if current == &resolved_to {
+            candidates.push(candidate);
+            if candidates.len() >= candidate_limit {
+                enumeration_truncated = true;
+                break;
+            }
+            continue;
+        }
+        if candidate.steps.len() >= options.max_depth {
+            continue;
+        }
+        let Some(edges) = adjacency.get(current) else { continue };
+        for (next, edge) in edges.iter().rev() {
+            if candidate.nodes.contains(next) {
+                continue;
+            }
+            let mut next_candidate = candidate.clone();
+            next_candidate.nodes.push(next.clone());
+            next_candidate.steps.push(PathStep {
+                from: current.clone(),
+                to: next.clone(),
+                edge: edge.clone(),
+            });
+            next_candidate.score = round_score(candidate.score.min(edge.relevance));
+            stack.push(next_candidate);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.steps.len().cmp(&right.steps.len()))
+            .then_with(|| left.nodes.cmp(&right.nodes))
+    });
+    let matched_paths = candidates.len();
+    let paths = candidates
+        .into_iter()
+        .take(options.path_limit)
+        .map(|candidate| {
+            let nodes = candidate
+                .nodes
+                .iter()
+                .filter_map(|key| node_by_key.get(key).cloned())
+                .collect();
+            GraphPath { score: candidate.score, nodes, steps: candidate.steps }
+        })
+        .collect();
+    Ok(PathSearch {
+        snapshot: neighborhood.snapshot,
+        requested_from: from.to_string(),
+        requested_to: to.to_string(),
+        resolved_from: neighborhood.resolved_anchor,
+        resolved_to,
+        from_status: neighborhood.anchor_status,
+        to_status,
+        paths,
+        searched_nodes: neighborhood.nodes.len(),
+        searched_edges: neighborhood.edges.len(),
+        truncated: neighborhood.truncated
+            || enumeration_truncated
+            || matched_paths > options.path_limit,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enqueue_ranked_steps(
     conn: &Connection,
@@ -2517,6 +2736,37 @@ mod tests {
                 && edge.target.contains("a.ts#::greet@1")
                 && edge.confidence == "certain"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn paths_returns_ranked_bounded_composed_routes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "flow.ts",
+            "export function finish() {}\n\
+             export function middle() { finish(); }\n\
+             export function start() { middle(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let result = super::paths(
+            &conn,
+            "flow.ts:start",
+            "flow.ts:finish",
+            &super::PathOptions {
+                direction: "out".into(),
+                max_depth: 3,
+                kinds: vec!["call".into()],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].steps.len(), 2);
+        assert!(result.paths[0].score > 0.0);
+        assert_eq!(result.paths[0].nodes[0].display_name, "start");
+        assert_eq!(result.paths[0].nodes[2].display_name, "finish");
         Ok(())
     }
 

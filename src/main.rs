@@ -18,6 +18,7 @@ mod semantic;
 mod stats;
 mod store;
 mod structural;
+mod surface;
 mod walk;
 mod watch;
 mod workspace;
