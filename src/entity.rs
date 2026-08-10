@@ -34,16 +34,14 @@ struct EntityVisitor {
 
 impl EntityVisitor {
     fn identity(&self, expression: &Expression<'_>) -> Option<(&'static str, String, u32)> {
-        if let Some(value) = static_string(expression, &self.static_strings) {
-            return Some(("literal", value, expression.span().start));
-        }
         match expression {
             Expression::Identifier(identifier) => Some((
                 "reference",
                 identifier.name.to_string(),
                 identifier.span.start,
             )),
-            _ => None,
+            _ => static_string(expression, &self.static_strings)
+                .map(|value| ("literal", value, expression.span().start)),
         }
     }
 
@@ -293,14 +291,14 @@ mod tests {
         assert!(extracted.iter().any(|site| {
             site.entity_type == "registry"
                 && site.role == "registered_handler"
-                && site.identity_kind == "literal"
-                && site.identity_name == "logic-id"
+                && site.identity_kind == "reference"
+                && site.identity_name == "TARGET"
                 && site.target_name.as_deref() == Some("handler")
         }));
         assert!(extracted.iter().any(|site| {
             site.entity_type == "registry"
                 && site.role == "dispatch_site"
-                && site.identity_name == "logic-id"
+                && site.identity_name == "TARGET"
         }));
         Ok(())
     }
