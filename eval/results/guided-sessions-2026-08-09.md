@@ -99,10 +99,33 @@ hook untouched. Structural additionally flagged the Python task-runner
 stdout path as a policy bypass (beyond gold's own scope) and chose gold's
 exact base-class chokepoint where grep gated the two leaf call sites.
 
-## Cross-session synthesis (three task pairs, six graded arms)
+## Deep-task session — Twenty trigger dispatch (`deep-61c72942acd5`)
 
-1. **First nonzero omission rates appeared only on the deep task** (0.125
-   both arms) — depth cuts, but it cut both arms identically.
+Doc-stripped, two-member arc (drift-monitoring repair content included in
+the story, so its edge-case rulings are instructed-content, not
+anticipation). 4 packages, 9 gold files.
+
+| | grep | structural |
+|---|---|---|
+| Matched | 4/9 | 8/9 |
+| **Confirmed omission rate** | **0.167** | **0** |
+| The separator | reused the pre-existing version-in-core flag, coupling this rollout to a different migration | dedicated default-off flag + full codegen surface, gold's exact design |
+| Drift repair (member 2) | covered | covered |
+| jscout calls | 0 | 2 (1 search, 1 neighborhood) |
+
+**First arm separation of the program** — with the honest caveat cutting
+against the tool: structural won using only two tool calls, so attribution
+to jscout is weak; run-to-run design variance is the live alternative
+explanation. Judge-process note: two adjudication rows initially used
+guessed generated-file paths; the grader's exact-path matching rejected
+them (third fabricate-then-verify catch of the program).
+
+## Cross-session synthesis (four task pairs, eight graded arms)
+
+1. **Nonzero omission rates appear only on deep tasks** (redaction
+   0.125/0.125; trigger-dispatch 0 vs 0.167) — the task-depth thesis is
+   confirmed as the right instrument: shallow arcs produced no signal in
+   four graded arms, deep arcs produced signal in all four.
 2. **The consistent human-vs-agent gap is the hardening layer**: fail-closed
    semantics + license-gate snapshot (redaction), injectable `now`
    (Insights). These live in operational history — flaky tests, production
@@ -110,9 +133,11 @@ exact base-class chokepoint where grep gated the two leaf call sites.
    surfaces them. This is the strongest empirical argument in the program
    for the memory layer over the retrieval layer: what agents miss is
    precisely what follow-up commits record.
-3. **Structural's recurring edge is architectural placement**, not outcome:
+3. **Structural's recurring edge is design fidelity to gold**:
    serializer-level injection (Insights), base-class chokepoint (redaction),
-   7/7 and 7/9 direct matches. Grep is never behind on outcome.
+   dedicated feature flag (trigger dispatch) — 7/7, 7/9, 8/9 direct
+   matches. Whether that reflects tooling or variance is unresolved
+   (the trigger-dispatch win used two tool calls).
 4. Doc-stripping did not visibly degrade localization on the one task run
    without docs (all sinks found); n=1.
 
