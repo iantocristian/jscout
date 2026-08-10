@@ -69,8 +69,10 @@ The indexing cost is material. Relative to the runtime-boundary-only Twenty
 run recorded on the same checkout, total time increases from 31.28 seconds to
 39.06 seconds, about 25%. Most of the added cost is inserting roughly 78k
 occurrences and their documentary edges, not module lookup. This is accepted
-for the first contract slice but should be included in future scale work; it is
-not evidence that default expansion should grow broader.
+for the first contract slice but should be included in future scale work. The
+same full projection rebuild currently runs after each watch cycle, so this
+roughly seven-second cost is also edit-loop pressure on repositories of this
+size; it is not evidence that default expansion should grow broader.
 
 ## Decision
 

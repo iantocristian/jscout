@@ -350,6 +350,9 @@ check are recorded in
 The separate contract-plane implementation, scale cost, and type-only barrel
 fixture are recorded in
 [`results/contract-plane-2026-08-10.md`](results/contract-plane-2026-08-10.md).
+The post-merge fixes for documentary module-edge labeling, scoped generic
+parameters, and contract graph load cost are recorded in
+[`results/contract-plane-followups-2026-08-10.md`](results/contract-plane-followups-2026-08-10.md).
 The route, GraphQL, environment, database, feature-flag, and external-host
 entity implementation is recorded in
 [`results/general-entities-2026-08-10.md`](results/general-entities-2026-08-10.md).
