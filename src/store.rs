@@ -308,6 +308,7 @@ CREATE TABLE IF NOT EXISTS scout_runs(
   source_snapshot TEXT NOT NULL,
   input_fingerprint TEXT NOT NULL,
   request_hash TEXT NOT NULL,
+  config_json TEXT NOT NULL DEFAULT '{}',
   usage_json TEXT,
   error_code TEXT,
   started_at TEXT NOT NULL,
@@ -765,8 +766,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         backfill_artifact_fingerprints(conn)?;
     }
 
+    // v13 -> v14: persist the deterministic inputs needed to reproduce a
+    // scout. Older runs remain attributable but cannot be refreshed by
+    // guessing their original seeds or traversal limits.
+    if version < 14 && !has_column(conn, "scout_runs", "config_json")? {
+        conn.execute(
+            "ALTER TABLE scout_runs ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','13')
+        "INSERT INTO meta(key, value) VALUES('schema_version','14')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -963,7 +974,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         assert!(database.is_file());
         Ok(())
     }
@@ -1000,7 +1011,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -1043,7 +1054,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -1107,7 +1118,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -1136,7 +1147,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -1180,7 +1191,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1230,7 +1241,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1296,7 +1307,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1344,7 +1355,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1392,7 +1403,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
@@ -1446,7 +1457,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
 
         // The backfilled fingerprint equals a recomputation from canonical parts.
         let stored: String = conn.query_row(
@@ -1487,6 +1498,53 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(identity, (None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v13_scout_runs_with_replay_configuration() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '13');
+             CREATE TABLE scout_runs(
+               id INTEGER PRIMARY KEY,
+               scout_kind TEXT NOT NULL,
+               status TEXT NOT NULL,
+               gateway_protocol INTEGER NOT NULL,
+               provider TEXT NOT NULL,
+               model TEXT NOT NULL,
+               billing_path TEXT NOT NULL,
+               reasoning TEXT,
+               prompt_version TEXT NOT NULL,
+               source_snapshot TEXT NOT NULL,
+               input_fingerprint TEXT NOT NULL,
+               request_hash TEXT NOT NULL,
+               usage_json TEXT,
+               error_code TEXT,
+               started_at TEXT NOT NULL,
+               completed_at TEXT
+             );
+             INSERT INTO scout_runs VALUES(
+               1,'workflow','completed',1,'faux','model','api',NULL,
+               'workflow-scout/v1','snapshot','input','request',NULL,NULL,
+               '2026-08-10T00:00:00Z','2026-08-10T00:01:00Z'
+             );",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let (version, config): (String, String) = conn.query_row(
+            "SELECT meta.value, run.config_json
+             FROM meta JOIN scout_runs run ON run.id=1
+             WHERE meta.key='schema_version'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(version, "14");
+        assert_eq!(config, "{}");
         Ok(())
     }
 

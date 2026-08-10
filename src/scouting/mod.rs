@@ -7,6 +7,8 @@
 
 pub mod evidence;
 pub mod ledger;
+pub mod plan;
+pub mod refresh;
 pub mod workflow;
 
 use std::collections::BTreeMap;
@@ -14,14 +16,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{
     ChatMessage, CompleteRequest, PROTOCOL_VERSION, ProviderOptions, SubmitTool, Usage,
 };
 use crate::llm::{GatewayError, LlmGateway};
-use crate::semantic::{self, WorkflowCandidateOptions, WorkflowCandidateSet};
-use crate::{store, structural};
+use crate::semantic::{self, WorkflowCandidateSet};
+use crate::structural;
 
 use evidence::EvidencePack;
 use ledger::{ClassificationRow, RunClaim, RunOutcome, RunSpec};
@@ -40,6 +43,15 @@ pub struct WorkflowScoutOptions {
     pub service_tier: Option<String>,
     pub policy: RequestPolicy,
     pub rebuild: bool,
+    pub supersedes_artifact_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRunConfig {
+    pub seeds: Vec<String>,
+    pub depth: usize,
+    pub candidate_limit: usize,
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,46 +68,211 @@ pub struct WorkflowScoutReport {
     pub incomplete_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkflowBatchReport {
+    pub reports: Vec<WorkflowScoutReport>,
+    pub model_calls: usize,
+    pub skipped_for_call_budget: usize,
+    pub skipped_unscoutable: usize,
+    pub duplicate_candidate_sets_skipped: usize,
+    pub auto_seed_limit_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshPlanItem {
+    pub artifact_id: i64,
+    pub freshness: String,
+    pub model: String,
+    pub reasoning: Option<String>,
+    pub workflow: plan::WorkflowPlan,
+}
+
+struct PreparedWorkflow {
+    candidate_set: WorkflowCandidateSet,
+    evidence: EvidencePack,
+    request: CompleteRequest,
+    spec: RunSpec,
+}
+
 /// One candidate-closed workflow scouting run for an explicit seed set.
+#[allow(dead_code)]
 pub fn scout_workflows(
     root: &Path,
     conn: &Connection,
     gateway: &mut dyn LlmGateway,
     options: &WorkflowScoutOptions,
 ) -> Result<WorkflowScoutReport> {
-    // This command issues exactly one completion; the budget still has to
-    // admit it so `--max-calls 0` cannot silently no-op.
-    if options.policy.max_calls < 1 {
-        bail!("--max-calls must admit at least one request for workflow scouting");
-    }
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
+    let mut plan = plan::workflows(
+        root,
+        conn,
+        &options.seeds,
+        options.depth,
+        options.candidate_limit,
+    )?;
+    if plan.items.len() != 1 {
+        bail!("single workflow scouting requires one explicit seed group");
+    }
+    let prepared = prepare_workflow(gateway, plan.items.remove(0), options)?;
+    execute_prepared_workflow(root, conn, gateway, options, prepared, true)
+}
 
-    // One bounded read snapshot for candidates and evidence; released before
-    // any network wait so no database snapshot spans model latency.
-    let (candidate_set, evidence) = store::with_read_snapshot(conn, "jscout_scout", || {
-        let candidate_set = semantic::workflow_candidates(
+/// Execute a precomputed explicit or automatic plan. Reusable completed runs
+/// are checked before the call budget, so reuse never consumes `--max-calls`.
+pub fn scout_workflow_plan(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    options: &WorkflowScoutOptions,
+    plan: plan::WorkflowPlan,
+) -> Result<WorkflowBatchReport> {
+    ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
+    let skipped_unscoutable = plan.skipped.len();
+    let duplicate_candidate_sets_skipped = plan.duplicate_candidate_sets_skipped;
+    let auto_seed_limit_reached = plan.auto_seed_limit_reached;
+    let prepared = plan
+        .items
+        .into_iter()
+        .map(|item| prepare_workflow(gateway, item, options))
+        .collect::<Result<Vec<_>>>()?;
+    let mut reports = Vec::new();
+    let mut model_calls = 0;
+    let mut skipped = 0;
+    for prepared in prepared {
+        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+        if !reusable && model_calls >= options.policy.max_calls {
+            skipped += 1;
+            continue;
+        }
+        let report = execute_prepared_workflow(
             root,
             conn,
-            &options.seeds,
-            &WorkflowCandidateOptions {
-                expected_snapshot: None,
-                depth: options.depth,
-                candidate_limit: options.candidate_limit,
-            },
+            gateway,
+            options,
+            prepared,
+            model_calls < options.policy.max_calls,
         )?;
-        if candidate_set.traversal_truncated || candidate_set.candidate_truncated {
+        if report.status != "reused" {
+            model_calls += 1;
+        }
+        reports.push(report);
+    }
+    Ok(WorkflowBatchReport {
+        reports,
+        model_calls,
+        skipped_for_call_budget: skipped,
+        skipped_unscoutable,
+        duplicate_candidate_sets_skipped,
+        auto_seed_limit_reached,
+    })
+}
+
+/// Materialize exact replacement inputs without starting the gateway.
+pub fn plan_refresh(
+    root: &Path,
+    conn: &Connection,
+    selection: &refresh::RefreshSelection,
+) -> Result<Vec<RefreshPlanItem>> {
+    selection
+        .targets
+        .iter()
+        .map(|target| {
+            Ok(RefreshPlanItem {
+                artifact_id: target.artifact_id,
+                freshness: target.freshness.clone(),
+                model: target.model.spec.clone(),
+                reasoning: target.reasoning.clone(),
+                workflow: plan::workflows(
+                    root,
+                    conn,
+                    &target.config.seeds,
+                    target.config.depth,
+                    target.config.candidate_limit,
+                )?,
+            })
+        })
+        .collect()
+}
+
+/// Refresh stale/degraded generated workflows under one strict command-level
+/// call budget while retaining each run's original model and configuration.
+pub fn scout_refresh(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    selection: refresh::RefreshSelection,
+    policy: RequestPolicy,
+) -> Result<WorkflowBatchReport> {
+    ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
+    let mut prepared = Vec::new();
+    for target in selection.targets {
+        let mut workflow_plan = plan::workflows(
+            root,
+            conn,
+            &target.config.seeds,
+            target.config.depth,
+            target.config.candidate_limit,
+        )?;
+        if workflow_plan.items.len() != 1 {
             bail!(
-                "the deterministic candidate set is truncated (traversal: {}, candidates: {}); \
-                 narrow the seeds or depth, or raise the supported deterministic limit — \
-                 the model is never asked to interpret a partial boundary",
-                candidate_set.traversal_truncated,
-                candidate_set.candidate_truncated,
+                "refresh artifact {} did not reconstruct one seed group",
+                target.artifact_id
             );
         }
-        let evidence = evidence::build(root, conn, &candidate_set.candidates)?;
-        Ok((candidate_set, evidence))
-    })?;
+        let options = WorkflowScoutOptions {
+            seeds: target.config.seeds,
+            depth: target.config.depth,
+            candidate_limit: target.config.candidate_limit,
+            model: target.model,
+            reasoning: target.reasoning,
+            service_tier: target.config.service_tier,
+            policy: policy.clone(),
+            rebuild: false,
+            supersedes_artifact_id: Some(target.artifact_id),
+        };
+        let workflow = prepare_workflow(gateway, workflow_plan.items.remove(0), &options)?;
+        prepared.push((options, workflow));
+    }
 
+    let mut reports = Vec::new();
+    let mut model_calls = 0;
+    let mut skipped = 0;
+    for (options, prepared) in prepared {
+        let reusable = ledger::reusable_run(conn, &prepared.spec)?.is_some();
+        if !reusable && model_calls >= policy.max_calls {
+            skipped += 1;
+            continue;
+        }
+        let report = execute_prepared_workflow(
+            root,
+            conn,
+            gateway,
+            &options,
+            prepared,
+            model_calls < policy.max_calls,
+        )?;
+        if report.status != "reused" {
+            model_calls += 1;
+        }
+        reports.push(report);
+    }
+    Ok(WorkflowBatchReport {
+        reports,
+        model_calls,
+        skipped_for_call_budget: skipped,
+        skipped_unscoutable: 0,
+        duplicate_candidate_sets_skipped: 0,
+        auto_seed_limit_reached: false,
+    })
+}
+
+fn prepare_workflow(
+    gateway: &mut dyn LlmGateway,
+    item: plan::WorkflowPlanItem,
+    options: &WorkflowScoutOptions,
+) -> Result<PreparedWorkflow> {
+    let candidate_set = item.candidate_set;
+    let evidence = item.evidence;
     let mut request = build_request(&candidate_set, &evidence, options)?;
     enforce_context_budget(
         gateway,
@@ -109,6 +286,12 @@ pub fn scout_workflows(
     let request_hash = blake3::hash(serde_json::to_string(&request)?.as_bytes())
         .to_hex()
         .to_string();
+    let config_json = serde_json::to_string(&WorkflowRunConfig {
+        seeds: candidate_set.seeds.clone(),
+        depth: options.depth,
+        candidate_limit: options.candidate_limit,
+        service_tier: options.service_tier.clone(),
+    })?;
     let spec = RunSpec {
         scout_kind: "workflow".into(),
         gateway_protocol: PROTOCOL_VERSION,
@@ -120,8 +303,35 @@ pub fn scout_workflows(
         source_snapshot: candidate_set.snapshot.clone(),
         input_fingerprint: input_fingerprint.clone(),
         request_hash,
+        config_json,
+        supersedes_artifact_id: options.supersedes_artifact_id,
     };
+    Ok(PreparedWorkflow {
+        candidate_set,
+        evidence,
+        request,
+        spec,
+    })
+}
 
+fn execute_prepared_workflow(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    options: &WorkflowScoutOptions,
+    prepared: PreparedWorkflow,
+    allow_new_call: bool,
+) -> Result<WorkflowScoutReport> {
+    let PreparedWorkflow {
+        candidate_set,
+        evidence,
+        request,
+        spec,
+    } = prepared;
+    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
+        bail!("workflow call budget exhausted before a non-reusable run");
+    }
+    let input_fingerprint = spec.input_fingerprint.clone();
     let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
         RunClaim::Reused(run_id) => {
             return reuse_report(conn, run_id, &candidate_set, &spec);
@@ -573,7 +783,7 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{WorkflowScoutOptions, scout_workflows};
+    use super::{WorkflowScoutOptions, scout_refresh, scout_workflow_plan, scout_workflows};
     use crate::llm::config::{ModelSpec, RequestPolicy};
     use crate::llm::protocol::{
         CompleteRequest, ModelCapabilities, ProviderSummary, ToolCall, Usage,
@@ -675,6 +885,7 @@ mod tests {
             service_tier: None,
             policy: RequestPolicy::new(30, 1, 240_000).expect("policy"),
             rebuild: false,
+            supersedes_artifact_id: None,
         }
     }
 
@@ -728,6 +939,39 @@ mod tests {
         })
     }
 
+    fn defining_submission(set: &crate::semantic::WorkflowCandidateSet) -> serde_json::Value {
+        let candidates = set
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                if index == 0 {
+                    json!({
+                        "anchor": candidate.anchor,
+                        "decision": "defining",
+                        "role": "deterministic entry boundary",
+                        "evidence": [{
+                            "start_line": candidate.evidence_start_line,
+                            "end_line": candidate.evidence_end_line,
+                        }],
+                    })
+                } else {
+                    json!({
+                        "anchor": candidate.anchor,
+                        "decision": "excluded",
+                        "reason": "outside the minimal boundary",
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "name": "deterministic entry flow",
+            "description": "The entry boundary initiates this workflow.",
+            "candidates": candidates,
+            "incomplete_reason": null,
+        })
+    }
+
     #[test]
     fn publishes_a_candidate_closed_workflow_atomically() -> Result<()> {
         let repo = tempfile::tempdir()?;
@@ -764,6 +1008,22 @@ mod tests {
         assert_eq!(status, "completed");
         assert!(usage_json.contains("\"total_tokens\":120"));
         assert_eq!(billing, "api");
+        let config: super::WorkflowRunConfig = serde_json::from_str(&conn.query_row(
+            "SELECT config_json FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        assert_eq!(
+            config.seeds,
+            vec![
+                anchors
+                    .iter()
+                    .find(|anchor| anchor.contains("::start@"))
+                    .expect("resolved start anchor")
+                    .clone()
+            ]
+        );
+        assert_eq!(config.depth, 2);
 
         let classifications: i64 = conn.query_row(
             "SELECT count(*) FROM scout_classifications WHERE run_id=?1",
@@ -784,6 +1044,90 @@ mod tests {
         assert_eq!(reused.status, "reused");
         assert_eq!(reused.artifact_id, Some(artifact_id));
         assert_eq!(idle_gateway.calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_batch_spends_only_for_new_fingerprints() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("index.ts"),
+            "export function first() { return 1; }\n\
+             export function second() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut options = scout_options();
+        options.seeds.clear();
+
+        let first_plan = super::plan::workflows(repo.path(), &conn, &[], 2, 31)?;
+        assert_eq!(first_plan.items.len(), 2);
+        let first_submission = defining_submission(&first_plan.items[0].candidate_set);
+        let mut first_gateway = FakeGateway::new(vec![Ok(outcome(first_submission))]);
+        let first =
+            scout_workflow_plan(repo.path(), &conn, &mut first_gateway, &options, first_plan)?;
+        assert_eq!(first.model_calls, 1);
+        assert_eq!(first.skipped_for_call_budget, 1);
+
+        let second_plan = super::plan::workflows(repo.path(), &conn, &[], 2, 31)?;
+        let second_submission = defining_submission(&second_plan.items[1].candidate_set);
+        let mut second_gateway = FakeGateway::new(vec![Ok(outcome(second_submission))]);
+        let second = scout_workflow_plan(
+            repo.path(),
+            &conn,
+            &mut second_gateway,
+            &options,
+            second_plan,
+        )?;
+        assert_eq!(second.model_calls, 1);
+        assert_eq!(second.skipped_for_call_budget, 0);
+        assert_eq!(second.reports.len(), 2);
+        assert_eq!(
+            second
+                .reports
+                .iter()
+                .filter(|report| report.status == "reused")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_replays_recorded_inputs_and_publishes_an_immutable_successor() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let anchors = candidate_anchors(&conn, repo.path())?;
+        let mut first_gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+        let first = scout_workflows(repo.path(), &conn, &mut first_gateway, &scout_options())?;
+        let first_id = first.artifact_id.expect("first artifact");
+
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 2; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let selection = super::refresh::select(&conn, &[first_id])?;
+        assert_eq!(selection.targets.len(), 1);
+        let refreshed_anchors = candidate_anchors(&conn, repo.path())?;
+        let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&refreshed_anchors)))]);
+        let batch = scout_refresh(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            selection,
+            RequestPolicy::new(30, 1, 240_000)?,
+        )?;
+        assert_eq!(batch.model_calls, 1);
+        let successor = batch.reports[0].artifact_id.expect("refreshed artifact");
+        assert_ne!(successor, first_id);
+        let supersedes: i64 = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [successor],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, first_id);
         Ok(())
     }
 

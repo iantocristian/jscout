@@ -724,7 +724,7 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
     Ok(artifacts)
 }
 
-fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
+pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
     let row = conn
         .query_row(
             "SELECT id, supersedes_artifact_id, artifact_type, canonical_name, body_json,

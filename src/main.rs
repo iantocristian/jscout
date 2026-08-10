@@ -281,12 +281,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ScoutCommand {
-    /// Candidate-closed workflow classification for explicit seed anchors
+    /// Candidate-closed workflow classification from explicit or automatic seeds
     Workflows {
         /// Repository root (must be indexed)
         root: PathBuf,
         /// Seed symbol anchors or uniquely resolvable symbol names (repeatable)
-        #[arg(long = "seed", required = true)]
+        #[arg(long = "seed")]
         seeds: Vec<String>,
         /// Exact pi-ai model as provider:model; falls back to JSCOUT_LLM_MODEL
         #[arg(long)]
@@ -301,8 +301,8 @@ enum ScoutCommand {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
         /// Hard command-level request budget
-        #[arg(long, default_value_t = 1)]
-        max_calls: usize,
+        #[arg(long)]
+        max_calls: Option<usize>,
         /// Maximum serialized evidence bytes sent to the model
         #[arg(long, default_value_t = 240_000)]
         context_bytes: usize,
@@ -315,6 +315,35 @@ enum ScoutCommand {
         /// Supersede a completed identical run instead of reusing it
         #[arg(long)]
         rebuild: bool,
+        /// Print exact deterministic seeds/candidate/evidence budgets; make no model calls
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
+    /// Replace stale/degraded generated workflows using their recorded inputs
+    Refresh {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Refresh only these current generated workflow artifacts (repeatable)
+        #[arg(long = "artifact")]
+        artifacts: Vec<i64>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level request budget
+        #[arg(long)]
+        max_calls: usize,
+        /// Maximum serialized evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Print selected artifacts and exact replacement inputs; make no model calls
+        #[arg(long)]
+        dry_run: bool,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -525,22 +554,51 @@ fn main() -> Result<()> {
                 depth,
                 candidate_limit,
                 rebuild,
+                dry_run,
                 database,
                 gateway_path,
-            } => cmd_scout_workflows(
+            } => {
+                let max_calls = match max_calls {
+                    Some(value) => value,
+                    None if seeds.is_empty() => {
+                        anyhow::bail!("automatic workflow scouting requires --max-calls")
+                    }
+                    None => 1,
+                };
+                cmd_scout_workflows(
+                    &root,
+                    database.as_deref(),
+                    gateway_path.as_deref(),
+                    dry_run,
+                    scouting::WorkflowScoutOptions {
+                        seeds,
+                        depth,
+                        candidate_limit,
+                        model: llm::config::resolve_model(model.as_deref())?,
+                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        service_tier,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        rebuild,
+                        supersedes_artifact_id: None,
+                    },
+                )
+            }
+            ScoutCommand::Refresh {
+                root,
+                artifacts,
+                timeout,
+                max_calls,
+                context_bytes,
+                dry_run,
+                database,
+                gateway_path,
+            } => cmd_scout_refresh(
                 &root,
                 database.as_deref(),
                 gateway_path.as_deref(),
-                scouting::WorkflowScoutOptions {
-                    seeds,
-                    depth,
-                    candidate_limit,
-                    model: llm::config::resolve_model(model.as_deref())?,
-                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
-                    service_tier,
-                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
-                    rebuild,
-                },
+                &artifacts,
+                dry_run,
+                llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
             ),
         },
     }
@@ -870,35 +928,118 @@ fn cmd_scout_workflows(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    dry_run: bool,
     options: scouting::WorkflowScoutOptions,
 ) -> Result<()> {
     let conn = open_database(root, database)?;
+    let plan = scouting::plan::workflows(
+        root,
+        &conn,
+        &options.seeds,
+        options.depth,
+        options.candidate_limit,
+    )?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "max_calls": options.policy.max_calls,
+                "context_bytes": options.policy.context_bytes,
+                "plan": plan,
+            }))?
+        );
+        return Ok(());
+    }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
-    let report = scouting::scout_workflows(root, &conn, &mut gateway, &options)?;
-    println!(
-        "run {}: {} ({} candidates, billing path {})",
-        report.run_id, report.status, report.candidate_count, report.billing_path
-    );
-    if let Some(started) = &report.started {
-        println!(
-            "  model: {}:{} via {} (auth {})",
-            started.provider, started.model, started.api, started.auth_source
-        );
-    }
-    for (decision, count) in &report.decisions {
-        println!("  {decision}: {count}");
-    }
-    if let Some(usage) = &report.usage {
-        println!(
-            "  usage: {} in / {} out / {} total tokens",
-            usage.input_tokens, usage.output_tokens, usage.total_tokens
-        );
-    }
-    if let Some(reason) = &report.incomplete_reason {
-        println!("  incomplete: {reason}");
-    }
-    if let Some(artifact) = report.artifact_id {
-        println!("  artifact: {artifact}");
-    }
+    let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
+    print_scout_batch(&batch);
     Ok(())
+}
+
+fn cmd_scout_refresh(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    artifacts: &[i64],
+    dry_run: bool,
+    policy: llm::config::RequestPolicy,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    let selection = scouting::refresh::select(&conn, artifacts)?;
+    if dry_run {
+        let plans = scouting::plan_refresh(root, &conn, &selection)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "max_calls": policy.max_calls,
+                "context_bytes": policy.context_bytes,
+                "selection": selection.summary,
+                "plans": plans,
+            }))?
+        );
+        return Ok(());
+    }
+    if !selection.summary.skipped_fresh.is_empty() {
+        println!(
+            "skipped fresh artifacts: {:?}",
+            selection.summary.skipped_fresh
+        );
+    }
+    if !selection.summary.unsupported_legacy.is_empty() {
+        println!(
+            "cannot refresh pre-G5 artifacts without recorded configuration: {:?}",
+            selection.summary.unsupported_legacy
+        );
+    }
+    if selection.targets.is_empty() {
+        println!("no stale or degraded generated workflows to refresh");
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let batch = scouting::scout_refresh(root, &conn, &mut gateway, selection, policy)?;
+    print_scout_batch(&batch);
+    Ok(())
+}
+
+fn print_scout_batch(batch: &scouting::WorkflowBatchReport) {
+    for report in &batch.reports {
+        println!(
+            "run {}: {} ({} candidates, billing path {})",
+            report.run_id, report.status, report.candidate_count, report.billing_path
+        );
+        if let Some(started) = &report.started {
+            println!(
+                "  model: {}:{} via {} (auth {})",
+                started.provider, started.model, started.api, started.auth_source
+            );
+        }
+        for (decision, count) in &report.decisions {
+            println!("  {decision}: {count}");
+        }
+        if let Some(usage) = &report.usage {
+            println!(
+                "  usage: {} in / {} out / {} total tokens",
+                usage.input_tokens, usage.output_tokens, usage.total_tokens
+            );
+        }
+        if let Some(reason) = &report.incomplete_reason {
+            println!("  incomplete: {reason}");
+        }
+        if let Some(artifact) = report.artifact_id {
+            println!("  artifact: {artifact}");
+        }
+    }
+    println!(
+        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; unscoutable seeds: {}",
+        batch.model_calls,
+        batch.reports.len(),
+        batch.duplicate_candidate_sets_skipped,
+        batch.skipped_for_call_budget,
+        batch.skipped_unscoutable,
+    );
+    if batch.auto_seed_limit_reached {
+        println!("automatic seed discovery reached its deterministic limit");
+    }
 }
