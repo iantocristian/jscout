@@ -29,14 +29,9 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Result: 64 tests passed; strict Clippy passed.
+Result: 65 tests passed; strict Clippy passed.
 
 ## n8n-scale first-party boundary check
-
-The available n8n checkout has no `node_modules`, so it cannot validate actual
-dependency-source discovery without first installing the repository. It was
-still used to check that package ownership and the schema/projection changes
-hold at monorepo scale using an isolated database under `/tmp`.
 
 ```text
 jscout index ../n8n --database /tmp/jscout-dep-validation-n8n-20260810.db
@@ -63,20 +58,74 @@ An unchanged second pass reported 19,198 unchanged files, zero indexed/failed
 files, and completed in 23.07 s. Most of that time remains the deliberately
 full structural projection rebuild (14.77 s), not file extraction.
 
-Twenty was not repeated because its checkout also lacks `node_modules`; it
-would test the same first-party ownership path, not dependency indexing.
+## Real installed-package checks
 
-## Remaining external validation gap
+### n8n / pnpm 10.32.1
 
-No installed n8n/Twenty dependency tree was available in this workspace.
-Therefore the real-package claims are limited to deterministic fixtures that
-model npm and pnpm layouts. Before treating the feature as release-proven, run
-one scoped package on an already-installed npm/pnpm monorepo and inspect:
+After installing n8n's modules with pnpm, the existing isolated index was
+updated with one selected package:
 
-1. every selected physical package instance and version;
-2. the chosen `manifest-source` versus `runtime` basis;
-3. truncated/skipped file and byte totals;
-4. first-party-to-package boundary edges; and
-5. default-hidden versus explicit-origin retrieval results.
+```text
+jscout index ../n8n \
+  --database /tmp/jscout-dep-validation-n8n-20260810.db \
+  --deps zod
+```
 
-Source-map reconstruction and Yarn PnP archive loading remain out of scope.
+Observed:
+
+```text
+zod@3.25.76
+canonical root: /Users/cristian/git/n8n/node_modules/.pnpm/zod@3.25.76/node_modules/zod
+locator: node_modules/.pnpm/zod@3.25.76/node_modules/zod
+source basis/status: runtime / complete
+417 dependency files, 3,022,930 bytes
+0 skipped files, 0 extraction failures
+4,723 chunks, 20,704 references added
+1,317 module edges resolved into dependency files
+1 versioned package-instance graph hub
+```
+
+This confirms that the logical workspace/package symlinks resolve to the pnpm
+store's physical package instance without duplicate file identities.
+
+For the dependency-only term `datetimeRegexWithLeapYearValidation`, an MCP
+`semantic_search` with omitted origins returned zero hits. The same call with
+`origins: ["dependency"]` returned two dependency hits.
+
+### Twenty / Yarn 4.13.0 with node_modules
+
+Twenty's Yarn installation uses a regular `node_modules` tree rather than PnP.
+A fresh isolated index was built with the same selected package:
+
+```text
+jscout index ../twenty \
+  --database /tmp/jscout-dep-validation-twenty-20260810.db \
+  --deps zod
+```
+
+Observed:
+
+```text
+zod@4.1.11
+canonical root: /Users/cristian/git/twenty/node_modules/zod
+locator: node_modules/zod
+source basis/status: runtime / complete
+450 dependency files, 3,346,331 bytes
+0 skipped files, 0 extraction failures
+970 module edges resolved into dependency files
+1 versioned package-instance graph hub
+```
+
+The complete Twenty pass indexed 23,185 files and produced 80,305 chunks and
+321,480 references in 33.96 seconds. File ownership was 1,711 repository,
+21,024 workspace, and 450 dependency.
+
+For the dependency-only term `ZodMiniDiscriminatedUnion`, default MCP search
+returned zero hits; `origins: ["dependency"]` returned three dependency hits.
+
+## Remaining scope boundaries
+
+The real checks cover one pnpm physical-store instance and one Yarn
+`node_modules` installation. Multiple-version discovery is still fixture-tested
+rather than observed in these two selected-package runs. Source-map
+reconstruction and Yarn PnP archive loading remain out of scope.
