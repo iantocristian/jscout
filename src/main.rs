@@ -7,6 +7,7 @@ mod file_role;
 mod graph;
 mod heur;
 mod indexer;
+mod llm;
 mod mcp;
 mod origin;
 mod package_exports;
@@ -265,6 +266,24 @@ enum Command {
         #[arg(long)]
         install: Option<PathBuf>,
     },
+    /// Model-gateway operations (generative calls run in a Node sidecar)
+    Llm {
+        #[command(subcommand)]
+        command: LlmCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LlmCommand {
+    /// Diagnose node, gateway, provider, and model availability
+    Doctor {
+        /// Exact pi-ai model as provider:model (e.g. openai-codex:gpt-5.6-terra)
+        #[arg(long)]
+        model: Option<String>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -436,6 +455,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Llm { command } => match command {
+            LlmCommand::Doctor {
+                model,
+                gateway_path,
+            } => llm::doctor(model.as_deref(), gateway_path.as_deref()),
+        },
     }
 }
 
