@@ -29,7 +29,12 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Result: 65 tests passed; strict Clippy passed.
+Result after review fixes: 70 tests passed; strict Clippy passed.
+
+Regression coverage includes dependency-corpus FTS cleanup, fail-closed
+snapshot invalidation when selected-package discovery fails, literal workspace
+path ownership, scoped-package discovery/resolution, forced entry precedence
+under package limits, and declaration-ordered export conditions.
 
 ## n8n-scale first-party boundary check
 

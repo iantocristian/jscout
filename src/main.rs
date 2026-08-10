@@ -67,7 +67,7 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         batch: usize,
         /// Restrict embeddings to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
     },
     /// Hybrid search over the indexed repository
@@ -83,7 +83,7 @@ enum Command {
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
         /// Restrict hits and expansion to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
         /// Do not attach matching persistent semantic memory
         #[arg(long)]
@@ -132,7 +132,7 @@ enum Command {
         /// Only show sites for this event name
         name: Option<String>,
         /// Restrict sites to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
     },
     /// Serve the index over MCP (stdio) for agent integration
@@ -217,7 +217,7 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Restrict targets and usages to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
     },
     /// Traverse the snapshot-safe structural graph around a file or symbol
@@ -251,7 +251,7 @@ enum Command {
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
         /// Restrict traversal to backing-file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = [String::from("repository"), String::from("workspace")])]
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
     },
     /// Print or install the jscout agent-integration skill

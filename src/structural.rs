@@ -1224,7 +1224,9 @@ fn round_score(score: f64) -> f64 {
 
 /// Resolve a user-facing anchor against the current structural snapshot for a
 /// durable semantic support. Ambiguity remains an error; stored supports use
-/// the returned exact node key.
+/// the returned exact node key. This write path deliberately considers every
+/// indexed origin, unlike retrieval defaults, so a shorthand cannot silently
+/// bind to first-party code when a dependency introduces the same symbol.
 pub fn resolve_current_anchor(conn: &Connection, anchor: &str) -> Result<String> {
     let all = origin::ALL.iter().copied().collect();
     let snapshot = current_snapshot(conn)?;
