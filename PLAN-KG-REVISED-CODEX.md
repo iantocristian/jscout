@@ -803,7 +803,8 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **CP-1** | Separate contract anchors: declarations, exported API types, decorators, DTO/schemas, and referenced contract names | RB-1 | Implemented 2026-08-10 with type-only barrel resolution; documentary edges remain distinct from runtime edges |
 | **EN-1** | Routes, GraphQL operations, environment variables, database resources, feature flags, and external-service hosts | CP-1; enriches SC-1/2 | Implemented 2026-08-10 with explicit extraction-version invalidation and bounded API provenance |
 | **AS-1** | Agent surfaces: deterministic repository overview, evidence-bearing entity lookup, and ranked bounded paths | EN-1 | Implemented 2026-08-10 as structural-profile MCP tools under whole-response budgets |
-| **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; EN-1 improves workflow seeds | Free-form producer blocked in preflight 2026-08-09 |
+| **WG-1** | Workflow-specific logical traversal: collapsed runtime handoffs, bounded general associations, and terminal high-degree helpers | AS-1 | Implemented 2026-08-10; known six-pair regression passes 24/24 without truncation |
+| **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; WG-1 supplies candidates | Known regression passes; new pre-registration and held-out Stage A remain required before semantic calls |
 | **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
 | **RI-2** | Graph export, ranking tuning, and scale work earned by benchmarks | RI-1/SC-1 | Bounded ranked paths landed in AS-1; remaining work is incremental |
 
@@ -825,8 +826,10 @@ correct token win. This accepts opt-in workflow memory, not default retrieval
 or broad scouting. After AS-1, the known workflow regression reached 22/24
 participants but still failed on truncation and two continuations beyond
 runtime handoffs. Workflow candidate generation must count a two-edge entity
-handoff as one logical transition and keep documentary/general planes out of
-the default candidate walk before SC-2b expands coverage.
+handoff as one logical transition, exclude documentary edges, and keep general
+associations terminal and degree-bounded. WG-1 implements that policy and
+passes all 24 known regression boundaries without truncation; because the
+policy was informed by those failures, the result is not held-out evidence.
 The first participant-scope preflight then showed that scope labels alone do
 not prevent omissions: two direct-write smokes omitted both later-needed
 synchronous operations, including after explicit complete-stage guidance. No

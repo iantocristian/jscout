@@ -196,21 +196,13 @@ pub fn workflow_candidates(
     let mut nodes: HashMap<String, (structural::GraphNode, bool)> = HashMap::new();
     let mut traversal_truncated = false;
     for seed in &resolved_seeds {
-        let neighborhood = structural::neighborhood(
+        let neighborhood = structural::workflow_neighborhood(
             conn,
             seed,
-            &structural::NeighborhoodOptions {
-                expected_snapshot: Some(snapshot.clone()),
-                depth: options.depth,
-                direction: "both".into(),
-                node_limit: WORKFLOW_TRAVERSAL_NODE_LIMIT,
-                edge_limit: WORKFLOW_TRAVERSAL_EDGE_LIMIT,
-                min_confidence: "likely".into(),
-                kinds: Vec::new(),
-                file_roles: vec!["production".into()],
-                file_origins: crate::origin::defaults(),
-                penalize_file_roles: true,
-            },
+            options.depth,
+            WORKFLOW_TRAVERSAL_NODE_LIMIT,
+            WORKFLOW_TRAVERSAL_EDGE_LIMIT,
+            &crate::origin::defaults(),
         )?;
         traversal_truncated |= neighborhood.truncated;
         for node in neighborhood.nodes {

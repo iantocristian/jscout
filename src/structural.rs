@@ -208,6 +208,59 @@ pub struct Neighborhood {
     pub truncated: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct WorkflowNeighborhood {
+    pub nodes: Vec<GraphNode>,
+    pub traversed_edges: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowLogicalStep {
+    other: GraphNode,
+    confidence_floor: f64,
+    relation_floor: f64,
+    hub_floor: f64,
+    runtime_boundary: bool,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowRankedNode {
+    key: String,
+    depth: usize,
+    confidence_floor: f64,
+    relation_floor: f64,
+    hub_floor: f64,
+    crossed_runtime: bool,
+    score: f64,
+}
+
+impl PartialEq for WorkflowRankedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+            && self.depth == other.depth
+            && self.key == other.key
+    }
+}
+
+impl Eq for WorkflowRankedNode {}
+
+impl PartialOrd for WorkflowRankedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorkflowRankedNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.depth.cmp(&self.depth))
+            .then_with(|| other.key.cmp(&self.key))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PathOptions {
     pub expected_snapshot: Option<String>,
@@ -2045,6 +2098,403 @@ fn neighborhood_in_snapshot(
     })
 }
 
+/// Traverse the code/runtime plane in logical workflow hops. Direct code edges
+/// cost one hop. A complementary producer/entity/consumer handoff also costs
+/// one hop even though it is represented by two physical graph edges.
+pub fn workflow_neighborhood(
+    conn: &Connection,
+    anchor: &str,
+    depth: usize,
+    node_limit: usize,
+    edge_limit: usize,
+    file_origins: &[String],
+) -> Result<WorkflowNeighborhood> {
+    if depth == 0 || depth > 3 {
+        bail!("workflow traversal depth must be between 1 and 3");
+    }
+    if node_limit == 0 || edge_limit == 0 {
+        bail!("workflow traversal node and edge limits must be greater than zero");
+    }
+    origin::validate_all(file_origins)?;
+    let allowed_origins: HashSet<&str> = file_origins.iter().map(String::as_str).collect();
+    let root = load_node(conn, anchor)?
+        .with_context(|| format!("missing workflow seed graph node {anchor}"))?;
+    if root.kind != "symbol" {
+        bail!("workflow seed must resolve to a symbol anchor");
+    }
+
+    let mut nodes = HashMap::from([(root.key.clone(), root)]);
+    let mut relevance = HashMap::from([(anchor.to_string(), 1.0_f64)]);
+    let mut expanded: HashMap<(String, usize), f64> = HashMap::new();
+    let mut frontier = BinaryHeap::from([WorkflowRankedNode {
+        key: anchor.to_string(),
+        depth: 0,
+        confidence_floor: 1.0,
+        relation_floor: 1.0,
+        hub_floor: 1.0,
+        crossed_runtime: false,
+        score: 1.0,
+    }]);
+    let mut traversed_edges = 0;
+    let mut truncated = false;
+
+    'walk: while let Some(state) = frontier.pop() {
+        let state_key = (state.key.clone(), state.depth);
+        if expanded
+            .get(&state_key)
+            .is_some_and(|score| *score >= state.score)
+        {
+            continue;
+        }
+        expanded.insert(state_key, state.score);
+        if state.depth >= depth {
+            continue;
+        }
+        let steps = workflow_logical_steps(conn, &state.key, &allowed_origins)?;
+        for step in steps {
+            if traversed_edges >= edge_limit {
+                truncated = true;
+                break 'walk;
+            }
+            traversed_edges += 1;
+            let new_node = !nodes.contains_key(&step.other.key);
+            if new_node && nodes.len() >= node_limit {
+                truncated = true;
+                continue;
+            }
+            let next_depth = state.depth + 1;
+            let confidence_floor = state.confidence_floor.min(step.confidence_floor);
+            let relation_floor = state.relation_floor.min(step.relation_floor);
+            let hub_floor = state.hub_floor.min(step.hub_floor);
+            let crossed_runtime = state.crossed_runtime || step.runtime_boundary;
+            let score = round_score(
+                confidence_floor
+                    * relation_floor
+                    * distance_decay(next_depth)
+                    * hub_floor
+                    + if crossed_runtime { 1.0 } else { 0.0 },
+            );
+            relevance
+                .entry(step.other.key.clone())
+                .and_modify(|existing| *existing = existing.max(score))
+                .or_insert(score);
+            nodes.entry(step.other.key.clone()).or_insert(step.other.clone());
+            if !step.terminal {
+                frontier.push(WorkflowRankedNode {
+                    key: step.other.key,
+                    depth: next_depth,
+                    confidence_floor,
+                    relation_floor,
+                    hub_floor,
+                    crossed_runtime,
+                    score,
+                });
+            }
+        }
+    }
+
+    let mut nodes = nodes
+        .into_values()
+        .map(|mut node| {
+            node.relevance = relevance.get(&node.key).copied().unwrap_or(0.0);
+            node
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        right
+            .relevance
+            .total_cmp(&left.relevance)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    Ok(WorkflowNeighborhood { nodes, traversed_edges, truncated })
+}
+
+fn workflow_logical_steps(
+    conn: &Connection,
+    node: &str,
+    allowed_origins: &HashSet<&str>,
+) -> Result<Vec<WorkflowLogicalStep>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_key, dst_key, kind, confidence
+         FROM resolved_edges
+         WHERE src_key=?1 OR dst_key=?1",
+    )?;
+    let incident = stmt
+        .query_map([node], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut by_target: HashMap<String, WorkflowLogicalStep> = HashMap::new();
+    for (source, target, kind, confidence) in incident {
+        if confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap() {
+            continue;
+        }
+        let other_key = if source == node { &target } else { &source };
+        let Some(other) = load_node(conn, other_key)? else { continue };
+        if workflow_direct_kind(&kind) && workflow_symbol_allowed(&other, allowed_origins) {
+            let step = WorkflowLogicalStep {
+                // Symbol degree includes documentary and file-projection edges
+                // outside this workflow plane, so it is not a valid hub signal.
+                hub_floor: 1.0,
+                confidence_floor: confidence_weight(&confidence),
+                relation_floor: relation_weight(&kind),
+                terminal: workflow_direct_degree(conn, &other.key, allowed_origins)? > 12,
+                other,
+                runtime_boundary: false,
+            };
+            retain_stronger_workflow_step(&mut by_target, step);
+            continue;
+        }
+        if let Some(family) = workflow_general_association_kind(&kind)
+            && other.kind == "entity"
+            && other.meta.get("plane").and_then(Value::as_str) == Some("general")
+        {
+            collect_general_workflow_steps(
+                conn,
+                node,
+                family,
+                &kind,
+                &confidence,
+                &other,
+                allowed_origins,
+                &mut by_target,
+            )?;
+            continue;
+        }
+        let Some((family, side)) = workflow_runtime_boundary_kind(&kind) else {
+            continue;
+        };
+        if other.kind != "entity"
+            || other.meta.get("plane").and_then(Value::as_str) != Some("runtime")
+        {
+            continue;
+        }
+        let mut entity_stmt = conn.prepare_cached(
+            "SELECT src_key, dst_key, kind, confidence
+             FROM resolved_edges
+             WHERE src_key=?1 OR dst_key=?1",
+        )?;
+        let entity_edges = entity_stmt
+            .query_map([&other.key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (peer_source, peer_target, peer_kind, peer_confidence) in entity_edges {
+            let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind)
+            else {
+                continue;
+            };
+            if family != peer_family
+                || side == peer_side
+                || confidence_rank(&peer_confidence).unwrap_or(0)
+                    < confidence_rank("likely").unwrap()
+            {
+                continue;
+            }
+            let peer_key = if peer_source == other.key {
+                &peer_target
+            } else {
+                &peer_source
+            };
+            if peer_key == node {
+                continue;
+            }
+            let Some(peer) = load_node(conn, peer_key)? else { continue };
+            if !workflow_symbol_allowed(&peer, allowed_origins) {
+                continue;
+            }
+            let step = WorkflowLogicalStep {
+                // A complementary runtime handoff is the primary workflow
+                // signal. Confidence still gates eligibility and remains on
+                // the underlying edges; candidate relevance prioritizes the
+                // handoff ahead of ordinary depth-two helper fan-out.
+                hub_floor: 1.0,
+                confidence_floor: 1.0,
+                relation_floor: 1.0,
+                other: peer,
+                runtime_boundary: true,
+                terminal: false,
+            };
+            retain_stronger_workflow_step(&mut by_target, step);
+        }
+    }
+    let mut steps = by_target.into_values().collect::<Vec<_>>();
+    steps.sort_by(|left, right| {
+        workflow_step_strength(right)
+            .total_cmp(&workflow_step_strength(left))
+            .then_with(|| left.other.key.cmp(&right.other.key))
+    });
+    Ok(steps)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_general_workflow_steps(
+    conn: &Connection,
+    node: &str,
+    family: &str,
+    kind: &str,
+    confidence: &str,
+    entity: &GraphNode,
+    allowed_origins: &HashSet<&str>,
+    steps: &mut HashMap<String, WorkflowLogicalStep>,
+) -> Result<()> {
+    let entity_degree = graph_degree(conn, &entity.key)?;
+    // Shared configuration/data identities are associative clues, not hard
+    // handoffs. High-degree identities are repository-wide hubs and do not
+    // belong in a bounded workflow candidate set.
+    if entity_degree > 12 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_key, dst_key, kind, confidence
+         FROM resolved_edges
+         WHERE src_key=?1 OR dst_key=?1",
+    )?;
+    let peers = stmt
+        .query_map([&entity.key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (source, target, peer_kind, peer_confidence) in peers {
+        if workflow_general_association_kind(&peer_kind) != Some(family)
+            || confidence_rank(&peer_confidence).unwrap_or(0)
+                < confidence_rank("likely").unwrap()
+        {
+            continue;
+        }
+        let peer_key = if source == entity.key { &target } else { &source };
+        if peer_key == node {
+            continue;
+        }
+        let Some(peer) = load_node(conn, peer_key)? else { continue };
+        if !workflow_symbol_allowed(&peer, allowed_origins) {
+            continue;
+        }
+        retain_stronger_workflow_step(
+            steps,
+            WorkflowLogicalStep {
+                hub_floor: hub_damping(entity_degree),
+                confidence_floor: confidence_weight(confidence)
+                    .min(confidence_weight(&peer_confidence)),
+                relation_floor: relation_weight(kind).min(relation_weight(&peer_kind)),
+                other: peer,
+                runtime_boundary: false,
+                terminal: true,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn retain_stronger_workflow_step(
+    steps: &mut HashMap<String, WorkflowLogicalStep>,
+    candidate: WorkflowLogicalStep,
+) {
+    match steps.get(&candidate.other.key) {
+        Some(existing) if workflow_step_strength(existing) >= workflow_step_strength(&candidate) => {}
+        _ => {
+            steps.insert(candidate.other.key.clone(), candidate);
+        }
+    }
+}
+
+fn workflow_step_strength(step: &WorkflowLogicalStep) -> f64 {
+    step.confidence_floor * step.relation_floor * step.hub_floor
+        + if step.runtime_boundary { 1.0 } else { 0.0 }
+}
+
+fn workflow_symbol_allowed(node: &GraphNode, allowed_origins: &HashSet<&str>) -> bool {
+    node.kind == "symbol"
+        && node.file_role.as_deref() == Some("production")
+        && node
+            .file_origin
+            .as_deref()
+            .is_none_or(|value| allowed_origins.contains(value))
+}
+
+fn workflow_direct_degree(
+    conn: &Connection,
+    node: &str,
+    allowed_origins: &HashSet<&str>,
+) -> Result<usize> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT src_key, dst_key, kind, confidence
+         FROM resolved_edges
+         WHERE src_key=?1 OR dst_key=?1",
+    )?;
+    let incident = stmt.query_map([node], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut neighbors = HashSet::new();
+    for row in incident {
+        let (source, target, kind, confidence) = row?;
+        if !workflow_direct_kind(&kind)
+            || confidence_rank(&confidence).unwrap_or(0)
+                < confidence_rank("likely").unwrap()
+        {
+            continue;
+        }
+        let other_key = if source == node { target } else { source };
+        if let Some(other) = load_node(conn, &other_key)?
+            && workflow_symbol_allowed(&other, allowed_origins)
+        {
+            neighbors.insert(other_key);
+        }
+    }
+    Ok(neighbors.len())
+}
+
+fn workflow_direct_kind(kind: &str) -> bool {
+    matches!(kind, "call" | "render" | "extend")
+}
+
+fn workflow_general_association_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "handles_graphql" | "invokes_graphql" => Some("graphql"),
+        "reads_resource" | "writes_resource" => Some("resource"),
+        "reads_env" => Some("environment"),
+        "checks_flag" => Some("feature_flag"),
+        "calls_host" => Some("external_host"),
+        _ => None,
+    }
+}
+
+/// Returns (boundary family, producer side). Complementary sides in the same
+/// family form one logical workflow transition through the runtime entity.
+fn workflow_runtime_boundary_kind(kind: &str) -> Option<(&'static str, bool)> {
+    match kind {
+        "dispatches" => Some(("registry", true)),
+        "registered_handler" => Some(("registry", false)),
+        "produces_lifecycle" | "produces_lifecycle_via" => Some(("lifecycle", true)),
+        "lifecycle_listener" => Some(("lifecycle", false)),
+        "produces_job" | "produces_job_via" => Some(("job", true)),
+        "job_handler" => Some(("job", false)),
+        "injects" => Some(("di", true)),
+        "provides" => Some(("di", false)),
+        _ => None,
+    }
+}
+
 pub fn paths(
     conn: &Connection,
     from: &str,
@@ -2692,7 +3142,10 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{NeighborhoodOptions, compute_snapshot, neighborhood, rebuild_projection};
+    use super::{
+        NeighborhoodOptions, compute_snapshot, neighborhood, rebuild_projection,
+        workflow_neighborhood,
+    };
     use crate::{indexer, origin, store};
 
     fn write(root: &Path, path: &str, source: &str) -> Result<()> {
@@ -2782,7 +3235,8 @@ mod tests {
             repo.path(),
             "handler.ts",
             "import { TARGET_HANDLER_ID } from './identifier';\n\
-             export const processHandler = () => 'handled';\n\
+             export const continueWorkflow = () => 'continued';\n\
+             export const processHandler = () => continueWorkflow();\n\
              export default defineLogicFunction({\n\
                universalIdentifier: TARGET_HANDLER_ID,\n\
                handler: processHandler,\n\
@@ -2833,6 +3287,17 @@ mod tests {
                 && edge.source.starts_with("entity:registry:ref-")
                 && edge.target.contains("handler.ts#::processHandler@1")
         }));
+        let workflow = workflow_neighborhood(
+            &conn,
+            "sym:route.ts#::routeHandler@1",
+            2,
+            20,
+            40,
+            &origin::defaults(),
+        )?;
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "processHandler"));
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "continueWorkflow"));
+        assert!(!workflow.truncated);
         Ok(())
     }
 
@@ -2863,6 +3328,12 @@ mod tests {
             "enqueue.ts",
             "import { createRequest } from './create';\n\
              export const enqueueRequest = async (client) => createRequest(client);\n",
+        )?;
+        write(
+            repo.path(),
+            "entry.ts",
+            "import { enqueueRequest } from './enqueue';\n\
+             export const start = async (client) => enqueueRequest(client);\n",
         )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
@@ -2923,6 +3394,57 @@ mod tests {
                 && edge.source == "entity:data_lifecycle:slackAssistantRequest.created"
                 && edge.target.contains("worker.ts#::workerHandler@1")
         }));
+        let workflow = workflow_neighborhood(
+            &conn,
+            "sym:entry.ts#::start@1",
+            2,
+            20,
+            40,
+            &origin::defaults(),
+        )?;
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "enqueueRequest"));
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "workerHandler"));
+        assert!(!workflow.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_neighborhood_stops_high_degree_code_hubs_without_truncation() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(repo.path(), "shared.ts", "export const shared = () => 1;\n")?;
+        write(
+            repo.path(),
+            "entry.ts",
+            "import { shared } from './shared';\n\
+             export const entry = () => shared();\n",
+        )?;
+        for index in 0..13 {
+            write(
+                repo.path(),
+                &format!("caller-{index}.ts"),
+                &format!(
+                    "import {{ shared }} from './shared';\n\
+                     export const caller{index} = () => shared();\n"
+                ),
+            )?;
+        }
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let workflow = workflow_neighborhood(
+            &conn,
+            "sym:entry.ts#::entry@1",
+            2,
+            100,
+            400,
+            &origin::defaults(),
+        )?;
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "shared"));
+        assert!(
+            !workflow.nodes.iter().any(|node| node.display_name == "caller0"),
+            "a high-degree helper is evidence but must not bridge to every caller"
+        );
+        assert!(!workflow.truncated);
         Ok(())
     }
 
@@ -3087,6 +3609,18 @@ mod tests {
                 && edge.target == alias
                 && edge.confidence == "certain"
         }));
+        let workflow = workflow_neighborhood(
+            &conn,
+            "sym:api.ts#::load@1",
+            2,
+            20,
+            40,
+            &origin::defaults(),
+        )?;
+        assert!(
+            !workflow.nodes.iter().any(|node| node.display_name == "save"),
+            "shared contracts are documentary and must not create workflow candidates"
+        );
         let contract_file: String = conn.query_row(
             "SELECT files.path FROM graph_nodes
              JOIN files ON files.id=graph_nodes.file_id
@@ -3143,6 +3677,9 @@ mod tests {
                flags.isEnabled('new-ui');\n\
                fetch('https://api.example.com/v1');\n\
                client.query({ currentUser: { id: true } });\n\
+             }\n\
+             export function followup() {\n\
+               client.query({ currentUser: { id: true } });\n\
              }\n",
         )?;
         let conn = store::open(repo.path())?;
@@ -3180,6 +3717,15 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(handler_target, "getUser");
+        let workflow = workflow_neighborhood(
+            &conn,
+            "sym:app.ts#::run@1",
+            1,
+            20,
+            40,
+            &origin::defaults(),
+        )?;
+        assert!(workflow.nodes.iter().any(|node| node.display_name == "followup"));
         Ok(())
     }
 
