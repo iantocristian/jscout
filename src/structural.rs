@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "4";
+pub const PROJECTION_VERSION: &str = "5";
 
 #[derive(Debug, Clone)]
 struct SymbolNode {
@@ -22,6 +22,29 @@ struct SymbolNode {
     decl_end: i64,
     line: i64,
     key: String,
+}
+
+#[derive(Debug)]
+struct EntitySiteNode {
+    id: i64,
+    file_id: i64,
+    chunk_id: Option<i64>,
+    start: i64,
+    end: i64,
+    line: i64,
+    end_line: i64,
+    plane: String,
+    entity_type: String,
+    role: String,
+    identity_kind: String,
+    identity_name: String,
+    identity_start: i64,
+    target_name: Option<String>,
+    target_start: Option<i64>,
+    extractor: String,
+    provenance: String,
+    confidence: String,
+    detail: Value,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +240,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM entities", [])?;
 
         let mut insert_node = conn.prepare_cached(
             "INSERT INTO graph_nodes(
@@ -277,6 +301,19 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
         )?;
         if timing {
             eprintln!("timing project-references={:?}", stage_started.elapsed());
+        }
+        let stage_started = Instant::now();
+        project_entities(
+            conn,
+            &files,
+            &graph,
+            &symbols,
+            &root_symbol,
+            &mut insert_node,
+            &mut insert_edge,
+        )?;
+        if timing {
+            eprintln!("timing project-entities={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
         project_member_calls(
@@ -717,6 +754,426 @@ fn project_references(
         }
     }
     Ok(())
+}
+
+fn project_entities(
+    conn: &Connection,
+    files: &HashMap<i64, String>,
+    graph: &ModuleGraph,
+    symbols: &[SymbolNode],
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+    insert_node: &mut rusqlite::CachedStatement<'_>,
+    insert_edge: &mut rusqlite::CachedStatement<'_>,
+) -> Result<()> {
+    let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
+    for symbol in symbols {
+        symbols_by_file.entry(symbol.file_id).or_default().push(symbol);
+    }
+    let sites = load_entity_sites(conn)?;
+    let mut inserted_nodes = HashSet::new();
+    // Occurrence tables retain every evidence site. The disposable traversal
+    // graph keeps one navigational edge per relationship so repeated writes in
+    // one symbol do not inflate degree and ranking.
+    let mut projected_edges: HashSet<(String, String, String)> = HashSet::new();
+    let mut insert_entity = conn.prepare_cached(
+        "INSERT INTO entities(
+           entity_key, plane, entity_type, name, identity_anchor, meta_json
+         ) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(entity_key) DO UPDATE SET
+           plane=excluded.plane,
+           entity_type=excluded.entity_type,
+           name=excluded.name,
+           identity_anchor=excluded.identity_anchor,
+           meta_json=excluded.meta_json",
+    )?;
+    let mut insert_occurrence = conn.prepare_cached(
+        "INSERT INTO entity_occurrences(
+           entity_id, site_id, file_id, chunk_id, start, end, line, end_line,
+           role, extractor, provenance, confidence, detail_json
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+    )?;
+    let mut insert_entity_edge = conn.prepare_cached(
+        "INSERT INTO entity_edges(
+           occurrence_id, target_key, kind, confidence, provenance, detail_json
+         ) VALUES(?1,?2,?3,?4,?5,?6)",
+    )?;
+
+    for site in sites {
+        let Some(path) = files.get(&site.file_id) else { continue };
+        let identity = resolve_entity_identity(conn, &site, path, graph, root_symbol)?;
+        let occurrence_confidence = lower_confidence(
+            &site.confidence,
+            if identity.ambiguous { "possible" } else { &site.confidence },
+        );
+        let entity_key = match site.identity_kind.as_str() {
+            "literal" => entity_key(&site.entity_type, &site.identity_name),
+            _ => reference_entity_key(&site.entity_type, &identity.keys, path, &site.identity_name),
+        };
+        let identity_anchor = (identity.keys.len() == 1).then(|| identity.keys[0].clone());
+        let entity_meta = json!({
+            "plane": site.plane,
+            "type": site.entity_type,
+            "identityKind": site.identity_kind,
+            "identityAnchor": identity_anchor,
+            "identityCandidates": identity.ambiguous.then_some(&identity.keys),
+        });
+        insert_entity.execute(params![
+            entity_key,
+            site.plane,
+            site.entity_type,
+            site.identity_name,
+            identity_anchor,
+            entity_meta.to_string(),
+        ])?;
+        let entity_id: i64 = conn.query_row(
+            "SELECT id FROM entities WHERE entity_key=?1",
+            [&entity_key],
+            |row| row.get(0),
+        )?;
+        if inserted_nodes.insert(entity_key.clone()) {
+            insert_node.execute(params![
+                entity_key,
+                "entity",
+                "entities",
+                entity_id,
+                site.identity_name,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                entity_meta.to_string(),
+            ])?;
+        }
+
+        let occurrence_detail = json!({
+            "site": site.detail,
+            "identityKind": site.identity_kind,
+            "identityName": site.identity_name,
+            "identityAnchor": identity_anchor,
+            "identityCandidates": identity.ambiguous.then_some(&identity.keys),
+        });
+        insert_occurrence.execute(params![
+            entity_id,
+            site.id,
+            site.file_id,
+            site.chunk_id,
+            site.start,
+            site.end,
+            site.line,
+            site.end_line,
+            site.role,
+            site.extractor,
+            site.provenance,
+            occurrence_confidence,
+            occurrence_detail.to_string(),
+        ])?;
+        let occurrence_id = conn.last_insert_rowid();
+        let source = owner_at(symbols_by_file.get(&site.file_id), site.start)
+            .map(|symbol| symbol.key.clone())
+            .unwrap_or_else(|| file_key(path));
+        let graph_detail = json!({
+            "entityOccurrenceId": occurrence_id,
+            "entitySiteId": site.id,
+            "extractor": site.extractor,
+            "role": site.role,
+            "evidence": {
+                "start": site.start,
+                "end": site.end,
+                "endLine": site.end_line,
+            },
+            "detail": site.detail,
+        });
+
+        match site.role.as_str() {
+            "dispatch_site" | "lifecycle_producer" | "job_producer" | "injection_site" => {
+                let kind = match site.role.as_str() {
+                    "dispatch_site" => "dispatches",
+                    "lifecycle_producer" => "produces_lifecycle",
+                    "job_producer" => "produces_job",
+                    _ => "injects",
+                };
+                insert_entity_edge.execute(params![
+                    occurrence_id,
+                    entity_key,
+                    kind,
+                    occurrence_confidence,
+                    site.provenance,
+                    graph_detail.to_string(),
+                ])?;
+                if projected_edges.insert((
+                    source.clone(),
+                    entity_key.clone(),
+                    kind.to_string(),
+                )) {
+                    insert_edge.execute(params![
+                        source,
+                        entity_key,
+                        kind,
+                        occurrence_confidence,
+                        site.provenance,
+                        site.file_id,
+                        Option::<i64>::None,
+                        site.line,
+                        graph_detail.to_string(),
+                    ])?;
+                }
+                if matches!(site.role.as_str(), "lifecycle_producer" | "job_producer") {
+                    project_entity_callers(
+                        conn,
+                        &source,
+                        &entity_key,
+                        occurrence_id,
+                        &occurrence_confidence,
+                        if site.role == "lifecycle_producer" {
+                            "produces_lifecycle_via"
+                        } else {
+                            "produces_job_via"
+                        },
+                        insert_edge,
+                        &mut projected_edges,
+                    )?;
+                }
+            }
+            "registered_handler" | "lifecycle_listener" | "job_handler" | "provider" => {
+                let mut targets = resolve_entity_target(conn, &site, graph, root_symbol)?;
+                let target_fallback = targets.keys.is_empty();
+                if target_fallback {
+                    targets = ProjectedTargets::exact(source.clone());
+                }
+                let edge_provenance = if target_fallback {
+                    if site.role == "provider" {
+                        "provider-site-fallback"
+                    } else {
+                        "registration-site-fallback"
+                    }
+                } else {
+                    &site.provenance
+                };
+                let mut edge_detail = graph_detail.clone();
+                if target_fallback {
+                    edge_detail["targetResolution"] = json!("site-fallback");
+                }
+                let edge_confidence = lower_confidence(
+                    &occurrence_confidence,
+                    if targets.ambiguous { "possible" } else { &occurrence_confidence },
+                );
+                let kind = match site.role.as_str() {
+                    "registered_handler" => "registered_handler",
+                    "lifecycle_listener" => "lifecycle_listener",
+                    "job_handler" => "job_handler",
+                    _ => "provides",
+                };
+                for target in &targets.keys {
+                    insert_entity_edge.execute(params![
+                        occurrence_id,
+                        target,
+                        kind,
+                        edge_confidence,
+                        edge_provenance,
+                        edge_detail.to_string(),
+                    ])?;
+                    if projected_edges.insert((
+                        entity_key.clone(),
+                        target.clone(),
+                        kind.to_string(),
+                    )) {
+                        insert_edge.execute(params![
+                            entity_key,
+                            target,
+                            kind,
+                            edge_confidence,
+                            edge_provenance,
+                            site.file_id,
+                            Option::<i64>::None,
+                            site.line,
+                            edge_detail.to_string(),
+                        ])?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn load_entity_sites(conn: &Connection) -> Result<Vec<EntitySiteNode>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_id, chunk_id, start, end, line, end_line, plane,
+                entity_type, role, identity_kind, identity_name, identity_start,
+                target_name, target_start, extractor, provenance, confidence,
+                detail_json
+         FROM entity_sites ORDER BY entity_type, identity_name, file_id, start, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let detail: String = row.get(18)?;
+        Ok(EntitySiteNode {
+            id: row.get(0)?,
+            file_id: row.get(1)?,
+            chunk_id: row.get(2)?,
+            start: row.get(3)?,
+            end: row.get(4)?,
+            line: row.get(5)?,
+            end_line: row.get(6)?,
+            plane: row.get(7)?,
+            entity_type: row.get(8)?,
+            role: row.get(9)?,
+            identity_kind: row.get(10)?,
+            identity_name: row.get(11)?,
+            identity_start: row.get(12)?,
+            target_name: row.get(13)?,
+            target_start: row.get(14)?,
+            extractor: row.get(15)?,
+            provenance: row.get(16)?,
+            confidence: row.get(17)?,
+            detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+fn resolve_entity_identity(
+    conn: &Connection,
+    site: &EntitySiteNode,
+    path: &str,
+    graph: &ModuleGraph,
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+) -> Result<ProjectedTargets> {
+    if site.identity_kind == "literal" {
+        return Ok(ProjectedTargets::default());
+    }
+    let targets = resolve_reference_at(
+        conn,
+        graph,
+        root_symbol,
+        site.file_id,
+        site.identity_start,
+        &site.identity_name,
+    )?;
+    if targets.keys.is_empty() {
+        Ok(ProjectedTargets::exact(format!(
+            "file:{path}#unresolved::{}",
+            site.identity_name
+        )))
+    } else {
+        Ok(targets)
+    }
+}
+
+fn resolve_entity_target(
+    conn: &Connection,
+    site: &EntitySiteNode,
+    graph: &ModuleGraph,
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+) -> Result<ProjectedTargets> {
+    let (Some(name), Some(start)) = (site.target_name.as_deref(), site.target_start) else {
+        return Ok(ProjectedTargets::default());
+    };
+    resolve_reference_at(conn, graph, root_symbol, site.file_id, start, name)
+}
+
+fn resolve_reference_at(
+    conn: &Connection,
+    graph: &ModuleGraph,
+    root_symbol: &HashMap<(i64, String), Vec<&SymbolNode>>,
+    file_id: i64,
+    start: i64,
+    fallback_name: &str,
+) -> Result<ProjectedTargets> {
+    let reference = conn
+        .query_row(
+            "SELECT target_request, target_name, local
+             FROM refs WHERE file_id=?1 AND start=?2
+             ORDER BY id LIMIT 1",
+            params![file_id, start],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((request, name, local)) = reference else {
+        return Ok(projected_symbols(
+            root_symbol.get(&(file_id, fallback_name.to_string())),
+        ));
+    };
+    if local {
+        return Ok(projected_symbols(root_symbol.get(&(file_id, name))));
+    }
+    let Some(request) = request else { return Ok(ProjectedTargets::default()) };
+    let Some(target_file) = graph.edge(file_id, &request) else {
+        return Ok(ProjectedTargets::default());
+    };
+    let (resolved_file, resolved_name) = graph
+        .resolve_export(target_file, &name)
+        .unwrap_or((target_file, name));
+    Ok(projected_symbols(
+        root_symbol.get(&(resolved_file, resolved_name)),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_entity_callers(
+    conn: &Connection,
+    producer: &str,
+    entity_key: &str,
+    occurrence_id: i64,
+    occurrence_confidence: &str,
+    via_kind: &str,
+    insert_edge: &mut rusqlite::CachedStatement<'_>,
+    projected_edges: &mut HashSet<(String, String, String)>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT src_key, confidence, source_file_id, line
+         FROM resolved_edges
+         WHERE dst_key=?1 AND kind='call'
+         ORDER BY src_key, id",
+    )?;
+    let rows = stmt.query_map([producer], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (caller, call_confidence, source_file_id, line) = row?;
+        let confidence = lower_confidence(occurrence_confidence, &call_confidence);
+        if !projected_edges.insert((
+            caller.clone(),
+            entity_key.to_string(),
+            via_kind.to_string(),
+        )) {
+            continue;
+        }
+        insert_edge.execute(params![
+            caller,
+            entity_key,
+            via_kind,
+            confidence,
+            "entity-boundary-collapse",
+            source_file_id,
+            Option::<i64>::None,
+            line,
+            json!({
+                "entityOccurrenceId": occurrence_id,
+                "producer": producer,
+            })
+            .to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn lower_confidence(left: &str, right: &str) -> String {
+    let rank = |confidence: &str| match confidence {
+        "certain" => 2,
+        "likely" => 1,
+        _ => 0,
+    };
+    if rank(left) <= rank(right) { left } else { right }.to_string()
 }
 
 fn project_member_calls(
@@ -1201,7 +1658,19 @@ fn confidence_weight(confidence: &str) -> f64 {
 
 fn relation_weight(kind: &str) -> f64 {
     match kind {
-        "call" | "render" | "extend" => 1.0,
+        "call"
+        | "render"
+        | "extend"
+        | "dispatches"
+        | "registered_handler"
+        | "produces_lifecycle"
+        | "produces_lifecycle_via"
+        | "lifecycle_listener"
+        | "produces_job"
+        | "produces_job_via"
+        | "job_handler"
+        | "injects"
+        | "provides" => 1.0,
         "member_call" | "member_candidate" => 0.9,
         "import" | "reexport" => 0.75,
         "emits" | "listens" => 0.7,
@@ -1451,6 +1920,37 @@ fn member_key(name: &str) -> String {
     format!("member:unknown:{name}")
 }
 
+fn entity_key(entity_type: &str, name: &str) -> String {
+    format!("entity:{entity_type}:{}", encode_key_component(name))
+}
+
+fn reference_entity_key(
+    entity_type: &str,
+    targets: &[String],
+    path: &str,
+    fallback_name: &str,
+) -> String {
+    let identity = if targets.is_empty() {
+        format!("{path}\0{fallback_name}")
+    } else {
+        targets.join("\0")
+    };
+    let digest = blake3::hash(identity.as_bytes()).to_hex();
+    format!("entity:{entity_type}:ref-{}", &digest[..16])
+}
+
+fn encode_key_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'@') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn symbol_key(path: &str, scope: &str, name: &str, ordinal: usize) -> String {
     format!("sym:{path}#{scope}::{name}@{ordinal}")
 }
@@ -1515,6 +2015,274 @@ mod tests {
                 && edge.target.contains("a.ts#::greet@1")
                 && edge.confidence == "certain"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_entity_connects_dispatch_to_imported_registered_handler() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "identifier.ts",
+            "export const TARGET_HANDLER_ID = 'handler-id';\n",
+        )?;
+        write(
+            repo.path(),
+            "handler.ts",
+            "import { TARGET_HANDLER_ID } from './identifier';\n\
+             export const processHandler = () => 'handled';\n\
+             export default defineLogicFunction({\n\
+               universalIdentifier: TARGET_HANDLER_ID,\n\
+               handler: processHandler,\n\
+             });\n",
+        )?;
+        write(
+            repo.path(),
+            "route.ts",
+            "import { TARGET_HANDLER_ID } from './identifier';\n\
+             export const routeHandler = () => ({\n\
+               targetLogicFunctionUniversalIdentifier: TARGET_HANDLER_ID,\n\
+             });\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let registry_entities: i64 = conn.query_row(
+            "SELECT count(*) FROM entities WHERE entity_type='registry'",
+            [],
+            |row| row.get(0),
+        )?;
+        let occurrences: i64 = conn.query_row(
+            "SELECT count(*) FROM entity_occurrences occurrence
+             JOIN entities entity ON entity.id=occurrence.entity_id
+             WHERE entity.entity_type='registry'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((registry_entities, occurrences), (1, 2));
+
+        let result = neighborhood(
+            &conn,
+            "routeHandler",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "dispatches"
+                && edge.source.contains("route.ts#::routeHandler@1")
+                && edge.target.starts_with("entity:registry:ref-")
+                && edge.confidence == "likely"
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "registered_handler"
+                && edge.source.starts_with("entity:registry:ref-")
+                && edge.target.contains("handler.ts#::processHandler@1")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_entity_collapses_producer_helper_for_two_hop_worker_recall() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "worker.ts",
+            "const OBJECT = 'slackAssistantRequest';\n\
+             export const workerHandler = () => 'worked';\n\
+             export default defineLogicFunction({\n\
+               universalIdentifier: 'worker-id',\n\
+               handler: workerHandler,\n\
+               databaseEventTriggerSettings: { eventName: `${OBJECT}.created` },\n\
+             });\n",
+        )?;
+        write(
+            repo.path(),
+            "create.ts",
+            "export const createRequest = async (client) => {\n\
+               await client.mutation({ createSlackAssistantRequest: { id: true } });\n\
+               await client.mutation({ createSlackAssistantRequest: { id: true } });\n\
+             };\n",
+        )?;
+        write(
+            repo.path(),
+            "enqueue.ts",
+            "import { createRequest } from './create';\n\
+             export const enqueueRequest = async (client) => createRequest(client);\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let roles: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT occurrence.role FROM entity_occurrences occurrence
+                 JOIN entities entity ON entity.id=occurrence.entity_id
+                 WHERE entity.entity_key='entity:data_lifecycle:slackAssistantRequest.created'
+                 ORDER BY occurrence.role",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        assert_eq!(
+            roles,
+            [
+                "lifecycle_listener",
+                "lifecycle_producer",
+                "lifecycle_producer"
+            ]
+        );
+        let producer_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE src_key LIKE '%create.ts#::createRequest@1'
+               AND dst_key='entity:data_lifecycle:slackAssistantRequest.created'
+               AND kind='produces_lifecycle'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(producer_edges, 1, "occurrences must not duplicate traversal edges");
+        let collapsed_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE src_key LIKE '%enqueue.ts#::enqueueRequest@1'
+               AND dst_key='entity:data_lifecycle:slackAssistantRequest.created'
+               AND kind='produces_lifecycle_via'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(collapsed_edges, 1, "caller collapse must also be deduplicated");
+
+        let result = neighborhood(
+            &conn,
+            "enqueueRequest",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "produces_lifecycle_via"
+                && edge.source.contains("enqueue.ts#::enqueueRequest@1")
+                && edge.target == "entity:data_lifecycle:slackAssistantRequest.created"
+        }));
+        assert!(result.edges.iter().any(|edge| {
+            edge.kind == "lifecycle_listener"
+                && edge.source == "entity:data_lifecycle:slackAssistantRequest.created"
+                && edge.target.contains("worker.ts#::workerHandler@1")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn job_and_di_entities_join_producers_handlers_tokens_and_implementations() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "job-name.ts",
+            "export class EmailJob {}\nexport class CleanupJob {}\n",
+        )?;
+        write(
+            repo.path(),
+            "jobs.ts",
+            "import { CleanupJob, EmailJob } from './job-name';\n\
+             export class JobConsumer {\n\
+               @Process(EmailJob.name) emailHandler(job) { return job.data; }\n\
+               @Process(CleanupJob.name) cleanupHandler(job) { return job.data; }\n\
+             }\n",
+        )?;
+        write(
+            repo.path(),
+            "producer.ts",
+            "import { CleanupJob, EmailJob } from './job-name';\n\
+             export class Producer {\n\
+               enqueueEmail(payload) {\n\
+                 return this.messageQueueService.add(EmailJob.name, payload);\n\
+               }\n\
+               scheduleCleanup() {\n\
+                 return this.messageQueueService.addCron({\n\
+                   jobName: CleanupJob.name,\n\
+                   data: undefined,\n\
+                   options: { repeat: { pattern: '0 0 * * *' } },\n\
+                 });\n\
+               }\n\
+             }\n",
+        )?;
+        write(repo.path(), "token.ts", "export const MAILER = Symbol('mailer');\n")?;
+        write(repo.path(), "mailer.ts", "export class MailerService {}\n")?;
+        write(
+            repo.path(),
+            "module.ts",
+            "import { MAILER } from './token';\n\
+             import { MailerService } from './mailer';\n\
+             export const providers = [{ provide: MAILER, useClass: MailerService }];\n",
+        )?;
+        write(
+            repo.path(),
+            "consumer.ts",
+            "import { MAILER } from './token';\n\
+             export class Consumer { constructor(@Inject(MAILER) mailer) {} }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let job = neighborhood(
+            &conn,
+            "enqueueEmail",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(job.edges.iter().any(|edge| {
+            edge.kind == "produces_job"
+                && edge.source.contains("producer.ts#Producer::enqueueEmail@1")
+                && edge.target.starts_with("entity:job:ref-")
+        }));
+        assert!(job.edges.iter().any(|edge| {
+            edge.kind == "job_handler"
+                && edge.source.starts_with("entity:job:ref-")
+                && edge.target.contains("jobs.ts#JobConsumer::emailHandler@1")
+                && edge.provenance == "registration-site-fallback"
+        }));
+
+        let cron = neighborhood(
+            &conn,
+            "scheduleCleanup",
+            &NeighborhoodOptions {
+                depth: 2,
+                direction: "out".into(),
+                ..Default::default()
+            },
+        )?;
+        assert!(cron.edges.iter().any(|edge| {
+            edge.kind == "produces_job"
+                && edge.source.contains("producer.ts#Producer::scheduleCleanup@1")
+        }));
+        assert!(cron.edges.iter().any(|edge| {
+            edge.kind == "job_handler"
+                && edge.target.contains("jobs.ts#JobConsumer::cleanupHandler@1")
+        }));
+
+        let provider: (String, String) = conn.query_row(
+            "SELECT source.node_key, target.node_key
+             FROM resolved_edges edge
+             JOIN graph_nodes source ON source.node_key=edge.src_key
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE edge.kind='provides' AND source.node_kind='entity'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(provider.0.starts_with("entity:di_token:ref-"));
+        assert!(provider.1.contains("mailer.ts#::MailerService@1"));
+        let injections: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind='injects' AND dst_key=?1",
+            [&provider.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(injections, 1);
         Ok(())
     }
 

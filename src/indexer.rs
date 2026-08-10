@@ -346,6 +346,38 @@ fn insert_file(
         ])?;
     }
 
+    let mut ins_entity_site = conn.prepare_cached(
+        "INSERT INTO entity_sites(
+           file_id, chunk_id, start, end, line, end_line, plane, entity_type,
+           role, identity_kind, identity_name, identity_start, target_name,
+           target_start, extractor, provenance, confidence, detail_json
+         ) VALUES(
+           ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18
+         )",
+    )?;
+    for site in &data.graph.entity_sites {
+        ins_entity_site.execute(params![
+            file_id,
+            chunk_for(site.span_start),
+            site.span_start,
+            site.span_end,
+            data.lines.line(site.span_start),
+            data.lines.line(site.span_end.saturating_sub(1)),
+            site.plane,
+            site.entity_type,
+            site.role,
+            site.identity_kind,
+            site.identity_name,
+            site.identity_start,
+            site.target_name,
+            site.target_start,
+            site.extractor,
+            site.provenance,
+            site.confidence,
+            site.detail.to_string(),
+        ])?;
+    }
+
     let mut ins_ref = conn.prepare_cached(
         "INSERT INTO refs(
            file_id, chunk_id, start, line, kind, confidence,

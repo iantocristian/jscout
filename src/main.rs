@@ -2,6 +2,7 @@ mod agent;
 mod chunk;
 mod dependency;
 mod embed;
+mod entity;
 mod file_role;
 mod graph;
 mod heur;

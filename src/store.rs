@@ -157,6 +157,79 @@ CREATE TABLE IF NOT EXISTS member_calls(
 );
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
 
+-- Source-local deterministic evidence. Identifier identities remain raw here
+-- until module resolution can group them under canonical entities.
+CREATE TABLE IF NOT EXISTS entity_sites(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  start INTEGER NOT NULL,
+  end INTEGER NOT NULL,
+  line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  plane TEXT NOT NULL CHECK(plane IN ('runtime', 'general')),
+  entity_type TEXT NOT NULL,
+  role TEXT NOT NULL,
+  identity_kind TEXT NOT NULL CHECK(identity_kind IN ('literal', 'reference')),
+  identity_name TEXT NOT NULL,
+  identity_start INTEGER NOT NULL,
+  target_name TEXT,
+  target_start INTEGER,
+  extractor TEXT NOT NULL,
+  provenance TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_entity_sites_file ON entity_sites(file_id);
+CREATE INDEX IF NOT EXISTS idx_entity_sites_identity
+  ON entity_sites(entity_type, identity_name);
+
+CREATE TABLE IF NOT EXISTS entities(
+  id INTEGER PRIMARY KEY,
+  entity_key TEXT UNIQUE NOT NULL,
+  plane TEXT NOT NULL CHECK(plane IN ('runtime', 'general')),
+  entity_type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  identity_anchor TEXT,
+  meta_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_entities_type_name ON entities(entity_type, name);
+
+CREATE TABLE IF NOT EXISTS entity_occurrences(
+  id INTEGER PRIMARY KEY,
+  entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  site_id INTEGER UNIQUE NOT NULL REFERENCES entity_sites(id) ON DELETE CASCADE,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  start INTEGER NOT NULL,
+  end INTEGER NOT NULL,
+  line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  extractor TEXT NOT NULL,
+  provenance TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_entity_occurrences_entity
+  ON entity_occurrences(entity_id, role);
+CREATE INDEX IF NOT EXISTS idx_entity_occurrences_file
+  ON entity_occurrences(file_id, start);
+
+CREATE TABLE IF NOT EXISTS entity_edges(
+  id INTEGER PRIMARY KEY,
+  occurrence_id INTEGER NOT NULL REFERENCES entity_occurrences(id) ON DELETE CASCADE,
+  target_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
+  provenance TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_occurrence
+  ON entity_edges(occurrence_id, kind);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_target
+  ON entity_edges(target_key, kind);
+
 CREATE TABLE IF NOT EXISTS embeddings(
   chunk_hash TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -432,8 +505,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
     }
 
+    // v8 -> v9: runtime/general entities preserve per-site spans and trust
+    // labels separately from snapshot-canonical identity. Existing files must
+    // pass through extraction once to populate entity_sites.
+    if version < 9 {
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute("DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')", [])?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','8')
+        "INSERT INTO meta(key, value) VALUES('schema_version','9')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -507,7 +590,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         assert!(database.is_file());
         Ok(())
     }
@@ -544,7 +627,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -587,7 +670,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -653,7 +736,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -682,7 +765,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -726,7 +809,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "8");
+        assert_eq!(version, "9");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -742,6 +825,55 @@ mod tests {
         assert_eq!(package_column, 1);
         let snapshots: i64 = conn.query_row(
             "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshots, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v8_with_entity_planes_and_forces_reextraction() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(".jscout.db");
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '8');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
+               role TEXT NOT NULL DEFAULT 'unknown',
+               origin TEXT NOT NULL DEFAULT 'repository',
+               package_instance_id INTEGER, package_path TEXT
+             );
+             INSERT INTO files VALUES(
+               1, 'src/old.ts', 'old-hash', 'production', 'repository', NULL, NULL
+             );",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "9");
+        let hash: String =
+            conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
+        assert!(hash.is_empty());
+        let tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type='table' AND name IN (
+               'entity_sites', 'entities', 'entity_occurrences', 'entity_edges'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tables, 4);
+        let snapshots: i64 = conn.query_row(
+            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
             [],
             |row| row.get(0),
         )?;
