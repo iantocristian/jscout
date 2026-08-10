@@ -395,11 +395,15 @@ impl EntityVisitor {
     }
 
     fn extract_general_call(&mut self, call: &CallExpression<'_>) {
+        let callee_name = match &call.callee {
+            Expression::Identifier(identifier) => identifier.name.as_str(),
+            Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+            _ => return,
+        };
+        if !is_general_callee(callee_name) {
+            return;
+        }
         let callee_path = member_path(&call.callee);
-        let callee_name = callee_path
-            .as_deref()
-            .and_then(|path| path.rsplit('.').next())
-            .unwrap_or_default();
 
         if let Some(path) = callee_path.as_deref()
             && let Some(method) = http_method(callee_name)
@@ -852,8 +856,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        if member.property.name != "env"
-            && member_path(&member.object).as_deref() == Some("process.env")
+        if is_process_env(&member.object)
         {
             self.push_general(GeneralSiteSpec {
                 entity_type: "environment_variable",
@@ -872,7 +875,7 @@ impl<'a> Visit<'a> for EntityVisitor {
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if member_path(&member.object).as_deref() == Some("process.env")
+        if is_process_env(&member.object)
             && let Some(name) = static_string(&member.expression, &self.static_strings)
         {
             self.push_general(GeneralSiteSpec {
@@ -1141,6 +1144,57 @@ fn is_feature_flag_callee(name: &str) -> bool {
             | "hasFeature"
             | "useFeatureFlag"
             | "featureFlag"
+    )
+}
+
+fn is_general_callee(name: &str) -> bool {
+    http_method(name).is_some()
+        || matches!(
+            name,
+            "query"
+                | "mutation"
+                | "subscription"
+                | "require"
+                | "getEnv"
+                | "requireEnv"
+                | "getRepository"
+                | "getModel"
+                | "create"
+                | "createMany"
+                | "insert"
+                | "insertMany"
+                | "save"
+                | "update"
+                | "updateMany"
+                | "upsert"
+                | "deleteMany"
+                | "remove"
+                | "find"
+                | "findOne"
+                | "findFirst"
+                | "findMany"
+                | "findUnique"
+                | "select"
+                | "count"
+                | "aggregate"
+                | "exists"
+                | "fetch"
+                | "axios"
+                | "got"
+                | "request"
+        )
+        || is_feature_flag_callee(name)
+}
+
+fn is_process_env(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression,
+        Expression::StaticMemberExpression(member)
+            if member.property.name == "env"
+                && matches!(
+                    &member.object,
+                    Expression::Identifier(identifier) if identifier.name == "process"
+                )
     )
 }
 
