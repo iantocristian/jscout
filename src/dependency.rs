@@ -10,11 +10,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use oxc_resolver::{Resolver, TsconfigDiscovery};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::indexer::{package_name, resolver_options};
+use crate::walk;
 use crate::workspace::{WorkspaceMap, WorkspacePackage};
+
+pub const DEFAULT_MAX_FILES: usize = 10_000;
+pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DiscoveredPackage {
@@ -25,6 +30,41 @@ pub struct DiscoveredPackage {
     pub canonical_root: PathBuf,
     pub locator: String,
     pub manifest_hash: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DependencyLimits {
+    pub max_files: usize,
+    pub max_bytes: u64,
+    pub max_file_bytes: u64,
+}
+
+impl Default for DependencyLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_MAX_FILES,
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannedFile {
+    pub source_path: PathBuf,
+    pub package_path: String,
+    pub bytes: u64,
+    pub forced_entry: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackagePlan {
+    pub package: DiscoveredPackage,
+    pub files: Vec<PlannedFile>,
+    pub source_basis: String,
+    pub skipped_files: usize,
+    pub skipped_bytes: u64,
+    pub status: String,
 }
 
 /// Find every installed instance of the selected package names that is used
@@ -92,6 +132,375 @@ pub fn discover(
     }
 
     Ok(found.into_values().collect())
+}
+
+/// Select a bounded, deterministic set of source files for each discovered
+/// third-party package. Workspace instances are identity-only here because
+/// their files are already part of the repository corpus.
+pub fn plan_packages(
+    packages: &[DiscoveredPackage],
+    limits: DependencyLimits,
+) -> Result<Vec<PackagePlan>> {
+    if limits.max_files == 0 || limits.max_bytes == 0 || limits.max_file_bytes == 0 {
+        bail!("dependency file and byte limits must be greater than zero");
+    }
+    packages
+        .iter()
+        .filter(|package| package.origin == "dependency")
+        .map(|package| plan_package(package, limits))
+        .collect()
+}
+
+/// Reconcile persistent package instances with the current workspace and the
+/// explicitly selected dependency plans. The selector list is authoritative:
+/// dependency instances omitted from this run are removed with their files.
+pub fn synchronize_instances(
+    root: &Path,
+    conn: &Connection,
+    workspace: &WorkspaceMap,
+    plans: &[PackagePlan],
+) -> Result<BTreeMap<PathBuf, i64>> {
+    conn.execute_batch("BEGIN")?;
+    let result = (|| {
+        conn.execute(
+            "UPDATE files
+             SET origin='repository', package_instance_id=NULL, package_path=NULL
+             WHERE origin IN ('repository', 'workspace')",
+            [],
+        )?;
+
+        let mut instances = BTreeMap::new();
+        let mut desired = BTreeSet::new();
+        for package in &workspace.packages {
+            let discovered = workspace_instance(root, package);
+            let id = upsert_instance(conn, &discovered, "complete")?;
+            desired.insert(discovered.canonical_root.clone());
+            instances.insert(discovered.canonical_root, id);
+        }
+        for plan in plans {
+            let id = upsert_instance(conn, &plan.package, &plan.status)?;
+            desired.insert(plan.package.canonical_root.clone());
+            instances.insert(plan.package.canonical_root.clone(), id);
+        }
+
+        let stale: Vec<(i64, PathBuf)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, canonical_root FROM package_instances
+                 WHERE origin IN ('workspace', 'dependency')",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, PathBuf::from(row.get::<_, String>(1)?)))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (id, canonical_root) in stale {
+            if !desired.contains(&canonical_root) {
+                conn.execute("DELETE FROM package_instances WHERE id=?1", [id])?;
+            }
+        }
+
+        // Shallow packages are tagged first so a nested declared workspace
+        // package, if present, owns its more-specific subtree.
+        let mut workspace_roots: Vec<_> = workspace.packages.iter().collect();
+        workspace_roots.sort_by_key(|package| package.canonical_root.components().count());
+        for package in workspace_roots {
+            let Some(id) = instances.get(&package.canonical_root) else { continue };
+            let Ok(relative) = package.canonical_root.strip_prefix(root) else { continue };
+            let prefix = relative.to_string_lossy().replace('\\', "/");
+            let like = format!("{prefix}/%");
+            conn.execute(
+                "UPDATE files
+                 SET origin='workspace', package_instance_id=?1,
+                     package_path=CASE
+                       WHEN path=?2 THEN ''
+                       ELSE substr(path, ?3)
+                     END
+                 WHERE origin!='dependency' AND (path=?2 OR path LIKE ?4)",
+                params![id, prefix, prefix.len() as i64 + 2, like],
+            )?;
+        }
+        Ok(instances)
+    })();
+    match result {
+        Ok(instances) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(instances)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn upsert_instance(conn: &Connection, package: &DiscoveredPackage, status: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO package_instances(
+           origin, name, version, canonical_root, locator, manifest_hash, status
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(canonical_root) DO UPDATE SET
+           origin=excluded.origin,
+           name=excluded.name,
+           version=excluded.version,
+           locator=excluded.locator,
+           manifest_hash=excluded.manifest_hash,
+           status=excluded.status",
+        params![
+            package.origin,
+            package.name,
+            package.version,
+            package.canonical_root.to_string_lossy(),
+            package.locator,
+            package.manifest_hash,
+            status,
+        ],
+    )?;
+    Ok(conn.query_row(
+        "SELECT id FROM package_instances WHERE canonical_root=?1",
+        [package.canonical_root.to_string_lossy()],
+        |row| row.get(0),
+    )?)
+}
+
+pub fn should_skip_minified(path: &Path, source: &str, forced_entry: bool) -> bool {
+    if forced_entry {
+        return false;
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if name.contains(".min.") {
+        return true;
+    }
+    let mut lines = source.lines();
+    let first = lines.next().unwrap_or_default();
+    first.len() > 4_000 && lines.take(4).all(|line| line.len() > 1_000)
+}
+
+fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result<PackagePlan> {
+    let manifest_path = package.canonical_root.join("package.json");
+    let text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read dependency manifest {}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse dependency manifest {}", manifest_path.display()))?;
+    let (roots, forced_entries, source_basis) = analysis_roots(package, &manifest);
+    let mut candidates = Vec::new();
+    for root in roots {
+        collect_indexable_files(&root, &mut candidates);
+    }
+    candidates.sort();
+    candidates.dedup();
+
+    let mut files = Vec::new();
+    let mut selected_bytes = 0_u64;
+    let mut skipped_files = 0_usize;
+    let mut skipped_bytes = 0_u64;
+    for source_path in candidates {
+        let Ok(package_path) = source_path.strip_prefix(&package.canonical_root) else {
+            continue;
+        };
+        let package_path = package_path.to_string_lossy().replace('\\', "/");
+        let bytes = fs::metadata(&source_path).map(|meta| meta.len()).unwrap_or(0);
+        if bytes > limits.max_file_bytes
+            || files.len() >= limits.max_files
+            || selected_bytes.saturating_add(bytes) > limits.max_bytes
+        {
+            skipped_files += 1;
+            skipped_bytes = skipped_bytes.saturating_add(bytes);
+            continue;
+        }
+        selected_bytes += bytes;
+        files.push(PlannedFile {
+            source_path,
+            forced_entry: forced_entries.contains(&package_path),
+            package_path,
+            bytes,
+        });
+    }
+    let status = if skipped_files == 0 { "complete" } else { "truncated" };
+    Ok(PackagePlan {
+        package: package.clone(),
+        files,
+        source_basis,
+        skipped_files,
+        skipped_bytes,
+        status: status.into(),
+    })
+}
+
+fn analysis_roots(
+    package: &DiscoveredPackage,
+    manifest: &serde_json::Value,
+) -> (Vec<PathBuf>, BTreeSet<String>, String) {
+    let mut source_targets = Vec::new();
+    if let Some(source) = manifest.get("source").and_then(|value| value.as_str()) {
+        source_targets.push(source.to_string());
+    }
+    collect_named_condition(manifest.get("exports"), "source", &mut source_targets);
+    let source_paths = existing_targets(&package.canonical_root, &source_targets);
+    if !source_paths.is_empty() {
+        return (
+            roots_for_targets(&package.canonical_root, &source_paths),
+            relative_files(&package.canonical_root, &source_paths),
+            "manifest-source".into(),
+        );
+    }
+
+    let mut runtime_targets = Vec::new();
+    if let Some(exports) = manifest.get("exports") {
+        collect_runtime_targets(exports, &mut runtime_targets);
+    }
+    for field in ["module", "main"] {
+        if let Some(target) = manifest.get(field).and_then(|value| value.as_str()) {
+            runtime_targets.push(target.to_string());
+        }
+    }
+    let runtime_paths = existing_targets(&package.canonical_root, &runtime_targets);
+    if !runtime_paths.is_empty() {
+        return (
+            roots_for_targets(&package.canonical_root, &runtime_paths),
+            relative_files(&package.canonical_root, &runtime_paths),
+            "runtime".into(),
+        );
+    }
+    (vec![package.canonical_root.clone()], BTreeSet::new(), "package-root".into())
+}
+
+fn collect_named_condition(value: Option<&serde_json::Value>, name: &str, out: &mut Vec<String>) {
+    let Some(value) = value else { return };
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == name {
+                    collect_strings(value, out);
+                } else {
+                    collect_named_condition(Some(value), name, out);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_named_condition(Some(value), name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_runtime_targets(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_runtime_targets(value, out);
+            }
+        }
+        serde_json::Value::Object(map) if map.keys().any(|key| key.starts_with('.')) => {
+            for value in map.values() {
+                collect_runtime_targets(value, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for condition in crate::indexer::RESOLVE_CONDITIONS {
+                if let Some(value) = map.get(*condition) {
+                    collect_runtime_targets(value, out);
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_strings(value, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn existing_targets(package_root: &Path, targets: &[String]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for target in targets {
+        if target.contains('*') {
+            let prefix = target
+                .split('*')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("./")
+                .trim_end_matches('/');
+            let path = package_root.join(prefix);
+            if path.is_dir() {
+                paths.push(path);
+            }
+            continue;
+        }
+        let path = package_root.join(target.trim_start_matches("./"));
+        if path.is_file() || path.is_dir() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn roots_for_targets(package_root: &Path, targets: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for target in targets {
+        let relative = target.strip_prefix(package_root).unwrap_or(target);
+        let first = relative.components().next().map(|component| component.as_os_str());
+        let root = match first {
+            Some(first) if relative.components().count() > 1 => package_root.join(first),
+            _ if target.is_dir() => target.clone(),
+            _ => package_root.to_path_buf(),
+        };
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn relative_files(package_root: &Path, targets: &[PathBuf]) -> BTreeSet<String> {
+    targets
+        .iter()
+        .filter(|path| path.is_file())
+        .filter_map(|path| path.strip_prefix(package_root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) {
+    if root.is_file() {
+        if walk::is_indexable(root) {
+            out.push(root.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_indexable_files(&path, out);
+        } else if file_type.is_file() && walk::is_indexable(&path) {
+            out.push(path);
+        }
+    }
 }
 
 fn normalized_selectors(selectors: &[String]) -> Result<BTreeSet<String>> {
@@ -214,7 +623,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::discover;
+    use super::{DependencyLimits, DiscoveredPackage, discover, plan_packages, should_skip_minified};
     use crate::{store, workspace::WorkspaceMap};
 
     fn write(path: &Path, content: &str) -> Result<()> {
@@ -321,6 +730,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("Plug'n'Play"));
+        Ok(())
+    }
+
+    #[test]
+    fn planning_prefers_manifest_source_and_enforces_deterministic_limits() -> Result<()> {
+        let package_root = tempfile::tempdir()?;
+        write(
+            &package_root.path().join("package.json"),
+            r#"{"name":"dep","version":"1.0.0","source":"src/index.ts","main":"dist/index.js"}"#,
+        )?;
+        write(&package_root.path().join("src/index.ts"), "export const entry = 1;\n")?;
+        write(&package_root.path().join("src/z.ts"), "export const z = 1;\n")?;
+        write(&package_root.path().join("dist/index.js"), "exports.entry = 1;\n")?;
+        let package = DiscoveredPackage {
+            origin: "dependency".into(),
+            name: "dep".into(),
+            version: Some("1.0.0".into()),
+            canonical_root: package_root.path().canonicalize()?,
+            locator: "node_modules/dep".into(),
+            manifest_hash: "hash".into(),
+        };
+
+        let plans = plan_packages(
+            &[package],
+            DependencyLimits { max_files: 1, max_bytes: 1024, max_file_bytes: 1024 },
+        )?;
+        let plan = &plans[0];
+        assert_eq!(plan.source_basis, "manifest-source");
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].package_path, "src/index.ts");
+        assert!(plan.files[0].forced_entry);
+        assert_eq!(plan.skipped_files, 1);
+        assert_eq!(plan.status, "truncated");
+        assert!(!plan.files.iter().any(|file| file.package_path.starts_with("dist/")));
+        Ok(())
+    }
+
+    #[test]
+    fn planning_uses_runtime_wildcard_tree_without_entering_nested_node_modules() -> Result<()> {
+        let package_root = tempfile::tempdir()?;
+        write(
+            &package_root.path().join("package.json"),
+            r#"{"name":"dep","version":"1.0.0","exports":{"./*":"./dist/*.js"}}"#,
+        )?;
+        write(&package_root.path().join("dist/a.js"), "exports.a = 1;\n")?;
+        write(&package_root.path().join("src/a.ts"), "export const a = 1;\n")?;
+        write(
+            &package_root.path().join("dist/node_modules/nested/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        let package = DiscoveredPackage {
+            origin: "dependency".into(),
+            name: "dep".into(),
+            version: Some("1.0.0".into()),
+            canonical_root: package_root.path().canonicalize()?,
+            locator: "node_modules/dep".into(),
+            manifest_hash: "hash".into(),
+        };
+
+        let plans = plan_packages(&[package], DependencyLimits::default())?;
+        let paths: Vec<&str> =
+            plans[0].files.iter().map(|file| file.package_path.as_str()).collect();
+        assert_eq!(plans[0].source_basis, "runtime");
+        assert_eq!(paths, vec!["dist/a.js"]);
+        assert!(should_skip_minified(Path::new("bundle.min.js"), "x", false));
+        assert!(!should_skip_minified(Path::new("bundle.min.js"), "x", true));
         Ok(())
     }
 }

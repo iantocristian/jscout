@@ -1,6 +1,6 @@
 mod agent;
 mod chunk;
-pub mod dependency;
+mod dependency;
 mod embed;
 mod file_role;
 mod graph;
@@ -53,6 +53,9 @@ enum Command {
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
+        /// Index internals for these installed packages (comma-separated or repeatable)
+        #[arg(long = "deps", value_delimiter = ',')]
+        dependencies: Vec<String>,
     },
     /// Embed chunks that don't have embeddings yet (needs an API key, see README)
     Embed {
@@ -244,7 +247,9 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
-        Command::Index { root, database } => cmd_index(&root, database.as_deref()),
+        Command::Index { root, database, dependencies } => {
+            cmd_index(&root, database.as_deref(), &dependencies)
+        }
         Command::Embed { root, batch } => cmd_embed(&root, batch),
         Command::Search {
             root,
@@ -465,14 +470,34 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_index(root: &Path, database: Option<&Path>) -> Result<()> {
+fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> Result<()> {
     let started = std::time::Instant::now();
     let conn = open_database(root, database)?;
-    let o = indexer::index_repo(root, &conn)?;
+    let o = indexer::index_repo_with_options(
+        root,
+        &conn,
+        &indexer::IndexOptions {
+            dependencies: dependencies.to_vec(),
+            ..Default::default()
+        },
+    )?;
     println!(
         "indexed {} files ({} unchanged, {} failed) — {} chunks, {} refs in {:?}",
         o.indexed, o.unchanged, o.failed, o.chunks, o.refs, started.elapsed()
     );
+    if !dependencies.is_empty() {
+        println!(
+            "dependency corpus: {} packages, {} files / {} bytes, {} files / {} bytes skipped",
+            o.dependency_packages,
+            o.dependency_files,
+            o.dependency_bytes,
+            o.dependency_skipped,
+            o.dependency_skipped_bytes
+        );
+        for plan in &o.dependency_plans {
+            println!("  {plan}");
+        }
+    }
     Ok(())
 }
 
