@@ -2,8 +2,8 @@
 
 > Status: authoritative plan as of 2026-08-11.
 >
-> G1–G6 of semantic scouting are implemented. G7, hierarchical summaries, is
-> next. Product-value testing is intentionally paused until the semantic-v1
+> G1–G7 of semantic scouting are implemented. G8, concepts, is next.
+> Product-value testing is intentionally paused until the semantic-v1
 > completion boundary.
 
 ## Document policy
@@ -112,7 +112,7 @@ agent, indexer, or semantic authority.
 | Dependency scope | Opt-in named packages; realpath-normalized workspace/dependency identity, pnpm layout/version handling, source-over-dist preference, bundle/minification limits, and dependency origin excluded from retrieval by default |
 | Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, repository overview, ranked paths, semantic-memory attachment, and opt-in structural expansion |
 | Agent integration | CLI, MCP profiles, project-local agent guide, response budgets, privacy-minimal telemetry, and isolated evaluation database support |
-| Semantic memory | Validated agent write-back; candidate-closed generated workflows; evidence-backed selected symbol cards; automatic deterministic seeds and card selection; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
+| Semantic memory | Validated agent write-back; candidate-closed generated workflows; evidence-backed selected symbol cards; bottom-up child-cited file/module/repository summaries with fingerprint-pinned child relations and upward freshness propagation; automatic deterministic seeds, card selection, and scope discovery; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
 | Model gateway | `@earendil-works/pi-ai` 0.84.1 sidecar, protocol-v1 JSONL over stdio, provider/auth registry, cancellation, normalized usage/errors, and `llm doctor` |
 
 ## Deterministic repository plane
@@ -317,11 +317,10 @@ The model may declare the evidence insufficient; that records an incomplete
 run and publishes no card. Refresh selects stale/degraded current cards and
 replays their recorded subject and model into immutable successors.
 
-## Remaining semantic-v1 roadmap
+### Implemented hierarchical summaries (G7)
 
-### G7 — hierarchical summaries (next)
-
-Build bottom-up rather than prompting over the repository at once:
+The governing specification, unchanged — build bottom-up rather than prompting
+over the repository at once:
 
 - file summaries from validated cards/workflows plus deterministic topology;
 - module/package summaries from selected child claims;
@@ -332,7 +331,43 @@ ultimately to exact source support. A changed child degrades or stales its
 parents even when the parent's own text is unchanged. Prose without a support
 chain is not indexable memory.
 
-### G8 — concepts
+As implemented, summaries reuse the same gateway, run ledger, support
+validator, freshness engine, and immutable supersession as workflows and cards.
+
+1. Discover scopes deterministically per level from the index and the workspace
+   manifest set, never from the model: `file:<path>` from the files current
+   cards and workflows cite, `module:<package>` from the file summaries a
+   workspace package owns, and `repo` from module summaries plus the file
+   summaries no package owns. A scope with no current children is not a summary
+   subject; a child set that outgrows one bounded prompt is refused or skipped,
+   never silently truncated.
+2. Enumerate the children as `C1..Cn` with their bodies quoted as data and their
+   artifact fingerprints pinned inline, so the prompt pack itself participates
+   in the input fingerprint. That fingerprint is deliberately snapshot-free:
+   an unrelated repository change reuses the completed run.
+3. Require every claim — the one mandatory `overview` and each optional key
+   point — to cite the child references supporting it. Uncited prose fails
+   validation, an unknown reference fails validation, and a refusal
+   (`incomplete_reason`) is mutually exclusive with any claim.
+4. Publish one artifact per scope key, with one `summarizes` relation per cited
+   child per claim, pinned to the fingerprint the claim was grounded on, at
+   `likely` confidence. Inside the publication transaction, recheck the
+   structural snapshot and that every cited child is still current with exactly
+   that fingerprint; either failing refuses the write whole.
+5. Run levels staged bottom-up under one `--max-calls` budget when no `--level`
+   is given, so each level is planned only after the previous level's artifacts
+   exist and a module summary sees the file summaries the same invocation just
+   published.
+
+Freshness propagates upward on read: a missing, superseded, or changed child
+stales its parent, and a current-but-not-fresh child degrades it, bounded by
+the three-level hierarchy. Refresh therefore needs no summary-specific
+selection rule — a summary whose child drifted is already non-fresh — and
+replans the recorded scope against the children current at refresh time.
+
+## Remaining semantic-v1 roadmap
+
+### G8 — concepts (next)
 
 Infer concepts from validated workflow/card vocabulary, not from embedding
 clusters and not by tagging every chunk with a separate model call.
@@ -376,7 +411,7 @@ Semantic v1 is complete when:
 
 ## Verification policy
 
-No further product-value evaluation is required before G7–G9. Implementation
+No further product-value evaluation is required before G8–G9. Implementation
 work still requires engineering verification:
 
 - Rust compile, formatting, lint, unit, migration, and existing regression

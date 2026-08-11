@@ -131,6 +131,8 @@ pub struct RefreshPlanItem {
     pub workflow: Option<plan::WorkflowPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub card: Option<plan::CardPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<plan::SummaryPlan>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +161,7 @@ struct PreparedCard {
 enum PreparedRefresh {
     Workflow(Box<WorkflowScoutOptions>, Box<PreparedWorkflow>),
     Card(Box<CardScoutOptions>, Box<PreparedCard>),
+    Summary(Box<SummaryScoutOptions>, Box<PreparedSummary>),
 }
 
 #[derive(Default)]
@@ -497,6 +500,7 @@ pub fn plan_refresh(
             reasoning: target.reasoning.clone(),
             workflow: None,
             card: None,
+            summary: None,
         };
         let planned = match &target.config {
             refresh::RefreshConfig::Workflow(config) => plan::workflows(
@@ -518,6 +522,16 @@ pub fn plan_refresh(
                     }
                 })
             }
+            refresh::RefreshConfig::Summary(config) => plan::summaries(
+                root,
+                conn,
+                &config.level,
+                std::slice::from_ref(&config.scope),
+            )
+            .map(|summary| RefreshPlanItem {
+                summary: Some(summary),
+                ..item.clone()
+            }),
         };
         match planned {
             Ok(planned) => plans.push(planned),
@@ -533,10 +547,10 @@ pub fn plan_refresh(
     })
 }
 
-/// Refresh stale/degraded generated workflows and cards under one strict
-/// command-level call budget while retaining each run's original model and
-/// configuration. Selection order (artifact id) is the execution order, so a
-/// mixed selection spends the budget predictably.
+/// Refresh stale/degraded generated workflows, cards, and summaries under one
+/// strict command-level call budget while retaining each run's original model
+/// and configuration. Selection order (artifact id) is the execution order, so
+/// a mixed selection spends the budget predictably.
 pub fn scout_refresh(
     root: &Path,
     conn: &Connection,
@@ -565,6 +579,17 @@ pub fn scout_refresh(
                 &policy,
             ),
             refresh::RefreshConfig::Card(config) => prepare_card_refresh(
+                root,
+                conn,
+                gateway,
+                &mut cache,
+                artifact_id,
+                config,
+                target.model,
+                target.reasoning,
+                &policy,
+            ),
+            refresh::RefreshConfig::Summary(config) => prepare_summary_refresh(
                 root,
                 conn,
                 gateway,
@@ -605,6 +630,7 @@ pub fn scout_refresh(
         let spec = match &prepared {
             PreparedRefresh::Workflow(_, workflow) => &workflow.spec,
             PreparedRefresh::Card(_, card) => &card.spec,
+            PreparedRefresh::Summary(_, summary) => &summary.spec,
         };
         let reusable = ledger::reusable_run(conn, spec)?.is_some();
         if !reusable && model_calls >= policy.max_calls {
@@ -618,6 +644,9 @@ pub fn scout_refresh(
             }
             PreparedRefresh::Card(options, card) => {
                 execute_prepared_card(root, conn, gateway, &options, *card, allow_new_call)?
+            }
+            PreparedRefresh::Summary(options, summary) => {
+                execute_prepared_summary(root, conn, gateway, &options, *summary, allow_new_call)?
             }
         };
         if report.status != "reused" {
@@ -704,6 +733,49 @@ fn prepare_card_refresh(
     };
     let prepared = prepare_card(gateway, cache, plan.items.remove(0), &options)?;
     Ok(Some(PreparedRefresh::Card(
+        Box::new(options),
+        Box::new(prepared),
+    )))
+}
+
+/// Re-plan the recorded scope explicitly, so the replacement summary sees the
+/// children that are current NOW rather than the ones the retired run cited.
+/// A scope whose children all disappeared no longer resolves and is reported
+/// unresolvable instead of aborting the batch.
+#[allow(clippy::too_many_arguments)]
+fn prepare_summary_refresh(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
+    artifact_id: i64,
+    config: SummaryRunConfig,
+    model: ModelSpec,
+    reasoning: Option<String>,
+    policy: &RequestPolicy,
+) -> Result<Option<PreparedRefresh>> {
+    let mut plan = plan::summaries(
+        root,
+        conn,
+        &config.level,
+        std::slice::from_ref(&config.scope),
+    )
+    .map_err(|error| anyhow::Error::from(UnresolvableRefresh(error.to_string())))?;
+    if plan.items.len() != 1 {
+        return Ok(None);
+    }
+    let options = SummaryScoutOptions {
+        level: Some(config.level),
+        scopes: vec![config.scope],
+        model,
+        reasoning,
+        service_tier: config.service_tier,
+        policy: policy.clone(),
+        rebuild: false,
+        supersedes_artifact_id: Some(artifact_id),
+    };
+    let prepared = prepare_summary(gateway, cache, plan.items.remove(0), &options)?;
+    Ok(Some(PreparedRefresh::Summary(
         Box::new(options),
         Box::new(prepared),
     )))
@@ -2336,8 +2408,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CardScoutOptions, ScoutReport, WorkflowScoutOptions, scout_card_plan, scout_refresh,
-        scout_workflow_plan, scout_workflows,
+        CardScoutOptions, ScoutReport, SummaryScoutOptions, WorkflowScoutOptions, scout_card_plan,
+        scout_refresh, scout_workflow_plan, scout_workflows,
     };
     use crate::llm::config::{ModelSpec, RequestPolicy};
     use crate::llm::protocol::{
@@ -3562,6 +3634,476 @@ mod tests {
 
         let runs: i64 = conn.query_row("SELECT count(*) FROM scout_runs", [], |row| row.get(0))?;
         assert_eq!(runs, 0, "a dry run writes no ledger rows");
+        Ok(())
+    }
+
+    fn summary_outcome(arguments: serde_json::Value) -> CompletionOutcome {
+        let mut outcome = outcome(arguments);
+        outcome.tool_call.name = super::summary::SUBMIT_TOOL_NAME.into();
+        outcome
+    }
+
+    fn summary_options(level: Option<&str>, max_calls: usize) -> SummaryScoutOptions {
+        SummaryScoutOptions {
+            level: level.map(str::to_string),
+            scopes: Vec::new(),
+            model: ModelSpec::parse("faux:faux-model").expect("model spec"),
+            reasoning: None,
+            service_tier: None,
+            policy: RequestPolicy::new(30, max_calls, 240_000).expect("policy"),
+            rebuild: false,
+            supersedes_artifact_id: None,
+        }
+    }
+
+    fn summary_submission(overview: &str, children: &[&str]) -> serde_json::Value {
+        json!({
+            "overview": { "text": overview, "children": children },
+            "key_points": [],
+            "incomplete_reason": null,
+        })
+    }
+
+    fn artifact_fingerprint(conn: &rusqlite::Connection, artifact_id: i64) -> Result<String> {
+        Ok(conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+            [artifact_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// (claim_path, relation, dst_artifact_id, dst_fingerprint, confidence).
+    type RelationRow = (String, String, i64, String, String);
+
+    /// Every child relation of one artifact, in a deterministic order.
+    fn relations_of(conn: &rusqlite::Connection, artifact_id: i64) -> Result<Vec<RelationRow>> {
+        let mut statement = conn.prepare(
+            "SELECT claim_path, relation, dst_artifact_id, dst_fingerprint, confidence
+             FROM semantic_relations WHERE src_artifact_id=?1
+             ORDER BY claim_path, dst_artifact_id",
+        )?;
+        let rows = statement.query_map([artifact_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    fn current_summaries(conn: &rusqlite::Connection) -> Result<Vec<i64>> {
+        let mut statement = conn.prepare(
+            "SELECT artifact.id FROM semantic_artifacts artifact
+             WHERE artifact.artifact_type='summary'
+               AND NOT EXISTS(
+                 SELECT 1 FROM semantic_artifacts successor
+                 WHERE successor.supersedes_artifact_id=artifact.id
+               )
+             ORDER BY artifact.id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// One completed card over the shared `fixture` repo, used as the child
+    /// artifact every summary test summarizes.
+    fn seed_card(root: &Path, conn: &rusqlite::Connection) -> Result<ScoutReport> {
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let report = scout_one_card(root, conn, &mut gateway, &card_options())?;
+        assert_eq!(report.status, "completed", "seed card must publish");
+        Ok(report)
+    }
+
+    #[test]
+    fn publishes_a_file_summary_with_pinned_child_relations() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let card = seed_card(repo.path(), &conn)?;
+        let card_id = card.artifact_id.expect("seeded card");
+        let card_fingerprint = artifact_fingerprint(&conn, card_id)?;
+
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the settlement entry point and the terminal helper it calls",
+            &["C1"],
+        )))]);
+        let batch = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+        assert_eq!(batch.reports.len(), 1, "one file scope has one child");
+        assert_eq!(batch.model_calls, 1);
+        let report = &batch.reports[0];
+        assert_eq!(report.status, "completed");
+        assert_eq!(report.kind, "summary");
+        assert_eq!(report.subject, "file:flow.ts");
+        assert_eq!(report.candidate_count, 1, "one cited child");
+        let summary_id = report.artifact_id.expect("published summary");
+
+        let (artifact_type, name, prompt_version, confidence): (String, String, String, String) =
+            conn.query_row(
+                "SELECT artifact_type, canonical_name, prompt_version, confidence
+                 FROM semantic_artifacts WHERE id=?1",
+                [summary_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(artifact_type, "summary");
+        assert_eq!(name, "file:flow.ts");
+        assert_eq!(prompt_version, "summary-scout/v1");
+        assert_eq!(confidence, "likely", "generated claims never exceed likely");
+
+        let relations = relations_of(&conn, summary_id)?;
+        assert_eq!(relations.len(), 1, "one relation per cited child per claim");
+        assert_eq!(
+            relations[0],
+            (
+                "/overview".to_string(),
+                "summarizes".to_string(),
+                card_id,
+                card_fingerprint,
+                "likely".to_string(),
+            ),
+            "the citation is pinned to the child's artifact fingerprint"
+        );
+
+        // A summary's evidence is its children, not source spans.
+        let supports: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_supports WHERE artifact_id=?1",
+            [summary_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supports, 0);
+
+        let config: super::SummaryRunConfig = serde_json::from_str(&conn.query_row(
+            "SELECT config_json FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        assert_eq!(config.level, "file");
+        assert_eq!(config.scope, "file:flow.ts");
+        Ok(())
+    }
+
+    #[test]
+    fn staged_run_builds_module_summaries_from_file_summaries_it_just_published() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
+        let package = repo.path().join("packages/app");
+        std::fs::create_dir_all(package.join("src"))?;
+        std::fs::write(
+            package.join("package.json"),
+            "{\"name\":\"@fixture/app\",\"version\":\"1.0.0\"}\n",
+        )?;
+        std::fs::write(
+            package.join("src/flow.ts"),
+            "export function finish() { return 1; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let mut card_options = card_options();
+        card_options.anchors = vec!["packages/app/src/flow.ts:start".into()];
+        let mut card_gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let card = scout_one_card(repo.path(), &conn, &mut card_gateway, &card_options)?;
+        assert_eq!(card.status, "completed");
+        let card_id = card.artifact_id.expect("seeded card");
+
+        // Two calls: the file summary, then the module summary planned from
+        // the file summary this same invocation just published. The repository
+        // level is planned too but has no budget left, so it never calls.
+        let mut gateway = FakeGateway::new(vec![
+            Ok(summary_outcome(summary_submission(
+                "hosts the package entry point that delegates to its finisher",
+                &["C1"],
+            ))),
+            Ok(summary_outcome(summary_submission(
+                "the app package exposes a single settlement entry point",
+                &["C1"],
+            ))),
+        ]);
+        let batch =
+            super::scout_summaries(repo.path(), &conn, &mut gateway, &summary_options(None, 2))?;
+        assert_eq!(batch.model_calls, 2);
+        assert_eq!(
+            batch.reports.len(),
+            2,
+            "file then module; repository has no budget left"
+        );
+        assert_eq!(batch.skipped_for_call_budget, 1, "the repository scope");
+        assert!(
+            batch
+                .reports
+                .iter()
+                .all(|report| report.status == "completed")
+        );
+        assert_eq!(batch.reports[0].subject, "file:packages/app/src/flow.ts");
+        assert_eq!(batch.reports[1].subject, "module:@fixture/app");
+
+        let file_summary = batch.reports[0].artifact_id.expect("file summary");
+        let module_summary = batch.reports[1].artifact_id.expect("module summary");
+        assert_eq!(
+            relations_of(&conn, file_summary)?
+                .iter()
+                .map(|relation| relation.2)
+                .collect::<Vec<_>>(),
+            vec![card_id]
+        );
+        let module_relations = relations_of(&conn, module_summary)?;
+        assert_eq!(module_relations.len(), 1);
+        assert_eq!(
+            module_relations[0].2, file_summary,
+            "the module summary cites the file summary published in this invocation"
+        );
+        assert_eq!(
+            module_relations[0].3,
+            artifact_fingerprint(&conn, file_summary)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_reuse_survives_unrelated_changes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        seed_card(repo.path(), &conn)?;
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the settlement entry point and the terminal helper it calls",
+            &["C1"],
+        )))]);
+        let first = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+        let summary_id = first.reports[0].artifact_id.expect("published summary");
+
+        // A new file moves the structural snapshot but leaves this scope's
+        // children untouched: the summary fingerprint is snapshot-free, so the
+        // completed run is reused instead of respent.
+        std::fs::write(
+            repo.path().join("unrelated.ts"),
+            "export const noise = 1;\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let mut idle_gateway = FakeGateway::new(Vec::new());
+        let second = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut idle_gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+        assert_eq!(second.reports.len(), 1);
+        assert_eq!(second.reports[0].status, "reused");
+        assert_eq!(second.reports[0].artifact_id, Some(summary_id));
+        assert_eq!(second.model_calls, 0);
+        assert_eq!(idle_gateway.calls, 0);
+        assert_eq!(
+            current_summaries(&conn)?,
+            vec![summary_id],
+            "reuse yields the one current summary, never a duplicate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_publication_loses_the_child_race_without_a_partial_write() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let card = seed_card(repo.path(), &conn)?;
+        let card_id = card.artifact_id.expect("seeded card");
+        let subject = card.subject.clone();
+
+        // Mid-flight the child card is superseded by an agent annotation on a
+        // second connection. The repository itself does not change, so the
+        // snapshot gate passes and the child-currency recheck is what refuses.
+        let root = repo.path().to_path_buf();
+        let db_path = store::db_path(repo.path());
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the settlement entry point and the terminal helper it calls",
+            &["C1"],
+        )))]);
+        gateway.on_complete = Some(Box::new(move || {
+            let racing = store::open_path(&db_path).expect("open racing connection");
+            let snapshot =
+                crate::structural::current_snapshot(&racing).expect("racing current snapshot");
+            crate::semantic::annotate(
+                &root,
+                &racing,
+                &crate::semantic::AnnotateInput {
+                    artifact_type: "card".into(),
+                    name: Some(subject.clone()),
+                    body: json!({ "purpose": "revised entry point for the settlement flow" }),
+                    supports: vec![crate::semantic::SupportInput {
+                        claim_path: "/purpose".into(),
+                        anchor: subject.clone(),
+                        role: None,
+                        evidence_file: "flow.ts".into(),
+                        evidence_start_line: 2,
+                        evidence_end_line: 2,
+                        confidence: "likely".into(),
+                    }],
+                    confidence: "likely".into(),
+                    snapshot,
+                    supersedes: Some(card_id),
+                },
+            )
+            .expect("racing successor card");
+        }));
+
+        let error = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )
+        .expect_err("the cited child stopped being current");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("publication recheck failed")
+                && rendered.contains(&format!("child artifact {card_id} changed")),
+            "unexpected failure: {rendered}"
+        );
+
+        let (status, code): (String, String) = conn.query_row(
+            "SELECT status, error_code FROM scout_runs WHERE scout_kind='summary'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            (status.as_str(), code.as_str()),
+            ("incomplete", "publication_recheck")
+        );
+        let summaries: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_artifacts WHERE artifact_type='summary'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(summaries, 0, "no partial write against a moved child");
+        let relations: i64 =
+            conn.query_row("SELECT count(*) FROM semantic_relations", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(relations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_refresh_replaces_a_child_stale_summary() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let card = seed_card(repo.path(), &conn)?;
+        let card_id = card.artifact_id.expect("seeded card");
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the settlement entry point and the terminal helper it calls",
+            &["C1"],
+        )))]);
+        let first = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+        let summary_id = first.reports[0].artifact_id.expect("published summary");
+        let summary_run = first.reports[0].run_id;
+
+        // The child drifts and is superseded: the summary's pinned fingerprint
+        // no longer names a current artifact, so it stales without its own
+        // text or supports changing.
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 2; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let successor_card = crate::semantic::annotate(
+            repo.path(),
+            &conn,
+            &crate::semantic::AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(card.subject.clone()),
+                body: json!({ "purpose": "revised entry point for the settlement flow" }),
+                supports: vec![crate::semantic::SupportInput {
+                    claim_path: "/purpose".into(),
+                    anchor: card.subject.clone(),
+                    role: None,
+                    evidence_file: "flow.ts".into(),
+                    evidence_start_line: 2,
+                    evidence_end_line: 2,
+                    confidence: "likely".into(),
+                }],
+                confidence: "likely".into(),
+                snapshot: crate::structural::current_snapshot(&conn)?,
+                supersedes: Some(card_id),
+            },
+        )?;
+
+        let selection = super::refresh::select(&conn, &[])?;
+        assert_eq!(
+            selection.targets.len(),
+            1,
+            "only the summary is refreshable"
+        );
+        assert_eq!(selection.targets[0].artifact_id, summary_id);
+        assert_eq!(selection.targets[0].config.kind(), "summary");
+        assert_eq!(selection.targets[0].freshness, "stale");
+
+        let mut refresh_gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the revised settlement entry point and its terminal helper",
+            &["C1"],
+        )))]);
+        let batch = scout_refresh(
+            repo.path(),
+            &conn,
+            &mut refresh_gateway,
+            selection,
+            RequestPolicy::new(30, 1, 240_000)?,
+        )?;
+        assert_eq!(batch.model_calls, 1);
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.reports[0].status, "completed");
+        assert_eq!(batch.reports[0].kind, "summary");
+        let successor = batch.reports[0].artifact_id.expect("refreshed summary");
+
+        let supersedes: Option<i64> = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [successor],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, Some(summary_id));
+        assert_eq!(
+            current_summaries(&conn)?,
+            vec![successor],
+            "the successor is the sole current summary for the scope"
+        );
+        let retired: String = conn.query_row(
+            "SELECT status FROM scout_runs WHERE id=?1",
+            [summary_run],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            retired, "superseded",
+            "superseding a summary retires its generating run"
+        );
+
+        // The replacement is grounded on the child that is current NOW.
+        let relations = relations_of(&conn, successor)?;
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].2, successor_card.id);
+        assert_eq!(
+            relations[0].3,
+            artifact_fingerprint(&conn, successor_card.id)?
+        );
         Ok(())
     }
 }

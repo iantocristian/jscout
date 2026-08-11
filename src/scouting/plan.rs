@@ -797,6 +797,12 @@ fn current_summary_children(
 /// Workspace package names with their repo-relative root prefixes, longest
 /// prefix first so nested packages win ownership.
 fn package_prefixes(root: &Path) -> Vec<(String, String)> {
+    // `WorkspaceMap` canonicalizes package roots and the indexer canonicalizes
+    // the repository root before recording file paths, so the prefix must be
+    // stripped against the canonical root too. Comparing against a raw root
+    // reached through a symlink strips nothing, and every module scope would
+    // silently vanish.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let workspace = crate::workspace::WorkspaceMap::build(root);
     let mut prefixes: Vec<(String, String)> = workspace
         .packages
@@ -804,7 +810,7 @@ fn package_prefixes(root: &Path) -> Vec<(String, String)> {
         .filter_map(|package| {
             let relative = package
                 .canonical_root
-                .strip_prefix(root)
+                .strip_prefix(&canonical_root)
                 .ok()?
                 .to_string_lossy()
                 .into_owned();

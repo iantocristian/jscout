@@ -434,7 +434,7 @@ enum ScoutCommand {
         #[arg(long)]
         gateway_path: Option<PathBuf>,
     },
-    /// Replace stale/degraded generated workflows and cards using their recorded inputs
+    /// Replace stale/degraded generated workflows, cards, and summaries using their recorded inputs
     Refresh {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -1301,7 +1301,7 @@ fn cmd_scout_refresh(
         );
     }
     if selection.targets.is_empty() {
-        println!("no stale or degraded generated workflows or cards to refresh");
+        println!("no stale or degraded generated workflows, cards, or summaries to refresh");
         return Ok(());
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
