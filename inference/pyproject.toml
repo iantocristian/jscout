@@ -1,0 +1,13 @@
+[project]
+name = "jscout-local-inference"
+version = "0.1.0"
+description = "Optional local BGE-M3 embedding and reranking service for jscout"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "sentencepiece>=0.2.0,<0.3",
+  "torch>=2.7,<3",
+  "transformers>=4.51,<5",
+]
+
+[tool.uv]
+package = false

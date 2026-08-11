@@ -53,7 +53,7 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
     );
     indexer::report_failures(&outcome);
     let provider = if embed_on_change {
-        embed::Provider::from_env()
+        embed::Provider::from_env()?
     } else {
         None
     };

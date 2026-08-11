@@ -1,9 +1,26 @@
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
 pub const DB_FILE: &str = ".jscout.db";
+
+static SQLITE_VEC: Once = Once::new();
+
+fn register_sqlite_vec() {
+    SQLITE_VEC.call_once(|| unsafe {
+        let entry = std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::ffi::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::ffi::c_int,
+        >(sqlite_vec::sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(entry));
+    });
+}
 
 /// FTS5 mirror of chunk content. FTS5 tables are not foreign-key aware, so
 /// this table is maintained explicitly alongside `chunks` — and recreated
@@ -28,6 +45,7 @@ pub fn open(root: &Path) -> Result<Connection> {
 /// uses this to give warm and cold sessions isolated semantic-memory state
 /// while both read the same frozen source tree.
 pub fn open_path(path: &Path) -> Result<Connection> {
+    register_sqlite_vec();
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -262,13 +280,32 @@ CREATE INDEX IF NOT EXISTS idx_entity_edges_occurrence
 CREATE INDEX IF NOT EXISTS idx_entity_edges_target
   ON entity_edges(target_key, kind);
 
+CREATE TABLE IF NOT EXISTS embedding_profiles(
+  id INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  config_fingerprint TEXT UNIQUE NOT NULL,
+  dimensions INTEGER NOT NULL,
+  config_json TEXT NOT NULL
+);
+
+-- Content-addressed cache. Multiple chunks with the same hash share these
+-- bytes, while embedding_index_entries materializes each current occurrence.
 CREATE TABLE IF NOT EXISTS embeddings(
   chunk_hash TEXT NOT NULL,
-  model TEXT NOT NULL,
-  dim INTEGER NOT NULL,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
   vec BLOB NOT NULL,
-  PRIMARY KEY (chunk_hash, model)
+  PRIMARY KEY (chunk_hash, profile_id)
 );
+
+CREATE TABLE IF NOT EXISTS embedding_index_entries(
+  id INTEGER PRIMARY KEY,
+  chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  UNIQUE (chunk_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_entries_profile
+  ON embedding_index_entries(profile_id, chunk_id);
 
 CREATE TABLE IF NOT EXISTS graph_nodes(
   node_key TEXT PRIMARY KEY,
@@ -818,8 +855,42 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v15 -> v16: model names are insufficient cache provenance, and Rust's
+    // full-table cosine loop is replaced by sqlite-vec vec0 indexes. Vectors
+    // are a disposable cache, so legacy rows are intentionally not guessed
+    // into a provider/configuration identity.
+    if version < 16 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS embedding_index_entries;
+             DROP TABLE IF EXISTS embeddings;
+             DROP TABLE IF EXISTS embedding_profiles;
+             CREATE TABLE embedding_profiles(
+               id INTEGER PRIMARY KEY,
+               provider TEXT NOT NULL,
+               model TEXT NOT NULL,
+               config_fingerprint TEXT UNIQUE NOT NULL,
+               dimensions INTEGER NOT NULL,
+               config_json TEXT NOT NULL
+             );
+             CREATE TABLE embeddings(
+               chunk_hash TEXT NOT NULL,
+               profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+               vec BLOB NOT NULL,
+               PRIMARY KEY (chunk_hash, profile_id)
+             );
+             CREATE TABLE embedding_index_entries(
+               id INTEGER PRIMARY KEY,
+               chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+               profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+               UNIQUE (chunk_id, profile_id)
+             );
+             CREATE INDEX idx_embedding_entries_profile
+               ON embedding_index_entries(profile_id, chunk_id);",
+        )?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','15')
+        "INSERT INTO meta(key, value) VALUES('schema_version','16')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -965,11 +1036,13 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// memory (scout_runs, scout_classifications, semantic_*), package identity
 /// (package_instances), and the content-addressed embedding cache survive.
 pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
+    crate::embed::clear_vector_rows(conn)?;
     // Children before parents, so foreign-key enforcement only ever checks
     // already-emptied referencing tables. `entities` and the graph tables are
     // disposable projection state rebuilt by the next projection pass.
     conn.execute_batch(
-        "DELETE FROM entity_edges;
+        "DELETE FROM embedding_index_entries;
+         DELETE FROM entity_edges;
          DELETE FROM entity_occurrences;
          DELETE FROM entities;
          DELETE FROM entity_sites;
@@ -994,6 +1067,7 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
 /// FTS rows are removed explicitly since fts5 isn't FK-aware.
 pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
+    crate::embed::delete_vector_rows_for_file(conn, file_id)?;
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
         [file_id],
@@ -1040,7 +1114,7 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::{file_source_path, open, open_path};
+    use super::{DB_FILE, file_source_path, open, open_path};
 
     #[test]
     fn opens_an_index_database_outside_the_repository_root() -> Result<()> {
@@ -1052,8 +1126,47 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         assert!(database.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_v15_embedding_cache_to_profiled_sqlite_vec_storage() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let database = repo.path().join(DB_FILE);
+        let connection = Connection::open(&database)?;
+        connection.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '15');
+             CREATE TABLE embeddings(
+               chunk_hash TEXT NOT NULL,
+               model TEXT NOT NULL,
+               dim INTEGER NOT NULL,
+               vec BLOB NOT NULL,
+               PRIMARY KEY(chunk_hash, model)
+             );
+             INSERT INTO embeddings VALUES('old', 'ambiguous-model', 2, X'00000000');",
+        )?;
+        drop(connection);
+
+        let connection = open(repo.path())?;
+        let version: String = connection.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "16");
+        let legacy_columns: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('embeddings')
+             WHERE name IN ('model', 'dim')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(legacy_columns, 0);
+        let cached: i64 =
+            connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
+        assert_eq!(cached, 0, "legacy model-only provenance is not reusable");
         Ok(())
     }
 
@@ -1104,7 +1217,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -1147,7 +1260,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -1211,7 +1324,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -1240,7 +1353,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -1284,7 +1397,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1334,7 +1447,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1400,7 +1513,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1448,7 +1561,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1496,7 +1609,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
@@ -1550,7 +1663,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
 
         // The backfilled fingerprint equals a recomputation from canonical parts.
         let stored: String = conn.query_row(
@@ -1636,7 +1749,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         assert_eq!(config, "{}");
         Ok(())
     }
@@ -1671,7 +1784,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         // Columns exist with the migration defaults; real values require
         // re-extraction, which the cleared hash forces.
         let (end, end_line, receiver, hash): (i64, i64, Option<String>, String) = conn.query_row(

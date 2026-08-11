@@ -1,4 +1,7 @@
 /target
+.venv/
+__pycache__/
+*.pyc
 .DS_Store
 .jscout.db
 .jscout.db-shm

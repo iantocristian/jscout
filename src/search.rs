@@ -180,31 +180,10 @@ fn vector_ranking(
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
     let t = std::time::Instant::now();
-    let qv = provider.embed_query(q)?;
+    let scored = embed::vector_search(conn, provider, q, limit, file_origins)?;
     if std::env::var_os("JSCOUT_TIMING").is_some() {
-        eprintln!("timing:   embed-query {:?}", t.elapsed());
+        eprintln!("timing:   embed-query+sqlite-vec {:?}", t.elapsed());
     }
-    // Brute-force cosine over all embedded chunks; dedup hash -> best chunk.
-    let mut stmt = conn.prepare(
-        "SELECT c.id, e.vec
-         FROM chunks c
-         JOIN files f ON f.id=c.file_id
-         JOIN embeddings e ON e.chunk_hash=c.hash AND e.model=?1
-         WHERE (?2 AND f.origin='repository')
-            OR (?3 AND f.origin='workspace')
-            OR (?4 AND f.origin='dependency')",
-    )?;
-    let flags = origin_flags(file_origins);
-    let rows = stmt.query_map(
-        rusqlite::params![provider.model, flags.0, flags.1, flags.2],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
-    )?;
-    let mut scored: Vec<(i64, f64)> = rows
-        .filter_map(|r| r.ok())
-        .map(|(id, blob)| (id, embed::cosine(&qv, &embed::blob_to_vec(&blob)) as f64))
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(limit);
     Ok(scored)
 }
 
@@ -217,33 +196,39 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
 }
 
 /// Optional cross-encoder rerank stage (dms-style service:
-/// POST {query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
-/// Configure with JSCOUT_RERANK_URL (e.g. http://127.0.0.1:8792/rerank).
+/// POST {model, query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
+/// Local embeddings use the bundled service automatically; an explicit
+/// JSCOUT_RERANK_URL overrides that endpoint.
 pub struct Reranker {
     url: String,
-    model: Option<String>,
+    model: String,
 }
 
 impl Reranker {
     pub fn from_env() -> Option<Self> {
-        let url = std::env::var("JSCOUT_RERANK_URL").ok()?;
+        let url = std::env::var("JSCOUT_RERANK_URL").ok().or_else(|| {
+            std::env::var("JSCOUT_EMBED_PROVIDER")
+                .ok()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("local"))
+                .then(|| format!("{}/rerank", crate::inference::base_url()))
+        })?;
         Some(Self {
             url,
-            model: std::env::var("JSCOUT_RERANK_MODEL").ok(),
+            model: std::env::var("JSCOUT_RERANK_MODEL")
+                .unwrap_or_else(|_| "BAAI/bge-reranker-v2-m3".to_string()),
         })
     }
 
     fn rerank(&self, query: &str, candidates: &[(i64, String)]) -> Result<Vec<(i64, f64)>> {
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
+            "model": self.model,
             "query": query,
+            "deadline_ms": 120_000,
             "candidates": candidates
                 .iter()
                 .map(|(id, text)| serde_json::json!({ "id": id.to_string(), "text": text }))
                 .collect::<Vec<_>>(),
         });
-        if let Some(m) = &self.model {
-            body["model"] = serde_json::json!(m);
-        }
         let mut resp = ureq::post(&self.url)
             .header("content-type", "application/json")
             .send(body.to_string())?;
@@ -258,6 +243,11 @@ impl Reranker {
                 Some((id, s["score"].as_f64()?))
             })
             .collect();
+        let expected = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+        let returned = out.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+        if out.len() != candidates.len() || returned != expected {
+            anyhow::bail!("reranker did not return every candidate exactly once");
+        }
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(out)
     }
@@ -342,7 +332,7 @@ fn ranked_hits(
             Err(e) => eprintln!("vector search unavailable: {e}"),
         }
         if timing {
-            eprintln!("timing: embed-query+vector-scan {:?}", t.elapsed());
+            eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
         }
     }
     let mut fused = rrf(&rankings, 60.0);
@@ -354,7 +344,8 @@ fn ranked_hits(
         let pool_n: usize = std::env::var("JSCOUT_RERANK_TOP")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
+            .unwrap_or(50)
+            .min(100);
         let max_chars: usize = std::env::var("JSCOUT_RERANK_CHARS")
             .ok()
             .and_then(|v| v.parse().ok())

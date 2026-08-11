@@ -49,7 +49,7 @@ pub fn serve(
         Some(path) => store::open_path(path)?,
         None => store::open(&root)?,
     };
-    let provider = embed::Provider::from_env();
+    let provider = embed::Provider::from_env()?;
     let telemetry_path = telemetry_path
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("JSCOUT_TELEMETRY_FILE").map(PathBuf::from));

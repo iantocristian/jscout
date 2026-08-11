@@ -2011,7 +2011,8 @@ mod tests {
             ("semantic_relations", "SELECT * FROM semantic_relations"),
             (
                 "embeddings",
-                "SELECT chunk_hash, model, dim FROM embeddings",
+                "SELECT e.chunk_hash, p.provider, p.model, p.config_fingerprint, p.dimensions
+                 FROM embeddings e JOIN embedding_profiles p ON p.id=e.profile_id",
             ),
             (
                 "meta",

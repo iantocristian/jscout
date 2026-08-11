@@ -8,6 +8,7 @@ mod file_role;
 mod graph;
 mod heur;
 mod indexer;
+mod inference;
 mod llm;
 mod mcp;
 mod origin;
@@ -67,7 +68,7 @@ enum Command {
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
     },
-    /// Embed chunks that don't have embeddings yet (needs an API key, see README)
+    /// Embed chunks missing from the explicitly configured provider profile
     Embed {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -302,6 +303,11 @@ enum Command {
         #[command(subcommand)]
         command: LlmCommand,
     },
+    /// Optional local embedding and reranking service
+    Inference {
+        #[command(subcommand)]
+        command: InferenceCommand,
+    },
     /// Generative scouting over deterministic candidates (pi-ai gateway)
     Scout {
         #[command(subcommand)]
@@ -431,6 +437,22 @@ enum LlmCommand {
         /// Gateway entry file for development and diagnostics
         #[arg(long)]
         gateway_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InferenceCommand {
+    /// Run the bundled Hugging Face/PyTorch sidecar through uv
+    Serve {
+        /// Directory containing inference/pyproject.toml and service.py
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Check the sidecar and print its effective model configuration
+    Doctor {
+        /// Service base URL; defaults to JSCOUT_INFERENCE_URL or loopback:8792
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -638,6 +660,10 @@ fn main() -> Result<()> {
                 gateway_path,
             } => llm::doctor(model.as_deref(), gateway_path.as_deref()),
         },
+        Command::Inference { command } => match command {
+            InferenceCommand::Serve { project } => inference::serve(project.as_deref()),
+            InferenceCommand::Doctor { url } => inference::doctor(url.as_deref()),
+        },
         Command::Scout { command } => match command {
             ScoutCommand::Workflows {
                 root,
@@ -759,10 +785,9 @@ fn cmd_neighborhood(
 
 fn cmd_embed(root: &Path, batch: usize, file_origins: &[String]) -> Result<()> {
     let conn = store::open(root)?;
-    let Some(provider) = embed::Provider::from_env() else {
+    let Some(provider) = embed::Provider::from_env()? else {
         anyhow::bail!(
-            "no embedding provider configured — set VOYAGE_API_KEY, OPENAI_API_KEY, \
-             or JSCOUT_EMBED_URL (OpenAI-compatible, e.g. Ollama)"
+            "no embedding provider configured — set JSCOUT_EMBED_PROVIDER to local, voyage, or openai"
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
@@ -782,7 +807,7 @@ fn cmd_search(
     let provider = if no_vector {
         None
     } else {
-        embed::Provider::from_env()
+        embed::Provider::from_env()?
     };
     let result = search::search(&conn, provider.as_ref(), query, &options)?;
     if json {
