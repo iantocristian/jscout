@@ -355,11 +355,49 @@ enum ScoutCommand {
         #[arg(long)]
         gateway_path: Option<PathBuf>,
     },
-    /// Replace stale/degraded generated workflows using their recorded inputs
+    /// Evidence-backed cards for selected symbols, one run per subject anchor
+    Cards {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Subject symbol anchors or uniquely resolvable symbol names (repeatable)
+        #[arg(long = "anchor")]
+        anchors: Vec<String>,
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level request budget; required without --anchor
+        #[arg(long)]
+        max_calls: Option<usize>,
+        /// Maximum serialized evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Supersede a completed identical run instead of reusing it
+        #[arg(long)]
+        rebuild: bool,
+        /// Print exact deterministic subjects and evidence budgets; make no model calls
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
+    /// Replace stale/degraded generated workflows and cards using their recorded inputs
     Refresh {
         /// Repository root (must be indexed)
         root: PathBuf,
-        /// Refresh only these current generated workflow artifacts (repeatable)
+        /// Refresh only these current generated artifacts (repeatable)
         #[arg(long = "artifact")]
         artifacts: Vec<i64>,
         /// Per-request wall-clock limit in seconds
@@ -633,6 +671,44 @@ fn main() -> Result<()> {
                         seeds,
                         depth,
                         candidate_limit,
+                        model: llm::config::resolve_model(model.as_deref())?,
+                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        service_tier,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        rebuild,
+                        supersedes_artifact_id: None,
+                    },
+                )
+            }
+            ScoutCommand::Cards {
+                root,
+                anchors,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                max_calls,
+                context_bytes,
+                rebuild,
+                dry_run,
+                database,
+                gateway_path,
+            } => {
+                let max_calls = match max_calls {
+                    Some(value) => value,
+                    None if anchors.is_empty() => {
+                        anyhow::bail!("automatic card scouting requires --max-calls")
+                    }
+                    // One run per explicitly requested subject.
+                    None => anchors.len(),
+                };
+                cmd_scout_cards(
+                    &root,
+                    database.as_deref(),
+                    gateway_path.as_deref(),
+                    dry_run,
+                    scouting::CardScoutOptions {
+                        anchors,
                         model: llm::config::resolve_model(model.as_deref())?,
                         reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
                         service_tier,
@@ -1072,6 +1148,28 @@ fn cmd_scout_workflows(
     Ok(())
 }
 
+fn cmd_scout_cards(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    dry_run: bool,
+    options: scouting::CardScoutOptions,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    let plan = scouting::plan::cards(root, &conn, &options.anchors)?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scouting::card_dry_run_report(&plan, &options)?)?
+        );
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let batch = scouting::scout_card_plan(root, &conn, &mut gateway, &options, plan)?;
+    print_scout_batch(&batch);
+    Ok(())
+}
+
 fn cmd_scout_refresh(
     root: &Path,
     database: Option<&Path>,
@@ -1109,7 +1207,7 @@ fn cmd_scout_refresh(
         );
     }
     if selection.targets.is_empty() {
-        println!("no stale or degraded generated workflows to refresh");
+        println!("no stale or degraded generated workflows or cards to refresh");
         return Ok(());
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
@@ -1118,12 +1216,13 @@ fn cmd_scout_refresh(
     Ok(())
 }
 
-fn print_scout_batch(batch: &scouting::WorkflowBatchReport) {
+fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
     for report in &batch.reports {
         println!(
-            "run {}: {} ({} candidates, billing path {})",
-            report.run_id, report.status, report.candidate_count, report.billing_path
+            "run {} [{}]: {} ({} candidates, billing path {})",
+            report.run_id, report.kind, report.status, report.candidate_count, report.billing_path
         );
+        println!("  subject: {}", report.subject);
         if let Some(started) = &report.started {
             println!(
                 "  model: {}:{} via {} (auth {})",
@@ -1147,7 +1246,7 @@ fn print_scout_batch(batch: &scouting::WorkflowBatchReport) {
         }
     }
     println!(
-        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; over budget: {}; unresolvable: {}; unscoutable seeds: {}",
+        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; over budget: {}; unresolvable: {}; unscoutable subjects: {}",
         batch.model_calls,
         batch.reports.len(),
         batch.duplicate_candidate_sets_skipped,
@@ -1156,8 +1255,8 @@ fn print_scout_batch(batch: &scouting::WorkflowBatchReport) {
         batch.skipped_unresolvable.len(),
         batch.skipped_unscoutable,
     );
-    if batch.auto_seed_limit_reached {
-        println!("automatic seed discovery reached its deterministic limit");
+    if batch.auto_limit_reached {
+        println!("automatic selection reached its deterministic limit");
     }
     for skipped in &batch.skipped_over_budget {
         println!(

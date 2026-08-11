@@ -1,5 +1,6 @@
-//! Deterministic workflow seed discovery and candidate/evidence planning.
-//! Planning never starts the gateway and never makes a model call.
+//! Deterministic subject discovery and candidate/evidence planning for both
+//! scouting kinds. Planning never starts the gateway and never makes a model
+//! call.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -8,11 +9,15 @@ use anyhow::{Result, bail};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use super::card::CardSubject;
 use super::evidence::{self, EvidencePack};
 use crate::semantic::{self, WorkflowCandidateOptions, WorkflowCandidateSet};
-use crate::store;
+use crate::{origin, store, structural};
 
 const AUTO_SEED_LIMIT: usize = 256;
+/// Automatic card selection is capped so a large repository reports a visibly
+/// capped plan instead of silently planning thousands of calls.
+const CARD_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowPlanItem {
@@ -152,10 +157,252 @@ pub fn workflows(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CardPlanItem {
+    pub anchor: String,
+    pub display_name: String,
+    pub file: String,
+    pub sources: Vec<String>,
+    pub declaration_start_line: i64,
+    pub declaration_end_line: i64,
+    /// Depth-1 resolved edges rendered as deterministic context.
+    pub context_edges: usize,
+    pub evidence_bytes: usize,
+    #[serde(skip)]
+    pub(crate) snapshot: String,
+    #[serde(skip)]
+    pub(crate) evidence: EvidencePack,
+}
+
+impl CardPlanItem {
+    pub(crate) fn subject(&self) -> CardSubject {
+        CardSubject {
+            anchor: self.anchor.clone(),
+            display_name: self.display_name.clone(),
+            file: self.file.clone(),
+            declaration_start_line: self.declaration_start_line,
+            declaration_end_line: self.declaration_end_line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CardPlanSkip {
+    pub anchor: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CardPlan {
+    pub mode: String,
+    pub snapshot: String,
+    pub items: Vec<CardPlanItem>,
+    pub skipped: Vec<CardPlanSkip>,
+    pub anchor_limit: Option<usize>,
+    pub anchor_limit_reached: bool,
+    /// Automatic mode: subjects discovered before the limit was applied, so a
+    /// capped plan is visibly capped.
+    pub anchors_discovered: Option<usize>,
+    pub sources: BTreeMap<String, usize>,
+}
+
+/// Build exact card subjects and their bounded evidence. Explicit anchors are
+/// resolved like workflow seeds and each becomes its own run; automatic mode
+/// selects exported symbols, runtime boundary endpoints, and participants of
+/// current published workflows.
+pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Result<CardPlan> {
+    store::with_read_snapshot(conn, "jscout_card_plan", || {
+        let (mode, selected, limit_reached, discovered_count) = if explicit_anchors.is_empty() {
+            let discovered = automatic_card_subjects(conn)?;
+            let discovered_count = discovered.len();
+            (
+                "automatic",
+                discovered.into_iter().take(CARD_LIMIT).collect::<Vec<_>>(),
+                discovered_count > CARD_LIMIT,
+                Some(discovered_count),
+            )
+        } else {
+            let mut resolved = explicit_anchors
+                .iter()
+                .map(|anchor| {
+                    structural::resolve_current_anchor_in_origins(conn, anchor, &origin::defaults())
+                        .map(|resolved| (resolved, vec!["agent-supplied".to_string()]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            resolved.sort();
+            resolved.dedup_by(|left, right| left.0 == right.0);
+            ("explicit", resolved, false, None)
+        };
+        if selected.is_empty() {
+            bail!("no deterministic card subjects were found; pass --anchor with a symbol anchor");
+        }
+
+        let snapshot = structural::current_snapshot(conn)?;
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        let mut sources = BTreeMap::new();
+        for (anchor, anchor_sources) in selected {
+            let Some(subject) = semantic::symbol_candidate(root, conn, &anchor)? else {
+                if mode == "explicit" {
+                    bail!(
+                        "anchor `{anchor}` is not a file-backed symbol in the current snapshot; \
+                         cards describe symbols"
+                    );
+                }
+                skipped.push(CardPlanSkip {
+                    anchor,
+                    reason: "not a file-backed symbol in the current snapshot".into(),
+                });
+                continue;
+            };
+            let mut evidence =
+                evidence::build_titled(root, conn, std::slice::from_ref(&subject), "Subject")?;
+            let (context, context_edges) = evidence::structural_context(conn, &anchor)?;
+            evidence.rendered.push_str(&context);
+            for source in &anchor_sources {
+                *sources.entry(source.clone()).or_insert(0) += 1;
+            }
+            items.push(CardPlanItem {
+                anchor,
+                display_name: subject.display_name,
+                file: subject.file,
+                sources: anchor_sources,
+                declaration_start_line: subject.evidence_start_line,
+                declaration_end_line: subject.evidence_end_line,
+                context_edges,
+                evidence_bytes: evidence.rendered.len(),
+                snapshot: snapshot.clone(),
+                evidence,
+            });
+        }
+
+        Ok(CardPlan {
+            mode: mode.into(),
+            snapshot,
+            items,
+            skipped,
+            anchor_limit: (mode == "automatic").then_some(CARD_LIMIT),
+            anchor_limit_reached: limit_reached,
+            anchors_discovered: discovered_count,
+            sources,
+        })
+    })
+}
+
+/// Union of the three deterministic card sources, deduped by anchor. Runtime
+/// boundary endpoints rank first, then workflow participants, so a capped
+/// plan keeps the symbols with the most established meaning.
+fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut subjects = runtime_boundary_endpoints(conn)?;
+    let mut statement = conn.prepare(
+        "SELECT node.node_key
+         FROM graph_nodes node
+         JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
+         JOIN files file ON file.id=node.file_id
+         WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
+           AND file.role='production' AND file.origin IN ('repository','workspace')
+         ORDER BY node.node_key",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        subjects
+            .entry(row?)
+            .or_default()
+            .push("exported-symbol".into());
+    }
+
+    // Participants of current published workflows already carry established
+    // meaning; a card gives each participant its own evidence-backed record.
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT support.anchor_key
+         FROM semantic_supports support
+         JOIN semantic_artifacts artifact ON artifact.id=support.artifact_id
+         WHERE artifact.artifact_type='workflow'
+           AND support.claim_path LIKE '/participants/%/role'
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )
+         ORDER BY support.anchor_key",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        subjects
+            .entry(row?)
+            .or_default()
+            .push("workflow-participant".into());
+    }
+
+    for sources in subjects.values_mut() {
+        sources.sort();
+        sources.dedup();
+    }
+    let mut subjects = subjects.into_iter().collect::<Vec<_>>();
+    subjects.sort_by(|left, right| {
+        card_priority(&left.1)
+            .cmp(&card_priority(&right.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(subjects)
+}
+
+fn card_priority(sources: &[String]) -> u8 {
+    if sources.iter().any(|source| source.starts_with("runtime:")) {
+        0
+    } else if sources
+        .iter()
+        .any(|source| source == "workflow-participant")
+    {
+        1
+    } else {
+        2
+    }
+}
+
 /// Prefer actual runtime boundary endpoints. Exported symbols are included
 /// only from conventional package/application entry files so a repository
 /// with thousands of exports does not turn every utility into a workflow.
 fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut seeds = runtime_boundary_endpoints(conn)?;
+    let mut statement = conn.prepare(
+        "SELECT node.node_key, file.path
+         FROM graph_nodes node
+         JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
+         JOIN files file ON file.id=node.file_id
+         WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
+           AND file.role='production' AND file.origin IN ('repository','workspace')
+         ORDER BY node.node_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let manifest_entries = crate::workspace::package_entry_paths(root);
+    for row in rows {
+        let (anchor, path) = row?;
+        if manifest_entries.binary_search(&path).is_ok() || is_entry_file(&path) {
+            seeds
+                .entry(anchor)
+                .or_default()
+                .push("exported-entry-point".into());
+        }
+    }
+
+    for sources in seeds.values_mut() {
+        sources.sort();
+        sources.dedup();
+    }
+    let mut seeds = seeds.into_iter().collect::<Vec<_>>();
+    seeds.sort_by(|left, right| {
+        seed_priority(&left.1)
+            .cmp(&seed_priority(&right.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(seeds)
+}
+
+/// Production symbols on a runtime boundary edge, labelled with the edge kind
+/// that put them there. Shared by workflow seeding and card selection.
+fn runtime_boundary_endpoints(conn: &Connection) -> Result<BTreeMap<String, Vec<String>>> {
     let inbound = [
         "handles_route",
         "handles_graphql",
@@ -226,40 +473,6 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
             sources.push(source);
         }
     }
-
-    let mut statement = conn.prepare(
-        "SELECT node.node_key, file.path
-         FROM graph_nodes node
-         JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
-         JOIN files file ON file.id=node.file_id
-         WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
-           AND file.role='production' AND file.origin IN ('repository','workspace')
-         ORDER BY node.node_key",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let manifest_entries = crate::workspace::package_entry_paths(root);
-    for row in rows {
-        let (anchor, path) = row?;
-        if manifest_entries.binary_search(&path).is_ok() || is_entry_file(&path) {
-            seeds
-                .entry(anchor)
-                .or_default()
-                .push("exported-entry-point".into());
-        }
-    }
-
-    for sources in seeds.values_mut() {
-        sources.sort();
-        sources.dedup();
-    }
-    let mut seeds = seeds.into_iter().collect::<Vec<_>>();
-    seeds.sort_by(|left, right| {
-        seed_priority(&left.1)
-            .cmp(&seed_priority(&right.1))
-            .then_with(|| left.0.cmp(&right.0))
-    });
     Ok(seeds)
 }
 
@@ -442,6 +655,139 @@ mod tests {
         assert_eq!(seeds[1].1, ["runtime:dispatches"]);
         assert_eq!(seeds[2].0, "sym:runtime.ts#::inject@3");
         assert_eq!(seeds[2].1, ["runtime:injects"]);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_card_selection_unions_its_sources_deterministically() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("index.ts"),
+            "export function first() { return helper(); }\n\
+             function helper() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let first = super::cards(repo.path(), &conn, &[])?;
+        let second = super::cards(repo.path(), &conn, &[])?;
+        assert_eq!(
+            serde_json::to_value(&first)?,
+            serde_json::to_value(&second)?,
+            "card planning must be deterministic"
+        );
+        assert_eq!(first.mode, "automatic");
+        assert_eq!(first.items.len(), 1, "only exported symbols are subjects");
+        assert_eq!(first.items[0].sources, ["exported-symbol"]);
+        assert_eq!(first.sources["exported-symbol"], 1);
+        assert_eq!(first.anchors_discovered, Some(1));
+        assert!(!first.anchor_limit_reached);
+        assert!(
+            first.items[0].evidence.rendered.contains("## Subject"),
+            "a card pack leads with its subject, not a candidate set"
+        );
+        assert!(
+            first.items[0]
+                .evidence
+                .rendered
+                .contains("## Direct structural context"),
+        );
+        assert!(first.items[0].context_edges > 0, "helper call is depth-1");
+
+        // A published workflow participant becomes a card subject even when it
+        // is not exported.
+        let helper = "sym:index.ts#::helper@1";
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        conn.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type,canonical_name,body_json,model,prompt_version,confidence,
+               source_snapshot,created_at
+             ) VALUES('workflow','flow','{\"participants\":[{\"role\":\"helper\"}]}',
+                      'agent-reported','annotate/v2','likely',?1,'2026-08-10T00:00:00Z')",
+            params![snapshot],
+        )?;
+        let artifact_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO semantic_supports(
+               artifact_id,claim_path,anchor_key,evidence_file,evidence_start_line,
+               evidence_end_line,source_hash,context_hash,confidence
+             ) VALUES(?1,'/participants/0/role',?2,'index.ts',2,2,'h','c','likely')",
+            params![artifact_id, helper],
+        )?;
+        let widened = super::cards(repo.path(), &conn, &[])?;
+        assert_eq!(widened.items.len(), 2);
+        let participant = widened
+            .items
+            .iter()
+            .find(|item| item.anchor == helper)
+            .expect("participant subject");
+        assert_eq!(participant.sources, ["workflow-participant"]);
+        assert_eq!(
+            widened.items[0].anchor, helper,
+            "workflow participants outrank plain exports in a capped plan"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_card_selection_reports_its_cap() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let mut source = String::new();
+        for index in 0..super::CARD_LIMIT + 4 {
+            source.push_str(&format!(
+                "export function symbol{index}() {{ return {index}; }}\n"
+            ));
+        }
+        std::fs::write(repo.path().join("index.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let plan = super::cards(repo.path(), &conn, &[])?;
+        assert_eq!(plan.anchors_discovered, Some(super::CARD_LIMIT + 4));
+        assert_eq!(plan.anchor_limit, Some(super::CARD_LIMIT));
+        assert!(plan.anchor_limit_reached);
+        assert_eq!(plan.items.len(), super::CARD_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_card_anchors_resolve_uniquely_or_fail_loudly() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("index.ts"),
+            "export function only() { return 1; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("other.ts"),
+            "export function shared() { return 1; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("second.ts"),
+            "export function shared() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let plan = super::cards(repo.path(), &conn, &["index.ts:only".into()])?;
+        assert_eq!(plan.mode, "explicit");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].sources, ["agent-supplied"]);
+        assert_eq!(plan.items[0].file, "index.ts");
+
+        // Repeating one anchor still spends one run.
+        let repeated = super::cards(
+            repo.path(),
+            &conn,
+            &["index.ts:only".into(), "index.ts:only".into()],
+        )?;
+        assert_eq!(repeated.items.len(), 1);
+
+        let error =
+            super::cards(repo.path(), &conn, &["shared".into()]).expect_err("ambiguous anchor");
+        assert!(error.to_string().contains("ambiguous"));
+        let error = super::cards(repo.path(), &conn, &["file:index.ts".into()])
+            .expect_err("file anchors are not card subjects");
+        assert!(error.to_string().contains("not a file-backed symbol"));
         Ok(())
     }
 }

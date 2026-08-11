@@ -5,6 +5,7 @@
 //! never create semantic artifacts. The model cannot add anchors: candidate
 //! expansion is a Rust change, not model improvisation.
 
+pub mod card;
 pub mod evidence;
 pub mod ledger;
 pub mod plan;
@@ -59,7 +60,32 @@ pub struct WorkflowRunConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkflowScoutReport {
+pub struct CardScoutOptions {
+    pub anchors: Vec<String>,
+    pub model: ModelSpec,
+    pub reasoning: Option<String>,
+    pub service_tier: Option<String>,
+    pub policy: RequestPolicy,
+    pub rebuild: bool,
+    pub supersedes_artifact_id: Option<i64>,
+}
+
+/// Replay configuration for one card run. The subject anchor is the whole
+/// deterministic input; evidence follows from it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardRunConfig {
+    pub anchor: String,
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+/// One scouting run of either kind. `candidate_count` is the deterministic
+/// input size: workflow candidates, or one card subject.
+#[derive(Debug, Clone)]
+pub struct ScoutReport {
+    pub kind: String,
+    pub subject: String,
     pub run_id: i64,
     pub status: String,
     /// Gateway-resolved provider/model/api/auth identity for completed calls.
@@ -72,20 +98,20 @@ pub struct WorkflowScoutReport {
     pub incomplete_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct WorkflowBatchReport {
-    pub reports: Vec<WorkflowScoutReport>,
+#[derive(Debug, Clone, Default)]
+pub struct ScoutBatchReport {
+    pub reports: Vec<ScoutReport>,
     pub model_calls: usize,
     pub skipped_for_call_budget: usize,
     pub skipped_unscoutable: usize,
     pub duplicate_candidate_sets_skipped: usize,
-    pub auto_seed_limit_reached: bool,
-    pub skipped_over_budget: Vec<WorkflowBatchSkip>,
-    pub skipped_unresolvable: Vec<WorkflowBatchSkip>,
+    pub auto_limit_reached: bool,
+    pub skipped_over_budget: Vec<BatchSkip>,
+    pub skipped_unresolvable: Vec<BatchSkip>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct WorkflowBatchSkip {
+pub struct BatchSkip {
     pub subject: String,
     pub reason: String,
 }
@@ -94,15 +120,19 @@ pub struct WorkflowBatchSkip {
 pub struct RefreshPlanItem {
     pub artifact_id: i64,
     pub freshness: String,
+    pub kind: String,
     pub model: String,
     pub reasoning: Option<String>,
-    pub workflow: plan::WorkflowPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<plan::WorkflowPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<plan::CardPlan>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RefreshPlanningReport {
     pub plans: Vec<RefreshPlanItem>,
-    pub skipped_unresolvable: Vec<WorkflowBatchSkip>,
+    pub skipped_unresolvable: Vec<BatchSkip>,
 }
 
 struct PreparedWorkflow {
@@ -110,6 +140,21 @@ struct PreparedWorkflow {
     evidence: EvidencePack,
     request: CompleteRequest,
     spec: RunSpec,
+}
+
+struct PreparedCard {
+    subject: card::CardSubject,
+    snapshot: String,
+    evidence: EvidencePack,
+    request: CompleteRequest,
+    spec: RunSpec,
+}
+
+/// One prepared refresh of either kind, so a mixed selection keeps one
+/// command-level call budget and one execution order.
+enum PreparedRefresh {
+    Workflow(Box<WorkflowScoutOptions>, Box<PreparedWorkflow>),
+    Card(Box<CardScoutOptions>, Box<PreparedCard>),
 }
 
 #[derive(Default)]
@@ -172,6 +217,19 @@ impl fmt::Display for ContextBudgetExceeded {
 
 impl std::error::Error for ContextBudgetExceeded {}
 
+/// A recorded refresh input that no longer resolves. Reported and skipped so
+/// one deleted subject cannot block the rest of the batch.
+#[derive(Debug)]
+struct UnresolvableRefresh(String);
+
+impl fmt::Display for UnresolvableRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnresolvableRefresh {}
+
 /// One candidate-closed workflow scouting run for an explicit seed set.
 #[cfg(test)]
 pub fn scout_workflows(
@@ -179,7 +237,7 @@ pub fn scout_workflows(
     conn: &Connection,
     gateway: &mut dyn LlmGateway,
     options: &WorkflowScoutOptions,
-) -> Result<WorkflowScoutReport> {
+) -> Result<ScoutReport> {
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let mut plan = plan::workflows(
         root,
@@ -208,7 +266,7 @@ pub fn scout_workflow_plan(
     gateway: &mut dyn LlmGateway,
     options: &WorkflowScoutOptions,
     plan: plan::WorkflowPlan,
-) -> Result<WorkflowBatchReport> {
+) -> Result<ScoutBatchReport> {
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let skipped_unscoutable = plan.skipped.len();
     let duplicate_candidate_sets_skipped = plan.duplicate_candidate_sets_skipped;
@@ -222,7 +280,7 @@ pub fn scout_workflow_plan(
         match prepare_workflow(gateway, &mut cache, item, options) {
             Ok(workflow) => prepared.push(workflow),
             Err(error) if automatic && error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
-                skipped_over_budget.push(WorkflowBatchSkip {
+                skipped_over_budget.push(BatchSkip {
                     subject,
                     reason: error.to_string(),
                 });
@@ -252,15 +310,77 @@ pub fn scout_workflow_plan(
         }
         reports.push(report);
     }
-    Ok(WorkflowBatchReport {
+    Ok(ScoutBatchReport {
         reports,
         model_calls,
         skipped_for_call_budget: skipped,
         skipped_unscoutable,
         duplicate_candidate_sets_skipped,
-        auto_seed_limit_reached,
+        auto_limit_reached: auto_seed_limit_reached,
         skipped_over_budget,
         skipped_unresolvable: Vec::new(),
+    })
+}
+
+/// Execute a precomputed card plan: one run per subject anchor. Reuse is
+/// checked before the call budget, exactly as for workflows.
+pub fn scout_card_plan(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    options: &CardScoutOptions,
+    plan: plan::CardPlan,
+) -> Result<ScoutBatchReport> {
+    ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
+    let skipped_unselectable = plan.skipped.len();
+    let anchor_limit_reached = plan.anchor_limit_reached;
+    let automatic = plan.mode == "automatic";
+    let mut cache = PreparationCache::default();
+    let mut prepared = Vec::new();
+    let mut skipped_over_budget = Vec::new();
+    for item in plan.items {
+        let subject = item.anchor.clone();
+        match prepare_card(gateway, &mut cache, item, options) {
+            Ok(card) => prepared.push(card),
+            Err(error) if automatic && error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+                skipped_over_budget.push(BatchSkip {
+                    subject,
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut reports = Vec::new();
+    let mut model_calls = 0;
+    let mut skipped = 0;
+    for prepared in prepared {
+        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+        if !reusable && model_calls >= options.policy.max_calls {
+            skipped += 1;
+            continue;
+        }
+        let report = execute_prepared_card(
+            root,
+            conn,
+            gateway,
+            options,
+            prepared,
+            model_calls < options.policy.max_calls,
+        )?;
+        if report.status != "reused" {
+            model_calls += 1;
+        }
+        reports.push(report);
+    }
+    Ok(ScoutBatchReport {
+        reports,
+        model_calls,
+        skipped_for_call_budget: skipped,
+        skipped_unscoutable: skipped_unselectable,
+        auto_limit_reached: anchor_limit_reached,
+        skipped_over_budget,
+        ..ScoutBatchReport::default()
     })
 }
 
@@ -314,6 +434,48 @@ pub fn dry_run_report(
     }))
 }
 
+/// The card equivalent of `dry_run_report`: same request construction and
+/// byte arithmetic as execution, no gateway, no model call, no ledger row.
+pub fn card_dry_run_report(
+    plan: &plan::CardPlan,
+    options: &CardScoutOptions,
+) -> Result<serde_json::Value> {
+    let mut annotated = serde_json::to_value(plan)?;
+    let mut eligible = 0_usize;
+    let mut over_budget = 0_usize;
+    if let Some(items) = annotated
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (rendered, item) in items.iter_mut().zip(&plan.items) {
+            let mut request = build_card_request(&item.subject(), &item.evidence, options)?;
+            let (_, request_bytes) = reserve_output_and_measure(&mut request, 1, None)?;
+            let over = request_bytes > options.policy.context_bytes;
+            let would_call = !over && eligible < options.policy.max_calls;
+            if over {
+                over_budget += 1;
+            } else {
+                eligible += 1;
+            }
+            rendered["request_bytes"] = request_bytes.into();
+            rendered["over_context_bytes"] = over.into();
+            rendered["would_call"] = would_call.into();
+        }
+    }
+    Ok(serde_json::json!({
+        "dry_run": true,
+        "max_calls": options.policy.max_calls,
+        "context_bytes": options.policy.context_bytes,
+        "calls_planned": eligible.min(options.policy.max_calls),
+        "over_context_bytes_items": over_budget,
+        "notes": [
+            "completed matching runs are reused at execution time without consuming --max-calls; later would_call:false items may still run",
+            "the model context-window check needs the gateway and runs at execution time; over_context_bytes covers --context-bytes only",
+        ],
+        "plan": annotated,
+    }))
+}
+
 /// Materialize exact replacement inputs without starting the gateway.
 pub fn plan_refresh(
     root: &Path,
@@ -323,21 +485,39 @@ pub fn plan_refresh(
     let mut plans = Vec::new();
     let mut skipped_unresolvable = Vec::new();
     for target in &selection.targets {
-        match plan::workflows(
-            root,
-            conn,
-            &target.config.seeds,
-            target.config.depth,
-            target.config.candidate_limit,
-        ) {
-            Ok(workflow) => plans.push(RefreshPlanItem {
-                artifact_id: target.artifact_id,
-                freshness: target.freshness.clone(),
-                model: target.model.spec.clone(),
-                reasoning: target.reasoning.clone(),
-                workflow,
+        let item = RefreshPlanItem {
+            artifact_id: target.artifact_id,
+            freshness: target.freshness.clone(),
+            kind: target.config.kind().into(),
+            model: target.model.spec.clone(),
+            reasoning: target.reasoning.clone(),
+            workflow: None,
+            card: None,
+        };
+        let planned = match &target.config {
+            refresh::RefreshConfig::Workflow(config) => plan::workflows(
+                root,
+                conn,
+                &config.seeds,
+                config.depth,
+                config.candidate_limit,
+            )
+            .map(|workflow| RefreshPlanItem {
+                workflow: Some(workflow),
+                ..item.clone()
             }),
-            Err(error) => skipped_unresolvable.push(WorkflowBatchSkip {
+            refresh::RefreshConfig::Card(config) => {
+                plan::cards(root, conn, std::slice::from_ref(&config.anchor)).map(|card| {
+                    RefreshPlanItem {
+                        card: Some(card),
+                        ..item.clone()
+                    }
+                })
+            }
+        };
+        match planned {
+            Ok(planned) => plans.push(planned),
+            Err(error) => skipped_unresolvable.push(BatchSkip {
                 subject: format!("artifact {}", target.artifact_id),
                 reason: error.to_string(),
             }),
@@ -349,15 +529,17 @@ pub fn plan_refresh(
     })
 }
 
-/// Refresh stale/degraded generated workflows under one strict command-level
-/// call budget while retaining each run's original model and configuration.
+/// Refresh stale/degraded generated workflows and cards under one strict
+/// command-level call budget while retaining each run's original model and
+/// configuration. Selection order (artifact id) is the execution order, so a
+/// mixed selection spends the budget predictably.
 pub fn scout_refresh(
     root: &Path,
     conn: &Connection,
     gateway: &mut dyn LlmGateway,
     selection: refresh::RefreshSelection,
     policy: RequestPolicy,
-) -> Result<WorkflowBatchReport> {
+) -> Result<ScoutBatchReport> {
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let mut prepared = Vec::new();
     let mut skipped_unresolvable = Vec::new();
@@ -365,46 +547,46 @@ pub fn scout_refresh(
     let mut cache = PreparationCache::default();
     for target in selection.targets {
         let artifact_id = target.artifact_id;
-        let workflow_plan = plan::workflows(
-            root,
-            conn,
-            &target.config.seeds,
-            target.config.depth,
-            target.config.candidate_limit,
-        );
-        let mut workflow_plan = match workflow_plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                skipped_unresolvable.push(WorkflowBatchSkip {
-                    subject: format!("artifact {artifact_id}"),
+        let subject = format!("artifact {artifact_id}");
+        let outcome = match target.config {
+            refresh::RefreshConfig::Workflow(config) => prepare_workflow_refresh(
+                root,
+                conn,
+                gateway,
+                &mut cache,
+                artifact_id,
+                config,
+                target.model,
+                target.reasoning,
+                &policy,
+            ),
+            refresh::RefreshConfig::Card(config) => prepare_card_refresh(
+                root,
+                conn,
+                gateway,
+                &mut cache,
+                artifact_id,
+                config,
+                target.model,
+                target.reasoning,
+                &policy,
+            ),
+        };
+        match outcome {
+            Ok(Some(item)) => prepared.push(item),
+            Ok(None) => skipped_unresolvable.push(BatchSkip {
+                subject,
+                reason: "did not reconstruct exactly one deterministic input".into(),
+            }),
+            Err(error) if error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+                skipped_over_budget.push(BatchSkip {
+                    subject,
                     reason: error.to_string(),
                 });
-                continue;
             }
-        };
-        if workflow_plan.items.len() != 1 {
-            skipped_unresolvable.push(WorkflowBatchSkip {
-                subject: format!("artifact {artifact_id}"),
-                reason: "did not reconstruct one seed group".into(),
-            });
-            continue;
-        }
-        let options = WorkflowScoutOptions {
-            seeds: target.config.seeds,
-            depth: target.config.depth,
-            candidate_limit: target.config.candidate_limit,
-            model: target.model,
-            reasoning: target.reasoning,
-            service_tier: target.config.service_tier,
-            policy: policy.clone(),
-            rebuild: false,
-            supersedes_artifact_id: Some(artifact_id),
-        };
-        match prepare_workflow(gateway, &mut cache, workflow_plan.items.remove(0), &options) {
-            Ok(workflow) => prepared.push((options, workflow)),
-            Err(error) if error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
-                skipped_over_budget.push(WorkflowBatchSkip {
-                    subject: format!("artifact {artifact_id}"),
+            Err(error) if error.downcast_ref::<UnresolvableRefresh>().is_some() => {
+                skipped_unresolvable.push(BatchSkip {
+                    subject,
                     reason: error.to_string(),
                 });
             }
@@ -415,35 +597,112 @@ pub fn scout_refresh(
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
-    for (options, prepared) in prepared {
-        let reusable = ledger::reusable_run(conn, &prepared.spec)?.is_some();
+    for prepared in prepared {
+        let spec = match &prepared {
+            PreparedRefresh::Workflow(_, workflow) => &workflow.spec,
+            PreparedRefresh::Card(_, card) => &card.spec,
+        };
+        let reusable = ledger::reusable_run(conn, spec)?.is_some();
         if !reusable && model_calls >= policy.max_calls {
             skipped += 1;
             continue;
         }
-        let report = execute_prepared_workflow(
-            root,
-            conn,
-            gateway,
-            &options,
-            prepared,
-            model_calls < policy.max_calls,
-        )?;
+        let allow_new_call = model_calls < policy.max_calls;
+        let report = match prepared {
+            PreparedRefresh::Workflow(options, workflow) => {
+                execute_prepared_workflow(root, conn, gateway, &options, *workflow, allow_new_call)?
+            }
+            PreparedRefresh::Card(options, card) => {
+                execute_prepared_card(root, conn, gateway, &options, *card, allow_new_call)?
+            }
+        };
         if report.status != "reused" {
             model_calls += 1;
         }
         reports.push(report);
     }
-    Ok(WorkflowBatchReport {
+    Ok(ScoutBatchReport {
         reports,
         model_calls,
         skipped_for_call_budget: skipped,
-        skipped_unscoutable: 0,
-        duplicate_candidate_sets_skipped: 0,
-        auto_seed_limit_reached: false,
         skipped_over_budget,
         skipped_unresolvable,
+        ..ScoutBatchReport::default()
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_workflow_refresh(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
+    artifact_id: i64,
+    config: WorkflowRunConfig,
+    model: ModelSpec,
+    reasoning: Option<String>,
+    policy: &RequestPolicy,
+) -> Result<Option<PreparedRefresh>> {
+    let mut plan = plan::workflows(
+        root,
+        conn,
+        &config.seeds,
+        config.depth,
+        config.candidate_limit,
+    )
+    .map_err(|error| anyhow::Error::from(UnresolvableRefresh(error.to_string())))?;
+    if plan.items.len() != 1 {
+        return Ok(None);
+    }
+    let options = WorkflowScoutOptions {
+        seeds: config.seeds,
+        depth: config.depth,
+        candidate_limit: config.candidate_limit,
+        model,
+        reasoning,
+        service_tier: config.service_tier,
+        policy: policy.clone(),
+        rebuild: false,
+        supersedes_artifact_id: Some(artifact_id),
+    };
+    let prepared = prepare_workflow(gateway, cache, plan.items.remove(0), &options)?;
+    Ok(Some(PreparedRefresh::Workflow(
+        Box::new(options),
+        Box::new(prepared),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_card_refresh(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
+    artifact_id: i64,
+    config: CardRunConfig,
+    model: ModelSpec,
+    reasoning: Option<String>,
+    policy: &RequestPolicy,
+) -> Result<Option<PreparedRefresh>> {
+    let mut plan = plan::cards(root, conn, std::slice::from_ref(&config.anchor))
+        .map_err(|error| anyhow::Error::from(UnresolvableRefresh(error.to_string())))?;
+    if plan.items.len() != 1 {
+        return Ok(None);
+    }
+    let options = CardScoutOptions {
+        anchors: vec![config.anchor],
+        model,
+        reasoning,
+        service_tier: config.service_tier,
+        policy: policy.clone(),
+        rebuild: false,
+        supersedes_artifact_id: Some(artifact_id),
+    };
+    let prepared = prepare_card(gateway, cache, plan.items.remove(0), &options)?;
+    Ok(Some(PreparedRefresh::Card(
+        Box::new(options),
+        Box::new(prepared),
+    )))
 }
 
 fn prepare_workflow(
@@ -459,9 +718,10 @@ fn prepare_workflow(
     enforce_context_budget(
         &capabilities,
         &mut request,
-        &evidence,
+        evidence.files.len(),
         candidate_set.candidates.len(),
-        options,
+        &options.policy,
+        &options.model.spec,
     )?;
 
     let input_fingerprint = input_fingerprint(
@@ -510,7 +770,7 @@ fn execute_prepared_workflow(
     options: &WorkflowScoutOptions,
     prepared: PreparedWorkflow,
     allow_new_call: bool,
-) -> Result<WorkflowScoutReport> {
+) -> Result<ScoutReport> {
     let PreparedWorkflow {
         candidate_set,
         evidence,
@@ -715,6 +975,309 @@ fn execute_prepared_workflow(
     ))
 }
 
+fn prepare_card(
+    gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
+    item: plan::CardPlanItem,
+    options: &CardScoutOptions,
+) -> Result<PreparedCard> {
+    let subject = item.subject();
+    let snapshot = item.snapshot;
+    let evidence = item.evidence;
+    let mut request = build_card_request(&subject, &evidence, options)?;
+    let capabilities = cache.model(gateway, &options.model)?;
+    enforce_context_budget(
+        &capabilities,
+        &mut request,
+        evidence.files.len(),
+        1,
+        &options.policy,
+        &options.model.spec,
+    )?;
+
+    let input_fingerprint = card_input_fingerprint(
+        &subject,
+        &snapshot,
+        &evidence,
+        &request,
+        options,
+        capabilities.base_url.as_deref(),
+    );
+    let request_hash = blake3::hash(serde_json::to_string(&request)?.as_bytes())
+        .to_hex()
+        .to_string();
+    let config_json = serde_json::to_string(&CardRunConfig {
+        anchor: subject.anchor.clone(),
+        service_tier: options.service_tier.clone(),
+        base_url: capabilities.base_url.clone(),
+    })?;
+    let spec = RunSpec {
+        scout_kind: "card".into(),
+        gateway_protocol: PROTOCOL_VERSION,
+        provider: options.model.provider.clone(),
+        model: options.model.model_id.clone(),
+        billing_path: cache.billing_path(gateway, &options.model)?,
+        reasoning: options.reasoning.clone(),
+        prompt_version: card::PROMPT_VERSION.into(),
+        source_snapshot: snapshot.clone(),
+        input_fingerprint,
+        request_hash,
+        config_json,
+        supersedes_artifact_id: options.supersedes_artifact_id,
+    };
+    Ok(PreparedCard {
+        subject,
+        snapshot,
+        evidence,
+        request,
+        spec,
+    })
+}
+
+fn execute_prepared_card(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    options: &CardScoutOptions,
+    prepared: PreparedCard,
+    allow_new_call: bool,
+) -> Result<ScoutReport> {
+    let PreparedCard {
+        subject,
+        snapshot,
+        evidence,
+        request,
+        spec,
+    } = prepared;
+    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
+        bail!("card call budget exhausted before a non-reusable run");
+    }
+    let input_fingerprint = spec.input_fingerprint.clone();
+    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
+        RunClaim::Reused(run_id) => return card_reuse_report(conn, run_id, &subject, &spec),
+        RunClaim::Claimed {
+            run_id,
+            supersedes_artifact_id,
+        } => (run_id, supersedes_artifact_id),
+    };
+
+    let outcome = match gateway.complete(&request, options.policy.timeout) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (status, code) = match &error {
+                GatewayError::Canceled(_) => (RunOutcome::Canceled, error.code()),
+                other => (RunOutcome::Failed, other.code()),
+            };
+            ledger::finish_run(conn, run_id, status, None, Some(&code))?;
+            return Err(anyhow::Error::from(error)).context("gateway completion failed");
+        }
+    };
+    let usage_json = serde_json::to_string(&serde_json::json!({
+        "usage": outcome.usage,
+        "stop_reason": outcome.stop_reason,
+        "response_model": outcome.response_model,
+        "base_url": outcome.started.base_url,
+    }))?;
+    conn.execute(
+        "UPDATE scout_runs SET billing_path=?2 WHERE id=?1",
+        rusqlite::params![run_id, outcome.started.billing_path],
+    )?;
+
+    let submission: card::Submission =
+        match serde_json::from_value(outcome.tool_call.arguments.clone()) {
+            Ok(submission) if outcome.tool_call.name == card::SUBMIT_TOOL_NAME => submission,
+            Ok(_) => {
+                ledger::finish_run(
+                    conn,
+                    run_id,
+                    RunOutcome::Failed,
+                    Some(&usage_json),
+                    Some("tool_contract"),
+                )?;
+                bail!(
+                    "model called an unexpected tool `{}`",
+                    outcome.tool_call.name
+                );
+            }
+            Err(error) => {
+                ledger::finish_run(
+                    conn,
+                    run_id,
+                    RunOutcome::Failed,
+                    Some(&usage_json),
+                    Some("schema"),
+                )?;
+                return Err(error).context("submission does not match the output contract");
+            }
+        };
+
+    let validated = match card::validate(&submission, &subject, &evidence) {
+        Ok(validated) => validated,
+        Err(error) => {
+            ledger::finish_run(
+                conn,
+                run_id,
+                RunOutcome::Failed,
+                Some(&usage_json),
+                Some("validation"),
+            )?;
+            return Err(error).context("submission failed claim-level card validation");
+        }
+    };
+
+    if let Some(reason) = &validated.incomplete {
+        publish_terminal(
+            conn,
+            run_id,
+            RunOutcome::Incomplete,
+            &usage_json,
+            Some("model_incomplete"),
+            &validated.classifications,
+        )?;
+        return Ok(card_report(
+            run_id,
+            "incomplete",
+            None,
+            &subject,
+            &validated.classifications,
+            Some(outcome.usage),
+            Some(outcome.started.clone()),
+            Some(reason.clone()),
+        ));
+    }
+
+    let annotate_input =
+        card::annotate_input(&validated, snapshot.clone(), supersedes_artifact_id)?;
+    let validated_artifact = match semantic::validate_annotate_input(root, conn, &annotate_input) {
+        Ok(parts) => parts,
+        Err(error) => {
+            publish_terminal(
+                conn,
+                run_id,
+                RunOutcome::Incomplete,
+                &usage_json,
+                Some("inputs_changed"),
+                &validated.classifications,
+            )?;
+            return Err(error).context(
+                "repository changed between evidence construction and publication; \
+                 re-index and re-run",
+            );
+        }
+    };
+    let (current_snapshot, supports) = validated_artifact;
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let published = (|| -> Result<i64> {
+        if structural::current_snapshot(conn)? != snapshot {
+            bail!("structural snapshot changed during publication");
+        }
+        for (file, entry) in &evidence.files {
+            let indexed: String = conn
+                .query_row("SELECT hash FROM files WHERE path=?1", [file], |row| {
+                    row.get(0)
+                })
+                .with_context(|| format!("evidence file `{file}` disappeared from the index"))?;
+            if indexed != entry.hash {
+                bail!("evidence file `{file}` changed during publication");
+            }
+        }
+        let artifact_id = semantic::persist_validated_artifact(
+            conn,
+            &annotate_input,
+            &current_snapshot,
+            &supports,
+            &semantic::ArtifactProvenance {
+                model: &options.model.spec,
+                prompt_version: card::PROMPT_VERSION,
+                scout_run_id: Some(run_id),
+                input_fingerprint: Some(&input_fingerprint),
+            },
+        )?;
+        ledger::record_classifications(conn, run_id, &validated.classifications)?;
+        ledger::finish_run(conn, run_id, RunOutcome::Completed, Some(&usage_json), None)?;
+        Ok(artifact_id)
+    })();
+    let artifact_id = match published {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            id
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            ledger::finish_run(
+                conn,
+                run_id,
+                RunOutcome::Incomplete,
+                Some(&usage_json),
+                Some("publication_recheck"),
+            )?;
+            return Err(error).context("publication recheck failed; nothing was published");
+        }
+    };
+
+    Ok(card_report(
+        run_id,
+        "completed",
+        Some(artifact_id),
+        &subject,
+        &validated.classifications,
+        Some(outcome.usage),
+        Some(outcome.started),
+        None,
+    ))
+}
+
+fn build_card_request(
+    subject: &card::CardSubject,
+    evidence: &EvidencePack,
+    options: &CardScoutOptions,
+) -> Result<CompleteRequest> {
+    let system = "You are a code-comprehension analyst. You receive ONE subject symbol, \
+                  its declaring file as line-numbered source, and deterministic \
+                  structural facts about it. Write a card about the subject only, then \
+                  submit through the tool. Rules: every claim you make must cite line \
+                  ranges from the numbered source of the subject's file; never restate \
+                  the signature, parameter list, deterministic entities, or the listed \
+                  depth-1 edges — those facts are already indexed and a card that \
+                  repeats them is worthless; state purpose, architectural role, domain \
+                  vocabulary, side effects, invariants, and failure modes only where the \
+                  evidence supports them; OMIT every optional field you cannot support \
+                  with exact evidence rather than guessing. If the evidence cannot \
+                  support even a purpose, set incomplete_reason instead."
+        .to_string();
+    let user = format!(
+        "Subject: {} (`{}`) declared in {} lines {}-{}\n\n\
+         Describe what this symbol means in the system, grounded in the evidence.\n\n{}",
+        subject.anchor,
+        subject.display_name,
+        subject.file,
+        subject.declaration_start_line,
+        subject.declaration_end_line,
+        evidence.rendered,
+    );
+    Ok(CompleteRequest {
+        model: options.model.spec.clone(),
+        reasoning: options.reasoning.clone(),
+        system: Some(system),
+        messages: vec![ChatMessage {
+            role: "user",
+            content: user,
+        }],
+        tool: SubmitTool {
+            name: card::SUBMIT_TOOL_NAME.into(),
+            description: "Submit the evidence-backed card for the subject symbol".into(),
+            parameters: card::submit_tool_schema(),
+        },
+        timeout_ms: Some(options.policy.timeout.as_millis() as u64),
+        max_tokens: None,
+        session_id: None,
+        provider_options: options.service_tier.as_ref().map(|tier| ProviderOptions {
+            service_tier: Some(tier.clone()),
+        }),
+    })
+}
+
 fn build_request(
     candidate_set: &WorkflowCandidateSet,
     evidence: &EvidencePack,
@@ -770,15 +1333,16 @@ fn build_request(
 /// context window the pack must plausibly fit it too.
 /// Reserve output tokens on the request and measure its serialized size —
 /// the shared arithmetic behind both real enforcement and dry-run reporting,
-/// so the two can never drift apart.
+/// so the two can never drift apart. `output_units` is the number of
+/// deterministic inputs the model must answer for: workflow candidates, or
+/// one card subject.
 fn reserve_output_and_measure(
     request: &mut CompleteRequest,
-    candidate_count: usize,
+    output_units: usize,
     max_tokens_cap: Option<u64>,
 ) -> Result<(u64, usize)> {
     let desired_output = BASE_OUTPUT_TOKENS.saturating_add(
-        OUTPUT_TOKENS_PER_CANDIDATE
-            .saturating_mul(u64::try_from(candidate_count).unwrap_or(u64::MAX)),
+        OUTPUT_TOKENS_PER_CANDIDATE.saturating_mul(u64::try_from(output_units).unwrap_or(u64::MAX)),
     );
     let output_tokens =
         max_tokens_cap.map_or(desired_output, |maximum| desired_output.min(maximum));
@@ -790,18 +1354,18 @@ fn reserve_output_and_measure(
 fn enforce_context_budget(
     capabilities: &ModelCapabilities,
     request: &mut CompleteRequest,
-    evidence: &EvidencePack,
-    candidate_count: usize,
-    options: &WorkflowScoutOptions,
+    evidence_files: usize,
+    output_units: usize,
+    policy: &RequestPolicy,
+    model_spec: &str,
 ) -> Result<()> {
     let (output_tokens, request_bytes) =
-        reserve_output_and_measure(request, candidate_count, capabilities.max_tokens)?;
-    if request_bytes > options.policy.context_bytes {
+        reserve_output_and_measure(request, output_units, capabilities.max_tokens)?;
+    if request_bytes > policy.context_bytes {
         return Err(ContextBudgetExceeded(format!(
             "serialized evidence pack is {request_bytes} bytes, over --context-bytes {}; \
-             narrow the seeds/depth or raise the budget ({} evidence files)",
-            options.policy.context_bytes,
-            evidence.files.len(),
+             narrow the subject/depth or raise the budget ({evidence_files} evidence files)",
+            policy.context_bytes,
         ))
         .into());
     }
@@ -813,9 +1377,8 @@ fn enforce_context_budget(
         if input_token_ceiling.saturating_add(output_tokens) > window {
             return Err(ContextBudgetExceeded(format!(
                 "evidence pack requires at most {input_token_ceiling} input tokens plus \
-                 {output_tokens} reserved output tokens, over the {} context window of {}; \
-                 narrow the seeds or choose a larger-context model",
-                window, options.model.spec,
+                 {output_tokens} reserved output tokens, over the {window} context window of \
+                 {model_spec}; narrow the inputs or choose a larger-context model",
             ))
             .into());
         }
@@ -838,6 +1401,41 @@ fn input_fingerprint(
         &candidate_set.fingerprint,
         &evidence.rendered,
         workflow::PROMPT_VERSION,
+        &options.model.spec,
+        options.reasoning.as_deref().unwrap_or(""),
+        options.service_tier.as_deref().unwrap_or(""),
+        base_url.unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(&PROTOCOL_VERSION.to_le_bytes());
+    hasher.update(&request.max_tokens.unwrap_or_default().to_le_bytes());
+    if let Ok(schema) = serde_json::to_string(&request.tool.parameters) {
+        hasher.update(schema.as_bytes());
+    }
+    if let Some(system) = &request.system {
+        hasher.update(system.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn card_input_fingerprint(
+    subject: &card::CardSubject,
+    snapshot: &str,
+    evidence: &EvidencePack,
+    request: &CompleteRequest,
+    options: &CardScoutOptions,
+    base_url: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-card-scout-input-v1\0");
+    for part in [
+        snapshot,
+        subject.anchor.as_str(),
+        subject.file.as_str(),
+        &evidence.rendered,
+        card::PROMPT_VERSION,
         &options.model.spec,
         options.reasoning.as_deref().unwrap_or(""),
         options.service_tier.as_deref().unwrap_or(""),
@@ -891,7 +1489,34 @@ fn reuse_report(
     run_id: i64,
     candidate_set: &WorkflowCandidateSet,
     spec: &RunSpec,
-) -> Result<WorkflowScoutReport> {
+) -> Result<ScoutReport> {
+    reused(
+        conn,
+        run_id,
+        "workflow",
+        candidate_set.seeds.join(", "),
+        candidate_set.candidates.len(),
+        spec,
+    )
+}
+
+fn card_reuse_report(
+    conn: &Connection,
+    run_id: i64,
+    subject: &card::CardSubject,
+    spec: &RunSpec,
+) -> Result<ScoutReport> {
+    reused(conn, run_id, "card", subject.anchor.clone(), 1, spec)
+}
+
+fn reused(
+    conn: &Connection,
+    run_id: i64,
+    kind: &str,
+    subject: String,
+    candidate_count: usize,
+    spec: &RunSpec,
+) -> Result<ScoutReport> {
     let artifact_id: Option<i64> = conn
         .query_row(
             "SELECT id FROM semantic_artifacts WHERE scout_run_id=?1",
@@ -914,12 +1539,14 @@ fn reuse_report(
         let (decision, count) = row?;
         decisions.insert(decision, count);
     }
-    Ok(WorkflowScoutReport {
+    Ok(ScoutReport {
+        kind: kind.into(),
+        subject,
         run_id,
         status: "reused".into(),
         started: None,
         artifact_id,
-        candidate_count: candidate_set.candidates.len(),
+        candidate_count,
         decisions,
         usage: None,
         billing_path: spec.billing_path.clone(),
@@ -937,16 +1564,70 @@ fn report(
     usage: Option<Usage>,
     started: Option<crate::llm::StartedInfo>,
     incomplete_reason: Option<String>,
-) -> WorkflowScoutReport {
+) -> ScoutReport {
+    scout_report(
+        run_id,
+        status,
+        "workflow",
+        candidate_set.seeds.join(", "),
+        candidate_set.candidates.len(),
+        artifact_id,
+        classifications,
+        usage,
+        started,
+        incomplete_reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn card_report(
+    run_id: i64,
+    status: &str,
+    artifact_id: Option<i64>,
+    subject: &card::CardSubject,
+    classifications: &[ClassificationRow],
+    usage: Option<Usage>,
+    started: Option<crate::llm::StartedInfo>,
+    incomplete_reason: Option<String>,
+) -> ScoutReport {
+    scout_report(
+        run_id,
+        status,
+        "card",
+        subject.anchor.clone(),
+        1,
+        artifact_id,
+        classifications,
+        usage,
+        started,
+        incomplete_reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scout_report(
+    run_id: i64,
+    status: &str,
+    kind: &str,
+    subject: String,
+    candidate_count: usize,
+    artifact_id: Option<i64>,
+    classifications: &[ClassificationRow],
+    usage: Option<Usage>,
+    started: Option<crate::llm::StartedInfo>,
+    incomplete_reason: Option<String>,
+) -> ScoutReport {
     let mut decisions = BTreeMap::new();
     for row in classifications {
         *decisions.entry(row.decision.clone()).or_insert(0) += 1;
     }
-    WorkflowScoutReport {
+    ScoutReport {
+        kind: kind.into(),
+        subject,
         run_id,
         status: status.into(),
         artifact_id,
-        candidate_count: candidate_set.candidates.len(),
+        candidate_count,
         decisions,
         usage,
         billing_path: started
@@ -967,7 +1648,10 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{WorkflowScoutOptions, scout_refresh, scout_workflow_plan, scout_workflows};
+    use super::{
+        CardScoutOptions, ScoutReport, WorkflowScoutOptions, scout_card_plan, scout_refresh,
+        scout_workflow_plan, scout_workflows,
+    };
     use crate::llm::config::{ModelSpec, RequestPolicy};
     use crate::llm::protocol::{
         CompleteRequest, ModelCapabilities, ProviderSummary, ToolCall, Usage,
@@ -1351,7 +2035,10 @@ mod tests {
         assert_eq!(selection.targets.len(), 1);
         let mut unresolvable = selection.targets[0].clone();
         unresolvable.artifact_id = 999;
-        unresolvable.config.seeds = vec!["deleted-workflow-anchor".into()];
+        let super::refresh::RefreshConfig::Workflow(config) = &mut unresolvable.config else {
+            panic!("expected a workflow replay configuration");
+        };
+        config.seeds = vec!["deleted-workflow-anchor".into()];
         selection.targets.insert(0, unresolvable);
         let refreshed_anchors = candidate_anchors(&conn, repo.path())?;
         let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&refreshed_anchors)))]);
@@ -1673,6 +2360,319 @@ mod tests {
                 .all(|item| item["over_context_bytes"] == serde_json::json!(true)
                     && item["would_call"] == serde_json::json!(false))
         );
+        Ok(())
+    }
+
+    fn card_outcome(arguments: serde_json::Value) -> CompletionOutcome {
+        let mut outcome = outcome(arguments);
+        outcome.tool_call.name = super::card::SUBMIT_TOOL_NAME.into();
+        outcome
+    }
+
+    fn card_options() -> CardScoutOptions {
+        CardScoutOptions {
+            anchors: vec!["flow.ts:start".into()],
+            model: ModelSpec::parse("faux:faux-model").expect("model spec"),
+            reasoning: None,
+            service_tier: None,
+            policy: RequestPolicy::new(30, 1, 240_000).expect("policy"),
+            rebuild: false,
+            supersedes_artifact_id: None,
+        }
+    }
+
+    fn card_submission() -> serde_json::Value {
+        json!({
+            "purpose": {
+                "text": "entry point that completes the flow through the finisher",
+                "evidence": [{"start_line": 2, "end_line": 2}],
+            },
+            "side_effects": [{
+                "text": "delegates to the terminal finisher",
+                "evidence": [{"start_line": 2, "end_line": 2}],
+            }],
+            "incomplete_reason": null,
+        })
+    }
+
+    fn scout_one_card(
+        root: &Path,
+        conn: &rusqlite::Connection,
+        gateway: &mut dyn LlmGateway,
+        options: &CardScoutOptions,
+    ) -> Result<ScoutReport> {
+        let plan = super::plan::cards(root, conn, &options.anchors)?;
+        assert_eq!(plan.items.len(), 1, "one explicit anchor is one card run");
+        let batch = scout_card_plan(root, conn, gateway, options, plan)?;
+        Ok(batch.reports.into_iter().next().expect("one card report"))
+    }
+
+    #[test]
+    fn publishes_a_card_with_claim_level_supports_and_reuses_identical_inputs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let report = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(report.status, "completed");
+        assert_eq!(report.kind, "card");
+        assert_eq!(report.candidate_count, 1);
+        assert!(report.subject.contains("::start@"));
+        let artifact_id = report.artifact_id.expect("published card");
+
+        let (artifact_type, name, prompt_version, confidence): (String, String, String, String) =
+            conn.query_row(
+                "SELECT artifact_type, canonical_name, prompt_version, confidence
+                 FROM semantic_artifacts WHERE id=?1",
+                [artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(artifact_type, "card");
+        assert_eq!(name, report.subject);
+        assert_eq!(prompt_version, "card-scout/v1");
+        assert_eq!(confidence, "likely");
+
+        let supports: Vec<(String, String, String)> = {
+            let mut statement = conn.prepare(
+                "SELECT claim_path, anchor_key, confidence FROM semantic_supports
+                 WHERE artifact_id=?1 ORDER BY claim_path",
+            )?;
+            let rows = statement.query_map([artifact_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        assert_eq!(
+            supports.len(),
+            2,
+            "one support per claim per evidence range"
+        );
+        assert_eq!(supports[0].0, "/purpose");
+        assert_eq!(supports[1].0, "/side_effects/0");
+        assert!(
+            supports
+                .iter()
+                .all(|support| support.1 == report.subject && support.2 == "likely"),
+            "every card claim is anchored on its subject at likely confidence"
+        );
+
+        let (scout_kind, status, config_json): (String, String, String) = conn.query_row(
+            "SELECT scout_kind, status, config_json FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            (scout_kind.as_str(), status.as_str()),
+            ("card", "completed")
+        );
+        let config: super::CardRunConfig = serde_json::from_str(&config_json)?;
+        assert_eq!(config.anchor, report.subject);
+
+        // Reuse: identical inputs return the same artifact without a call.
+        let mut idle_gateway = FakeGateway::new(Vec::new());
+        let reused = scout_one_card(repo.path(), &conn, &mut idle_gateway, &card_options())?;
+        assert_eq!(reused.status, "reused");
+        assert_eq!(reused.artifact_id, Some(artifact_id));
+        assert_eq!(idle_gateway.calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_and_out_of_range_card_claims_publish_nothing() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+
+        let mut unsupported = card_submission();
+        unsupported["invariants"] = json!([{"text": "callers hold the lock", "evidence": []}]);
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(unsupported))]);
+        let error = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())
+            .expect_err("claim without evidence");
+        assert!(format!("{error:#}").contains("claim-level card validation"));
+
+        let mut out_of_range = card_submission();
+        out_of_range["purpose"]["evidence"] = json!([{"start_line": 1, "end_line": 99}]);
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(out_of_range))]);
+        let error = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())
+            .expect_err("evidence outside the pack");
+        assert!(format!("{error:#}").contains("outside `flow.ts`"));
+
+        let failed: i64 = conn.query_row(
+            "SELECT count(*) FROM scout_runs WHERE scout_kind='card' AND status='failed'
+             AND error_code='validation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(failed, 2);
+        let artifacts: i64 =
+            conn.query_row("SELECT count(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(artifacts, 0, "failed card runs publish nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn card_incomplete_records_the_run_without_an_artifact() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut submission = card_submission();
+        submission["incomplete_reason"] = json!("the caller supplies the settlement policy");
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(submission))]);
+        let report = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(report.status, "incomplete");
+        assert_eq!(report.artifact_id, None);
+        assert!(report.incomplete_reason.is_some());
+
+        let (status, code): (String, String) = conn.query_row(
+            "SELECT status, error_code FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            (status.as_str(), code.as_str()),
+            ("incomplete", "model_incomplete")
+        );
+        let classifications: i64 = conn.query_row(
+            "SELECT count(*) FROM scout_classifications WHERE run_id=?1 AND decision='excluded'",
+            [report.run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(classifications, 1);
+        let artifacts: i64 =
+            conn.query_row("SELECT count(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(artifacts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn card_publication_loses_the_snapshot_race_without_a_partial_write() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let root = repo.path().to_path_buf();
+        let db_path = store::db_path(repo.path());
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        gateway.on_complete = Some(Box::new(move || {
+            std::fs::write(
+                root.join("flow.ts"),
+                "export function finish() { return 2; }\n\
+                 export function start() { return finish(); }\n",
+            )
+            .expect("rewrite fixture");
+            let racing = store::open_path(&db_path).expect("open racing connection");
+            indexer::index_repo(&root, &racing).expect("racing re-index");
+        }));
+
+        let error = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())
+            .expect_err("stale inputs");
+        assert!(format!("{error:#}").contains("repository changed"));
+        let (status, code): (String, String) = conn.query_row(
+            "SELECT status, error_code FROM scout_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            (status.as_str(), code.as_str()),
+            ("incomplete", "inputs_changed")
+        );
+        let artifacts: i64 =
+            conn.query_row("SELECT count(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(artifacts, 0, "no partial write against changed inputs");
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilt_and_refreshed_cards_become_immutable_successors() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let first = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        let first_id = first.artifact_id.expect("first card");
+
+        let mut rebuild = card_options();
+        rebuild.rebuild = true;
+        let mut rebuild_gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let rebuilt = scout_one_card(repo.path(), &conn, &mut rebuild_gateway, &rebuild)?;
+        let rebuilt_id = rebuilt.artifact_id.expect("rebuilt card");
+        let supersedes: i64 = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [rebuilt_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, first_id);
+
+        // Source drift stales the card; refresh replays its recorded anchor
+        // and model into another immutable successor.
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 3; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let selection = super::refresh::select(&conn, &[])?;
+        assert_eq!(selection.targets.len(), 1);
+        assert_eq!(selection.targets[0].artifact_id, rebuilt_id);
+        assert_eq!(selection.targets[0].config.kind(), "card");
+        let mut refresh_gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let batch = scout_refresh(
+            repo.path(),
+            &conn,
+            &mut refresh_gateway,
+            selection,
+            RequestPolicy::new(30, 1, 240_000)?,
+        )?;
+        assert_eq!(batch.model_calls, 1);
+        let successor = batch.reports[0].artifact_id.expect("refreshed card");
+        let supersedes: i64 = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [successor],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, rebuilt_id);
+        assert_eq!(batch.reports[0].kind, "card");
+        Ok(())
+    }
+
+    #[test]
+    fn card_dry_run_plans_without_calls_ledger_rows_or_byte_drift() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut options = card_options();
+        options.anchors = Vec::new();
+        options.policy = RequestPolicy::new(30, 1, 240_000)?;
+
+        let plan = super::plan::cards(repo.path(), &conn, &options.anchors)?;
+        assert_eq!(plan.mode, "automatic");
+        assert_eq!(
+            plan.items.len(),
+            2,
+            "both exported symbols are card subjects"
+        );
+        let first = super::card_dry_run_report(&plan, &options)?;
+        let repeat_plan = super::plan::cards(repo.path(), &conn, &options.anchors)?;
+        let second = super::card_dry_run_report(&repeat_plan, &options)?;
+        assert_eq!(
+            serde_json::to_string(&first)?,
+            serde_json::to_string(&second)?,
+            "dry-run output must be byte-deterministic"
+        );
+        assert_eq!(first["dry_run"], json!(true));
+        assert_eq!(first["calls_planned"], json!(1));
+        assert_eq!(first["over_context_bytes_items"], json!(0));
+        let items = first["plan"]["items"].as_array().expect("annotated items");
+        assert_eq!(items[0]["would_call"], json!(true));
+        assert_eq!(items[1]["would_call"], json!(false));
+        assert!(items[0]["request_bytes"].as_u64().expect("bytes") > 0);
+
+        options.policy = RequestPolicy::new(30, 2, 64)?;
+        let refused = super::card_dry_run_report(&plan, &options)?;
+        assert_eq!(refused["calls_planned"], json!(0));
+        assert_eq!(refused["over_context_bytes_items"], json!(plan.items.len()));
+
+        let runs: i64 = conn.query_row("SELECT count(*) FROM scout_runs", [], |row| row.get(0))?;
+        assert_eq!(runs, 0, "a dry run writes no ledger rows");
         Ok(())
     }
 }
