@@ -17,7 +17,7 @@ use crate::{origin, store, structural};
 const AUTO_SEED_LIMIT: usize = 256;
 /// Automatic card selection is capped so a large repository reports a visibly
 /// capped plan instead of silently planning thousands of calls.
-const CARD_LIMIT: usize = 256;
+const CARD_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowPlanItem {
@@ -742,25 +742,32 @@ mod tests {
 
     #[test]
     fn automatic_card_selection_reports_its_cap() -> Result<()> {
+        // Every subject's pack renders its whole declaring file, so the
+        // fixture spreads symbols over files: one huge file would make this
+        // test quadratic in the cap.
+        const PER_FILE: usize = 16;
+        let files = (super::CARD_LIMIT + 4).div_ceil(PER_FILE);
+        let discovered = files * PER_FILE;
         let repo = tempfile::tempdir()?;
-        let mut source = String::new();
-        for index in 0..super::CARD_LIMIT + 4 {
-            source.push_str(&format!(
-                "export function symbol{index}() {{ return {index}; }}\n"
-            ));
+        for file in 0..files {
+            let mut source = String::new();
+            for index in 0..PER_FILE {
+                source.push_str(&format!(
+                    "export function symbol{file}_{index}() {{ return {index}; }}\n"
+                ));
+            }
+            std::fs::write(repo.path().join(format!("module{file}.ts")), source)?;
         }
-        std::fs::write(repo.path().join("index.ts"), source)?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
 
         let plan = super::cards(repo.path(), &conn, &[])?;
-        assert_eq!(plan.anchors_discovered, Some(super::CARD_LIMIT + 4));
+        assert_eq!(plan.anchors_discovered, Some(discovered));
         assert_eq!(plan.anchor_limit, Some(super::CARD_LIMIT));
         assert!(plan.anchor_limit_reached);
         assert_eq!(plan.items.len(), super::CARD_LIMIT);
         assert_eq!(
-            plan.discovered_sources["exported-symbol"],
-            super::CARD_LIMIT + 4,
+            plan.discovered_sources["exported-symbol"], discovered,
             "a capped plan still reports everything discovery found"
         );
         assert_eq!(plan.sources["exported-symbol"], super::CARD_LIMIT);

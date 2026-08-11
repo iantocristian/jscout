@@ -125,7 +125,8 @@ counts, and evidence bytes without starting Node or contacting a model.
 `jscout scout cards` writes one evidence-backed card per selected symbol.
 Without `--anchor`, subjects are the union of exported production symbols,
 runtime boundary endpoints, and participants of current published workflows,
-deduped by anchor and capped at 256 with the discovered count reported.
+deduped by anchor and capped at 1024 with the discovered count and the
+per-source breakdown of everything discovery found reported.
 `--anchor` selects subjects explicitly — each resolves uniquely to a symbol,
 like a workflow seed, and each becomes its own run; automatic mode requires
 `--max-calls`, explicit mode defaults it to the number of anchors. Evidence is
