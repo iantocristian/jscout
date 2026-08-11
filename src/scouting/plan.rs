@@ -43,6 +43,9 @@ pub struct WorkflowPlan {
     pub duplicate_candidate_sets_skipped: usize,
     pub auto_seed_limit: Option<usize>,
     pub auto_seed_limit_reached: bool,
+    /// Automatic mode: how many boundary seeds were discovered before the
+    /// limit was applied, so a capped plan is visibly capped.
+    pub auto_seeds_discovered: Option<usize>,
 }
 
 /// Build exact candidate/evidence inputs. Explicit seeds form one workflow
@@ -56,9 +59,10 @@ pub fn workflows(
     candidate_limit: usize,
 ) -> Result<WorkflowPlan> {
     store::with_read_snapshot(conn, "jscout_scout_plan", || {
-        let (mode, seed_groups, limit_reached) = if explicit_seeds.is_empty() {
+        let (mode, seed_groups, limit_reached, discovered_count) = if explicit_seeds.is_empty() {
             let discovered = automatic_seeds(root, conn)?;
-            let limit_reached = discovered.len() > AUTO_SEED_LIMIT;
+            let discovered_count = discovered.len();
+            let limit_reached = discovered_count > AUTO_SEED_LIMIT;
             (
                 "automatic",
                 discovered
@@ -67,12 +71,14 @@ pub fn workflows(
                     .map(|(anchor, sources)| (vec![anchor], sources))
                     .collect(),
                 limit_reached,
+                Some(discovered_count),
             )
         } else {
             (
                 "explicit",
                 vec![(explicit_seeds.to_vec(), vec!["agent-supplied".into()])],
                 false,
+                None,
             )
         };
 
@@ -141,6 +147,7 @@ pub fn workflows(
             duplicate_candidate_sets_skipped: duplicates,
             auto_seed_limit: (mode == "automatic").then_some(AUTO_SEED_LIMIT),
             auto_seed_limit_reached: limit_reached,
+            auto_seeds_discovered: discovered_count,
         })
     })
 }
