@@ -203,7 +203,11 @@ pub struct CardPlan {
     /// Automatic mode: subjects discovered before the limit was applied, so a
     /// capped plan is visibly capped.
     pub anchors_discovered: Option<usize>,
+    /// Selection sources of the planned items.
     pub sources: BTreeMap<String, usize>,
+    /// Automatic mode: selection sources of every discovered subject, so a
+    /// capped plan also shows which sources it left out.
+    pub discovered_sources: BTreeMap<String, usize>,
 }
 
 /// Build exact card subjects and their bounded evidence. Explicit anchors are
@@ -212,9 +216,15 @@ pub struct CardPlan {
 /// current published workflows.
 pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Result<CardPlan> {
     store::with_read_snapshot(conn, "jscout_card_plan", || {
+        let mut discovered_sources: BTreeMap<String, usize> = BTreeMap::new();
         let (mode, selected, limit_reached, discovered_count) = if explicit_anchors.is_empty() {
             let discovered = automatic_card_subjects(conn)?;
             let discovered_count = discovered.len();
+            for (_, sources) in &discovered {
+                for source in sources {
+                    *discovered_sources.entry(source.clone()).or_insert(0) += 1;
+                }
+            }
             (
                 "automatic",
                 discovered.into_iter().take(CARD_LIMIT).collect::<Vec<_>>(),
@@ -285,6 +295,7 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
             anchor_limit_reached: limit_reached,
             anchors_discovered: discovered_count,
             sources,
+            discovered_sources,
         })
     })
 }
@@ -747,6 +758,12 @@ mod tests {
         assert_eq!(plan.anchor_limit, Some(super::CARD_LIMIT));
         assert!(plan.anchor_limit_reached);
         assert_eq!(plan.items.len(), super::CARD_LIMIT);
+        assert_eq!(
+            plan.discovered_sources["exported-symbol"],
+            super::CARD_LIMIT + 4,
+            "a capped plan still reports everything discovery found"
+        );
+        assert_eq!(plan.sources["exported-symbol"], super::CARD_LIMIT);
         Ok(())
     }
 

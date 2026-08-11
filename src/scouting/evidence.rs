@@ -250,4 +250,29 @@ mod tests {
         assert!(error.to_string().contains("changed since indexing"));
         Ok(())
     }
+
+    #[test]
+    fn structural_context_renders_both_directions_deterministically() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 1; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let (rendered, edges) = super::structural_context(&conn, "sym:flow.ts#::finish@1")?;
+        let (repeat, repeat_edges) = super::structural_context(&conn, "sym:flow.ts#::finish@1")?;
+        assert_eq!((rendered.clone(), edges), (repeat, repeat_edges));
+        assert!(rendered.contains("## Direct structural context"));
+        assert!(rendered.contains("do not restate them as claims"));
+        assert!(
+            rendered.contains("call (certain) sym:flow.ts#::start@1 `start` at flow.ts:2"),
+            "incoming callers carry kind, confidence, anchor, and site: {rendered}"
+        );
+        assert!(rendered.contains("Outgoing:\n- none"), "{rendered}");
+        assert_eq!(edges, 1);
+        Ok(())
+    }
 }
