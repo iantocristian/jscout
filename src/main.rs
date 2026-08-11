@@ -943,12 +943,7 @@ fn cmd_scout_workflows(
     if dry_run {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "max_calls": options.policy.max_calls,
-                "context_bytes": options.policy.context_bytes,
-                "plan": plan,
-            }))?
+            serde_json::to_string_pretty(&scouting::dry_run_report(&plan, &options)?)?
         );
         return Ok(());
     }

@@ -264,6 +264,56 @@ pub fn scout_workflow_plan(
     })
 }
 
+/// Render a workflow plan as the exact execution preview: per item, the
+/// serialized request size, whether `--context-bytes` would refuse it, and
+/// whether it falls inside the `--max-calls` budget. Uses the same request
+/// construction and byte arithmetic as execution; needs no gateway. The model
+/// context-window check and completed-run reuse depend on the gateway and are
+/// resolved at execution time — the notes say so instead of guessing.
+pub fn dry_run_report(
+    plan: &plan::WorkflowPlan,
+    options: &WorkflowScoutOptions,
+) -> Result<serde_json::Value> {
+    let mut annotated = serde_json::to_value(plan)?;
+    let mut eligible = 0_usize;
+    let mut over_budget = 0_usize;
+    if let Some(items) = annotated
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (rendered, item) in items.iter_mut().zip(&plan.items) {
+            let mut request = build_request(&item.candidate_set, &item.evidence, options)?;
+            let (_, request_bytes) = reserve_output_and_measure(
+                &mut request,
+                item.candidate_set.candidates.len(),
+                None,
+            )?;
+            let over = request_bytes > options.policy.context_bytes;
+            let would_call = !over && eligible < options.policy.max_calls;
+            if over {
+                over_budget += 1;
+            } else {
+                eligible += 1;
+            }
+            rendered["request_bytes"] = request_bytes.into();
+            rendered["over_context_bytes"] = over.into();
+            rendered["would_call"] = would_call.into();
+        }
+    }
+    Ok(serde_json::json!({
+        "dry_run": true,
+        "max_calls": options.policy.max_calls,
+        "context_bytes": options.policy.context_bytes,
+        "calls_planned": eligible.min(options.policy.max_calls),
+        "over_context_bytes_items": over_budget,
+        "notes": [
+            "completed matching runs are reused at execution time without consuming --max-calls; later would_call:false items may still run",
+            "the model context-window check needs the gateway and runs at execution time; over_context_bytes covers --context-bytes only",
+        ],
+        "plan": annotated,
+    }))
+}
+
 /// Materialize exact replacement inputs without starting the gateway.
 pub fn plan_refresh(
     root: &Path,
@@ -718,6 +768,25 @@ fn build_request(
 /// The 16 MiB line guard is a corruption check, not the context budget: the
 /// pack must fit --context-bytes, and when the gateway reports the model's
 /// context window the pack must plausibly fit it too.
+/// Reserve output tokens on the request and measure its serialized size —
+/// the shared arithmetic behind both real enforcement and dry-run reporting,
+/// so the two can never drift apart.
+fn reserve_output_and_measure(
+    request: &mut CompleteRequest,
+    candidate_count: usize,
+    max_tokens_cap: Option<u64>,
+) -> Result<(u64, usize)> {
+    let desired_output = BASE_OUTPUT_TOKENS.saturating_add(
+        OUTPUT_TOKENS_PER_CANDIDATE
+            .saturating_mul(u64::try_from(candidate_count).unwrap_or(u64::MAX)),
+    );
+    let output_tokens =
+        max_tokens_cap.map_or(desired_output, |maximum| desired_output.min(maximum));
+    request.max_tokens = Some(output_tokens);
+    let request_bytes = serde_json::to_string(request)?.len();
+    Ok((output_tokens, request_bytes))
+}
+
 fn enforce_context_budget(
     capabilities: &ModelCapabilities,
     request: &mut CompleteRequest,
@@ -725,16 +794,8 @@ fn enforce_context_budget(
     candidate_count: usize,
     options: &WorkflowScoutOptions,
 ) -> Result<()> {
-    let desired_output = BASE_OUTPUT_TOKENS.saturating_add(
-        OUTPUT_TOKENS_PER_CANDIDATE
-            .saturating_mul(u64::try_from(candidate_count).unwrap_or(u64::MAX)),
-    );
-    let output_tokens = capabilities
-        .max_tokens
-        .map_or(desired_output, |maximum| desired_output.min(maximum));
-    request.max_tokens = Some(output_tokens);
-
-    let request_bytes = serde_json::to_string(request)?.len();
+    let (output_tokens, request_bytes) =
+        reserve_output_and_measure(request, candidate_count, capabilities.max_tokens)?;
     if request_bytes > options.policy.context_bytes {
         return Err(ContextBudgetExceeded(format!(
             "serialized evidence pack is {request_bytes} bytes, over --context-bytes {}; \
@@ -1559,6 +1620,59 @@ mod tests {
                 row.get(0)
             })?;
         assert_eq!(artifacts, 0, "no partial write against changed inputs");
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_report_marks_budget_and_call_slots() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("index.ts"),
+            "export function first() { return shared(); }\n\
+             export function second() { return 2; }\n\
+             function shared() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let plan = super::plan::workflows(repo.path(), &conn, &[], 2, 31)?;
+        assert!(
+            plan.items.len() >= 2,
+            "fixture must yield two distinct boundaries, got {}",
+            plan.items.len()
+        );
+        assert_eq!(plan.auto_seeds_discovered, Some(2));
+
+        let mut options = scout_options();
+        options.seeds = Vec::new();
+        options.policy = RequestPolicy::new(30, 1, 240_000).expect("policy");
+        let report = super::dry_run_report(&plan, &options)?;
+        assert_eq!(report["dry_run"], serde_json::json!(true));
+        assert_eq!(report["calls_planned"], serde_json::json!(1));
+        assert_eq!(report["over_context_bytes_items"], serde_json::json!(0));
+        let items = report["plan"]["items"].as_array().expect("annotated items");
+        assert_eq!(items[0]["would_call"], serde_json::json!(true));
+        assert_eq!(items[1]["would_call"], serde_json::json!(false));
+        assert!(items[0]["request_bytes"].as_u64().expect("bytes") > 0);
+        assert_eq!(items[0]["over_context_bytes"], serde_json::json!(false));
+
+        // A budget below any request size refuses every item and plans no
+        // calls, exactly as execution would.
+        options.policy = RequestPolicy::new(30, 1, 64).expect("tiny policy");
+        let refused = super::dry_run_report(&plan, &options)?;
+        assert_eq!(refused["calls_planned"], serde_json::json!(0));
+        assert_eq!(
+            refused["over_context_bytes_items"],
+            serde_json::json!(plan.items.len())
+        );
+        let refused_items = refused["plan"]["items"]
+            .as_array()
+            .expect("annotated items");
+        assert!(
+            refused_items
+                .iter()
+                .all(|item| item["over_context_bytes"] == serde_json::json!(true)
+                    && item["would_call"] == serde_json::json!(false))
+        );
         Ok(())
     }
 }

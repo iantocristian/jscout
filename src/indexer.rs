@@ -30,6 +30,9 @@ pub struct IndexOutcome {
     pub dependency_skipped: usize,
     pub dependency_skipped_bytes: u64,
     pub dependency_plans: Vec<String>,
+    /// False when the structural projection was provably identical (same
+    /// snapshot, projection version, and module resolution) and was kept.
+    pub projection_rebuilt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,7 @@ pub fn index_repo_with_options(
         dependency_skipped: 0,
         dependency_skipped_bytes: 0,
         dependency_plans: Vec::new(),
+        projection_rebuilt: true,
     };
 
     let existing: HashMap<String, (i64, String, String)> = {
@@ -225,11 +229,17 @@ pub fn index_repo_with_options(
         }
     }
 
+    // Remember the published projection identity before invalidating it: if
+    // this run reproduces the exact same snapshot and module resolution, the
+    // existing projection rows are provably identical and can be republished
+    // without a rebuild.
+    let previous = ProjectionIdentity::read(conn)?;
+
     // Commit canonical rows and snapshot invalidation atomically. Every
     // following dependency/resolution step can fail, so the previous graph
     // must stop being public before control enters that phase.
     conn.execute(
-        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
         [],
     )?;
     conn.execute_batch("COMMIT")?;
@@ -246,9 +256,42 @@ pub fn index_repo_with_options(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [root.to_string_lossy()],
     )?;
-    let snapshot = crate::structural::compute_snapshot(conn)?;
+    let resolution = crate::structural::compute_resolution_hash(conn)?;
+    let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
+    let current = ProjectionIdentity {
+        snapshot: Some(snapshot.clone()),
+        projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
+        resolution_hash: Some(resolution.clone()),
+    };
     let projection_started = std::time::Instant::now();
+    if previous == current {
+        // The projection is a pure function of the canonical tables: the
+        // snapshot covers every extracted row (file content identity) and the
+        // resolution hash covers module edges, whose inputs (tsconfigs,
+        // manifests, node_modules layout) live outside indexed content.
+        // Identical inputs under the same projection version republish the
+        // existing rows instead of rebuilding them.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = current.publish(conn);
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        outcome.projection_rebuilt = false;
+        if std::env::var_os("JSCOUT_TIMING").is_some() {
+            eprintln!("timing structural-projection=skipped (unchanged)");
+        }
+        return Ok(outcome);
+    }
     crate::structural::rebuild_projection(conn, &snapshot)?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [&resolution],
+    )?;
     if std::env::var_os("JSCOUT_TIMING").is_some() {
         eprintln!(
             "timing structural-projection={:?}",
@@ -256,6 +299,50 @@ pub fn index_repo_with_options(
         );
     }
     Ok(outcome)
+}
+
+/// The three meta values that must all match for the previous projection to
+/// be provably identical to what a rebuild would produce.
+#[derive(PartialEq, Eq)]
+struct ProjectionIdentity {
+    snapshot: Option<String>,
+    projection_version: Option<String>,
+    resolution_hash: Option<String>,
+}
+
+impl ProjectionIdentity {
+    fn read(conn: &Connection) -> Result<Self> {
+        let read = |key: &str| -> Result<Option<String>> {
+            Ok(conn
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .ok())
+        };
+        Ok(Self {
+            snapshot: read("snapshot")?,
+            projection_version: read("projection_version")?,
+            resolution_hash: read("resolution_hash")?,
+        })
+    }
+
+    fn publish(&self, conn: &Connection) -> Result<()> {
+        for (key, value) in [
+            ("snapshot", &self.snapshot),
+            ("projection_version", &self.projection_version),
+            ("resolution_hash", &self.resolution_hash),
+        ] {
+            let value = value
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("projection identity is missing {key}"))?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn ensure_extraction_version(conn: &Connection) -> Result<()> {
@@ -800,16 +887,27 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
                                 Some(workspace.classify(&request)),
                                 *package_instance,
                             ),
+                            None if external_package_name(&request).is_none() => {
+                                // Resolved to a real but un-indexable file
+                                // (styles, assets, JSON): keep the edge as
+                                // evidence without inventing a package.
+                                (None, None, Some("unresolved"), None)
+                            }
                             None => {
+                                let package = external_package_name(&request)
+                                    .expect("guarded external package request");
                                 let package_instance = package_roots
                                     .iter()
                                     .find(|(root, _)| path.starts_with(root))
                                     .map(|(_, id)| *id);
-                                (None, Some(package_name(&request)), None, package_instance)
+                                (None, Some(package), None, package_instance)
                             }
                         }
                     }
-                    Err(_) => (None, Some(package_name(&request)), None, None),
+                    Err(_) if external_package_name(&request).is_none() => {
+                        (None, None, Some("unresolved"), None)
+                    }
+                    Err(_) => (None, external_package_name(&request), None, None),
                 }
             })
             .clone();
@@ -826,6 +924,42 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     drop(ins);
     conn.execute_batch("COMMIT")?;
     Ok(())
+}
+
+/// Return the package boundary for a syntactically valid bare package
+/// specifier. Relative/absolute paths, package-import aliases (`#name`),
+/// bundler aliases (`~/`, `@/`), URLs, and Windows paths are unresolved
+/// evidence rather than invented `pkg:` identities.
+fn external_package_name(request: &str) -> Option<String> {
+    if let Some((scheme, _)) = request.split_once(':') {
+        return matches!(scheme, "node" | "bun").then(|| package_name(request));
+    }
+    if request.is_empty()
+        || request.starts_with(['.', '/', '~', '#'])
+        || request.contains(['\\', '%', '?'])
+    {
+        return None;
+    }
+    let mut parts = request.split('/');
+    let first = parts.next()?;
+    if let Some(scope) = first.strip_prefix('@') {
+        let name = parts.next()?;
+        if scope.is_empty() || !valid_package_segment(scope) || !valid_package_segment(name) {
+            return None;
+        }
+        Some(format!("@{scope}/{name}"))
+    } else {
+        valid_package_segment(first).then(|| first.to_string())
+    }
+}
+
+fn valid_package_segment(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '\\' | '%' | ':' | '#' | '?' | '@')
+        })
 }
 
 /// "@scope/pkg/sub/path" -> "@scope/pkg"; "./x" stays as-is (unresolved relative).
@@ -894,6 +1028,192 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(environment_occurrences, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_non_package_imports_carry_no_package_identity() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("style.module.scss"),
+            ".a { color: red; }\n",
+        )?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import styles from './style.module.scss';\n\
+             import Tree from './Tree.vue';\n\
+             import cover from '~/assets/cover.png';\n\
+             import app from '@/components/app';\n\
+             import internal from '#internal/widget';\n\
+             import icon from 'C:\\\\assets\\\\icon.svg';\n\
+             import missing from 'not-installed-pkg';\n\
+             import scoped from '@scope/not-installed/subpath';\n\
+             export const view = () => [styles, Tree, cover, app, internal, icon, missing, scoped];\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+
+        let edge = |request: &str| -> Result<(Option<i64>, Option<String>, Option<String>)> {
+            Ok(conn.query_row(
+                "SELECT edge.to_file, edge.package, edge.resolution
+                 FROM module_edges edge
+                 JOIN files source ON source.id=edge.from_file
+                 WHERE source.path='main.ts' AND edge.request=?1",
+                [request],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        };
+        // Resolved to a real but un-indexable asset, and not resolvable at
+        // all: both keep the edge as evidence with no package identity.
+        assert_eq!(
+            edge("./style.module.scss")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(edge("./Tree.vue")?, (None, None, Some("unresolved".into())));
+        // Bundler aliases, package-import aliases, and Windows paths are not
+        // installable package identities.
+        assert_eq!(
+            edge("~/assets/cover.png")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge("@/components/app")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge("#internal/widget")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge(r"C:\assets\icon.svg")?,
+            (None, None, Some("unresolved".into()))
+        );
+        // Bare specifiers stay classified as external packages.
+        assert_eq!(
+            edge("not-installed-pkg")?,
+            (None, Some("not-installed-pkg".into()), None)
+        );
+        assert_eq!(
+            edge("@scope/not-installed/subpath")?,
+            (None, Some("@scope/not-installed".into()), None)
+        );
+
+        let bogus_packages: i64 = conn.query_row(
+            "SELECT count(*) FROM graph_nodes
+             WHERE node_key LIKE 'pkg:.%' OR node_key LIKE 'pkg:/%'
+                OR node_key LIKE 'pkg:~%' OR node_key LIKE 'pkg:@/%'
+                OR node_key LIKE 'pkg:#%' OR node_key LIKE 'pkg:C:%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            bogus_packages, 0,
+            "relative requests must not mint pkg: nodes"
+        );
+        let package_hub: i64 = conn.query_row(
+            "SELECT count(*) FROM graph_nodes WHERE node_key='pkg:not-installed-pkg'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(package_hub, 1);
+        let unresolved_projected: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind IN ('import','imports_types','imports_package','imports_package_types')
+               AND (detail_json LIKE '%Tree.vue%' OR detail_json LIKE '%scss%')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unresolved_projected, 0);
+        let dangling: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges edge
+             LEFT JOIN graph_nodes node ON node.node_key=edge.dst_key
+             WHERE node.node_key IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(dangling, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn noop_reindex_republishes_projection_without_rebuild() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("lib.ts"), "export const lib = 1;\n")?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { lib } from 'lib';\nexport const main = () => lib;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        let meta_snapshot = || -> Result<String> {
+            Ok(
+                conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        };
+        let edge_count = || -> Result<i64> {
+            Ok(conn.query_row("SELECT count(*) FROM resolved_edges", [], |row| row.get(0))?)
+        };
+
+        let first = index_repo(repo.path(), &conn)?;
+        assert!(first.projection_rebuilt);
+        let original_snapshot = meta_snapshot()?;
+        let original_edges = edge_count()?;
+        let original_neighborhood = structural::neighborhood(
+            &conn,
+            "main.ts:main",
+            &structural::NeighborhoodOptions::default(),
+        )?;
+
+        let second = index_repo(repo.path(), &conn)?;
+        assert!(!second.projection_rebuilt, "no-op must keep the projection");
+        assert_eq!(meta_snapshot()?, original_snapshot);
+        assert_eq!(edge_count()?, original_edges);
+
+        // Resolution inputs live outside indexed content: a new tsconfig
+        // remaps 'lib' onto ./lib.ts without changing any indexed file. The
+        // graph and its public snapshot must both change.
+        fs::write(
+            repo.path().join("tsconfig.json"),
+            r#"{"compilerOptions": {"paths": {"lib": ["./lib.ts"]}}}"#,
+        )?;
+        let third = index_repo(repo.path(), &conn)?;
+        assert!(
+            third.projection_rebuilt,
+            "resolution change without content change must rebuild"
+        );
+        assert_ne!(meta_snapshot()?, original_snapshot);
+        let updated_neighborhood = structural::neighborhood(
+            &conn,
+            &original_neighborhood.resolved_anchor,
+            &structural::NeighborhoodOptions {
+                expected_snapshot: Some(original_neighborhood.snapshot),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(updated_neighborhood.anchor_status, "re-resolved");
+        let target: Option<String> = conn.query_row(
+            "SELECT target.path FROM module_edges edge
+             JOIN files source ON source.id=edge.from_file
+             LEFT JOIN files target ON target.id=edge.to_file
+             WHERE source.path='main.ts' AND edge.request='lib'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(target, Some("lib.ts".into()));
+        let fourth = index_repo(repo.path(), &conn)?;
+        assert!(!fourth.projection_rebuilt);
+
+        fs::write(repo.path().join("lib.ts"), "export const lib = 2;\n")?;
+        let fifth = index_repo(repo.path(), &conn)?;
+        assert!(fifth.projection_rebuilt, "content change must rebuild");
+        assert_ne!(meta_snapshot()?, original_snapshot);
+
+        fs::remove_file(repo.path().join("main.ts"))?;
+        let sixth = index_repo(repo.path(), &conn)?;
+        assert!(sixth.projection_rebuilt, "deletion must rebuild");
+        let seventh = index_repo(repo.path(), &conn)?;
+        assert!(!seventh.projection_rebuilt);
         Ok(())
     }
 
