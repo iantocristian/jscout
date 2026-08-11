@@ -800,6 +800,12 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
                                 Some(workspace.classify(&request)),
                                 *package_instance,
                             ),
+                            None if is_relative_request(&request) => {
+                                // Resolved to a real but un-indexable file
+                                // (styles, assets, JSON): keep the edge as
+                                // evidence without inventing a package.
+                                (None, None, Some("unresolved"), None)
+                            }
                             None => {
                                 let package_instance = package_roots
                                     .iter()
@@ -808,6 +814,9 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
                                 (None, Some(package_name(&request)), None, package_instance)
                             }
                         }
+                    }
+                    Err(_) if is_relative_request(&request) => {
+                        (None, None, Some("unresolved"), None)
                     }
                     Err(_) => (None, Some(package_name(&request)), None, None),
                 }
@@ -826,6 +835,18 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     drop(ins);
     conn.execute_batch("COMMIT")?;
     Ok(())
+}
+
+/// Requests that can never name an installable package: relative and
+/// absolute paths, plus `~/` bundler home-alias requests. When these fail to
+/// resolve to an indexed file, the module edge keeps the raw request as
+/// evidence with `resolution='unresolved'` and no package identity, so the
+/// graph never mints `pkg:` nodes for style/asset/JSON imports.
+fn is_relative_request(request: &str) -> bool {
+    request.starts_with('.')
+        || request.starts_with('/')
+        || request == "~"
+        || request.starts_with("~/")
 }
 
 /// "@scope/pkg/sub/path" -> "@scope/pkg"; "./x" stays as-is (unresolved relative).
@@ -894,6 +915,88 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(environment_occurrences, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_relative_imports_carry_no_package_identity() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("style.module.scss"),
+            ".a { color: red; }\n",
+        )?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import styles from './style.module.scss';\n\
+             import Tree from './Tree.vue';\n\
+             import cover from '~/assets/cover.png';\n\
+             import missing from 'not-installed-pkg';\n\
+             export const view = () => [styles, Tree, cover, missing];\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+
+        let edge = |request: &str| -> Result<(Option<i64>, Option<String>, Option<String>)> {
+            Ok(conn.query_row(
+                "SELECT edge.to_file, edge.package, edge.resolution
+                 FROM module_edges edge
+                 JOIN files source ON source.id=edge.from_file
+                 WHERE source.path='main.ts' AND edge.request=?1",
+                [request],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        };
+        // Resolved to a real but un-indexable asset, and not resolvable at
+        // all: both keep the edge as evidence with no package identity.
+        assert_eq!(
+            edge("./style.module.scss")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(edge("./Tree.vue")?, (None, None, Some("unresolved".into())));
+        // Bundler home aliases are path-shaped, not packages.
+        assert_eq!(
+            edge("~/assets/cover.png")?,
+            (None, None, Some("unresolved".into()))
+        );
+        // Bare specifiers stay classified as external packages.
+        assert_eq!(
+            edge("not-installed-pkg")?,
+            (None, Some("not-installed-pkg".into()), None)
+        );
+
+        let bogus_packages: i64 = conn.query_row(
+            "SELECT count(*) FROM graph_nodes
+             WHERE node_key LIKE 'pkg:.%' OR node_key LIKE 'pkg:/%'
+                OR node_key LIKE 'pkg:~%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            bogus_packages, 0,
+            "path-like requests must not mint pkg: nodes"
+        );
+        let package_hub: i64 = conn.query_row(
+            "SELECT count(*) FROM graph_nodes WHERE node_key='pkg:not-installed-pkg'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(package_hub, 1);
+        let unresolved_projected: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind IN ('import','imports_types','imports_package','imports_package_types')
+               AND (detail_json LIKE '%Tree.vue%' OR detail_json LIKE '%scss%')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unresolved_projected, 0);
+        let dangling: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges edge
+             LEFT JOIN graph_nodes node ON node.node_key=edge.dst_key
+             WHERE node.node_key IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(dangling, 0);
         Ok(())
     }
 
