@@ -124,8 +124,13 @@ Canonical anchors are snapshot-scoped:
 - `file:<repo-relative-path>`
 - `pkg:<package-name>`
 - `sym:<path>#<scope>::<name>@<ordinal>`
-- `contract:<path>#<scope>::<name>@<ordinal>`
-- `entity:<type>:<normalized-name>`
+- `contract:<entity-type>:<path>#<name>` for contract declarations;
+  name-only contract references collapse to hashed
+  `contract:<entity-type>:ref-<digest>` hubs, and requests that leave the
+  indexed tree use the `contract:<entity-type>:external:<request>#<name>`
+  and `contract:<entity-type>:unresolved:<request>#<name>` variants
+- `entity:<type>:<normalized-name>` for canonical entities, with hashed
+  `entity:<type>:ref-<digest>` reference hubs
 - receiver-qualified or unknown event/property hubs
 
 They are deterministic for one indexed snapshot, not stable identities across
@@ -226,6 +231,13 @@ There is no automatic provider, model, or billing-path fallback. Diagnostics
 and every scout run record provider, model, billing path, reasoning policy,
 gateway protocol, prompt version, usage, and stable error classification.
 Credentials and hidden reasoning are never stored.
+
+The operator configuration surface — `JSCOUT_LLM_MODEL`,
+`JSCOUT_LLM_REASONING`, `JSCOUT_PI_AI_GATEWAY`, `JSCOUT_NODE`, and the
+gateway-side `JSCOUT_PI_AI_AUTH_FILE` and
+`JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` — is documented in the README
+configuration section, with `.env.example` as the safe template. This
+document defines the boundary; the README owns the operating instructions.
 
 The versioned JSONL protocol uses request IDs and supports `hello`,
 capabilities, completion, cancellation, and shutdown. Rust submits one JSON
