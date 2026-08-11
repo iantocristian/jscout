@@ -288,7 +288,7 @@ enum ScoutCommand {
         /// Seed symbol anchors or uniquely resolvable symbol names (repeatable)
         #[arg(long = "seed")]
         seeds: Vec<String>,
-        /// Exact pi-ai model as provider:model; falls back to JSCOUT_LLM_MODEL
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
         /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
@@ -357,7 +357,7 @@ enum ScoutCommand {
 enum LlmCommand {
     /// Diagnose node, gateway, provider, and model availability
     Doctor {
-        /// Exact pi-ai model as provider:model (e.g. openai-codex:gpt-5.6-terra)
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
         /// Gateway entry file for development and diagnostics
@@ -1032,14 +1032,28 @@ fn print_scout_batch(batch: &scouting::WorkflowBatchReport) {
         }
     }
     println!(
-        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; unscoutable seeds: {}",
+        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; over budget: {}; unresolvable: {}; unscoutable seeds: {}",
         batch.model_calls,
         batch.reports.len(),
         batch.duplicate_candidate_sets_skipped,
         batch.skipped_for_call_budget,
+        batch.skipped_over_budget.len(),
+        batch.skipped_unresolvable.len(),
         batch.skipped_unscoutable,
     );
     if batch.auto_seed_limit_reached {
         println!("automatic seed discovery reached its deterministic limit");
+    }
+    for skipped in &batch.skipped_over_budget {
+        println!(
+            "  skipped over budget: {}: {}",
+            skipped.subject, skipped.reason
+        );
+    }
+    for skipped in &batch.skipped_unresolvable {
+        println!(
+            "  skipped unresolvable: {}: {}",
+            skipped.subject, skipped.reason
+        );
     }
 }

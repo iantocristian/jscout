@@ -4,3 +4,4 @@
 .jscout.db-shm
 .jscout.db-wal
 .jscout-telemetry.jsonl
+.env

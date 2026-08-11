@@ -120,8 +120,8 @@ pub trait LlmGateway {
     ) -> Result<CompletionOutcome, GatewayError>;
 }
 
-/// `jscout llm doctor`: report every layer needed for a model call and fail
-/// with a clear remedy instead of a hidden fallback.
+/// `jscout llm doctor`: report every layer needed for a model call. With no
+/// override it diagnoses the same plan-backed model scouting uses.
 pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let node = config::resolve_node()?;
     println!("node: {}", node.display());
@@ -144,10 +144,7 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
         gateway.versions.node
     );
 
-    let requested_model = match model {
-        Some(value) => Some(config::ModelSpec::parse(value)?),
-        None => config::resolve_model(None).ok(),
-    };
+    let requested_model = Some(config::resolve_model(model)?);
     let (providers, capabilities) =
         gateway.capabilities(requested_model.as_ref().map(|spec| spec.spec.as_str()))?;
     println!(

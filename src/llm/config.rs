@@ -1,6 +1,6 @@
 //! CLI/environment resolution for the gateway: model, node runtime, gateway
-//! entry point, and request policy. There is no silent default model — an
-//! unnoticed provider or billing-path change is worse than an error.
+//! entry point, and request policy. The default stays on the explicit
+//! ChatGPT-plan-backed provider; CLI/environment settings may override it.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ pub const MODEL_ENV: &str = "JSCOUT_LLM_MODEL";
 pub const REASONING_ENV: &str = "JSCOUT_LLM_REASONING";
 pub const GATEWAY_ENV: &str = "JSCOUT_PI_AI_GATEWAY";
 pub const NODE_ENV: &str = "JSCOUT_NODE";
-pub const MODEL_EXAMPLE: &str = "openai-codex:gpt-5.6-terra";
+pub const DEFAULT_MODEL: &str = "openai-codex:gpt-5.6-terra";
+pub const MODEL_EXAMPLE: &str = DEFAULT_MODEL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
@@ -38,20 +39,22 @@ impl ModelSpec {
     }
 }
 
-/// `--model`, then `JSCOUT_LLM_MODEL`, then a hard error with an example.
+/// `--model`, then `JSCOUT_LLM_MODEL`, then the plan-backed default.
 pub fn resolve_model(cli: Option<&str>) -> Result<ModelSpec> {
+    let configured = env::var(MODEL_ENV).ok();
+    resolve_model_values(cli, configured.as_deref())
+}
+
+fn resolve_model_values(cli: Option<&str>, configured: Option<&str>) -> Result<ModelSpec> {
     if let Some(value) = cli {
         return ModelSpec::parse(value);
     }
-    if let Ok(value) = env::var(MODEL_ENV)
+    if let Some(value) = configured
         && !value.trim().is_empty()
     {
-        return ModelSpec::parse(&value);
+        return ModelSpec::parse(value);
     }
-    bail!(
-        "no model selected: pass --model or set {MODEL_ENV} (e.g. {MODEL_EXAMPLE}); \
-         jscout never falls back to a default provider or billing path"
-    );
+    ModelSpec::parse(DEFAULT_MODEL)
 }
 
 /// `--reasoning`, then `JSCOUT_LLM_REASONING`; None means provider default.
@@ -175,22 +178,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_resolution_prefers_cli_and_never_defaults() {
-        let spec = resolve_model(Some("openai-codex:gpt-5.6-terra")).expect("cli model");
+    fn model_resolution_prefers_cli_then_env_then_plan_default() {
+        let spec = resolve_model_values(Some("openai-codex:gpt-5.6-sol"), Some("openai:gpt-5.4"))
+            .expect("cli model");
         assert_eq!(
             (spec.provider.as_str(), spec.model_id.as_str()),
-            ("openai-codex", "gpt-5.6-terra")
+            ("openai-codex", "gpt-5.6-sol")
         );
         assert!(ModelSpec::parse("missing-separator").is_err());
         assert!(ModelSpec::parse(":model").is_err());
         assert!(ModelSpec::parse("provider:").is_err());
 
-        // Without CLI or env the resolution must fail with the example text.
-        // (Serial-safe: this test never sets the env variable.)
-        if env::var(MODEL_ENV).is_err() {
-            let error = resolve_model(None).expect_err("no default model");
-            assert!(error.to_string().contains(MODEL_EXAMPLE));
-        }
+        assert_eq!(
+            resolve_model_values(None, Some("openai:gpt-5.4"))
+                .expect("environment model")
+                .spec,
+            "openai:gpt-5.4"
+        );
+        assert_eq!(
+            resolve_model_values(None, None)
+                .expect("default model")
+                .spec,
+            DEFAULT_MODEL
+        );
     }
 
     #[test]
