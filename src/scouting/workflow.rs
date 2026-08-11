@@ -32,16 +32,18 @@ pub fn submit_tool_schema(anchors: &[String]) -> Value {
         "required": ["name", "description", "candidates", "incomplete_reason"],
         "properties": {
             "name": {
-                "type": "string",
+                "type": ["string", "null"],
                 "minLength": 3,
                 "maxLength": MAX_NAME_CHARS,
-                "description": "Short domain name of the workflow"
+                "description": "Short domain name of the workflow; null ONLY together \
+                                with incomplete_reason"
             },
             "description": {
-                "type": "string",
+                "type": ["string", "null"],
                 "minLength": 10,
                 "maxLength": MAX_DESCRIPTION_CHARS,
-                "description": "What the workflow does, grounded in the evidence"
+                "description": "What the workflow does, grounded in the evidence; null \
+                                ONLY together with incomplete_reason"
             },
             "candidates": {
                 "type": "array",
@@ -105,8 +107,12 @@ pub fn submit_tool_schema(anchors: &[String]) -> Value {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Submission {
-    pub name: String,
-    pub description: String,
+    /// Nullable so a refusal never forces the model to fabricate a workflow
+    /// identity; the complete path still requires both.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     pub candidates: Vec<SubmittedCandidate>,
     #[serde(default)]
     pub incomplete_reason: Option<String>,
@@ -171,11 +177,11 @@ pub fn validate(
         });
     }
 
-    let name = submission.name.trim();
+    let name = submission.name.as_deref().unwrap_or("").trim();
     if name.is_empty() || name.chars().count() > MAX_NAME_CHARS {
         bail!("workflow name must be 1-{MAX_NAME_CHARS} characters");
     }
-    let description = submission.description.trim();
+    let description = submission.description.as_deref().unwrap_or("").trim();
     if description.is_empty() || description.chars().count() > MAX_DESCRIPTION_CHARS {
         bail!("workflow description must be 1-{MAX_DESCRIPTION_CHARS} characters");
     }

@@ -48,12 +48,19 @@ pub fn submit_tool_schema() -> Value {
         "additionalProperties": false,
         "required": ["purpose", "incomplete_reason"],
         "properties": {
-            "purpose": claim_schema(
-                "text",
-                10,
-                MAX_PURPOSE_CHARS,
-                "What this symbol is for, in domain terms",
-            ),
+            "purpose": {
+                "anyOf": [
+                    claim_schema(
+                        "text",
+                        10,
+                        MAX_PURPOSE_CHARS,
+                        "What this symbol is for, in domain terms",
+                    ),
+                    { "type": "null" }
+                ],
+                "description": "The card's one required claim; null ONLY together \
+                                with incomplete_reason"
+            },
             "architectural_role": claim_schema(
                 "text",
                 3,
@@ -207,6 +214,32 @@ pub fn validate(
         let reason = reason.trim();
         if reason.is_empty() {
             bail!("incomplete_reason must be a non-empty explanation when set");
+        }
+        // A refusal and a card are mutually exclusive: claims alongside an
+        // incomplete_reason are contradictory output, not a partial card.
+        if submission.purpose.is_some()
+            || submission.architectural_role.is_some()
+            || submission
+                .domain_terms
+                .as_deref()
+                .is_some_and(|terms| !terms.is_empty())
+            || submission
+                .side_effects
+                .as_deref()
+                .is_some_and(|claims| !claims.is_empty())
+            || submission
+                .invariants
+                .as_deref()
+                .is_some_and(|claims| !claims.is_empty())
+            || submission
+                .failure_modes
+                .as_deref()
+                .is_some_and(|claims| !claims.is_empty())
+        {
+            bail!(
+                "an incomplete submission must not carry claims; set purpose to null \
+                 and omit every optional field when refusing"
+            );
         }
         return Ok(ValidatedCard {
             anchor: subject.anchor.clone(),
@@ -588,12 +621,10 @@ mod tests {
 
     #[test]
     fn incomplete_submissions_publish_nothing() -> Result<()> {
+        // The honest refusal shape: purpose is null, no fabricated claim.
         let card = validate(
             &submission(json!({
-                "purpose": {
-                    "text": "cannot be determined from this file alone",
-                    "evidence": [{"start_line": 1, "end_line": 1}],
-                },
+                "purpose": null,
                 "incomplete_reason": "the dispatch target is generated at runtime",
             })),
             &subject(),
@@ -603,6 +634,24 @@ mod tests {
         assert_eq!(card.classifications.len(), 1);
         assert_eq!(card.classifications[0].decision, "excluded");
         assert!(super::annotate_input(&card, "snapshot".into(), None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_carrying_claims_is_contradictory_output() -> Result<()> {
+        let error = validate(
+            &submission(json!({
+                "purpose": {
+                    "text": "cannot be determined from this file alone",
+                    "evidence": [{"start_line": 1, "end_line": 1}],
+                },
+                "incomplete_reason": "the dispatch target is generated at runtime",
+            })),
+            &subject(),
+            &pack(),
+        )
+        .expect_err("claims beside a refusal must be rejected");
+        assert!(error.to_string().contains("must not carry claims"));
         Ok(())
     }
 }

@@ -1241,14 +1241,22 @@ fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
         if let Some(reason) = &report.incomplete_reason {
             println!("  incomplete: {reason}");
         }
+        if let Some(failure) = &report.failure {
+            println!("  failed: {failure}");
+        }
         if let Some(artifact) = report.artifact_id {
             println!("  artifact: {artifact}");
         }
     }
     println!(
-        "model calls: {}; reports: {}; duplicate boundaries: {}; skipped by call budget: {}; over budget: {}; unresolvable: {}; unscoutable subjects: {}",
+        "model calls: {}; reports: {}; failed subjects: {}; duplicate boundaries: {}; skipped by call budget: {}; over budget: {}; unresolvable: {}; unscoutable subjects: {}",
         batch.model_calls,
         batch.reports.len(),
+        batch
+            .reports
+            .iter()
+            .filter(|report| report.status == "failed")
+            .count(),
         batch.duplicate_candidate_sets_skipped,
         batch.skipped_for_call_budget,
         batch.skipped_over_budget.len(),

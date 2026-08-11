@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::config::{ModelSpec, RequestPolicy};
@@ -96,6 +96,9 @@ pub struct ScoutReport {
     pub usage: Option<Usage>,
     pub billing_path: String,
     pub incomplete_reason: Option<String>,
+    /// Subject-local failure (tool contract, schema, validation): the run is
+    /// recorded failed, the call is spent, and the batch continues.
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -829,10 +832,18 @@ fn execute_prepared_workflow(
                     Some(&usage_json),
                     Some("tool_contract"),
                 )?;
-                bail!(
-                    "model called an unexpected tool `{}`",
-                    outcome.tool_call.name
-                );
+                return Ok(failed_report(
+                    run_id,
+                    "workflow",
+                    candidate_set.seeds.join(", "),
+                    candidate_set.candidates.len(),
+                    outcome.usage,
+                    outcome.started,
+                    format!(
+                        "model called an unexpected tool `{}`",
+                        outcome.tool_call.name
+                    ),
+                ));
             }
             Err(error) => {
                 ledger::finish_run(
@@ -842,7 +853,15 @@ fn execute_prepared_workflow(
                     Some(&usage_json),
                     Some("schema"),
                 )?;
-                return Err(error).context("submission does not match the output contract");
+                return Ok(failed_report(
+                    run_id,
+                    "workflow",
+                    candidate_set.seeds.join(", "),
+                    candidate_set.candidates.len(),
+                    outcome.usage,
+                    outcome.started,
+                    format!("submission does not match the output contract: {error}"),
+                ));
             }
         };
 
@@ -856,7 +875,15 @@ fn execute_prepared_workflow(
                 Some(&usage_json),
                 Some("validation"),
             )?;
-            return Err(error).context("submission failed candidate-closed validation");
+            return Ok(failed_report(
+                run_id,
+                "workflow",
+                candidate_set.seeds.join(", "),
+                candidate_set.candidates.len(),
+                outcome.usage,
+                outcome.started,
+                format!("submission failed candidate-closed validation: {error:#}"),
+            ));
         }
     };
 
@@ -997,7 +1024,6 @@ fn prepare_card(
 
     let input_fingerprint = card_input_fingerprint(
         &subject,
-        &snapshot,
         &evidence,
         &request,
         options,
@@ -1094,10 +1120,18 @@ fn execute_prepared_card(
                     Some(&usage_json),
                     Some("tool_contract"),
                 )?;
-                bail!(
-                    "model called an unexpected tool `{}`",
-                    outcome.tool_call.name
-                );
+                return Ok(failed_report(
+                    run_id,
+                    "card",
+                    subject.anchor.clone(),
+                    1,
+                    outcome.usage,
+                    outcome.started,
+                    format!(
+                        "model called an unexpected tool `{}`",
+                        outcome.tool_call.name
+                    ),
+                ));
             }
             Err(error) => {
                 ledger::finish_run(
@@ -1107,7 +1141,15 @@ fn execute_prepared_card(
                     Some(&usage_json),
                     Some("schema"),
                 )?;
-                return Err(error).context("submission does not match the output contract");
+                return Ok(failed_report(
+                    run_id,
+                    "card",
+                    subject.anchor.clone(),
+                    1,
+                    outcome.usage,
+                    outcome.started,
+                    format!("submission does not match the output contract: {error}"),
+                ));
             }
         };
 
@@ -1121,7 +1163,15 @@ fn execute_prepared_card(
                 Some(&usage_json),
                 Some("validation"),
             )?;
-            return Err(error).context("submission failed claim-level card validation");
+            return Ok(failed_report(
+                run_id,
+                "card",
+                subject.anchor.clone(),
+                1,
+                outcome.usage,
+                outcome.started,
+                format!("submission failed claim-level card validation: {error:#}"),
+            ));
         }
     };
 
@@ -1146,7 +1196,7 @@ fn execute_prepared_card(
         ));
     }
 
-    let annotate_input =
+    let mut annotate_input =
         card::annotate_input(&validated, snapshot.clone(), supersedes_artifact_id)?;
     let validated_artifact = match semantic::validate_annotate_input(root, conn, &annotate_input) {
         Ok(parts) => parts,
@@ -1181,6 +1231,25 @@ fn execute_prepared_card(
             if indexed != entry.hash {
                 bail!("evidence file `{file}` changed during publication");
             }
+        }
+        // One current card per subject: a normal run supersedes the current
+        // card for its anchor, resolved inside this transaction so no second
+        // "current" card can ever be published beside it. Refresh runs carry
+        // their explicit predecessor from the ledger claim instead.
+        if annotate_input.supersedes.is_none() {
+            annotate_input.supersedes = conn
+                .query_row(
+                    "SELECT artifact.id FROM semantic_artifacts artifact
+                     WHERE artifact.artifact_type='card' AND artifact.canonical_name=?1
+                       AND NOT EXISTS(
+                         SELECT 1 FROM semantic_artifacts successor
+                         WHERE successor.supersedes_artifact_id=artifact.id
+                       )
+                     ORDER BY artifact.id DESC LIMIT 1",
+                    [subject.anchor.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
         }
         let artifact_id = semantic::persist_validated_artifact(
             conn,
@@ -1420,18 +1489,21 @@ fn input_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
+/// Deliberately snapshot-free: the rendered evidence already covers the
+/// subject's file content and its depth-1 structural context, so an
+/// unrelated repository change must reuse the completed run instead of
+/// regenerating an identical card. The run's `source_snapshot` still records
+/// provenance and gates publication.
 fn card_input_fingerprint(
     subject: &card::CardSubject,
-    snapshot: &str,
     evidence: &EvidencePack,
     request: &CompleteRequest,
     options: &CardScoutOptions,
     base_url: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-card-scout-input-v1\0");
+    hasher.update(b"jscout-card-scout-input-v2\0");
     for part in [
-        snapshot,
         subject.anchor.as_str(),
         subject.file.as_str(),
         &evidence.rendered,
@@ -1551,6 +1623,7 @@ fn reused(
         usage: None,
         billing_path: spec.billing_path.clone(),
         incomplete_reason: None,
+        failure: None,
     })
 }
 
@@ -1636,6 +1709,36 @@ fn scout_report(
             .unwrap_or_default(),
         started,
         incomplete_reason,
+        failure: None,
+    }
+}
+
+/// A subject-local failure that must not abort the batch: the ledger has the
+/// failed run, the model call counts against the budget, and later subjects
+/// still get their turn. Gateway/infrastructure errors and invalidated
+/// publication state keep aborting via `Err`.
+fn failed_report(
+    run_id: i64,
+    kind: &str,
+    subject: String,
+    candidate_count: usize,
+    usage: Usage,
+    started: crate::llm::StartedInfo,
+    failure: String,
+) -> ScoutReport {
+    ScoutReport {
+        kind: kind.into(),
+        subject,
+        run_id,
+        status: "failed".into(),
+        artifact_id: None,
+        candidate_count,
+        decisions: BTreeMap::new(),
+        usage: Some(usage),
+        billing_path: started.billing_path.clone(),
+        started: Some(started),
+        incomplete_reason: None,
+        failure: Some(failure),
     }
 }
 
@@ -2190,9 +2293,18 @@ mod tests {
             "incomplete_reason": null,
         });
         let mut gateway = FakeGateway::new(vec![Ok(outcome(partial))]);
-        let error = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())
-            .expect_err("closure violation");
-        assert!(format!("{error:#}").contains("candidate-closed validation"));
+        let report = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())?;
+        assert_eq!(
+            report.status, "failed",
+            "subject-local failure, not an abort"
+        );
+        assert!(
+            report
+                .failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("candidate-closed validation")
+        );
 
         let (status, code): (String, String) = conn.query_row(
             "SELECT status, error_code FROM scout_runs ORDER BY id DESC LIMIT 1",
@@ -2484,16 +2596,31 @@ mod tests {
         let mut unsupported = card_submission();
         unsupported["invariants"] = json!([{"text": "callers hold the lock", "evidence": []}]);
         let mut gateway = FakeGateway::new(vec![Ok(card_outcome(unsupported))]);
-        let error = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())
-            .expect_err("claim without evidence");
-        assert!(format!("{error:#}").contains("claim-level card validation"));
+        let report = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(
+            report.status, "failed",
+            "subject-local failure, not an abort"
+        );
+        assert!(
+            report
+                .failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("claim-level card validation")
+        );
 
         let mut out_of_range = card_submission();
         out_of_range["purpose"]["evidence"] = json!([{"start_line": 1, "end_line": 99}]);
         let mut gateway = FakeGateway::new(vec![Ok(card_outcome(out_of_range))]);
-        let error = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())
-            .expect_err("evidence outside the pack");
-        assert!(format!("{error:#}").contains("outside `flow.ts`"));
+        let report = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(report.status, "failed");
+        assert!(
+            report
+                .failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside `flow.ts`")
+        );
 
         let failed: i64 = conn.query_row(
             "SELECT count(*) FROM scout_runs WHERE scout_kind='card' AND status='failed'
@@ -2514,8 +2641,10 @@ mod tests {
     fn card_incomplete_records_the_run_without_an_artifact() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = fixture(repo.path())?;
-        let mut submission = card_submission();
-        submission["incomplete_reason"] = json!("the caller supplies the settlement policy");
+        let submission = json!({
+            "purpose": null,
+            "incomplete_reason": "the caller supplies the settlement policy",
+        });
         let mut gateway = FakeGateway::new(vec![Ok(card_outcome(submission))]);
         let report = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
         assert_eq!(report.status, "incomplete");
@@ -2542,6 +2671,116 @@ mod tests {
                 row.get(0)
             })?;
         assert_eq!(artifacts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_repository_change_reuses_completed_card_runs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let first = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(first.status, "completed");
+
+        // A new file changes the snapshot but not the subject's evidence:
+        // the completed run must be reused, not respent.
+        std::fs::write(
+            repo.path().join("unrelated.ts"),
+            "export const noise = 1;\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let mut idle_gateway = FakeGateway::new(Vec::new());
+        let second = scout_one_card(repo.path(), &conn, &mut idle_gateway, &card_options())?;
+        assert_eq!(second.status, "reused");
+        assert_eq!(second.artifact_id, first.artifact_id);
+        assert_eq!(idle_gateway.calls, 0);
+        let artifacts: i64 =
+            conn.query_row("SELECT count(*) FROM semantic_artifacts", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(artifacts, 1, "no duplicate current card");
+        Ok(())
+    }
+
+    #[test]
+    fn subject_change_supersedes_the_previous_card_instead_of_duplicating() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let first = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        let first_artifact = first.artifact_id.expect("published card");
+
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 2; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let second = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(second.status, "completed");
+        let second_artifact = second.artifact_id.expect("published successor");
+
+        let supersedes: Option<i64> = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [second_artifact],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, Some(first_artifact));
+        let current: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_artifacts artifact
+             WHERE artifact.artifact_type='card'
+               AND NOT EXISTS(
+                 SELECT 1 FROM semantic_artifacts successor
+                 WHERE successor.supersedes_artifact_id=artifact.id
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(current, 1, "exactly one current card per subject");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_subject_does_not_abort_the_card_batch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut options = card_options();
+        options.anchors = vec!["flow.ts:finish".into(), "flow.ts:start".into()];
+        options.policy = RequestPolicy::new(30, 2, 240_000).expect("policy");
+
+        // First subject: arguments that cannot deserialize (schema failure).
+        // Second subject: a valid card. The batch must record the first as a
+        // failed, budget-consuming run and still publish the second.
+        let mut gateway = FakeGateway::new(vec![
+            Ok(card_outcome(
+                json!({ "purpose": 42, "incomplete_reason": null }),
+            )),
+            Ok(card_outcome(card_submission())),
+        ]);
+        let plan = super::plan::cards(repo.path(), &conn, &options.anchors)?;
+        assert_eq!(plan.items.len(), 2);
+        let batch = scout_card_plan(repo.path(), &conn, &mut gateway, &options, plan)?;
+
+        assert_eq!(batch.reports.len(), 2);
+        assert_eq!(batch.reports[0].status, "failed");
+        assert!(
+            batch.reports[0]
+                .failure
+                .as_deref()
+                .unwrap_or("")
+                .contains("output contract")
+        );
+        assert_eq!(batch.reports[1].status, "completed");
+        assert!(batch.reports[1].artifact_id.is_some());
+        assert_eq!(batch.model_calls, 2, "a failed call still spends budget");
+        let failed_runs: i64 = conn.query_row(
+            "SELECT count(*) FROM scout_runs WHERE status='failed' AND error_code='schema'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(failed_runs, 1);
         Ok(())
     }
 
