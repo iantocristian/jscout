@@ -68,8 +68,10 @@ jscout scout workflows R       # auto-select deterministic workflow entry surfac
   --max-calls N                #   default: openai-codex:gpt-5.6-terra via ChatGPT plan
 jscout scout workflows R       # classify one agent-supplied workflow boundary
   --seed ANCHOR                #   repeat --seed to define one multi-seed boundary
-jscout scout refresh R         # replace stale/degraded generated workflows
-  --max-calls N                #   reuses each workflow's recorded model/configuration
+jscout scout cards R           # evidence-backed cards for selected symbols
+  --max-calls N                #   --anchor SPEC selects subjects explicitly (repeatable)
+jscout scout refresh R         # replace stale/degraded generated workflows and cards
+  --max-calls N                #   reuses each artifact's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
@@ -120,10 +122,28 @@ skipped without blocking smaller boundaries. `--dry-run` prints the exact
 resolved seeds, candidate fingerprints, candidate counts, evidence file
 counts, and evidence bytes without starting Node or contacting a model.
 
+`jscout scout cards` writes one evidence-backed card per selected symbol.
+Without `--anchor`, subjects are the union of exported production symbols,
+runtime boundary endpoints, and participants of current published workflows,
+deduped by anchor and capped at 256 with the discovered count reported.
+`--anchor` selects subjects explicitly — each resolves uniquely to a symbol,
+like a workflow seed, and each becomes its own run; automatic mode requires
+`--max-calls`, explicit mode defaults it to the number of anchors. Evidence is
+the subject's declaring file plus its deterministic depth-1 edges, which the
+prompt forbids restating: a card carries purpose, architectural role, domain
+terms, side effects, invariants, and failure modes, never signatures or call
+lists. Every individual claim cites its own line ranges in that file and is
+published as its own support at `likely` confidence; an optional field the
+model cannot support is omitted rather than guessed, and a claim without exact
+evidence fails the run instead of downgrading it. `--dry-run` prints the
+selected subjects, evidence bytes, per-item request bytes, and budget
+decisions without starting Node or contacting a model.
+
 Generated workflows record their resolved seeds, traversal limits, service
-tier, model, and reasoning policy in the run ledger. After indexing exposes
-source or structural-context drift, `jscout scout refresh --max-calls N`
-selects current stale/degraded generated workflows and publishes immutable
+tier, model, and reasoning policy in the run ledger; cards record their
+subject anchor the same way. After indexing exposes source or
+structural-context drift, `jscout scout refresh --max-calls N` selects current
+stale/degraded generated workflows and cards and publishes immutable
 successors. Index and watch never make model calls. Runs created before replay
 configuration was stored remain visible but are reported as non-refreshable;
 jscout does not guess their original boundary. A stale target whose recorded

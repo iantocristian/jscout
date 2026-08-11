@@ -2,9 +2,9 @@
 
 > Status: authoritative plan as of 2026-08-11.
 >
-> G1–G5 of semantic scouting are implemented. G6, evidence-backed symbol
-> cards, is next. Product-value testing is intentionally paused until the
-> semantic-v1 completion boundary.
+> G1–G6 of semantic scouting are implemented. G7, hierarchical summaries, is
+> next. Product-value testing is intentionally paused until the semantic-v1
+> completion boundary.
 
 ## Document policy
 
@@ -112,7 +112,7 @@ agent, indexer, or semantic authority.
 | Dependency scope | Opt-in named packages; realpath-normalized workspace/dependency identity, pnpm layout/version handling, source-over-dist preference, bundle/minification limits, and dependency origin excluded from retrieval by default |
 | Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, repository overview, ranked paths, semantic-memory attachment, and opt-in structural expansion |
 | Agent integration | CLI, MCP profiles, project-local agent guide, response budgets, privacy-minimal telemetry, and isolated evaluation database support |
-| Semantic memory | Validated agent write-back; candidate-closed generated workflows; automatic deterministic seeds; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
+| Semantic memory | Validated agent write-back; candidate-closed generated workflows; evidence-backed selected symbol cards; automatic deterministic seeds and card selection; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
 | Model gateway | `@earendil-works/pi-ai` 0.84.1 sidecar, protocol-v1 JSONL over stdio, provider/auth registry, cancellation, normalized usage/errors, and `llm doctor` |
 
 ## Deterministic repository plane
@@ -288,29 +288,38 @@ The model cannot add anchors outside the deterministic candidate set. It may
 declare the pack incomplete; that records an incomplete run and publishes no
 workflow.
 
+### Implemented selected symbol cards (G6)
+
+Cards reuse the same gateway, run ledger, evidence pack, support validator,
+freshness engine, and immutable supersession as workflows.
+
+1. Select subjects deterministically: exported production symbols, runtime
+   boundary endpoints, and participants of current published workflows,
+   deduped by anchor and capped with a reported discovered count; or resolve
+   explicitly requested anchors. One run per subject.
+2. Build evidence from the subject's declaring file plus its depth-1 resolved
+   edges, rendered deterministically. Those edges and entity annotations are
+   deterministic facts the prompt forbids restating as claims: a card that
+   repeats signatures or call lists spends tokens on what the index already
+   knows.
+3. Fingerprint the snapshot, subject, evidence, schema, prompt, gateway
+   protocol, model, and request policy, and reuse a matching completed run
+   unless rebuild is explicit.
+4. Require `purpose` with exact evidence; accept `architectural_role`,
+   `domain_terms`, `side_effects`, `invariants`, and `failure_modes` only when
+   each individual claim carries its own line ranges. Unsupported optional
+   fields are omitted, never filled speculatively, and an unsupported claim
+   fails the run rather than downgrading the card.
+5. Publish one artifact per subject anchor with one JSON-pointer support per
+   claim per range at `likely` confidence, under the same atomic recheck.
+
+The model may declare the evidence insufficient; that records an incomplete
+run and publishes no card. Refresh selects stale/degraded current cards and
+replays their recorded subject and model into immutable successors.
+
 ## Remaining semantic-v1 roadmap
 
-### G6 — selected symbol cards (next)
-
-Generate cards only for exported symbols, entity endpoints, workflow
-participants, and explicitly requested anchors. Reuse the gateway, run ledger,
-evidence pack, support validator, freshness engine, and immutable supersession.
-
-Cards may describe purpose, architectural role, domain terms, side effects,
-invariants, and failure modes. They must not spend model tokens restating
-signatures or deterministic calls. Every individual claim needs exact support;
-unsupported optional fields are omitted rather than filled speculatively.
-
-Required engineering work:
-
-- versioned card schema and submit tool;
-- deterministic selection and `--dry-run` planning;
-- bounded evidence focused on the selected symbol and direct structural
-  context;
-- claim-level support validation and artifact fingerprinting;
-- reuse, refresh, cancellation, snapshot-race, and no-partial-write coverage.
-
-### G7 — hierarchical summaries
+### G7 — hierarchical summaries (next)
 
 Build bottom-up rather than prompting over the repository at once:
 
@@ -367,7 +376,7 @@ Semantic v1 is complete when:
 
 ## Verification policy
 
-No further product-value evaluation is required before G6–G9. Implementation
+No further product-value evaluation is required before G7–G9. Implementation
 work still requires engineering verification:
 
 - Rust compile, formatting, lint, unit, migration, and existing regression
