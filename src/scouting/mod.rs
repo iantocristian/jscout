@@ -12,6 +12,7 @@ pub mod refresh;
 pub mod workflow;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{
-    ChatMessage, CompleteRequest, PROTOCOL_VERSION, ProviderOptions, SubmitTool, Usage,
+    ChatMessage, CompleteRequest, ModelCapabilities, PROTOCOL_VERSION, ProviderOptions,
+    ProviderSummary, SubmitTool, Usage,
 };
 use crate::llm::{GatewayError, LlmGateway};
 use crate::semantic::{self, WorkflowCandidateSet};
@@ -76,6 +78,14 @@ pub struct WorkflowBatchReport {
     pub skipped_unscoutable: usize,
     pub duplicate_candidate_sets_skipped: usize,
     pub auto_seed_limit_reached: bool,
+    pub skipped_over_budget: Vec<WorkflowBatchSkip>,
+    pub skipped_unresolvable: Vec<WorkflowBatchSkip>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowBatchSkip {
+    pub subject: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +97,12 @@ pub struct RefreshPlanItem {
     pub workflow: plan::WorkflowPlan,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshPlanningReport {
+    pub plans: Vec<RefreshPlanItem>,
+    pub skipped_unresolvable: Vec<WorkflowBatchSkip>,
+}
+
 struct PreparedWorkflow {
     candidate_set: WorkflowCandidateSet,
     evidence: EvidencePack,
@@ -94,8 +110,68 @@ struct PreparedWorkflow {
     spec: RunSpec,
 }
 
+#[derive(Default)]
+struct PreparationCache {
+    models: BTreeMap<String, ModelCapabilities>,
+    providers: Option<ProviderSummary>,
+}
+
+impl PreparationCache {
+    fn model(
+        &mut self,
+        gateway: &mut dyn LlmGateway,
+        spec: &ModelSpec,
+    ) -> Result<ModelCapabilities> {
+        if let Some(capabilities) = self.models.get(&spec.spec) {
+            return Ok(capabilities.clone());
+        }
+        let (providers, capabilities) = gateway.capabilities(Some(&spec.spec))?;
+        self.providers.get_or_insert(providers);
+        let Some(capabilities) = capabilities else {
+            bail!(
+                "model {} is not known to the gateway; run `jscout llm doctor --model {}`",
+                spec.spec,
+                spec.spec,
+            );
+        };
+        self.models.insert(spec.spec.clone(), capabilities.clone());
+        Ok(capabilities)
+    }
+
+    fn billing_path(&mut self, gateway: &mut dyn LlmGateway, model: &ModelSpec) -> Result<String> {
+        if model.provider == "openai-codex" {
+            return Ok("plan".into());
+        }
+        if self.providers.is_none() {
+            self.providers = Some(gateway.capabilities(None)?.0);
+        }
+        Ok(
+            if self
+                .providers
+                .as_ref()
+                .is_some_and(|providers| providers.custom.iter().any(|id| id == &model.provider))
+            {
+                "custom".into()
+            } else {
+                "api".into()
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ContextBudgetExceeded(String);
+
+impl fmt::Display for ContextBudgetExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContextBudgetExceeded {}
+
 /// One candidate-closed workflow scouting run for an explicit seed set.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn scout_workflows(
     root: &Path,
     conn: &Connection,
@@ -113,7 +189,12 @@ pub fn scout_workflows(
     if plan.items.len() != 1 {
         bail!("single workflow scouting requires one explicit seed group");
     }
-    let prepared = prepare_workflow(gateway, plan.items.remove(0), options)?;
+    let prepared = prepare_workflow(
+        gateway,
+        &mut PreparationCache::default(),
+        plan.items.remove(0),
+        options,
+    )?;
     execute_prepared_workflow(root, conn, gateway, options, prepared, true)
 }
 
@@ -130,11 +211,23 @@ pub fn scout_workflow_plan(
     let skipped_unscoutable = plan.skipped.len();
     let duplicate_candidate_sets_skipped = plan.duplicate_candidate_sets_skipped;
     let auto_seed_limit_reached = plan.auto_seed_limit_reached;
-    let prepared = plan
-        .items
-        .into_iter()
-        .map(|item| prepare_workflow(gateway, item, options))
-        .collect::<Result<Vec<_>>>()?;
+    let automatic = plan.mode == "automatic";
+    let mut cache = PreparationCache::default();
+    let mut prepared = Vec::new();
+    let mut skipped_over_budget = Vec::new();
+    for item in plan.items {
+        let subject = item.seeds.join(", ");
+        match prepare_workflow(gateway, &mut cache, item, options) {
+            Ok(workflow) => prepared.push(workflow),
+            Err(error) if automatic && error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+                skipped_over_budget.push(WorkflowBatchSkip {
+                    subject,
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
@@ -164,6 +257,8 @@ pub fn scout_workflow_plan(
         skipped_unscoutable,
         duplicate_candidate_sets_skipped,
         auto_seed_limit_reached,
+        skipped_over_budget,
+        skipped_unresolvable: Vec::new(),
     })
 }
 
@@ -172,26 +267,34 @@ pub fn plan_refresh(
     root: &Path,
     conn: &Connection,
     selection: &refresh::RefreshSelection,
-) -> Result<Vec<RefreshPlanItem>> {
-    selection
-        .targets
-        .iter()
-        .map(|target| {
-            Ok(RefreshPlanItem {
+) -> Result<RefreshPlanningReport> {
+    let mut plans = Vec::new();
+    let mut skipped_unresolvable = Vec::new();
+    for target in &selection.targets {
+        match plan::workflows(
+            root,
+            conn,
+            &target.config.seeds,
+            target.config.depth,
+            target.config.candidate_limit,
+        ) {
+            Ok(workflow) => plans.push(RefreshPlanItem {
                 artifact_id: target.artifact_id,
                 freshness: target.freshness.clone(),
                 model: target.model.spec.clone(),
                 reasoning: target.reasoning.clone(),
-                workflow: plan::workflows(
-                    root,
-                    conn,
-                    &target.config.seeds,
-                    target.config.depth,
-                    target.config.candidate_limit,
-                )?,
-            })
-        })
-        .collect()
+                workflow,
+            }),
+            Err(error) => skipped_unresolvable.push(WorkflowBatchSkip {
+                subject: format!("artifact {}", target.artifact_id),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    Ok(RefreshPlanningReport {
+        plans,
+        skipped_unresolvable,
+    })
 }
 
 /// Refresh stale/degraded generated workflows under one strict command-level
@@ -205,19 +308,34 @@ pub fn scout_refresh(
 ) -> Result<WorkflowBatchReport> {
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let mut prepared = Vec::new();
+    let mut skipped_unresolvable = Vec::new();
+    let mut skipped_over_budget = Vec::new();
+    let mut cache = PreparationCache::default();
     for target in selection.targets {
-        let mut workflow_plan = plan::workflows(
+        let artifact_id = target.artifact_id;
+        let workflow_plan = plan::workflows(
             root,
             conn,
             &target.config.seeds,
             target.config.depth,
             target.config.candidate_limit,
-        )?;
+        );
+        let mut workflow_plan = match workflow_plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                skipped_unresolvable.push(WorkflowBatchSkip {
+                    subject: format!("artifact {artifact_id}"),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
         if workflow_plan.items.len() != 1 {
-            bail!(
-                "refresh artifact {} did not reconstruct one seed group",
-                target.artifact_id
-            );
+            skipped_unresolvable.push(WorkflowBatchSkip {
+                subject: format!("artifact {artifact_id}"),
+                reason: "did not reconstruct one seed group".into(),
+            });
+            continue;
         }
         let options = WorkflowScoutOptions {
             seeds: target.config.seeds,
@@ -228,10 +346,18 @@ pub fn scout_refresh(
             service_tier: target.config.service_tier,
             policy: policy.clone(),
             rebuild: false,
-            supersedes_artifact_id: Some(target.artifact_id),
+            supersedes_artifact_id: Some(artifact_id),
         };
-        let workflow = prepare_workflow(gateway, workflow_plan.items.remove(0), &options)?;
-        prepared.push((options, workflow));
+        match prepare_workflow(gateway, &mut cache, workflow_plan.items.remove(0), &options) {
+            Ok(workflow) => prepared.push((options, workflow)),
+            Err(error) if error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+                skipped_over_budget.push(WorkflowBatchSkip {
+                    subject: format!("artifact {artifact_id}"),
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let mut reports = Vec::new();
@@ -263,19 +389,23 @@ pub fn scout_refresh(
         skipped_unscoutable: 0,
         duplicate_candidate_sets_skipped: 0,
         auto_seed_limit_reached: false,
+        skipped_over_budget,
+        skipped_unresolvable,
     })
 }
 
 fn prepare_workflow(
     gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
     item: plan::WorkflowPlanItem,
     options: &WorkflowScoutOptions,
 ) -> Result<PreparedWorkflow> {
     let candidate_set = item.candidate_set;
     let evidence = item.evidence;
     let mut request = build_request(&candidate_set, &evidence, options)?;
+    let capabilities = cache.model(gateway, &options.model)?;
     enforce_context_budget(
-        gateway,
+        &capabilities,
         &mut request,
         &evidence,
         candidate_set.candidates.len(),
@@ -297,7 +427,7 @@ fn prepare_workflow(
         gateway_protocol: PROTOCOL_VERSION,
         provider: options.model.provider.clone(),
         model: options.model.model_id.clone(),
-        billing_path: provisional_billing_path(gateway, &options.model)?,
+        billing_path: cache.billing_path(gateway, &options.model)?,
         reasoning: options.reasoning.clone(),
         prompt_version: workflow::PROMPT_VERSION.into(),
         source_snapshot: candidate_set.snapshot.clone(),
@@ -579,20 +709,12 @@ fn build_request(
 /// pack must fit --context-bytes, and when the gateway reports the model's
 /// context window the pack must plausibly fit it too.
 fn enforce_context_budget(
-    gateway: &mut dyn LlmGateway,
+    capabilities: &ModelCapabilities,
     request: &mut CompleteRequest,
     evidence: &EvidencePack,
     candidate_count: usize,
     options: &WorkflowScoutOptions,
 ) -> Result<()> {
-    let (_, capabilities) = gateway.capabilities(Some(&options.model.spec))?;
-    let Some(capabilities) = capabilities else {
-        bail!(
-            "model {} is not known to the gateway; run `jscout llm doctor --model {}`",
-            options.model.spec,
-            options.model.spec,
-        );
-    };
     let desired_output = BASE_OUTPUT_TOKENS.saturating_add(
         OUTPUT_TOKENS_PER_CANDIDATE
             .saturating_mul(u64::try_from(candidate_count).unwrap_or(u64::MAX)),
@@ -604,12 +726,13 @@ fn enforce_context_budget(
 
     let request_bytes = serde_json::to_string(request)?.len();
     if request_bytes > options.policy.context_bytes {
-        bail!(
+        return Err(ContextBudgetExceeded(format!(
             "serialized evidence pack is {request_bytes} bytes, over --context-bytes {}; \
              narrow the seeds/depth or raise the budget ({} evidence files)",
             options.policy.context_bytes,
             evidence.files.len(),
-        );
+        ))
+        .into());
     }
     if let Some(window) = capabilities.context_window {
         // pi-ai exposes no common tokenizer. UTF-8 byte length is a
@@ -617,28 +740,16 @@ fn enforce_context_budget(
         // average bytes/token divisor can undercount punctuation-heavy code.
         let input_token_ceiling = request_bytes as u64;
         if input_token_ceiling.saturating_add(output_tokens) > window {
-            bail!(
+            return Err(ContextBudgetExceeded(format!(
                 "evidence pack requires at most {input_token_ceiling} input tokens plus \
                  {output_tokens} reserved output tokens, over the {} context window of {}; \
                  narrow the seeds or choose a larger-context model",
-                window,
-                options.model.spec,
-            );
+                window, options.model.spec,
+            ))
+            .into());
         }
     }
     Ok(())
-}
-
-fn provisional_billing_path(gateway: &mut dyn LlmGateway, model: &ModelSpec) -> Result<String> {
-    if model.provider == "openai-codex" {
-        return Ok("plan".into());
-    }
-    let (providers, _) = gateway.capabilities(None)?;
-    Ok(if providers.custom.iter().any(|id| id == &model.provider) {
-        "custom".into()
-    } else {
-        "api".into()
-    })
 }
 
 fn input_fingerprint(
@@ -794,6 +905,7 @@ mod tests {
     struct FakeGateway {
         results: VecDeque<Result<CompletionOutcome, GatewayError>>,
         calls: usize,
+        capability_calls: usize,
         last_max_tokens: Option<u64>,
         on_complete: Option<Box<dyn FnMut()>>,
     }
@@ -803,6 +915,7 @@ mod tests {
             Self {
                 results: results.into(),
                 calls: 0,
+                capability_calls: 0,
                 last_max_tokens: None,
                 on_complete: None,
             }
@@ -814,6 +927,7 @@ mod tests {
             &mut self,
             model: Option<&str>,
         ) -> Result<(ProviderSummary, Option<ModelCapabilities>), GatewayError> {
+            self.capability_calls += 1;
             Ok((
                 ProviderSummary {
                     builtin: 1,
@@ -1094,6 +1208,55 @@ mod tests {
     }
 
     #[test]
+    fn automatic_batch_skips_one_oversized_boundary_and_continues() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("index.ts"),
+            "export function huge() { return 1; }\n\
+             export function tiny() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut plan = super::plan::workflows(repo.path(), &conn, &[], 2, 31)?;
+        assert_eq!(plan.items.len(), 2);
+        plan.items[0]
+            .evidence
+            .rendered
+            .push_str(&"x".repeat(20_000));
+        let submission = defining_submission(&plan.items[1].candidate_set);
+
+        let mut options = scout_options();
+        options.seeds.clear();
+        options.policy = RequestPolicy::new(30, 2, 8_000)?;
+        let mut gateway = FakeGateway::new(vec![Ok(outcome(submission))]);
+        let batch = scout_workflow_plan(repo.path(), &conn, &mut gateway, &options, plan)?;
+
+        assert_eq!(batch.skipped_over_budget.len(), 1);
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.model_calls, 1);
+        assert_eq!(gateway.calls, 1);
+        assert_eq!(
+            gateway.capability_calls, 1,
+            "model capabilities and provider summary are cached for the batch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_workflow_keeps_the_hard_context_budget_failure() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        let mut options = scout_options();
+        options.policy = RequestPolicy::new(30, 1, 1)?;
+        let mut gateway = FakeGateway::new(Vec::new());
+        let error = scout_workflows(repo.path(), &conn, &mut gateway, &options)
+            .expect_err("explicit over-budget input must fail");
+        assert!(error.to_string().contains("over --context-bytes"));
+        assert_eq!(gateway.calls, 0);
+        Ok(())
+    }
+
+    #[test]
     fn refresh_replays_recorded_inputs_and_publishes_an_immutable_successor() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = fixture(repo.path())?;
@@ -1108,8 +1271,12 @@ mod tests {
              export function start() { return finish(); }\n",
         )?;
         indexer::index_repo(repo.path(), &conn)?;
-        let selection = super::refresh::select(&conn, &[first_id])?;
+        let mut selection = super::refresh::select(&conn, &[first_id])?;
         assert_eq!(selection.targets.len(), 1);
+        let mut unresolvable = selection.targets[0].clone();
+        unresolvable.artifact_id = 999;
+        unresolvable.config.seeds = vec!["deleted-workflow-anchor".into()];
+        selection.targets.insert(0, unresolvable);
         let refreshed_anchors = candidate_anchors(&conn, repo.path())?;
         let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&refreshed_anchors)))]);
         let batch = scout_refresh(
@@ -1120,6 +1287,7 @@ mod tests {
             RequestPolicy::new(30, 1, 240_000)?,
         )?;
         assert_eq!(batch.model_calls, 1);
+        assert_eq!(batch.skipped_unresolvable.len(), 1);
         let successor = batch.reports[0].artifact_id.expect("refreshed artifact");
         assert_ne!(successor, first_id);
         let supersedes: i64 = conn.query_row(

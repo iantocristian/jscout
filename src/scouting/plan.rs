@@ -249,16 +249,43 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
     }
     let mut seeds = seeds.into_iter().collect::<Vec<_>>();
     seeds.sort_by(|left, right| {
-        let left_export_only = left.1.iter().all(|source| source == "exported-entry-point");
-        let right_export_only = right
-            .1
-            .iter()
-            .all(|source| source == "exported-entry-point");
-        left_export_only
-            .cmp(&right_export_only)
+        seed_priority(&left.1)
+            .cmp(&seed_priority(&right.1))
             .then_with(|| left.0.cmp(&right.0))
     });
     Ok(seeds)
+}
+
+fn seed_priority(sources: &[String]) -> u8 {
+    if sources.iter().any(|source| {
+        matches!(
+            source.as_str(),
+            "runtime:handles_route"
+                | "runtime:handles_graphql"
+                | "runtime:registered_handler"
+                | "runtime:lifecycle_listener"
+                | "runtime:job_handler"
+                | "runtime:provides"
+        )
+    }) {
+        0
+    } else if sources.iter().any(|source| {
+        matches!(
+            source.as_str(),
+            "runtime:dispatches"
+                | "runtime:produces_lifecycle"
+                | "runtime:produces_lifecycle_via"
+                | "runtime:produces_job"
+                | "runtime:produces_job_via"
+                | "runtime:invokes_graphql"
+        )
+    }) {
+        1
+    } else if sources.iter().any(|source| source == "runtime:injects") {
+        2
+    } else {
+        3
+    }
 }
 
 fn is_entry_file(path: &str) -> bool {
@@ -348,6 +375,7 @@ mod tests {
                 "symbol",
                 Some(production_file),
             ),
+            ("sym:runtime.ts#::inject@3", "symbol", Some(production_file)),
             ("sym:runtime.ts#::handle@2", "symbol", Some(production_file)),
             (
                 "sym:runtime.test.ts#::testOnly@1",
@@ -383,6 +411,11 @@ mod tests {
                 "entity:registry:job",
                 "produces_job",
             ),
+            (
+                "sym:runtime.ts#::inject@3",
+                "entity:registry:job",
+                "injects",
+            ),
         ] {
             conn.execute(
                 "INSERT INTO resolved_edges(src_key,dst_key,kind,confidence,provenance)
@@ -392,14 +425,16 @@ mod tests {
         }
 
         let seeds = super::automatic_seeds(repo.path(), &conn)?;
-        assert_eq!(seeds.len(), 2, "test-role endpoints stay out of auto seeds");
-        assert_eq!(seeds[0].0, "sym:runtime.ts#::dispatch@1");
-        assert_eq!(seeds[0].1, ["runtime:dispatches"]);
-        assert_eq!(seeds[1].0, "sym:runtime.ts#::handle@2");
+        assert_eq!(seeds.len(), 3, "test-role endpoints stay out of auto seeds");
+        assert_eq!(seeds[0].0, "sym:runtime.ts#::handle@2");
         assert_eq!(
-            seeds[1].1,
+            seeds[0].1,
             ["runtime:handles_route", "runtime:registered_handler"]
         );
+        assert_eq!(seeds[1].0, "sym:runtime.ts#::dispatch@1");
+        assert_eq!(seeds[1].1, ["runtime:dispatches"]);
+        assert_eq!(seeds[2].0, "sym:runtime.ts#::inject@3");
+        assert_eq!(seeds[2].1, ["runtime:injects"]);
         Ok(())
     }
 }
