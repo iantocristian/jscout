@@ -968,6 +968,9 @@ fn execute_prepared_workflow(
                 input_fingerprint: Some(&input_fingerprint),
             },
         )?;
+        if let Some(previous) = annotate_input.supersedes {
+            ledger::retire_generating_run(conn, previous)?;
+        }
         ledger::record_classifications(conn, run_id, &validated.classifications)?;
         ledger::finish_run(conn, run_id, RunOutcome::Completed, Some(&usage_json), None)?;
         Ok(artifact_id)
@@ -1263,6 +1266,9 @@ fn execute_prepared_card(
                 input_fingerprint: Some(&input_fingerprint),
             },
         )?;
+        if let Some(previous) = annotate_input.supersedes {
+            ledger::retire_generating_run(conn, previous)?;
+        }
         ledger::record_classifications(conn, run_id, &validated.classifications)?;
         ledger::finish_run(conn, run_id, RunOutcome::Completed, Some(&usage_json), None)?;
         Ok(artifact_id)
@@ -2739,6 +2745,72 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(current, 1, "exactly one current card per subject");
+        Ok(())
+    }
+
+    #[test]
+    fn reverting_the_subject_republishes_over_the_stale_successor() -> Result<()> {
+        let original = "export function finish() { return 1; }\n\
+                        export function start() { return finish(); }\n";
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+
+        // Input A -> card A.
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let card_a = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        let artifact_a = card_a.artifact_id.expect("card A");
+        let run_a = card_a.run_id;
+
+        // Input B -> card B supersedes card A.
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 2; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let card_b = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        let artifact_b = card_b.artifact_id.expect("card B");
+        let run_a_status: String = conn.query_row(
+            "SELECT status FROM scout_runs WHERE id=?1",
+            [run_a],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            run_a_status, "superseded",
+            "superseding card A must retire its generating run"
+        );
+
+        // Input back to A: run A must NOT satisfy reuse; the third card must
+        // supersede stale card B and become the sole current artifact.
+        std::fs::write(repo.path().join("flow.ts"), original)?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let card_c = scout_one_card(repo.path(), &conn, &mut gateway, &card_options())?;
+        assert_eq!(card_c.status, "completed", "reverted input must republish");
+        let artifact_c = card_c.artifact_id.expect("card C");
+        assert_ne!(artifact_c, artifact_a);
+        assert_ne!(artifact_c, artifact_b);
+
+        let supersedes: Option<i64> = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [artifact_c],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, Some(artifact_b));
+        let current: Vec<i64> = {
+            let mut statement = conn.prepare(
+                "SELECT artifact.id FROM semantic_artifacts artifact
+                 WHERE artifact.artifact_type='card'
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )",
+            )?;
+            let rows = statement.query_map([], |row| row.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        assert_eq!(current, vec![artifact_c], "card C is the sole current card");
         Ok(())
     }
 

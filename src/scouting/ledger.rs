@@ -72,6 +72,21 @@ pub struct ClassificationRow {
 pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<RunClaim> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let claim = (|| -> Result<RunClaim> {
+        // A completed run whose artifact has since been superseded (input
+        // A -> B -> back to A) still occupies the unique in-flight slot but
+        // must not satisfy reuse: retire it so a replacement can claim these
+        // inputs and supersede the stale successor.
+        conn.execute(
+            "UPDATE scout_runs SET status='superseded'
+             WHERE scout_kind=?1 AND input_fingerprint=?2 AND status='completed'
+               AND EXISTS(
+                 SELECT 1 FROM semantic_artifacts artifact
+                 JOIN semantic_artifacts successor
+                   ON successor.supersedes_artifact_id=artifact.id
+                 WHERE artifact.scout_run_id=scout_runs.id
+               )",
+            params![spec.scout_kind, spec.input_fingerprint],
+        )?;
         let current_artifact = current_artifact_for_input(conn, spec)?;
         let supersedes_artifact_id = if rebuild {
             conn.execute(
@@ -156,19 +171,39 @@ fn current_artifact_for_input(conn: &Connection, spec: &RunSpec) -> Result<Optio
         .optional()?)
 }
 
+/// A completed identical run is reusable only while its artifact is still
+/// current: once a successor exists, reuse would hand back a hidden record
+/// while the stale successor stayed current. A completed run without a
+/// recorded artifact stays reusable — refusing it would leave the unique
+/// in-flight slot occupied with no way to claim a replacement.
 pub(crate) fn reusable_run(conn: &Connection, spec: &RunSpec) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
-            "SELECT id FROM scout_runs
-             WHERE scout_kind=?1 AND input_fingerprint=?2 AND status='completed'",
+            "SELECT run.id FROM scout_runs run
+             LEFT JOIN semantic_artifacts artifact ON artifact.scout_run_id=run.id
+             WHERE run.scout_kind=?1 AND run.input_fingerprint=?2
+               AND run.status='completed'
+               AND (artifact.id IS NULL OR NOT EXISTS(
+                 SELECT 1 FROM semantic_artifacts successor
+                 WHERE successor.supersedes_artifact_id=artifact.id
+               ))",
             params![spec.scout_kind, spec.input_fingerprint],
             |row| row.get(0),
         )
-        .map(Some)
-        .or_else(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?)
+        .optional()?)
+}
+
+/// When an artifact gains a successor, its generating completed run must
+/// stop satisfying reuse and stop occupying the unique in-flight slot for
+/// its inputs. Runs inside the caller's publication transaction.
+pub(crate) fn retire_generating_run(conn: &Connection, artifact_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE scout_runs SET status='superseded'
+         WHERE status='completed'
+           AND id=(SELECT scout_run_id FROM semantic_artifacts WHERE id=?1)",
+        [artifact_id],
+    )?;
+    Ok(())
 }
 
 /// Terminal transition. Safe inside a caller-owned transaction: this is a

@@ -1145,7 +1145,7 @@ fn cmd_scout_workflows(
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
-    Ok(())
+    scout_batch_exit(&batch)
 }
 
 fn cmd_scout_cards(
@@ -1167,7 +1167,7 @@ fn cmd_scout_cards(
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_card_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
-    Ok(())
+    scout_batch_exit(&batch)
 }
 
 fn cmd_scout_refresh(
@@ -1213,6 +1213,24 @@ fn cmd_scout_refresh(
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_refresh(root, &conn, &mut gateway, selection, policy)?;
     print_scout_batch(&batch);
+    scout_batch_exit(&batch)
+}
+
+/// Failed subjects are printed AND fail the process: scripts and agents key
+/// on exit status. Incomplete refusals and reported policy skips are designed
+/// outcomes and exit zero.
+fn scout_batch_exit(batch: &scouting::ScoutBatchReport) -> Result<()> {
+    let failed = batch
+        .reports
+        .iter()
+        .filter(|report| report.status == "failed")
+        .count();
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} of {} scouting subject(s) failed; see the report above",
+            batch.reports.len()
+        );
+    }
     Ok(())
 }
 
