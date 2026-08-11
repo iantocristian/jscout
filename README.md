@@ -8,6 +8,13 @@ TypeScript. Type-only bindings never become runtime edges. A separate
 documentary contract plane indexes interfaces, aliases, enums, decorators,
 schemas, and exported API types without claiming they execute.
 
+## Project documents
+
+- [PLAN.md](PLAN.md) is the single current architecture and roadmap.
+- [eval/](eval/) contains dated evaluation protocols and results.
+- [presentations/](presentations/) contains dated, non-normative explanatory
+  artifacts; they are not revision material unless explicitly requested.
+
 ## Commands
 
 ```
