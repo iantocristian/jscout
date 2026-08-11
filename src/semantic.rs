@@ -39,6 +39,18 @@ pub struct AnnotateInput {
     pub supersedes: Option<i64>,
 }
 
+/// One parent-claim link to a child artifact, pinned to the child's
+/// fingerprint so a changed child degrades or stales the parent even when
+/// the parent's own text is unchanged.
+#[derive(Debug, Clone)]
+pub struct RelationInput {
+    pub claim_path: String,
+    pub relation: String,
+    pub dst_artifact_id: i64,
+    pub dst_fingerprint: String,
+    pub confidence: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowParticipantInput {
     pub anchor: String,
@@ -455,6 +467,7 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         input,
         &snapshot,
         &supports,
+        &[],
         &ArtifactProvenance {
             model: "agent-reported",
             prompt_version: "annotate/v2",
@@ -635,6 +648,7 @@ pub(crate) fn persist_validated_artifact(
     input: &AnnotateInput,
     snapshot: &str,
     supports: &[ValidatedSupport],
+    relations: &[RelationInput],
     provenance: &ArtifactProvenance<'_>,
 ) -> Result<i64> {
     let body_json = serde_json::to_string(&input.body)?;
@@ -654,6 +668,16 @@ pub(crate) fn persist_validated_artifact(
             ]
         })
         .collect();
+    // Relations are evidence identity for parent artifacts: a summary's
+    // fingerprint must change when its view of any child changes.
+    support_rows.extend(relations.iter().map(|relation| {
+        vec![
+            format!("relation:{}", relation.relation),
+            relation.claim_path.clone(),
+            relation.dst_fingerprint.clone(),
+            relation.confidence.clone(),
+        ]
+    }));
     let artifact_fingerprint = crate::store::artifact_fingerprint(
         &crate::store::ArtifactIdentity {
             artifact_type: &input.artifact_type,
@@ -707,6 +731,22 @@ pub(crate) fn persist_validated_artifact(
                 support.source_hash,
                 support.context_hash,
                 support.confidence,
+            ])?;
+        }
+        let mut relation_statement = conn.prepare_cached(
+            "INSERT INTO semantic_relations(
+               src_artifact_id, dst_artifact_id, relation, claim_path,
+               confidence, dst_fingerprint
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+        )?;
+        for relation in relations {
+            relation_statement.execute(params![
+                artifact_id,
+                relation.dst_artifact_id,
+                relation.relation,
+                relation.claim_path,
+                relation.confidence,
+                relation.dst_fingerprint,
             ])?;
         }
         Ok(artifact_id)
@@ -764,6 +804,14 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
+    load_artifact_at_depth(conn, id, 3)
+}
+
+fn load_artifact_at_depth(
+    conn: &Connection,
+    id: i64,
+    depth: u8,
+) -> Result<Option<SemanticArtifact>> {
     let row = conn
         .query_row(
             "SELECT id, supersedes_artifact_id, artifact_type, canonical_name, body_json,
@@ -868,13 +916,14 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
         .iter()
         .filter(|support| support.freshness == "fresh")
         .count();
-    let freshness = if fresh_supports == supports.len() {
+    let own_freshness = if fresh_supports == supports.len() {
         "fresh"
     } else if artifact_type == "workflow" && fresh_supports > 0 {
         "degraded"
     } else {
         "stale"
     };
+    let freshness = child_adjusted_freshness(conn, id, own_freshness, depth)?;
     Ok(Some(SemanticArtifact {
         id,
         supersedes,
@@ -887,25 +936,117 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
         confidence,
         source_snapshot,
         created_at,
-        freshness: freshness.to_string(),
+        freshness,
         supports,
         relevance: 0.0,
     }))
+}
+
+/// Fold pinned child fingerprints into the parent's freshness: a missing,
+/// superseded, or changed child stales the parent; a current child that is
+/// itself no longer fresh degrades it — even when the parent's own text and
+/// direct supports are unchanged. Depth bounds the recursion defensively;
+/// the hierarchy is file -> module -> repository, so three levels suffice.
+fn child_adjusted_freshness(
+    conn: &Connection,
+    artifact_id: i64,
+    own_freshness: &str,
+    depth: u8,
+) -> Result<String> {
+    let rank = |label: &str| match label {
+        "fresh" => 0_u8,
+        "degraded" => 1,
+        _ => 2,
+    };
+    let mut worst = rank(own_freshness);
+    let mut statement = conn.prepare_cached(
+        "SELECT dst_artifact_id, dst_fingerprint FROM semantic_relations
+         WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
+    )?;
+    let children = statement
+        .query_map([artifact_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (child_id, pinned_fingerprint) in children {
+        if worst == 2 {
+            break;
+        }
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT artifact.artifact_fingerprint FROM semantic_artifacts artifact
+                 WHERE artifact.id=?1 AND NOT EXISTS(
+                   SELECT 1 FROM semantic_artifacts successor
+                   WHERE successor.supersedes_artifact_id=artifact.id
+                 )",
+                [child_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current.flatten() {
+            Some(fingerprint) if fingerprint == pinned_fingerprint => {
+                if depth == 0 {
+                    continue;
+                }
+                let child_freshness =
+                    load_artifact_at_depth(conn, child_id, depth - 1)?.map(|child| child.freshness);
+                match child_freshness.as_deref() {
+                    Some("fresh") => {}
+                    Some(_) => worst = worst.max(1),
+                    None => worst = 2,
+                }
+            }
+            _ => worst = 2,
+        }
+    }
+    Ok(match worst {
+        0 => "fresh".into(),
+        1 => "degraded".into(),
+        _ => "stale".into(),
+    })
 }
 
 fn validate_input(input: &AnnotateInput) -> Result<()> {
     validate_confidence(&input.confidence)?;
     if !matches!(
         input.artifact_type.as_str(),
-        "workflow" | "annotation" | "card"
+        "workflow" | "annotation" | "card" | "summary"
     ) {
-        bail!("semantic artifact type must be one of: workflow, annotation, card");
+        bail!("semantic artifact type must be one of: workflow, annotation, card, summary");
     }
     if !input.body.is_object() {
         bail!("semantic artifact body must be a JSON object");
     }
     if serde_json::to_vec(&input.body)?.len() > MAX_BODY_BYTES {
         bail!("semantic artifact body exceeds {MAX_BODY_BYTES} bytes");
+    }
+    // A summary's claims are supported by `summarizes` relations pinned to
+    // child artifact fingerprints, not by direct source spans: the scouting
+    // layer enforces claim-to-child coverage and the publication transaction
+    // rechecks child currency. Prose without that chain never validates.
+    if input.artifact_type == "summary" {
+        if input.supports.len() > MAX_SUPPORTS {
+            bail!("semantic artifacts allow at most {MAX_SUPPORTS} supports");
+        }
+        let Some(scope) = input.name.as_deref().filter(|name| !name.is_empty()) else {
+            bail!("summary artifacts require their scope key as the name");
+        };
+        let level = input.body.get("level").and_then(Value::as_str);
+        match (level, scope) {
+            (Some("file"), scope) if scope.starts_with("file:") => {}
+            (Some("module"), scope) if scope.starts_with("module:") => {}
+            (Some("repository"), "repo") => {}
+            _ => bail!("summary level must be file, module, or repository and match its scope key"),
+        }
+        if input
+            .body
+            .get("overview")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("summary body requires a non-empty string `overview`");
+        }
+        return Ok(());
     }
     if input.supports.is_empty() || input.supports.len() > MAX_SUPPORTS {
         bail!("semantic artifacts require 1..={MAX_SUPPORTS} supports");
@@ -1121,6 +1262,109 @@ mod tests {
             evidence_end_line: 1,
             confidence: "likely".into(),
         }
+    }
+
+    #[test]
+    fn summaries_degrade_and_stale_with_their_children() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        let alpha = "sym:a.ts#::alpha@1";
+
+        let card = annotate(
+            repo.path(),
+            &conn,
+            &AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(alpha.into()),
+                body: json!({ "purpose": "starts the alpha flow" }),
+                supports: vec![support("/purpose", alpha, "a.ts")],
+                confidence: "likely".into(),
+                snapshot: snapshot.clone(),
+                supersedes: None,
+            },
+        )?;
+        let card_fingerprint: String = conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+            [card.id],
+            |row| row.get(0),
+        )?;
+
+        let summary_input = AnnotateInput {
+            artifact_type: "summary".into(),
+            name: Some("file:a.ts".into()),
+            body: json!({
+                "level": "file",
+                "scope": "file:a.ts",
+                "overview": "hosts the alpha entry point",
+            }),
+            supports: Vec::new(),
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        };
+        let (current_snapshot, supports) =
+            super::validate_annotate_input(repo.path(), &conn, &summary_input)?;
+        let parent_id = super::persist_validated_artifact(
+            &conn,
+            &summary_input,
+            &current_snapshot,
+            &supports,
+            &[super::RelationInput {
+                claim_path: "/overview".into(),
+                relation: "summarizes".into(),
+                dst_artifact_id: card.id,
+                dst_fingerprint: card_fingerprint,
+                confidence: "likely".into(),
+            }],
+            &super::ArtifactProvenance {
+                model: "test",
+                prompt_version: "summary-scout/v1",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )?;
+        let freshness = |id: i64| -> Result<String> {
+            Ok(super::load_artifact(&conn, id)?
+                .expect("artifact exists")
+                .freshness)
+        };
+        assert_eq!(freshness(parent_id)?, "fresh");
+
+        // The child's own source drifts: the child is still current with the
+        // pinned fingerprint but no longer fresh, so the parent degrades even
+        // though its own text and relations are unchanged.
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 2; }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        assert_ne!(freshness(card.id)?, "fresh");
+        assert_eq!(freshness(parent_id)?, "degraded");
+
+        // The child is superseded: the parent's pinned fingerprint no longer
+        // names a current artifact, so the parent is stale outright.
+        let successor_snapshot = structural::current_snapshot(&conn)?;
+        annotate(
+            repo.path(),
+            &conn,
+            &AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(alpha.into()),
+                body: json!({ "purpose": "starts the revised alpha flow" }),
+                supports: vec![support("/purpose", alpha, "a.ts")],
+                confidence: "likely".into(),
+                snapshot: successor_snapshot,
+                supersedes: Some(card.id),
+            },
+        )?;
+        assert_eq!(freshness(parent_id)?, "stale");
+        Ok(())
     }
 
     #[test]

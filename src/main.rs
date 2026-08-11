@@ -393,6 +393,47 @@ enum ScoutCommand {
         #[arg(long)]
         gateway_path: Option<PathBuf>,
     },
+    /// Hierarchical child-cited summaries over validated artifacts
+    Summaries {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Summary level: file, module, or repository; omit to run all bottom-up
+        #[arg(long)]
+        level: Option<String>,
+        /// Explicit scope keys (file:<path>, module:<pkg>, repo); requires --level
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level request budget across all levels
+        #[arg(long)]
+        max_calls: usize,
+        /// Maximum serialized evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Supersede completed identical runs instead of reusing them
+        #[arg(long)]
+        rebuild: bool,
+        /// Print exact per-level plans and budgets; make no model calls
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
     /// Replace stale/degraded generated workflows and cards using their recorded inputs
     Refresh {
         /// Repository root (must be indexed)
@@ -718,6 +759,36 @@ fn main() -> Result<()> {
                     },
                 )
             }
+            ScoutCommand::Summaries {
+                root,
+                level,
+                scopes,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                max_calls,
+                context_bytes,
+                rebuild,
+                dry_run,
+                database,
+                gateway_path,
+            } => cmd_scout_summaries(
+                &root,
+                database.as_deref(),
+                gateway_path.as_deref(),
+                dry_run,
+                scouting::SummaryScoutOptions {
+                    level,
+                    scopes,
+                    model: llm::config::resolve_model(model.as_deref())?,
+                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                    service_tier,
+                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                    rebuild,
+                    supersedes_artifact_id: None,
+                },
+            ),
             ScoutCommand::Refresh {
                 root,
                 artifacts,
@@ -1144,6 +1215,29 @@ fn cmd_scout_workflows(
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
+    print_scout_batch(&batch);
+    scout_batch_exit(&batch)
+}
+
+fn cmd_scout_summaries(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    dry_run: bool,
+    options: scouting::SummaryScoutOptions,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scouting::summary_dry_run_report(
+                root, &conn, &options
+            )?)?
+        );
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let batch = scouting::scout_summaries(root, &conn, &mut gateway, &options)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
 }

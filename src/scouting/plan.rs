@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::card::CardSubject;
 use super::evidence::{self, EvidencePack};
+use super::summary::{self};
 use crate::semantic::{self, WorkflowCandidateOptions, WorkflowCandidateSet};
 use crate::{origin, store, structural};
 
@@ -537,6 +538,344 @@ fn candidate_boundary_fingerprint(set: &WorkflowCandidateSet) -> String {
         hasher.update(candidate.anchor.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// A summary scope's child artifacts can outgrow one bounded prompt; the
+/// deterministic response is refusal (skip in automatic mode), never silent
+/// truncation of the child set.
+const MAX_SUMMARY_CHILDREN: usize = 64;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlanItem {
+    pub level: String,
+    pub scope: String,
+    pub display: String,
+    pub child_count: usize,
+    pub evidence_bytes: usize,
+    #[serde(skip)]
+    pub(crate) scope_meta: summary::SummaryScope,
+    #[serde(skip)]
+    pub(crate) children: Vec<summary::SummaryChild>,
+    #[serde(skip)]
+    pub(crate) rendered: String,
+    #[serde(skip)]
+    pub(crate) snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlanSkip {
+    pub scope: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlan {
+    pub mode: String,
+    pub level: String,
+    pub snapshot: String,
+    pub items: Vec<SummaryPlanItem>,
+    pub skipped: Vec<SummaryPlanSkip>,
+}
+
+/// Deterministic bottom-up scope discovery for one level. A scope is planned
+/// only when it has current child artifacts to summarize — prose without a
+/// support chain is not indexable memory, so childless scopes are not
+/// summary subjects at all. Explicit scopes must resolve or the plan fails.
+pub fn summaries(
+    root: &Path,
+    conn: &Connection,
+    level: &str,
+    explicit_scopes: &[String],
+) -> Result<SummaryPlan> {
+    if !matches!(level, "file" | "module" | "repository") {
+        bail!("summary level must be one of: file, module, repository");
+    }
+    store::with_read_snapshot(conn, "jscout_scout_plan", || {
+        let snapshot = structural::current_snapshot(conn)?;
+        let mut scopes = discover_summary_scopes(root, conn, level)?;
+        let mode = if explicit_scopes.is_empty() {
+            "automatic"
+        } else {
+            for scope in explicit_scopes {
+                if !scopes.iter().any(|(key, _, _)| key == scope) {
+                    bail!(
+                        "summary scope `{scope}` has no current child artifacts at level \
+                         {level}; scout cards/workflows (or lower summary levels) first"
+                    );
+                }
+            }
+            scopes.retain(|(key, _, _)| explicit_scopes.iter().any(|scope| scope == key));
+            "explicit"
+        };
+
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for (scope_key, display, children) in scopes.drain(..) {
+            if children.len() > MAX_SUMMARY_CHILDREN {
+                let reason = format!(
+                    "{} child artifacts exceed the supported {MAX_SUMMARY_CHILDREN}; \
+                     the child set is never silently truncated",
+                    children.len()
+                );
+                if mode == "explicit" {
+                    bail!("summary scope `{scope_key}`: {reason}");
+                }
+                skipped.push(SummaryPlanSkip {
+                    scope: scope_key,
+                    reason,
+                });
+                continue;
+            }
+            let scope_meta = summary::SummaryScope {
+                level: level.to_string(),
+                scope_key: scope_key.clone(),
+                display: display.clone(),
+            };
+            let rendered = render_summary_pack(conn, &scope_meta, &children)?;
+            items.push(SummaryPlanItem {
+                level: level.to_string(),
+                scope: scope_key,
+                display,
+                child_count: children.len(),
+                evidence_bytes: rendered.len(),
+                scope_meta,
+                children,
+                rendered,
+                snapshot: snapshot.clone(),
+            });
+        }
+        Ok(SummaryPlan {
+            mode: mode.into(),
+            level: level.into(),
+            snapshot,
+            items,
+            skipped,
+        })
+    })
+}
+
+type DiscoveredScope = (String, String, Vec<summary::SummaryChild>);
+
+fn discover_summary_scopes(
+    root: &Path,
+    conn: &Connection,
+    level: &str,
+) -> Result<Vec<DiscoveredScope>> {
+    let mut scopes: BTreeMap<String, (String, Vec<summary::SummaryChild>)> = BTreeMap::new();
+    let mut add = |scope_key: String, display: String, child: SummaryChildRow| {
+        let entry = scopes
+            .entry(scope_key)
+            .or_insert_with(|| (display, Vec::new()));
+        if entry
+            .1
+            .iter()
+            .any(|existing| existing.artifact_id == child.id)
+        {
+            return;
+        }
+        let reference = format!("C{}", entry.1.len() + 1);
+        entry.1.push(summary::SummaryChild {
+            reference,
+            artifact_id: child.id,
+            artifact_type: child.artifact_type,
+            name: child.name,
+            fingerprint: child.fingerprint,
+            body_json: child.body_json,
+        });
+    };
+    match level {
+        "file" => {
+            // Children: current cards and workflows, attached to every file
+            // their supports cite. Fingerprint-less legacy rows are excluded
+            // rather than pinned to nothing.
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT support.evidence_file, artifact.id, artifact.artifact_type,
+                        artifact.canonical_name, artifact.artifact_fingerprint,
+                        artifact.body_json
+                 FROM semantic_artifacts artifact
+                 JOIN semantic_supports support ON support.artifact_id=artifact.id
+                 WHERE artifact.artifact_type IN ('card','workflow')
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )
+                 ORDER BY support.evidence_file, artifact.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, summary_child_row(row, 1)?))
+            })?;
+            for row in rows {
+                let (file, child) = row?;
+                add(format!("file:{file}"), file, child);
+            }
+        }
+        "module" => {
+            // Children: current file summaries grouped onto workspace
+            // packages by canonical-root ownership of the summarized file.
+            let packages = package_prefixes(root);
+            for (file, child) in current_summary_children(conn, "file:")? {
+                if let Some(package) = owning_package(&packages, &file) {
+                    add(format!("module:{package}"), package.to_string(), child);
+                }
+            }
+        }
+        "repository" => {
+            // Children: current module summaries, plus file summaries that no
+            // workspace package owns (root-level code still reaches the top).
+            let packages = package_prefixes(root);
+            for (module, child) in current_summary_children(conn, "module:")? {
+                let _ = module;
+                add("repo".into(), "repository".into(), child);
+            }
+            for (file, child) in current_summary_children(conn, "file:")? {
+                if owning_package(&packages, &file).is_none() {
+                    add("repo".into(), "repository".into(), child);
+                }
+            }
+        }
+        _ => unreachable!("level validated by the caller"),
+    }
+    Ok(scopes
+        .into_iter()
+        .map(|(scope, (display, children))| (scope, display, children))
+        .collect())
+}
+
+struct SummaryChildRow {
+    id: i64,
+    artifact_type: String,
+    name: Option<String>,
+    fingerprint: String,
+    body_json: String,
+}
+
+fn summary_child_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SummaryChildRow> {
+    Ok(SummaryChildRow {
+        id: row.get(offset)?,
+        artifact_type: row.get(offset + 1)?,
+        name: row.get(offset + 2)?,
+        fingerprint: row.get(offset + 3)?,
+        body_json: row.get(offset + 4)?,
+    })
+}
+
+/// Current summary artifacts whose scope key starts with `prefix`, keyed by
+/// the scope remainder (file path or module name).
+fn current_summary_children(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(String, SummaryChildRow)>> {
+    let mut statement = conn.prepare(
+        "SELECT artifact.canonical_name, artifact.id, artifact.artifact_type,
+                artifact.canonical_name, artifact.artifact_fingerprint, artifact.body_json
+         FROM semantic_artifacts artifact
+         WHERE artifact.artifact_type='summary'
+           AND artifact.canonical_name LIKE ?1 || '%'
+           AND artifact.artifact_fingerprint IS NOT NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )
+         ORDER BY artifact.canonical_name, artifact.id",
+    )?;
+    let rows = statement.query_map([prefix], |row| {
+        Ok((row.get::<_, String>(0)?, summary_child_row(row, 1)?))
+    })?;
+    let mut children = Vec::new();
+    for row in rows {
+        let (scope_key, child) = row?;
+        let remainder = scope_key
+            .strip_prefix(prefix)
+            .unwrap_or(scope_key.as_str())
+            .to_string();
+        children.push((remainder, child));
+    }
+    Ok(children)
+}
+
+/// Workspace package names with their repo-relative root prefixes, longest
+/// prefix first so nested packages win ownership.
+fn package_prefixes(root: &Path) -> Vec<(String, String)> {
+    let workspace = crate::workspace::WorkspaceMap::build(root);
+    let mut prefixes: Vec<(String, String)> = workspace
+        .packages
+        .iter()
+        .filter_map(|package| {
+            let relative = package
+                .canonical_root
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+            (!relative.is_empty()).then(|| (package.name.clone(), relative))
+        })
+        .collect();
+    prefixes.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    prefixes
+}
+
+fn owning_package<'a>(prefixes: &'a [(String, String)], file: &str) -> Option<&'a str> {
+    prefixes
+        .iter()
+        .find(|(_, prefix)| {
+            file.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .map(|(name, _)| name.as_str())
+}
+
+/// Deterministic prompt pack: the enumerated children (bodies quoted as
+/// data, fingerprints pinned inline so the pack participates in the input
+/// fingerprint) plus minimal deterministic topology for orientation.
+fn render_summary_pack(
+    conn: &Connection,
+    scope: &summary::SummaryScope,
+    children: &[summary::SummaryChild],
+) -> Result<String> {
+    let mut rendered = format!(
+        "## Scope: {} {}\n\n## Children\n",
+        scope.level, scope.display
+    );
+    for child in children {
+        rendered.push_str(&format!(
+            "\n### [{}] {} `{}` (fingerprint {})\n{}\n",
+            child.reference,
+            child.artifact_type,
+            child.name.as_deref().unwrap_or("unnamed"),
+            child.fingerprint,
+            child.body_json,
+        ));
+    }
+    rendered.push_str("\n## Topology\n");
+    match scope.level.as_str() {
+        "file" => {
+            let path = scope.scope_key.strip_prefix("file:").unwrap_or_default();
+            let (imports_out, imported_by): (i64, i64) = conn.query_row(
+                "SELECT
+                   (SELECT count(*) FROM module_edges edge
+                    JOIN files source ON source.id=edge.from_file WHERE source.path=?1),
+                   (SELECT count(*) FROM module_edges edge
+                    JOIN files target ON target.id=edge.to_file WHERE target.path=?1)",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            rendered.push_str(&format!(
+                "- imports: {imports_out} requests out, {imported_by} files import this file\n"
+            ));
+        }
+        "module" | "repository" => {
+            rendered.push_str(&format!("- summarized children: {}\n", children.len()));
+        }
+        _ => {}
+    }
+    Ok(rendered)
 }
 
 #[cfg(test)]
