@@ -318,6 +318,49 @@ test("custom providers cannot shadow built-in provider and billing identities", 
   );
 });
 
+test("built-in OpenAI keeps its transport and API-key auth when its base URL is overridden", async () => {
+  const registry = buildRegistry({
+    authFile: "/unused",
+    credentialStore: { read: async () => undefined, list: async () => [] },
+    openAIBaseUrl: "https://gateway.example.test/openai/v1/",
+  });
+  const model = registry.models.getModel("openai", "gpt-5.6-terra");
+  assert.ok(model);
+  assert.equal(model.api, "openai-responses");
+  assert.equal(model.baseUrl, "https://gateway.example.test/openai/v1");
+  const auth = await registry.models.getAuth(model, { env: { OPENAI_API_KEY: "test-key" } });
+  assert.equal(auth.auth.apiKey, "test-key");
+  assert.equal(auth.source, "OPENAI_API_KEY");
+});
+
+test("OpenAI base URL environment setting reaches gateway capabilities", async () => {
+  const state = createGatewayState({
+    env: { JSCOUT_PI_AI_OPENAI_BASE_URL: "https://gateway.example.test/v1/" },
+    versions: VERSIONS,
+    credentialStore: { read: async () => undefined, list: async () => [] },
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  await handleMessage(
+    state,
+    { protocol: 1, id: "cap-openai", kind: "capabilities", model: "openai:gpt-5.6-terra" },
+    send,
+  );
+  assert.equal(sent.at(-1).model.base_url, "https://gateway.example.test/v1");
+});
+
+test("built-in OpenAI base URL override rejects unsafe endpoints", () => {
+  assert.throws(
+    () =>
+      buildRegistry({
+        authFile: "/unused",
+        credentialStore: { read: async () => undefined, list: async () => [] },
+        openAIBaseUrl: "https://secret@example.test/v1",
+      }),
+    /without embedded credentials/,
+  );
+});
+
 test("credential read-modify-write is serialized across gateway processes", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "jscout-credentials-"));
   const file = path.join(directory, "auth.json");

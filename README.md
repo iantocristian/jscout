@@ -141,6 +141,7 @@ Generative scouting (`jscout scout …`, `jscout llm doctor`):
 | `JSCOUT_LLM_MODEL` | Exact `provider:model` for generative calls; default `openai-codex:gpt-5.6-terra` (ChatGPT-plan OAuth). Overridden by `--model`. |
 | `JSCOUT_LLM_REASONING` | Provider-normalized reasoning effort; unset means provider default. Overridden by `--reasoning`. |
 | `JSCOUT_PI_AI_AUTH_FILE` | pi-ai OAuth credential store read by the gateway; default `~/.pi-ai/auth.json`. |
+| `JSCOUT_PI_AI_OPENAI_BASE_URL` | Replace only the built-in `openai` provider endpoint. The model catalog, Responses transport, and `OPENAI_API_KEY` auth remain intact. |
 | `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` | Validated JSON array of additional local OpenAI-compatible providers (see below). |
 | `JSCOUT_PI_AI_GATEWAY` | Path to the gateway entry file when it is not discoverable beside the binary. Overridden by `--gateway-path`. Names a file, never a shell command. |
 | `JSCOUT_NODE` | Node executable used to launch the gateway; default is `node` on `PATH`. Names a file, never a shell command. |
@@ -152,6 +153,21 @@ pi-ai's built-in registry (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, …). `jscout llm doctor` reports exactly which provider,
 auth path, and billing path the selected model resolves to; plan, API, and
 custom billing paths are recorded distinctly and never pooled.
+
+For API-key Terra through a non-default OpenAI gateway, configure the built-in
+provider rather than declaring a custom provider:
+
+```bash
+export OPENAI_API_KEY='...'
+export JSCOUT_LLM_MODEL='openai:gpt-5.6-terra'
+export JSCOUT_PI_AI_OPENAI_BASE_URL='https://gateway.example.com/v1'
+jscout llm doctor
+```
+
+The endpoint must implement the OpenAI Responses API, streaming, and tool
+calls. `llm doctor` prints the resolved endpoint. URLs containing credentials
+are rejected; put the key only in `OPENAI_API_KEY`. `JSCOUT_PI_AI_GATEWAY` is
+unrelated: it names the local Node sidecar file, not the remote API endpoint.
 
 Custom OpenAI-compatible providers target local keyless servers (Ollama,
 LM Studio, vLLM); the gateway sends a placeholder API key:
@@ -170,6 +186,10 @@ Retrieval and diagnostics:
 | `JSCOUT_TIMING` | Print per-stage latency to stderr during search and indexing. |
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
+
+Indexing continues past file-local read and extraction errors. The final count
+is followed by every failed path, its stage (`read` or `extract`), and the
+underlying error on stderr; `watch` prints the same detail on each cycle.
 
 ## Search anchors and expansion
 

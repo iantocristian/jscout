@@ -17,6 +17,7 @@ import {
 
 export const AUTH_FILE_ENV = "JSCOUT_PI_AI_AUTH_FILE";
 export const CUSTOM_PROVIDERS_ENV = "JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS";
+export const OPENAI_BASE_URL_ENV = "JSCOUT_PI_AI_OPENAI_BASE_URL";
 const DEFAULT_AUTH_FILE = "~/.pi-ai/auth.json";
 
 export function createGatewayState({ env, versions, credentialStore, exit = process.exit }) {
@@ -50,6 +51,7 @@ function registry(state) {
       authFile: state.env[AUTH_FILE_ENV] ?? DEFAULT_AUTH_FILE,
       customProviders: parseOpenAICompatibleProviders(state.env[CUSTOM_PROVIDERS_ENV], CUSTOM_PROVIDERS_ENV),
       credentialStore: state.credentialStore,
+      openAIBaseUrl: state.env[OPENAI_BASE_URL_ENV],
     });
     return state.registry;
   } catch (error) {

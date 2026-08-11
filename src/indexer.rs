@@ -21,6 +21,7 @@ pub struct IndexOutcome {
     pub indexed: usize,
     pub unchanged: usize,
     pub failed: usize,
+    pub failures: Vec<IndexFailure>,
     pub chunks: usize,
     pub refs: usize,
     pub dependency_packages: usize,
@@ -29,6 +30,40 @@ pub struct IndexOutcome {
     pub dependency_skipped: usize,
     pub dependency_skipped_bytes: u64,
     pub dependency_plans: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFailure {
+    pub path: String,
+    pub stage: &'static str,
+    pub error: String,
+}
+
+impl IndexOutcome {
+    fn record_failure(
+        &mut self,
+        path: impl Into<String>,
+        stage: &'static str,
+        error: impl std::fmt::Display,
+    ) {
+        self.failed += 1;
+        self.failures.push(IndexFailure {
+            path: path.into(),
+            stage,
+            error: error.to_string(),
+        });
+    }
+}
+
+pub fn report_failures(outcome: &IndexOutcome) {
+    if outcome.failures.is_empty() {
+        return;
+    }
+    eprintln!("index failures ({}):", outcome.failures.len());
+    for failure in &outcome.failures {
+        let error = failure.error.replace('\n', "\n      ");
+        eprintln!("  [{}] {}: {error}", failure.stage, failure.path);
+    }
 }
 
 struct FileData {
@@ -103,6 +138,7 @@ pub fn index_repo_with_options(
         indexed: 0,
         unchanged: 0,
         failed: 0,
+        failures: Vec::new(),
         chunks: 0,
         refs: 0,
         dependency_packages: 0,
@@ -138,9 +174,12 @@ pub fn index_repo_with_options(
             .to_string_lossy()
             .into_owned();
         seen.insert(rel.clone());
-        let Ok(source) = std::fs::read_to_string(file) else {
-            outcome.failed += 1;
-            continue;
+        let source = match std::fs::read_to_string(file) {
+            Ok(source) => source,
+            Err(error) => {
+                outcome.record_failure(rel, "read", error);
+                continue;
+            }
         };
         let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
         let role = file_role::classify(Path::new(&rel), &source);
@@ -175,8 +214,7 @@ pub fn index_repo_with_options(
                 outcome.refs += nrefs;
             }
             Err(e) => {
-                eprintln!("skip {rel}: {e}");
-                outcome.failed += 1;
+                outcome.record_failure(rel, "extract", e);
             }
         }
     }
@@ -534,12 +572,16 @@ fn index_dependency_files(
                 let display = dependency_display_path(&plan.package, &file.package_path);
                 let source = match std::fs::read_to_string(&file.source_path) {
                     Ok(source) => source,
-                    Err(_) => {
+                    Err(error) => {
                         // Preserve the last successfully indexed row on a
                         // transient read failure; a later successful cycle can
                         // replace it without first losing known-good data.
-                        seen.insert(display);
-                        outcome.failed += 1;
+                        seen.insert(display.clone());
+                        outcome.record_failure(
+                            display,
+                            "read",
+                            format!("{}: {error}", file.source_path.display()),
+                        );
                         continue;
                     }
                 };
@@ -586,8 +628,7 @@ fn index_dependency_files(
                         outcome.refs += refs;
                     }
                     Err(error) => {
-                        eprintln!("skip {display}: {error}");
-                        outcome.failed += 1;
+                        outcome.record_failure(display, "extract", error);
                     }
                 }
             }
@@ -808,6 +849,22 @@ mod tests {
 
     use super::{IndexOptions, index_repo, index_repo_with_options};
     use crate::{origin, query, search, store, structural};
+
+    #[test]
+    fn reports_the_file_and_stage_for_read_failures() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("bad.ts"), [0xff, 0xfe])?;
+        let conn = store::open(repo.path())?;
+
+        let outcome = index_repo(repo.path(), &conn)?;
+
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].path, "bad.ts");
+        assert_eq!(outcome.failures[0].stage, "read");
+        assert!(!outcome.failures[0].error.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn extraction_version_change_forces_unchanged_files_through_extraction() -> Result<()> {

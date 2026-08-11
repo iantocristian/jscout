@@ -728,6 +728,7 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
         o.refs,
         started.elapsed()
     );
+    indexer::report_failures(&o);
     if !dependencies.is_empty() {
         println!(
             "dependency corpus: {} packages, {} files / {} bytes, {} files / {} bytes skipped",

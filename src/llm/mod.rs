@@ -21,6 +21,7 @@ pub struct StartedInfo {
     pub provider: String,
     pub model: String,
     pub api: String,
+    pub base_url: Option<String>,
     pub billing_path: String,
     pub auth_source: String,
 }
@@ -186,6 +187,10 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
                 } else {
                     "unsupported"
                 },
+            );
+            println!(
+                "endpoint: {}",
+                model.base_url.as_deref().unwrap_or("unknown")
             );
         }
         (Some(spec), None) => {

@@ -303,6 +303,7 @@ impl ProcessGateway {
                 provider,
                 model,
                 api,
+                base_url,
                 billing_path,
                 auth_source,
                 ..
@@ -310,6 +311,7 @@ impl ProcessGateway {
                 provider,
                 model,
                 api,
+                base_url,
                 billing_path,
                 auth_source,
             },

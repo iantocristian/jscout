@@ -205,6 +205,7 @@ export async function startCompletion({ registry, parsed, request, signal }) {
     provider: model.provider,
     model: model.id,
     api: model.api,
+    base_url: model.baseUrl ?? null,
     billing_path: billingPath(parsed.provider, customProviderIds),
     // Category only ("OAuth", "OPENAI_API_KEY", ...), never a credential value.
     auth_source: auth.source ?? "configured",

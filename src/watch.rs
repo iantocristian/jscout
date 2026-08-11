@@ -45,11 +45,13 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
     };
     let outcome = indexer::index_repo_with_options(&root, &conn, &options)?;
     eprintln!(
-        "initial: {} indexed, {} unchanged — watching {} for changes (ctrl-c to stop)",
+        "initial: {} indexed, {} unchanged, {} failed — watching {} for changes (ctrl-c to stop)",
         outcome.indexed,
         outcome.unchanged,
+        outcome.failed,
         root.display()
     );
+    indexer::report_failures(&outcome);
     let provider = if embed_on_change {
         embed::Provider::from_env()
     } else {
@@ -92,6 +94,7 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
                     o.failed,
                     started.elapsed()
                 );
+                indexer::report_failures(&o);
                 if let Some(p) = &provider {
                     match embed::embed_missing(&conn, p, 64) {
                         Ok((done, _)) if done > 0 => eprintln!("embedded {done} new chunks"),

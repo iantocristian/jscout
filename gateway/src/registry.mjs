@@ -155,9 +155,10 @@ export function parseOpenAICompatibleProviders(value, envName) {
 
 /// Assemble the collection: full built-in catalog over the configured
 /// credential store, then custom OpenAI-compatible providers on top.
-export function buildRegistry({ authFile, customProviders = [], credentialStore }) {
+export function buildRegistry({ authFile, customProviders = [], credentialStore, openAIBaseUrl }) {
   const credentials = credentialStore ?? new JsonCredentialStore(resolveAuthPath(authFile));
   const models = builtinModels({ credentials });
+  overrideProviderBaseUrl(models, "openai", openAIBaseUrl, "JSCOUT_PI_AI_OPENAI_BASE_URL");
   const builtinProviderIds = new Set(models.getProviders().map((provider) => provider.id));
   const customProviderIds = new Set();
   for (const provider of customProviders) {
@@ -208,6 +209,7 @@ export function describeModel(model) {
     provider: model.provider,
     model: model.id,
     api: model.api,
+    base_url: model.baseUrl ?? null,
     context_window: model.contextWindow ?? null,
     max_tokens: model.maxTokens ?? null,
     reasoning: model.reasoning === true,
@@ -217,6 +219,20 @@ export function describeModel(model) {
 }
 
 export { hasApi };
+
+function overrideProviderBaseUrl(models, providerId, value, envName) {
+  if (value === undefined || value === null || value === "") return;
+  const baseUrl = normalizeBaseUrl(value, envName);
+  const provider = models.getProvider(providerId);
+  if (!provider) {
+    throw new RegistryError("configuration", `built-in provider ${providerId} is unavailable`);
+  }
+  models.setProvider({
+    ...provider,
+    baseUrl,
+    getModels: () => provider.getModels().map((model) => ({ ...model, baseUrl })),
+  });
+}
 
 function normalizeBaseUrl(value, name) {
   const text = requiredText(value, name);

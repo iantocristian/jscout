@@ -54,6 +54,8 @@ pub struct WorkflowRunConfig {
     pub depth: usize,
     pub candidate_limit: usize,
     pub service_tier: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +414,13 @@ fn prepare_workflow(
         options,
     )?;
 
-    let input_fingerprint = input_fingerprint(&candidate_set, &evidence, &request, options);
+    let input_fingerprint = input_fingerprint(
+        &candidate_set,
+        &evidence,
+        &request,
+        options,
+        capabilities.base_url.as_deref(),
+    );
     let request_hash = blake3::hash(serde_json::to_string(&request)?.as_bytes())
         .to_hex()
         .to_string();
@@ -421,6 +429,7 @@ fn prepare_workflow(
         depth: options.depth,
         candidate_limit: options.candidate_limit,
         service_tier: options.service_tier.clone(),
+        base_url: capabilities.base_url.clone(),
     })?;
     let spec = RunSpec {
         scout_kind: "workflow".into(),
@@ -489,6 +498,7 @@ fn execute_prepared_workflow(
         "usage": outcome.usage,
         "stop_reason": outcome.stop_reason,
         "response_model": outcome.response_model,
+        "base_url": outcome.started.base_url,
     }))?;
 
     // The gateway's resolved billing path is authoritative; keep the ledger
@@ -757,9 +767,10 @@ fn input_fingerprint(
     evidence: &EvidencePack,
     request: &CompleteRequest,
     options: &WorkflowScoutOptions,
+    base_url: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-workflow-scout-input-v1\0");
+    hasher.update(b"jscout-workflow-scout-input-v2\0");
     for part in [
         candidate_set.snapshot.as_str(),
         &candidate_set.seeds.join("\u{1}"),
@@ -769,6 +780,7 @@ fn input_fingerprint(
         &options.model.spec,
         options.reasoning.as_deref().unwrap_or(""),
         options.service_tier.as_deref().unwrap_or(""),
+        base_url.unwrap_or(""),
     ] {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");
@@ -937,6 +949,7 @@ mod tests {
                     provider: "faux".into(),
                     model: "faux-model".into(),
                     api: "faux".into(),
+                    base_url: Some("https://faux.example.test/v1".into()),
                     context_window: Some(200_000),
                     max_tokens: Some(32_000),
                     reasoning: true,
@@ -968,6 +981,7 @@ mod tests {
                 provider: "faux".into(),
                 model: "faux-model".into(),
                 api: "faux".into(),
+                base_url: Some("https://faux.example.test/v1".into()),
                 billing_path: "api".into(),
                 auth_source: "test".into(),
             },
@@ -1121,6 +1135,7 @@ mod tests {
         )?;
         assert_eq!(status, "completed");
         assert!(usage_json.contains("\"total_tokens\":120"));
+        assert!(usage_json.contains("\"base_url\":\"https://faux.example.test/v1\""));
         assert_eq!(billing, "api");
         let config: super::WorkflowRunConfig = serde_json::from_str(&conn.query_row(
             "SELECT config_json FROM scout_runs WHERE id=?1",

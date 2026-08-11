@@ -80,6 +80,8 @@ pub enum Inbound {
         provider: String,
         model: String,
         api: String,
+        #[serde(default)]
+        base_url: Option<String>,
         billing_path: String,
         auth_source: String,
     },
@@ -145,6 +147,8 @@ pub struct ModelCapabilities {
     pub provider: String,
     pub model: String,
     pub api: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default)]
     pub context_window: Option<u64>,
     #[serde(default)]

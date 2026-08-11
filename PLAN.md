@@ -235,7 +235,8 @@ Credentials and hidden reasoning are never stored.
 The operator configuration surface — `JSCOUT_LLM_MODEL`,
 `JSCOUT_LLM_REASONING`, `JSCOUT_PI_AI_GATEWAY`, `JSCOUT_NODE`, and the
 gateway-side `JSCOUT_PI_AI_AUTH_FILE` and
-`JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` — is documented in the README
+`JSCOUT_PI_AI_OPENAI_BASE_URL` and `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS`
+— is documented in the README
 configuration section, with `.env.example` as the safe template. This
 document defines the boundary; the README owns the operating instructions.
 
