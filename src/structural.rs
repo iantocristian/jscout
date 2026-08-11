@@ -339,9 +339,58 @@ pub fn current_snapshot(conn: &Connection) -> Result<String> {
     .context("no structural snapshot; run `jscout index <root>` first")
 }
 
+#[cfg(test)]
 pub fn compute_snapshot(conn: &Connection) -> Result<String> {
+    let resolution_hash = compute_resolution_hash(conn)?;
+    compute_snapshot_with_resolution(conn, &resolution_hash)
+}
+
+/// Deterministic digest of the module-resolution outcome. Resolution reads
+/// unindexed inputs such as tsconfigs, manifests, and node_modules, so this
+/// digest is part of the public structural snapshot as well as the no-op
+/// projection identity.
+pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-structural-snapshot\0");
+    hasher.update(b"jscout-resolution-hash-v1\0");
+    let mut stmt = conn.prepare(
+        "SELECT from_file, request, COALESCE(to_file, -1),
+                COALESCE(package, ''), COALESCE(resolution, ''),
+                COALESCE(package_instance_id, -1), type_only
+         FROM module_edges ORDER BY from_file, request",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (from_file, request, to_file, package, resolution, package_instance, type_only) = row?;
+        hasher.update(b"\0");
+        hasher.update(from_file.to_le_bytes().as_slice());
+        hasher.update(request.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(to_file.to_le_bytes().as_slice());
+        hasher.update(package.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(resolution.as_bytes());
+        hasher.update(package_instance.to_le_bytes().as_slice());
+        hasher.update(type_only.to_le_bytes().as_slice());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+pub(crate) fn compute_snapshot_with_resolution(
+    conn: &Connection,
+    resolution_hash: &str,
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-structural-snapshot-v2\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
     let mut stmt = conn.prepare(
         "SELECT f.path, f.hash, f.role, f.origin, COALESCE(f.package_path, ''),
@@ -373,6 +422,8 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
             hasher.update(value.as_bytes());
         }
     }
+    hasher.update(b"\0module-resolution\0");
+    hasher.update(resolution_hash.as_bytes());
     Ok(hasher.finalize().to_hex().to_string())
 }
 

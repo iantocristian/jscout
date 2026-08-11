@@ -256,8 +256,8 @@ pub fn index_repo_with_options(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [root.to_string_lossy()],
     )?;
-    let snapshot = crate::structural::compute_snapshot(conn)?;
-    let resolution = resolution_hash(conn)?;
+    let resolution = crate::structural::compute_resolution_hash(conn)?;
+    let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
     let current = ProjectionIdentity {
         snapshot: Some(snapshot.clone()),
         projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
@@ -343,45 +343,6 @@ impl ProjectionIdentity {
         }
         Ok(())
     }
-}
-
-/// Deterministic digest of the module resolution outcome. Resolution reads
-/// un-indexed inputs (tsconfigs, package manifests, node_modules), so file
-/// hashes alone cannot prove the projection's module edges are current.
-fn resolution_hash(conn: &Connection) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-resolution-hash-v1\0");
-    let mut stmt = conn.prepare(
-        "SELECT from_file, request, COALESCE(to_file, -1),
-                COALESCE(package, ''), COALESCE(resolution, ''),
-                COALESCE(package_instance_id, -1), type_only
-         FROM module_edges ORDER BY from_file, request",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-        ))
-    })?;
-    for row in rows {
-        let (from_file, request, to_file, package, resolution, package_instance, type_only) = row?;
-        hasher.update(b"\0");
-        hasher.update(from_file.to_le_bytes().as_slice());
-        hasher.update(request.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(to_file.to_le_bytes().as_slice());
-        hasher.update(package.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(resolution.as_bytes());
-        hasher.update(package_instance.to_le_bytes().as_slice());
-        hasher.update(type_only.to_le_bytes().as_slice());
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn ensure_extraction_version(conn: &Connection) -> Result<()> {
@@ -926,25 +887,27 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
                                 Some(workspace.classify(&request)),
                                 *package_instance,
                             ),
-                            None if is_relative_request(&request) => {
+                            None if external_package_name(&request).is_none() => {
                                 // Resolved to a real but un-indexable file
                                 // (styles, assets, JSON): keep the edge as
                                 // evidence without inventing a package.
                                 (None, None, Some("unresolved"), None)
                             }
                             None => {
+                                let package = external_package_name(&request)
+                                    .expect("guarded external package request");
                                 let package_instance = package_roots
                                     .iter()
                                     .find(|(root, _)| path.starts_with(root))
                                     .map(|(_, id)| *id);
-                                (None, Some(package_name(&request)), None, package_instance)
+                                (None, Some(package), None, package_instance)
                             }
                         }
                     }
-                    Err(_) if is_relative_request(&request) => {
+                    Err(_) if external_package_name(&request).is_none() => {
                         (None, None, Some("unresolved"), None)
                     }
-                    Err(_) => (None, Some(package_name(&request)), None, None),
+                    Err(_) => (None, external_package_name(&request), None, None),
                 }
             })
             .clone();
@@ -963,16 +926,40 @@ pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Requests that can never name an installable package: relative and
-/// absolute paths, plus `~/` bundler home-alias requests. When these fail to
-/// resolve to an indexed file, the module edge keeps the raw request as
-/// evidence with `resolution='unresolved'` and no package identity, so the
-/// graph never mints `pkg:` nodes for style/asset/JSON imports.
-fn is_relative_request(request: &str) -> bool {
-    request.starts_with('.')
-        || request.starts_with('/')
-        || request == "~"
-        || request.starts_with("~/")
+/// Return the package boundary for a syntactically valid bare package
+/// specifier. Relative/absolute paths, package-import aliases (`#name`),
+/// bundler aliases (`~/`, `@/`), URLs, and Windows paths are unresolved
+/// evidence rather than invented `pkg:` identities.
+fn external_package_name(request: &str) -> Option<String> {
+    if let Some((scheme, _)) = request.split_once(':') {
+        return matches!(scheme, "node" | "bun").then(|| package_name(request));
+    }
+    if request.is_empty()
+        || request.starts_with(['.', '/', '~', '#'])
+        || request.contains(['\\', '%', '?'])
+    {
+        return None;
+    }
+    let mut parts = request.split('/');
+    let first = parts.next()?;
+    if let Some(scope) = first.strip_prefix('@') {
+        let name = parts.next()?;
+        if scope.is_empty() || !valid_package_segment(scope) || !valid_package_segment(name) {
+            return None;
+        }
+        Some(format!("@{scope}/{name}"))
+    } else {
+        valid_package_segment(first).then(|| first.to_string())
+    }
+}
+
+fn valid_package_segment(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '\\' | '%' | ':' | '#' | '?' | '@')
+        })
 }
 
 /// "@scope/pkg/sub/path" -> "@scope/pkg"; "./x" stays as-is (unresolved relative).
@@ -1045,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_relative_imports_carry_no_package_identity() -> Result<()> {
+    fn unresolved_non_package_imports_carry_no_package_identity() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
             repo.path().join("style.module.scss"),
@@ -1056,8 +1043,12 @@ mod tests {
             "import styles from './style.module.scss';\n\
              import Tree from './Tree.vue';\n\
              import cover from '~/assets/cover.png';\n\
+             import app from '@/components/app';\n\
+             import internal from '#internal/widget';\n\
+             import icon from 'C:\\\\assets\\\\icon.svg';\n\
              import missing from 'not-installed-pkg';\n\
-             export const view = () => [styles, Tree, cover, missing];\n",
+             import scoped from '@scope/not-installed/subpath';\n\
+             export const view = () => [styles, Tree, cover, app, internal, icon, missing, scoped];\n",
         )?;
         let conn = store::open(repo.path())?;
         index_repo(repo.path(), &conn)?;
@@ -1079,9 +1070,22 @@ mod tests {
             (None, None, Some("unresolved".into()))
         );
         assert_eq!(edge("./Tree.vue")?, (None, None, Some("unresolved".into())));
-        // Bundler home aliases are path-shaped, not packages.
+        // Bundler aliases, package-import aliases, and Windows paths are not
+        // installable package identities.
         assert_eq!(
             edge("~/assets/cover.png")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge("@/components/app")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge("#internal/widget")?,
+            (None, None, Some("unresolved".into()))
+        );
+        assert_eq!(
+            edge(r"C:\assets\icon.svg")?,
             (None, None, Some("unresolved".into()))
         );
         // Bare specifiers stay classified as external packages.
@@ -1089,11 +1093,16 @@ mod tests {
             edge("not-installed-pkg")?,
             (None, Some("not-installed-pkg".into()), None)
         );
+        assert_eq!(
+            edge("@scope/not-installed/subpath")?,
+            (None, Some("@scope/not-installed".into()), None)
+        );
 
         let bogus_packages: i64 = conn.query_row(
             "SELECT count(*) FROM graph_nodes
              WHERE node_key LIKE 'pkg:.%' OR node_key LIKE 'pkg:/%'
-                OR node_key LIKE 'pkg:~%'",
+                OR node_key LIKE 'pkg:~%' OR node_key LIKE 'pkg:@/%'
+                OR node_key LIKE 'pkg:#%' OR node_key LIKE 'pkg:C:%'",
             [],
             |row| row.get(0),
         )?;
@@ -1150,6 +1159,11 @@ mod tests {
         assert!(first.projection_rebuilt);
         let original_snapshot = meta_snapshot()?;
         let original_edges = edge_count()?;
+        let original_neighborhood = structural::neighborhood(
+            &conn,
+            "main.ts:main",
+            &structural::NeighborhoodOptions::default(),
+        )?;
 
         let second = index_repo(repo.path(), &conn)?;
         assert!(!second.projection_rebuilt, "no-op must keep the projection");
@@ -1157,8 +1171,8 @@ mod tests {
         assert_eq!(edge_count()?, original_edges);
 
         // Resolution inputs live outside indexed content: a new tsconfig
-        // remaps 'lib' onto ./lib.ts without changing any indexed file, so
-        // the snapshot is identical but the projection must still rebuild.
+        // remaps 'lib' onto ./lib.ts without changing any indexed file. The
+        // graph and its public snapshot must both change.
         fs::write(
             repo.path().join("tsconfig.json"),
             r#"{"compilerOptions": {"paths": {"lib": ["./lib.ts"]}}}"#,
@@ -1168,7 +1182,16 @@ mod tests {
             third.projection_rebuilt,
             "resolution change without content change must rebuild"
         );
-        assert_eq!(meta_snapshot()?, original_snapshot);
+        assert_ne!(meta_snapshot()?, original_snapshot);
+        let updated_neighborhood = structural::neighborhood(
+            &conn,
+            &original_neighborhood.resolved_anchor,
+            &structural::NeighborhoodOptions {
+                expected_snapshot: Some(original_neighborhood.snapshot),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(updated_neighborhood.anchor_status, "re-resolved");
         let target: Option<String> = conn.query_row(
             "SELECT target.path FROM module_edges edge
              JOIN files source ON source.id=edge.from_file
