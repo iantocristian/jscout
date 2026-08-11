@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS events(
   name TEXT NOT NULL,
   method TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_events_file ON events(file_id);
 CREATE INDEX IF NOT EXISTS idx_events_name ON events(name);
 
 CREATE TABLE IF NOT EXISTS member_calls(
@@ -185,6 +186,7 @@ CREATE TABLE IF NOT EXISTS member_calls(
   object TEXT,
   receiver TEXT                     -- full static chain, e.g. dbs.wave.card
 );
+CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
 
 -- Source-local deterministic evidence. Identifier identities remain raw here
@@ -1052,6 +1054,21 @@ mod tests {
         )?;
         assert_eq!(version, "15");
         assert!(database.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn indexes_high_volume_evidence_tables_by_file() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        for index in ["idx_events_file", "idx_member_calls_file"] {
+            let column: String = conn.query_row(
+                &format!("SELECT name FROM pragma_index_info('{index}') WHERE seqno=0"),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(column, "file_id", "{index} must index file_id first");
+        }
         Ok(())
     }
 
