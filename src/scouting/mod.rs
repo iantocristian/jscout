@@ -4068,6 +4068,179 @@ mod tests {
     }
 
     #[test]
+    fn added_children_stale_summaries_and_close_gates() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
+        let package = repo.path().join("packages/app");
+        std::fs::create_dir_all(package.join("src"))?;
+        std::fs::write(
+            package.join("package.json"),
+            "{\"name\":\"@fixture/app\",\"version\":\"1.0.0\"}\n",
+        )?;
+        std::fs::write(
+            package.join("src/flow.ts"),
+            "export function finish() { return 1; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let file = "packages/app/src/flow.ts";
+
+        // Card A, then a file summary that covers exactly it.
+        let mut cards = card_options();
+        cards.anchors = vec![format!("{file}:start")];
+        let mut card_gateway = FakeGateway::new(vec![Ok(card_outcome(card_submission()))]);
+        let card_a = scout_one_card(repo.path(), &conn, &mut card_gateway, &cards)?;
+        let card_a_id = card_a.artifact_id.expect("card A");
+
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the package entry point that delegates to its finisher",
+            &["C1"],
+        )))]);
+        let published = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+        assert_eq!(published.reports[0].status, "completed");
+        let summary_id = published.reports[0].artifact_id.expect("file summary");
+
+        let freshness = |id: i64| -> Result<String> {
+            Ok(crate::semantic::load_artifact(&conn, id)?
+                .expect("artifact exists")
+                .freshness)
+        };
+        assert_eq!(freshness(summary_id)?, "fresh");
+        let before = super::plan::summaries(repo.path(), &conn, "module", &[])?;
+        assert_eq!(
+            before.items.len(),
+            1,
+            "the module plans before the addition"
+        );
+        assert!(before.skipped.is_empty());
+
+        // Card B lands on the same file. Card A is untouched, the source is
+        // untouched, and the snapshot does not move: only the scope's child
+        // set grew.
+        let finish_anchor =
+            crate::structural::resolve_current_anchor(&conn, &format!("{file}:finish"))?;
+        let card_b = crate::semantic::annotate(
+            repo.path(),
+            &conn,
+            &crate::semantic::AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(finish_anchor.clone()),
+                body: json!({ "purpose": "terminal helper that completes the flow" }),
+                supports: vec![crate::semantic::SupportInput {
+                    claim_path: "/purpose".into(),
+                    anchor: finish_anchor,
+                    role: None,
+                    evidence_file: file.into(),
+                    evidence_start_line: 1,
+                    evidence_end_line: 1,
+                    confidence: "likely".into(),
+                }],
+                confidence: "likely".into(),
+                snapshot: crate::structural::current_snapshot(&conn)?,
+                supersedes: None,
+            },
+        )?;
+        let card_b_id = card_b.id;
+
+        // (a) The summary no longer covers its scope, so it is stale even
+        // though every dependency it stored is intact.
+        assert_eq!(freshness(card_a_id)?, "fresh", "card A is untouched");
+        assert_eq!(
+            freshness(summary_id)?,
+            "stale",
+            "a child added after publication stales the summary"
+        );
+
+        // (b) The module refuses to build on the now-incomplete file summary.
+        let gated = super::plan::summaries(repo.path(), &conn, "module", &[])?;
+        assert!(gated.items.is_empty(), "no module over stale coverage");
+        assert_eq!(gated.skipped.len(), 1);
+        assert_eq!(gated.skipped[0].scope, "module:@fixture/app");
+        assert!(
+            gated.skipped[0].reason.contains(file)
+                && gated.skipped[0]
+                    .reason
+                    .contains("no longer covers its current child set"),
+            "unexpected gate reason: {}",
+            gated.skipped[0].reason
+        );
+
+        // (c) Refresh selects it and republishes over the full child set.
+        let selection = super::refresh::select(&conn, &[])?;
+        assert_eq!(selection.targets.len(), 1, "only the summary is non-fresh");
+        assert_eq!(selection.targets[0].artifact_id, summary_id);
+        assert_eq!(selection.targets[0].config.kind(), "summary");
+
+        let mut refresh_gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the package entry point and the terminal helper it delegates to",
+            &["C1", "C2"],
+        )))]);
+        let batch = scout_refresh(
+            repo.path(),
+            &conn,
+            &mut refresh_gateway,
+            selection,
+            RequestPolicy::new(30, 1, 240_000)?,
+        )?;
+        assert_eq!(batch.model_calls, 1);
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.reports[0].status, "completed");
+        assert_eq!(batch.reports[0].candidate_count, 2, "both children planned");
+        let successor = batch.reports[0].artifact_id.expect("refreshed summary");
+        let supersedes: Option<i64> = conn.query_row(
+            "SELECT supersedes_artifact_id FROM semantic_artifacts WHERE id=?1",
+            [successor],
+            |row| row.get(0),
+        )?;
+        assert_eq!(supersedes, Some(summary_id));
+        assert_eq!(current_summaries(&conn)?, vec![successor]);
+
+        let relations = relations_of(&conn, successor)?;
+        let both = std::collections::BTreeSet::from([card_a_id, card_b_id]);
+        assert_eq!(
+            relations
+                .iter()
+                .filter(|relation| relation.0 == "/overview")
+                .map(|relation| relation.2)
+                .collect::<std::collections::BTreeSet<_>>(),
+            both,
+            "both children are cited"
+        );
+        assert_eq!(
+            relations
+                .iter()
+                .filter(|relation| relation.0.is_empty())
+                .map(|relation| relation.2)
+                .collect::<std::collections::BTreeSet<_>>(),
+            both,
+            "both children are input dependencies"
+        );
+        assert_eq!(relations.len(), 4, "claim plus input-dep row per child");
+        assert_eq!(
+            freshness(successor)?,
+            "fresh",
+            "the successor covers the current child set"
+        );
+
+        // (d) With coverage restored the module gate opens again.
+        let reopened = super::plan::summaries(repo.path(), &conn, "module", &[])?;
+        assert!(reopened.skipped.is_empty(), "the gate opens");
+        assert_eq!(reopened.items.len(), 1);
+        assert_eq!(reopened.items[0].scope, "module:@fixture/app");
+        assert_eq!(reopened.items[0].child_count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn mixed_refresh_ends_with_every_current_artifact_fresh() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = fixture(repo.path())?;
