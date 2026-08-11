@@ -1,4 +1,5 @@
 mod agent;
+mod calls;
 mod chunk;
 mod dependency;
 mod embed;
@@ -141,6 +142,35 @@ enum Command {
         /// Restrict sites to file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
+    },
+    /// Exact member-call sites by method, receiver chain, and argument options
+    Calls {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Method name, e.g. insert
+        method: String,
+        /// Option filter KEY or KEY=VALUE; repeatable, all must match the
+        /// same object-literal argument
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Restrict the options object to this 1-based argument position
+        #[arg(long)]
+        arg_position: Option<usize>,
+        /// Dotted suffix the static receiver chain must end with, e.g. wave.card
+        #[arg(long)]
+        receiver: Option<String>,
+        /// Restrict calls to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        file_origins: Vec<String>,
+        /// Maximum reported matches
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Emit the full JSON result
+        #[arg(long)]
+        json: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
     /// Serve the index over MCP (stdio) for agent integration
     Mcp {
@@ -430,6 +460,35 @@ fn main() -> Result<()> {
             name,
             file_origins,
         } => cmd_events(&root, name.as_deref(), &file_origins),
+        Command::Calls {
+            root,
+            method,
+            args,
+            arg_position,
+            receiver,
+            file_origins,
+            limit,
+            json,
+            database,
+        } => {
+            let filters = args
+                .iter()
+                .map(|text| calls::ArgFilter::parse(text))
+                .collect::<Result<Vec<_>>>()?;
+            cmd_calls(
+                &root,
+                database.as_deref(),
+                &calls::CallQuery {
+                    method,
+                    args: filters,
+                    arg_position,
+                    receiver_suffix: receiver,
+                    file_origins,
+                    limit,
+                },
+                json,
+            )
+        }
         Command::Mcp {
             root,
             database,
@@ -742,6 +801,63 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
             println!("  {plan}");
         }
     }
+    Ok(())
+}
+
+fn cmd_calls(
+    root: &Path,
+    database: Option<&Path>,
+    query: &calls::CallQuery,
+    json: bool,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    let result = calls::query(root, &conn, query)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if result.matches.is_empty() {
+        println!(
+            "no matching call sites ({} candidate files scanned)",
+            result.files_scanned
+        );
+        return Ok(());
+    }
+    for site in &result.matches {
+        let receiver = site.receiver.as_deref().unwrap_or("<expr>");
+        let options = site
+            .matched_options
+            .iter()
+            .map(|option| match &option.value {
+                Some(value) => format!("{}: {value}", option.key),
+                None => option.key.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let argument = site
+            .matched_argument
+            .map(|position| format!("  [arg {position}: {options}]"))
+            .unwrap_or_default();
+        let anchor = site
+            .anchor
+            .as_deref()
+            .map(|anchor| format!("  ({anchor})"))
+            .unwrap_or_default();
+        println!(
+            "{}:{}-{}  {receiver}.{}({} args){argument}{anchor}",
+            site.file, site.start_line, site.end_line, site.method, site.argument_count,
+        );
+    }
+    println!(
+        "\n{} match(es) in {} candidate file(s){}",
+        result.matches.len(),
+        result.files_scanned,
+        if result.truncated {
+            "; truncated by --limit"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 

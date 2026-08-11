@@ -255,6 +255,22 @@ fn tool_defs(profile: ToolProfile) -> Value {
             }
         },
         {
+            "name": "calls",
+            "description": "Exact member-call sites by method name, optional receiver-chain suffix, and argument options, matched on the AST. Each match reports the complete call span (a multiline call owns every line inside it), the static receiver chain, the matched argument position, and the enclosing declaration anchor. Use for questions like 'where is merge: replace passed to insert?'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string", "description": "Method name, e.g. insert" },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Option filters, each KEY or KEY=VALUE; all must match top-level properties of the same object-literal argument" },
+                    "arg_position": { "type": "integer", "minimum": 1, "description": "Restrict the options object to this 1-based argument position" },
+                    "receiver": { "type": "string", "description": "Dotted suffix the static receiver chain must end with, e.g. wave.card" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Call-site origin allowlist. Dependency calls are excluded unless explicitly included" },
+                    "limit": { "type": "integer", "default": 200, "minimum": 1, "maximum": 1000 }
+                },
+                "required": ["method"]
+            }
+        },
+        {
             "name": "entities",
             "description": "Bounded lookup over canonical runtime, contract, and general repository entities with exact evidence occurrences. Use for registries, lifecycle events, jobs, DI tokens, types, schemas, routes, GraphQL operations, environment variables, database resources, feature flags, and external hosts.",
             "inputSchema": {
@@ -615,6 +631,26 @@ fn call_tool(
             let origins = json_string_array_or(args, "origins", crate::origin::defaults);
             let sites = query::events_in_origins(conn, filter, &origins)?;
             Ok(serde_json::to_string_pretty(&sites)?)
+        }
+        "calls" => {
+            let method = args["method"].as_str().unwrap_or("").to_string();
+            let filters = json_string_array(args, "args")
+                .iter()
+                .map(|text| crate::calls::ArgFilter::parse(text))
+                .collect::<Result<Vec<_>>>()?;
+            let result = crate::calls::query(
+                root,
+                conn,
+                &crate::calls::CallQuery {
+                    method,
+                    args: filters,
+                    arg_position: args["arg_position"].as_u64().map(|value| value as usize),
+                    receiver_suffix: args["receiver"].as_str().map(str::to_string),
+                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    limit: (args["limit"].as_u64().unwrap_or(200) as usize).min(1000),
+                },
+            )?;
+            Ok(serde_json::to_string_pretty(&result)?)
         }
         "entities" => {
             if profile == ToolProfile::Baseline {

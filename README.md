@@ -54,11 +54,13 @@ jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confide
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
+jscout calls <root> METHOD     # exact member-call sites matched on the AST
+                               #   --arg merge=replace --receiver wave.card --json
 jscout watch <root> [--embed]  # hash-incremental parse; projection is currently rebuilt
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
 jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
-                               #   who_uses, definition, file_outline, events, annotate
+                               #   who_uses, definition, file_outline, events, calls, annotate
 jscout memory <root> [query]   # inspect persistent semantic artifacts + freshness
 jscout annotate <root> in.json # write a validated semantic artifact
 jscout llm doctor              # verify Node, pi-ai, plan auth, and default model capabilities
@@ -190,6 +192,28 @@ Retrieval and diagnostics:
 Indexing continues past file-local read and extraction errors. The final count
 is followed by every failed path, its stage (`read` or `extract`), and the
 underlying error on stderr; `watch` prints the same detail on each cycle.
+
+## Call-site queries
+
+`jscout calls` answers "where is this option passed to this method?" with
+exact AST matching instead of line-based text joins:
+
+```bash
+jscout calls /path/to/repo insert --arg merge=replace --receiver wave.card --json
+```
+
+Candidate files come from the index (member-call names plus full-text
+argument tokens); matches re-parse those files, so every hit reports the
+complete call span — a multiline call owns every line inside it — the
+static receiver chain (`dbs.wave.card`), the matched argument position, and
+the innermost enclosing declaration anchor. All `--arg KEY[=VALUE]` filters
+must match top-level literal properties of the same object-literal argument;
+`--arg-position` pins which argument that is. Candidate files are
+hash-verified against disk, and drift fails the query instead of answering
+from a stale index. Receiver identity stays checker-less: which
+implementation actually handles the call remains an explicit candidate-set
+question (`who-uses`, property hubs), never a silent guess. The same query
+is exposed as the `calls` MCP tool.
 
 ## Search anchors and expansion
 
