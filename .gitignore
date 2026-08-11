@@ -5,3 +5,4 @@
 .jscout.db-wal
 .jscout-telemetry.jsonl
 .env
+~$*.pptx

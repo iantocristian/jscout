@@ -18,7 +18,15 @@
 >   server only; reranking + asymmetric query prefixes added post-M6 (see
 >   README).
 >
-> **Next: [PLAN-KG.md](PLAN-KG.md) (revision 2)** — jscout reframed as
+> **Current implementation plan:
+> [PLAN-SEMANTIC-SCOUTING.md](PLAN-SEMANTIC-SCOUTING.md)** — jscout remains a
+> Rust indexer and persistent repository-memory service, with all generative
+> model calls isolated behind a companion JavaScript pi-ai gateway. The next
+> work is G6 selected symbol cards, followed by hierarchy, concepts, retrieval
+> surfaces, and packaging. G1–G5 (gateway, workflow scouting, automatic seeds,
+> reuse, and refresh) are implemented.
+>
+> **Architectural base: [PLAN-KG.md](PLAN-KG.md) (revision 2)** — jscout reframed as
 > persistent agent memory: T1 deterministic facts (KG-1 identity/resolution/
 > traversal + KG-4 entities), T2 on-demand renderers (skeletons/map/paths),
 > T3 fingerprinted semantic memory (workflows + agent write-back).
@@ -30,9 +38,10 @@
 > SC-1 full/elided agent gate retained answer quality but found no source-byte
 > reduction, so full source remains the default. The discriminating three-arm
 > comparison also found no outcome gain over grep (4/4 each); structural
-> inspected fewer files at much higher agent-token cost. Graph scope is frozen
-> while the bounded SC-2a workflow-memory/write-back experiment begins in
-> [PLAN-KG-REVISED-CODEX.md](PLAN-KG-REVISED-CODEX.md).
+> inspected fewer files at much higher agent-token cost. The structural
+> evaluation phase is closed for now. Product-value testing resumes after the
+> semantic-v1 implementation boundary; implementation-time verification is
+> limited to compile, migration, protocol, and regression correctness.
 
 A fast indexer for JavaScript/TypeScript codebases built for RAG and agent retrieval.
 Core philosophy: **TypeScript is for humans** — parse TS syntax, but index the *runtime

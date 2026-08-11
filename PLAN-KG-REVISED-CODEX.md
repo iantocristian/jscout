@@ -5,6 +5,13 @@
 > from the implementation review, the design discussion, and research on
 > repository-level context compression and summarization.
 
+> **Implementation direction, 2026-08-10:** SC-2 now proceeds through the
+> Rust-owned, pi-ai-gateway design in
+> [PLAN-SEMANTIC-SCOUTING.md](PLAN-SEMANTIC-SCOUTING.md). That plan supersedes
+> the remaining pre-implementation product-evaluation gates below. The trust,
+> evidence, candidate-closure, confidence, and freshness rules in this document
+> still apply.
+
 ## Objective
 
 `jscout` is persistent, verifiable repository memory for coding agents. It is
@@ -468,7 +475,7 @@ LLMs add semantic information that syntax and embeddings do not make explicit.
 The first useful product is not a free-standing ontology; it is structured,
 evidence-backed annotations over R1/R2 anchors.
 
-### Step 1: bounded workflow experiment
+### Step 1: bounded workflow implementation
 
 Generate candidate subgraphs from entry points, calls, events, routes, tables,
 and graph communities. Start with dozens of high-value seeds, not one LLM call
@@ -523,7 +530,7 @@ Write-back follows the same trust contract as scout output:
 - write-back can only create semantic artifacts and supports. It cannot write
   `graph_nodes`, `resolved_edges`, entities, or any other structural fact.
 
-### Step 3: optional symbol cards
+### Step 3: selected symbol cards
 
 For each selected symbol, provide the LLM:
 
@@ -554,21 +561,24 @@ Concept-to-concept edges are deferred until the vocabulary is stable. Embedding
 clusters, if implemented, are called `themes`; they are candidate regions, not
 domain concepts.
 
-Cards now share the optional-summary gate. They ship only if a pre-registered
-query set shows value beyond search, elided source, and workflow artifacts.
+Cards are generated only for exported symbols, entity endpoints, workflow
+participants, and explicitly requested anchors. They use the common scouting
+run, evidence, validation, and freshness machinery rather than a separate
+experimental path.
 
-### Step 4: optional hierarchical summaries
+### Step 4: hierarchical summaries and concepts
 
 - File summaries aggregate available workflow/card evidence and file topology.
 - Module/package summaries aggregate file summaries, not raw repository code.
 - Summaries retain lists of supporting anchors; prose without traceability is
   not indexable memory.
 
-Nothing downstream depends on these summaries. They enter a separate SC-2c
-gate and ship only if curated questions or agent-utility evaluation show that
-they reduce source reads, tool calls, or tokens beyond the deterministic
-overview, symbol cards, and workflows. Otherwise they remain an experiment,
-not default memory.
+Nothing structural depends on these summaries. They remain derived, opt-in
+memory with support anchors and freshness labels. Concepts are normalized from
+validated workflow/card vocabulary and inherit the same support/fingerprint
+contract; chunks are tagged indirectly through evidence overlaps rather than
+through one LLM call per chunk. The executable sequence is specified in
+[PLAN-SEMANTIC-SCOUTING.md](PLAN-SEMANTIC-SCOUTING.md).
 
 ### Semantic storage and freshness
 
@@ -634,10 +644,11 @@ evidence.
   code.
 - `annotate` round-trips an agent claim with validated evidence and visibly
   marks it stale/degraded after relevant code changes.
-- A curated set of repository questions compares base search, R2 scouting, and
-  R2+R3 semantic memory.
-- Symbol cards and file/module summaries are not prerequisites for SC-2
-  completion; SC-2c owns their separate value gate.
+- Workflows, selected symbol cards, hierarchical summaries, and concepts use
+  one gateway, run ledger, support validator, and freshness engine.
+- Product-value testing resumes after the semantic-v1 completion boundary in
+  [PLAN-SEMANTIC-SCOUTING.md](PLAN-SEMANTIC-SCOUTING.md); implementation-time
+  tests establish contracts rather than agent value.
 
 ---
 
@@ -804,8 +815,8 @@ current 8/8 task set with more seeds measures variance but not discrimination.
 | **EN-1** | Routes, GraphQL operations, environment variables, configuration keys, database resources, feature flags, and external-service hosts | CP-1; enriches SC-1/2 | Implemented 2026-08-10 with explicit extraction-version invalidation and bounded API provenance; post-merge recognizer corrections are recorded separately |
 | **AS-1** | Agent surfaces: deterministic repository overview, evidence-bearing entity lookup, and ranked bounded paths | EN-1 | Implemented 2026-08-10 as structural-profile MCP tools under whole-response budgets |
 | **WG-1** | Workflow-specific logical traversal: collapsed runtime handoffs, bounded general associations, and terminal high-degree helpers | AS-1 | Implemented 2026-08-10; known six-pair regression passes 24/24 without truncation |
-| **SC-2b** | Candidate-closed scouting: deterministic bounded graph candidates, exhaustive LLM defining/supporting/excluded classification, and snapshot-bound validation before expanding coverage | SC-2a; WG-1 supplies candidates | Known regression passes; new pre-registration and held-out Stage A remain required before semantic calls |
-| **SC-2c** | Optional symbol-card and file/module-summary experiments with pre-registered query sets | SC-2a | 1 day plus evaluation, if earned |
+| **SC-2b** | Candidate-closed workflow scouting through the Rust-owned pi-ai gateway, with exhaustive defining/supporting/excluded classification and snapshot-bound validation | SC-2a; WG-1 supplies candidates | Implemented 2026-08-11 through G1–G5, including automatic seeds, reuse, and explicit refresh |
+| **SC-2c** | Selected symbol cards, hierarchical summaries, concepts, retrieval surfaces, and gateway packaging | SC-2b | Next implementation; see `PLAN-SEMANTIC-SCOUTING.md` G6–G9 |
 | **RI-2** | Graph export, ranking tuning, and scale work earned by benchmarks | RI-1/SC-1 | Bounded ranked paths landed in AS-1; remaining work is incremental |
 
 The contamination-probed n8n/Twenty suite is complete: 72 Terra/high runs over
@@ -833,16 +844,18 @@ policy was informed by those failures, the result is not held-out evidence.
 The first participant-scope preflight then showed that scope labels alone do
 not prevent omissions: two direct-write smokes omitted both later-needed
 synchronous operations, including after explicit complete-stage guidance. No
-registered Twenty run was started. SC-2b must therefore be candidate-closed:
+registered Twenty run was started. SC-2b is therefore candidate-closed:
 deterministic graph expansion enumerates a bounded set and the LLM must classify
 every candidate as defining, supporting, or excluded. Free-form LLM discovery
-is not the next implementation step.
+is not part of the implementation. The 2026-08-10 decision is to build the
+complete semantic-v1 surface before another product-value run; mechanical
+contract and regression verification continues during implementation.
 Expansion remains opt-in. The failed first SC-1
 gate keeps full source as the default and requires a paired-artifact compression
 benchmark before another source-view agent run. Broad workflow coverage
 benefits from routes/events/tables, but the bounded experiment does not wait for
-every EN-1 extractor. Cards and summaries must earn separate implementation
-effort.
+every EN-1 extractor. Cards, summaries, and concepts now follow the workflow
+slice on the same validated semantic engine; they remain opt-in derived memory.
 
 ## Explicitly deferred
 
