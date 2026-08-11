@@ -276,22 +276,61 @@ fn workflow_candidate(
     )?;
     let source = std::fs::read_to_string(root.join(&file))
         .with_context(|| format!("read workflow candidate file `{file}`"))?;
-    let declaration_end = usize::try_from(declaration_end)
-        .unwrap_or(source.len())
-        .min(source.len());
-    let end_line = source
-        .get(..declaration_end)
-        .map_or(start_line, |prefix| prefix.lines().count() as i64)
-        .max(start_line);
     Ok(WorkflowCandidate {
         anchor: node.key,
         display_name: node.display_name,
         file,
         evidence_start_line: start_line,
-        evidence_end_line: end_line,
+        evidence_end_line: declaration_end_line(&source, start_line, declaration_end),
         relevance: node.relevance,
         seed,
     })
+}
+
+/// The declaration span of one anchor, resolved exactly as a workflow
+/// candidate. Card planning needs the same file and line arithmetic for a
+/// single symbol without a traversal. `None` means the anchor is not a
+/// file-backed symbol in the current snapshot.
+pub(crate) fn symbol_candidate(
+    root: &Path,
+    conn: &Connection,
+    anchor: &str,
+) -> Result<Option<WorkflowCandidate>> {
+    let row: Option<(String, String, i64, i64)> = conn
+        .query_row(
+            "SELECT g.display_name, f.path, s.line, s.decl_end
+             FROM graph_nodes g
+             JOIN symbols s ON g.native_table='symbols' AND g.native_id=s.id
+             JOIN files f ON f.id=s.file_id
+             WHERE g.node_key=?1",
+            [anchor],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((display_name, file, start_line, declaration_end)) = row else {
+        return Ok(None);
+    };
+    let source = std::fs::read_to_string(root.join(&file))
+        .with_context(|| format!("read card subject file `{file}`"))?;
+    Ok(Some(WorkflowCandidate {
+        anchor: anchor.to_string(),
+        display_name,
+        file,
+        evidence_start_line: start_line,
+        evidence_end_line: declaration_end_line(&source, start_line, declaration_end),
+        relevance: 1.0,
+        seed: false,
+    }))
+}
+
+fn declaration_end_line(source: &str, start_line: i64, declaration_end: i64) -> i64 {
+    let declaration_end = usize::try_from(declaration_end)
+        .unwrap_or(source.len())
+        .min(source.len());
+    source
+        .get(..declaration_end)
+        .map_or(start_line, |prefix| prefix.lines().count() as i64)
+        .max(start_line)
 }
 
 fn workflow_candidate_fingerprint(
@@ -856,8 +895,11 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
 
 fn validate_input(input: &AnnotateInput) -> Result<()> {
     validate_confidence(&input.confidence)?;
-    if !matches!(input.artifact_type.as_str(), "workflow" | "annotation") {
-        bail!("semantic artifact type must be one of: workflow, annotation");
+    if !matches!(
+        input.artifact_type.as_str(),
+        "workflow" | "annotation" | "card"
+    ) {
+        bail!("semantic artifact type must be one of: workflow, annotation, card");
     }
     if !input.body.is_object() {
         bail!("semantic artifact body must be a JSON object");
@@ -886,6 +928,32 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     if input.artifact_type == "annotation" {
         if input.body.get("claim").and_then(Value::as_str).is_none() {
             bail!("annotation body requires a string `claim`");
+        }
+        return Ok(());
+    }
+    // A card is about exactly one symbol: its canonical name is that anchor
+    // and every claim is supported from the subject's own declaration.
+    if input.artifact_type == "card" {
+        let Some(subject) = input.name.as_deref().filter(|name| !name.is_empty()) else {
+            bail!("card artifacts require the subject anchor as their name");
+        };
+        if input
+            .body
+            .get("purpose")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("card body requires a non-empty string `purpose`");
+        }
+        if let Some(support) = input
+            .supports
+            .iter()
+            .find(|support| support.anchor != subject)
+        {
+            bail!(
+                "card supports must cite the subject anchor `{subject}`, not `{}`",
+                support.anchor
+            );
         }
         return Ok(());
     }

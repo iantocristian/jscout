@@ -1,4 +1,4 @@
-//! Selection of current generated workflows whose evidence is no longer
+//! Selection of current generated artifacts whose evidence is no longer
 //! wholly fresh. Execution stays in the parent orchestrator so every refresh
 //! uses the same candidate closure and publication path as an initial scout.
 
@@ -6,9 +6,26 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::WorkflowRunConfig;
+use super::{CardRunConfig, WorkflowRunConfig};
 use crate::llm::config::ModelSpec;
 use crate::semantic;
+
+/// Recorded replay configuration, one variant per scouted artifact type. The
+/// scout kind of the producing run decides which shape is authoritative.
+#[derive(Debug, Clone)]
+pub enum RefreshConfig {
+    Workflow(WorkflowRunConfig),
+    Card(CardRunConfig),
+}
+
+impl RefreshConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RefreshConfig::Workflow(_) => "workflow",
+            RefreshConfig::Card(_) => "card",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RefreshTarget {
@@ -16,7 +33,7 @@ pub struct RefreshTarget {
     pub freshness: String,
     pub model: ModelSpec,
     pub reasoning: Option<String>,
-    pub config: WorkflowRunConfig,
+    pub config: RefreshConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,15 +49,17 @@ pub struct RefreshSelection {
     pub summary: RefreshSelectionSummary,
 }
 
-/// Select current model-generated workflow artifacts. Explicit IDs are
-/// validated against that same boundary; fresh artifacts are never refreshed.
+/// Select current model-generated workflow and card artifacts. Explicit IDs
+/// are validated against that same boundary; fresh artifacts are never
+/// refreshed.
 pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelection> {
     let mut ids = if requested_ids.is_empty() {
         let mut statement = conn.prepare(
             "SELECT artifact.id
              FROM semantic_artifacts artifact
              JOIN scout_runs run ON run.id=artifact.scout_run_id
-             WHERE artifact.artifact_type='workflow' AND run.scout_kind='workflow'
+             WHERE artifact.artifact_type=run.scout_kind
+               AND run.scout_kind IN ('workflow','card')
                AND NOT EXISTS(
                  SELECT 1 FROM semantic_artifacts successor
                  WHERE successor.supersedes_artifact_id=artifact.id
@@ -64,14 +83,14 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
     for id in ids {
         let row = conn.query_row(
             "SELECT run.provider, run.model, run.reasoning, run.config_json,
-                    artifact.artifact_type,
+                    artifact.artifact_type, run.scout_kind,
                     EXISTS(
                       SELECT 1 FROM semantic_artifacts successor
                       WHERE successor.supersedes_artifact_id=artifact.id
                     )
              FROM semantic_artifacts artifact
              JOIN scout_runs run ON run.id=artifact.scout_run_id
-             WHERE artifact.id=?1 AND run.scout_kind='workflow'",
+             WHERE artifact.id=?1 AND run.scout_kind IN ('workflow','card')",
             [id],
             |row| {
                 Ok((
@@ -80,16 +99,17 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, bool>(6)?,
                 ))
             },
         );
-        let (provider, model, reasoning, config_json, artifact_type, has_successor) = row
-            .with_context(|| {
-                format!("artifact {id} is not a model-generated workflow or does not exist")
+        let (provider, model, reasoning, config_json, artifact_type, scout_kind, has_successor) =
+            row.with_context(|| {
+                format!("artifact {id} is not a model-generated artifact or does not exist")
             })?;
-        if artifact_type != "workflow" || has_successor {
-            bail!("artifact {id} is not a current generated workflow");
+        if artifact_type != scout_kind || has_successor {
+            bail!("artifact {id} is not a current generated workflow or card");
         }
         let artifact = semantic::load_artifact(conn, id)?
             .with_context(|| format!("semantic artifact {id} disappeared"))?;
@@ -97,14 +117,10 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
             skipped_fresh.push(id);
             continue;
         }
-        let Ok(config) = serde_json::from_str::<WorkflowRunConfig>(&config_json) else {
+        let Some(config) = replay_config(&scout_kind, &config_json) else {
             unsupported_legacy.push(id);
             continue;
         };
-        if config.seeds.is_empty() {
-            unsupported_legacy.push(id);
-            continue;
-        }
         targets.push(RefreshTarget {
             artifact_id: id,
             freshness: artifact.freshness,
@@ -121,6 +137,22 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
         },
         targets,
     })
+}
+
+/// Runs created before replay configuration was stored, or with a shape that
+/// no longer parses, are reported rather than replayed against a guess.
+fn replay_config(scout_kind: &str, config_json: &str) -> Option<RefreshConfig> {
+    match scout_kind {
+        "workflow" => {
+            let config = serde_json::from_str::<WorkflowRunConfig>(config_json).ok()?;
+            (!config.seeds.is_empty()).then_some(RefreshConfig::Workflow(config))
+        }
+        "card" => {
+            let config = serde_json::from_str::<CardRunConfig>(config_json).ok()?;
+            (!config.anchor.is_empty()).then_some(RefreshConfig::Card(config))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +205,10 @@ mod tests {
         assert_eq!(selected.targets.len(), 1);
         assert_eq!(selected.targets[0].artifact_id, artifact_id);
         assert_eq!(selected.targets[0].freshness, "stale");
-        assert_eq!(selected.targets[0].config.depth, 2);
+        let super::RefreshConfig::Workflow(config) = &selected.targets[0].config else {
+            panic!("expected a workflow replay configuration");
+        };
+        assert_eq!(config.depth, 2);
         Ok(())
     }
 }

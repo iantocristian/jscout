@@ -22,6 +22,10 @@ pub struct EvidencePack {
     pub files: BTreeMap<String, FileEvidence>,
 }
 
+/// Depth-1 structural context is bounded per direction; a symbol with more
+/// neighbours reports the omitted count rather than truncating silently.
+const CONTEXT_EDGES_PER_DIRECTION: usize = 40;
+
 /// Build the pack for a candidate set inside the caller's read snapshot.
 /// Fails when any candidate file changed on disk since indexing: scouting
 /// against un-indexed edits would publish evidence that immediately reads
@@ -30,6 +34,17 @@ pub fn build(
     root: &Path,
     conn: &Connection,
     candidates: &[WorkflowCandidate],
+) -> Result<EvidencePack> {
+    build_titled(root, conn, candidates, "Candidates")
+}
+
+/// `build` with a caller-chosen heading for the anchor listing. Card packs
+/// carry a single subject rather than a candidate set.
+pub fn build_titled(
+    root: &Path,
+    conn: &Connection,
+    candidates: &[WorkflowCandidate],
+    section: &str,
 ) -> Result<EvidencePack> {
     let mut files: BTreeMap<String, FileEvidence> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
@@ -63,7 +78,7 @@ pub fn build(
     }
 
     let mut rendered = String::new();
-    rendered.push_str("## Candidates\n\n");
+    rendered.push_str(&format!("## {section}\n\n"));
     for candidate in candidates {
         rendered.push_str(&format!(
             "- {} ({}) in {} lines {}-{}{}\n",
@@ -93,6 +108,75 @@ pub fn build(
     }
 
     Ok(EvidencePack { rendered, files })
+}
+
+/// Deterministic depth-1 in/out edges of one anchor, rendered for a card
+/// pack. These are indexed facts: the prompt forbids restating them as
+/// claims, and they are never citable evidence because only the subject's
+/// declaring file is shipped as numbered source.
+pub fn structural_context(conn: &Connection, anchor: &str) -> Result<(String, usize)> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT 'out', edge.kind, edge.confidence, edge.dst_key,
+                node.display_name, COALESCE(file.path, ''), COALESCE(node.line, 0)
+         FROM resolved_edges edge
+         JOIN graph_nodes node ON node.node_key=edge.dst_key
+         LEFT JOIN files file ON file.id=node.file_id
+         WHERE edge.src_key=?1
+         UNION
+         SELECT DISTINCT 'in', edge.kind, edge.confidence, edge.src_key,
+                node.display_name, COALESCE(file.path, ''), COALESCE(node.line, 0)
+         FROM resolved_edges edge
+         JOIN graph_nodes node ON node.node_key=edge.src_key
+         LEFT JOIN files file ON file.id=node.file_id
+         WHERE edge.dst_key=?1
+         ORDER BY 1, 2, 4, 3",
+    )?;
+    let rows = statement.query_map([anchor], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            format!(
+                "{} ({}) {} `{}` at {}:{}",
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ),
+        ))
+    })?;
+    let mut outgoing = Vec::new();
+    let mut incoming = Vec::new();
+    for row in rows {
+        let (direction, line) = row?;
+        if direction == "out" {
+            outgoing.push(line);
+        } else {
+            incoming.push(line);
+        }
+    }
+    let total = outgoing.len() + incoming.len();
+
+    let mut rendered = String::from(
+        "\n## Direct structural context\n\n\
+         Deterministic depth-1 edges of the subject. These facts are already \
+         indexed; do not restate them as claims.\n",
+    );
+    for (label, mut edges) in [("Outgoing", outgoing), ("Incoming", incoming)] {
+        let omitted = edges.len().saturating_sub(CONTEXT_EDGES_PER_DIRECTION);
+        edges.truncate(CONTEXT_EDGES_PER_DIRECTION);
+        rendered.push_str(&format!("\n{label}:\n"));
+        if edges.is_empty() {
+            rendered.push_str("- none\n");
+        }
+        for edge in edges {
+            rendered.push_str(&format!("- {edge}\n"));
+        }
+        if omitted > 0 {
+            rendered.push_str(&format!("- ({omitted} further edges omitted)\n"));
+        }
+    }
+    Ok((rendered, total))
 }
 
 /// Runtime and general entity occurrences in one file, ordered by position.
@@ -164,6 +248,31 @@ mod tests {
         let error = super::build(repo.path(), &conn, &candidates.candidates)
             .expect_err("changed file must be rejected");
         assert!(error.to_string().contains("changed since indexing"));
+        Ok(())
+    }
+
+    #[test]
+    fn structural_context_renders_both_directions_deterministically() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function finish() { return 1; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let (rendered, edges) = super::structural_context(&conn, "sym:flow.ts#::finish@1")?;
+        let (repeat, repeat_edges) = super::structural_context(&conn, "sym:flow.ts#::finish@1")?;
+        assert_eq!((rendered.clone(), edges), (repeat, repeat_edges));
+        assert!(rendered.contains("## Direct structural context"));
+        assert!(rendered.contains("do not restate them as claims"));
+        assert!(
+            rendered.contains("call (certain) sym:flow.ts#::start@1 `start` at flow.ts:2"),
+            "incoming callers carry kind, confidence, anchor, and site: {rendered}"
+        );
+        assert!(rendered.contains("Outgoing:\n- none"), "{rendered}");
+        assert_eq!(edges, 1);
         Ok(())
     }
 }
