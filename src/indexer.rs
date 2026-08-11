@@ -33,6 +33,10 @@ pub struct IndexOutcome {
     /// False when the structural projection was provably identical (same
     /// snapshot, projection version, and module resolution) and was kept.
     pub projection_rebuilt: bool,
+    /// True when a forced re-extraction (cleared file hashes, e.g. after a
+    /// schema migration) truncated the extraction tables wholesale instead of
+    /// replacing files one at a time.
+    pub extraction_reset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +138,27 @@ pub fn index_repo_with_options(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
+    index_repo_impl(root, conn, options, true)
+}
+
+/// The pre-reset code path: always replace files one at a time, even when
+/// every hash is cleared. Kept only so tests can prove the wholesale reset
+/// produces the same database.
+#[cfg(test)]
+pub(crate) fn index_repo_without_extraction_reset(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    index_repo_impl(root, conn, options, false)
+}
+
+fn index_repo_impl(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+    allow_extraction_reset: bool,
+) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     ensure_extraction_version(conn)?;
     let files = walk::source_files(&root);
@@ -151,9 +176,10 @@ pub fn index_repo_with_options(
         dependency_skipped_bytes: 0,
         dependency_plans: Vec::new(),
         projection_rebuilt: true,
+        extraction_reset: false,
     };
 
-    let existing: HashMap<String, (i64, String, String)> = {
+    let mut existing: HashMap<String, (i64, String, String)> = {
         let mut stmt =
             conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
         let rows = stmt.query_map([], |r| {
@@ -169,8 +195,27 @@ pub fn index_repo_with_options(
         rows.collect::<std::result::Result<_, _>>()?
     };
 
+    // Migrations force re-extraction by clearing file hashes, and the
+    // first-party loop commits atomically, so a real database sits at ~100%
+    // or ~0% cleared; the half-way threshold only guards hand-edited state.
+    // At that scale, per-file replacement is pathological: every
+    // `store::delete_file` cascades through the large evidence tables and the
+    // FTS index while they are still fully populated. Truncate everything
+    // once and let the loop below insert like a fresh index instead.
+    let cleared = existing
+        .values()
+        .filter(|(_, hash, _)| hash.is_empty())
+        .count();
+    let extraction_reset =
+        allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len();
+
     let mut seen: std::collections::HashSet<String> = Default::default();
     conn.execute_batch("BEGIN")?;
+    if extraction_reset {
+        store::reset_extraction_state(conn)?;
+        existing.clear();
+        outcome.extraction_reset = true;
+    }
     for file in &files {
         let rel = file
             .strip_prefix(&root)
@@ -232,8 +277,17 @@ pub fn index_repo_with_options(
     // Remember the published projection identity before invalidating it: if
     // this run reproduces the exact same snapshot and module resolution, the
     // existing projection rows are provably identical and can be republished
-    // without a rebuild.
-    let previous = ProjectionIdentity::read(conn)?;
+    // without a rebuild. A wholesale reset wiped those rows, so nothing can
+    // be republished no matter what identity was left behind.
+    let previous = if outcome.extraction_reset {
+        ProjectionIdentity {
+            snapshot: None,
+            projection_version: None,
+            resolution_hash: None,
+        }
+    } else {
+        ProjectionIdentity::read(conn)?
+    };
 
     // Commit canonical rows and snapshot invalidation atomically. Every
     // following dependency/resolution step can fail, so the previous graph
@@ -985,7 +1039,9 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{IndexOptions, index_repo, index_repo_with_options};
+    use super::{
+        IndexOptions, index_repo, index_repo_with_options, index_repo_without_extraction_reset,
+    };
     use crate::{origin, query, search, store, structural};
 
     #[test]
@@ -1777,6 +1833,373 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(fallback, (None, Some("selected-dep".into())));
+        Ok(())
+    }
+
+    /// Render one query with every rowid replaced by content identity, in a
+    /// total order over all output columns, so two databases built by
+    /// different code paths can be compared byte-for-byte.
+    fn dump_section(conn: &rusqlite::Connection, sql: &str) -> Result<String> {
+        let columns = conn.prepare(sql)?.column_count();
+        let order: Vec<String> = (1..=columns).map(|index| index.to_string()).collect();
+        let wrapped = format!("SELECT * FROM ({sql}) ORDER BY {}", order.join(","));
+        let mut stmt = conn.prepare(&wrapped)?;
+        let mut rows = stmt.query([])?;
+        let mut out = String::new();
+        while let Some(row) = rows.next()? {
+            for index in 0..columns {
+                use rusqlite::types::ValueRef;
+                match row.get_ref(index)? {
+                    ValueRef::Null => out.push_str("<null>"),
+                    ValueRef::Integer(value) => out.push_str(&value.to_string()),
+                    ValueRef::Real(value) => out.push_str(&value.to_string()),
+                    ValueRef::Text(value) => out.push_str(&String::from_utf8_lossy(value)),
+                    ValueRef::Blob(value) => out.push_str(&format!("<blob:{}>", value.len())),
+                }
+                out.push('\x1f');
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Every canonical and projected table, keyed by paths/keys/spans instead
+    /// of rowids. `snapshot` and `resolution_hash` are excluded: the
+    /// resolution hash digests file ids, which every full re-index reassigns
+    /// — on the per-file path and the wholesale-reset path alike.
+    fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, String)>> {
+        const SECTIONS: &[(&str, &str)] = &[
+            (
+                "counts",
+                "SELECT (SELECT count(*) FROM chunks), (SELECT count(*) FROM chunks_fts)",
+            ),
+            (
+                "files",
+                "SELECT f.path, f.hash, f.role, f.origin, f.package_path,
+                        p.origin, p.name, p.version, p.canonical_root, p.locator,
+                        p.manifest_hash, p.status
+                 FROM files f LEFT JOIN package_instances p ON p.id=f.package_instance_id",
+            ),
+            (
+                "chunks",
+                "SELECT f.path, c.kind, c.name, c.scope_chain, c.symbols, c.start, c.end,
+                        c.start_line, c.end_line, c.hash, c.content
+                 FROM chunks c JOIN files f ON f.id=c.file_id",
+            ),
+            (
+                "chunks_fts",
+                "SELECT f.path, c.start, fts.content, fts.name, fts.symbols, fts.path
+                 FROM chunks_fts fts
+                 JOIN chunks c ON c.id=fts.rowid
+                 JOIN files f ON f.id=c.file_id",
+            ),
+            (
+                "symbols",
+                "SELECT f.path, s.name, s.kind, s.start, s.end, s.decl_start, s.decl_end,
+                        s.scope_chain, s.line, s.exported
+                 FROM symbols s JOIN files f ON f.id=s.file_id",
+            ),
+            (
+                "imports",
+                "SELECT f.path, i.local_name, i.imported_name, i.request
+                 FROM imports i JOIN files f ON f.id=i.file_id",
+            ),
+            (
+                "exports",
+                "SELECT f.path, e.export_name, e.local_name, e.from_request, e.from_name
+                 FROM exports e JOIN files f ON f.id=e.file_id",
+            ),
+            (
+                "contract_imports",
+                "SELECT f.path, i.local_name, i.imported_name, i.request
+                 FROM contract_imports i JOIN files f ON f.id=i.file_id",
+            ),
+            (
+                "contract_exports",
+                "SELECT f.path, e.export_name, e.local_name, e.from_request, e.from_name
+                 FROM contract_exports e JOIN files f ON f.id=e.file_id",
+            ),
+            (
+                "module_edges",
+                "SELECT src.path, e.request, dst.path, e.package, e.resolution,
+                        p.name, p.version, p.canonical_root, e.type_only
+                 FROM module_edges e
+                 JOIN files src ON src.id=e.from_file
+                 LEFT JOIN files dst ON dst.id=e.to_file
+                 LEFT JOIN package_instances p ON p.id=e.package_instance_id",
+            ),
+            (
+                "refs",
+                "SELECT f.path, c.start, r.start, r.line, r.kind, r.confidence,
+                        r.target_request, r.target_name, r.local, r.detail
+                 FROM refs r
+                 JOIN files f ON f.id=r.file_id
+                 LEFT JOIN chunks c ON c.id=r.chunk_id",
+            ),
+            (
+                "events",
+                "SELECT f.path, c.start, e.line, e.role, e.name, e.method
+                 FROM events e
+                 JOIN files f ON f.id=e.file_id
+                 LEFT JOIN chunks c ON c.id=e.chunk_id",
+            ),
+            (
+                "member_calls",
+                "SELECT f.path, c.start, m.start, m.end, m.line, m.end_line,
+                        m.prop, m.object, m.receiver
+                 FROM member_calls m
+                 JOIN files f ON f.id=m.file_id
+                 LEFT JOIN chunks c ON c.id=m.chunk_id",
+            ),
+            (
+                "entity_sites",
+                "SELECT f.path, c.start, s.start, s.end, s.line, s.end_line, s.plane,
+                        s.entity_type, s.role, s.identity_kind, s.identity_name,
+                        s.identity_start, s.target_name, s.target_start, s.extractor,
+                        s.provenance, s.confidence, s.detail_json
+                 FROM entity_sites s
+                 JOIN files f ON f.id=s.file_id
+                 LEFT JOIN chunks c ON c.id=s.chunk_id",
+            ),
+            (
+                "entities",
+                "SELECT entity_key, plane, entity_type, name, identity_anchor, meta_json
+                 FROM entities",
+            ),
+            (
+                "entity_occurrences",
+                "SELECT en.entity_key, f.path, site.start, o.start, o.end, o.line,
+                        o.end_line, o.role, o.extractor, o.provenance, o.confidence,
+                        o.detail_json
+                 FROM entity_occurrences o
+                 JOIN entities en ON en.id=o.entity_id
+                 JOIN entity_sites site ON site.id=o.site_id
+                 JOIN files f ON f.id=o.file_id",
+            ),
+            (
+                // detail_json embeds occurrence/site rowid pointers, which
+                // every full re-index reassigns; the join already pins the
+                // same identity by content.
+                "entity_edges",
+                "SELECT en.entity_key, o.start, e.target_key, e.kind, e.confidence,
+                        e.provenance,
+                        json_remove(e.detail_json, '$.entityOccurrenceId', '$.entitySiteId')
+                 FROM entity_edges e
+                 JOIN entity_occurrences o ON o.id=e.occurrence_id
+                 JOIN entities en ON en.id=o.entity_id",
+            ),
+            (
+                "graph_nodes",
+                "SELECT n.node_key, n.node_kind, n.native_table, n.display_name,
+                        f.path, n.line, n.meta_json
+                 FROM graph_nodes n LEFT JOIN files f ON f.id=n.file_id",
+            ),
+            (
+                "resolved_edges",
+                "SELECT e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
+                        f.path, e.line,
+                        json_remove(e.detail_json, '$.entityOccurrenceId', '$.entitySiteId')
+                 FROM resolved_edges e LEFT JOIN files f ON f.id=e.source_file_id",
+            ),
+            ("scout_runs", "SELECT * FROM scout_runs"),
+            (
+                "scout_classifications",
+                "SELECT * FROM scout_classifications",
+            ),
+            ("semantic_artifacts", "SELECT * FROM semantic_artifacts"),
+            ("semantic_supports", "SELECT * FROM semantic_supports"),
+            ("semantic_relations", "SELECT * FROM semantic_relations"),
+            (
+                "embeddings",
+                "SELECT chunk_hash, model, dim FROM embeddings",
+            ),
+            (
+                "meta",
+                "SELECT key, value FROM meta WHERE key NOT IN ('snapshot', 'resolution_hash')",
+            ),
+        ];
+        SECTIONS
+            .iter()
+            .map(|(name, sql)| Ok((*name, dump_section(conn, sql)?)))
+            .collect()
+    }
+
+    #[test]
+    fn forced_reextraction_reset_matches_per_file_replacement() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )?;
+        let lib = repo.path().join("packages/lib");
+        fs::create_dir_all(lib.join("src"))?;
+        fs::write(
+            lib.join("package.json"),
+            r#"{"name": "@acme/lib", "module": "src/index.ts"}"#,
+        )?;
+        fs::write(
+            lib.join("src/index.ts"),
+            "export const greet = (name: string) => `hi ${name}`;\n\
+             export interface Shape { id: string }\n",
+        )?;
+        fs::write(
+            repo.path().join("helper.ts"),
+            "export const helper = (value: string) => value.trim();\n",
+        )?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { greet } from '@acme/lib';\n\
+             import type { Shape } from '@acme/lib';\n\
+             import { EventEmitter } from 'node:events';\n\
+             import { helper } from './helper';\n\
+             import { inner } from 'selected-dep';\n\
+             import missing from 'not-installed-pkg';\n\
+             const emitter = new EventEmitter();\n\
+             emitter.on('ready', () => greet('x'));\n\
+             emitter.emit('ready');\n\
+             export function main(shape: Shape) {\n\
+               const key = process.env.API_KEY;\n\
+               return helper(greet(key ?? shape.id)) + inner() + missing;\n\
+             }\n\
+             export const spans = emitter.listeners(\n\
+               'ready',\n\
+             );\n",
+        )?;
+        let dependency = repo.path().join("node_modules/selected-dep");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"selected-dep","version":"1.2.3","main":"index.js"}"#,
+        )?;
+        fs::write(
+            dependency.join("index.js"),
+            "export { inner } from './inner.js';\n",
+        )?;
+        fs::write(
+            dependency.join("inner.js"),
+            "export const inner = () => 42;\n",
+        )?;
+
+        let databases = tempfile::tempdir()?;
+        let per_file = store::open_path(&databases.path().join("per-file.db"))?;
+        let reset = store::open_path(&databases.path().join("reset.db"))?;
+        let options = IndexOptions {
+            dependencies: vec!["selected-dep".into()],
+            ..Default::default()
+        };
+        for conn in [&per_file, &reset] {
+            let outcome = index_repo_with_options(repo.path(), conn, &options)?;
+            assert!(!outcome.extraction_reset, "initial index must not reset");
+            // Semantic memory that must survive a forced re-extraction on
+            // both paths: a completed scout run, its classification, and an
+            // artifact with one support.
+            conn.execute_batch(
+                "INSERT INTO scout_runs(
+                   id, scout_kind, status, gateway_protocol, provider, model,
+                   billing_path, prompt_version, source_snapshot,
+                   input_fingerprint, request_hash, started_at, completed_at
+                 ) VALUES(7, 'workflow', 'completed', 1, 'test', 'test-model',
+                          'api', 'v1', 'snap', 'fp', 'req',
+                          '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+                 INSERT INTO scout_classifications(
+                   run_id, anchor_key, decision, role, evidence_json
+                 ) VALUES(7, 'sym:main.ts#::main@10', 'defining', 'entry', '{}');
+                 INSERT INTO semantic_artifacts(
+                   id, artifact_type, canonical_name, body_json, model,
+                   prompt_version, confidence, source_snapshot, created_at,
+                   scout_run_id, input_fingerprint, artifact_fingerprint
+                 ) VALUES(3, 'workflow', 'checkout', '{}', 'test-model', 'v1',
+                          'likely', 'snap', '2026-01-01T00:01:00Z', 7, 'fp', 'af');
+                 INSERT INTO semantic_supports(
+                   artifact_id, claim_path, anchor_key, role, evidence_file,
+                   evidence_start_line, evidence_end_line, source_hash,
+                   context_hash, confidence
+                 ) VALUES(3, '$.steps[0]', 'sym:main.ts#::main@10', 'entry',
+                          'main.ts', 10, 13, 'sh', 'ch', 'likely');",
+            )?;
+            // The v15-style forced re-extraction: clear every hash and
+            // invalidate the disposable projection and its public identity.
+            conn.execute("UPDATE files SET hash = ''", [])?;
+            conn.execute("DELETE FROM resolved_edges", [])?;
+            conn.execute("DELETE FROM graph_nodes", [])?;
+            conn.execute(
+                "DELETE FROM meta
+                 WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+                [],
+            )?;
+        }
+
+        let slow = index_repo_without_extraction_reset(repo.path(), &per_file, &options)?;
+        assert!(!slow.extraction_reset);
+        let fast = index_repo_with_options(repo.path(), &reset, &options)?;
+        assert!(fast.extraction_reset, "cleared hashes must take the reset");
+        assert_eq!(
+            (fast.indexed, fast.unchanged, fast.failed),
+            (slow.indexed, slow.unchanged, slow.failed)
+        );
+
+        for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?
+            .iter()
+            .zip(canonical_dump(&reset)?)
+        {
+            assert_eq!(
+                slow_rows, &fast_rows,
+                "section `{section}` diverged between per-file and reset paths"
+            );
+        }
+
+        // Equality alone cannot prove survival; pin the preserved rows and a
+        // live FTS index on the reset path explicitly.
+        let (runs, artifacts, supports, classifications): (i64, i64, i64, i64) = reset.query_row(
+            "SELECT (SELECT count(*) FROM scout_runs),
+                    (SELECT count(*) FROM semantic_artifacts),
+                    (SELECT count(*) FROM semantic_supports),
+                    (SELECT count(*) FROM scout_classifications)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!((runs, artifacts, supports, classifications), (1, 1, 1, 1));
+        let greet_hits: i64 = reset.query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'greet'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(greet_hits > 0, "rebuilt FTS index must serve matches");
+        Ok(())
+    }
+
+    #[test]
+    fn extraction_reset_triggers_only_at_majority_cleared() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        for name in ["one", "two", "three"] {
+            fs::write(
+                repo.path().join(format!("{name}.ts")),
+                format!("export const {name} = 1;\n"),
+            )?;
+        }
+        let conn = store::open(repo.path())?;
+        let first = index_repo(repo.path(), &conn)?;
+        assert!(!first.extraction_reset);
+
+        let second = index_repo(repo.path(), &conn)?;
+        assert!(!second.extraction_reset, "no-op run must stay incremental");
+        assert_eq!((second.indexed, second.unchanged), (0, 3));
+
+        conn.execute("UPDATE files SET hash='' WHERE path='one.ts'", [])?;
+        let minority = index_repo(repo.path(), &conn)?;
+        assert!(
+            !minority.extraction_reset,
+            "one cleared hash out of three must replace per file"
+        );
+        assert_eq!((minority.indexed, minority.unchanged), (1, 2));
+
+        conn.execute(
+            "UPDATE files SET hash='' WHERE path IN ('one.ts', 'two.ts')",
+            [],
+        )?;
+        let majority = index_repo(repo.path(), &conn)?;
+        assert!(majority.extraction_reset, "majority cleared must reset");
+        assert_eq!((majority.indexed, majority.unchanged), (3, 0));
         Ok(())
     }
 

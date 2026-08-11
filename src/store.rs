@@ -5,6 +5,17 @@ use rusqlite::{Connection, params};
 
 pub const DB_FILE: &str = ".jscout.db";
 
+/// FTS5 mirror of chunk content. FTS5 tables are not foreign-key aware, so
+/// this table is maintained explicitly alongside `chunks` — and recreated
+/// wholesale by [`reset_extraction_state`], which must use the exact same
+/// definition.
+const CHUNKS_FTS_CREATE: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+  content, name, symbols, path,
+  tokenize="unicode61 tokenchars '_$'"
+);
+"#;
+
 pub fn db_path(root: &Path) -> std::path::PathBuf {
     root.join(DB_FILE)
 }
@@ -71,11 +82,6 @@ CREATE TABLE IF NOT EXISTS chunks(
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  content, name, symbols, path,
-  tokenize="unicode61 tokenchars '_$'"
-);
 
 CREATE TABLE IF NOT EXISTS symbols(
   id INTEGER PRIMARY KEY,
@@ -393,6 +399,7 @@ CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
   ON semantic_supports(anchor_key);
 "#,
     )?;
+    conn.execute_batch(CHUNKS_FTS_CREATE)?;
     migrate(conn)?;
     // These indexes refer to columns introduced by migrations, so create them
     // only after legacy tables have been upgraded.
@@ -944,6 +951,42 @@ pub(crate) fn load_support_fingerprint_rows(
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)");
     Ok(conn.query_row(&sql, [column], |r| r.get::<_, i64>(0))? != 0)
+}
+
+/// Wholesale replacement for per-file deletion when (nearly) every file is
+/// about to be re-extracted, e.g. after a migration cleared file hashes.
+/// Cascading [`delete_file`] through tens of thousands of files re-scans the
+/// large evidence tables and the FTS index once per file; truncating every
+/// extraction-derived table and the disposable projection outright keeps a
+/// forced re-index at fresh-index cost. The caller owns the surrounding
+/// transaction and must re-insert every file before committing. Semantic
+/// memory (scout_runs, scout_classifications, semantic_*), package identity
+/// (package_instances), and the content-addressed embedding cache survive.
+pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
+    // Children before parents, so foreign-key enforcement only ever checks
+    // already-emptied referencing tables. `entities` and the graph tables are
+    // disposable projection state rebuilt by the next projection pass.
+    conn.execute_batch(
+        "DELETE FROM entity_edges;
+         DELETE FROM entity_occurrences;
+         DELETE FROM entities;
+         DELETE FROM entity_sites;
+         DELETE FROM refs;
+         DELETE FROM events;
+         DELETE FROM member_calls;
+         DELETE FROM imports;
+         DELETE FROM exports;
+         DELETE FROM contract_imports;
+         DELETE FROM contract_exports;
+         DELETE FROM module_edges;
+         DELETE FROM chunks;
+         DELETE FROM files;
+         DELETE FROM resolved_edges;
+         DELETE FROM graph_nodes;
+         DROP TABLE chunks_fts;",
+    )?;
+    conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    Ok(())
 }
 
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
