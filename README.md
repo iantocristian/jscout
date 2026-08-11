@@ -8,6 +8,40 @@ TypeScript. Type-only bindings never become runtime edges. A separate
 documentary contract plane indexes interfaces, aliases, enums, decorators,
 schemas, and exported API types without claiming they execute.
 
+## Project documents
+
+- [PLAN.md](PLAN.md) is the single current architecture and roadmap.
+- [eval/](eval/) contains dated evaluation protocols and results.
+- [presentations/](presentations/) contains dated, non-normative explanatory
+  artifacts; they are not revision material unless explicitly requested.
+
+## Getting started
+
+```bash
+cargo build --release            # binary at target/release/jscout
+jscout index /path/to/repo       # build .jscout.db beside the sources
+jscout search /path/to/repo "checkout inventory"
+```
+
+Everything deterministic — indexing, search, graph traversal, the MCP server —
+is the Rust binary alone, with no runtime dependencies. Generative scouting
+(`jscout scout …`, `jscout llm doctor`) additionally requires Node >= 22.19.0
+because model calls run through the bundled pi-ai gateway sidecar:
+
+```bash
+cd gateway && npm install        # installs the pinned @earendil-works/pi-ai
+jscout llm doctor                # verifies node, gateway, auth, and the model
+```
+
+The gateway entry (`gateway/src/main.mjs`) is discovered beside the jscout
+binary in an installed layout, or at the repository root when running
+`target/{debug,release}/jscout` in development. `--gateway-path` or
+`JSCOUT_PI_AI_GATEWAY` overrides discovery explicitly; there is no fallback
+search beyond these locations. The default model
+`openai-codex:gpt-5.6-terra` bills to a ChatGPT plan through pi-ai's OAuth
+credential store; see [Configuration](#configuration) for the complete
+environment surface and auth setup.
+
 ## Commands
 
 ```
@@ -62,8 +96,14 @@ callers without materializing every call-site × symbol pair.
 `jscout scout workflows` makes candidate-closed model calls through the bundled
 pi-ai gateway. Generative calls default to
 `openai-codex:gpt-5.6-terra`, which uses the ChatGPT-plan OAuth path; `--model`
-and `JSCOUT_LLM_MODEL` remain explicit overrides. See [.env.example](.env.example)
-for the complete safe configuration template.
+and `JSCOUT_LLM_MODEL` remain explicit overrides. Request policy is explicit
+per command: `--timeout` (default 300 s per request), `--max-calls` (a hard
+command-level budget), `--context-bytes` (default 240 000 serialized evidence
+bytes, also checked against the selected model's context window),
+`--reasoning`, `--service-tier` (rejected where the provider API does not
+support tiers), and `--rebuild` (supersede a completed identical run instead
+of reusing it). See [Configuration](#configuration) for the complete
+environment surface.
 
 Without `--seed`, scouting derives bounded seeds from routes, GraphQL
 operations, runtime handlers/producers, lifecycle/job/DI boundaries, and
@@ -87,6 +127,49 @@ configuration was stored remain visible but are reported as non-refreshable;
 jscout does not guess their original boundary. A stale target whose recorded
 seed no longer resolves is reported and skipped without blocking other
 refreshes.
+
+## Configuration
+
+jscout is configured through CLI flags and process environment variables; it
+never auto-loads a `.env` file. [.env.example](.env.example) is the safe
+copy-paste template. CLI flags always win over environment variables.
+
+Generative scouting (`jscout scout …`, `jscout llm doctor`):
+
+| Variable | Effect |
+|---|---|
+| `JSCOUT_LLM_MODEL` | Exact `provider:model` for generative calls; default `openai-codex:gpt-5.6-terra` (ChatGPT-plan OAuth). Overridden by `--model`. |
+| `JSCOUT_LLM_REASONING` | Provider-normalized reasoning effort; unset means provider default. Overridden by `--reasoning`. |
+| `JSCOUT_PI_AI_AUTH_FILE` | pi-ai OAuth credential store read by the gateway; default `~/.pi-ai/auth.json`. |
+| `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` | Validated JSON array of additional local OpenAI-compatible providers (see below). |
+| `JSCOUT_PI_AI_GATEWAY` | Path to the gateway entry file when it is not discoverable beside the binary. Overridden by `--gateway-path`. Names a file, never a shell command. |
+| `JSCOUT_NODE` | Node executable used to launch the gateway; default is `node` on `PATH`. Names a file, never a shell command. |
+
+The plan-backed `openai-codex:*` default reads pi-ai's OAuth store; jscout
+never creates or writes credentials, so sign in with pi-ai's own tooling
+first. API-key providers use their standard environment variables through
+pi-ai's built-in registry (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY`, …). `jscout llm doctor` reports exactly which provider,
+auth path, and billing path the selected model resolves to; plan, API, and
+custom billing paths are recorded distinctly and never pooled.
+
+Custom OpenAI-compatible providers target local keyless servers (Ollama,
+LM Studio, vLLM); the gateway sends a placeholder API key:
+
+```json
+[{"id": "local", "baseUrl": "http://127.0.0.1:11434/v1",
+  "models": [{"id": "qwen3:32b", "contextWindow": 131072, "maxTokens": 32768}]}]
+```
+
+Retrieval and diagnostics:
+
+| Variable | Effect |
+|---|---|
+| `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `JSCOUT_EMBED_URL`, `JSCOUT_EMBED_KEY`, `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_PROVIDER`, `JSCOUT_QUERY_PREFIX` | Optional embedding providers; see [Embeddings](#embeddings-optional). |
+| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_MODEL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder reranking; see [Reranking](#reranking-optional). |
+| `JSCOUT_TIMING` | Print per-stage latency to stderr during search and indexing. |
+| `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
+| `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
 ## Search anchors and expansion
 
@@ -274,7 +357,8 @@ records tool name, latency, success, response size, session, and snapshot. It
 does not record queries, arguments, source, or results. Set
 `JSCOUT_SESSION_ID` to correlate calls from one evaluation run and
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
-included in each record. Expanded searches also record aggregate node totals
+included in each record; `JSCOUT_PROFILE_LABEL` overrides the recorded
+profile label. Expanded searches also record aggregate node totals
 and `expansion_role_counts`; no paths or source are added to telemetry.
 Semantic calls add only aggregate artifact returned/written counts and
 fresh/degraded/stale totals.
@@ -310,9 +394,3 @@ confidence. jscout constructs the stored body and support pointers. Generic
 every distinct stable cross-file production stage as a participant; internal
 or leaf stages are `supporting`, not compressed into another participant's
 prose role.
-
-## Build
-
-```
-cargo build --release   # binary at target/release/jscout
-```
