@@ -804,13 +804,14 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
-    load_artifact_at_depth(conn, id, 3)
+    load_artifact_at_depth(conn, id, 3, &mut HashMap::new())
 }
 
 fn load_artifact_at_depth(
     conn: &Connection,
     id: i64,
     depth: u8,
+    freshness_memo: &mut HashMap<i64, String>,
 ) -> Result<Option<SemanticArtifact>> {
     let row = conn
         .query_row(
@@ -923,7 +924,7 @@ fn load_artifact_at_depth(
     } else {
         "stale"
     };
-    let freshness = child_adjusted_freshness(conn, id, own_freshness, depth)?;
+    let freshness = child_adjusted_freshness(conn, id, own_freshness, depth, freshness_memo)?;
     Ok(Some(SemanticArtifact {
         id,
         supersedes,
@@ -952,6 +953,7 @@ fn child_adjusted_freshness(
     artifact_id: i64,
     own_freshness: &str,
     depth: u8,
+    freshness_memo: &mut HashMap<i64, String>,
 ) -> Result<String> {
     let rank = |label: &str| match label {
         "fresh" => 0_u8,
@@ -960,7 +962,7 @@ fn child_adjusted_freshness(
     };
     let mut worst = rank(own_freshness);
     let mut statement = conn.prepare_cached(
-        "SELECT dst_artifact_id, dst_fingerprint FROM semantic_relations
+        "SELECT DISTINCT dst_artifact_id, dst_fingerprint FROM semantic_relations
          WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
     )?;
     let children = statement
@@ -988,8 +990,20 @@ fn child_adjusted_freshness(
                 if depth == 0 {
                     continue;
                 }
-                let child_freshness =
-                    load_artifact_at_depth(conn, child_id, depth - 1)?.map(|child| child.freshness);
+                // Memoized across one top-level load: a child cited by many
+                // claims (or shared across a search pass) is computed once.
+                let child_freshness = match freshness_memo.get(&child_id) {
+                    Some(label) => Some(label.clone()),
+                    None => {
+                        let label =
+                            load_artifact_at_depth(conn, child_id, depth - 1, freshness_memo)?
+                                .map(|child| child.freshness);
+                        if let Some(label) = &label {
+                            freshness_memo.insert(child_id, label.clone());
+                        }
+                        label
+                    }
+                };
                 match child_freshness.as_deref() {
                     Some("fresh") => {}
                     Some(_) => worst = worst.max(1),

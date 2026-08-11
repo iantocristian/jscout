@@ -559,11 +559,31 @@ pub fn scout_refresh(
     policy: RequestPolicy,
 ) -> Result<ScoutBatchReport> {
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
-    let mut prepared = Vec::new();
     let mut skipped_unresolvable = Vec::new();
     let mut skipped_over_budget = Vec::new();
     let mut cache = PreparationCache::default();
-    for target in selection.targets {
+    let mut reports = Vec::new();
+    let mut model_calls = 0;
+    let mut skipped = 0;
+    // Children refresh before parents, and each target is prepared
+    // immediately before it executes: a summary prepared against a child the
+    // same command is about to replace would reuse its own stale run. The
+    // just-in-time re-plan sees every successor published moments earlier.
+    let mut targets = selection.targets;
+    targets.sort_by_key(|target| {
+        (
+            match &target.config {
+                refresh::RefreshConfig::Workflow(_) | refresh::RefreshConfig::Card(_) => 0_u8,
+                refresh::RefreshConfig::Summary(config) => match config.level.as_str() {
+                    "file" => 1,
+                    "module" => 2,
+                    _ => 3,
+                },
+            },
+            target.artifact_id,
+        )
+    });
+    for target in targets {
         let artifact_id = target.artifact_id;
         let subject = format!("artifact {artifact_id}");
         let outcome = match target.config {
@@ -602,7 +622,44 @@ pub fn scout_refresh(
             ),
         };
         match outcome {
-            Ok(Some(item)) => prepared.push(item),
+            Ok(Some(prepared)) => {
+                let spec = match &prepared {
+                    PreparedRefresh::Workflow(_, workflow) => &workflow.spec,
+                    PreparedRefresh::Card(_, card) => &card.spec,
+                    PreparedRefresh::Summary(_, summary) => &summary.spec,
+                };
+                let reusable = ledger::reusable_run(conn, spec)?.is_some();
+                if !reusable && model_calls >= policy.max_calls {
+                    skipped += 1;
+                    continue;
+                }
+                let allow_new_call = model_calls < policy.max_calls;
+                let report = match prepared {
+                    PreparedRefresh::Workflow(options, workflow) => execute_prepared_workflow(
+                        root,
+                        conn,
+                        gateway,
+                        &options,
+                        *workflow,
+                        allow_new_call,
+                    )?,
+                    PreparedRefresh::Card(options, card) => {
+                        execute_prepared_card(root, conn, gateway, &options, *card, allow_new_call)?
+                    }
+                    PreparedRefresh::Summary(options, summary) => execute_prepared_summary(
+                        root,
+                        conn,
+                        gateway,
+                        &options,
+                        *summary,
+                        allow_new_call,
+                    )?,
+                };
+                if report.status != "reused" {
+                    model_calls += 1;
+                }
+                reports.push(report);
+            }
             Ok(None) => skipped_unresolvable.push(BatchSkip {
                 subject,
                 reason: "did not reconstruct exactly one deterministic input".into(),
@@ -621,38 +678,6 @@ pub fn scout_refresh(
             }
             Err(error) => return Err(error),
         }
-    }
-
-    let mut reports = Vec::new();
-    let mut model_calls = 0;
-    let mut skipped = 0;
-    for prepared in prepared {
-        let spec = match &prepared {
-            PreparedRefresh::Workflow(_, workflow) => &workflow.spec,
-            PreparedRefresh::Card(_, card) => &card.spec,
-            PreparedRefresh::Summary(_, summary) => &summary.spec,
-        };
-        let reusable = ledger::reusable_run(conn, spec)?.is_some();
-        if !reusable && model_calls >= policy.max_calls {
-            skipped += 1;
-            continue;
-        }
-        let allow_new_call = model_calls < policy.max_calls;
-        let report = match prepared {
-            PreparedRefresh::Workflow(options, workflow) => {
-                execute_prepared_workflow(root, conn, gateway, &options, *workflow, allow_new_call)?
-            }
-            PreparedRefresh::Card(options, card) => {
-                execute_prepared_card(root, conn, gateway, &options, *card, allow_new_call)?
-            }
-            PreparedRefresh::Summary(options, summary) => {
-                execute_prepared_summary(root, conn, gateway, &options, *summary, allow_new_call)?
-            }
-        };
-        if report.status != "reused" {
-            model_calls += 1;
-        }
-        reports.push(report);
     }
     Ok(ScoutBatchReport {
         reports,
@@ -3757,17 +3782,32 @@ mod tests {
         assert_eq!(confidence, "likely", "generated claims never exceed likely");
 
         let relations = relations_of(&conn, summary_id)?;
-        assert_eq!(relations.len(), 1, "one relation per cited child per claim");
         assert_eq!(
-            relations[0],
+            relations.len(),
+            2,
+            "one claim citation plus one whole-artifact input dependency"
+        );
+        let claim = relations
+            .iter()
+            .find(|relation| relation.0 == "/overview")
+            .expect("claim relation");
+        assert_eq!(
             (
-                "/overview".to_string(),
-                "summarizes".to_string(),
-                card_id,
-                card_fingerprint,
-                "likely".to_string(),
+                claim.1.as_str(),
+                claim.2,
+                claim.3.as_str(),
+                claim.4.as_str()
             ),
+            ("summarizes", card_id, card_fingerprint.as_str(), "likely"),
             "the citation is pinned to the child's artifact fingerprint"
+        );
+        let input_dependency = relations
+            .iter()
+            .find(|relation| relation.0.is_empty())
+            .expect("every planned child is an input dependency");
+        assert_eq!(
+            (input_dependency.2, input_dependency.3.as_str()),
+            (card_id, card_fingerprint.as_str())
         );
 
         // A summary's evidence is its children, not source spans.
@@ -3853,18 +3893,22 @@ mod tests {
             relations_of(&conn, file_summary)?
                 .iter()
                 .map(|relation| relation.2)
-                .collect::<Vec<_>>(),
-            vec![card_id]
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([card_id])
         );
         let module_relations = relations_of(&conn, module_summary)?;
-        assert_eq!(module_relations.len(), 1);
         assert_eq!(
-            module_relations[0].2, file_summary,
-            "the module summary cites the file summary published in this invocation"
+            module_relations.len(),
+            2,
+            "claim citation plus input dependency"
         );
-        assert_eq!(
-            module_relations[0].3,
-            artifact_fingerprint(&conn, file_summary)?
+        assert!(
+            module_relations
+                .iter()
+                .all(|relation| relation.2 == file_summary
+                    && relation.3
+                        == artifact_fingerprint(&conn, file_summary).expect("fingerprint")),
+            "the module summary cites the file summary published in this invocation"
         );
         Ok(())
     }
@@ -4098,11 +4142,13 @@ mod tests {
 
         // The replacement is grounded on the child that is current NOW.
         let relations = relations_of(&conn, successor)?;
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].2, successor_card.id);
-        assert_eq!(
-            relations[0].3,
-            artifact_fingerprint(&conn, successor_card.id)?
+        assert_eq!(relations.len(), 2, "claim citation plus input dependency");
+        assert!(
+            relations
+                .iter()
+                .all(|relation| relation.2 == successor_card.id
+                    && relation.3
+                        == artifact_fingerprint(&conn, successor_card.id).expect("fingerprint"))
         );
         Ok(())
     }

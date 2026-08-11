@@ -338,6 +338,19 @@ pub fn annotate_input(
     for (index, point) in summary.key_points.iter().enumerate() {
         push(&format!("/key_points/{index}"), point);
     }
+    // Every planned child is an input dependency regardless of citation: the
+    // model saw it and chose what to keep, so its later change must stale the
+    // summary and block publication like any cited child. The empty claim
+    // path marks whole-artifact dependencies apart from claim supports.
+    for child in children {
+        relations.push(RelationInput {
+            claim_path: String::new(),
+            relation: "summarizes".into(),
+            dst_artifact_id: child.artifact_id,
+            dst_fingerprint: child.fingerprint.clone(),
+            confidence: "likely".into(),
+        });
+    }
     Ok((
         AnnotateInput {
             artifact_type: "summary".into(),
@@ -418,7 +431,19 @@ mod tests {
             super::annotate_input(&summary, &children(), "snapshot".into(), None)?;
         assert_eq!(input.artifact_type, "summary");
         assert_eq!(input.name.as_deref(), Some("file:src/flow.ts"));
-        assert_eq!(relations.len(), 3, "one relation per cited child per claim");
+        assert_eq!(
+            relations.len(),
+            5,
+            "one relation per cited child per claim, plus one input dependency per planned child"
+        );
+        assert_eq!(
+            relations
+                .iter()
+                .filter(|relation| relation.claim_path.is_empty())
+                .count(),
+            2,
+            "every planned child is a whole-artifact input dependency"
+        );
         assert!(
             relations.iter().all(
                 |relation| relation.relation == "summarizes" && relation.confidence == "likely"
