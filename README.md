@@ -27,6 +27,13 @@ jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood
                                #   who_uses, definition, file_outline, events, annotate
 jscout memory <root> [query]   # inspect persistent semantic artifacts + freshness
 jscout annotate <root> in.json # write a validated semantic artifact
+jscout llm doctor              # verify Node, pi-ai, plan auth, and default model capabilities
+jscout scout workflows R       # auto-select deterministic workflow entry surfaces
+  --max-calls N                #   default: openai-codex:gpt-5.6-terra via ChatGPT plan
+jscout scout workflows R       # classify one agent-supplied workflow boundary
+  --seed ANCHOR                #   repeat --seed to define one multi-seed boundary
+jscout scout refresh R         # replace stale/degraded generated workflows
+  --max-calls N                #   reuses each workflow's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
@@ -49,6 +56,37 @@ Traversal defaults to `certain`/`likely` edges. Use
 explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
+
+## Semantic scouting
+
+`jscout scout workflows` makes candidate-closed model calls through the bundled
+pi-ai gateway. Generative calls default to
+`openai-codex:gpt-5.6-terra`, which uses the ChatGPT-plan OAuth path; `--model`
+and `JSCOUT_LLM_MODEL` remain explicit overrides. See [.env.example](.env.example)
+for the complete safe configuration template.
+
+Without `--seed`, scouting derives bounded seeds from routes, GraphQL
+operations, runtime handlers/producers, lifecycle/job/DI boundaries, and
+exported package/application entry files. Export seeding is deliberately
+limited to manifest-resolved entries and conventional `index`, `main`,
+`server`, `app`, or `entry` filenames. Routes/GraphQL/handlers rank ahead of
+producers and dispatchers, which rank ahead of DI injection sites. Equal
+deterministic candidate fingerprints are collapsed before any call. Automatic
+mode requires an explicit `--max-calls`; completed matching runs are reused
+before that budget is spent, and one over-budget boundary is reported and
+skipped without blocking smaller boundaries. `--dry-run` prints the exact
+resolved seeds, candidate fingerprints, candidate counts, evidence file
+counts, and evidence bytes without starting Node or contacting a model.
+
+Generated workflows record their resolved seeds, traversal limits, service
+tier, model, and reasoning policy in the run ledger. After indexing exposes
+source or structural-context drift, `jscout scout refresh --max-calls N`
+selects current stale/degraded generated workflows and publishes immutable
+successors. Index and watch never make model calls. Runs created before replay
+configuration was stored remain visible but are reported as non-refreshable;
+jscout does not guess their original boundary. A stale target whose recorded
+seed no longer resolves is reported and skipped without blocking other
+refreshes.
 
 ## Search anchors and expansion
 

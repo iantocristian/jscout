@@ -468,6 +468,42 @@ fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<(PathBuf, Origin
     None
 }
 
+/// Repository-relative source entry files named by the root/workspace package
+/// manifests (with the same source-first fallback used by module resolution).
+/// This is intentionally a path surface, not a second resolver.
+pub fn package_entry_paths(root: &Path) -> Vec<String> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut dirs = vec![canonical_root.clone()];
+    dirs.extend(
+        WorkspaceMap::build(root)
+            .packages
+            .into_iter()
+            .map(|package| package.canonical_root),
+    );
+    dirs.sort();
+    dirs.dedup();
+    let mut entries = Vec::new();
+    for dir in dirs {
+        let Ok(text) = fs::read_to_string(dir.join("package.json")) else {
+            continue;
+        };
+        let Ok(package) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some((entry, _)) = package_entry(&dir, &package) else {
+            continue;
+        };
+        let entry = entry.canonicalize().unwrap_or(entry);
+        let Ok(relative) = entry.strip_prefix(&canonical_root) else {
+            continue;
+        };
+        entries.push(relative.to_string_lossy().replace('\\', "/"));
+    }
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
 fn first_existing(dir: &Path, field: &str) -> Option<PathBuf> {
     entry_candidates(field)
         .into_iter()
@@ -712,7 +748,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{WorkspaceMap, pnpm_workspace_globs};
+    use super::{WorkspaceMap, package_entry_paths, pnpm_workspace_globs};
     use oxc_resolver::AliasValue;
 
     fn write(path: &Path, content: &str) {
@@ -815,6 +851,14 @@ catalog:
         );
 
         let map = WorkspaceMap::build(root);
+        assert_eq!(
+            package_entry_paths(root),
+            vec![
+                "packages/@scope/api/src/index.ts",
+                "packages/nested/deep/ui/src/index.ts",
+                "packages/workflow/src/index.ts",
+            ]
+        );
         // Descending key order: every "name/…" entry precedes its bare-name
         // prefix entry, so subpath/dist aliases win before the prefix matches.
         let names: Vec<&str> = map.aliases.iter().map(|(name, _)| name.as_str()).collect();

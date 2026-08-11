@@ -18,6 +18,10 @@ pub struct RunSpec {
     pub source_snapshot: String,
     pub input_fingerprint: String,
     pub request_hash: String,
+    pub config_json: String,
+    /// Explicit current artifact replaced by a refresh. Regular rebuilds
+    /// discover their predecessor from the matching input fingerprint.
+    pub supersedes_artifact_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,21 +79,21 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
                  WHERE scout_kind=?1 AND input_fingerprint=?2 AND status='completed'",
                 params![spec.scout_kind, spec.input_fingerprint],
             )?;
-            current_artifact
+            spec.supersedes_artifact_id.or(current_artifact)
         } else if let Some(existing) = reusable_run(conn, spec)? {
             return Ok(RunClaim::Reused(existing));
         } else {
             // A previous rebuild attempt may have superseded the run before
             // failing. Its artifact remains current and the retry must still
             // replace it rather than creating a parallel current record.
-            current_artifact
+            spec.supersedes_artifact_id.or(current_artifact)
         };
         let inserted = conn.execute(
             "INSERT INTO scout_runs(
                scout_kind, status, gateway_protocol, provider, model, billing_path,
                reasoning, prompt_version, source_snapshot, input_fingerprint,
-               request_hash, started_at
-             ) VALUES(?1,'running',?2,?3,?4,?5,?6,?7,?8,?9,?10,
+               request_hash, config_json, started_at
+             ) VALUES(?1,'running',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
                       strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             params![
                 spec.scout_kind,
@@ -102,6 +106,7 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
                 spec.source_snapshot,
                 spec.input_fingerprint,
                 spec.request_hash,
+                spec.config_json,
             ],
         );
         match inserted {
@@ -151,7 +156,7 @@ fn current_artifact_for_input(conn: &Connection, spec: &RunSpec) -> Result<Optio
         .optional()?)
 }
 
-fn reusable_run(conn: &Connection, spec: &RunSpec) -> Result<Option<i64>> {
+pub(crate) fn reusable_run(conn: &Connection, spec: &RunSpec) -> Result<Option<i64>> {
     Ok(conn
         .query_row(
             "SELECT id FROM scout_runs
@@ -243,6 +248,8 @@ mod tests {
             source_snapshot: "snap".into(),
             input_fingerprint: fingerprint.into(),
             request_hash: "req".into(),
+            config_json: "{}".into(),
+            supersedes_artifact_id: None,
         }
     }
 
