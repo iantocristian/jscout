@@ -544,17 +544,21 @@ fn insert_file(
     }
 
     let mut ins_mc = conn.prepare_cached(
-        "INSERT INTO member_calls(file_id, chunk_id, start, line, prop, object)
-         VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO member_calls(
+           file_id, chunk_id, start, end, line, end_line, prop, object, receiver
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
     )?;
     for m in &data.graph.member_calls {
         ins_mc.execute(params![
             file_id,
             chunk_for(m.span_start),
             m.span_start,
+            m.span_end,
             data.lines.line(m.span_start),
+            data.lines.line(m.span_end.saturating_sub(1)),
             m.prop,
             m.object,
+            m.receiver,
         ])?;
     }
 

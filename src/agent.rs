@@ -37,6 +37,7 @@ mod tests {
 
     #[test]
     fn installs_once_without_overwriting() -> Result<()> {
+        assert!(GUIDE.contains("Use `calls` for exact member-method"));
         let repo = tempfile::tempdir()?;
         let target = install(repo.path())?;
         assert_eq!(std::fs::read_to_string(&target)?, GUIDE);

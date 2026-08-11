@@ -14,6 +14,8 @@ questions, then verify decisive claims in source.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
 - Use `file_outline` after localizing a file and `events` for string-keyed
   emit/listener wiring.
+- Use `calls` for exact member-method and object-option questions, such as
+  finding every `insert` call passed `merge=replace`.
 - Use `neighborhood` for targeted drill-down when an exact anchor is already
   known. Expanded search is the normal discovery surface.
 - Treat `possible` confidence as a candidate, not a fact. It includes
