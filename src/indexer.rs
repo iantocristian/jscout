@@ -30,6 +30,9 @@ pub struct IndexOutcome {
     pub dependency_skipped: usize,
     pub dependency_skipped_bytes: u64,
     pub dependency_plans: Vec<String>,
+    /// False when the structural projection was provably identical (same
+    /// snapshot, projection version, and module resolution) and was kept.
+    pub projection_rebuilt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +150,7 @@ pub fn index_repo_with_options(
         dependency_skipped: 0,
         dependency_skipped_bytes: 0,
         dependency_plans: Vec::new(),
+        projection_rebuilt: true,
     };
 
     let existing: HashMap<String, (i64, String, String)> = {
@@ -225,11 +229,17 @@ pub fn index_repo_with_options(
         }
     }
 
+    // Remember the published projection identity before invalidating it: if
+    // this run reproduces the exact same snapshot and module resolution, the
+    // existing projection rows are provably identical and can be republished
+    // without a rebuild.
+    let previous = ProjectionIdentity::read(conn)?;
+
     // Commit canonical rows and snapshot invalidation atomically. Every
     // following dependency/resolution step can fail, so the previous graph
     // must stop being public before control enters that phase.
     conn.execute(
-        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
         [],
     )?;
     conn.execute_batch("COMMIT")?;
@@ -247,8 +257,41 @@ pub fn index_repo_with_options(
         [root.to_string_lossy()],
     )?;
     let snapshot = crate::structural::compute_snapshot(conn)?;
+    let resolution = resolution_hash(conn)?;
+    let current = ProjectionIdentity {
+        snapshot: Some(snapshot.clone()),
+        projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
+        resolution_hash: Some(resolution.clone()),
+    };
     let projection_started = std::time::Instant::now();
+    if previous == current {
+        // The projection is a pure function of the canonical tables: the
+        // snapshot covers every extracted row (file content identity) and the
+        // resolution hash covers module edges, whose inputs (tsconfigs,
+        // manifests, node_modules layout) live outside indexed content.
+        // Identical inputs under the same projection version republish the
+        // existing rows instead of rebuilding them.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = current.publish(conn);
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        outcome.projection_rebuilt = false;
+        if std::env::var_os("JSCOUT_TIMING").is_some() {
+            eprintln!("timing structural-projection=skipped (unchanged)");
+        }
+        return Ok(outcome);
+    }
     crate::structural::rebuild_projection(conn, &snapshot)?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [&resolution],
+    )?;
     if std::env::var_os("JSCOUT_TIMING").is_some() {
         eprintln!(
             "timing structural-projection={:?}",
@@ -256,6 +299,89 @@ pub fn index_repo_with_options(
         );
     }
     Ok(outcome)
+}
+
+/// The three meta values that must all match for the previous projection to
+/// be provably identical to what a rebuild would produce.
+#[derive(PartialEq, Eq)]
+struct ProjectionIdentity {
+    snapshot: Option<String>,
+    projection_version: Option<String>,
+    resolution_hash: Option<String>,
+}
+
+impl ProjectionIdentity {
+    fn read(conn: &Connection) -> Result<Self> {
+        let read = |key: &str| -> Result<Option<String>> {
+            Ok(conn
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .ok())
+        };
+        Ok(Self {
+            snapshot: read("snapshot")?,
+            projection_version: read("projection_version")?,
+            resolution_hash: read("resolution_hash")?,
+        })
+    }
+
+    fn publish(&self, conn: &Connection) -> Result<()> {
+        for (key, value) in [
+            ("snapshot", &self.snapshot),
+            ("projection_version", &self.projection_version),
+            ("resolution_hash", &self.resolution_hash),
+        ] {
+            let value = value
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("projection identity is missing {key}"))?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic digest of the module resolution outcome. Resolution reads
+/// un-indexed inputs (tsconfigs, package manifests, node_modules), so file
+/// hashes alone cannot prove the projection's module edges are current.
+fn resolution_hash(conn: &Connection) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-resolution-hash-v1\0");
+    let mut stmt = conn.prepare(
+        "SELECT from_file, request, COALESCE(to_file, -1),
+                COALESCE(package, ''), COALESCE(resolution, ''),
+                COALESCE(package_instance_id, -1), type_only
+         FROM module_edges ORDER BY from_file, request",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (from_file, request, to_file, package, resolution, package_instance, type_only) = row?;
+        hasher.update(b"\0");
+        hasher.update(from_file.to_le_bytes().as_slice());
+        hasher.update(request.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(to_file.to_le_bytes().as_slice());
+        hasher.update(package.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(resolution.as_bytes());
+        hasher.update(package_instance.to_le_bytes().as_slice());
+        hasher.update(type_only.to_le_bytes().as_slice());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn ensure_extraction_version(conn: &Connection) -> Result<()> {
@@ -973,7 +1099,7 @@ mod tests {
         )?;
         assert_eq!(
             bogus_packages, 0,
-            "path-like requests must not mint pkg: nodes"
+            "relative requests must not mint pkg: nodes"
         );
         let package_hub: i64 = conn.query_row(
             "SELECT count(*) FROM graph_nodes WHERE node_key='pkg:not-installed-pkg'",
@@ -997,6 +1123,74 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(dangling, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn noop_reindex_republishes_projection_without_rebuild() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("lib.ts"), "export const lib = 1;\n")?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { lib } from 'lib';\nexport const main = () => lib;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        let meta_snapshot = || -> Result<String> {
+            Ok(
+                conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        };
+        let edge_count = || -> Result<i64> {
+            Ok(conn.query_row("SELECT count(*) FROM resolved_edges", [], |row| row.get(0))?)
+        };
+
+        let first = index_repo(repo.path(), &conn)?;
+        assert!(first.projection_rebuilt);
+        let original_snapshot = meta_snapshot()?;
+        let original_edges = edge_count()?;
+
+        let second = index_repo(repo.path(), &conn)?;
+        assert!(!second.projection_rebuilt, "no-op must keep the projection");
+        assert_eq!(meta_snapshot()?, original_snapshot);
+        assert_eq!(edge_count()?, original_edges);
+
+        // Resolution inputs live outside indexed content: a new tsconfig
+        // remaps 'lib' onto ./lib.ts without changing any indexed file, so
+        // the snapshot is identical but the projection must still rebuild.
+        fs::write(
+            repo.path().join("tsconfig.json"),
+            r#"{"compilerOptions": {"paths": {"lib": ["./lib.ts"]}}}"#,
+        )?;
+        let third = index_repo(repo.path(), &conn)?;
+        assert!(
+            third.projection_rebuilt,
+            "resolution change without content change must rebuild"
+        );
+        assert_eq!(meta_snapshot()?, original_snapshot);
+        let target: Option<String> = conn.query_row(
+            "SELECT target.path FROM module_edges edge
+             JOIN files source ON source.id=edge.from_file
+             LEFT JOIN files target ON target.id=edge.to_file
+             WHERE source.path='main.ts' AND edge.request='lib'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(target, Some("lib.ts".into()));
+        let fourth = index_repo(repo.path(), &conn)?;
+        assert!(!fourth.projection_rebuilt);
+
+        fs::write(repo.path().join("lib.ts"), "export const lib = 2;\n")?;
+        let fifth = index_repo(repo.path(), &conn)?;
+        assert!(fifth.projection_rebuilt, "content change must rebuild");
+        assert_ne!(meta_snapshot()?, original_snapshot);
+
+        fs::remove_file(repo.path().join("main.ts"))?;
+        let sixth = index_repo(repo.path(), &conn)?;
+        assert!(sixth.projection_rebuilt, "deletion must rebuild");
+        let seventh = index_repo(repo.path(), &conn)?;
+        assert!(!seventh.projection_rebuilt);
         Ok(())
     }
 
