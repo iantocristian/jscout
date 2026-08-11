@@ -804,14 +804,126 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
-    load_artifact_at_depth(conn, id, 3, &mut HashMap::new())
+    load_artifact_at_depth(conn, id, 3, &mut FreshnessContext::default())
+}
+
+/// Shared state for one top-level artifact load: memoized child freshness
+/// plus the lazily built workspace ownership table needed to recompute a
+/// summary scope's expected child set.
+#[derive(Default)]
+struct FreshnessContext {
+    memo: HashMap<i64, String>,
+    packages: Option<Vec<(String, String)>>,
+}
+
+impl FreshnessContext {
+    fn packages(&mut self, conn: &Connection) -> Result<&[(String, String)]> {
+        if self.packages.is_none() {
+            let root: Option<String> = conn
+                .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            self.packages = Some(match root {
+                Some(root) => crate::scouting::plan::package_prefixes(std::path::Path::new(&root)),
+                None => Vec::new(),
+            });
+        }
+        Ok(self.packages.as_deref().expect("just populated"))
+    }
+}
+
+/// The deterministic child-artifact set a summary scope would be planned
+/// over right now. Any addition, removal, or replacement relative to the
+/// summary's stored input dependencies must stale it: children arrive
+/// incrementally under call budgets, and a summary that silently misses a
+/// new child is wrong even though every pinned child is unchanged.
+pub(crate) fn expected_summary_child_ids(
+    conn: &Connection,
+    packages: &[(String, String)],
+    level: &str,
+    scope_key: &str,
+) -> Result<std::collections::BTreeSet<i64>> {
+    let mut expected = std::collections::BTreeSet::new();
+    match level {
+        "file" => {
+            let file = scope_key.strip_prefix("file:").unwrap_or(scope_key);
+            let mut statement = conn.prepare_cached(
+                "SELECT DISTINCT artifact.id FROM semantic_artifacts artifact
+                 JOIN semantic_supports support ON support.artifact_id=artifact.id
+                 WHERE artifact.artifact_type IN ('card','workflow')
+                   AND support.evidence_file=?1
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )",
+            )?;
+            let rows = statement.query_map([file], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                expected.insert(row?);
+            }
+        }
+        "module" | "repository" => {
+            let mut statement = conn.prepare_cached(
+                "SELECT artifact.id, artifact.canonical_name FROM semantic_artifacts artifact
+                 WHERE artifact.artifact_type='summary'
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, name) = row?;
+                let Some(name) = name else { continue };
+                if level == "module" {
+                    let package = scope_key.strip_prefix("module:").unwrap_or(scope_key);
+                    if let Some(file) = name.strip_prefix("file:")
+                        && crate::scouting::plan::owning_package(packages, file) == Some(package)
+                    {
+                        expected.insert(id);
+                    }
+                } else if name.starts_with("module:") {
+                    expected.insert(id);
+                } else if let Some(file) = name.strip_prefix("file:")
+                    && crate::scouting::plan::owning_package(packages, file).is_none()
+                {
+                    expected.insert(id);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(expected)
+}
+
+/// True when a summary's stored input dependencies (empty claim path) match
+/// the scope's current expected child set exactly.
+pub(crate) fn summary_child_set_current(
+    conn: &Connection,
+    packages: &[(String, String)],
+    artifact_id: i64,
+    level: &str,
+    scope_key: &str,
+) -> Result<bool> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT dst_artifact_id FROM semantic_relations
+         WHERE src_artifact_id=?1 AND claim_path=''",
+    )?;
+    let rows = statement.query_map([artifact_id], |row| row.get::<_, i64>(0))?;
+    let stored = rows.collect::<std::result::Result<std::collections::BTreeSet<i64>, _>>()?;
+    Ok(stored == expected_summary_child_ids(conn, packages, level, scope_key)?)
 }
 
 fn load_artifact_at_depth(
     conn: &Connection,
     id: i64,
     depth: u8,
-    freshness_memo: &mut HashMap<i64, String>,
+    context: &mut FreshnessContext,
 ) -> Result<Option<SemanticArtifact>> {
     let row = conn
         .query_row(
@@ -924,7 +1036,16 @@ fn load_artifact_at_depth(
     } else {
         "stale"
     };
-    let freshness = child_adjusted_freshness(conn, id, own_freshness, depth, freshness_memo)?;
+    let freshness = child_adjusted_freshness(
+        conn,
+        id,
+        &artifact_type,
+        &name,
+        &body,
+        own_freshness,
+        depth,
+        context,
+    )?;
     Ok(Some(SemanticArtifact {
         id,
         supersedes,
@@ -948,12 +1069,16 @@ fn load_artifact_at_depth(
 /// itself no longer fresh degrades it — even when the parent's own text and
 /// direct supports are unchanged. Depth bounds the recursion defensively;
 /// the hierarchy is file -> module -> repository, so three levels suffice.
+#[allow(clippy::too_many_arguments)]
 fn child_adjusted_freshness(
     conn: &Connection,
     artifact_id: i64,
+    artifact_type: &str,
+    name: &Option<String>,
+    body: &Value,
     own_freshness: &str,
     depth: u8,
-    freshness_memo: &mut HashMap<i64, String>,
+    context: &mut FreshnessContext,
 ) -> Result<String> {
     let rank = |label: &str| match label {
         "fresh" => 0_u8,
@@ -961,6 +1086,21 @@ fn child_adjusted_freshness(
         _ => 2,
     };
     let mut worst = rank(own_freshness);
+    // A summary must cover the scope's CURRENT deterministic child set, not
+    // just keep its pinned children unchanged: a child added after
+    // publication stales it even though every stored dependency is intact.
+    if artifact_type == "summary" && worst < 2 {
+        let level = body
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let scope = name.clone().unwrap_or_default();
+        let packages = context.packages(conn)?.to_vec();
+        if !summary_child_set_current(conn, &packages, artifact_id, &level, &scope)? {
+            worst = 2;
+        }
+    }
     let mut statement = conn.prepare_cached(
         "SELECT DISTINCT dst_artifact_id, dst_fingerprint FROM semantic_relations
          WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
@@ -992,14 +1132,13 @@ fn child_adjusted_freshness(
                 }
                 // Memoized across one top-level load: a child cited by many
                 // claims (or shared across a search pass) is computed once.
-                let child_freshness = match freshness_memo.get(&child_id) {
+                let child_freshness = match context.memo.get(&child_id) {
                     Some(label) => Some(label.clone()),
                     None => {
-                        let label =
-                            load_artifact_at_depth(conn, child_id, depth - 1, freshness_memo)?
-                                .map(|child| child.freshness);
+                        let label = load_artifact_at_depth(conn, child_id, depth - 1, context)?
+                            .map(|child| child.freshness);
                         if let Some(label) = &label {
-                            freshness_memo.insert(child_id, label.clone());
+                            context.memo.insert(child_id, label.clone());
                         }
                         label
                     }
@@ -1329,13 +1468,24 @@ mod tests {
             &summary_input,
             &current_snapshot,
             &supports,
-            &[super::RelationInput {
-                claim_path: "/overview".into(),
-                relation: "summarizes".into(),
-                dst_artifact_id: card.id,
-                dst_fingerprint: card_fingerprint,
-                confidence: "likely".into(),
-            }],
+            &[
+                super::RelationInput {
+                    claim_path: "/overview".into(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: card.id,
+                    dst_fingerprint: card_fingerprint.clone(),
+                    confidence: "likely".into(),
+                },
+                // Real publication always records the whole-artifact input
+                // dependency; the expected-child-set check requires it.
+                super::RelationInput {
+                    claim_path: String::new(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: card.id,
+                    dst_fingerprint: card_fingerprint,
+                    confidence: "likely".into(),
+                },
+            ],
             &super::ArtifactProvenance {
                 model: "test",
                 prompt_version: "summary-scout/v1",

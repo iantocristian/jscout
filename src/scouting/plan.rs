@@ -764,6 +764,25 @@ fn discover_summary_scopes(
             for (file, child) in current_summary_children(conn, "file:")? {
                 summarized.insert(file.clone());
                 if let Some(package) = owning_package(&packages, &file) {
+                    // A file summary that no longer covers the file's current
+                    // child set is not a usable dependency: gate the module
+                    // instead of building on known-incomplete coverage.
+                    if !crate::semantic::summary_child_set_current(
+                        conn,
+                        &packages,
+                        child.id,
+                        "file",
+                        &format!("file:{file}"),
+                    )? {
+                        gate(
+                            format!("module:{package}"),
+                            format!(
+                                "file summary for `{file}` no longer covers its current \
+                                 child set; refresh it first"
+                            ),
+                        );
+                        continue;
+                    }
                     add(format!("module:{package}"), package.to_string(), child);
                 }
             }
@@ -789,13 +808,45 @@ fn discover_summary_scopes(
             let packages = package_prefixes(root);
             let mut module_summaries = std::collections::BTreeSet::new();
             for (module, child) in current_summary_children(conn, "module:")? {
-                module_summaries.insert(module);
+                module_summaries.insert(module.clone());
+                if !crate::semantic::summary_child_set_current(
+                    conn,
+                    &packages,
+                    child.id,
+                    "module",
+                    &format!("module:{module}"),
+                )? {
+                    gate(
+                        "repo".into(),
+                        format!(
+                            "module summary for `{module}` no longer covers its current \
+                             child set; refresh it first"
+                        ),
+                    );
+                    continue;
+                }
                 add("repo".into(), "repository".into(), child);
             }
             let mut file_summaries = std::collections::BTreeSet::new();
             for (file, child) in current_summary_children(conn, "file:")? {
                 file_summaries.insert(file.clone());
                 if owning_package(&packages, &file).is_none() {
+                    if !crate::semantic::summary_child_set_current(
+                        conn,
+                        &packages,
+                        child.id,
+                        "file",
+                        &format!("file:{file}"),
+                    )? {
+                        gate(
+                            "repo".into(),
+                            format!(
+                                "file summary for `{file}` no longer covers its current \
+                                 child set; refresh it first"
+                            ),
+                        );
+                        continue;
+                    }
                     add("repo".into(), "repository".into(), child);
                 }
             }
@@ -898,7 +949,7 @@ fn current_summary_children(
 
 /// Workspace package names with their repo-relative root prefixes, longest
 /// prefix first so nested packages win ownership.
-fn package_prefixes(root: &Path) -> Vec<(String, String)> {
+pub(crate) fn package_prefixes(root: &Path) -> Vec<(String, String)> {
     // `WorkspaceMap` canonicalizes package roots and the indexer canonicalizes
     // the repository root before recording file paths, so the prefix must be
     // stripped against the canonical root too. Comparing against a raw root
@@ -929,7 +980,7 @@ fn package_prefixes(root: &Path) -> Vec<(String, String)> {
     prefixes
 }
 
-fn owning_package<'a>(prefixes: &'a [(String, String)], file: &str) -> Option<&'a str> {
+pub(crate) fn owning_package<'a>(prefixes: &'a [(String, String)], file: &str) -> Option<&'a str> {
     prefixes
         .iter()
         .find(|(_, prefix)| {
