@@ -787,6 +787,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
         o.refs,
         started.elapsed()
     );
+    if o.extraction_reset {
+        println!("forced re-extraction: rebuilt the extraction tables wholesale");
+    }
     indexer::report_failures(&o);
     if !dependencies.is_empty() {
         println!(
