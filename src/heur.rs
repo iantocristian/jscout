@@ -32,7 +32,13 @@ pub struct EventSite {
 pub struct MemberCall {
     pub prop: String,
     pub object: Option<String>,
+    /// Full static receiver chain (`dbs.wave.card`, `this.db`); None when any
+    /// link is computed or a call result.
+    pub receiver: Option<String>,
     pub span_start: u32,
+    /// End of the complete CallExpression: a multiline call's evidence lines
+    /// all fall inside [span_start, span_end].
+    pub span_end: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -206,7 +212,9 @@ impl<'a> Visit<'a> for HeurVisitor {
             self.out.member_calls.push(MemberCall {
                 prop,
                 object,
+                receiver: member_path(&m.object),
                 span_start: call.span.start,
+                span_end: call.span.end,
             });
         }
         oxc_ast_visit::walk::walk_call_expression(self, call);
@@ -258,9 +266,10 @@ pub fn extract(program: &Program<'_>) -> Heuristics {
 }
 
 /// Render `a.b.c` member paths for small depths; None for anything complex.
-fn member_path(expr: &Expression<'_>) -> Option<String> {
+pub(crate) fn member_path(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::ThisExpression(_) => Some("this".into()),
         Expression::StaticMemberExpression(m) => {
             let base = member_path(&m.object)?;
             Some(format!("{base}.{}", m.property.name))
