@@ -392,6 +392,24 @@ test("error payloads redact credential forms and never expose raw provider failu
   assert.equal(classified.code, "connection");
   assert.equal(classified.message, "provider connection failed");
   assert.ok(!classified.message.includes("PROMPT_MARKER"));
+
+  for (const transient of [
+    "rate limit reached for this API key",
+    "ResourceExhausted",
+    "EAI_AGAIN",
+    "stream ended before a terminal response event",
+  ]) {
+    assert.equal(classifyProviderFailure(transient).retryable, true, transient);
+  }
+  for (const terminal of [
+    "FreeUsageLimitError",
+    "usage_limit_reached",
+    "available balance is exhausted",
+  ]) {
+    const failure = classifyProviderFailure(terminal);
+    assert.equal(failure.code, "billing", terminal);
+    assert.equal(failure.retryable, false, terminal);
+  }
 });
 
 test("readLines splits frames and reports oversized lines without resync", async () => {

@@ -159,10 +159,11 @@ export function extractSubmission(message, toolName) {
 export function classifyProviderFailure(message) {
   const text = String(message ?? "provider request failed");
   const lower = text.toLowerCase();
-  if (/(^|\D)(401|403)(\D|$)/.test(text) || lower.includes("unauthorized") || lower.includes("api key") || lower.includes("credential")) {
-    return new CompletionError("auth", "provider authentication failed");
-  }
   if (
+    lower.includes("gousagelimiterror") ||
+    lower.includes("freeusagelimiterror") ||
+    lower.includes("usage_limit_reached") ||
+    lower.includes("usage not included") ||
     lower.includes("insufficient_quota") ||
     lower.includes("usage limit") ||
     lower.includes("quota exceeded") ||
@@ -170,28 +171,66 @@ export function classifyProviderFailure(message) {
     lower.includes("billing") ||
     lower.includes("payment required") ||
     lower.includes("credit balance") ||
+    lower.includes("available balance") ||
     lower.includes("out of budget")
   ) {
     return new CompletionError("billing", "provider quota or billing limit was reached");
   }
-  if (/(^|\D)429(\D|$)/.test(text) || lower.includes("rate limit") || lower.includes("overloaded") || lower.includes("capacity")) {
+  if (
+    /(^|\D)429(\D|$)/.test(text) ||
+    /rate.?limit/iu.test(text) ||
+    lower.includes("too many requests") ||
+    lower.includes("overloaded") ||
+    lower.includes("capacity") ||
+    lower.includes("resourceexhausted") ||
+    lower.includes("resource exhausted")
+  ) {
     return new CompletionError("capacity", "provider is temporarily capacity-limited", {
       retryable: true,
       capacity: true,
     });
   }
+  if (
+    /(^|\D)(401|403)(\D|$)/.test(text) ||
+    lower.includes("unauthorized") ||
+    lower.includes("invalid api key") ||
+    lower.includes("incorrect api key") ||
+    lower.includes("invalid credential") ||
+    lower.includes("authentication failed")
+  ) {
+    return new CompletionError("auth", "provider authentication failed");
+  }
   if (lower.includes("context") && (lower.includes("length") || lower.includes("window") || lower.includes("too long"))) {
     return new CompletionError("context_limit", "request exceeds the provider context limit");
   }
   if (
-    /(^|\D)(408|409|500|502|503|504)(\D|$)/.test(text) ||
+    /(^|\D)(408|409|500|502|503|504|524)(\D|$)/.test(text) ||
     lower.includes("timeout") ||
     lower.includes("timed out") ||
     lower.includes("econn") ||
     lower.includes("socket") ||
     lower.includes("network") ||
     lower.includes("fetch failed") ||
-    lower.includes("service unavailable")
+    lower.includes("service unavailable") ||
+    lower.includes("server error") ||
+    lower.includes("internal error") ||
+    lower.includes("provider returned error") ||
+    lower.includes("connection refused") ||
+    lower.includes("connection lost") ||
+    lower.includes("other side closed") ||
+    lower.includes("getaddrinfo") ||
+    lower.includes("enotfound") ||
+    lower.includes("eai_again") ||
+    lower.includes("upstream connect") ||
+    lower.includes("reset before headers") ||
+    lower.includes("ended without") ||
+    lower.includes("stream ended before") ||
+    lower.includes("did not get a response") ||
+    lower.includes("retry delay") ||
+    lower.includes("retry your request") ||
+    lower.includes("websocket closed") ||
+    lower.includes("websocket error") ||
+    lower.includes("terminated")
   ) {
     return new CompletionError("connection", "provider connection failed", { retryable: true });
   }
