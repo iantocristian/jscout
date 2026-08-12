@@ -596,7 +596,23 @@ the checker. A lockfile hash may contribute but is not a freshness certificate
 for ambient/generated declarations or effective compiler settings. The pass is
 planned against one structural snapshot and publishes a completed batch in one
 transaction after rechecking that snapshot, occurrence source hashes, target
-anchors, and checker inputs; drift publishes nothing from the raced batch.
+anchors, and checker inputs; drift publishes nothing from the raced batch. Only
+one batch is retained: publishing supersedes and drops its predecessor.
+
+As implemented, "only fresh facts" is enforced at two granularities. Inputs the
+index itself tracks — repository sources — are policed per fact, because each
+fact records its own source path/hash, occurrence spans, and target
+fingerprint; an edit retires exactly the facts recorded against that file.
+Inputs the index does not track — the TypeScript package, the `tsconfig` chain,
+ambient/generated declarations, anything outside the index — have no per-fact
+anchor and retire the whole batch. The batch's planning snapshot is therefore
+not itself a projection gate: binding to it would retire every fact in a
+repository whenever any one file changed, which is the opposite of the rule
+above. The accepted cost is that an edit to one file cannot retire a fact in
+another file whose answer that edit changed; re-running `jscout enrich`
+re-derives it. Because the fingerprint hashes machine-absolute paths, a
+database moved to another path or host never revalidates and projects no
+checker edges until enrichment runs there — enrichment is host-local by design.
 
 Verification follows the gateway precedent: fake-sidecar protocol,
 unknown-type, crash, enforced-timeout, cancellation, and outside-root tests in

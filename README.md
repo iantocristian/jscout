@@ -160,12 +160,39 @@ all of them. Conflicting declarations remain separate `possible` candidates;
 one mapped declaration becomes an occurrence-specific `likely` edge with
 `checker` provenance. `any`, error, and unknown receiver types publish no edge.
 
-Results are stored as canonical fingerprinted batches and projected only while
-the structural snapshot, occurrence source, declaration target, and checker
-inputs remain fresh. A raced batch publishes nothing. Each request has a hard
-deadline (`--timeout`, default 30 seconds); timeout kills the sidecar process.
-Ctrl-C terminates active checker work rather than leaving a blocked TypeScript
-worker behind.
+Results are stored as one canonical fingerprinted batch; publishing a new batch
+drops the one it supersedes. A raced batch publishes nothing. Each request has a
+hard deadline (`--timeout`, default 30 seconds); timeout kills the sidecar
+process. Ctrl-C terminates active checker work rather than leaving a blocked
+TypeScript worker behind.
+
+### What a rebuild keeps
+
+Freshness has two granularities, because checker inputs have two kinds of
+anchor:
+
+- **Per fact.** Every published fact records its own source file and hash, its
+  exact occurrence spans, and its target's fingerprint. Editing one repository
+  file retires the edges recorded against *that* file and leaves every other
+  file's alone.
+- **Per batch.** Environment inputs — the TypeScript version and package, the
+  `tsconfig` inheritance chain, ambient/generated `.d.ts` declarations, and
+  anything else the index does not track — have no per-fact anchor, so drift in
+  any of them retires the whole batch's edges at the next rebuild.
+
+Canonical facts are never erased by a rebuild; they stop being traversable and
+become projectable again when their inputs match. Two consequences are
+deliberate and worth stating:
+
+- An edit to file A cannot retire a fact recorded in file B even when A is what
+  changed B's answer. Per-fact freshness trades that for not losing a
+  repository's whole checker plane to one keystroke; re-run `jscout enrich` to
+  re-derive.
+- The checker-input fingerprint hashes machine-absolute paths, so a database
+  copied or moved to another path (or another machine) never revalidates its
+  enrichments and simply projects no checker edges until `jscout enrich` runs
+  again there. Enrichment is host-local by design; this is conservative
+  invalidation, not corruption.
 
 ## Semantic scouting
 
