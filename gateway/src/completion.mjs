@@ -15,6 +15,11 @@ export class CompletionError extends Error {
 }
 
 const ROLES = new Set(["user", "assistant"]);
+export const DEFAULT_RETRY_POLICY = Object.freeze({
+  maxRetries: 2,
+  baseDelayMs: 500,
+  maxDelayMs: 2_000,
+});
 
 export function validateCompleteRequest(request) {
   const tool = request.tool;
@@ -111,7 +116,7 @@ function numberOrZero(value) {
 /// never forwarded.
 export function extractSubmission(message, toolName) {
   if (message.stopReason === "aborted") {
-    throw new CompletionError("canceled", message.errorMessage || "request aborted");
+    throw new CompletionError("canceled", "request aborted");
   }
   if (message.stopReason === "error") {
     throw classifyProviderFailure(message.errorMessage || "provider reported an error");
@@ -155,24 +160,107 @@ export function classifyProviderFailure(message) {
   const text = String(message ?? "provider request failed");
   const lower = text.toLowerCase();
   if (/(^|\D)(401|403)(\D|$)/.test(text) || lower.includes("unauthorized") || lower.includes("api key") || lower.includes("credential")) {
-    return new CompletionError("auth", text);
+    return new CompletionError("auth", "provider authentication failed");
   }
-  if (/(^|\D)429(\D|$)/.test(text) || lower.includes("rate limit") || lower.includes("overloaded") || lower.includes("capacity") || lower.includes("quota")) {
-    return new CompletionError("capacity", text, { retryable: true, capacity: true });
+  if (
+    lower.includes("insufficient_quota") ||
+    lower.includes("usage limit") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("monthly quota") ||
+    lower.includes("billing") ||
+    lower.includes("payment required") ||
+    lower.includes("credit balance") ||
+    lower.includes("out of budget")
+  ) {
+    return new CompletionError("billing", "provider quota or billing limit was reached");
+  }
+  if (/(^|\D)429(\D|$)/.test(text) || lower.includes("rate limit") || lower.includes("overloaded") || lower.includes("capacity")) {
+    return new CompletionError("capacity", "provider is temporarily capacity-limited", {
+      retryable: true,
+      capacity: true,
+    });
   }
   if (lower.includes("context") && (lower.includes("length") || lower.includes("window") || lower.includes("too long"))) {
-    return new CompletionError("context_limit", text);
+    return new CompletionError("context_limit", "request exceeds the provider context limit");
   }
-  if (/(^|\D)(500|502|503|504)(\D|$)/.test(text) || lower.includes("timeout") || lower.includes("timed out") || lower.includes("econn") || lower.includes("socket") || lower.includes("network") || lower.includes("fetch failed")) {
-    return new CompletionError("connection", text, { retryable: true });
+  if (
+    /(^|\D)(408|409|500|502|503|504)(\D|$)/.test(text) ||
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("econn") ||
+    lower.includes("socket") ||
+    lower.includes("network") ||
+    lower.includes("fetch failed") ||
+    lower.includes("service unavailable")
+  ) {
+    return new CompletionError("connection", "provider connection failed", { retryable: true });
   }
-  return new CompletionError("provider", text);
+  return new CompletionError("provider", "provider request failed");
+}
+
+function retryPolicy(value) {
+  const configured = value ?? DEFAULT_RETRY_POLICY;
+  return {
+    maxRetries: nonNegativeInteger(configured.maxRetries, "maxRetries"),
+    baseDelayMs: nonNegativeInteger(configured.baseDelayMs, "baseDelayMs"),
+    maxDelayMs: nonNegativeInteger(configured.maxDelayMs, "maxDelayMs"),
+  };
+}
+
+function nonNegativeInteger(value, name) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new CompletionError("configuration", `retry policy ${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function retryDelayMs(policy, retryIndex) {
+  return Math.min(policy.baseDelayMs * 2 ** retryIndex, policy.maxDelayMs);
+}
+
+function abortableDelay(delayMs, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new CompletionError("canceled", "request aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    timer.unref?.();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new CompletionError("canceled", "request aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function completeWithRetry({ models, model, context, options, toolName, signal, policy }) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const message = await models.complete(model, context, options);
+      return { ...extractSubmission(message, toolName), attempts: attempt + 1 };
+    } catch (error) {
+      let classified = error;
+      if (!(error instanceof CompletionError) && !(error instanceof RegistryError)) {
+        classified = signal.aborted || error?.name === "AbortError"
+          ? new CompletionError("canceled", "request aborted")
+          : classifyProviderFailure(error?.message);
+      }
+      if (!(classified instanceof CompletionError) || !classified.retryable || attempt >= policy.maxRetries) {
+        throw classified;
+      }
+      await abortableDelay(retryDelayMs(policy, attempt), signal);
+    }
+  }
 }
 
 /// Run one completion. Returns {started, result}; the caller emits `started`
 /// before awaiting the result promise so Rust can observe the resolved
 /// provider/billing path before any network wait.
-export async function startCompletion({ registry, parsed, request, signal }) {
+export async function startCompletion({ registry, parsed, request, signal, retry: configuredRetry }) {
   const { models, customProviderIds } = registry;
   const model = models.getModel(parsed.provider, parsed.modelId);
   if (!model) {
@@ -183,6 +271,9 @@ export async function startCompletion({ registry, parsed, request, signal }) {
     ...reasoningOptions(parsed.provider, request.reasoning),
     ...serviceTierOptions(model, request.provider_options?.service_tier),
     signal,
+    // The gateway owns the one visible retry policy. Disable adapter/SDK
+    // retries so attempts cannot multiply invisibly underneath it.
+    maxRetries: 0,
   };
   if (Number.isInteger(request.max_tokens) && request.max_tokens > 0) {
     options.maxTokens = request.max_tokens;
@@ -194,8 +285,8 @@ export async function startCompletion({ registry, parsed, request, signal }) {
     options.cacheRetention = request.cache_retention;
   }
 
-  const auth = await models.getAuth(model).catch((error) => {
-    throw new CompletionError("auth", `auth resolution failed: ${error.message}`);
+  const auth = await models.getAuth(model, { signal }).catch(() => {
+    throw new CompletionError("auth", "provider authentication could not be resolved");
   });
   if (!auth) {
     throw new CompletionError("auth", `provider ${parsed.provider} has no configured credentials`);
@@ -211,15 +302,14 @@ export async function startCompletion({ registry, parsed, request, signal }) {
     auth_source: auth.source ?? "configured",
   };
 
-  const result = models
-    .complete(model, toContext(request, model), options)
-    .then((message) => extractSubmission(message, request.tool.name))
-    .catch((error) => {
-      if (error instanceof CompletionError || error instanceof RegistryError) throw error;
-      if (signal.aborted || error?.name === "AbortError") {
-        throw new CompletionError("canceled", "request aborted");
-      }
-      throw classifyProviderFailure(error?.message);
-    });
+  const result = completeWithRetry({
+    models,
+    model,
+    context: toContext(request, model),
+    options,
+    toolName: request.tool.name,
+    signal,
+    policy: retryPolicy(configuredRetry),
+  });
   return { started, result };
 }
