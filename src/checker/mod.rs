@@ -58,14 +58,14 @@ fn existing(path: &Path, source: &str) -> Result<PathBuf> {
 }
 
 pub fn launch(root: &Path, sidecar: Option<&Path>) -> Result<process::ProcessChecker> {
-    let node = crate::llm::config::resolve_node()?;
+    let node = crate::llm::config::resolve_node_for("the TypeScript checker sidecar")?;
     crate::llm::config::verify_node_version(&node)?;
     let sidecar = resolve_sidecar(sidecar)?;
     Ok(process::ProcessChecker::spawn(&node, &sidecar, root)?)
 }
 
 pub fn doctor(root: &Path, sidecar: Option<&Path>, timeout: std::time::Duration) -> Result<()> {
-    let node = crate::llm::config::resolve_node()?;
+    let node = crate::llm::config::resolve_node_for("the TypeScript checker sidecar")?;
     let node_version = crate::llm::config::verify_node_version(&node)?;
     let sidecar = resolve_sidecar(sidecar)?;
     println!("node: {} ({node_version})", node.display());
