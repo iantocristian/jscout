@@ -1795,14 +1795,19 @@ fn execute_prepared_summary(
         }
     };
     let (current_snapshot, supports) = validated_artifact;
+    let planned_child_ids = children
+        .iter()
+        .map(|child| child.artifact_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let packages = plan::package_prefixes(root);
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<i64> {
         if structural::current_snapshot(conn)? != snapshot {
             bail!("structural snapshot changed during publication");
         }
-        // The summary's evidence is its children: every cited child must
-        // still be current with the exact fingerprint the claims were
+        // The summary's evidence is its children: every planned child must
+        // still be current with the exact fingerprint the summary was
         // grounded on, or this publication would pin prose to evidence that
         // no longer exists.
         for relation in &relations {
@@ -1824,6 +1829,20 @@ fn execute_prepared_summary(
                     relation.dst_artifact_id
                 ),
             }
+        }
+        // Child identity can also change without invalidating any planned
+        // child: another scout or agent may publish an additional child in
+        // this scope while the model call is in flight. Check the complete
+        // current set under the write transaction after retaining the more
+        // specific changed-child diagnostic above.
+        let expected_child_ids =
+            semantic::expected_summary_child_ids(conn, &packages, &scope.level, &scope.scope_key)?;
+        if expected_child_ids != planned_child_ids {
+            bail!(
+                "summary child set changed during publication (planned {}, current {})",
+                planned_child_ids.len(),
+                expected_child_ids.len()
+            );
         }
         // One current summary per scope, resolved inside this transaction.
         if annotate_input.supersedes.is_none() {
@@ -4635,6 +4654,92 @@ mod tests {
                 row.get(0)
             })?;
         assert_eq!(relations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_publication_refuses_a_child_added_mid_flight() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        seed_card(repo.path(), &conn)?;
+
+        // Planning sees only the start card. While the model call is in
+        // flight, an agent adds a second current card to the same file. No
+        // source or structural snapshot changes, and the original child is
+        // untouched, so only a complete child-set recheck can catch it.
+        let finish_anchor = crate::structural::resolve_current_anchor(&conn, "flow.ts:finish")?;
+        let root = repo.path().to_path_buf();
+        let db_path = store::db_path(repo.path());
+        let mut gateway = FakeGateway::new(vec![Ok(summary_outcome(summary_submission(
+            "hosts the settlement entry point and the terminal helper it calls",
+            &["C1"],
+        )))]);
+        gateway.on_complete = Some(Box::new(move || {
+            let racing = store::open_path(&db_path).expect("open racing connection");
+            let snapshot =
+                crate::structural::current_snapshot(&racing).expect("racing current snapshot");
+            crate::semantic::annotate(
+                &root,
+                &racing,
+                &crate::semantic::AnnotateInput {
+                    artifact_type: "card".into(),
+                    name: Some(finish_anchor.clone()),
+                    body: json!({ "purpose": "terminal helper that completes the flow" }),
+                    supports: vec![crate::semantic::SupportInput {
+                        claim_path: "/purpose".into(),
+                        anchor: finish_anchor.clone(),
+                        role: None,
+                        evidence_file: "flow.ts".into(),
+                        evidence_start_line: 1,
+                        evidence_end_line: 1,
+                        confidence: "likely".into(),
+                    }],
+                    confidence: "likely".into(),
+                    snapshot,
+                    supersedes: None,
+                },
+            )
+            .expect("racing additional card");
+        }));
+
+        let error = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )
+        .expect_err("the scope gained a child during completion");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("publication recheck failed")
+                && rendered.contains(
+                    "summary child set changed during publication (planned 1, current 2)"
+                ),
+            "unexpected failure: {rendered}"
+        );
+
+        let (status, code): (String, String) = conn.query_row(
+            "SELECT status, error_code FROM scout_runs WHERE scout_kind='summary'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            (status.as_str(), code.as_str()),
+            ("incomplete", "publication_recheck")
+        );
+        let summaries: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_artifacts WHERE artifact_type='summary'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(summaries, 0, "no partial summary write");
+        let cards: i64 = conn.query_row(
+            "SELECT count(*) FROM semantic_artifacts WHERE artifact_type='card'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cards, 2, "the racing child committed independently");
         Ok(())
     }
 

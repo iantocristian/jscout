@@ -150,11 +150,13 @@ file summaries no package owns); omitting `--level` runs all three in that
 order under a single `--max-calls` budget, so a module summary is planned from
 the file summaries the same invocation just published. Every claim must cite
 the enumerated child references it rests on, and each citation is published as
-a `summarizes` relation pinned to that child's artifact fingerprint — uncited
-prose never validates, and a scope with no current children is not a summary
-subject at all. Publication rechecks inside the transaction that every cited
-child is still current with the pinned fingerprint, so a child that moves
-mid-flight refuses the write rather than pinning prose to vanished evidence.
+a `summarizes` relation pinned to that child's artifact fingerprint. Every
+planned child also becomes a whole-summary input dependency, whether cited or
+not — uncited prose never validates, and a scope with no current children is
+not a summary subject at all. Publication rechecks inside the transaction that
+the scope still has exactly the planned child set and that every child remains
+current with its pinned fingerprint, so a child added, removed, or replaced
+mid-flight refuses the write rather than publishing immediately stale prose.
 Freshness then propagates upward: a missing, superseded, or changed child
 stales its parent, and a current-but-not-fresh child degrades it, even when the
 parent's own text never changed. `--scope KEY` selects scopes explicitly and

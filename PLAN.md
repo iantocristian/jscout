@@ -350,10 +350,11 @@ validator, freshness engine, and immutable supersession as workflows and cards.
    validation, an unknown reference fails validation, and a refusal
    (`incomplete_reason`) is mutually exclusive with any claim.
 4. Publish one artifact per scope key, with one `summarizes` relation per cited
-   child per claim, pinned to the fingerprint the claim was grounded on, at
+   child per claim plus a whole-summary input dependency for every planned
+   child, all pinned to the fingerprints the summary was grounded on, at
    `likely` confidence. Inside the publication transaction, recheck the
-   structural snapshot and that every cited child is still current with exactly
-   that fingerprint; either failing refuses the write whole.
+   structural snapshot, exact current child set, and every child's pinned
+   fingerprint; any mismatch refuses the write whole.
 5. Run levels staged bottom-up under one `--max-calls` budget when no `--level`
    is given, so each level is planned only after the previous level's artifacts
    exist and a module summary sees the file summaries the same invocation just
