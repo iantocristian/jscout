@@ -73,6 +73,19 @@ function normalizeOption(value) {
   return value;
 }
 
+// Canonical facts and agent-visible output stay repo-relative: strip the
+// absolute repository prefix from `import("...")` type spellings and mask
+// any other machine-absolute path.
+function normalizeTypeText(text) {
+  return text.replace(/import\("([^"]+)"\)/gu, (_, spec) => {
+    if (!path.isAbsolute(spec)) return `import("${spec}")`;
+    if (insideRoot(spec)) {
+      return `import("${path.relative(root, spec).split(path.sep).join("/")}")`;
+    }
+    return `import("outside:${path.basename(spec)}")`;
+  });
+}
+
 function digestText(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
@@ -270,10 +283,12 @@ function owningProjects(queryFile, force = false) {
 
 function buildProject(project, force = false) {
   if (!force && programCache.has(project.id)) return programCache.get(project.id);
+  // The program gets the EFFECTIVE options: normalizing absolute paths here
+  // breaks baseUrl/paths resolution and silently degrades every mapped
+  // receiver to `any`. Normalization exists for the fingerprint only.
   const program = ts.createProgram({
     rootNames: project.fileNames,
-    options: normalizeOption(project.options),
-    project_references: normalizeOption(project.projectReferences ?? []),
+    options: project.options,
     projectReferences: project.projectReferences,
   });
   const checker = program.getTypeChecker();
@@ -303,7 +318,7 @@ function buildProject(project, force = false) {
     compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
     configs: configs.map(({ identity, source_hash }) => [identity, source_hash]),
-    options: project.options,
+    options: normalizeOption(project.options),
     inputs: sourceInputs.map(({ identity, source_hash }) => [identity, source_hash]),
   })));
   const built = { program, checker, fingerprint, inputFiles };
@@ -440,11 +455,11 @@ function resolveMember(query) {
     answers.push({
       project_id: project.id,
       status: declarations.length > 0 ? "resolved" : "unknown",
-      receiver_type: built.checker.typeToString(
+      receiver_type: normalizeTypeText(built.checker.typeToString(
         receiverType,
         occurrence.member.expression,
         ts.TypeFormatFlags.NoTruncation,
-      ),
+      )),
       declarations,
       checker_input_fingerprint: built.fingerprint,
     });

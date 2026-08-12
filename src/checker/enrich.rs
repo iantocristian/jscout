@@ -42,6 +42,7 @@ struct Occurrence {
     receiver_end: i64,
     property_start: i64,
     property_end: i64,
+    member: String,
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +155,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                 unknown_answers += 1;
                 continue;
             }
+            let mut occurrence_unmapped = 0_usize;
             for declaration in answer.declarations {
-                match map_declaration(&conn, &declaration)? {
+                match map_declaration(&conn, &occurrence.member, &declaration)? {
                     Some(target) => occurrence_facts.push(PendingFact {
                         occurrence: occurrence.clone(),
                         project_id: answer.project_id.clone(),
@@ -164,28 +166,30 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                         confidence: String::new(),
                         input_fingerprint: answer.checker_input_fingerprint.clone(),
                     }),
-                    None => unmapped_declarations += 1,
+                    None => occurrence_unmapped += 1,
                 }
             }
-        }
-        occurrence_facts.sort_by(|left, right| {
-            (&left.project_id, &left.target.anchor).cmp(&(&right.project_id, &right.target.anchor))
-        });
-        occurrence_facts.dedup_by(|left, right| {
-            left.project_id == right.project_id && left.target.anchor == right.target.anchor
-        });
-        let target_count = occurrence_facts
-            .iter()
-            .map(|fact| fact.target.anchor.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
-        for fact in &mut occurrence_facts {
-            fact.confidence = if target_count == 1 {
-                "likely"
-            } else {
-                "possible"
+            unmapped_declarations += occurrence_unmapped;
+            occurrence_facts.sort_by(|left, right| {
+                (&left.project_id, &left.target.anchor)
+                    .cmp(&(&right.project_id, &right.target.anchor))
+            });
+            occurrence_facts.dedup_by(|left, right| {
+                left.project_id == right.project_id && left.target.anchor == right.target.anchor
+            });
+            let target_count = occurrence_facts
+                .iter()
+                .map(|fact| fact.target.anchor.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            // Ambiguity is judged over the checker's WHOLE answer: a valid
+            // declaration that failed to map still means the checker saw more
+            // than one target, so the survivors never inherit a lone `likely`
+            // the checker did not assert.
+            let unambiguous = target_count == 1 && occurrence_unmapped == 0;
+            for fact in &mut occurrence_facts {
+                fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
             }
-            .into();
         }
         facts.extend(occurrence_facts);
         if (index + 1) % 100 == 0 {
@@ -300,7 +304,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
     let mut statement = conn.prepare(
         "SELECT call.rowid, file.id, file.path, file.hash,
                 call.start, call.end, call.receiver_start, call.receiver_end,
-                call.property_start, call.property_end
+                call.property_start, call.property_end, call.prop
          FROM member_calls call
          JOIN files file ON file.id=call.file_id
          WHERE file.origin IN ('repository', 'workspace')
@@ -322,6 +326,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
             receiver_end: row.get(7)?,
             property_start: row.get(8)?,
             property_end: row.get(9)?,
+            member: row.get(10)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -350,30 +355,43 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
     Ok(())
 }
 
-fn map_declaration(conn: &Connection, declaration: &DeclarationSite) -> Result<Option<Target>> {
+fn map_declaration(
+    conn: &Connection,
+    member: &str,
+    declaration: &DeclarationSite,
+) -> Result<Option<Target>> {
     if declaration.outside_root {
         return Ok(None);
     }
     let Some(path) = declaration.file.as_deref() else {
         return Ok(None);
     };
+    // Containment alone fabricates targets: any declaration nested inside an
+    // indexed symbol's body would anchor to its container (an object-literal
+    // method inside a function became a `likely` self-edge on the function).
+    // The mapped symbol must BE the member's declaration: same name, and the
+    // tightest span containing the checker's declaration node.
     let mut statement = conn.prepare(
         "SELECT node.node_key, file.hash, symbol.decl_start, symbol.decl_end
          FROM symbols symbol
          JOIN files file ON file.id=symbol.file_id
          JOIN graph_nodes node ON node.native_table='symbols' AND node.native_id=symbol.id
          WHERE file.path=?1
+           AND symbol.name=?4
            AND symbol.decl_start<=?2 AND symbol.decl_end>=?3
          ORDER BY (symbol.decl_end-symbol.decl_start), node.node_key",
     )?;
-    let rows = statement.query_map(params![path, declaration.start, declaration.end], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![path, declaration.start, declaration.end, member],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
     let mut candidates = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     if candidates.is_empty() {
         return Ok(None);
