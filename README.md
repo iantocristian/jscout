@@ -412,6 +412,13 @@ profile and source origin, and keeps occurrence rows in the same SQLite file.
 This removes the Rust full-table cosine loop. The stable `vec0` implementation
 is native exact KNN, not an HNSW/approximate index.
 
+The first vector search after upgrading an existing database performs one full
+consistency repair; later searches use a cheap regular-table readiness check.
+On the August 2026 n8n validation corpus (92,215 vector occurrences), a warm
+release search measured 107 ms for exact KNN and 332 ms for the complete vector
+stage. ANN/HNSW remains a separate follow-up rather than a correctness
+dependency of this storage change.
+
 ## Reranking (optional)
 
 With `JSCOUT_EMBED_PROVIDER=local`, search automatically sends the top RRF

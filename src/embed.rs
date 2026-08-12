@@ -596,83 +596,140 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (profile_id, dimensions) in profiles {
-        let table = ensure_vector_table(conn, dimensions)?;
-        conn.execute(
-            &format!(
-                "DELETE FROM {table}
-                 WHERE profile_id=?1
-                   AND rowid NOT IN (SELECT id FROM embedding_index_entries WHERE profile_id=?1)"
-            ),
-            [profile_id],
-        )?;
+    let profiles = profiles
+        .into_iter()
+        .map(|(profile_id, dimensions)| Ok((profile_id, ensure_vector_table(conn, dimensions)?)))
+        .collect::<Result<Vec<_>>>()?;
 
-        let missing_chunks = {
-            let mut statement = conn.prepare(
-                "SELECT c.id, f.origin, e.vec
-                 FROM chunks c
-                 JOIN files f ON f.id=c.file_id
-                 JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
-                 LEFT JOIN embedding_index_entries i
-                   ON i.chunk_id=c.id AND i.profile_id=e.profile_id
-                 WHERE i.id IS NULL",
-            )?;
-            let rows = statement.query_map([profile_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for (chunk_id, origin, vector) in missing_chunks {
-            conn.execute(
-                "INSERT INTO embedding_index_entries(chunk_id, profile_id) VALUES(?1, ?2)",
-                params![chunk_id, profile_id],
-            )?;
-            let row_id = conn.last_insert_rowid();
+    // A savepoint is atomic both for the standalone `embed` command and when
+    // search calls this inside its snapshot savepoint.
+    conn.execute_batch("SAVEPOINT jscout_vector_sync")?;
+    let sync_result = (|| -> Result<()> {
+        for (profile_id, table) in profiles {
             conn.execute(
                 &format!(
-                    "INSERT INTO {table}(rowid, embedding, profile_id, origin)
-                     VALUES(?1, ?2, ?3, ?4)"
+                    "DELETE FROM {table}
+                     WHERE profile_id=?1
+                       AND rowid NOT IN (SELECT id FROM embedding_index_entries WHERE profile_id=?1)"
                 ),
-                params![row_id, vector, profile_id, origin],
+                [profile_id],
+            )?;
+
+            let missing_chunks = {
+                let mut statement = conn.prepare(
+                    "SELECT c.id, f.origin, e.vec
+                     FROM chunks c
+                     JOIN files f ON f.id=c.file_id
+                     JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
+                     LEFT JOIN embedding_index_entries i
+                       ON i.chunk_id=c.id AND i.profile_id=e.profile_id
+                     WHERE i.id IS NULL",
+                )?;
+                let rows = statement.query_map([profile_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (chunk_id, origin, vector) in missing_chunks {
+                conn.execute(
+                    "INSERT INTO embedding_index_entries(chunk_id, profile_id) VALUES(?1, ?2)",
+                    params![chunk_id, profile_id],
+                )?;
+                let row_id = conn.last_insert_rowid();
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table}(rowid, embedding, profile_id, origin)
+                         VALUES(?1, ?2, ?3, ?4)"
+                    ),
+                    params![row_id, vector, profile_id, origin],
+                )?;
+            }
+
+            // Repair a virtual row lost by an older, non-transactional build
+            // without discarding the durable occurrence identity.
+            let missing_vectors = {
+                let mut statement = conn.prepare(&format!(
+                    "SELECT i.id, f.origin, e.vec
+                     FROM embedding_index_entries i
+                     JOIN chunks c ON c.id=i.chunk_id
+                     JOIN files f ON f.id=c.file_id
+                     JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=i.profile_id
+                     LEFT JOIN {table} v ON v.rowid=i.id
+                     WHERE i.profile_id=?1 AND v.rowid IS NULL"
+                ))?;
+                let rows = statement.query_map([profile_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (row_id, origin, vector) in missing_vectors {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table}(rowid, embedding, profile_id, origin)
+                         VALUES(?1, ?2, ?3, ?4)"
+                    ),
+                    params![row_id, vector, profile_id, origin],
+                )?;
+            }
+
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, '1')
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [vector_sync_key(profile_id)],
             )?;
         }
-
-        // Repair a virtual row lost outside a transaction without discarding
-        // the durable occurrence identity.
-        let missing_vectors = {
-            let mut statement = conn.prepare(&format!(
-                "SELECT i.id, f.origin, e.vec
-                 FROM embedding_index_entries i
-                 JOIN chunks c ON c.id=i.chunk_id
-                 JOIN files f ON f.id=c.file_id
-                 JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=i.profile_id
-                 LEFT JOIN {table} v ON v.rowid=i.id
-                 WHERE i.profile_id=?1 AND v.rowid IS NULL"
-            ))?;
-            let rows = statement.query_map([profile_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for (row_id, origin, vector) in missing_vectors {
-            conn.execute(
-                &format!(
-                    "INSERT INTO {table}(rowid, embedding, profile_id, origin)
-                     VALUES(?1, ?2, ?3, ?4)"
-                ),
-                params![row_id, vector, profile_id, origin],
-            )?;
+        Ok(())
+    })();
+    match sync_result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_sync")?,
+        Err(error) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO jscout_vector_sync; RELEASE jscout_vector_sync");
+            return Err(error);
         }
     }
     Ok(())
+}
+
+fn vector_sync_key(profile_id: i64) -> String {
+    format!("embedding_index_synced_v1:{profile_id}")
+}
+
+/// The virtual index is transactionally maintained after its first complete
+/// repair. A regular-table anti-join cheaply detects newly indexed chunk
+/// occurrences that can reuse cached embeddings; it avoids auditing every
+/// sqlite-vec row on every search.
+fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    let has_completed_sync = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [vector_sync_key(profile_id)],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_completed_sync {
+        return Ok(true);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM chunks c
+           JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
+           LEFT JOIN embedding_index_entries i
+             ON i.chunk_id=c.id AND i.profile_id=e.profile_id
+           WHERE i.id IS NULL
+           LIMIT 1
+         )",
+        [profile_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
 }
 
 pub fn vector_search(
@@ -682,14 +739,39 @@ pub fn vector_search(
     limit: usize,
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
+    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let started = std::time::Instant::now();
     let spec = provider.profile()?;
+    if timing {
+        eprintln!("timing:     vector profile {:?}", started.elapsed());
+    }
+    let started = std::time::Instant::now();
     let response = provider.embed_query(query)?;
+    if timing {
+        eprintln!("timing:     vector query embedding {:?}", started.elapsed());
+    }
     validate_response_profile(&spec, &response)?;
     let vector = &response.vectors[0];
+    let started = std::time::Instant::now();
     let profile = ensure_profile(conn, &spec, vector.len())?;
-    sync_vector_index(conn, Some(profile.id))?;
+    if timing {
+        eprintln!("timing:     vector profile storage {:?}", started.elapsed());
+    }
+    let started = std::time::Instant::now();
+    let repaired = vector_index_needs_sync(conn, profile.id)?;
+    if repaired {
+        sync_vector_index(conn, Some(profile.id))?;
+    }
+    if timing {
+        eprintln!(
+            "timing:     vector index readiness {:?} (repaired={repaired})",
+            started.elapsed()
+        );
+    }
     let table = vector_table(profile.dimensions)?;
     let mut scores = Vec::new();
+    let started = std::time::Instant::now();
     for origin in file_origins {
         let mut statement = conn.prepare(&format!(
             "SELECT i.chunk_id, v.distance
@@ -712,6 +794,10 @@ pub fn vector_search(
     }
     scores.sort_by(|left, right| right.1.total_cmp(&left.1));
     scores.truncate(limit);
+    if timing {
+        eprintln!("timing:     vector exact KNN {:?}", started.elapsed());
+        eprintln!("timing:     vector total {:?}", total_started.elapsed());
+    }
     Ok(scores)
 }
 
@@ -772,7 +858,7 @@ fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse
 mod tests {
     use super::{
         ProfileSpec, ensure_profile, profile_fingerprint, sync_vector_index, validate_endpoint,
-        vec_to_blob, vector_table,
+        vec_to_blob, vector_index_needs_sync, vector_table,
     };
 
     #[test]
@@ -833,6 +919,27 @@ mod tests {
         )?;
         assert_eq!(found.0, chunk_id);
         assert!(found.1 < 0.0001);
+
+        assert!(!vector_index_needs_sync(&connection, profile.id)?);
+        connection.execute(
+            "INSERT INTO chunks(
+               file_id, kind, scope_chain, symbols, start, end, start_line, end_line, hash, content
+             ) VALUES(?1, 'function', '', '', 2, 3, 2, 2, 'same', 'alpha')",
+            [file_id],
+        )?;
+        assert!(
+            vector_index_needs_sync(&connection, profile.id)?,
+            "a new occurrence of cached content must invalidate materialization"
+        );
+        sync_vector_index(&connection, Some(profile.id))?;
+        assert!(!vector_index_needs_sync(&connection, profile.id)?);
+        let materialized: i64 = connection.query_row(
+            "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
+            [profile.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(materialized, 2);
+
         crate::store::delete_file(&connection, file_id)?;
         let vector_rows: i64 =
             connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
