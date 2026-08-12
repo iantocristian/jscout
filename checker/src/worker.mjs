@@ -1,0 +1,391 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { parentPort, workerData } from "node:worker_threads";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+
+const root = fs.realpathSync(workerData.root);
+const bundledRequire = createRequire(import.meta.url);
+
+function loadTypeScript() {
+  try {
+    const repositoryRequire = createRequire(path.join(root, "package.json"));
+    const resolved = repositoryRequire.resolve("typescript");
+    return { ts: repositoryRequire(resolved), source: "repository", resolved };
+  } catch {
+    const resolved = bundledRequire.resolve("typescript");
+    return { ts: bundledRequire(resolved), source: "bundled", resolved };
+  }
+}
+
+const runtime = loadTypeScript();
+const ts = runtime.ts;
+const programCache = new Map();
+
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  }
+  return value;
+}
+
+function digestText(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function sourceHash(value) {
+  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+  return bytesToHex(blake3(bytes));
+}
+
+function digestFile(file) {
+  return digestText(fs.readFileSync(file));
+}
+
+function insideRoot(file) {
+  const relative = path.relative(root, file);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function relativeIdentity(file) {
+  const canonical = fs.realpathSync(file);
+  if (insideRoot(canonical)) return path.relative(root, canonical).split(path.sep).join("/");
+  return `outside:${digestText(canonical).slice(0, 24)}:${path.basename(canonical)}`;
+}
+
+function resolveQueryFile(relativePath) {
+  if (typeof relativePath !== "string" || relativePath.length === 0 || path.isAbsolute(relativePath)) {
+    throw coded("outside_root", "query file must be a non-empty repository-relative path");
+  }
+  const lexical = path.resolve(root, relativePath);
+  if (!insideRoot(lexical)) throw coded("outside_root", "query file escapes the repository root");
+  let canonical;
+  try {
+    canonical = fs.realpathSync(lexical);
+  } catch {
+    throw coded("query_file_missing", "query file does not exist");
+  }
+  if (!insideRoot(canonical)) throw coded("outside_root", "query file resolves outside the repository root");
+  if (!fs.statSync(canonical).isFile()) throw coded("query_file_missing", "query path is not a file");
+  return canonical;
+}
+
+function coded(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function walkConfigs(directory, output = []) {
+  let entries;
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return output;
+  }
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if ([".git", ".jscout", ".worktrees", "node_modules"].includes(entry.name)) continue;
+      walkConfigs(path.join(directory, entry.name), output);
+    } else if (entry.isFile() && /^tsconfig(?:\.[^.]+)?\.json$/u.test(entry.name)) {
+      output.push(path.join(directory, entry.name));
+    }
+  }
+  return output;
+}
+
+function configProblem(config, error) {
+  return {
+    project_id: path.relative(root, config).split(path.sep).join("/"),
+    code: "config",
+    message: ts.flattenDiagnosticMessageText(error.messageText, " "),
+  };
+}
+
+function configuredProjects() {
+  const projects = [];
+  const problems = [];
+  for (const config of walkConfigs(root)) {
+    const read = ts.readConfigFile(config, ts.sys.readFile);
+    if (read.error) {
+      problems.push(configProblem(config, read.error));
+      continue;
+    }
+    const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, path.dirname(config), undefined, config);
+    if (parsed.errors.length > 0) {
+      for (const error of parsed.errors) problems.push(configProblem(config, error));
+      continue;
+    }
+    projects.push({
+      id: path.relative(root, config).split(path.sep).join("/"),
+      config,
+      options: parsed.options,
+      fileNames: parsed.fileNames.map((file) => path.resolve(file)),
+      projectReferences: parsed.projectReferences,
+    });
+  }
+  projects.sort((left, right) => left.id.localeCompare(right.id));
+  problems.sort((left, right) => left.project_id.localeCompare(right.project_id));
+  return { projects, problems };
+}
+
+function owningProjects(queryFile) {
+  const discovered = configuredProjects();
+  const owners = discovered.projects.filter((project) => project.fileNames.includes(queryFile));
+  if (owners.length > 0) return { owners, problems: discovered.problems };
+  const relative = path.relative(root, queryFile).split(path.sep).join("/");
+  return {
+    owners: [{
+      id: `inferred:${relative}`,
+      config: undefined,
+      options: {
+        allowJs: true,
+        checkJs: false,
+        jsx: ts.JsxEmit.Preserve,
+        module: ts.ModuleKind.ESNext,
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        target: ts.ScriptTarget.ESNext,
+      },
+      fileNames: [queryFile],
+      projectReferences: undefined,
+    }],
+    problems: discovered.problems,
+  };
+}
+
+function buildProject(project, force = false) {
+  if (!force && programCache.has(project.id)) return programCache.get(project.id);
+  const program = ts.createProgram({
+    rootNames: project.fileNames,
+    options: project.options,
+    projectReferences: project.projectReferences,
+  });
+  const checker = program.getTypeChecker();
+  const inputs = [];
+  for (const source of program.getSourceFiles()) {
+    let canonical;
+    try {
+      canonical = fs.realpathSync(source.fileName);
+    } catch {
+      continue;
+    }
+    inputs.push([relativeIdentity(canonical), digestText(source.text)]);
+  }
+  inputs.sort((left, right) => left[0].localeCompare(right[0]));
+  const config = project.config
+    ? [relativeIdentity(project.config), digestFile(project.config)]
+    : undefined;
+  const fingerprint = digestText(JSON.stringify(stable({
+    protocol: 1,
+    typescript: { version: ts.version, source: runtime.source },
+    project: project.id,
+    config,
+    options: project.options,
+    inputs,
+  })));
+  const built = { program, checker, fingerprint };
+  programCache.set(project.id, built);
+  return built;
+}
+
+function byteToUtf16(buffer, offset, label) {
+  if (!Number.isInteger(offset) || offset < 0 || offset > buffer.length) {
+    throw coded("invalid_span", `${label} is outside the query file`);
+  }
+  const prefix = buffer.subarray(0, offset);
+  const text = prefix.toString("utf8");
+  if (Buffer.byteLength(text, "utf8") !== offset) {
+    throw coded("invalid_span", `${label} is not a UTF-8 boundary`);
+  }
+  return text.length;
+}
+
+function utf16ToByte(text, offset) {
+  return Buffer.byteLength(text.slice(0, offset), "utf8");
+}
+
+function requestSpans(buffer, query) {
+  const call = [
+    byteToUtf16(buffer, query.call_start, "call_start"),
+    byteToUtf16(buffer, query.call_end, "call_end"),
+  ];
+  const receiver = [
+    byteToUtf16(buffer, query.receiver_start, "receiver_start"),
+    byteToUtf16(buffer, query.receiver_end, "receiver_end"),
+  ];
+  const property = [
+    byteToUtf16(buffer, query.property_start, "property_start"),
+    byteToUtf16(buffer, query.property_end, "property_end"),
+  ];
+  if (!(call[0] <= receiver[0] && receiver[1] <= property[0] && property[1] <= call[1])) {
+    throw coded("invalid_span", "receiver/property spans are not contained by the call span");
+  }
+  return { call, receiver, property };
+}
+
+function findMemberCall(tsSource, spans) {
+  let found;
+  function visit(node) {
+    if (found) return;
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const member = node.expression;
+      const exact = node.getStart(tsSource) === spans.call[0]
+        && node.end === spans.call[1]
+        && member.expression.getStart(tsSource) === spans.receiver[0]
+        && member.expression.end === spans.receiver[1]
+        && member.name.getStart(tsSource) === spans.property[0]
+        && member.name.end === spans.property[1];
+      if (exact) found = { call: node, member };
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(tsSource);
+  return found;
+}
+
+function degradedType(type) {
+  return Boolean(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown))
+    || type.intrinsicName === "error";
+}
+
+function symbolDeclarations(checker, receiverType, member) {
+  const property = member.name.text;
+  const types = receiverType.isUnion() ? receiverType.types : [receiverType];
+  const symbols = [];
+  for (const type of types) {
+    const symbol = checker.getPropertyOfType(type, property) ?? checker.getSymbolAtLocation(member.name);
+    if (!symbol) continue;
+    const resolved = symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    if (!symbols.includes(resolved)) symbols.push(resolved);
+  }
+  return symbols.flatMap((symbol) => symbol.getDeclarations() ?? []);
+}
+
+function declarationResult(declaration) {
+  const source = declaration.getSourceFile();
+  let canonical;
+  try {
+    canonical = fs.realpathSync(source.fileName);
+  } catch {
+    return undefined;
+  }
+  const named = declaration.name ?? declaration;
+  return {
+    file: insideRoot(canonical) ? path.relative(root, canonical).split(path.sep).join("/") : null,
+    outside_root: !insideRoot(canonical),
+    start: utf16ToByte(source.text, named.getStart(source)),
+    end: utf16ToByte(source.text, named.end),
+    source_hash: sourceHash(source.text),
+  };
+}
+
+function resolveMember(query) {
+  const queryFile = resolveQueryFile(query.file);
+  const buffer = fs.readFileSync(queryFile);
+  const actualHash = sourceHash(buffer);
+  if (typeof query.indexed_hash !== "string") {
+    throw coded("protocol", "resolve_member requires indexed_hash");
+  }
+  if (query.indexed_hash !== actualHash) throw coded("hash_mismatch", "query source changed after indexing");
+  const spans = requestSpans(buffer, query);
+  const { owners, problems } = owningProjects(queryFile);
+  const answers = [];
+  for (const project of owners) {
+    const built = buildProject(project);
+    const source = built.program.getSourceFile(queryFile);
+    if (!source) {
+      answers.push({ project_id: project.id, status: "unknown", checker_input_fingerprint: built.fingerprint });
+      continue;
+    }
+    const occurrence = findMemberCall(source, spans);
+    if (!occurrence) throw coded("span_mismatch", "exact indexed member-call occurrence was not found");
+    const receiverType = built.checker.getTypeAtLocation(occurrence.member.expression);
+    if (degradedType(receiverType)) {
+      answers.push({ project_id: project.id, status: "unknown", checker_input_fingerprint: built.fingerprint });
+      continue;
+    }
+    const declarations = symbolDeclarations(built.checker, receiverType, occurrence.member)
+      .map(declarationResult)
+      .filter(Boolean)
+      .filter((value, index, all) => all.findIndex((other) => JSON.stringify(other) === JSON.stringify(value)) === index)
+      .sort((left, right) => (left.file ?? "").localeCompare(right.file ?? "") || left.start - right.start);
+    answers.push({
+      project_id: project.id,
+      status: declarations.length > 0 ? "resolved" : "unknown",
+      receiver_type: built.checker.typeToString(
+        receiverType,
+        occurrence.member.expression,
+        ts.TypeFormatFlags.NoTruncation,
+      ),
+      declarations,
+      checker_input_fingerprint: built.fingerprint,
+    });
+  }
+  return {
+    indexed_hash: query.indexed_hash,
+    source_hash: actualHash,
+    typescript: { version: ts.version, source: runtime.source },
+    projects: answers,
+    configuration_problems: problems,
+  };
+}
+
+function validateInputs(entries) {
+  programCache.clear();
+  const results = [];
+  for (const entry of entries) {
+    const queryFile = resolveQueryFile(entry.file);
+    const { owners } = owningProjects(queryFile);
+    const project = owners.find((candidate) => candidate.id === entry.project_id);
+    const fingerprint = project ? buildProject(project, true).fingerprint : null;
+    results.push({
+      project_id: entry.project_id,
+      file: entry.file,
+      fingerprint,
+      valid: fingerprint === entry.fingerprint,
+    });
+  }
+  return { valid: results.every((result) => result.valid), results };
+}
+
+function capabilities() {
+  const discovered = configuredProjects();
+  return {
+    typescript: { version: ts.version, source: runtime.source },
+    projects: discovered.projects.map((project) => ({
+      project_id: project.id,
+      file_count: project.fileNames.length,
+    })),
+    configuration_problems: discovered.problems,
+    question: "resolve_statically_named_member_at_indexed_call_occurrence",
+  };
+}
+
+parentPort.on("message", (message) => {
+  try {
+    let payload;
+    if (message.kind === "capabilities") {
+      payload = { kind: "capabilities_result", capabilities: capabilities() };
+    } else if (message.kind === "resolve_member") {
+      payload = { kind: "resolve_member_result", result: resolveMember(message.query ?? {}) };
+    } else if (message.kind === "validate_inputs") {
+      payload = { kind: "validate_inputs_result", result: validateInputs(message.entries ?? []) };
+    } else {
+      throw coded("unsupported", "unsupported checker worker request");
+    }
+    parentPort.postMessage({ id: message.id, payload });
+  } catch (failure) {
+    parentPort.postMessage({
+      id: message.id,
+      payload: {
+        kind: "error",
+        error: {
+          code: failure?.code ?? "checker_failure",
+          message: failure?.message ?? "checker request failed",
+        },
+      },
+    });
+  }
+});
