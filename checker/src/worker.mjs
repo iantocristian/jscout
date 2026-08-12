@@ -23,6 +23,8 @@ function loadTypeScript() {
 const runtime = loadTypeScript();
 const ts = runtime.ts;
 const programCache = new Map();
+const occurrenceCache = new WeakMap();
+let discoveryCache;
 
 function runtimeInputs() {
   const files = [runtime.resolved];
@@ -55,6 +57,18 @@ function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  }
+  return value;
+}
+
+function normalizeOption(value) {
+  if (Array.isArray(value)) return value.map(normalizeOption);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeOption(item)]));
+  }
+  if (typeof value === "string" && path.isAbsolute(value)) {
+    if (insideRoot(value)) return `repository:${path.relative(root, value).split(path.sep).join("/")}`;
+    return `outside:${digestText(value).slice(0, 24)}:${path.basename(value)}`;
   }
   return value;
 }
@@ -127,7 +141,8 @@ function configProblem(config, error) {
   };
 }
 
-function configuredProjects() {
+function configuredProjects(force = false) {
+  if (!force && discoveryCache) return discoveryCache;
   const projects = [];
   const problems = [];
   const records = walkConfigs(root).map((config) => ({
@@ -178,7 +193,8 @@ function configuredProjects() {
   }
   projects.sort((left, right) => left.id.localeCompare(right.id));
   problems.sort((left, right) => left.project_id.localeCompare(right.project_id));
-  return { projects, problems };
+  discoveryCache = { projects, problems };
+  return discoveryCache;
 }
 
 function resolveExtendedConfig(specifier, fromConfig) {
@@ -228,8 +244,8 @@ function configInputs(config, seen = new Set()) {
   return own.sort((left, right) => left.identity.localeCompare(right.identity));
 }
 
-function owningProjects(queryFile) {
-  const discovered = configuredProjects();
+function owningProjects(queryFile, force = false) {
+  const discovered = configuredProjects(force);
   const owners = discovered.projects.filter((project) => project.fileNames.includes(queryFile));
   if (owners.length > 0) return { owners, problems: discovered.problems };
   const relative = path.relative(root, queryFile).split(path.sep).join("/");
@@ -256,7 +272,8 @@ function buildProject(project, force = false) {
   if (!force && programCache.has(project.id)) return programCache.get(project.id);
   const program = ts.createProgram({
     rootNames: project.fileNames,
-    options: project.options,
+    options: normalizeOption(project.options),
+    project_references: normalizeOption(project.projectReferences ?? []),
     projectReferences: project.projectReferences,
   });
   const checker = program.getTypeChecker();
@@ -330,23 +347,28 @@ function requestSpans(buffer, query) {
 }
 
 function findMemberCall(tsSource, spans) {
-  let found;
+  let occurrences = occurrenceCache.get(tsSource);
+  if (occurrences) return occurrences.get(spanKey(spans));
+  occurrences = new Map();
   function visit(node) {
-    if (found) return;
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const member = node.expression;
-      const exact = node.getStart(tsSource) === spans.call[0]
-        && node.end === spans.call[1]
-        && member.expression.getStart(tsSource) === spans.receiver[0]
-        && member.expression.end === spans.receiver[1]
-        && member.name.getStart(tsSource) === spans.property[0]
-        && member.name.end === spans.property[1];
-      if (exact) found = { call: node, member };
+      const occurrenceSpans = {
+        call: [node.getStart(tsSource), node.end],
+        receiver: [member.expression.getStart(tsSource), member.expression.end],
+        property: [member.name.getStart(tsSource), member.name.end],
+      };
+      occurrences.set(spanKey(occurrenceSpans), { call: node, member });
     }
     ts.forEachChild(node, visit);
   }
   visit(tsSource);
-  return found;
+  occurrenceCache.set(tsSource, occurrences);
+  return occurrences.get(spanKey(spans));
+}
+
+function spanKey(spans) {
+  return [...spans.call, ...spans.receiver, ...spans.property].join(":");
 }
 
 function degradedType(type) {
@@ -438,6 +460,7 @@ function resolveMember(query) {
 
 function validateInputs(entries) {
   programCache.clear();
+  discoveryCache = undefined;
   const results = [];
   for (const entry of entries) {
     const queryFile = resolveQueryFile(entry.file);
