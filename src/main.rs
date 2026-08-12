@@ -234,6 +234,9 @@ enum Command {
         /// Maximum source evidence rows
         #[arg(long, default_value_t = 12)]
         source_limit: usize,
+        /// Maximum semantic-relation hops followed during source drill-down
+        #[arg(long, default_value_t = 8)]
+        source_depth: usize,
         /// Maximum source bytes per evidence row
         #[arg(long, default_value_t = semantic_query::DEFAULT_SOURCE_BYTE_LIMIT)]
         source_bytes: usize,
@@ -243,6 +246,12 @@ enum Command {
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = semantic_query::DEFAULT_RESPONSE_BYTE_LIMIT)]
         response_bytes: usize,
+        /// Maximum direct evidence supports retained per artifact
+        #[arg(long, default_value_t = 8)]
+        supports_per_artifact: usize,
+        /// Maximum direct semantic relations returned
+        #[arg(long, default_value_t = 40)]
+        relation_limit: usize,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -353,6 +362,9 @@ enum Command {
         /// Restrict traversal to backing-file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = 24_000)]
+        response_bytes: usize,
     },
     /// Print or install the jscout agent-integration skill
     AgentGuide {
@@ -667,9 +679,12 @@ fn main() -> Result<()> {
             include_superseded,
             source,
             source_limit,
+            source_depth,
             source_bytes,
             file_origins,
             response_bytes,
+            supports_per_artifact,
+            relation_limit,
             database,
         } => {
             let conn = open_database(&root, database.as_deref())?;
@@ -687,10 +702,12 @@ fn main() -> Result<()> {
                     limit,
                     include_source: source,
                     source_limit,
+                    evidence_relation_depth: source_depth,
                     source_byte_limit: source_bytes,
                     file_origins,
                     response_byte_limit: response_bytes,
-                    ..Default::default()
+                    supports_per_artifact,
+                    relation_limit,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -768,9 +785,11 @@ fn main() -> Result<()> {
             kinds,
             file_roles,
             file_origins,
+            response_bytes,
         } => cmd_neighborhood(
             &root,
             &anchor,
+            response_bytes,
             structural::NeighborhoodOptions {
                 expected_snapshot: snapshot,
                 depth,
@@ -940,11 +959,19 @@ fn open_database(root: &Path, database: Option<&Path>) -> Result<rusqlite::Conne
 fn cmd_neighborhood(
     root: &Path,
     anchor: &str,
+    response_bytes: usize,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
     let conn = store::open(root)?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
-    println!("{}", serde_json::to_string_pretty(&neighborhood)?);
+    println!(
+        "{}",
+        mcp::render_bounded_object_arrays(
+            serde_json::to_value(neighborhood)?,
+            &["edges", "nodes"],
+            response_bytes,
+        )?
+    );
     Ok(())
 }
 

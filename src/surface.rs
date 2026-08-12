@@ -579,7 +579,7 @@ fn semantic_overlay(
         configured_types.iter().map(String::as_str).collect()
     };
     let mut statement = conn.prepare(
-        "SELECT artifact.id FROM semantic_artifacts artifact
+        "SELECT artifact.id, artifact.artifact_type FROM semantic_artifacts artifact
          WHERE NOT EXISTS(
            SELECT 1 FROM semantic_artifacts successor
            WHERE successor.supersedes_artifact_id=artifact.id
@@ -587,13 +587,19 @@ fn semantic_overlay(
          ORDER BY artifact.id DESC",
     )?;
     let ids = statement
-        .query_map([], |row| row.get::<_, i64>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((id, artifact_type)) if types.contains(artifact_type.as_str()) => Some(Ok(id)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let artifacts = semantic::load_artifacts(conn, &ids)?;
     let mut excluded_non_fresh = 0;
     let mut artifacts = artifacts
         .into_iter()
-        .filter(|artifact| types.contains(artifact.artifact_type.as_str()))
         .filter_map(|artifact| {
             if artifact.freshness != "fresh" {
                 excluded_non_fresh += 1;
@@ -847,6 +853,26 @@ mod tests {
                 snapshot,
                 supersedes: None,
             },
+        )?;
+        conn.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type, canonical_name, body_json, model, prompt_version,
+               confidence, source_snapshot, created_at, artifact_fingerprint
+             ) VALUES('summary','module:excluded',?1,'test','summary-scout/v1',
+                      'likely',?2,'now','excluded-summary')",
+            rusqlite::params![
+                json!({
+                    "level": "module",
+                    "scope": "module:excluded",
+                    "overview": "must not be freshness-loaded by a card-only overlay",
+                })
+                .to_string(),
+                structural::current_snapshot(&conn)?,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE meta SET value='/definitely/missing/jscout/root' WHERE key='root'",
+            [],
         )?;
 
         let options = OverviewOptions {

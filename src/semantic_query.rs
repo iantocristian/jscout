@@ -22,6 +22,7 @@ pub const MAX_RELATION_LIMIT: usize = 200;
 pub const MAX_SOURCE_LIMIT: usize = 100;
 const MAX_SOURCE_BYTE_LIMIT: usize = 16_000;
 const EVIDENCE_RELATION_DEPTH: usize = 8;
+const MAX_EVIDENCE_RELATION_PATHS: usize = 2_000;
 
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
@@ -40,6 +41,7 @@ pub struct QueryOptions {
     pub source_byte_limit: usize,
     pub file_origins: Vec<String>,
     pub response_byte_limit: usize,
+    pub evidence_relation_depth: usize,
 }
 
 impl Default for QueryOptions {
@@ -60,6 +62,7 @@ impl Default for QueryOptions {
             source_byte_limit: DEFAULT_SOURCE_BYTE_LIMIT,
             file_origins: origin::defaults(),
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
+            evidence_relation_depth: EVIDENCE_RELATION_DEPTH,
         }
     }
 }
@@ -151,6 +154,10 @@ pub struct ResponseBudget {
     pub omitted_sources_by_origin: usize,
     pub truncated_sources: usize,
     pub omitted_supports: usize,
+    pub relation_depth_truncated: bool,
+    pub omitted_relation_branches: usize,
+    pub relation_paths_truncated: bool,
+    pub relation_cycles_skipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,12 +225,20 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             .collect::<Vec<_>>();
         let (related_artifacts, omitted_relations) =
             related_artifacts(conn, &selected_ids, options.relation_limit)?;
-        let (source_evidence, omitted_sources_by_origin, omitted_sources) =
-            if options.include_source {
-                source_evidence(root, conn, &selected_ids, options)?
-            } else {
-                (Vec::new(), 0, 0)
-            };
+        let source_result = if options.include_source {
+            source_evidence(root, conn, &selected_ids, options)?
+        } else {
+            SourceEvidenceResult::default()
+        };
+        let SourceEvidenceResult {
+            evidence: source_evidence,
+            omitted_by_origin: omitted_sources_by_origin,
+            omitted: omitted_sources,
+            relation_depth_truncated,
+            omitted_relation_branches,
+            relation_paths_truncated,
+            relation_cycles_skipped,
+        } = source_result;
         let semantic_artifacts: Vec<ArtifactView> = loaded
             .into_iter()
             .map(|artifact| {
@@ -252,7 +267,9 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             || omitted_sources > 0
             || omitted_sources_by_origin > 0
             || omitted_supports > 0
-            || truncated_sources > 0;
+            || truncated_sources > 0
+            || relation_depth_truncated
+            || relation_paths_truncated;
         let mut result = QueryResult {
             snapshot,
             matched_artifacts,
@@ -268,6 +285,10 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
                 omitted_sources_by_origin,
                 truncated_sources,
                 omitted_supports,
+                relation_depth_truncated,
+                omitted_relation_branches,
+                relation_paths_truncated,
+                relation_cycles_skipped,
                 ..Default::default()
             },
         };
@@ -294,6 +315,9 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     }
     if options.response_byte_limit == 0 {
         bail!("response byte limit must be greater than zero");
+    }
+    if options.evidence_relation_depth == 0 || options.evidence_relation_depth > 32 {
+        bail!("evidence relation depth must be between 1 and 32");
     }
     origin::validate_all(&options.file_origins)?;
     if let Some(value) = options
@@ -537,12 +561,23 @@ fn related_artifacts(
     Ok((related, omitted))
 }
 
+#[derive(Default)]
+struct SourceEvidenceResult {
+    evidence: Vec<SourceEvidence>,
+    omitted_by_origin: usize,
+    omitted: usize,
+    relation_depth_truncated: bool,
+    omitted_relation_branches: usize,
+    relation_paths_truncated: bool,
+    relation_cycles_skipped: usize,
+}
+
 fn source_evidence(
     root: &Path,
     conn: &Connection,
     root_ids: &[i64],
     options: &QueryOptions,
-) -> Result<(Vec<SourceEvidence>, usize, usize)> {
+) -> Result<SourceEvidenceResult> {
     let allowed_origins = options
         .file_origins
         .iter()
@@ -551,62 +586,103 @@ fn source_evidence(
     let mut evidence = Vec::new();
     let mut omitted_by_origin = 0;
     let mut observed: usize = 0;
+    let mut relation_depth_truncated = false;
+    let mut omitted_relation_branches = 0;
+    let mut relation_paths_truncated = false;
+    let mut relation_cycles_skipped = 0;
     for &root_id in root_ids {
-        let paths = evidence_paths(conn, root_id)?;
-        let ids = paths.keys().copied().collect::<Vec<_>>();
+        let paths = evidence_paths(conn, root_id, options.evidence_relation_depth)?;
+        relation_depth_truncated |= paths.truncated;
+        omitted_relation_branches += paths.omitted_branches;
+        relation_paths_truncated |= paths.paths_truncated;
+        relation_cycles_skipped += paths.cycles_skipped;
+        let ids = paths.paths.keys().copied().collect::<Vec<_>>();
         let artifacts = semantic::load_artifacts(conn, &ids)?;
         for artifact in artifacts {
-            let path = paths.get(&artifact.id).cloned().unwrap_or_default();
+            let artifact_paths = paths.paths.get(&artifact.id).cloned().unwrap_or_default();
             for support in artifact.supports {
-                observed += 1;
-                let Some(file) = evidence_file(conn, &support.evidence_file)? else {
-                    if evidence.len() < options.source_limit {
-                        evidence.push(unavailable_source(
-                            root_id,
-                            artifact.id,
-                            path.clone(),
-                            support,
-                            "missing-index-file",
-                        ));
+                for path in &artifact_paths {
+                    observed += 1;
+                    let Some(file) = evidence_file(conn, &support.evidence_file)? else {
+                        if evidence.len() < options.source_limit {
+                            evidence.push(unavailable_source(
+                                root_id,
+                                artifact.id,
+                                path.clone(),
+                                support.clone(),
+                                "missing-index-file",
+                            ));
+                        }
+                        continue;
+                    };
+                    if !allowed_origins.contains(file.origin.as_str()) {
+                        omitted_by_origin += 1;
+                        continue;
                     }
-                    continue;
-                };
-                if !allowed_origins.contains(file.origin.as_str()) {
-                    omitted_by_origin += 1;
-                    continue;
+                    if evidence.len() >= options.source_limit {
+                        continue;
+                    }
+                    evidence.push(render_source_evidence(
+                        root,
+                        conn,
+                        root_id,
+                        artifact.id,
+                        path.clone(),
+                        support.clone(),
+                        file,
+                        options.source_byte_limit,
+                    ));
                 }
-                if evidence.len() >= options.source_limit {
-                    continue;
-                }
-                evidence.push(render_source_evidence(
-                    root,
-                    conn,
-                    root_id,
-                    artifact.id,
-                    path.clone(),
-                    support,
-                    file,
-                    options.source_byte_limit,
-                ));
             }
         }
     }
     let omitted = observed
         .saturating_sub(omitted_by_origin)
         .saturating_sub(evidence.len());
-    Ok((evidence, omitted_by_origin, omitted))
+    Ok(SourceEvidenceResult {
+        evidence,
+        omitted_by_origin,
+        omitted,
+        relation_depth_truncated,
+        omitted_relation_branches,
+        relation_paths_truncated,
+        relation_cycles_skipped,
+    })
 }
 
-fn evidence_paths(conn: &Connection, root_id: i64) -> Result<BTreeMap<i64, Vec<EvidenceHop>>> {
-    let mut paths = BTreeMap::from([(root_id, Vec::new())]);
-    let mut queue = VecDeque::from([(root_id, 0_usize)]);
-    while let Some((artifact_id, depth)) = queue.pop_front() {
-        if depth >= EVIDENCE_RELATION_DEPTH {
+struct EvidencePaths {
+    paths: BTreeMap<i64, Vec<Vec<EvidenceHop>>>,
+    truncated: bool,
+    omitted_branches: usize,
+    paths_truncated: bool,
+    cycles_skipped: usize,
+}
+
+fn evidence_paths(conn: &Connection, root_id: i64, max_depth: usize) -> Result<EvidencePaths> {
+    let mut paths = BTreeMap::from([(root_id, vec![Vec::new()])]);
+    let mut queue = VecDeque::from([(root_id, 0_usize, Vec::new())]);
+    let mut truncated = false;
+    let mut omitted_branches = 0;
+    let mut paths_truncated = false;
+    let mut cycles_skipped = 0;
+    let mut path_count = 1;
+    while let Some((artifact_id, depth, parent_path)) = queue.pop_front() {
+        if depth >= max_depth {
+            let deeper: i64 = conn.query_row(
+                "SELECT count(*) FROM semantic_relations
+                 WHERE src_artifact_id=?1 AND claim_path<>''",
+                [artifact_id],
+                |row| row.get(0),
+            )?;
+            if deeper > 0 {
+                truncated = true;
+                omitted_branches += usize::try_from(deeper).unwrap_or(usize::MAX);
+            }
             continue;
         }
         let mut statement = conn.prepare_cached(
             "SELECT dst_artifact_id, relation, claim_path FROM semantic_relations
-             WHERE src_artifact_id=?1
+             WHERE src_artifact_id=?1 AND claim_path<>''
              ORDER BY dst_artifact_id, relation, claim_path",
         )?;
         let rows = statement.query_map([artifact_id], |row| {
@@ -616,20 +692,36 @@ fn evidence_paths(conn: &Connection, root_id: i64) -> Result<BTreeMap<i64, Vec<E
                 claim_path: row.get(2)?,
             })
         })?;
-        let parent_path = paths.get(&artifact_id).cloned().unwrap_or_default();
         for row in rows {
             let hop = row?;
             let child_id = hop.artifact_id;
-            if paths.contains_key(&child_id) {
+            if child_id == root_id
+                || parent_path
+                    .iter()
+                    .any(|existing: &EvidenceHop| existing.artifact_id == child_id)
+            {
+                cycles_skipped += 1;
                 continue;
             }
             let mut path = parent_path.clone();
             path.push(hop);
-            paths.insert(child_id, path);
-            queue.push_back((child_id, depth + 1));
+            if path_count >= MAX_EVIDENCE_RELATION_PATHS {
+                paths_truncated = true;
+                omitted_branches += 1;
+                continue;
+            }
+            path_count += 1;
+            paths.entry(child_id).or_default().push(path.clone());
+            queue.push_back((child_id, depth + 1, path));
         }
     }
-    Ok(paths)
+    Ok(EvidencePaths {
+        paths,
+        truncated,
+        omitted_branches,
+        paths_truncated,
+        cycles_skipped,
+    })
 }
 
 struct EvidenceFile {
@@ -710,7 +802,7 @@ fn render_source_evidence(
         lines: [support.evidence_start_line, support.evidence_end_line],
         confidence: support.confidence,
         support_freshness: support.freshness.clone(),
-        source_status: support.freshness,
+        source_status: support.freshness.clone(),
         source: None,
         source_original_bytes: 0,
         source_rendered_bytes: 0,
@@ -732,6 +824,13 @@ fn render_source_evidence(
     };
     if blake3::hash(source.as_bytes()).to_hex().as_str() != file.indexed_hash {
         result.source_status = "index-stale".into();
+        return result;
+    }
+    if support.freshness == "source-stale" {
+        // The indexed file is current, but this support was pinned to older
+        // source bytes. Recorded line numbers no longer identify exact
+        // evidence, so never render current text under the old claim.
+        result.source_status = "source-stale".into();
         return result;
     }
     let Some(mut excerpt) = line_excerpt(
@@ -935,6 +1034,199 @@ mod tests {
             result.response_budget.unbudgeted_bytes,
             result.response_budget.rendered_bytes
         );
+
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function moved() { return 0; }\n\
+             export function finish() { return 1; }\n\
+             export function start() { return finish(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let stale = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                include_source: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stale.source_evidence[0].support_freshness, "source-stale");
+        assert_eq!(stale.source_evidence[0].source_status, "source-stale");
+        assert!(stale.source_evidence[0].source.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn summary_drilldown_follows_only_claim_citations_and_reports_depth_caps() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("flow.ts"),
+            "export function cited() { return 1; }\n\
+             export function uncited() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let cited_anchor = crate::structural::resolve_current_anchor(&conn, "flow.ts:cited")?;
+        let uncited_anchor = crate::structural::resolve_current_anchor(&conn, "flow.ts:uncited")?;
+        let create_card = |name: String, line: i64, purpose: &str| -> Result<_> {
+            semantic::annotate(
+                repo.path(),
+                &conn,
+                &semantic::AnnotateInput {
+                    artifact_type: "card".into(),
+                    name: Some(name.clone()),
+                    body: json!({ "purpose": purpose }),
+                    supports: vec![semantic::SupportInput {
+                        claim_path: "/purpose".into(),
+                        anchor: name,
+                        role: None,
+                        evidence_file: "flow.ts".into(),
+                        evidence_start_line: line,
+                        evidence_end_line: line,
+                        confidence: "likely".into(),
+                    }],
+                    confidence: "likely".into(),
+                    snapshot: snapshot.clone(),
+                    supersedes: None,
+                },
+            )
+        };
+        let cited = create_card(cited_anchor, 1, "cited child")?;
+        let uncited = create_card(uncited_anchor, 2, "uncited child")?;
+        let fingerprint = |id| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )?)
+        };
+        let summary = semantic::AnnotateInput {
+            artifact_type: "summary".into(),
+            name: Some("file:flow.ts".into()),
+            body: json!({
+                "level": "file",
+                "scope": "file:flow.ts",
+                "overview": "uses only the cited child",
+                "key_points": ["the same child supports a second claim"],
+            }),
+            supports: Vec::new(),
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        };
+        let (current_snapshot, supports) =
+            semantic::validate_annotate_input(repo.path(), &conn, &summary)?;
+        let summary_id = semantic::persist_validated_artifact(
+            &conn,
+            &summary,
+            &current_snapshot,
+            &supports,
+            &[
+                semantic::RelationInput {
+                    claim_path: "/overview".into(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: cited.id,
+                    dst_fingerprint: fingerprint(cited.id)?,
+                    confidence: "likely".into(),
+                },
+                semantic::RelationInput {
+                    claim_path: "/key_points/0".into(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: cited.id,
+                    dst_fingerprint: fingerprint(cited.id)?,
+                    confidence: "likely".into(),
+                },
+                semantic::RelationInput {
+                    claim_path: String::new(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: cited.id,
+                    dst_fingerprint: fingerprint(cited.id)?,
+                    confidence: "likely".into(),
+                },
+                semantic::RelationInput {
+                    claim_path: String::new(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: uncited.id,
+                    dst_fingerprint: fingerprint(uncited.id)?,
+                    confidence: "likely".into(),
+                },
+            ],
+            &semantic::ArtifactProvenance {
+                model: "test",
+                prompt_version: "summary-scout/v1",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )?;
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(summary_id),
+                include_source: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.source_evidence.len(), 2);
+        assert!(
+            result
+                .source_evidence
+                .iter()
+                .all(|evidence| evidence.evidence_artifact_id == cited.id)
+        );
+        let claim_paths = result
+            .source_evidence
+            .iter()
+            .map(|evidence| evidence.via_relations[0].claim_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            claim_paths,
+            std::collections::BTreeSet::from(["/key_points/0", "/overview"])
+        );
+
+        let middle_fingerprint = "middle-fingerprint";
+        conn.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type, canonical_name, body_json, model, prompt_version,
+               confidence, source_snapshot, created_at, artifact_fingerprint
+             ) VALUES('annotation','middle','{\"claim\":\"middle\"}','test','test/v1',
+                      'likely',?1,'now',?2)",
+            rusqlite::params![snapshot, middle_fingerprint],
+        )?;
+        let middle_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO semantic_relations VALUES(?1,?2,'related_to','/claim','likely',?3)",
+            rusqlite::params![middle_id, cited.id, fingerprint(cited.id)?],
+        )?;
+        let root_fingerprint = "root-fingerprint";
+        conn.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type, canonical_name, body_json, model, prompt_version,
+               confidence, source_snapshot, created_at, artifact_fingerprint
+             ) VALUES('annotation','root','{\"claim\":\"root\"}','test','test/v1',
+                      'likely',?1,'now',?2)",
+            rusqlite::params![snapshot, root_fingerprint],
+        )?;
+        let root_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO semantic_relations VALUES(?1,?2,'related_to','/claim','likely',?3)",
+            rusqlite::params![root_id, middle_id, middle_fingerprint],
+        )?;
+        let capped = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(root_id),
+                include_source: true,
+                evidence_relation_depth: 1,
+                ..Default::default()
+            },
+        )?;
+        assert!(capped.response_budget.relation_depth_truncated);
+        assert_eq!(capped.response_budget.omitted_relation_branches, 1);
+        assert!(capped.source_evidence.is_empty());
         Ok(())
     }
 

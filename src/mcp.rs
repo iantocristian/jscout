@@ -346,6 +346,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "relation_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40 },
                     "include_source": { "type": "boolean", "default": false },
                     "source_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
+                    "source_depth": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 },
                     "source_bytes": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 2000 },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"] },
                     "response_bytes": { "type": "integer", "minimum": 1, "default": 24000 }
@@ -808,6 +809,8 @@ fn call_tool(
                         .min(200),
                     include_source: args["include_source"].as_bool().unwrap_or(false),
                     source_limit: (args["source_limit"].as_u64().unwrap_or(12) as usize).min(100),
+                    evidence_relation_depth: (args["source_depth"].as_u64().unwrap_or(8) as usize)
+                        .min(32),
                     source_byte_limit: (args["source_bytes"].as_u64().unwrap_or(2_000) as usize)
                         .min(16_000),
                     file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
@@ -898,7 +901,7 @@ fn render_bounded_items(field: &str, items: Vec<Value>, byte_limit: usize) -> Re
     render_bounded_object_arrays(json!({ (field): items }), &[field], byte_limit)
 }
 
-fn render_bounded_object_arrays(
+pub(crate) fn render_bounded_object_arrays(
     mut response: Value,
     fields: &[&str],
     byte_limit: usize,

@@ -51,6 +51,7 @@ trap 'rm -rf "$staging"' EXIT
 mkdir -p "$staging/$bundle/gateway"
 cp "$binary" "$staging/$bundle/$binary_name"
 cp README.md "$staging/$bundle/README.md"
+cp PLAN.md "$staging/$bundle/PLAN.md"
 cp .env.example "$staging/$bundle/.env.example"
 cp gateway/package.json gateway/package-lock.json "$staging/$bundle/gateway/"
 cp -R gateway/src "$staging/$bundle/gateway/src"

@@ -208,13 +208,20 @@ historical artifact id. Current artifacts are the default; an exact historical
 id reports `current: false` and its `superseded_by` successor.
 
 Add `--source` (MCP: `include_source=true`) to follow the artifact's pinned
-outgoing relations to leaf supports. Every returned path identifies the
-intermediate artifact, relation, and JSON claim pointer. Source resolution uses
-the indexed file identity—including virtual dependency paths—then reads disk
-and compares the current bytes with the indexed hash. Changed files return
-`source_status: "index-stale"` with no misleading excerpt; an unavailable file
-is explicit. Structural-context drift is reported separately as support
-freshness and does not hide hash-verified source bytes.
+outgoing claim-citation relations to leaf supports. Empty-path whole-input
+dependencies remain visible in the relation section but are never presented as
+claim evidence. Every returned path identifies the intermediate artifact,
+relation, and JSON claim pointer; distinct claims that cite the same child stay
+distinct. `--source-depth` bounds relation traversal and the response reports
+depth/path truncation and skipped cycles explicitly.
+
+Source resolution uses the indexed file identity—including virtual dependency
+paths—then reads disk and compares the current bytes with the indexed hash. A
+disk change that has not been indexed returns `source_status: "index-stale"`.
+After re-indexing changed source, an older support returns
+`source_status: "source-stale"`. Neither case returns a misleading excerpt; an
+unavailable file is also explicit. Structural-context drift is reported
+separately as support freshness and does not hide hash-verified source bytes.
 
 `jscout overview` and MCP `repository_overview` return the deterministic corpus
 inventory from one pinned SQLite read snapshot. Generated memory is absent by
@@ -278,13 +285,14 @@ LM Studio, vLLM); the gateway sends a placeholder API key:
   "models": [{"id": "qwen3:32b", "contextWindow": 131072, "maxTokens": 32768}]}]
 ```
 
-The gateway owns one visible retry layer: at most two retries with bounded
-backoff, only for classified connection, timeout, rate-limit, overload, or
+The gateway owns one visible retry layer: at most two retries with 500 ms then
+1,000 ms backoff, only for classified connection, timeout, rate-limit, overload, or
 capacity failures. Every attempt keeps the exact provider, model, service tier,
 and billing path. Auth, schema, context-window, quota, credit, and billing
 failures are terminal; there is no hidden provider/model/tier fallback. The
-command timeout includes retries and backoff. Interrupting a scouting command
-sends cancellation to the active gateway request before the process exits.
+command timeout includes retries and backoff. The first Ctrl-C sends
+cancellation to the active gateway request; a second Ctrl-C, or an interrupt
+when no request is active, forces exit status 130.
 
 Normal gateway errors use stable controlled messages. Provider exception text,
 prompts, tool arguments, and credential values are not written to stderr or the
