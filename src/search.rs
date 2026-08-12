@@ -54,6 +54,9 @@ pub struct SearchOptions {
     pub file_origins: Vec<String>,
     pub include_memory: bool,
     pub memory_limit: usize,
+    /// Apply the separately configured cross-encoder to the fused candidate
+    /// pool. This is independent of whether vector retrieval is enabled.
+    pub rerank: bool,
     pub expansion: ExpansionOptions,
 }
 
@@ -67,6 +70,7 @@ impl Default for SearchOptions {
             file_origins: origin::defaults(),
             include_memory: true,
             memory_limit: 4,
+            rerank: true,
             expansion: ExpansionOptions::default(),
         }
     }
@@ -290,6 +294,7 @@ pub fn search(
             options.limit,
             &options.file_roles,
             &options.file_origins,
+            options.rerank,
         )?;
         let semantic_artifacts = if options.include_memory {
             semantic::search(conn, q, options.memory_limit)?
@@ -322,6 +327,7 @@ fn ranked_hits(
     limit: usize,
     file_roles: &[String],
     file_origins: &[String],
+    rerank: bool,
 ) -> Result<Vec<Hit>> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
@@ -345,7 +351,7 @@ fn ranked_hits(
     // Cross-encoder rerank of the candidate pool, when a service is configured.
     // Pool size and per-candidate truncation trade quality for latency:
     // JSCOUT_RERANK_TOP (default 50), JSCOUT_RERANK_CHARS (default 4000).
-    if let Some(reranker) = Reranker::from_env() {
+    if rerank && let Some(reranker) = Reranker::from_env() {
         let pool_n: usize = std::env::var("JSCOUT_RERANK_TOP")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -928,6 +934,7 @@ mod tests {
                 file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
+                rerank: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
@@ -961,6 +968,7 @@ mod tests {
                 file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
+                rerank: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     byte_limit: 1,

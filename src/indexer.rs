@@ -303,6 +303,9 @@ fn index_repo_impl(
     let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
     let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
     index_dependency_files(conn, &plans, &instances, &mut outcome)?;
+    if outcome.indexed > 0 {
+        crate::embed::materialize_cached_embeddings(conn)?;
+    }
 
     resolve_module_edges(&root, conn)?;
     conn.execute(

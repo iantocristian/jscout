@@ -107,6 +107,12 @@ enum Command {
         /// Skip vector search even if a provider is configured
         #[arg(long)]
         no_vector: bool,
+        /// Skip cross-encoder reranking even if it is configured
+        #[arg(long)]
+        no_rerank: bool,
+        /// Use BM25 only (equivalent to --no-vector --no-rerank)
+        #[arg(long)]
+        lexical_only: bool,
         /// Output JSON
         #[arg(long)]
         json: bool,
@@ -638,6 +644,8 @@ fn main() -> Result<()> {
             memory_limit,
             response_bytes,
             no_vector,
+            no_rerank,
+            lexical_only,
             json,
             expand,
             expand_depth,
@@ -650,7 +658,7 @@ fn main() -> Result<()> {
         } => cmd_search(
             &root,
             &query,
-            no_vector,
+            no_vector || lexical_only,
             json,
             search::SearchOptions {
                 limit,
@@ -659,6 +667,7 @@ fn main() -> Result<()> {
                 file_origins: file_origins.clone(),
                 include_memory: !no_memory,
                 memory_limit,
+                rerank: !(no_rerank || lexical_only),
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -1695,8 +1704,9 @@ mod main_tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::render_semantic_memory_text;
+    use super::{Cli, Command, render_semantic_memory_text};
     use crate::semantic::SemanticArtifact;
+    use clap::Parser;
 
     #[test]
     fn text_search_memory_is_renderable_without_code_hits() -> Result<()> {
@@ -1719,5 +1729,38 @@ mod main_tests {
         assert!(rendered.contains("semantic memory (untrusted; verify in source)"));
         assert!(rendered.contains("invoice settlement [fresh]"));
         Ok(())
+    }
+
+    #[test]
+    fn lexical_only_and_rerank_controls_parse_independently() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "search",
+            ".",
+            "query",
+            "--no-vector",
+            "--no-rerank",
+        ])
+        .expect("explicit controls parse");
+        let Command::Search {
+            no_vector,
+            no_rerank,
+            lexical_only,
+            ..
+        } = command
+        else {
+            panic!("expected search")
+        };
+        assert!(no_vector);
+        assert!(no_rerank);
+        assert!(!lexical_only);
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--lexical-only"])
+                .expect("lexical shortcut parses");
+        let Command::Search { lexical_only, .. } = command else {
+            panic!("expected search")
+        };
+        assert!(lexical_only);
     }
 }

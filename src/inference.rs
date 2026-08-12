@@ -93,7 +93,10 @@ pub fn get_json(url: &str) -> Result<serde_json::Value> {
         .timeout_global(Some(std::time::Duration::from_secs(10)))
         .build()
         .new_agent();
-    let mut response = agent.get(url).call()?;
+    let mut response = agent
+        .get(url)
+        .call()
+        .with_context(|| format!("request to local inference endpoint {url} failed"))?;
     let text = response.body_mut().read_to_string()?;
     serde_json::from_str(&text).with_context(|| format!("invalid JSON from {url}"))
 }
@@ -147,7 +150,14 @@ fn validate_project(path: &Path, source: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_project;
+    use super::{get_json, validate_project};
+
+    #[test]
+    fn endpoint_failures_name_the_url() {
+        let url = "http://127.0.0.1:1/configuration";
+        let error = get_json(url).expect_err("closed local port must fail");
+        assert!(error.to_string().contains(url));
+    }
 
     #[test]
     fn validates_complete_project() -> anyhow::Result<()> {

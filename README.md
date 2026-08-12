@@ -67,6 +67,7 @@ jscout index <root>            # build/update .jscout.db (incremental, content-h
                                #   --deps pkg,@scope/pkg indexes named dependency internals
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   add --expand for a bounded structural context pack
+                               #   --no-vector, --no-rerank, or --lexical-only control stages
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
@@ -384,7 +385,7 @@ Retrieval and diagnostics:
 | `JSCOUT_INFERENCE_ALLOW_REMOTE` | Permit a non-loopback Python service bind. Off by default; enable only on a trusted network. |
 | `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_REVISION`, `JSCOUT_RERANK_MODEL`, `JSCOUT_RERANK_REVISION`, `JSCOUT_MODEL_CACHE_ROOT` | Local/hosted model identity, optional immutable Hugging Face revisions, and model cache. |
 | `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `JSCOUT_EMBED_URL`, `JSCOUT_EMBED_KEY`, `JSCOUT_QUERY_PREFIX` | Hosted or OpenAI-compatible embedding transport. A custom URL receives only `JSCOUT_EMBED_KEY`, never `OPENAI_API_KEY`. |
-| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder override and candidate limits; local reranking is automatic when the local embedding provider is selected. |
+| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder override and candidate limits; local reranking is automatic when the local embedding provider is selected unless `--no-rerank` or `--lexical-only` is passed. |
 | `JSCOUT_TIMING` | Print per-stage latency to stderr during search and indexing. |
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
@@ -543,7 +544,9 @@ memory; and exposes `/health`, `/configuration`, `/embed`, and `/rerank`.
 Override its cache and model configuration through `.env.example`. Pin
 `JSCOUT_EMBED_REVISION` and `JSCOUT_RERANK_REVISION` to select different
 immutable commits; the bundled defaults are already pinned and their revisions
-are part of the embedding-profile fingerprint.
+are part of the embedding-profile fingerprint. Runtime device is diagnostic,
+not cache identity: MPS and CUDA reuse the same float16 profile, while CPU uses
+a separate float32 profile because dtype changes the generated vectors.
 
 Asymmetric models: when the model name contains `nomic-embed-code` or `coderankembed`,
 queries are automatically prefixed with `"Represent this query for searching relevant
@@ -570,12 +573,15 @@ profile and source origin, and keeps occurrence rows in the same SQLite file.
 This removes the Rust full-table cosine loop. The stable `vec0` implementation
 is native exact KNN, not an HNSW/approximate index.
 
-The first vector search after upgrading an existing database performs one full
-consistency repair; later searches use a cheap regular-table readiness check.
-On the August 2026 n8n validation corpus (92,215 vector occurrences), a warm
-release search measured 107 ms for exact KNN and 332 ms for the complete vector
-stage. ANN/HNSW remains a separate follow-up rather than a correctness
-dependency of this storage change.
+`jscout embed` owns profile creation and full consistency repair. Indexing
+materializes new chunk occurrences when their content hashes already have
+cached vectors. Search performs readiness checks only; it never creates a
+profile, table, or vector row inside its read snapshot. If vector state is
+missing or incomplete, the vector stage reports that `jscout embed` is needed
+and search continues with BM25. On the August 2026 n8n validation corpus
+(92,215 vector occurrences), a warm release search measured 107 ms for exact
+KNN and 332 ms for the complete vector stage. ANN/HNSW remains a separate
+follow-up rather than a correctness dependency of this storage change.
 
 ## Reranking (optional)
 
@@ -585,7 +591,9 @@ candidates to the same service's BGE reranker. To use a separate service, set
 `POST {model,query,candidates:[{id,text}]}` → `{scores:[{id,score}]}`. A malformed
 or incomplete score set is rejected and search falls back to RRF ordering.
 Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
-(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`.
+(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`. `--no-vector`
+keeps BM25 plus reranking, `--no-rerank` disables only the cross-encoder, and
+`--lexical-only` disables both optional stages.
 Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (BM25 / embed-query +
 sqlite-vec / rerank) to stderr on search and structural-projection stage
 timings during indexing.

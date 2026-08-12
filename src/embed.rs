@@ -169,7 +169,6 @@ impl Provider {
                 (
                     json!({
                         "protocol": "jscout-local-v1",
-                        "device": response["device"],
                         "embedding": embedding,
                     }),
                     Some(dimensions),
@@ -292,7 +291,6 @@ impl Provider {
             }
             let configuration = json!({
                 "protocol": "jscout-local-v1",
-                "device": response["device"],
                 "embedding": {
                     "model": response["model"],
                     "dimensions": response["dimensions"],
@@ -428,6 +426,8 @@ pub fn embed_missing_for_origins(
     }
     crate::origin::validate_all(file_origins)?;
     let profile = provider.profile()?;
+    let mut resolved = existing_profile(conn, &profile)?;
+    let resolved_profile_id = resolved.as_ref().map(|profile| profile.id);
     let flags = origin_flags(file_origins);
     let rows: Vec<(String, String, String, Option<String>, String)> = {
         let mut statement = conn.prepare(
@@ -435,15 +435,24 @@ pub fn embed_missing_for_origins(
              FROM chunks c JOIN files f ON c.file_id=f.id
              WHERE NOT EXISTS (
                SELECT 1 FROM embeddings e
-               JOIN embedding_profiles p ON p.id=e.profile_id
-               WHERE e.chunk_hash=c.hash AND p.config_fingerprint=?1
+               WHERE e.chunk_hash=c.hash
+                 AND e.profile_id=COALESCE(
+                   ?5,
+                   (SELECT id FROM embedding_profiles WHERE config_fingerprint=?1)
+                 )
              )
                AND ((?2 AND f.origin='repository')
                  OR (?3 AND f.origin='workspace')
                  OR (?4 AND f.origin='dependency'))",
         )?;
         let found = statement.query_map(
-            params![profile.fingerprint, flags.0, flags.1, flags.2],
+            params![
+                profile.fingerprint,
+                flags.0,
+                flags.1,
+                flags.2,
+                resolved_profile_id
+            ],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -459,7 +468,6 @@ pub fn embed_missing_for_origins(
 
     let total = rows.len();
     let mut done = 0usize;
-    let mut resolved = existing_profile(conn, &profile)?;
     // The local HTTP boundary accepts at most 500k characters. Sixteen fully
     // expanded 24k-character chunks remain inside that limit and the 4 MiB
     // request-body cap even for multibyte source.
@@ -516,18 +524,59 @@ pub fn embed_missing_for_origins(
 }
 
 fn existing_profile(conn: &Connection, profile: &ProfileSpec) -> Result<Option<ResolvedProfile>> {
-    conn.query_row(
-        "SELECT id, dimensions FROM embedding_profiles WHERE config_fingerprint=?1",
-        [&profile.fingerprint],
-        |row| {
-            Ok(ResolvedProfile {
-                id: row.get(0)?,
-                dimensions: row.get::<_, i64>(1)? as usize,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
+    let exact = conn
+        .query_row(
+            "SELECT id, dimensions FROM embedding_profiles WHERE config_fingerprint=?1",
+            [&profile.fingerprint],
+            |row| {
+                Ok(ResolvedProfile {
+                    id: row.get(0)?,
+                    dimensions: row.get::<_, i64>(1)? as usize,
+                })
+            },
+        )
+        .optional()?;
+    if exact.is_some() {
+        return Ok(exact);
+    }
+
+    // Profiles created before device was removed from local cache identity
+    // remain reusable. Device is diagnostic; dtype and every output-affecting
+    // model setting remain in the fingerprint. Refuse an ambiguous legacy
+    // database instead of silently choosing between multiple candidates.
+    let expected: Value = serde_json::from_str(&profile.config_json)?;
+    if expected["protocol"].as_str() != Some("jscout-local-v1") {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare(
+        "SELECT id, dimensions, config_json
+         FROM embedding_profiles WHERE provider=?1 AND model=?2 ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![profile.provider, profile.model], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)? as usize,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut compatible = Vec::new();
+    for row in rows {
+        let (id, dimensions, config_json) = row?;
+        let mut stored: Value = serde_json::from_str(&config_json)?;
+        if stored["protocol"].as_str() == Some("jscout-local-v1") {
+            stored.as_object_mut().map(|object| object.remove("device"));
+            if stored == expected {
+                compatible.push(ResolvedProfile { id, dimensions });
+            }
+        }
+    }
+    match compatible.len() {
+        0 => Ok(None),
+        1 => Ok(compatible.pop()),
+        count => bail!(
+            "{count} legacy local embedding profiles differ only by device; run `jscout embed` with a fresh database or remove the obsolete profiles explicitly"
+        ),
+    }
 }
 
 fn ensure_profile(
@@ -544,6 +593,13 @@ fn ensure_profile(
             "embedding dimension mismatch: configuration={:?}, response={dimensions}",
             profile.dimensions
         );
+    }
+    if let Some(resolved) = existing_profile(conn, profile)? {
+        if resolved.dimensions != dimensions {
+            bail!("stored embedding profile has incompatible dimensions");
+        }
+        ensure_vector_table(conn, dimensions)?;
+        return Ok(resolved);
     }
     conn.execute(
         "INSERT INTO embedding_profiles(
@@ -601,8 +657,8 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
         .map(|(profile_id, dimensions)| Ok((profile_id, ensure_vector_table(conn, dimensions)?)))
         .collect::<Result<Vec<_>>>()?;
 
-    // A savepoint is atomic both for the standalone `embed` command and when
-    // search calls this inside its snapshot savepoint.
+    // A savepoint keeps the explicit embed/repair operation atomic and nests
+    // safely if a future write workflow already owns a transaction.
     conn.execute_batch("SAVEPOINT jscout_vector_sync")?;
     let sync_result = (|| -> Result<()> {
         for (profile_id, table) in profiles {
@@ -615,39 +671,7 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
                 [profile_id],
             )?;
 
-            let missing_chunks = {
-                let mut statement = conn.prepare(
-                    "SELECT c.id, f.origin, e.vec
-                     FROM chunks c
-                     JOIN files f ON f.id=c.file_id
-                     JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
-                     LEFT JOIN embedding_index_entries i
-                       ON i.chunk_id=c.id AND i.profile_id=e.profile_id
-                     WHERE i.id IS NULL",
-                )?;
-                let rows = statement.query_map([profile_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for (chunk_id, origin, vector) in missing_chunks {
-                conn.execute(
-                    "INSERT INTO embedding_index_entries(chunk_id, profile_id) VALUES(?1, ?2)",
-                    params![chunk_id, profile_id],
-                )?;
-                let row_id = conn.last_insert_rowid();
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {table}(rowid, embedding, profile_id, origin)
-                         VALUES(?1, ?2, ?3, ?4)"
-                    ),
-                    params![row_id, vector, profile_id, origin],
-                )?;
-            }
+            materialize_profile(conn, profile_id, &table)?;
 
             // Repair a virtual row lost by an older, non-transactional build
             // without discarding the durable occurrence identity.
@@ -699,6 +723,81 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
     Ok(())
 }
 
+fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Result<()> {
+    let missing_chunks = {
+        let mut statement = conn.prepare(
+            "SELECT c.id, f.origin, e.vec
+             FROM chunks c
+             JOIN files f ON f.id=c.file_id
+             JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
+             LEFT JOIN embedding_index_entries i
+               ON i.chunk_id=c.id AND i.profile_id=e.profile_id
+             WHERE i.id IS NULL",
+        )?;
+        let rows = statement.query_map([profile_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (chunk_id, origin, vector) in missing_chunks {
+        conn.execute(
+            "INSERT INTO embedding_index_entries(chunk_id, profile_id) VALUES(?1, ?2)",
+            params![chunk_id, profile_id],
+        )?;
+        let row_id = conn.last_insert_rowid();
+        conn.execute(
+            &format!(
+                "INSERT INTO {table}(rowid, embedding, profile_id, origin)
+                 VALUES(?1, ?2, ?3, ?4)"
+            ),
+            params![row_id, vector, profile_id, origin],
+        )?;
+    }
+    Ok(())
+}
+
+/// Materialize newly indexed chunk occurrences that can reuse durable cached
+/// embeddings. Indexing calls this after canonical chunk changes; it does not
+/// perform the expensive legacy virtual-row audit owned by `jscout embed`.
+pub fn materialize_cached_embeddings(conn: &Connection) -> Result<()> {
+    let profiles = {
+        let mut statement =
+            conn.prepare("SELECT id, dimensions FROM embedding_profiles ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let profiles = profiles
+        .into_iter()
+        .map(|(profile_id, dimensions)| Ok((profile_id, ensure_vector_table(conn, dimensions)?)))
+        .collect::<Result<Vec<_>>>()?;
+    conn.execute_batch("SAVEPOINT jscout_vector_materialize")?;
+    let result = (|| -> Result<()> {
+        for (profile_id, table) in profiles {
+            materialize_profile(conn, profile_id, &table)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_materialize")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_vector_materialize; RELEASE jscout_vector_materialize",
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn vector_sync_key(profile_id: i64) -> String {
     format!("embedding_index_synced_v1:{profile_id}")
 }
@@ -732,6 +831,28 @@ fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
     .map_err(Into::into)
 }
 
+fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<ResolvedProfile> {
+    let profile = existing_profile(conn, spec)?.with_context(|| {
+        format!(
+            "embedding profile `{}` is not materialized; run `jscout embed <root>`",
+            spec.model
+        )
+    })?;
+    if vector_index_needs_sync(conn, profile.id)? {
+        bail!("vector index is not ready; run `jscout embed <root>` after indexing")
+    }
+    let table = vector_table(profile.dimensions)?;
+    let table_exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [&table],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !table_exists {
+        bail!("vector index table is missing; run `jscout embed <root>` to repair it")
+    }
+    Ok(profile)
+}
+
 pub fn vector_search(
     conn: &Connection,
     provider: &Provider,
@@ -747,28 +868,35 @@ pub fn vector_search(
         eprintln!("timing:     vector profile {:?}", started.elapsed());
     }
     let started = std::time::Instant::now();
+    let profile = ready_search_profile(conn, &spec)?;
+    if timing {
+        eprintln!("timing:     vector index readiness {:?}", started.elapsed());
+    }
+    let started = std::time::Instant::now();
     let response = provider.embed_query(query)?;
     if timing {
         eprintln!("timing:     vector query embedding {:?}", started.elapsed());
     }
     validate_response_profile(&spec, &response)?;
     let vector = &response.vectors[0];
-    let started = std::time::Instant::now();
-    let profile = ensure_profile(conn, &spec, vector.len())?;
+    if vector.len() != profile.dimensions {
+        bail!("stored embedding profile has incompatible dimensions");
+    }
+    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)?;
     if timing {
-        eprintln!("timing:     vector profile storage {:?}", started.elapsed());
+        eprintln!("timing:     vector total {:?}", total_started.elapsed());
     }
-    let started = std::time::Instant::now();
-    let repaired = vector_index_needs_sync(conn, profile.id)?;
-    if repaired {
-        sync_vector_index(conn, Some(profile.id))?;
-    }
-    if timing {
-        eprintln!(
-            "timing:     vector index readiness {:?} (repaired={repaired})",
-            started.elapsed()
-        );
-    }
+    Ok(scores)
+}
+
+fn exact_vector_search(
+    conn: &Connection,
+    profile: &ResolvedProfile,
+    vector: &[f32],
+    limit: usize,
+    file_origins: &[String],
+) -> Result<Vec<(i64, f64)>> {
+    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let table = vector_table(profile.dimensions)?;
     let mut scores = Vec::new();
     let started = std::time::Instant::now();
@@ -796,7 +924,6 @@ pub fn vector_search(
     scores.truncate(limit);
     if timing {
         eprintln!("timing:     vector exact KNN {:?}", started.elapsed());
-        eprintln!("timing:     vector total {:?}", total_started.elapsed());
     }
     Ok(scores)
 }
@@ -857,8 +984,9 @@ fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse
 #[cfg(test)]
 mod tests {
     use super::{
-        ProfileSpec, ensure_profile, profile_fingerprint, sync_vector_index, validate_endpoint,
-        vec_to_blob, vector_index_needs_sync, vector_table,
+        ProfileSpec, ensure_profile, exact_vector_search, existing_profile,
+        materialize_cached_embeddings, profile_fingerprint, ready_search_profile,
+        sync_vector_index, validate_endpoint, vec_to_blob, vector_index_needs_sync, vector_table,
     };
 
     #[test]
@@ -866,6 +994,60 @@ mod tests {
         let first = profile_fingerprint("local", "m", r#"{"dtype":"float16"}"#);
         let second = profile_fingerprint("local", "m", r#"{"dtype":"float32"}"#);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn device_only_legacy_profile_is_reused_without_duplication() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        let embedding = serde_json::json!({
+            "model": "BAAI/bge-m3",
+            "dimensions": 2,
+            "revision": "pinned",
+            "configuration": {
+                "pooling": "cls",
+                "normalized": true,
+                "max_length": 4096,
+                "dtype": "float16"
+            }
+        });
+        let legacy_config = serde_json::json!({
+            "protocol": "jscout-local-v1",
+            "device": "mps",
+            "embedding": embedding
+        })
+        .to_string();
+        connection.execute(
+            "INSERT INTO embedding_profiles(
+               provider, model, config_fingerprint, dimensions, config_json
+             ) VALUES('local', 'BAAI/bge-m3', ?1, 2, ?2)",
+            rusqlite::params![
+                profile_fingerprint("local", "BAAI/bge-m3", &legacy_config),
+                legacy_config
+            ],
+        )?;
+        let legacy_id = connection.last_insert_rowid();
+        let config_json = serde_json::json!({
+            "protocol": "jscout-local-v1",
+            "embedding": embedding
+        })
+        .to_string();
+        let spec = ProfileSpec {
+            provider: "local".into(),
+            model: "BAAI/bge-m3".into(),
+            fingerprint: profile_fingerprint("local", "BAAI/bge-m3", &config_json),
+            config_json,
+            dimensions: Some(2),
+        };
+
+        assert_eq!(existing_profile(&connection, &spec)?.unwrap().id, legacy_id);
+        assert_eq!(ensure_profile(&connection, &spec, 2)?.id, legacy_id);
+        let profiles: i64 =
+            connection.query_row("SELECT count(*) FROM embedding_profiles", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(profiles, 1);
+        Ok(())
     }
 
     #[test]
@@ -920,6 +1102,10 @@ mod tests {
         assert_eq!(found.0, chunk_id);
         assert!(found.1 < 0.0001);
 
+        connection.pragma_update(None, "query_only", true)?;
+        assert_eq!(ready_search_profile(&connection, &spec)?.id, profile.id);
+        connection.pragma_update(None, "query_only", false)?;
+
         assert!(!vector_index_needs_sync(&connection, profile.id)?);
         connection.execute(
             "INSERT INTO chunks(
@@ -931,7 +1117,7 @@ mod tests {
             vector_index_needs_sync(&connection, profile.id)?,
             "a new occurrence of cached content must invalidate materialization"
         );
-        sync_vector_index(&connection, Some(profile.id))?;
+        materialize_cached_embeddings(&connection)?;
         assert!(!vector_index_needs_sync(&connection, profile.id)?);
         let materialized: i64 = connection.query_row(
             "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
@@ -949,6 +1135,47 @@ mod tests {
         let cache_rows: i64 =
             connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
         assert_eq!(cache_rows, 1, "content-addressed cache should survive");
+        Ok(())
+    }
+
+    #[test]
+    fn vector_search_database_path_is_read_only() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        connection.execute(
+            "INSERT INTO files(path, hash, role, origin)
+             VALUES('a.ts', 'f', 'production', 'repository')",
+            [],
+        )?;
+        let file_id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO chunks(
+               file_id, kind, scope_chain, symbols, start, end, start_line, end_line, hash, content
+             ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+            [file_id],
+        )?;
+        let chunk_id = connection.last_insert_rowid();
+
+        let config_json = r#"{"protocol":"openai-embeddings-v1"}"#.to_string();
+        let spec = ProfileSpec {
+            provider: "openai-compatible".into(),
+            model: "tiny".into(),
+            fingerprint: profile_fingerprint("openai-compatible", "tiny", &config_json),
+            config_json,
+            dimensions: None,
+        };
+        let profile = ensure_profile(&connection, &spec, 2)?;
+        connection.execute(
+            "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+            rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+        )?;
+        sync_vector_index(&connection, Some(profile.id))?;
+
+        connection.pragma_update(None, "query_only", true)?;
+        let ready = ready_search_profile(&connection, &spec)?;
+        let results =
+            exact_vector_search(&connection, &ready, &[1.0, 0.0], 1, &["repository".into()])?;
+        assert_eq!(results.first().map(|result| result.0), Some(chunk_id));
         Ok(())
     }
 }
