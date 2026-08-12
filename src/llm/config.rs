@@ -96,17 +96,30 @@ pub fn resolve_gateway(cli: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn companion_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        let mut ancestors = exe.parent();
-        // Installed layout: gateway/ beside the binary. Development layout:
-        // target/{debug,release}/jscout with gateway/ at the repository root.
-        for _ in 0..3 {
-            if let Some(dir) = ancestors {
-                candidates.push(dir.join("gateway/src/main.mjs"));
-                ancestors = dir.parent();
-            }
-        }
+    let Ok(exe) = env::current_exe() else {
+        return Vec::new();
+    };
+    companion_candidates_for(&exe)
+}
+
+fn companion_candidates_for(exe: &Path) -> Vec<PathBuf> {
+    let Some(binary_dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = vec![binary_dir.join("gateway/src/main.mjs")];
+    // Development-only fallback. Installed binaries must not discover an
+    // unrelated gateway in an arbitrary parent directory.
+    if matches!(
+        binary_dir.file_name().and_then(|name| name.to_str()),
+        Some("debug" | "release")
+    ) && binary_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("target")
+        && let Some(repository) = binary_dir.parent().and_then(Path::parent)
+    {
+        candidates.push(repository.join("gateway/src/main.mjs"));
     }
     candidates
 }
@@ -138,9 +151,11 @@ pub fn resolve_node() -> Result<PathBuf> {
     }
     let path_var = env::var_os("PATH").context("PATH is not set; cannot locate node")?;
     for dir in env::split_paths(&path_var) {
-        let candidate = dir.join("node");
-        if candidate.is_file() {
-            return Ok(candidate);
+        for executable in ["node", "node.exe"] {
+            let candidate = dir.join(executable);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
     bail!(
@@ -267,5 +282,20 @@ mod tests {
         }
         assert!((22, 18, 9) < MINIMUM_NODE_VERSION);
         assert!((22, 19, 0) >= MINIMUM_NODE_VERSION);
+    }
+
+    #[test]
+    fn gateway_discovery_uses_only_installed_or_explicit_dev_layouts() {
+        assert_eq!(
+            companion_candidates_for(Path::new("/opt/jscout/jscout")),
+            vec![PathBuf::from("/opt/jscout/gateway/src/main.mjs")]
+        );
+        assert_eq!(
+            companion_candidates_for(Path::new("/repo/target/release/jscout")),
+            vec![
+                PathBuf::from("/repo/target/release/gateway/src/main.mjs"),
+                PathBuf::from("/repo/gateway/src/main.mjs"),
+            ]
+        );
     }
 }

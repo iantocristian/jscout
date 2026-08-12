@@ -20,3 +20,41 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+      - name: Install pinned gateway dependencies
+        run: npm ci --prefix gateway
+      - name: Run gateway tests
+        run: npm test --prefix gateway
+
+  release-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+      - name: Build self-contained release archive
+        run: scripts/package-release.sh
+      - name: Smoke-test outside the checkout
+        shell: bash
+        run: |
+          archive="$(find target/release-packages -name 'jscout-*.tar.gz' -print -quit)"
+          mkdir "$RUNNER_TEMP/jscout-package"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/jscout-package"
+          binary="$(find "$RUNNER_TEMP/jscout-package" -type f -name jscout -print -quit)"
+          JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS='[{"id":"local","baseUrl":"http://127.0.0.1:11434/v1","models":[{"id":"smoke","contextWindow":131072,"maxTokens":32768}]}]' \
+            "$binary" llm doctor --model local:smoke
