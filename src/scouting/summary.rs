@@ -47,6 +47,7 @@ pub struct SummaryChild {
     pub artifact_type: String,
     pub name: Option<String>,
     pub fingerprint: String,
+    pub confidence: String,
     pub body_json: String,
 }
 
@@ -318,6 +319,15 @@ pub fn annotate_input(
     if summary.overview.is_none() {
         bail!("an incomplete summary must not be published");
     }
+    // A generated summary cannot be more certain than any model-visible
+    // child it synthesized. The same cap applies to claim citations and
+    // whole-input dependencies so their confidence remains internally
+    // consistent with the artifact.
+    let confidence = if children.iter().any(|child| child.confidence == "possible") {
+        "possible"
+    } else {
+        "likely"
+    };
     let mut relations = Vec::new();
     let mut push = |claim_path: &str, claim: &ValidatedClaim| {
         for &child_index in &claim.children {
@@ -327,8 +337,7 @@ pub fn annotate_input(
                 relation: "summarizes".into(),
                 dst_artifact_id: child.artifact_id,
                 dst_fingerprint: child.fingerprint.clone(),
-                // Generated claims never exceed `likely`.
-                confidence: "likely".into(),
+                confidence: confidence.into(),
             });
         }
     };
@@ -348,7 +357,7 @@ pub fn annotate_input(
             relation: "summarizes".into(),
             dst_artifact_id: child.artifact_id,
             dst_fingerprint: child.fingerprint.clone(),
-            confidence: "likely".into(),
+            confidence: confidence.into(),
         });
     }
     Ok((
@@ -357,7 +366,7 @@ pub fn annotate_input(
             name: Some(summary.scope_key.clone()),
             body: body(summary),
             supports: Vec::new(),
-            confidence: "likely".into(),
+            confidence: confidence.into(),
             snapshot,
             supersedes,
         },
@@ -388,6 +397,7 @@ mod tests {
                 artifact_type: "card".into(),
                 name: Some("sym:src/flow.ts#::start@1".into()),
                 fingerprint: "fp-card".into(),
+                confidence: "likely".into(),
                 body_json: r#"{"purpose":"starts the flow"}"#.into(),
             },
             SummaryChild {
@@ -396,6 +406,7 @@ mod tests {
                 artifact_type: "workflow".into(),
                 name: Some("settlement".into()),
                 fingerprint: "fp-workflow".into(),
+                confidence: "likely".into(),
                 body_json: r#"{"description":"settles"}"#.into(),
             },
         ]
@@ -452,6 +463,17 @@ mod tests {
         assert_eq!(relations[0].claim_path, "/overview");
         assert_eq!(relations[2].claim_path, "/key_points/0");
         assert_eq!(relations[2].dst_fingerprint, "fp-card");
+
+        let mut possible_children = children();
+        possible_children[1].confidence = "possible".into();
+        let (possible_input, possible_relations) =
+            super::annotate_input(&summary, &possible_children, "snapshot".into(), None)?;
+        assert_eq!(possible_input.confidence, "possible");
+        assert!(
+            possible_relations
+                .iter()
+                .all(|relation| relation.confidence == "possible")
+        );
 
         let unknown = validate(
             &submission(json!({

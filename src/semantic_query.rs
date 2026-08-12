@@ -20,6 +20,8 @@ pub const DEFAULT_SOURCE_BYTE_LIMIT: usize = 2_000;
 pub const MAX_ARTIFACT_LIMIT: usize = 100;
 pub const MAX_RELATION_LIMIT: usize = 200;
 pub const MAX_SOURCE_LIMIT: usize = 100;
+pub const DEFAULT_CONCEPT_TAG_LIMIT: usize = 40;
+pub const MAX_CONCEPT_TAG_LIMIT: usize = 200;
 const MAX_SOURCE_BYTE_LIMIT: usize = 16_000;
 const EVIDENCE_RELATION_DEPTH: usize = 8;
 const MAX_EVIDENCE_RELATION_PATHS: usize = 2_000;
@@ -36,6 +38,7 @@ pub struct QueryOptions {
     pub limit: usize,
     pub supports_per_artifact: usize,
     pub relation_limit: usize,
+    pub concept_tag_limit: usize,
     pub include_source: bool,
     pub source_limit: usize,
     pub source_byte_limit: usize,
@@ -57,6 +60,7 @@ impl Default for QueryOptions {
             limit: 20,
             supports_per_artifact: 8,
             relation_limit: 40,
+            concept_tag_limit: DEFAULT_CONCEPT_TAG_LIMIT,
             include_source: false,
             source_limit: 12,
             source_byte_limit: DEFAULT_SOURCE_BYTE_LIMIT,
@@ -142,6 +146,22 @@ pub struct EvidenceHop {
     pub claim_path: String,
 }
 
+/// A deterministic association from one selected concept to either a file or
+/// one current indexed chunk. File tags are emitted independently of chunk
+/// overlap, so `level = "file"` always has null chunk fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConceptTag {
+    pub concept_artifact_id: i64,
+    pub concept_name: Option<String>,
+    pub file: String,
+    pub level: String,
+    pub chunk_id: Option<i64>,
+    pub chunk_kind: Option<String>,
+    pub chunk_name: Option<String>,
+    pub chunk_scope: Option<String>,
+    pub chunk_lines: Option<[i64; 2]>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ResponseBudget {
     pub byte_limit: usize,
@@ -154,6 +174,7 @@ pub struct ResponseBudget {
     pub omitted_sources_by_origin: usize,
     pub truncated_sources: usize,
     pub omitted_supports: usize,
+    pub omitted_concept_tags: usize,
     pub relation_depth_truncated: bool,
     pub omitted_relation_branches: usize,
     pub relation_paths_truncated: bool,
@@ -164,8 +185,10 @@ pub struct ResponseBudget {
 pub struct QueryResult {
     pub snapshot: String,
     pub matched_artifacts: usize,
+    pub matched_concept_tags: usize,
     pub semantic_artifacts: Vec<ArtifactView>,
     pub related_artifacts: Vec<RelatedArtifact>,
+    pub concept_tags: Vec<ConceptTag>,
     pub source_evidence: Vec<SourceEvidence>,
     pub response_budget: ResponseBudget,
 }
@@ -239,6 +262,10 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             relation_paths_truncated,
             relation_cycles_skipped,
         } = source_result;
+        let mut concept_tags = concept_tags(conn, &loaded, &current, &options.file_origins)?;
+        let matched_concept_tags = concept_tags.len();
+        concept_tags.truncate(options.concept_tag_limit);
+        let omitted_concept_tags = matched_concept_tags.saturating_sub(concept_tags.len());
         let semantic_artifacts: Vec<ArtifactView> = loaded
             .into_iter()
             .map(|artifact| {
@@ -267,14 +294,17 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             || omitted_sources > 0
             || omitted_sources_by_origin > 0
             || omitted_supports > 0
+            || omitted_concept_tags > 0
             || truncated_sources > 0
             || relation_depth_truncated
             || relation_paths_truncated;
         let mut result = QueryResult {
             snapshot,
             matched_artifacts,
+            matched_concept_tags,
             semantic_artifacts,
             related_artifacts,
+            concept_tags,
             source_evidence,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
@@ -285,6 +315,7 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
                 omitted_sources_by_origin,
                 truncated_sources,
                 omitted_supports,
+                omitted_concept_tags,
                 relation_depth_truncated,
                 omitted_relation_branches,
                 relation_paths_truncated,
@@ -306,6 +337,9 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     }
     if options.relation_limit == 0 || options.relation_limit > MAX_RELATION_LIMIT {
         bail!("semantic relation limit must be between 1 and {MAX_RELATION_LIMIT}");
+    }
+    if options.concept_tag_limit == 0 || options.concept_tag_limit > MAX_CONCEPT_TAG_LIMIT {
+        bail!("concept tag limit must be between 1 and {MAX_CONCEPT_TAG_LIMIT}");
     }
     if options.source_limit == 0 || options.source_limit > MAX_SOURCE_LIMIT {
         bail!("semantic source limit must be between 1 and {MAX_SOURCE_LIMIT}");
@@ -400,13 +434,53 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
 }
 
 fn rank_candidates(candidates: &mut Vec<Candidate>, query: &str) {
-    let tokens = tokens(query);
+    let raw_tokens = raw_tokens(query);
+    let concept_tokens = concept_tokens(query);
+    let normalized_concept_query = crate::scouting::concept::normalize(query);
     candidates.retain_mut(|candidate| {
+        let (name, body, exact_name) = if candidate.artifact_type == "concept" {
+            let name =
+                crate::scouting::concept::normalize(candidate.name.as_deref().unwrap_or_default());
+            let body = serde_json::from_str::<Value>(&candidate.body_json)
+                .ok()
+                .map(|body| {
+                    let definition = body
+                        .get("definition")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let aliases = body
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
+                })
+                .unwrap_or_else(|| crate::scouting::concept::normalize(&candidate.body_json));
+            let exact = !name.is_empty() && normalized_concept_query == name;
+            (name, body, exact)
+        } else {
+            let name = candidate.name.as_deref().unwrap_or_default().to_lowercase();
+            let exact = !name.is_empty() && query.eq_ignore_ascii_case(&name);
+            (name, candidate.body_json.to_lowercase(), exact)
+        };
+        let tokens = if candidate.artifact_type == "concept" {
+            &concept_tokens
+        } else {
+            &raw_tokens
+        };
+        // Valid identities can consist only of punctuation and one-character
+        // tokens (`C++`, `R`). Exact normalized identity still has to localize
+        // them instead of admitting arbitrary recent artifacts.
         if tokens.is_empty() {
-            return true;
+            if exact_name {
+                candidate.relevance = 1.0;
+                return true;
+            }
+            return query.trim().is_empty();
         }
-        let name = candidate.name.as_deref().unwrap_or_default().to_lowercase();
-        let body = candidate.body_json.to_lowercase();
         let matches = tokens
             .iter()
             .filter(|token| name.contains(token.as_str()) || body.contains(token.as_str()))
@@ -414,7 +488,7 @@ fn rank_candidates(candidates: &mut Vec<Candidate>, query: &str) {
         if matches == 0 {
             return false;
         }
-        let exact_name = usize::from(!name.is_empty() && query.eq_ignore_ascii_case(&name));
+        let exact_name = usize::from(exact_name);
         candidate.relevance =
             ((matches + exact_name * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
         true
@@ -427,7 +501,15 @@ fn rank_candidates(candidates: &mut Vec<Candidate>, query: &str) {
     });
 }
 
-fn tokens(query: &str) -> Vec<String> {
+fn raw_tokens(query: &str) -> Vec<String> {
+    split_tokens(&query.to_lowercase())
+}
+
+fn concept_tokens(query: &str) -> Vec<String> {
+    split_tokens(&crate::scouting::concept::normalize(query))
+}
+
+fn split_tokens(query: &str) -> Vec<String> {
     query
         .split(|character: char| {
             !character.is_alphanumeric() && character != '_' && character != '$'
@@ -465,6 +547,153 @@ fn artifact_view(
         supports_truncated: support_count > artifact.supports.len(),
         supports: artifact.supports,
     }
+}
+
+fn concept_tags(
+    conn: &Connection,
+    artifacts: &[semantic::SemanticArtifact],
+    current: &HashMap<i64, bool>,
+    allowed_origins: &[String],
+) -> Result<Vec<ConceptTag>> {
+    let allowed_origins = allowed_origins
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut indexed_origins = HashMap::<String, Option<String>>::new();
+    let mut origin_for_file = conn.prepare_cached("SELECT origin FROM files WHERE path=?1")?;
+    let mut tags = BTreeMap::<(i64, String, i64), ConceptTag>::new();
+    let mut chunks = conn.prepare_cached(
+        "SELECT chunk.id, chunk.kind, chunk.name, chunk.scope_chain,
+                chunk.start_line, chunk.end_line
+         FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.path=?1
+           AND chunk.start_line<=?2
+           AND chunk.end_line>=?3
+           AND file.origin=?4
+         ORDER BY chunk.start_line, chunk.end_line, chunk.id",
+    )?;
+    for artifact in artifacts {
+        if artifact.artifact_type != "concept"
+            || artifact.freshness != "fresh"
+            || !current.get(&artifact.id).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        let mut child_ids = Vec::new();
+        let mut relation_statement = conn.prepare_cached(
+            "SELECT DISTINCT dst_artifact_id FROM semantic_relations
+             WHERE src_artifact_id=?1 AND relation='related_to' AND claim_path<>''
+             ORDER BY dst_artifact_id",
+        )?;
+        let rows = relation_statement.query_map([artifact.id], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            child_ids.push(row?);
+        }
+        // Legacy direct-support concepts remain readable. New generated
+        // concepts reach exact source through fingerprinted child relations.
+        let support_artifacts = if child_ids.is_empty() {
+            vec![artifact.clone()]
+        } else {
+            semantic::load_artifacts(conn, &child_ids)?
+        };
+        for support in support_artifacts
+            .iter()
+            .flat_map(|child| &child.supports)
+            .filter(|support| support.freshness == "fresh")
+        {
+            let indexed_origin = match indexed_origins.get(&support.evidence_file) {
+                Some(origin) => origin.clone(),
+                None => {
+                    let origin = origin_for_file
+                        .query_row([&support.evidence_file], |row| row.get::<_, String>(0))
+                        .optional()?;
+                    indexed_origins.insert(support.evidence_file.clone(), origin.clone());
+                    origin
+                }
+            };
+            let Some(indexed_origin) = indexed_origin else {
+                continue;
+            };
+            if !allowed_origins.contains(indexed_origin.as_str()) {
+                continue;
+            }
+            let file_key = (artifact.id, support.evidence_file.clone(), 0);
+            tags.entry(file_key).or_insert_with(|| ConceptTag {
+                concept_artifact_id: artifact.id,
+                concept_name: artifact.name.clone(),
+                file: support.evidence_file.clone(),
+                level: "file".into(),
+                chunk_id: None,
+                chunk_kind: None,
+                chunk_name: None,
+                chunk_scope: None,
+                chunk_lines: None,
+            });
+            let rows = chunks.query_map(
+                rusqlite::params![
+                    support.evidence_file,
+                    support.evidence_end_line,
+                    support.evidence_start_line,
+                    indexed_origin,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (chunk_id, kind, name, scope, start_line, end_line) = row?;
+                let key = (artifact.id, support.evidence_file.clone(), chunk_id);
+                tags.entry(key).or_insert_with(|| ConceptTag {
+                    concept_artifact_id: artifact.id,
+                    concept_name: artifact.name.clone(),
+                    file: support.evidence_file.clone(),
+                    level: "chunk".into(),
+                    chunk_id: Some(chunk_id),
+                    chunk_kind: Some(kind),
+                    chunk_name: name,
+                    chunk_scope: Some(scope),
+                    chunk_lines: Some([start_line, end_line]),
+                });
+            }
+        }
+    }
+    let ranks = artifacts
+        .iter()
+        .enumerate()
+        .map(|(rank, artifact)| (artifact.id, rank))
+        .collect::<HashMap<_, _>>();
+    let mut tags = tags.into_values().collect::<Vec<_>>();
+    tags.sort_by(|left, right| {
+        // Preserve broad file coverage before chunk refinements, then retain
+        // the semantic result ranking inside each level.
+        left.chunk_id
+            .is_some()
+            .cmp(&right.chunk_id.is_some())
+            .then_with(|| {
+                ranks
+                    .get(&left.concept_artifact_id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(
+                        &ranks
+                            .get(&right.concept_artifact_id)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    )
+            })
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.chunk_lines.cmp(&right.chunk_lines))
+            .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+    });
+    Ok(tags)
 }
 
 fn related_artifacts(
@@ -869,6 +1098,11 @@ fn apply_response_budget(result: &mut QueryResult) -> Result<()> {
     while result.response_budget.rendered_bytes > byte_limit {
         result.response_budget.truncated = true;
         let rendered = result.response_budget.rendered_bytes;
+        if result.concept_tags.pop().is_some() {
+            result.response_budget.omitted_concept_tags += 1;
+            settle_rendered_bytes(result)?;
+            continue;
+        }
         if let Some(source) = result
             .source_evidence
             .iter_mut()
@@ -970,8 +1204,78 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{QueryOptions, line_excerpt, query};
+    use super::{MAX_CONCEPT_TAG_LIMIT, QueryOptions, concept_tags, line_excerpt, query};
     use crate::{indexer, semantic, store};
+
+    fn concept_fixture(
+        repo: &std::path::Path,
+        conn: &rusqlite::Connection,
+        name: &str,
+        anchor: &str,
+        start_line: i64,
+        end_line: i64,
+        supersedes: Option<i64>,
+    ) -> Result<semantic::SemanticArtifact> {
+        semantic::annotate(
+            repo,
+            conn,
+            &semantic::AnnotateInput {
+                artifact_type: "concept".into(),
+                name: Some(name.into()),
+                body: json!({
+                    "definition": format!("Repository meaning of {name}"),
+                    "aliases": [name],
+                }),
+                supports: vec![
+                    semantic::SupportInput {
+                        claim_path: "/definition".into(),
+                        anchor: anchor.into(),
+                        role: None,
+                        evidence_file: "concept.ts".into(),
+                        evidence_start_line: start_line,
+                        evidence_end_line: end_line,
+                        confidence: "likely".into(),
+                    },
+                    semantic::SupportInput {
+                        claim_path: "/aliases/0".into(),
+                        anchor: anchor.into(),
+                        role: None,
+                        evidence_file: "concept.ts".into(),
+                        evidence_start_line: start_line,
+                        evidence_end_line: end_line,
+                        confidence: "likely".into(),
+                    },
+                ],
+                confidence: "likely".into(),
+                snapshot: crate::structural::current_snapshot(conn)?,
+                supersedes,
+            },
+        )
+    }
+
+    fn replace_concept_chunks(conn: &rusqlite::Connection, spans: &[(i64, i64)]) -> Result<()> {
+        let file_id: i64 =
+            conn.query_row("SELECT id FROM files WHERE path='concept.ts'", [], |row| {
+                row.get(0)
+            })?;
+        conn.execute("DELETE FROM chunks WHERE file_id=?1", [file_id])?;
+        for (index, &(start_line, end_line)) in spans.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO chunks(
+                   file_id, kind, name, scope_chain, symbols, start, end,
+                   start_line, end_line, hash, content
+                 ) VALUES(?1,'function',?2,'','',0,1,?3,?4,?5,'x')",
+                rusqlite::params![
+                    file_id,
+                    format!("chunk_{index}"),
+                    start_line,
+                    end_line,
+                    format!("hash-{index}"),
+                ],
+            )?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn semantic_query_filters_relates_and_drills_to_exact_source() -> Result<()> {
@@ -1235,5 +1539,449 @@ mod tests {
         assert_eq!(line_excerpt("a\nb\nc\n", 2, 3).as_deref(), Some("b\nc\n"));
         assert!(line_excerpt("a\n", 0, 1).is_none());
         assert!(line_excerpt("a\n", 2, 2).is_none());
+    }
+
+    #[test]
+    fn concept_tags_use_inclusive_overlap_dedupe_and_file_fallback() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let overlapping =
+            concept_fixture(repo.path(), &conn, "boundary concept", &anchor, 2, 4, None)?;
+        replace_concept_chunks(&conn, &[(1, 2), (4, 5)])?;
+
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(overlapping.id),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.matched_concept_tags, 3);
+        assert_eq!(result.concept_tags.len(), 3);
+        assert_eq!(result.concept_tags[0].level, "file");
+        assert!(result.concept_tags[0].chunk_id.is_none());
+        assert_eq!(result.concept_tags[1].chunk_lines, Some([1, 2]));
+        assert_eq!(result.concept_tags[2].chunk_lines, Some([4, 5]));
+        assert!(
+            result
+                .concept_tags
+                .iter()
+                .all(|tag| tag.concept_artifact_id == overlapping.id)
+        );
+
+        let file_only = concept_fixture(repo.path(), &conn, "gap concept", &anchor, 3, 3, None)?;
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(file_only.id),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.matched_concept_tags, 1);
+        assert_eq!(result.concept_tags.len(), 1);
+        assert_eq!(result.concept_tags[0].level, "file");
+        assert!(result.concept_tags[0].chunk_lines.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn relation_backed_concept_tags_follow_child_semantic_supports() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  const a = 1;\n  return a;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let child = semantic::annotate(
+            repo.path(),
+            &conn,
+            &semantic::AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(anchor.clone()),
+                body: json!({
+                    "purpose": "establishes the relation-backed concept meaning",
+                    "domain_terms": ["relation concept"],
+                }),
+                supports: vec![
+                    semantic::SupportInput {
+                        claim_path: "/purpose".into(),
+                        anchor: anchor.clone(),
+                        role: None,
+                        evidence_file: "concept.ts".into(),
+                        evidence_start_line: 1,
+                        evidence_end_line: 3,
+                        confidence: "likely".into(),
+                    },
+                    semantic::SupportInput {
+                        claim_path: "/domain_terms/0".into(),
+                        anchor: anchor.clone(),
+                        role: None,
+                        evidence_file: "concept.ts".into(),
+                        evidence_start_line: 1,
+                        evidence_end_line: 1,
+                        confidence: "likely".into(),
+                    },
+                ],
+                confidence: "likely".into(),
+                snapshot: crate::structural::current_snapshot(&conn)?,
+                supersedes: None,
+            },
+        )?;
+        let fingerprint: String = conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+            [child.id],
+            |row| row.get(0),
+        )?;
+        let concept_input = semantic::AnnotateInput {
+            artifact_type: "concept".into(),
+            name: Some("relation concept".into()),
+            body: json!({
+                "definition": "Repository meaning established by the child card",
+                "aliases": ["relation concept"],
+            }),
+            supports: Vec::new(),
+            confidence: "likely".into(),
+            snapshot: crate::structural::current_snapshot(&conn)?,
+            supersedes: None,
+        };
+        let (snapshot, supports) =
+            semantic::validate_annotate_input(repo.path(), &conn, &concept_input)?;
+        let relations = vec![
+            semantic::RelationInput {
+                claim_path: "/definition".into(),
+                relation: "related_to".into(),
+                dst_artifact_id: child.id,
+                dst_fingerprint: fingerprint.clone(),
+                confidence: "likely".into(),
+            },
+            semantic::RelationInput {
+                claim_path: "/aliases/0".into(),
+                relation: "related_to".into(),
+                dst_artifact_id: child.id,
+                dst_fingerprint: fingerprint.clone(),
+                confidence: "likely".into(),
+            },
+            semantic::RelationInput {
+                claim_path: String::new(),
+                relation: "related_to".into(),
+                dst_artifact_id: child.id,
+                dst_fingerprint: fingerprint,
+                confidence: "likely".into(),
+            },
+        ];
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let concept_id = semantic::persist_validated_artifact(
+            &conn,
+            &concept_input,
+            &snapshot,
+            &supports,
+            &relations,
+            &semantic::ArtifactProvenance {
+                model: "test",
+                prompt_version: "concept-scout/v1",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )?;
+        conn.execute_batch("COMMIT")?;
+
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(concept_id),
+                ..Default::default()
+            },
+        )?;
+        assert!(result.semantic_artifacts[0].supports.is_empty());
+        assert!(
+            result
+                .concept_tags
+                .iter()
+                .any(|tag| tag.file == "concept.ts"),
+            "tags must traverse concept -> child -> exact source supports"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concept_query_uses_the_versioned_unicode_normalizer() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let concept = concept_fixture(
+            repo.path(),
+            &conn,
+            "invoice settlement",
+            &anchor,
+            1,
+            1,
+            None,
+        )?;
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                query: "ＩＮＶＯＩＣＥ　ＳＥＴＴＬＥＭＥＮＴ".into(),
+                artifact_types: vec!["concept".into()],
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.semantic_artifacts.len(), 1);
+        assert_eq!(result.semantic_artifacts[0].id, concept.id);
+        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_short_or_punctuation_concept_query_bypasses_token_length_filter() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let expected = concept_fixture(repo.path(), &conn, "c++", &anchor, 1, 1, None)?;
+        concept_fixture(
+            repo.path(),
+            &conn,
+            "newer unrelated concept",
+            &anchor,
+            1,
+            1,
+            None,
+        )?;
+
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                query: "C++".into(),
+                artifact_types: vec!["concept".into()],
+                limit: 1,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.matched_artifacts, 1);
+        assert_eq!(result.semantic_artifacts[0].id, expected.id);
+        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        Ok(())
+    }
+
+    #[test]
+    fn concept_tags_apply_file_origin_policy_before_matching() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  return 1;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let artifact = concept_fixture(repo.path(), &conn, "origin concept", &anchor, 1, 2, None)?;
+        conn.execute(
+            "UPDATE files SET origin='dependency' WHERE path='concept.ts'",
+            [],
+        )?;
+
+        let excluded = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(artifact.id),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(excluded.matched_concept_tags, 0);
+        assert!(excluded.concept_tags.is_empty());
+        assert_eq!(excluded.response_budget.omitted_concept_tags, 0);
+
+        let included = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(artifact.id),
+                file_origins: vec!["dependency".into()],
+                ..Default::default()
+            },
+        )?;
+        assert!(included.matched_concept_tags > 0);
+        assert_eq!(included.matched_concept_tags, included.concept_tags.len());
+        assert!(
+            included
+                .concept_tags
+                .iter()
+                .all(|tag| tag.file == "concept.ts")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concept_tags_exclude_historical_degraded_and_stale_concepts() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  return 1;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let historical =
+            concept_fixture(repo.path(), &conn, "history concept", &anchor, 1, 2, None)?;
+        let current = concept_fixture(
+            repo.path(),
+            &conn,
+            "history concept",
+            &anchor,
+            1,
+            2,
+            Some(historical.id),
+        )?;
+
+        let result = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                query: "history concept".into(),
+                artifact_types: vec!["concept".into()],
+                include_superseded: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.matched_artifacts, 2);
+        assert!(!result.concept_tags.is_empty());
+        assert!(
+            result
+                .concept_tags
+                .iter()
+                .all(|tag| tag.concept_artifact_id == current.id)
+        );
+
+        let mut degraded = semantic::load_artifact(&conn, current.id)?.expect("current concept");
+        degraded.freshness = "degraded".into();
+        assert!(
+            concept_tags(
+                &conn,
+                &[degraded],
+                &std::collections::HashMap::from([(current.id, true)]),
+                &crate::origin::defaults(),
+            )?
+            .is_empty()
+        );
+
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  return 2;\n}\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let stale = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(current.id),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(stale.semantic_artifacts[0].freshness, "stale");
+        assert_eq!(stale.matched_concept_tags, 0);
+        assert!(stale.concept_tags.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn concept_tag_limits_and_response_budget_account_for_whole_tags() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("concept.ts"),
+            "export function subject() {\n  const a = 1;\n  const b = 2;\n  const c = 3;\n  return a + b + c;\n}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = crate::structural::resolve_current_anchor(&conn, "concept.ts:subject")?;
+        let artifact = concept_fixture(repo.path(), &conn, "budget concept", &anchor, 2, 4, None)?;
+        replace_concept_chunks(&conn, &[(1, 2), (4, 5)])?;
+
+        let limited = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(artifact.id),
+                concept_tag_limit: 2,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(limited.matched_concept_tags, 3);
+        assert_eq!(limited.concept_tags.len(), 2);
+        assert_eq!(limited.response_budget.omitted_concept_tags, 1);
+
+        let full = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(artifact.id),
+                include_source: true,
+                ..Default::default()
+            },
+        )?;
+        let budgeted = query(
+            repo.path(),
+            &conn,
+            &QueryOptions {
+                artifact_id: Some(artifact.id),
+                include_source: true,
+                response_byte_limit: full.response_budget.rendered_bytes - 64,
+                ..Default::default()
+            },
+        )?;
+        assert!(budgeted.concept_tags.len() < full.concept_tags.len());
+        assert_eq!(
+            budgeted.response_budget.omitted_concept_tags,
+            budgeted.matched_concept_tags - budgeted.concept_tags.len()
+        );
+        assert_eq!(
+            budgeted.semantic_artifacts.len(),
+            full.semantic_artifacts.len()
+        );
+        assert_eq!(budgeted.source_evidence.len(), full.source_evidence.len());
+        assert!(
+            budgeted
+                .source_evidence
+                .iter()
+                .all(|evidence| evidence.source.is_some())
+        );
+        assert!(
+            budgeted.response_budget.rendered_bytes <= full.response_budget.rendered_bytes - 64
+        );
+
+        assert!(
+            query(
+                repo.path(),
+                &conn,
+                &QueryOptions {
+                    artifact_id: Some(artifact.id),
+                    concept_tag_limit: MAX_CONCEPT_TAG_LIMIT + 1,
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

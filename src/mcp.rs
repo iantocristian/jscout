@@ -344,6 +344,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "supports_per_artifact": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
                     "relation_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40 },
+                    "concept_tag_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40, "description": "Maximum deterministic file/chunk tags derived from returned current fresh concepts" },
                     "include_source": { "type": "boolean", "default": false },
                     "source_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
                     "source_depth": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 },
@@ -806,6 +807,8 @@ fn call_tool(
                         as usize)
                         .min(64),
                     relation_limit: (args["relation_limit"].as_u64().unwrap_or(40) as usize)
+                        .min(200),
+                    concept_tag_limit: (args["concept_tag_limit"].as_u64().unwrap_or(40) as usize)
                         .min(200),
                     include_source: args["include_source"].as_bool().unwrap_or(false),
                     source_limit: (args["source_limit"].as_u64().unwrap_or(12) as usize).min(100),

@@ -13,6 +13,12 @@ questions, then verify decisive claims in source.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
   `semantic_memory`. Use its `anchor` or `related_to` filters for code-to-memory
   joins and `include_source=true` for hash-verified evidence drill-down.
+- For selected current, fresh concepts, use the returned `concept_tags` as
+  deterministic file/chunk localization hints. They follow fingerprinted
+  concept-to-child claims and derive from the child's exact support-span
+  overlap, not separate model claims; increase
+  `concept_tag_limit` only when the omitted count shows the default bound was
+  reached.
 - Start code localization with `semantic_search`. Keep expansion off for exact
   lookups.
 - For blast-radius, multi-hop, or workflow questions, use

@@ -252,6 +252,9 @@ enum Command {
         /// Maximum direct semantic relations returned
         #[arg(long, default_value_t = 40)]
         relation_limit: usize,
+        /// Maximum deterministic file/chunk tags derived from fresh concepts
+        #[arg(long, default_value_t = semantic_query::DEFAULT_CONCEPT_TAG_LIMIT)]
+        concept_tag_limit: usize,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -509,7 +512,45 @@ enum ScoutCommand {
         #[arg(long)]
         gateway_path: Option<PathBuf>,
     },
-    /// Replace stale/degraded generated workflows, cards, and summaries using their recorded inputs
+    /// Evidence-backed concepts from exact workflow-name/card-domain-term vocabulary
+    Concepts {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Exact vocabulary term to scout (repeatable); omit for automatic discovery
+        #[arg(long = "term")]
+        terms: Vec<String>,
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level model-run budget; required without --term
+        #[arg(long)]
+        max_calls: Option<usize>,
+        /// Maximum serialized vocabulary/evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Supersede completed identical runs instead of reusing them
+        #[arg(long)]
+        rebuild: bool,
+        /// Print exact normalized groups, inputs, and budgets; make no model calls
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
+    /// Replace stale/degraded generated workflows, cards, summaries, and concepts using recorded inputs
     Refresh {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -685,6 +726,7 @@ fn main() -> Result<()> {
             response_bytes,
             supports_per_artifact,
             relation_limit,
+            concept_tag_limit,
             database,
         } => {
             let conn = open_database(&root, database.as_deref())?;
@@ -708,6 +750,7 @@ fn main() -> Result<()> {
                     response_byte_limit: response_bytes,
                     supports_per_artifact,
                     relation_limit,
+                    concept_tag_limit,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -928,6 +971,43 @@ fn main() -> Result<()> {
                     supersedes_artifact_id: None,
                 },
             ),
+            ScoutCommand::Concepts {
+                root,
+                terms,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                max_calls,
+                context_bytes,
+                rebuild,
+                dry_run,
+                database,
+                gateway_path,
+            } => {
+                let max_calls = match max_calls {
+                    Some(value) => value,
+                    None if terms.is_empty() => {
+                        anyhow::bail!("automatic concept scouting requires --max-calls")
+                    }
+                    None => terms.len(),
+                };
+                cmd_scout_concepts(
+                    &root,
+                    database.as_deref(),
+                    gateway_path.as_deref(),
+                    dry_run,
+                    scouting::ConceptScoutOptions {
+                        terms,
+                        model: llm::config::resolve_model(model.as_deref())?,
+                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        service_tier,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        rebuild,
+                        supersedes_artifact_id: None,
+                    },
+                )
+            }
             ScoutCommand::Refresh {
                 root,
                 artifacts,
@@ -1431,6 +1511,28 @@ fn cmd_scout_cards(
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_card_plan(root, &conn, &mut gateway, &options, plan)?;
+    print_scout_batch(&batch);
+    scout_batch_exit(&batch)
+}
+
+fn cmd_scout_concepts(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    dry_run: bool,
+    options: scouting::ConceptScoutOptions,
+) -> Result<()> {
+    let conn = open_database(root, database)?;
+    let plan = scouting::plan::concepts(&conn, &options.terms)?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scouting::concept_dry_run_report(&plan, &options)?)?
+        );
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let batch = scouting::scout_concept_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
 }
