@@ -25,6 +25,10 @@ from typing import Any
 
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+# Pin the bundled defaults so a mutable Hugging Face `main` cannot silently
+# change vector or reranker semantics under an existing cache fingerprint.
+DEFAULT_EMBED_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
+DEFAULT_RERANK_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_EMBED_INPUTS = 128
 MAX_RERANK_CANDIDATES = 100
@@ -108,8 +112,8 @@ class LocalBgeProvider:
                 "use the OpenAI-compatible provider for other models"
             )
         self.rerank_model_id = _text_env("JSCOUT_RERANK_MODEL", DEFAULT_RERANK_MODEL)
-        self.embed_revision = _text_env("JSCOUT_EMBED_REVISION") or None
-        self.rerank_revision = _text_env("JSCOUT_RERANK_REVISION") or None
+        self.embed_revision = _text_env("JSCOUT_EMBED_REVISION", DEFAULT_EMBED_REVISION)
+        self.rerank_revision = _text_env("JSCOUT_RERANK_REVISION", DEFAULT_RERANK_REVISION)
         self.batch_size = _positive_int("JSCOUT_INFERENCE_BATCH_SIZE", 16)
         self.max_length = _positive_int("JSCOUT_INFERENCE_MAX_LENGTH", 4096)
         self._runtime_state: tuple[Any, Any, str, str] | None = None

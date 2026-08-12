@@ -383,8 +383,9 @@ other embedding models. It selects MPS, then CUDA, then CPU; loads each model
 lazily; serializes inference to bound
 memory; and exposes `/health`, `/configuration`, `/embed`, and `/rerank`.
 Override its cache and model configuration through `.env.example`. Pin
-`JSCOUT_EMBED_REVISION` and `JSCOUT_RERANK_REVISION` when immutable model
-provenance is required.
+`JSCOUT_EMBED_REVISION` and `JSCOUT_RERANK_REVISION` to select different
+immutable commits; the bundled defaults are already pinned and their revisions
+are part of the embedding-profile fingerprint.
 
 Asymmetric models: when the model name contains `nomic-embed-code` or `coderankembed`,
 queries are automatically prefixed with `"Represent this query for searching relevant

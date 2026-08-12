@@ -229,7 +229,12 @@ impl Reranker {
                 .map(|(id, text)| serde_json::json!({ "id": id.to_string(), "text": text }))
                 .collect::<Vec<_>>(),
         });
-        let mut resp = ureq::post(&self.url)
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(125)))
+            .build()
+            .new_agent();
+        let mut resp = agent
+            .post(&self.url)
             .header("content-type", "application/json")
             .send(body.to_string())?;
         let parsed: serde_json::Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;

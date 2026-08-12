@@ -89,6 +89,16 @@ class RequestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 service.inference_port()
 
+    def test_default_models_use_immutable_revisions(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"JSCOUT_EMBED_REVISION": "", "JSCOUT_RERANK_REVISION": ""},
+            clear=False,
+        ):
+            provider = service.LocalBgeProvider()
+        self.assertEqual(provider.embed_revision, service.DEFAULT_EMBED_REVISION)
+        self.assertEqual(provider.rerank_revision, service.DEFAULT_RERANK_REVISION)
+
 
 if __name__ == "__main__":
     unittest.main()

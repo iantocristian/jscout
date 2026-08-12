@@ -205,11 +205,26 @@ impl Provider {
 
     fn post_with_retry(&self, body: &Value) -> Result<Value> {
         let mut last_error: Option<anyhow::Error> = None;
-        for (attempt, delay_ms) in [(0u32, 0u64), (1, 2_000), (2, 8_000), (3, 20_000)] {
+        let local_attempts = [(0u32, 0u64)];
+        let remote_attempts = [(0u32, 0u64), (1, 2_000), (2, 8_000), (3, 20_000)];
+        let attempts = if self.protocol == Protocol::Local {
+            local_attempts.as_slice()
+        } else {
+            remote_attempts.as_slice()
+        };
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_millis(
+                DEFAULT_LOCAL_DEADLINE_MS + 5_000,
+            )))
+            .build()
+            .new_agent();
+        for (attempt_index, &(attempt, delay_ms)) in attempts.iter().enumerate() {
             if delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
-            let mut request = ureq::post(&self.url).header("content-type", "application/json");
+            let mut request = agent
+                .post(&self.url)
+                .header("content-type", "application/json");
             if let Some(key) = &self.key {
                 request = request.header("authorization", &format!("Bearer {key}"));
             }
@@ -220,7 +235,7 @@ impl Provider {
                         .with_context(|| format!("invalid embedding response from {}", self.url));
                 }
                 Err(error) => {
-                    if attempt < 3 {
+                    if attempt_index + 1 < attempts.len() {
                         eprintln!(
                             "embed request failed (attempt {}): {error}; retrying",
                             attempt + 1

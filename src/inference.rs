@@ -64,26 +64,36 @@ pub fn doctor(url: Option<&str>) -> Result<()> {
         configuration["device"].as_str().unwrap_or("unknown")
     );
     println!(
-        "embedding: {} ({} dimensions)",
+        "embedding: {} @ {} ({} dimensions)",
         configuration["embedding"]["model"]
             .as_str()
             .unwrap_or("unknown"),
+        configuration["embedding"]["revision"]
+            .as_str()
+            .unwrap_or("unresolved"),
         configuration["embedding"]["dimensions"]
             .as_u64()
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     );
     println!(
-        "reranker: {}",
+        "reranker: {} @ {}",
         configuration["reranker"]["model"]
             .as_str()
-            .unwrap_or("unknown")
+            .unwrap_or("unknown"),
+        configuration["reranker"]["revision"]
+            .as_str()
+            .unwrap_or("unresolved")
     );
     Ok(())
 }
 
 pub fn get_json(url: &str) -> Result<serde_json::Value> {
-    let mut response = ureq::get(url).call()?;
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let mut response = agent.get(url).call()?;
     let text = response.body_mut().read_to_string()?;
     serde_json::from_str(&text).with_context(|| format!("invalid JSON from {url}"))
 }
