@@ -267,7 +267,6 @@ function abortableDelay(delayMs, signal) {
       signal.removeEventListener("abort", onAbort);
       resolve();
     }, delayMs);
-    timer.unref?.();
     const onAbort = () => {
       clearTimeout(timer);
       reject(new CompletionError("canceled", "request aborted"));

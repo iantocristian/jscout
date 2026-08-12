@@ -157,7 +157,6 @@ async function handleComplete(state, message, send) {
       active.reason = "timeout";
       controller.abort();
     }, timeoutMs);
-    active.timer.unref?.();
   }
   try {
     const { started, result } = await startCompletion({
