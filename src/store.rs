@@ -404,6 +404,10 @@ CREATE TABLE IF NOT EXISTS semantic_artifacts(
 CREATE TABLE IF NOT EXISTS semantic_relations(
   src_artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id) ON DELETE CASCADE,
   dst_artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id),
+  -- `names_concept` is reserved for a future explicit source-artifact ->
+  -- concept assertion. Current generated concepts point in the opposite
+  -- direction (concept -> evidence-bearing child) and therefore use
+  -- `related_to`.
   relation TEXT NOT NULL CHECK(relation IN ('summarizes', 'names_concept', 'related_to')),
   claim_path TEXT NOT NULL,
   confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),

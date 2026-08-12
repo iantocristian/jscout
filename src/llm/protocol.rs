@@ -9,7 +9,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(dead_code)] // Cancel is sent by interactive cancellation (follow-up layer)
 pub enum Outbound {
     Hello,
     Capabilities {
@@ -90,6 +89,8 @@ pub enum Inbound {
         tool_call: ToolCall,
         stop_reason: String,
         usage: Usage,
+        #[serde(default = "one_attempt")]
+        attempts: u64,
         #[serde(default)]
         response_model: Option<String>,
     },
@@ -156,6 +157,18 @@ pub struct ModelCapabilities {
     pub reasoning: bool,
     pub supports_service_tier: bool,
     pub supports_tools: bool,
+    #[serde(default)]
+    pub billing_path: Option<String>,
+    #[serde(default)]
+    pub auth_configured: bool,
+    #[serde(default)]
+    pub auth_type: Option<String>,
+    #[serde(default)]
+    pub auth_source: Option<String>,
+}
+
+const fn one_attempt() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,7 +190,7 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // retryability classification drives the S7 retry policy
+#[allow(dead_code)] // retryability/capacity are retained for ledger diagnostics
 pub struct RemoteError {
     pub code: String,
     pub message: String,
