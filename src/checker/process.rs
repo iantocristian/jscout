@@ -343,39 +343,47 @@ mod tests {
     use super::*;
     use crate::checker::protocol::MemberQuery;
 
+    // Canned protocol frames. Request IDs are deterministic per process: the
+    // client numbers from r1, so hello is r1, the one resolve_member is r2, and
+    // the cancel that follows it is r3.
+    const READY: &str = r#"{"protocol":1,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":1}}"#;
+    const UNKNOWN_RESULT: &str = r#"{"protocol":1,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:a.ts","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
+    const OUTSIDE_ERROR: &str = r#"{"protocol":1,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
+    const CANCELED: &str = r#"{"protocol":1,"id":"r2","kind":"canceled","reason":"requested"}"#;
+    const CANCEL_RESULT: &str =
+        r#"{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
+    const SHUTDOWN_RESULT: &str = r#"{"protocol":1,"id":"r3","kind":"shutdown_result"}"#;
+
+    /// Write an executable fake sidecar (a `/bin/sh` script) answering the
+    /// protocol from canned case patterns, and return it as the "node" binary
+    /// plus the sidecar path. Following the gateway's fake-process precedent
+    /// keeps the default `cargo test` suite runnable without Node installed:
+    /// these tests exercise the Rust client, not the TypeScript worker.
     fn fake_sidecar(mode: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().expect("tempdir");
-        let script = directory.path().join("fake-checker.mjs");
+        let script = directory.path().join("fake-checker.sh");
+        // `timeout` and `cancel` answer a query with silence.
+        let resolve = match mode {
+            "unknown" => format!("echo '{UNKNOWN_RESULT}'"),
+            "outside" => format!("echo '{OUTSIDE_ERROR}'"),
+            "crash" => "exit 3".to_string(),
+            _ => ":".to_string(),
+        };
         let source = format!(
-            r#"import readline from 'node:readline';
-const mode = {mode:?};
-const send = (message) => process.stdout.write(JSON.stringify({{protocol:1,...message}}) + '\n');
-readline.createInterface({{input:process.stdin,crlfDelay:Infinity}}).on('line', (line) => {{
-  const message = JSON.parse(line);
-  if (message.kind === 'hello') {{
-    send({{id:message.id,kind:'ready',versions:{{sidecar:'fake',node:process.versions.node,protocol:1}}}});
-  }} else if (message.kind === 'resolve_member') {{
-    if (mode === 'timeout' || mode === 'cancel') return;
-    if (mode === 'crash') process.exit(3);
-    if (mode === 'outside') {{
-      send({{id:message.id,kind:'error',error:{{code:'outside_root',message:'outside root'}}}});
-    }} else {{
-      send({{id:message.id,kind:'resolve_member_result',result:{{
-        indexed_hash:'hash',source_hash:'hash',typescript:{{version:'5.9.3',source:'bundled'}},
-        projects:[{{project_id:'inferred:a.ts',status:'unknown',declarations:[],checker_input_fingerprint:'inputs'}}],
-        configuration_problems:[]
-      }}}});
-    }}
-  }} else if (message.kind === 'cancel') {{
-    send({{id:message.target_id,kind:'canceled',reason:'requested'}});
-    send({{id:message.id,kind:'cancel_result',target_id:message.target_id,active:true}});
-  }} else if (message.kind === 'shutdown') {{
-    send({{id:message.id,kind:'shutdown_result'}}); process.exit(0);
-  }}
-}});
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"resolve_member"'*) {resolve} ;;
+    *'"kind":"cancel"'*) echo '{CANCELED}'; echo '{CANCEL_RESULT}' ;;
+    *'"kind":"shutdown"'*) echo '{SHUTDOWN_RESULT}'; exit 0 ;;
+  esac
+done
 "#
         );
         fs::write(&script, source).expect("fake sidecar");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
         (directory, script)
     }
 
@@ -394,8 +402,8 @@ readline.createInterface({{input:process.stdin,crlfDelay:Infinity}}).on('line', 
 
     fn spawn_fake(mode: &str) -> (tempfile::TempDir, ProcessChecker) {
         let (directory, script) = fake_sidecar(mode);
-        let node = crate::llm::config::resolve_node().expect("node for fake checker");
-        let checker = ProcessChecker::spawn(&node, &script, directory.path()).expect("spawn fake");
+        let checker = ProcessChecker::spawn(Path::new("/bin/sh"), &script, directory.path())
+            .expect("spawn fake");
         (directory, checker)
     }
 
