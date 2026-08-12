@@ -401,6 +401,10 @@ invisible to concept discovery.
    vocabulary child set, and the current concept lineage inside publication.
    Child drift makes the concept stale/degraded through the shared freshness
    engine; `scout refresh` replans it and publishes an immutable successor.
+   Operationally, scout concepts after workflow/card sweeps. A newly published
+   child carrying an existing normalized term intentionally stales that concept;
+   mixed refresh orders children first, and every concept planning surface
+   refuses reuse or model spend until those dependencies are fresh.
 6. `memory`/`semantic_memory` derives bounded `concept_tags` only for selected
    current, fresh concepts. Exact supports reached through claim-level child
    relations project into deduplicated file associations and associations with
@@ -412,6 +416,11 @@ Exact normalized spellings share one lineage. Fuzzy, stemming, punctuation,
 or embedding-based near-duplicate merging is deferred. The current schema has
 one predecessor per successor, so jscout also refuses ambiguous many-lineage
 merges instead of pretending a many-to-one merge occurred.
+
+Concept-to-child provenance uses `related_to` because its direction is
+concept → evidence-bearing workflow/card. The schema's `names_concept` value is
+reserved for a future explicit source-artifact → concept assertion; it does not
+describe the current generated provenance direction.
 
 This layer enables questions such as “which workflows touch invoice
 reconciliation?” without replacing the source evidence used to answer them.

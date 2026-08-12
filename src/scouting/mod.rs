@@ -707,10 +707,12 @@ pub fn plan_refresh(
     })
 }
 
-/// Refresh stale/degraded generated workflows, cards, summaries, and concepts under one
-/// strict command-level call budget while retaining each run's original model
-/// and configuration. Selection order (artifact id) is the execution order, so
-/// a mixed selection spends the budget predictably.
+/// Refresh stale/degraded generated workflows, cards, summaries, and concepts
+/// under one strict command-level call budget while retaining each run's
+/// original model and configuration. Execution is dependency-ranked first,
+/// then artifact id within each rank, so a mixed selection spends the budget
+/// predictably without preparing parents against children it is about to
+/// replace.
 pub fn scout_refresh(
     root: &Path,
     conn: &Connection,
@@ -1003,32 +1005,6 @@ fn prepare_concept_refresh(
         .map_err(|error| anyhow::Error::from(UnresolvableRefresh(error.to_string())))?;
     if plan.items.len() != 1 {
         return Ok(None);
-    }
-    let non_fresh_children = plan.items[0]
-        .sources
-        .iter()
-        .map(|source| {
-            let freshness = semantic::load_artifact(conn, source.artifact_id)?
-                .with_context(|| {
-                    format!("concept child artifact {} disappeared", source.artifact_id)
-                })?
-                .freshness;
-            Ok((source.artifact_id, freshness))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|(_, freshness)| freshness != "fresh")
-        .collect::<Vec<_>>();
-    if !non_fresh_children.is_empty() {
-        let dependencies = non_fresh_children
-            .iter()
-            .map(|(id, freshness)| format!("{id}:{freshness}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(anyhow::Error::from(UnresolvableRefresh(format!(
-            "concept `{}` still depends on non-fresh child artifacts ({dependencies}); refresh those children first",
-            config.term
-        ))));
     }
     let options = ConceptScoutOptions {
         terms: vec![config.term],

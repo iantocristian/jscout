@@ -205,6 +205,14 @@ none of their spans onto newly generated prose. Instead, claim-level
 `related_to` relations pin each child fingerprint and preserve the drill-down
 through that child's exact source supports.
 
+Run concept scouting after the intended workflow/card sweep. The expected
+vocabulary group is recomputed on every semantic read: publishing another card
+or workflow with the same normalized term intentionally stales the existing
+concept until it is refreshed against the settled child set. In mixed refresh
+runs, jscout enforces this order automatically. All concept planning, including
+direct and dry-run commands, refuses reuse or model spend while one of the
+group's children is still non-fresh.
+
 Without `--term`, all bounded groups are planned and `--max-calls` is required.
 Repeatable `--term TEXT` selects an existing group through the same normalizer
 and defaults the call budget to the number of supplied terms. Oversized groups

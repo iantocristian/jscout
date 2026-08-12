@@ -1674,7 +1674,7 @@ fn confidence_rank(confidence: &str) -> u8 {
     }
 }
 
-fn context_hash(conn: &Connection, anchor: &str) -> Result<String> {
+pub(crate) fn context_hash(conn: &Connection, anchor: &str) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-semantic-context-v1\0");
     hasher.update(anchor.as_bytes());
