@@ -82,7 +82,9 @@ jscout scout cards R           # evidence-backed cards for selected symbols
   --max-calls N                #   --anchor SPEC selects subjects explicitly (repeatable)
 jscout scout summaries R       # bottom-up file/module/repository summaries over artifacts
   --max-calls N                #   --level file|module|repository, --scope KEY (repeatable)
-jscout scout refresh R         # replace stale/degraded workflows, cards, and summaries
+jscout scout concepts R        # concepts from exact workflow-name/card-domain-term vocabulary
+  --max-calls N                #   --term TEXT selects normalized groups explicitly (repeatable)
+jscout scout refresh R         # replace stale/degraded workflows, cards, summaries, and concepts
   --max-calls N                #   reuses each artifact's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
@@ -121,8 +123,10 @@ callers without materializing every call-site × symbol pair.
 
 ## Semantic scouting
 
-`jscout scout workflows` makes candidate-closed model calls through the bundled
-pi-ai gateway. Generative calls default to
+`jscout scout workflows`, `cards`, `summaries`, and `concepts` make
+schema-constrained model calls through the bundled pi-ai gateway. Workflow and
+concept runs additionally require exhaustive candidate classification.
+Generative calls default to
 `openai-codex:gpt-5.6-terra`, which uses the ChatGPT-plan OAuth path; `--model`
 and `JSCOUT_LLM_MODEL` remain explicit overrides. Request policy is explicit
 per command: `--timeout` (default 300 s per request), `--max-calls` (a hard
@@ -186,18 +190,47 @@ requires `--level`, since scope keys are level-specific. `--dry-run` prints the
 per-level plans, child counts, and request bytes without starting Node or
 contacting a model.
 
+`jscout scout concepts` writes one concept per exact normalized vocabulary
+group. Discovery considers only current fingerprinted workflows whose `/name`
+claim has exact supports and current fingerprinted cards whose string-valued
+`/domain_terms/N` claim has exact supports; other body fields and unsupported
+prose are excluded. The versioned normalizer applies Unicode NFKC, Unicode
+lowercase, and trimmed/collapsed whitespace while preserving punctuation, so
+case and compatibility variants group together but `invoice-id` and
+`invoice id` do not. The model supplies a repository-specific definition and
+cites deterministic child references; it cannot choose the concept identity,
+invent aliases, or add children. Published aliases exhaustively reproduce the
+observed NFKC/whitespace-normalized display spellings, and the concept copies
+none of their spans onto newly generated prose. Instead, claim-level
+`related_to` relations pin each child fingerprint and preserve the drill-down
+through that child's exact source supports.
+
+Without `--term`, all bounded groups are planned and `--max-calls` is required.
+Repeatable `--term TEXT` selects an existing group through the same normalizer
+and defaults the call budget to the number of supplied terms. Oversized groups
+are skipped in automatic mode and fail explicitly selected runs rather than
+being truncated. Publication atomically rechecks the snapshot, child
+fingerprints, exact child set, and concept lineage. Near-duplicate matching and
+many-lineage merging are deliberately not implemented: punctuation, fuzzy
+similarity, stemming, and embedding proximity never cause an implicit merge.
+`--dry-run` prints the normalized groups, exact aliases, child/support counts,
+input bytes, skips, and budget decisions without starting Node or contacting a
+model.
+
 Generated workflows record their resolved seeds, traversal limits, service
 tier, model, and reasoning policy in the run ledger; cards record their
-subject anchor and summaries their level and scope key the same way. After
+subject anchor, summaries their level and scope key, and concepts their
+normalized vocabulary group the same way. After
 indexing exposes source or structural-context drift, `jscout scout refresh
 --max-calls N` selects current stale/degraded generated workflows, cards, and
-summaries and publishes immutable successors. A summary needs no rule of its
-own here: child drift already makes it non-fresh, so it selects naturally and
-is replanned against the children that are current now. Index and watch never
-make model calls. Runs created before replay configuration was stored remain
-visible but are reported as non-refreshable; jscout does not guess their
-original boundary. A stale target whose recorded seed or scope no longer
-resolves is reported and skipped without blocking other refreshes.
+summaries, and concepts and publishes immutable successors. A summary needs no
+rule of its own here: child drift already makes it non-fresh, so it selects
+naturally and is replanned against the children that are current now; a concept
+is replanned from the currently supported exact vocabulary group. Index and
+watch never make model calls. Runs created before replay configuration was
+stored remain visible but are reported as non-refreshable; jscout does not
+guess their original boundary. A stale target whose recorded seed or scope no
+longer resolves is reported and skipped without blocking other refreshes.
 
 ## Semantic retrieval
 
@@ -206,6 +239,16 @@ persistent memory independently of BM25/vector code ranking. They filter by
 artifact type, computed freshness, exact evidence anchor, direct relation, or
 historical artifact id. Current artifacts are the default; an exact historical
 id reports `current: false` and its `superseded_by` successor.
+
+When the selected results include current, fresh concepts, the response also
+contains deterministic `concept_tags`: deduplicated file-level associations
+and chunk-level associations for each indexed chunk whose line range overlaps
+an exact support reached through the concept's claim-level child relations.
+These are derived R2 localization hints, not stored claims and not additional
+model output. `--concept-tag-limit N` (MCP:
+`concept_tag_limit`, default 40, maximum 200) bounds them independently; the
+complete response-byte budget removes whole concept tags before source,
+relations, or semantic artifacts and reports the omitted count.
 
 Add `--source` (MCP: `include_source=true`) to follow the artifact's pinned
 outgoing claim-citation relations to leaf supports. Empty-path whole-input
@@ -550,9 +593,10 @@ carry `repository`, `workspace`, or `dependency` origin plus optional package
 instance/path identity. Package instances record canonical root, name, version,
 locator, manifest hash, and completeness status.
 
-Agent-authored `workflow` and `annotation` records live in separate
-`semantic_artifacts`/`semantic_supports` tables; they never become structural
-edges. Workflow participants are explicitly `defining` (the minimal stable
+Agent-authored and generated `workflow`, `card`, `summary`, `concept`, and
+`annotation` records live in separate `semantic_artifacts`/
+`semantic_supports` tables; they never become structural edges. Workflow
+participants are explicitly `defining` (the minimal stable
 cross-file skeleton) or `supporting` (internal helpers and leaf operations), so
 evidence does not flatten every related function into an equal boundary.
 Supports store source and direct structural-context fingerprints.
