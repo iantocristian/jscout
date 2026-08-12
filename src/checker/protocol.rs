@@ -161,6 +161,14 @@ pub struct ValidationEntryResult {
     pub file: String,
     pub fingerprint: Option<String>,
     pub valid: bool,
+    #[serde(default)]
+    pub inputs: Vec<CheckerInputFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckerInputFile {
+    pub path: String,
+    pub source_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

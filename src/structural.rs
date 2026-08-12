@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "10";
+pub const PROJECTION_VERSION: &str = "11";
 const WORKFLOW_HUB_DEGREE_LIMIT: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -432,6 +432,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let files = load_files(conn)?;
     let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
+    let checker_inputs_fresh = checker_inputs_fresh(conn, snapshot)?;
     let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
     for symbol in &symbols {
         if symbol.scope.is_empty() {
@@ -527,6 +528,16 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
+        if checker_inputs_fresh {
+            project_checker_enrichments(conn, snapshot, &files, &symbols, &mut insert_edge)?;
+        }
+        if timing {
+            eprintln!(
+                "timing project-checker-enrichments={:?}",
+                stage_started.elapsed()
+            );
+        }
+        let stage_started = Instant::now();
         project_events(conn, &files, &mut insert_node, &mut insert_edge)?;
         if timing {
             eprintln!("timing project-events={:?}", stage_started.elapsed());
@@ -552,6 +563,70 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn checker_inputs_fresh(conn: &Connection, snapshot: &str) -> Result<bool> {
+    let batch_id = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE active=1 AND source_snapshot=?1",
+            [snapshot],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(batch_id) = batch_id else {
+        return Ok(false);
+    };
+    let repository_root = conn
+        .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    let mut statement = conn.prepare(
+        "SELECT input_kind, input_path, source_hash FROM checker_input_files
+         WHERE batch_id=?1 ORDER BY input_kind, input_path",
+    )?;
+    let rows = statement.query_map([batch_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (kind, stored_path, expected) = row?;
+        let path = if kind == "repository" {
+            let Some(root) = repository_root.as_deref() else {
+                return Ok(false);
+            };
+            std::path::Path::new(root).join(stored_path)
+        } else {
+            std::path::PathBuf::from(stored_path)
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(false);
+        };
+        if blake3::hash(&bytes).to_hex().as_str() != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether an otherwise unchanged structural projection can be reused without
+/// revalidating checker-derived edges. No current-snapshot checker batch means
+/// there are no such edges to invalidate; a matching batch must still have an
+/// exact live input manifest.
+pub(crate) fn checker_projection_reusable(conn: &Connection, snapshot: &str) -> Result<bool> {
+    let has_batch = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM checker_enrichment_batches
+           WHERE active=1 AND source_snapshot=?1
+         )",
+        [snapshot],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    Ok(!has_batch || checker_inputs_fresh(conn, snapshot)?)
 }
 
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
@@ -1963,6 +2038,175 @@ fn project_member_calls(
                 "object": object,
                 "property": property,
                 "candidateCount": candidates.len()
+            })
+            .to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CheckerProjection {
+    source: String,
+    target: String,
+    file_id: i64,
+    line: i64,
+    member_call_id: i64,
+    call_start: i64,
+    call_end: i64,
+    receiver_start: i64,
+    receiver_end: i64,
+    property_start: i64,
+    property_end: i64,
+    confidence: String,
+    projects: BTreeSet<String>,
+    receiver_types: BTreeSet<String>,
+}
+
+fn project_checker_enrichments(
+    conn: &Connection,
+    snapshot: &str,
+    files: &HashMap<i64, String>,
+    symbols: &[SymbolNode],
+    insert_edge: &mut rusqlite::CachedStatement<'_>,
+) -> Result<()> {
+    let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
+    for symbol in symbols {
+        symbols_by_file
+            .entry(symbol.file_id)
+            .or_default()
+            .push(symbol);
+    }
+    let mut statement = conn.prepare(
+        "SELECT enrichment.member_call_id, source.id, source.path,
+                call.line, enrichment.call_start, enrichment.call_end,
+                enrichment.receiver_start, enrichment.receiver_end,
+                enrichment.property_start, enrichment.property_end,
+                enrichment.project_id, enrichment.receiver_type,
+                enrichment.target_anchor, enrichment.target_fingerprint,
+                enrichment.confidence,
+                target_file.hash, target_symbol.decl_start, target_symbol.decl_end
+         FROM checker_enrichments enrichment
+         JOIN checker_enrichment_batches batch
+           ON batch.id=enrichment.batch_id AND batch.active=1
+         JOIN files source
+           ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
+         JOIN member_calls call
+           ON call.rowid=enrichment.member_call_id AND call.file_id=source.id
+          AND call.start=enrichment.call_start AND call.end=enrichment.call_end
+          AND call.receiver_start=enrichment.receiver_start
+          AND call.receiver_end=enrichment.receiver_end
+          AND call.property_start=enrichment.property_start
+          AND call.property_end=enrichment.property_end
+         JOIN graph_nodes target ON target.node_key=enrichment.target_anchor
+         JOIN symbols target_symbol
+           ON target.native_table='symbols' AND target.native_id=target_symbol.id
+         JOIN files target_file ON target_file.id=target_symbol.file_id
+         WHERE batch.source_snapshot=?1
+         ORDER BY enrichment.member_call_id, enrichment.target_anchor, enrichment.project_id",
+    )?;
+    let rows = statement.query_map([snapshot], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, String>(13)?,
+            row.get::<_, String>(14)?,
+            row.get::<_, String>(15)?,
+            row.get::<_, i64>(16)?,
+            row.get::<_, i64>(17)?,
+        ))
+    })?;
+    let mut projected: BTreeMap<(i64, String), CheckerProjection> = BTreeMap::new();
+    for row in rows {
+        let (
+            member_call_id,
+            file_id,
+            path,
+            line,
+            call_start,
+            call_end,
+            receiver_start,
+            receiver_end,
+            property_start,
+            property_end,
+            project,
+            receiver_type,
+            target,
+            fingerprint,
+            confidence,
+            target_hash,
+            target_start,
+            target_end,
+        ) = row?;
+        if crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end)
+            != fingerprint
+        {
+            continue;
+        }
+        let Some(current_path) = files.get(&file_id) else {
+            continue;
+        };
+        if current_path != &path {
+            continue;
+        }
+        let source = owner_at(symbols_by_file.get(&file_id), call_start)
+            .map(|symbol| symbol.key.clone())
+            .unwrap_or_else(|| file_key(&path));
+        let projection = projected
+            .entry((member_call_id, target.clone()))
+            .or_insert_with(|| CheckerProjection {
+                source,
+                target,
+                file_id,
+                line,
+                member_call_id,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+                confidence: confidence.clone(),
+                projects: BTreeSet::new(),
+                receiver_types: BTreeSet::new(),
+            });
+        projection.projects.insert(project);
+        if let Some(receiver_type) = receiver_type {
+            projection.receiver_types.insert(receiver_type);
+        }
+        if confidence == "possible" {
+            projection.confidence = "possible".into();
+        }
+    }
+    for projection in projected.into_values() {
+        insert_edge.execute(params![
+            projection.source,
+            projection.target,
+            "member_call",
+            projection.confidence,
+            "checker",
+            projection.file_id,
+            projection.member_call_id,
+            projection.line,
+            json!({
+                "memberCallId": projection.member_call_id,
+                "call": [projection.call_start, projection.call_end],
+                "receiver": [projection.receiver_start, projection.receiver_end],
+                "property": [projection.property_start, projection.property_end],
+                "projects": projection.projects,
+                "receiverTypes": projection.receiver_types,
+                "occurrenceSpecific": true
             })
             .to_string(),
         ])?;
@@ -4471,6 +4715,141 @@ mod tests {
                 && edge.target == "member:unknown:load"
                 && edge.confidence == "possible"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn checker_facts_project_per_occurrence_without_replacing_member_hubs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "service.ts",
+            "class Service { load() {} }\nfunction run(client: Service) { client.load(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = super::current_snapshot(&conn)?;
+        let (
+            member_call_id,
+            source_file_id,
+            source_hash,
+            call_start,
+            call_end,
+            receiver_start,
+            receiver_end,
+            property_start,
+            property_end,
+        ) = conn.query_row(
+            "SELECT call.rowid, file.id, file.hash, call.start, call.end,
+                    call.receiver_start, call.receiver_end,
+                    call.property_start, call.property_end
+             FROM member_calls call JOIN files file ON file.id=call.file_id
+             WHERE call.prop='load'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
+        let (target, target_start, target_end): (String, i64, i64) = conn.query_row(
+            "SELECT node.node_key, symbol.decl_start, symbol.decl_end
+             FROM graph_nodes node JOIN symbols symbol
+               ON node.native_table='symbols' AND node.native_id=symbol.id
+             WHERE node.display_name='load'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let target_fingerprint =
+            crate::checker::target_fingerprint(&target, &source_hash, target_start, target_end);
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(?1,'5.9.3','bundled','inputs',1,datetime('now'),1)",
+            [&snapshot],
+        )?;
+        let batch_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO checker_input_files(
+               batch_id, project_id, query_file, input_kind, input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','service.ts','repository','service.ts',?2)",
+            rusqlite::params![batch_id, source_hash,],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_enrichments(
+               batch_id, member_call_id, source_file_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id, receiver_type,
+               target_anchor, target_fingerprint, confidence, provenance,
+               checker_input_fingerprint
+             ) VALUES(
+               ?1,?2,?3,'service.ts',?4,?5,?6,?7,?8,?9,?10,
+               'tsconfig.json','Service',?11,?12,'likely','checker','inputs'
+             )",
+            rusqlite::params![
+                batch_id,
+                member_call_id,
+                source_file_id,
+                source_hash,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+                target,
+                target_fingerprint,
+            ],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
+
+        let checker_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind='member_call' AND provenance='checker'
+               AND confidence='likely' AND dst_key=?1",
+            [&target],
+            |row| row.get(0),
+        )?;
+        let hub_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind='member_call' AND provenance='member-name-match'
+               AND dst_key='member:unknown:load'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(checker_edges, 1);
+        assert_eq!(hub_edges, 1);
+        assert!(super::checker_projection_reusable(&conn, &snapshot)?);
+
+        write(
+            repo.path(),
+            "service.ts",
+            "class Service { load() { return 1; } }\nfunction run(client: Service) { client.load(); }\n",
+        )?;
+        assert!(!super::checker_projection_reusable(&conn, &snapshot)?);
+        rebuild_projection(&conn, &snapshot)?;
+        let stale_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE kind='member_call' AND provenance='checker'",
+            [],
+            |row| row.get(0),
+        )?;
+        let retained_facts: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(stale_edges, 0);
+        assert_eq!(retained_facts, 1);
         Ok(())
     }
 

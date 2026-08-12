@@ -12,6 +12,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
+const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
 
 function sourceHash(text) {
   return bytesToHex(blake3(new TextEncoder().encode(text)));
@@ -115,8 +116,9 @@ test("keeps overlapping projects visible and invalidates changed checker inputs"
   const root = fixture({
     "main.ts": source,
     "ambient.d.ts": "declare const ambientVersion: 1;\n",
-    "tsconfig.json": JSON.stringify({ files: ["main.ts", "ambient.d.ts"] }),
-    "nested/tsconfig.app.json": JSON.stringify({ files: ["../main.ts", "../ambient.d.ts"] }),
+    "tsconfig.base.json": JSON.stringify({ compilerOptions: { strict: true } }),
+    "tsconfig.json": JSON.stringify({ extends: "./tsconfig.base.json", files: ["main.ts", "ambient.d.ts"] }),
+    "nested/tsconfig.app.json": JSON.stringify({ extends: "../tsconfig.base.json", files: ["../main.ts", "../ambient.d.ts"] }),
   });
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const checker = client(root);
@@ -135,11 +137,80 @@ test("keeps overlapping projects visible and invalidates changed checker inputs"
     project_id: project.project_id,
     fingerprint: project.checker_input_fingerprint,
   }));
+  fs.writeFileSync(path.join(root, "tsconfig.base.json"), JSON.stringify({ compilerOptions: { strict: true }, display: "changed" }));
+  const configValidation = await checker.request("validate_inputs", { entries });
+  assert.equal(configValidation.kind, "validate_inputs_result");
+  assert.equal(configValidation.result.valid, false);
+  assert.ok(configValidation.result.results.every((result) => !result.valid));
+
+  const refreshed = await checker.request("resolve_member", {
+    query: queryFor(source, "alpha.save()", "alpha", "save"),
+  });
+  const refreshedEntries = refreshed.result.projects.map((project) => ({
+    file: "main.ts",
+    project_id: project.project_id,
+    fingerprint: project.checker_input_fingerprint,
+  }));
   fs.writeFileSync(path.join(root, "ambient.d.ts"), "declare const ambientVersion: 2;\n");
-  const validation = await checker.request("validate_inputs", { entries });
-  assert.equal(validation.kind, "validate_inputs_result");
-  assert.equal(validation.result.valid, false);
-  assert.ok(validation.result.results.every((result) => !result.valid));
+  const ambientValidation = await checker.request("validate_inputs", { entries: refreshedEntries });
+  assert.equal(ambientValidation.result.valid, false);
+  assert.ok(ambientValidation.result.results.every((result) => !result.valid));
+  await checker.close();
+});
+
+test("keeps receiver identity, inheritance, overrides, and overload declarations distinct", async (context) => {
+  const source = [
+    "class Alpha { save(): void {} }",
+    "class Beta { save(): void {} }",
+    "class Base { run(): void {} }",
+    "class Inherited extends Base {}",
+    "class Override extends Base { run(): void {} }",
+    "interface Overloaded { execute(value: string): void; execute(value: number): void }",
+    "declare const alpha: Alpha; declare const beta: Beta;",
+    "declare const inherited: Inherited; declare const overridden: Override;",
+    "declare const overloaded: Overloaded;",
+    "const intentionallyBroken: string = 123;",
+    "alpha.save()",
+    "beta.save()",
+    "inherited.run()",
+    "overridden.run()",
+    "overloaded.execute('x')",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true }, files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const answers = {};
+  for (const [call, receiver, property] of [
+    ["alpha.save()", "alpha", "save"],
+    ["beta.save()", "beta", "save"],
+    ["inherited.run()", "inherited", "run"],
+    ["overridden.run()", "overridden", "run"],
+    ["overloaded.execute('x')", "overloaded", "execute"],
+  ]) {
+    const response = await checker.request("resolve_member", {
+      query: queryFor(source, call, receiver, property),
+    });
+    assert.equal(response.kind, "resolve_member_result");
+    assert.equal(response.result.projects[0].status, "resolved");
+    answers[call] = response.result.projects[0];
+  }
+  assert.notEqual(
+    answers["alpha.save()"].declarations[0].start,
+    answers["beta.save()"].declarations[0].start,
+  );
+  assert.notEqual(
+    answers["inherited.run()"].declarations[0].start,
+    answers["overridden.run()"].declarations[0].start,
+  );
+  assert.equal(answers["overloaded.execute('x')"].declarations.length, 2);
+  assert.ok(!("diagnostics" in answers["alpha.save()"]));
   await checker.close();
 });
 
@@ -158,5 +229,27 @@ test("rejects traversal and source-hash drift with stable codes", async (context
     query: { ...queryFor(source, "value.run()", "value", "run"), indexed_hash: "stale" },
   });
   assert.equal(drift.error.code, "hash_mismatch");
+  await checker.close();
+});
+
+test("prefers a repository TypeScript installation over the bundled fallback", async (context) => {
+  const root = fixture({
+    "package.json": JSON.stringify({ private: true }),
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+  });
+  fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+  fs.symlinkSync(
+    bundledTypeScript,
+    path.join(root, "node_modules/typescript"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+  const capabilities = await checker.request("capabilities");
+  assert.equal(capabilities.capabilities.typescript.source, "repository");
+  assert.equal(capabilities.capabilities.typescript.version, "5.9.3");
   await checker.close();
 });

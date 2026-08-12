@@ -341,6 +341,59 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
+-- Canonical TypeScript-checker facts are retained across projection rebuilds.
+-- Source/target identities are deliberately not foreign keys: a re-index may
+-- replace native rows, after which freshness checks keep these facts inert
+-- without erasing their provenance.
+CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
+  id INTEGER PRIMARY KEY,
+  source_snapshot TEXT NOT NULL,
+  checker_version TEXT NOT NULL,
+  checker_source TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
+  sidecar_protocol INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
+  ON checker_enrichment_batches(active) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS checker_enrichments(
+  id INTEGER PRIMARY KEY,
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  member_call_id INTEGER NOT NULL,
+  source_file_id INTEGER NOT NULL,
+  source_file TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  call_start INTEGER NOT NULL,
+  call_end INTEGER NOT NULL,
+  receiver_start INTEGER NOT NULL,
+  receiver_end INTEGER NOT NULL,
+  property_start INTEGER NOT NULL,
+  property_end INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  receiver_type TEXT,
+  target_anchor TEXT NOT NULL,
+  target_fingerprint TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  provenance TEXT NOT NULL CHECK(provenance = 'checker'),
+  checker_input_fingerprint TEXT NOT NULL,
+  UNIQUE(batch_id, member_call_id, project_id, target_anchor)
+);
+CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
+  ON checker_enrichments(source_file, call_start);
+CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
+  ON checker_enrichments(target_anchor);
+CREATE TABLE IF NOT EXISTS checker_input_files(
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  query_file TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+  input_path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
+);
+
 -- One row per generative model run. Failures, exclusions, cost, and
 -- provenance stay attributable; artifacts reference the run that produced
 -- them. Statuses: running | completed | incomplete | failed | canceled |
@@ -923,8 +976,61 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v17 -> v18: canonical, snapshot-bound checker enrichment batches.
+    if version < 18 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
+               id INTEGER PRIMARY KEY,
+               source_snapshot TEXT NOT NULL,
+               checker_version TEXT NOT NULL,
+               checker_source TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
+               sidecar_protocol INTEGER NOT NULL,
+               created_at TEXT NOT NULL,
+               active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
+               ON checker_enrichment_batches(active) WHERE active = 1;
+             CREATE TABLE IF NOT EXISTS checker_enrichments(
+               id INTEGER PRIMARY KEY,
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               member_call_id INTEGER NOT NULL,
+               source_file_id INTEGER NOT NULL,
+               source_file TEXT NOT NULL,
+               source_hash TEXT NOT NULL,
+               call_start INTEGER NOT NULL,
+               call_end INTEGER NOT NULL,
+               receiver_start INTEGER NOT NULL,
+               receiver_end INTEGER NOT NULL,
+               property_start INTEGER NOT NULL,
+               property_end INTEGER NOT NULL,
+               project_id TEXT NOT NULL,
+               receiver_type TEXT,
+               target_anchor TEXT NOT NULL,
+               target_fingerprint TEXT NOT NULL,
+               confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+               provenance TEXT NOT NULL CHECK(provenance = 'checker'),
+               checker_input_fingerprint TEXT NOT NULL,
+               UNIQUE(batch_id, member_call_id, project_id, target_anchor)
+             );
+             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
+               ON checker_enrichments(source_file, call_start);
+             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
+               ON checker_enrichments(target_anchor);
+             CREATE TABLE IF NOT EXISTS checker_input_files(
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               project_id TEXT NOT NULL,
+               query_file TEXT NOT NULL,
+               input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+               input_path TEXT NOT NULL,
+               source_hash TEXT NOT NULL,
+               PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
+             );",
+        )?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','17')
+        "INSERT INTO meta(key, value) VALUES('schema_version','18')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -1160,7 +1266,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         assert!(database.is_file());
         Ok(())
     }
@@ -1190,7 +1296,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let legacy_columns: i64 = connection.query_row(
             "SELECT count(*) FROM pragma_table_info('embeddings')
              WHERE name IN ('model', 'dim')",
@@ -1251,7 +1357,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -1294,7 +1400,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -1358,7 +1464,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -1387,7 +1493,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -1431,7 +1537,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1481,7 +1587,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1547,7 +1653,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1595,7 +1701,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1643,7 +1749,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
@@ -1697,7 +1803,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
 
         // The backfilled fingerprint equals a recomputation from canonical parts.
         let stored: String = conn.query_row(
@@ -1783,7 +1889,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         assert_eq!(config, "{}");
         Ok(())
     }
@@ -1818,7 +1924,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
         // Columns exist with the migration defaults; real values require
         // re-extraction, which the cleared hash forces.
         let (end, end_line, receiver, hash): (i64, i64, Option<String>, String) = conn.query_row(

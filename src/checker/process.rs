@@ -334,3 +334,116 @@ fn unexpected(expected: &str, message: &Inbound) -> CheckerError {
         message.id()
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::checker::protocol::MemberQuery;
+
+    fn fake_sidecar(mode: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("fake-checker.mjs");
+        let source = format!(
+            r#"import readline from 'node:readline';
+const mode = {mode:?};
+const send = (message) => process.stdout.write(JSON.stringify({{protocol:1,...message}}) + '\n');
+readline.createInterface({{input:process.stdin,crlfDelay:Infinity}}).on('line', (line) => {{
+  const message = JSON.parse(line);
+  if (message.kind === 'hello') {{
+    send({{id:message.id,kind:'ready',versions:{{sidecar:'fake',node:process.versions.node,protocol:1}}}});
+  }} else if (message.kind === 'resolve_member') {{
+    if (mode === 'timeout' || mode === 'cancel') return;
+    if (mode === 'crash') process.exit(3);
+    if (mode === 'outside') {{
+      send({{id:message.id,kind:'error',error:{{code:'outside_root',message:'outside root'}}}});
+    }} else {{
+      send({{id:message.id,kind:'resolve_member_result',result:{{
+        indexed_hash:'hash',source_hash:'hash',typescript:{{version:'5.9.3',source:'bundled'}},
+        projects:[{{project_id:'inferred:a.ts',status:'unknown',declarations:[],checker_input_fingerprint:'inputs'}}],
+        configuration_problems:[]
+      }}}});
+    }}
+  }} else if (message.kind === 'cancel') {{
+    send({{id:message.target_id,kind:'canceled',reason:'requested'}});
+    send({{id:message.id,kind:'cancel_result',target_id:message.target_id,active:true}});
+  }} else if (message.kind === 'shutdown') {{
+    send({{id:message.id,kind:'shutdown_result'}}); process.exit(0);
+  }}
+}});
+"#
+        );
+        fs::write(&script, source).expect("fake sidecar");
+        (directory, script)
+    }
+
+    fn query() -> MemberQuery {
+        MemberQuery {
+            file: "a.ts".into(),
+            indexed_hash: "hash".into(),
+            call_start: 1,
+            call_end: 10,
+            receiver_start: 1,
+            receiver_end: 4,
+            property_start: 5,
+            property_end: 8,
+        }
+    }
+
+    fn spawn_fake(mode: &str) -> (tempfile::TempDir, ProcessChecker) {
+        let (directory, script) = fake_sidecar(mode);
+        let node = crate::llm::config::resolve_node().expect("node for fake checker");
+        let checker = ProcessChecker::spawn(&node, &script, directory.path()).expect("spawn fake");
+        (directory, checker)
+    }
+
+    #[test]
+    fn fake_sidecar_preserves_unknown_and_stable_remote_errors() {
+        let (_directory, mut checker) = spawn_fake("unknown");
+        let answer = checker
+            .resolve_member(query(), Duration::from_secs(1))
+            .expect("unknown response");
+        assert_eq!(answer.projects[0].status, "unknown");
+        drop(checker);
+
+        let (_directory, mut checker) = spawn_fake("outside");
+        let error = checker
+            .resolve_member(query(), Duration::from_secs(1))
+            .expect_err("outside root");
+        assert!(matches!(error, CheckerError::Remote { code, .. } if code == "outside_root"));
+    }
+
+    #[test]
+    fn timeout_terminates_the_unresponsive_sidecar() {
+        let (_directory, mut checker) = spawn_fake("timeout");
+        let error = checker
+            .resolve_member(query(), Duration::from_millis(30))
+            .expect_err("timeout");
+        assert!(matches!(error, CheckerError::Timeout(_)));
+        assert!(checker.child.try_wait().expect("child status").is_some());
+    }
+
+    #[test]
+    fn crash_and_cancel_are_distinct_terminal_outcomes() {
+        let (_directory, mut checker) = spawn_fake("crash");
+        let error = checker
+            .resolve_member(query(), Duration::from_secs(1))
+            .expect_err("crash");
+        assert!(matches!(error, CheckerError::ChildExited(_)));
+        drop(checker);
+
+        let (_directory, mut checker) = spawn_fake("cancel");
+        let control = checker.control();
+        let canceler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            control.cancel_active()
+        });
+        let error = checker
+            .resolve_member(query(), Duration::from_secs(1))
+            .expect_err("canceled");
+        assert!(canceler.join().expect("cancel thread").expect("cancel"));
+        assert!(matches!(error, CheckerError::Canceled(reason) if reason == "requested"));
+    }
+}

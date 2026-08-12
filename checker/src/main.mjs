@@ -108,7 +108,8 @@ function handle(message) {
       active = undefined;
       terminateWorker();
       send({ id: message.id, kind: "shutdown_result" });
-      process.exitCode = 0;
+      process.stdin.pause();
+      process.stdout.write("", () => process.exit(0));
       break;
     default:
       send({ id: message.id, kind: "error", error: errorPayload("unsupported", "unsupported checker request") });

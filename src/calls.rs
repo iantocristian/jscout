@@ -567,4 +567,43 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn member_occurrence_spans_cover_this_and_optional_chains() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "class Runner {\n  constructor(private service: any) {}\n  go() { this.service.run(); }\n}\n\
+                      declare const dbs: any;\n\
+                      dbs.wave.card?.insert();\n";
+        std::fs::write(repo.path().join("occurrences.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut statement = conn.prepare(
+            "SELECT prop, receiver, receiver_start, receiver_end,
+                    property_start, property_end
+             FROM member_calls WHERE prop IN ('run', 'insert') ORDER BY start",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "run");
+        assert_eq!(rows[0].1.as_deref(), Some("this.service"));
+        assert_eq!(rows[1].0, "insert");
+        assert_eq!(rows[1].1.as_deref(), Some("dbs.wave.card"));
+        for (property, _, receiver_start, receiver_end, property_start, property_end) in rows {
+            let receiver = &source[receiver_start as usize..receiver_end as usize];
+            let property_source = &source[property_start as usize..property_end as usize];
+            assert!(matches!(receiver, "this.service" | "dbs.wave.card"));
+            assert_eq!(property_source, property);
+        }
+        Ok(())
+    }
 }

@@ -24,6 +24,33 @@ const runtime = loadTypeScript();
 const ts = runtime.ts;
 const programCache = new Map();
 
+function runtimeInputs() {
+  const files = [runtime.resolved];
+  let directory = path.dirname(runtime.resolved);
+  while (directory !== path.dirname(directory)) {
+    const packageFile = path.join(directory, "package.json");
+    if (fs.existsSync(packageFile)) {
+      try {
+        if (JSON.parse(fs.readFileSync(packageFile, "utf8")).name === "typescript") {
+          files.push(packageFile);
+          break;
+        }
+      } catch {
+        break;
+      }
+    }
+    directory = path.dirname(directory);
+  }
+  return files.map((file) => {
+    const canonical = fs.realpathSync(file);
+    return {
+      identity: `typescript:${path.basename(canonical)}`,
+      path: canonical,
+      source_hash: sourceHash(fs.readFileSync(canonical)),
+    };
+  });
+}
+
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === "object") {
@@ -39,10 +66,6 @@ function digestText(text) {
 function sourceHash(value) {
   const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
   return bytesToHex(blake3(bytes));
-}
-
-function digestFile(file) {
-  return digestText(fs.readFileSync(file));
 }
 
 function insideRoot(file) {
@@ -89,7 +112,7 @@ function walkConfigs(directory, output = []) {
     if (entry.isDirectory()) {
       if ([".git", ".jscout", ".worktrees", "node_modules"].includes(entry.name)) continue;
       walkConfigs(path.join(directory, entry.name), output);
-    } else if (entry.isFile() && /^tsconfig(?:\.[^.]+)?\.json$/u.test(entry.name)) {
+    } else if (entry.isFile() && /^tsconfig(?:\..+)?\.json$/u.test(entry.name)) {
       output.push(path.join(directory, entry.name));
     }
   }
@@ -107,12 +130,32 @@ function configProblem(config, error) {
 function configuredProjects() {
   const projects = [];
   const problems = [];
-  for (const config of walkConfigs(root)) {
-    const read = ts.readConfigFile(config, ts.sys.readFile);
+  const records = walkConfigs(root).map((config) => ({
+    config,
+    canonical: fs.realpathSync(config),
+    read: ts.readConfigFile(config, ts.sys.readFile),
+  }));
+  const inheritedBases = new Set();
+  for (const record of records) {
+    if (record.read.error) continue;
+    const inherited = Array.isArray(record.read.config.extends)
+      ? record.read.config.extends
+      : record.read.config.extends ? [record.read.config.extends] : [];
+    for (const specifier of inherited) {
+      if (typeof specifier !== "string") continue;
+      const resolved = resolveExtendedConfig(specifier, record.config);
+      if (resolved) inheritedBases.add(fs.realpathSync(resolved));
+    }
+  }
+  for (const { config, canonical, read } of records) {
     if (read.error) {
       problems.push(configProblem(config, read.error));
       continue;
     }
+    const explicitlySelectsFiles = read.config.files !== undefined
+      || read.config.include !== undefined
+      || read.config.references !== undefined;
+    if (inheritedBases.has(canonical) && !explicitlySelectsFiles) continue;
     const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, path.dirname(config), undefined, config);
     if (parsed.errors.length > 0) {
       for (const error of parsed.errors) problems.push(configProblem(config, error));
@@ -122,13 +165,67 @@ function configuredProjects() {
       id: path.relative(root, config).split(path.sep).join("/"),
       config,
       options: parsed.options,
-      fileNames: parsed.fileNames.map((file) => path.resolve(file)),
+      fileNames: parsed.fileNames.map((file) => {
+        const resolved = path.resolve(file);
+        try {
+          return fs.realpathSync(resolved);
+        } catch {
+          return resolved;
+        }
+      }),
       projectReferences: parsed.projectReferences,
     });
   }
   projects.sort((left, right) => left.id.localeCompare(right.id));
   problems.sort((left, right) => left.project_id.localeCompare(right.project_id));
   return { projects, problems };
+}
+
+function resolveExtendedConfig(specifier, fromConfig) {
+  const fromDirectory = path.dirname(fromConfig);
+  const candidates = [];
+  if (specifier.startsWith(".") || path.isAbsolute(specifier)) {
+    const base = path.resolve(fromDirectory, specifier);
+    candidates.push(base, `${base}.json`, path.join(base, "tsconfig.json"));
+  } else {
+    try {
+      candidates.push(createRequire(fromConfig).resolve(specifier));
+    } catch {
+      try {
+        candidates.push(createRequire(fromConfig).resolve(`${specifier}/tsconfig.json`));
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+}
+
+function configInputs(config, seen = new Set()) {
+  let canonical;
+  try {
+    canonical = fs.realpathSync(config);
+  } catch {
+    return [];
+  }
+  if (seen.has(canonical)) return [];
+  seen.add(canonical);
+  const read = ts.readConfigFile(canonical, ts.sys.readFile);
+  const own = [{
+    identity: relativeIdentity(canonical),
+    path: canonical,
+    source_hash: sourceHash(fs.readFileSync(canonical)),
+  }];
+  if (read.error) return own;
+  const inherited = Array.isArray(read.config.extends)
+    ? read.config.extends
+    : read.config.extends ? [read.config.extends] : [];
+  for (const specifier of inherited) {
+    if (typeof specifier !== "string") continue;
+    const resolved = resolveExtendedConfig(specifier, canonical);
+    if (resolved) own.push(...configInputs(resolved, seen));
+  }
+  return own.sort((left, right) => left.identity.localeCompare(right.identity));
 }
 
 function owningProjects(queryFile) {
@@ -163,7 +260,7 @@ function buildProject(project, force = false) {
     projectReferences: project.projectReferences,
   });
   const checker = program.getTypeChecker();
-  const inputs = [];
+  const sourceInputs = [];
   for (const source of program.getSourceFiles()) {
     let canonical;
     try {
@@ -171,21 +268,28 @@ function buildProject(project, force = false) {
     } catch {
       continue;
     }
-    inputs.push([relativeIdentity(canonical), digestText(source.text)]);
+    sourceInputs.push({
+      identity: relativeIdentity(canonical),
+      path: canonical,
+      source_hash: sourceHash(fs.readFileSync(canonical)),
+    });
   }
-  inputs.sort((left, right) => left[0].localeCompare(right[0]));
-  const config = project.config
-    ? [relativeIdentity(project.config), digestFile(project.config)]
-    : undefined;
+  sourceInputs.sort((left, right) => left.identity.localeCompare(right.identity));
+  const configs = project.config ? configInputs(project.config) : [];
+  const compilerInputs = runtimeInputs();
+  const inputFiles = [...compilerInputs, ...configs, ...sourceInputs]
+    .filter((value, index, all) => all.findIndex((other) => other.path === value.path) === index)
+    .sort((left, right) => left.path.localeCompare(right.path));
   const fingerprint = digestText(JSON.stringify(stable({
     protocol: 1,
     typescript: { version: ts.version, source: runtime.source },
+    compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
-    config,
+    configs: configs.map(({ identity, source_hash }) => [identity, source_hash]),
     options: project.options,
-    inputs,
+    inputs: sourceInputs.map(({ identity, source_hash }) => [identity, source_hash]),
   })));
-  const built = { program, checker, fingerprint };
+  const built = { program, checker, fingerprint, inputFiles };
   programCache.set(project.id, built);
   return built;
 }
@@ -345,6 +449,10 @@ function validateInputs(entries) {
       file: entry.file,
       fingerprint,
       valid: fingerprint === entry.fingerprint,
+      inputs: project ? buildProject(project).inputFiles.map(({ path: inputPath, source_hash }) => ({
+        path: inputPath,
+        source_hash,
+      })) : [],
     });
   }
   return { valid: results.every((result) => result.valid), results };

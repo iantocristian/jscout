@@ -1,5 +1,6 @@
 mod agent;
 mod calls;
+mod checker;
 mod chunk;
 mod dependency;
 mod embed;
@@ -382,6 +383,25 @@ enum Command {
         #[arg(long)]
         install: Option<PathBuf>,
     },
+    /// Enrich exact member-call occurrences with bounded TypeScript checker facts
+    Enrich {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Hard deadline for each checker request in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// TypeScript checker sidecar diagnostics
+    Checker {
+        #[command(subcommand)]
+        command: CheckerCommand,
+    },
     /// Model-gateway operations (generative calls run in a Node sidecar)
     Llm {
         #[command(subcommand)]
@@ -396,6 +416,21 @@ enum Command {
     Scout {
         #[command(subcommand)]
         command: ScoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckerCommand {
+    /// Report TypeScript version, projects, config problems, and readiness
+    Doctor {
+        /// Repository root whose configured projects are discovered
+        root: PathBuf,
+        /// Hard deadline for project discovery in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
     },
 }
 
@@ -886,6 +921,34 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Enrich {
+            root,
+            timeout,
+            sidecar_path,
+            database,
+        } => {
+            let report = checker::enrich(
+                &root,
+                &checker::EnrichOptions {
+                    database: database.as_deref(),
+                    sidecar: sidecar_path.as_deref(),
+                    timeout: std::time::Duration::from_secs(timeout),
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Checker { command } => match command {
+            CheckerCommand::Doctor {
+                root,
+                timeout,
+                sidecar_path,
+            } => checker::doctor(
+                &root,
+                sidecar_path.as_deref(),
+                std::time::Duration::from_secs(timeout),
+            ),
+        },
         Command::Llm { command } => match command {
             LlmCommand::Doctor {
                 model,
