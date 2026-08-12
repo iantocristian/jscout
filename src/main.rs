@@ -8,6 +8,7 @@ mod file_role;
 mod graph;
 mod heur;
 mod indexer;
+mod inference;
 mod llm;
 mod mcp;
 mod origin;
@@ -68,7 +69,7 @@ enum Command {
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
     },
-    /// Embed chunks that don't have embeddings yet (needs an API key, see README)
+    /// Embed chunks missing from the explicitly configured provider profile
     Embed {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -106,6 +107,12 @@ enum Command {
         /// Skip vector search even if a provider is configured
         #[arg(long)]
         no_vector: bool,
+        /// Skip cross-encoder reranking even if it is configured
+        #[arg(long)]
+        no_rerank: bool,
+        /// Use BM25 only (equivalent to --no-vector --no-rerank)
+        #[arg(long)]
+        lexical_only: bool,
         /// Output JSON
         #[arg(long)]
         json: bool,
@@ -380,6 +387,11 @@ enum Command {
         #[command(subcommand)]
         command: LlmCommand,
     },
+    /// Optional local embedding and reranking service
+    Inference {
+        #[command(subcommand)]
+        command: InferenceCommand,
+    },
     /// Generative scouting over deterministic candidates (pi-ai gateway)
     Scout {
         #[command(subcommand)]
@@ -591,6 +603,22 @@ enum LlmCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum InferenceCommand {
+    /// Run the bundled Hugging Face/PyTorch sidecar through uv
+    Serve {
+        /// Directory containing inference/pyproject.toml and service.py
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Check the sidecar and print its effective model configuration
+    Doctor {
+        /// Service base URL; defaults to JSCOUT_INFERENCE_URL or loopback:8792
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -616,6 +644,8 @@ fn main() -> Result<()> {
             memory_limit,
             response_bytes,
             no_vector,
+            no_rerank,
+            lexical_only,
             json,
             expand,
             expand_depth,
@@ -628,7 +658,7 @@ fn main() -> Result<()> {
         } => cmd_search(
             &root,
             &query,
-            no_vector,
+            no_vector || lexical_only,
             json,
             search::SearchOptions {
                 limit,
@@ -637,6 +667,7 @@ fn main() -> Result<()> {
                 file_origins: file_origins.clone(),
                 include_memory: !no_memory,
                 memory_limit,
+                rerank: !(no_rerank || lexical_only),
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -861,6 +892,10 @@ fn main() -> Result<()> {
                 gateway_path,
             } => llm::doctor(model.as_deref(), gateway_path.as_deref()),
         },
+        Command::Inference { command } => match command {
+            InferenceCommand::Serve { project } => inference::serve(project.as_deref()),
+            InferenceCommand::Doctor { url } => inference::doctor(url.as_deref()),
+        },
         Command::Scout { command } => match command {
             ScoutCommand::Workflows {
                 root,
@@ -1057,10 +1092,9 @@ fn cmd_neighborhood(
 
 fn cmd_embed(root: &Path, batch: usize, file_origins: &[String]) -> Result<()> {
     let conn = store::open(root)?;
-    let Some(provider) = embed::Provider::from_env() else {
+    let Some(provider) = embed::Provider::from_env()? else {
         anyhow::bail!(
-            "no embedding provider configured — set VOYAGE_API_KEY, OPENAI_API_KEY, \
-             or JSCOUT_EMBED_URL (OpenAI-compatible, e.g. Ollama)"
+            "no embedding provider configured — set JSCOUT_EMBED_PROVIDER to local, voyage, or openai"
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
@@ -1080,7 +1114,7 @@ fn cmd_search(
     let provider = if no_vector {
         None
     } else {
-        embed::Provider::from_env()
+        embed::Provider::from_env()?
     };
     let result = search::search(&conn, provider.as_ref(), query, &options)?;
     if json {
@@ -1670,8 +1704,9 @@ mod main_tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::render_semantic_memory_text;
+    use super::{Cli, Command, render_semantic_memory_text};
     use crate::semantic::SemanticArtifact;
+    use clap::Parser;
 
     #[test]
     fn text_search_memory_is_renderable_without_code_hits() -> Result<()> {
@@ -1694,5 +1729,38 @@ mod main_tests {
         assert!(rendered.contains("semantic memory (untrusted; verify in source)"));
         assert!(rendered.contains("invoice settlement [fresh]"));
         Ok(())
+    }
+
+    #[test]
+    fn lexical_only_and_rerank_controls_parse_independently() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "search",
+            ".",
+            "query",
+            "--no-vector",
+            "--no-rerank",
+        ])
+        .expect("explicit controls parse");
+        let Command::Search {
+            no_vector,
+            no_rerank,
+            lexical_only,
+            ..
+        } = command
+        else {
+            panic!("expected search")
+        };
+        assert!(no_vector);
+        assert!(no_rerank);
+        assert!(!lexical_only);
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--lexical-only"])
+                .expect("lexical shortcut parses");
+        let Command::Search { lexical_only, .. } = command else {
+            panic!("expected search")
+        };
+        assert!(lexical_only);
     }
 }

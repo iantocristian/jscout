@@ -49,7 +49,7 @@ pub fn serve(
         Some(path) => store::open_path(path)?,
         None => store::open(&root)?,
     };
-    let provider = embed::Provider::from_env();
+    let provider = embed::Provider::from_env()?;
     let telemetry_path = telemetry_path
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("JSCOUT_TELEMETRY_FILE").map(PathBuf::from));
@@ -191,6 +191,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Hit and expansion origin allowlist. Dependency internals are excluded unless explicitly included" },
                     "include_memory": { "type": "boolean", "default": true, "description": "Attach matching persistent semantic artifacts with freshness and evidence" },
                     "memory_limit": { "type": "integer", "default": 4 },
+                    "vector": { "type": "boolean", "default": true, "description": "Use the configured embedding profile when it is already materialized" },
+                    "rerank": { "type": "boolean", "default": true, "description": "Apply the configured cross-encoder to the candidate pool; independent of vector retrieval" },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered result, including hits, expansion, metadata, and JSON overhead" },
                     "expand": { "type": "boolean", "default": false, "description": "Attach a separately labelled structural context pack; off by default" },
                     "expand_depth": { "type": "integer", "default": 1 },
@@ -505,7 +507,11 @@ fn call_tool(
             }
             let result = search::search(
                 conn,
-                provider,
+                if args["vector"].as_bool().unwrap_or(true) {
+                    provider
+                } else {
+                    None
+                },
                 q,
                 &search::SearchOptions {
                     limit,
@@ -515,6 +521,7 @@ fn call_tool(
                     include_memory: profile == ToolProfile::Structural
                         && args["include_memory"].as_bool().unwrap_or(true),
                     memory_limit: args["memory_limit"].as_u64().unwrap_or(4) as usize,
+                    rerank: args["rerank"].as_bool().unwrap_or(true),
                     response_byte_limit: args["response_bytes"]
                         .as_u64()
                         .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)

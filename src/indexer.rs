@@ -303,6 +303,9 @@ fn index_repo_impl(
     let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
     let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
     index_dependency_files(conn, &plans, &instances, &mut outcome)?;
+    if outcome.indexed > 0 {
+        crate::embed::materialize_cached_embeddings(conn)?;
+    }
 
     resolve_module_edges(&root, conn)?;
     conn.execute(
@@ -2011,7 +2014,8 @@ mod tests {
             ("semantic_relations", "SELECT * FROM semantic_relations"),
             (
                 "embeddings",
-                "SELECT chunk_hash, model, dim FROM embeddings",
+                "SELECT e.chunk_hash, p.provider, p.model, p.config_fingerprint, p.dimensions
+                 FROM embeddings e JOIN embedding_profiles p ON p.id=e.profile_id",
             ),
             (
                 "meta",

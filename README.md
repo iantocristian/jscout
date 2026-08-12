@@ -44,6 +44,21 @@ search beyond these locations. The default model
 credential store; see [Configuration](#configuration) for the complete
 environment surface and auth setup.
 
+Optional local semantic retrieval uses a separate Python 3.11/3.12 service
+with Hugging Face Transformers and PyTorch. Install [uv](https://docs.astral.sh/uv/),
+then run the one service that owns both BGE-M3 embeddings and the BGE reranker:
+
+```bash
+uv sync --project inference       # locked Python environment
+jscout inference serve            # http://127.0.0.1:8792 by default
+# in another shell:
+jscout inference doctor
+JSCOUT_EMBED_PROVIDER=local jscout embed /path/to/repo
+```
+
+The models download into `~/.cache/jscout/models` on first use. BM25-only
+installs do not need Python, uv, PyTorch, or model downloads.
+
 ## Commands
 
 ```
@@ -52,6 +67,7 @@ jscout index <root>            # build/update .jscout.db (incremental, content-h
                                #   --deps pkg,@scope/pkg indexes named dependency internals
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   add --expand for a bounded structural context pack
+                               #   --no-vector, --no-rerank, or --lexical-only control stages
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
@@ -61,6 +77,8 @@ jscout calls <root> METHOD     # exact member-call sites matched on the AST
 jscout watch <root> [--embed]  # hash-incremental parse; projection is currently rebuilt
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
+jscout inference serve         # run the optional local embedding/reranking service
+jscout inference doctor        # verify its endpoint, device, models, and dimensions
 jscout entities <root> [query] # runtime, contract, route, config, data, flag, host entities
 jscout paths <root> A B        # bounded ranked paths between exact boundaries
 jscout overview <root>         # deterministic cold-start inventory
@@ -362,8 +380,12 @@ Retrieval and diagnostics:
 
 | Variable | Effect |
 |---|---|
-| `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `JSCOUT_EMBED_URL`, `JSCOUT_EMBED_KEY`, `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_PROVIDER`, `JSCOUT_QUERY_PREFIX` | Optional embedding providers; see [Embeddings](#embeddings-optional). |
-| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_MODEL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder reranking; see [Reranking](#reranking-optional). |
+| `JSCOUT_EMBED_PROVIDER` | Explicit embedding selection: `local`, `voyage`, `openai`, or `none`/unset. API keys alone never enable a provider. |
+| `JSCOUT_INFERENCE_URL`, `JSCOUT_INFERENCE_HOST`, `JSCOUT_INFERENCE_PORT`, `JSCOUT_INFERENCE_PROJECT`, `JSCOUT_UV` | Local inference endpoint, bind address, project discovery, and uv executable overrides. |
+| `JSCOUT_INFERENCE_ALLOW_REMOTE` | Permit a non-loopback Python service bind. Off by default; enable only on a trusted network. |
+| `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_REVISION`, `JSCOUT_RERANK_MODEL`, `JSCOUT_RERANK_REVISION`, `JSCOUT_MODEL_CACHE_ROOT` | Local/hosted model identity, optional immutable Hugging Face revisions, and model cache. |
+| `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `JSCOUT_EMBED_URL`, `JSCOUT_EMBED_KEY`, `JSCOUT_QUERY_PREFIX` | Hosted or OpenAI-compatible embedding transport. A custom URL receives only `JSCOUT_EMBED_KEY`, never `OPENAI_API_KEY`. |
+| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder override and candidate limits; local reranking is automatic when the local embedding provider is selected unless `--no-rerank` or `--lexical-only` is passed. |
 | `JSCOUT_TIMING` | Print per-stage latency to stderr during search and indexing. |
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
@@ -499,13 +521,32 @@ code visible unless `dependency` is included in the caller's origin filter.
 
 ## Embeddings (optional)
 
-Search works BM25-only out of the box. For hybrid semantic search set one of:
+Search works BM25-only out of the box. Provider selection is explicit:
 
-- `VOYAGE_API_KEY` — uses `voyage-code-3`
-- `OPENAI_API_KEY` — uses `text-embedding-3-small`
-- `JSCOUT_EMBED_URL` (+ `JSCOUT_EMBED_KEY`) — any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM)
+- `JSCOUT_EMBED_PROVIDER=local` — bundled BGE-M3 service at
+  `JSCOUT_INFERENCE_URL` (default `http://127.0.0.1:8792`)
+- `JSCOUT_EMBED_PROVIDER=voyage` + `VOYAGE_API_KEY` — `voyage-code-3`
+- `JSCOUT_EMBED_PROVIDER=openai` + `OPENAI_API_KEY` —
+  `text-embedding-3-small`
+- `JSCOUT_EMBED_PROVIDER=openai` + `JSCOUT_EMBED_URL` — an
+  OpenAI-compatible endpoint (LM Studio, Ollama, vLLM); optionally authenticate
+  with `JSCOUT_EMBED_KEY`
 
-Overrides: `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_PROVIDER=voyage|openai|none`.
+An API key or URL without `JSCOUT_EMBED_PROVIDER` does nothing. When a custom
+embedding URL is configured, jscout never falls back to `OPENAI_API_KEY` for
+that request.
+
+The local service has one process and one port for both models. Its embedding
+model is intentionally fixed to BGE-M3; use the OpenAI-compatible adapter for
+other embedding models. It selects MPS, then CUDA, then CPU; loads each model
+lazily; serializes inference to bound
+memory; and exposes `/health`, `/configuration`, `/embed`, and `/rerank`.
+Override its cache and model configuration through `.env.example`. Pin
+`JSCOUT_EMBED_REVISION` and `JSCOUT_RERANK_REVISION` to select different
+immutable commits; the bundled defaults are already pinned and their revisions
+are part of the embedding-profile fingerprint. Runtime device is diagnostic,
+not cache identity: MPS and CUDA reuse the same float16 profile, while CPU uses
+a separate float32 profile because dtype changes the generated vectors.
 
 Asymmetric models: when the model name contains `nomic-embed-code` or `coderankembed`,
 queries are automatically prefixed with `"Represent this query for searching relevant
@@ -516,21 +557,45 @@ LM Studio example (loads `nomic-embed-code` GGUF, serves OpenAI-compatible API):
 ```bash
 JSCOUT_EMBED_URL=http://localhost:1234/v1/embeddings \
 JSCOUT_EMBED_MODEL=text-embedding-nomic-embed-code \
+JSCOUT_EMBED_PROVIDER=openai \
 jscout embed /path/to/repo
 ```
 
-Embeddings are keyed by (chunk content hash, model): unchanged code is never
-re-embedded, and multiple models can coexist in one index.
+Embeddings are keyed by chunk content hash and a fingerprint of provider,
+model, endpoint/protocol, revision, pooling, normalization, and other
+output-affecting configuration. The profile also records and enforces vector
+dimensions. Unchanged code is not re-embedded, and incompatible configurations
+can coexist without silently sharing vectors.
+
+Vector retrieval uses the statically linked `sqlite-vec` extension. jscout
+creates one cosine `vec0` virtual table per embedding dimension, partitioned by
+profile and source origin, and keeps occurrence rows in the same SQLite file.
+This removes the Rust full-table cosine loop. The stable `vec0` implementation
+is native exact KNN, not an HNSW/approximate index.
+
+`jscout embed` owns profile creation and full consistency repair. Indexing
+materializes new chunk occurrences when their content hashes already have
+cached vectors. Search performs readiness checks only; it never creates a
+profile, table, or vector row inside its read snapshot. If vector state is
+missing or incomplete, the vector stage reports that `jscout embed` is needed
+and search continues with BM25. On the August 2026 n8n validation corpus
+(92,215 vector occurrences), a warm release search measured 107 ms for exact
+KNN and 332 ms for the complete vector stage. ANN/HNSW remains a separate
+follow-up rather than a correctness dependency of this storage change.
 
 ## Reranking (optional)
 
-Set `JSCOUT_RERANK_URL` to a cross-encoder service speaking
-`POST {query, candidates:[{id,text}]}` → `{scores:[{id,score}]}` (e.g. a local
-bge-reranker-v2-m3). The top RRF candidates are reranked before final ordering.
+With `JSCOUT_EMBED_PROVIDER=local`, search automatically sends the top RRF
+candidates to the same service's BGE reranker. To use a separate service, set
+`JSCOUT_RERANK_URL` to an endpoint speaking
+`POST {model,query,candidates:[{id,text}]}` → `{scores:[{id,score}]}`. A malformed
+or incomplete score set is rejected and search falls back to RRF ordering.
 Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
-(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`.
-Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (bm25 / embed-query /
-vector-scan / rerank) to stderr on search and structural-projection stage
+(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`. `--no-vector`
+keeps BM25 plus reranking, `--no-rerank` disables only the cross-encoder, and
+`--lexical-only` disables both optional stages.
+Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (BM25 / embed-query +
+sqlite-vec / rerank) to stderr on search and structural-projection stage
 timings during indexing.
 
 ## MCP integration
@@ -590,7 +655,8 @@ fresh/degraded/stale totals.
 
 Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
 `.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, classified
-references, event/member-call sites, embeddings, and a disposable
+references, event/member-call sites, provenance-keyed embedding caches,
+dimension-specific sqlite-vec indexes, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
 after indexing so barrel changes can reroute references in otherwise unchanged
 files without leaving stale graph edges behind. Runtime module links use
