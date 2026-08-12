@@ -35,6 +35,20 @@ jobs:
       - name: Run gateway tests
         run: npm test --prefix gateway
 
+  checker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          cache-dependency-path: checker/package-lock.json
+      - name: Install pinned checker dependencies
+        run: npm ci --prefix checker
+      - name: Run checker tests
+        run: npm test --prefix checker
+
   release-package:
     runs-on: ubuntu-latest
     steps:
@@ -58,3 +72,5 @@ jobs:
           binary="$(find "$RUNNER_TEMP/jscout-package" -type f -name jscout -print -quit)"
           JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS='[{"id":"local","baseUrl":"http://127.0.0.1:11434/v1","models":[{"id":"smoke","contextWindow":131072,"maxTokens":32768}]}]' \
             "$binary" llm doctor --model local:smoke
+          bundle_dir="$(dirname "$binary")"
+          "$binary" checker doctor "$bundle_dir"

@@ -2,7 +2,7 @@
 
 > Status: authoritative plan as of 2026-08-12.
 >
-> G1–G9 are implemented. Semantic v1 has reached its implementation boundary;
+> G1–G10 are implemented. Semantic v1 has reached its implementation boundary;
 > product-value testing remains paused until the engineering verification gate
 > below is green.
 
@@ -495,7 +495,15 @@ After semantic v1, run real Sol or Terra scouting on the installed n8n and
 Twenty repositories, inspect generated memory, repair implementation defects,
 and only then compare real agent work with and without it.
 
-## Post-v1: checker enrichment sidecar (G10)
+## Implemented post-v1 checker enrichment sidecar (G10)
+
+As implemented, schema v18 stores exact call/receiver/property byte spans and
+canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
+sidecar explicitly; `jscout checker doctor` reports project/configuration
+readiness. The protocol host isolates compiler work in a terminable worker,
+and the Rust client enforces a hard deadline. Projection v11 recreates only
+fresh occurrence-specific `checker` edges and retains the shared possible
+member hubs.
 
 The original plan deferred checker-backed enrichment behind a revisit
 trigger. That trigger is now pulled deliberately: the call-site query work
@@ -679,9 +687,9 @@ jscout provides a different repository-level surface:
 - bounded snapshot-labelled context for agent consumption;
 - persistent evidence-backed semantic and agent memory across sessions.
 
-Do not reimplement checker machinery. Optional occurrence-scoped
-receiver/member enrichment through a checker sidecar is planned as G10
-(post-v1) — a deliberate pull of the original deferral trigger. Unambiguous
+Do not reimplement general LSP machinery. Optional occurrence-scoped
+receiver/member enrichment is implemented as G10 (post-v1) — a deliberate
+pull of the original deferral trigger. Unambiguous
 answers are recorded at `likely` with `checker` provenance; ambiguous answers
 remain candidates. Everything else typed navigation offers remains the LSP's
 job.
