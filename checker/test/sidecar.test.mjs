@@ -106,6 +106,56 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
   await checker.close();
 });
 
+// The program must be built from the EFFECTIVE compiler options. Normalizing
+// absolute paths before `ts.createProgram` (normalization belongs to the
+// fingerprint) silently degraded every receiver reached through a `paths`
+// mapping to `any`, disabling enrichment for the monorepo shapes G10 targets.
+test("resolves receivers through a baseUrl/paths mapping and keeps type text repo-relative", async (context) => {
+  const source = [
+    'import { makeCard } from "@lib/tables";',
+    "const card = makeCard();",
+    "card.insert()",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "main.ts": source,
+    "src/lib/tables.ts": [
+      "export class CardTable { insert(): void {} }",
+      "export function makeCard(): CardTable { return new CardTable() }",
+      "",
+    ].join("\n"),
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: { strict: true, baseUrl: ".", paths: { "@lib/*": ["src/lib/*"] } },
+      files: ["main.ts", "src/lib/tables.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const message = await checker.request("resolve_member", {
+    query: queryFor(source, "card.insert()", "card", "insert"),
+  });
+  assert.equal(message.kind, "resolve_member_result");
+  const [answer] = message.result.projects;
+  assert.equal(answer.status, "resolved", "a mapped receiver must not degrade to any/unknown");
+  assert.equal(answer.declarations.length, 1);
+  assert.equal(answer.declarations[0].file, "src/lib/tables.ts");
+  assert.ok(
+    !answer.receiver_type.includes(root),
+    `receiver type leaked a machine-absolute path: ${answer.receiver_type}`,
+  );
+
+  // The fingerprint is what normalization exists for, and it still round-trips.
+  const validation = await checker.request("validate_inputs", {
+    entries: [{ file: "main.ts", project_id: "tsconfig.json", fingerprint: answer.checker_input_fingerprint }],
+  });
+  assert.equal(validation.result.valid, true);
+  assert.ok(validation.result.results[0].inputs.length > 0);
+  await checker.close();
+});
+
 test("keeps overlapping projects visible and invalidates changed checker inputs", async (context) => {
   const source = [
     "interface Alpha { save(): void }",
