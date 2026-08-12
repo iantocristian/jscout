@@ -32,6 +32,7 @@ pub struct CompletionOutcome {
     pub tool_call: ToolCall,
     pub stop_reason: String,
     pub usage: Usage,
+    pub attempts: u64,
     pub response_model: Option<String>,
 }
 
@@ -126,12 +127,11 @@ pub trait LlmGateway {
 pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let node = config::resolve_node()?;
     println!("node: {}", node.display());
-    let version = std::process::Command::new(&node)
-        .arg("--version")
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|error| format!("unavailable ({error})"));
-    println!("node version: {version} (required >= 22.19.0)");
+    let version = config::verify_node_version(&node)?;
+    println!(
+        "node version: {version} (required >= {})",
+        config::MINIMUM_NODE_VERSION_TEXT
+    );
 
     let gateway_file = config::resolve_gateway(gateway_path)?;
     println!("gateway: {}", gateway_file.display());
@@ -192,6 +192,21 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
                 "endpoint: {}",
                 model.base_url.as_deref().unwrap_or("unknown")
             );
+            println!(
+                "billing path: {} (configured routing only; no provider request made)",
+                model.billing_path.as_deref().unwrap_or("unknown")
+            );
+            if !model.auth_configured {
+                anyhow::bail!(
+                    "no usable authentication configuration was found for provider {}; configure its API-key environment variable or pi-ai OAuth auth store before scouting",
+                    model.provider
+                );
+            }
+            println!(
+                "auth: configured (type {}, source {}); credential validity, quota, and billing were not checked against the provider",
+                model.auth_type.as_deref().unwrap_or("unknown"),
+                model.auth_source.as_deref().unwrap_or("unknown")
+            );
         }
         (Some(spec), None) => {
             anyhow::bail!(
@@ -207,6 +222,6 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
             );
         }
     }
-    println!("doctor: ok");
+    println!("doctor: local runtime, model, and auth configuration ok (no model request made)");
     Ok(())
 }
