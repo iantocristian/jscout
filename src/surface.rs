@@ -263,10 +263,13 @@ pub struct RepositoryOverview {
     pub totals: BTreeMap<String, usize>,
     pub files_by_origin: BTreeMap<String, usize>,
     pub files_by_role: BTreeMap<String, usize>,
+    pub areas_matched: usize,
     pub areas: Vec<AreaOverview>,
     pub areas_truncated: bool,
+    pub entity_inventory_matched: usize,
     pub entity_inventory: Vec<InventoryCount>,
     pub entity_inventory_truncated: bool,
+    pub relations_matched: usize,
     pub relations: Vec<RelationCount>,
     pub relations_truncated: bool,
 }
@@ -424,7 +427,8 @@ fn overview_unpinned(
             .then_with(|| right.symbols.cmp(&left.symbols))
             .then_with(|| left.path.cmp(&right.path))
     });
-    let areas_truncated = areas.len() > area_limit;
+    let areas_matched = areas.len();
+    let areas_truncated = areas_matched > area_limit;
     areas.truncate(area_limit);
 
     let mut entity_inventory = Vec::new();
@@ -451,6 +455,7 @@ fn overview_unpinned(
     for row in rows {
         entity_inventory.push(row?);
     }
+    let entity_inventory_matched = entity_inventory.len();
 
     let mut relations = Vec::new();
     let mut stmt = conn.prepare(
@@ -475,7 +480,8 @@ fn overview_unpinned(
     }
     *totals.get_mut("graph_edges").expect("total exists") =
         relations.iter().map(|relation| relation.edges).sum();
-    let relations_truncated = relations.len() > relation_limit;
+    let relations_matched = relations.len();
+    let relations_truncated = relations_matched > relation_limit;
     relations.truncate(relation_limit);
 
     Ok(RepositoryOverview {
@@ -483,10 +489,13 @@ fn overview_unpinned(
         totals,
         files_by_origin,
         files_by_role,
+        areas_matched,
         areas,
         areas_truncated,
+        entity_inventory_matched,
         entity_inventory,
         entity_inventory_truncated: false,
+        relations_matched,
         relations,
         relations_truncated,
     })
@@ -514,11 +523,30 @@ pub fn overview_response(
             .include_semantic
             .then(|| semantic_overlay(conn, &options.semantic_types, options.semantic_limit))
             .transpose()?;
+        let omitted_semantic_artifacts = semantic_overlay.as_ref().map_or(0, |overlay| {
+            overlay.fresh_matched.saturating_sub(overlay.returned)
+        });
+        let omitted_relations = overview
+            .relations_matched
+            .saturating_sub(overview.relations.len());
+        let omitted_areas = overview.areas_matched.saturating_sub(overview.areas.len());
+        let omitted_entity_inventory = overview
+            .entity_inventory_matched
+            .saturating_sub(overview.entity_inventory.len());
+        let initially_truncated = omitted_semantic_artifacts > 0
+            || omitted_relations > 0
+            || omitted_areas > 0
+            || omitted_entity_inventory > 0;
         let mut response = RepositoryOverviewResponse {
             overview,
             semantic_overlay,
             response_budget: OverviewResponseBudget {
                 byte_limit: options.response_byte_limit,
+                truncated: initially_truncated,
+                omitted_semantic_artifacts,
+                omitted_relations,
+                omitted_areas,
+                omitted_entity_inventory,
                 ..Default::default()
             },
         };
@@ -621,9 +649,7 @@ fn semantic_overlay_priority(artifact: &semantic::SemanticArtifact) -> u8 {
 
 fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()> {
     let byte_limit = response.response_budget.byte_limit;
-    let unbudgeted = settle_overview_bytes(response)?;
-    response.response_budget.unbudgeted_bytes = unbudgeted;
-    settle_overview_bytes(response)?;
+    settle_overview_unbudgeted_bytes(response)?;
     while response.response_budget.rendered_bytes > byte_limit {
         response.response_budget.truncated = true;
         if let Some(overlay) = response.semantic_overlay.as_mut()
@@ -658,6 +684,18 @@ fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()
             "overview response byte limit {byte_limit} is below the minimum envelope ({minimum} bytes)"
         );
     }
+    Ok(())
+}
+
+fn settle_overview_unbudgeted_bytes(response: &mut RepositoryOverviewResponse) -> Result<()> {
+    for _ in 0..8 {
+        let rendered = settle_overview_bytes(response)?;
+        if response.response_budget.unbudgeted_bytes == rendered {
+            return Ok(());
+        }
+        response.response_budget.unbudgeted_bytes = rendered;
+    }
+    settle_overview_bytes(response)?;
     Ok(())
 }
 
@@ -795,7 +833,7 @@ mod tests {
             &semantic::AnnotateInput {
                 artifact_type: "card".into(),
                 name: Some(anchor.clone()),
-                body: json!({ "purpose": "starts the flow" }),
+                body: json!({ "purpose": "starts the flow ".repeat(256) }),
                 supports: vec![semantic::SupportInput {
                     claim_path: "/purpose".into(),
                     anchor,
@@ -817,10 +855,43 @@ mod tests {
             ..Default::default()
         };
         let fresh = overview_response(&conn, &options)?;
-        let overlay = fresh.semantic_overlay.expect("overlay requested");
+        let deterministic_areas = fresh.overview.areas.len();
+        let overlay = fresh.semantic_overlay.as_ref().expect("overlay requested");
         assert_eq!(overlay.returned, 1);
         assert_eq!(overlay.excluded_non_fresh, 0);
         assert_eq!(overlay.artifacts[0].freshness, "fresh");
+        assert_eq!(
+            fresh.response_budget.unbudgeted_bytes,
+            fresh.response_budget.rendered_bytes
+        );
+
+        let deterministic = overview_response(
+            &conn,
+            &OverviewOptions {
+                include_semantic: false,
+                ..options.clone()
+            },
+        )?;
+        let bounded_limit = deterministic.response_budget.rendered_bytes + 512;
+        assert!(fresh.response_budget.rendered_bytes > bounded_limit);
+
+        let bounded = overview_response(
+            &conn,
+            &OverviewOptions {
+                response_byte_limit: bounded_limit,
+                ..options.clone()
+            },
+        )?;
+        assert!(bounded.response_budget.truncated);
+        assert_eq!(bounded.response_budget.omitted_semantic_artifacts, 1);
+        assert!(
+            bounded
+                .semantic_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.artifacts.is_empty())
+        );
+        assert_eq!(bounded.overview.areas.len(), deterministic_areas);
+        assert!(bounded.response_budget.rendered_bytes <= bounded_limit);
 
         fs::write(
             repo.path().join("flow.ts"),

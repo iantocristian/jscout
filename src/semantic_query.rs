@@ -207,6 +207,7 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
         });
         let matched_artifacts = loaded.len();
         loaded.truncate(options.limit);
+        let omitted_artifacts = matched_artifacts.saturating_sub(loaded.len());
         for artifact in &mut loaded {
             artifact.relevance = relevance.get(&artifact.id).copied().unwrap_or_default();
         }
@@ -223,7 +224,7 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             } else {
                 (Vec::new(), 0, 0)
             };
-        let semantic_artifacts = loaded
+        let semantic_artifacts: Vec<ArtifactView> = loaded
             .into_iter()
             .map(|artifact| {
                 artifact_view(
@@ -234,6 +235,24 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
                 )
             })
             .collect();
+        let omitted_supports = semantic_artifacts
+            .iter()
+            .map(|artifact| {
+                artifact
+                    .support_count
+                    .saturating_sub(artifact.supports.len())
+            })
+            .sum();
+        let truncated_sources = source_evidence
+            .iter()
+            .filter(|source| source.source_truncated)
+            .count();
+        let initially_truncated = omitted_artifacts > 0
+            || omitted_relations > 0
+            || omitted_sources > 0
+            || omitted_sources_by_origin > 0
+            || omitted_supports > 0
+            || truncated_sources > 0;
         let mut result = QueryResult {
             snapshot,
             matched_artifacts,
@@ -242,9 +261,13 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             source_evidence,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
+                truncated: initially_truncated,
+                omitted_artifacts,
                 omitted_relations,
                 omitted_sources,
                 omitted_sources_by_origin,
+                truncated_sources,
+                omitted_supports,
                 ..Default::default()
             },
         };
@@ -743,9 +766,7 @@ fn line_excerpt(source: &str, start_line: i64, end_line: i64) -> Option<String> 
 
 fn apply_response_budget(result: &mut QueryResult) -> Result<()> {
     let byte_limit = result.response_budget.byte_limit;
-    let unbudgeted = settle_rendered_bytes(result)?;
-    result.response_budget.unbudgeted_bytes = unbudgeted;
-    settle_rendered_bytes(result)?;
+    settle_unbudgeted_bytes(result)?;
     while result.response_budget.rendered_bytes > byte_limit {
         result.response_budget.truncated = true;
         let rendered = result.response_budget.rendered_bytes;
@@ -808,6 +829,18 @@ fn apply_response_budget(result: &mut QueryResult) -> Result<()> {
             "response byte limit {byte_limit} is below the minimum semantic response ({minimum} bytes)"
         );
     }
+    Ok(())
+}
+
+fn settle_unbudgeted_bytes(result: &mut QueryResult) -> Result<()> {
+    for _ in 0..8 {
+        let rendered = settle_rendered_bytes(result)?;
+        if result.response_budget.unbudgeted_bytes == rendered {
+            return Ok(());
+        }
+        result.response_budget.unbudgeted_bytes = rendered;
+    }
+    settle_rendered_bytes(result)?;
     Ok(())
 }
 
@@ -898,6 +931,10 @@ mod tests {
                 .is_some_and(|source| source.contains("function start"))
         );
         assert!(result.response_budget.rendered_bytes <= 24_000);
+        assert_eq!(
+            result.response_budget.unbudgeted_bytes,
+            result.response_budget.rendered_bytes
+        );
         Ok(())
     }
 

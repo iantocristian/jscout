@@ -1110,8 +1110,8 @@ fn load_artifact_at_depth(
 /// Fold pinned child fingerprints into the parent's freshness: a missing,
 /// superseded, or changed child stales the parent; a current child that is
 /// itself no longer fresh degrades it — even when the parent's own text and
-/// direct supports are unchanged. Depth bounds the recursion defensively;
-/// the hierarchy is file -> module -> repository, so three levels suffice.
+/// direct supports are unchanged. Depth bounds recursion defensively while
+/// still covering a concept above repository -> module -> file -> card.
 #[allow(clippy::too_many_arguments)]
 fn child_adjusted_freshness(
     conn: &Connection,
