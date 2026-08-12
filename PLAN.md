@@ -683,7 +683,8 @@ job.
 
 - cross-edit stable symbol identity;
 - runtime traces;
-- checker-backed enrichment beyond G10's type-at-position queries
+- checker-backed enrichment beyond G10's occurrence-scoped receiver/member
+  resolution
   (diagnostics, rename/refactor safety, call hierarchy — use an LSP);
 - learned compression or learned traversal policy;
 - LLM-generated pseudocode as source truth;
@@ -703,7 +704,7 @@ job.
 |---|---|---|
 | Keep chunks out of graph identity | Chunk boundaries follow retrieval budgets and churn independently of repository identity | A concrete query needs chunk identity independent of source anchors |
 | Rebuild the graph projection after indexing | Barrel edits can reroute unchanged importers; full rebuild is simpler and correct at current scale | A measured repository exceeds the acceptable projection budget |
-| Use hubs/candidates for uncertain dynamic relationships | Direct pairing creates false edges and quadratic fan-out | G10 checker enrichment narrows hubs to `likely` edges; hubs remain for what the checker cannot type |
+| Use hubs/candidates for uncertain dynamic relationships | Direct pairing creates false edges and quadratic fan-out | G10 adds occurrence-specific `likely` edges while retaining shared hubs as the `possible` fallback |
 | Separate entities from occurrences | Canonical identity and evidence sites have different lifecycle/provenance semantics | No planned revisit |
 | Keep structural expansion off by default | Evaluation did not show a default-workload outcome gain and simple lookups do not need graph context | Real agent work shows a reliable default benefit |
 | Treat traversal weights as heuristics | Published systems do not validate jscout's edge kinds, confidence mapping, or workload | Repository-specific evidence supports tuning or learning |
