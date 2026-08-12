@@ -202,7 +202,11 @@ CREATE TABLE IF NOT EXISTS member_calls(
   end_line INTEGER NOT NULL DEFAULT 0,
   prop TEXT NOT NULL,
   object TEXT,
-  receiver TEXT                     -- full static chain, e.g. dbs.wave.card
+  receiver TEXT,                    -- full static chain, e.g. dbs.wave.card
+  receiver_start INTEGER NOT NULL DEFAULT 0,
+  receiver_end INTEGER NOT NULL DEFAULT 0,
+  property_start INTEGER NOT NULL DEFAULT 0,
+  property_end INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
@@ -893,8 +897,34 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v16 -> v17: checker enrichment addresses one exact member occurrence.
+    // Legacy rows know the complete call but not the receiver/property spans,
+    // so only re-extraction can populate trustworthy query locations.
+    if version < 17 {
+        for (column, declaration) in [
+            ("receiver_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("receiver_end", "INTEGER NOT NULL DEFAULT 0"),
+            ("property_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("property_end", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !has_column(conn, "member_calls", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE member_calls ADD COLUMN {column} {declaration}"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            [],
+        )?;
+    }
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','16')
+        "INSERT INTO meta(key, value) VALUES('schema_version','17')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -1130,7 +1160,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         assert!(database.is_file());
         Ok(())
     }
@@ -1160,7 +1190,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let legacy_columns: i64 = connection.query_row(
             "SELECT count(*) FROM pragma_table_info('embeddings')
              WHERE name IN ('model', 'dim')",
@@ -1221,7 +1251,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -1264,7 +1294,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -1328,7 +1358,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -1357,7 +1387,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -1401,7 +1431,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1451,7 +1481,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1517,7 +1547,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1565,7 +1595,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1613,7 +1643,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
@@ -1667,7 +1697,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
 
         // The backfilled fingerprint equals a recomputation from canonical parts.
         let stored: String = conn.query_row(
@@ -1753,7 +1783,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         assert_eq!(config, "{}");
         Ok(())
     }
@@ -1788,7 +1818,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
         // Columns exist with the migration defaults; real values require
         // re-extraction, which the cleared hash forces.
         let (end, end_line, receiver, hash): (i64, i64, Option<String>, String) = conn.query_row(

@@ -39,6 +39,12 @@ pub struct MemberCall {
     /// End of the complete CallExpression: a multiline call's evidence lines
     /// all fall inside [span_start, span_end].
     pub span_end: u32,
+    /// Exact UTF-8 byte span of the receiver expression (`dbs.wave.card`).
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    /// Exact UTF-8 byte span of the statically named property (`insert`).
+    pub property_start: u32,
+    pub property_end: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +221,10 @@ impl<'a> Visit<'a> for HeurVisitor {
                 receiver: member_path(&m.object),
                 span_start: call.span.start,
                 span_end: call.span.end,
+                receiver_start: m.object.span().start,
+                receiver_end: m.object.span().end,
+                property_start: m.property.span.start,
+                property_end: m.property.span.end,
             });
         }
         oxc_ast_visit::walk::walk_call_expression(self, call);

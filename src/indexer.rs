@@ -602,8 +602,9 @@ fn insert_file(
 
     let mut ins_mc = conn.prepare_cached(
         "INSERT INTO member_calls(
-           file_id, chunk_id, start, end, line, end_line, prop, object, receiver
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+           file_id, chunk_id, start, end, line, end_line, prop, object, receiver,
+           receiver_start, receiver_end, property_start, property_end
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
     )?;
     for m in &data.graph.member_calls {
         ins_mc.execute(params![
@@ -616,6 +617,10 @@ fn insert_file(
             m.prop,
             m.object,
             m.receiver,
+            m.receiver_start,
+            m.receiver_end,
+            m.property_start,
+            m.property_end,
         ])?;
     }
 
