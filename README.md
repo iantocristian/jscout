@@ -70,7 +70,9 @@ jscout scout workflows R       # classify one agent-supplied workflow boundary
   --seed ANCHOR                #   repeat --seed to define one multi-seed boundary
 jscout scout cards R           # evidence-backed cards for selected symbols
   --max-calls N                #   --anchor SPEC selects subjects explicitly (repeatable)
-jscout scout refresh R         # replace stale/degraded generated workflows and cards
+jscout scout summaries R       # bottom-up file/module/repository summaries over artifacts
+  --max-calls N                #   --level file|module|repository, --scope KEY (repeatable)
+jscout scout refresh R         # replace stale/degraded workflows, cards, and summaries
   --max-calls N                #   reuses each artifact's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
@@ -140,16 +142,40 @@ evidence fails the run instead of downgrading it. `--dry-run` prints the
 selected subjects, evidence bytes, per-item request bytes, and budget
 decisions without starting Node or contacting a model.
 
+`jscout scout summaries` writes one summary per scope, strictly bottom-up over
+already-validated artifacts and never over raw source. Levels are `file`
+(children: current cards and workflows), `module` (children: the file summaries
+of one workspace package), and `repository` (children: module summaries plus
+file summaries no package owns); omitting `--level` runs all three in that
+order under a single `--max-calls` budget, so a module summary is planned from
+the file summaries the same invocation just published. Every claim must cite
+the enumerated child references it rests on, and each citation is published as
+a `summarizes` relation pinned to that child's artifact fingerprint. Every
+planned child also becomes a whole-summary input dependency, whether cited or
+not — uncited prose never validates, and a scope with no current children is
+not a summary subject at all. Publication rechecks inside the transaction that
+the scope still has exactly the planned child set and that every child remains
+current with its pinned fingerprint, so a child added, removed, or replaced
+mid-flight refuses the write rather than publishing immediately stale prose.
+Freshness then propagates upward: a missing, superseded, or changed child
+stales its parent, and a current-but-not-fresh child degrades it, even when the
+parent's own text never changed. `--scope KEY` selects scopes explicitly and
+requires `--level`, since scope keys are level-specific. `--dry-run` prints the
+per-level plans, child counts, and request bytes without starting Node or
+contacting a model.
+
 Generated workflows record their resolved seeds, traversal limits, service
 tier, model, and reasoning policy in the run ledger; cards record their
-subject anchor the same way. After indexing exposes source or
-structural-context drift, `jscout scout refresh --max-calls N` selects current
-stale/degraded generated workflows and cards and publishes immutable
-successors. Index and watch never make model calls. Runs created before replay
-configuration was stored remain visible but are reported as non-refreshable;
-jscout does not guess their original boundary. A stale target whose recorded
-seed no longer resolves is reported and skipped without blocking other
-refreshes.
+subject anchor and summaries their level and scope key the same way. After
+indexing exposes source or structural-context drift, `jscout scout refresh
+--max-calls N` selects current stale/degraded generated workflows, cards, and
+summaries and publishes immutable successors. A summary needs no rule of its
+own here: child drift already makes it non-fresh, so it selects naturally and
+is replanned against the children that are current now. Index and watch never
+make model calls. Runs created before replay configuration was stored remain
+visible but are reported as non-refreshable; jscout does not guess their
+original boundary. A stale target whose recorded seed or scope no longer
+resolves is reported and skipped without blocking other refreshes.
 
 ## Configuration
 

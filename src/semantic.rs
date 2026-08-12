@@ -39,6 +39,18 @@ pub struct AnnotateInput {
     pub supersedes: Option<i64>,
 }
 
+/// One parent-claim link to a child artifact, pinned to the child's
+/// fingerprint so a changed child degrades or stales the parent even when
+/// the parent's own text is unchanged.
+#[derive(Debug, Clone)]
+pub struct RelationInput {
+    pub claim_path: String,
+    pub relation: String,
+    pub dst_artifact_id: i64,
+    pub dst_fingerprint: String,
+    pub confidence: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowParticipantInput {
     pub anchor: String,
@@ -455,6 +467,7 @@ pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result
         input,
         &snapshot,
         &supports,
+        &[],
         &ArtifactProvenance {
             model: "agent-reported",
             prompt_version: "annotate/v2",
@@ -635,6 +648,7 @@ pub(crate) fn persist_validated_artifact(
     input: &AnnotateInput,
     snapshot: &str,
     supports: &[ValidatedSupport],
+    relations: &[RelationInput],
     provenance: &ArtifactProvenance<'_>,
 ) -> Result<i64> {
     let body_json = serde_json::to_string(&input.body)?;
@@ -654,6 +668,16 @@ pub(crate) fn persist_validated_artifact(
             ]
         })
         .collect();
+    // Relations are evidence identity for parent artifacts: a summary's
+    // fingerprint must change when its view of any child changes.
+    support_rows.extend(relations.iter().map(|relation| {
+        vec![
+            format!("relation:{}", relation.relation),
+            relation.claim_path.clone(),
+            relation.dst_fingerprint.clone(),
+            relation.confidence.clone(),
+        ]
+    }));
     let artifact_fingerprint = crate::store::artifact_fingerprint(
         &crate::store::ArtifactIdentity {
             artifact_type: &input.artifact_type,
@@ -707,6 +731,22 @@ pub(crate) fn persist_validated_artifact(
                 support.source_hash,
                 support.context_hash,
                 support.confidence,
+            ])?;
+        }
+        let mut relation_statement = conn.prepare_cached(
+            "INSERT INTO semantic_relations(
+               src_artifact_id, dst_artifact_id, relation, claim_path,
+               confidence, dst_fingerprint
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+        )?;
+        for relation in relations {
+            relation_statement.execute(params![
+                artifact_id,
+                relation.dst_artifact_id,
+                relation.relation,
+                relation.claim_path,
+                relation.confidence,
+                relation.dst_fingerprint,
             ])?;
         }
         Ok(artifact_id)
@@ -764,6 +804,127 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
+    load_artifact_at_depth(conn, id, 3, &mut FreshnessContext::default())
+}
+
+/// Shared state for one top-level artifact load: memoized child freshness
+/// plus the lazily built workspace ownership table needed to recompute a
+/// summary scope's expected child set.
+#[derive(Default)]
+struct FreshnessContext {
+    memo: HashMap<i64, String>,
+    packages: Option<Vec<(String, String)>>,
+}
+
+impl FreshnessContext {
+    fn packages(&mut self, conn: &Connection) -> Result<&[(String, String)]> {
+        if self.packages.is_none() {
+            let root: Option<String> = conn
+                .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            self.packages = Some(match root {
+                Some(root) => crate::scouting::plan::package_prefixes(std::path::Path::new(&root)),
+                None => Vec::new(),
+            });
+        }
+        Ok(self.packages.as_deref().expect("just populated"))
+    }
+}
+
+/// The deterministic child-artifact set a summary scope would be planned
+/// over right now. Any addition, removal, or replacement relative to the
+/// summary's stored input dependencies must stale it: children arrive
+/// incrementally under call budgets, and a summary that silently misses a
+/// new child is wrong even though every pinned child is unchanged.
+pub(crate) fn expected_summary_child_ids(
+    conn: &Connection,
+    packages: &[(String, String)],
+    level: &str,
+    scope_key: &str,
+) -> Result<std::collections::BTreeSet<i64>> {
+    let mut expected = std::collections::BTreeSet::new();
+    match level {
+        "file" => {
+            let file = scope_key.strip_prefix("file:").unwrap_or(scope_key);
+            let mut statement = conn.prepare_cached(
+                "SELECT DISTINCT artifact.id FROM semantic_artifacts artifact
+                 JOIN semantic_supports support ON support.artifact_id=artifact.id
+                 WHERE artifact.artifact_type IN ('card','workflow')
+                   AND support.evidence_file=?1
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )",
+            )?;
+            let rows = statement.query_map([file], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                expected.insert(row?);
+            }
+        }
+        "module" | "repository" => {
+            let mut statement = conn.prepare_cached(
+                "SELECT artifact.id, artifact.canonical_name FROM semantic_artifacts artifact
+                 WHERE artifact.artifact_type='summary'
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, name) = row?;
+                let Some(name) = name else { continue };
+                if level == "module" {
+                    let package = scope_key.strip_prefix("module:").unwrap_or(scope_key);
+                    if let Some(file) = name.strip_prefix("file:")
+                        && crate::scouting::plan::owning_package(packages, file) == Some(package)
+                    {
+                        expected.insert(id);
+                    }
+                } else if name.starts_with("module:") {
+                    expected.insert(id);
+                } else if let Some(file) = name.strip_prefix("file:")
+                    && crate::scouting::plan::owning_package(packages, file).is_none()
+                {
+                    expected.insert(id);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(expected)
+}
+
+/// True when a summary's stored input dependencies (empty claim path) match
+/// the scope's current expected child set exactly.
+pub(crate) fn summary_child_set_current(
+    conn: &Connection,
+    packages: &[(String, String)],
+    artifact_id: i64,
+    level: &str,
+    scope_key: &str,
+) -> Result<bool> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT dst_artifact_id FROM semantic_relations
+         WHERE src_artifact_id=?1 AND claim_path=''",
+    )?;
+    let rows = statement.query_map([artifact_id], |row| row.get::<_, i64>(0))?;
+    let stored = rows.collect::<std::result::Result<std::collections::BTreeSet<i64>, _>>()?;
+    Ok(stored == expected_summary_child_ids(conn, packages, level, scope_key)?)
+}
+
+fn load_artifact_at_depth(
+    conn: &Connection,
+    id: i64,
+    depth: u8,
+    context: &mut FreshnessContext,
+) -> Result<Option<SemanticArtifact>> {
     let row = conn
         .query_row(
             "SELECT id, supersedes_artifact_id, artifact_type, canonical_name, body_json,
@@ -868,13 +1029,23 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
         .iter()
         .filter(|support| support.freshness == "fresh")
         .count();
-    let freshness = if fresh_supports == supports.len() {
+    let own_freshness = if fresh_supports == supports.len() {
         "fresh"
     } else if artifact_type == "workflow" && fresh_supports > 0 {
         "degraded"
     } else {
         "stale"
     };
+    let freshness = child_adjusted_freshness(
+        conn,
+        id,
+        &artifact_type,
+        &name,
+        &body,
+        own_freshness,
+        depth,
+        context,
+    )?;
     Ok(Some(SemanticArtifact {
         id,
         supersedes,
@@ -887,25 +1058,148 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
         confidence,
         source_snapshot,
         created_at,
-        freshness: freshness.to_string(),
+        freshness,
         supports,
         relevance: 0.0,
     }))
+}
+
+/// Fold pinned child fingerprints into the parent's freshness: a missing,
+/// superseded, or changed child stales the parent; a current child that is
+/// itself no longer fresh degrades it — even when the parent's own text and
+/// direct supports are unchanged. Depth bounds the recursion defensively;
+/// the hierarchy is file -> module -> repository, so three levels suffice.
+#[allow(clippy::too_many_arguments)]
+fn child_adjusted_freshness(
+    conn: &Connection,
+    artifact_id: i64,
+    artifact_type: &str,
+    name: &Option<String>,
+    body: &Value,
+    own_freshness: &str,
+    depth: u8,
+    context: &mut FreshnessContext,
+) -> Result<String> {
+    let rank = |label: &str| match label {
+        "fresh" => 0_u8,
+        "degraded" => 1,
+        _ => 2,
+    };
+    let mut worst = rank(own_freshness);
+    // A summary must cover the scope's CURRENT deterministic child set, not
+    // just keep its pinned children unchanged: a child added after
+    // publication stales it even though every stored dependency is intact.
+    if artifact_type == "summary" && worst < 2 {
+        let level = body
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let scope = name.clone().unwrap_or_default();
+        let packages = context.packages(conn)?.to_vec();
+        if !summary_child_set_current(conn, &packages, artifact_id, &level, &scope)? {
+            worst = 2;
+        }
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT dst_artifact_id, dst_fingerprint FROM semantic_relations
+         WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
+    )?;
+    let children = statement
+        .query_map([artifact_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (child_id, pinned_fingerprint) in children {
+        if worst == 2 {
+            break;
+        }
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT artifact.artifact_fingerprint FROM semantic_artifacts artifact
+                 WHERE artifact.id=?1 AND NOT EXISTS(
+                   SELECT 1 FROM semantic_artifacts successor
+                   WHERE successor.supersedes_artifact_id=artifact.id
+                 )",
+                [child_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current.flatten() {
+            Some(fingerprint) if fingerprint == pinned_fingerprint => {
+                if depth == 0 {
+                    continue;
+                }
+                // Memoized across one top-level load: a child cited by many
+                // claims (or shared across a search pass) is computed once.
+                let child_freshness = match context.memo.get(&child_id) {
+                    Some(label) => Some(label.clone()),
+                    None => {
+                        let label = load_artifact_at_depth(conn, child_id, depth - 1, context)?
+                            .map(|child| child.freshness);
+                        if let Some(label) = &label {
+                            context.memo.insert(child_id, label.clone());
+                        }
+                        label
+                    }
+                };
+                match child_freshness.as_deref() {
+                    Some("fresh") => {}
+                    Some(_) => worst = worst.max(1),
+                    None => worst = 2,
+                }
+            }
+            _ => worst = 2,
+        }
+    }
+    Ok(match worst {
+        0 => "fresh".into(),
+        1 => "degraded".into(),
+        _ => "stale".into(),
+    })
 }
 
 fn validate_input(input: &AnnotateInput) -> Result<()> {
     validate_confidence(&input.confidence)?;
     if !matches!(
         input.artifact_type.as_str(),
-        "workflow" | "annotation" | "card"
+        "workflow" | "annotation" | "card" | "summary"
     ) {
-        bail!("semantic artifact type must be one of: workflow, annotation, card");
+        bail!("semantic artifact type must be one of: workflow, annotation, card, summary");
     }
     if !input.body.is_object() {
         bail!("semantic artifact body must be a JSON object");
     }
     if serde_json::to_vec(&input.body)?.len() > MAX_BODY_BYTES {
         bail!("semantic artifact body exceeds {MAX_BODY_BYTES} bytes");
+    }
+    // A summary's claims are supported by `summarizes` relations pinned to
+    // child artifact fingerprints, not by direct source spans: the scouting
+    // layer enforces claim-to-child coverage and the publication transaction
+    // rechecks child currency. Prose without that chain never validates.
+    if input.artifact_type == "summary" {
+        if input.supports.len() > MAX_SUPPORTS {
+            bail!("semantic artifacts allow at most {MAX_SUPPORTS} supports");
+        }
+        let Some(scope) = input.name.as_deref().filter(|name| !name.is_empty()) else {
+            bail!("summary artifacts require their scope key as the name");
+        };
+        let level = input.body.get("level").and_then(Value::as_str);
+        match (level, scope) {
+            (Some("file"), scope) if scope.starts_with("file:") => {}
+            (Some("module"), scope) if scope.starts_with("module:") => {}
+            (Some("repository"), "repo") => {}
+            _ => bail!("summary level must be file, module, or repository and match its scope key"),
+        }
+        if input
+            .body
+            .get("overview")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("summary body requires a non-empty string `overview`");
+        }
+        return Ok(());
     }
     if input.supports.is_empty() || input.supports.len() > MAX_SUPPORTS {
         bail!("semantic artifacts require 1..={MAX_SUPPORTS} supports");
@@ -1121,6 +1415,120 @@ mod tests {
             evidence_end_line: 1,
             confidence: "likely".into(),
         }
+    }
+
+    #[test]
+    fn summaries_degrade_and_stale_with_their_children() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        let alpha = "sym:a.ts#::alpha@1";
+
+        let card = annotate(
+            repo.path(),
+            &conn,
+            &AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(alpha.into()),
+                body: json!({ "purpose": "starts the alpha flow" }),
+                supports: vec![support("/purpose", alpha, "a.ts")],
+                confidence: "likely".into(),
+                snapshot: snapshot.clone(),
+                supersedes: None,
+            },
+        )?;
+        let card_fingerprint: String = conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+            [card.id],
+            |row| row.get(0),
+        )?;
+
+        let summary_input = AnnotateInput {
+            artifact_type: "summary".into(),
+            name: Some("file:a.ts".into()),
+            body: json!({
+                "level": "file",
+                "scope": "file:a.ts",
+                "overview": "hosts the alpha entry point",
+            }),
+            supports: Vec::new(),
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        };
+        let (current_snapshot, supports) =
+            super::validate_annotate_input(repo.path(), &conn, &summary_input)?;
+        let parent_id = super::persist_validated_artifact(
+            &conn,
+            &summary_input,
+            &current_snapshot,
+            &supports,
+            &[
+                super::RelationInput {
+                    claim_path: "/overview".into(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: card.id,
+                    dst_fingerprint: card_fingerprint.clone(),
+                    confidence: "likely".into(),
+                },
+                // Real publication always records the whole-artifact input
+                // dependency; the expected-child-set check requires it.
+                super::RelationInput {
+                    claim_path: String::new(),
+                    relation: "summarizes".into(),
+                    dst_artifact_id: card.id,
+                    dst_fingerprint: card_fingerprint,
+                    confidence: "likely".into(),
+                },
+            ],
+            &super::ArtifactProvenance {
+                model: "test",
+                prompt_version: "summary-scout/v1",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )?;
+        let freshness = |id: i64| -> Result<String> {
+            Ok(super::load_artifact(&conn, id)?
+                .expect("artifact exists")
+                .freshness)
+        };
+        assert_eq!(freshness(parent_id)?, "fresh");
+
+        // The child's own source drifts: the child is still current with the
+        // pinned fingerprint but no longer fresh, so the parent degrades even
+        // though its own text and relations are unchanged.
+        fs::write(
+            repo.path().join("a.ts"),
+            "export function alpha() { return 2; }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        assert_ne!(freshness(card.id)?, "fresh");
+        assert_eq!(freshness(parent_id)?, "degraded");
+
+        // The child is superseded: the parent's pinned fingerprint no longer
+        // names a current artifact, so the parent is stale outright.
+        let successor_snapshot = structural::current_snapshot(&conn)?;
+        annotate(
+            repo.path(),
+            &conn,
+            &AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(alpha.into()),
+                body: json!({ "purpose": "starts the revised alpha flow" }),
+                supports: vec![support("/purpose", alpha, "a.ts")],
+                confidence: "likely".into(),
+                snapshot: successor_snapshot,
+                supersedes: Some(card.id),
+            },
+        )?;
+        assert_eq!(freshness(parent_id)?, "stale");
+        Ok(())
     }
 
     #[test]

@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::card::CardSubject;
 use super::evidence::{self, EvidencePack};
+use super::summary::{self};
 use crate::semantic::{self, WorkflowCandidateOptions, WorkflowCandidateSet};
 use crate::{origin, store, structural};
 
@@ -537,6 +538,503 @@ fn candidate_boundary_fingerprint(set: &WorkflowCandidateSet) -> String {
         hasher.update(candidate.anchor.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// A summary scope's child artifacts can outgrow one bounded prompt; the
+/// deterministic response is refusal (skip in automatic mode), never silent
+/// truncation of the child set.
+const MAX_SUMMARY_CHILDREN: usize = 64;
+/// The single repository scope aggregates every module summary; module
+/// bodies are small, so its cap is wider than the per-file/module cap
+/// (n8n alone has 77 workspace packages).
+const MAX_REPOSITORY_CHILDREN: usize = 256;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlanItem {
+    pub level: String,
+    pub scope: String,
+    pub display: String,
+    pub child_count: usize,
+    pub evidence_bytes: usize,
+    #[serde(skip)]
+    pub(crate) scope_meta: summary::SummaryScope,
+    #[serde(skip)]
+    pub(crate) children: Vec<summary::SummaryChild>,
+    #[serde(skip)]
+    pub(crate) rendered: String,
+    #[serde(skip)]
+    pub(crate) snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlanSkip {
+    pub scope: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPlan {
+    pub mode: String,
+    pub level: String,
+    pub snapshot: String,
+    pub items: Vec<SummaryPlanItem>,
+    pub skipped: Vec<SummaryPlanSkip>,
+}
+
+/// Deterministic bottom-up scope discovery for one level. A scope is planned
+/// only when it has current child artifacts to summarize — prose without a
+/// support chain is not indexable memory, so childless scopes are not
+/// summary subjects at all. Explicit scopes must resolve or the plan fails.
+pub fn summaries(
+    root: &Path,
+    conn: &Connection,
+    level: &str,
+    explicit_scopes: &[String],
+) -> Result<SummaryPlan> {
+    if !matches!(level, "file" | "module" | "repository") {
+        bail!("summary level must be one of: file, module, repository");
+    }
+    store::with_read_snapshot(conn, "jscout_scout_plan", || {
+        let snapshot = structural::current_snapshot(conn)?;
+        let (mut scopes, gate_skips) = discover_summary_scopes(root, conn, level)?;
+        let mode = if explicit_scopes.is_empty() {
+            "automatic"
+        } else {
+            for scope in explicit_scopes {
+                if let Some(gated) = gate_skips.iter().find(|skip| &skip.scope == scope) {
+                    bail!("summary scope `{scope}` is not ready: {}", gated.reason);
+                }
+                if !scopes.iter().any(|(key, _, _)| key == scope) {
+                    bail!(
+                        "summary scope `{scope}` has no current child artifacts at level \
+                         {level}; scout cards/workflows (or lower summary levels) first"
+                    );
+                }
+            }
+            scopes.retain(|(key, _, _)| explicit_scopes.iter().any(|scope| scope == key));
+            "explicit"
+        };
+
+        let child_cap = if level == "repository" {
+            MAX_REPOSITORY_CHILDREN
+        } else {
+            MAX_SUMMARY_CHILDREN
+        };
+        let mut items = Vec::new();
+        // Gate skips are part of the plan: a parent scope whose lower level
+        // is incomplete is visibly refused, never silently published around.
+        let mut skipped = if mode == "automatic" {
+            gate_skips
+        } else {
+            Vec::new()
+        };
+        for (scope_key, display, children) in scopes.drain(..) {
+            if children.len() > child_cap {
+                let reason = format!(
+                    "{} child artifacts exceed the supported {child_cap}; \
+                     the child set is never silently truncated",
+                    children.len()
+                );
+                if mode == "explicit" {
+                    bail!("summary scope `{scope_key}`: {reason}");
+                }
+                skipped.push(SummaryPlanSkip {
+                    scope: scope_key,
+                    reason,
+                });
+                continue;
+            }
+            let scope_meta = summary::SummaryScope {
+                level: level.to_string(),
+                scope_key: scope_key.clone(),
+                display: display.clone(),
+            };
+            let rendered = render_summary_pack(conn, &scope_meta, &children)?;
+            items.push(SummaryPlanItem {
+                level: level.to_string(),
+                scope: scope_key,
+                display,
+                child_count: children.len(),
+                evidence_bytes: rendered.len(),
+                scope_meta,
+                children,
+                rendered,
+                snapshot: snapshot.clone(),
+            });
+        }
+        Ok(SummaryPlan {
+            mode: mode.into(),
+            level: level.into(),
+            snapshot,
+            items,
+            skipped,
+        })
+    })
+}
+
+type DiscoveredScope = (String, String, Vec<summary::SummaryChild>);
+
+/// Files that currently have card/workflow children — the set of scopes the
+/// file level would summarize, used to gate parents on lower completeness.
+fn child_bearing_files(conn: &Connection) -> Result<std::collections::BTreeSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT support.evidence_file
+         FROM semantic_artifacts artifact
+         JOIN semantic_supports support ON support.artifact_id=artifact.id
+         WHERE artifact.artifact_type IN ('card','workflow')
+           AND artifact.artifact_fingerprint IS NOT NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+fn discover_summary_scopes(
+    root: &Path,
+    conn: &Connection,
+    level: &str,
+) -> Result<(Vec<DiscoveredScope>, Vec<SummaryPlanSkip>)> {
+    let mut scopes: BTreeMap<String, (String, Vec<summary::SummaryChild>)> = BTreeMap::new();
+    // One reason per gated scope is enough to make the refusal actionable;
+    // the first missing dependency (deterministic order) is recorded.
+    let mut gates: BTreeMap<String, String> = BTreeMap::new();
+    let mut gate = |scope_key: String, reason: String| {
+        gates.entry(scope_key).or_insert(reason);
+    };
+    let mut add = |scope_key: String, display: String, child: SummaryChildRow| {
+        let entry = scopes
+            .entry(scope_key)
+            .or_insert_with(|| (display, Vec::new()));
+        if entry
+            .1
+            .iter()
+            .any(|existing| existing.artifact_id == child.id)
+        {
+            return;
+        }
+        let reference = format!("C{}", entry.1.len() + 1);
+        entry.1.push(summary::SummaryChild {
+            reference,
+            artifact_id: child.id,
+            artifact_type: child.artifact_type,
+            name: child.name,
+            fingerprint: child.fingerprint,
+            body_json: child.body_json,
+        });
+    };
+    match level {
+        "file" => {
+            // Children: current cards and workflows, attached to every file
+            // their supports cite. Fingerprint-less legacy rows are excluded
+            // rather than pinned to nothing.
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT support.evidence_file, artifact.id, artifact.artifact_type,
+                        artifact.canonical_name, artifact.artifact_fingerprint,
+                        artifact.body_json
+                 FROM semantic_artifacts artifact
+                 JOIN semantic_supports support ON support.artifact_id=artifact.id
+                 WHERE artifact.artifact_type IN ('card','workflow')
+                   AND artifact.artifact_fingerprint IS NOT NULL
+                   AND NOT EXISTS(
+                     SELECT 1 FROM semantic_artifacts successor
+                     WHERE successor.supersedes_artifact_id=artifact.id
+                   )
+                 ORDER BY support.evidence_file, artifact.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, summary_child_row(row, 1)?))
+            })?;
+            for row in rows {
+                let (file, child) = row?;
+                add(format!("file:{file}"), file, child);
+            }
+        }
+        "module" => {
+            // Children: current file summaries grouped onto workspace
+            // packages by canonical-root ownership of the summarized file.
+            // A module is gated on lower-level completeness: every
+            // child-bearing file it owns must have a current file summary,
+            // or the module is a visible skip rather than a summary that
+            // silently omits evidence.
+            let packages = package_prefixes(root);
+            let mut summarized = std::collections::BTreeSet::new();
+            for (file, child) in current_summary_children(conn, "file:")? {
+                summarized.insert(file.clone());
+                if let Some(package) = owning_package(&packages, &file) {
+                    // A file summary that no longer covers the file's current
+                    // child set is not a usable dependency: gate the module
+                    // instead of building on known-incomplete coverage.
+                    if !crate::semantic::summary_child_set_current(
+                        conn,
+                        &packages,
+                        child.id,
+                        "file",
+                        &format!("file:{file}"),
+                    )? {
+                        gate(
+                            format!("module:{package}"),
+                            format!(
+                                "file summary for `{file}` no longer covers its current \
+                                 child set; refresh it first"
+                            ),
+                        );
+                        continue;
+                    }
+                    add(format!("module:{package}"), package.to_string(), child);
+                }
+            }
+            for file in child_bearing_files(conn)? {
+                if summarized.contains(&file) {
+                    continue;
+                }
+                if let Some(package) = owning_package(&packages, &file) {
+                    gate(
+                        format!("module:{package}"),
+                        format!("child-bearing file `{file}` has no current file summary"),
+                    );
+                }
+            }
+        }
+        "repository" => {
+            // Children: current module summaries, plus file summaries that no
+            // workspace package owns (root-level code still reaches the top).
+            // Gated on lower-level completeness: every child-bearing module
+            // needs a current module summary and every unowned child-bearing
+            // file a current file summary, or the repository is a visible
+            // skip — a hierarchy never publishes around a missing scope.
+            let packages = package_prefixes(root);
+            let mut module_summaries = std::collections::BTreeSet::new();
+            for (module, child) in current_summary_children(conn, "module:")? {
+                module_summaries.insert(module.clone());
+                if !crate::semantic::summary_child_set_current(
+                    conn,
+                    &packages,
+                    child.id,
+                    "module",
+                    &format!("module:{module}"),
+                )? {
+                    gate(
+                        "repo".into(),
+                        format!(
+                            "module summary for `{module}` no longer covers its current \
+                             child set; refresh it first"
+                        ),
+                    );
+                    continue;
+                }
+                add("repo".into(), "repository".into(), child);
+            }
+            let mut file_summaries = std::collections::BTreeSet::new();
+            for (file, child) in current_summary_children(conn, "file:")? {
+                file_summaries.insert(file.clone());
+                if owning_package(&packages, &file).is_none() {
+                    if !crate::semantic::summary_child_set_current(
+                        conn,
+                        &packages,
+                        child.id,
+                        "file",
+                        &format!("file:{file}"),
+                    )? {
+                        gate(
+                            "repo".into(),
+                            format!(
+                                "file summary for `{file}` no longer covers its current \
+                                 child set; refresh it first"
+                            ),
+                        );
+                        continue;
+                    }
+                    add("repo".into(), "repository".into(), child);
+                }
+            }
+            for file in child_bearing_files(conn)? {
+                match owning_package(&packages, &file) {
+                    Some(package) => {
+                        if !module_summaries.contains(package) {
+                            gate(
+                                "repo".into(),
+                                format!(
+                                    "child-bearing module `{package}` has no current \
+                                     module summary"
+                                ),
+                            );
+                        }
+                    }
+                    None => {
+                        if !file_summaries.contains(&file) {
+                            gate(
+                                "repo".into(),
+                                format!(
+                                    "unowned child-bearing file `{file}` has no current \
+                                     file summary"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        _ => unreachable!("level validated by the caller"),
+    }
+    let gate_skips: Vec<SummaryPlanSkip> = gates
+        .into_iter()
+        .map(|(scope, reason)| SummaryPlanSkip { scope, reason })
+        .collect();
+    for skip in &gate_skips {
+        scopes.remove(&skip.scope);
+    }
+    Ok((
+        scopes
+            .into_iter()
+            .map(|(scope, (display, children))| (scope, display, children))
+            .collect(),
+        gate_skips,
+    ))
+}
+
+struct SummaryChildRow {
+    id: i64,
+    artifact_type: String,
+    name: Option<String>,
+    fingerprint: String,
+    body_json: String,
+}
+
+fn summary_child_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SummaryChildRow> {
+    Ok(SummaryChildRow {
+        id: row.get(offset)?,
+        artifact_type: row.get(offset + 1)?,
+        name: row.get(offset + 2)?,
+        fingerprint: row.get(offset + 3)?,
+        body_json: row.get(offset + 4)?,
+    })
+}
+
+/// Current summary artifacts whose scope key starts with `prefix`, keyed by
+/// the scope remainder (file path or module name).
+fn current_summary_children(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(String, SummaryChildRow)>> {
+    let mut statement = conn.prepare(
+        "SELECT artifact.canonical_name, artifact.id, artifact.artifact_type,
+                artifact.canonical_name, artifact.artifact_fingerprint, artifact.body_json
+         FROM semantic_artifacts artifact
+         WHERE artifact.artifact_type='summary'
+           AND artifact.canonical_name LIKE ?1 || '%'
+           AND artifact.artifact_fingerprint IS NOT NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )
+         ORDER BY artifact.canonical_name, artifact.id",
+    )?;
+    let rows = statement.query_map([prefix], |row| {
+        Ok((row.get::<_, String>(0)?, summary_child_row(row, 1)?))
+    })?;
+    let mut children = Vec::new();
+    for row in rows {
+        let (scope_key, child) = row?;
+        let remainder = scope_key
+            .strip_prefix(prefix)
+            .unwrap_or(scope_key.as_str())
+            .to_string();
+        children.push((remainder, child));
+    }
+    Ok(children)
+}
+
+/// Workspace package names with their repo-relative root prefixes, longest
+/// prefix first so nested packages win ownership.
+pub(crate) fn package_prefixes(root: &Path) -> Vec<(String, String)> {
+    // `WorkspaceMap` canonicalizes package roots and the indexer canonicalizes
+    // the repository root before recording file paths, so the prefix must be
+    // stripped against the canonical root too. Comparing against a raw root
+    // reached through a symlink strips nothing, and every module scope would
+    // silently vanish.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let workspace = crate::workspace::WorkspaceMap::build(root);
+    let mut prefixes: Vec<(String, String)> = workspace
+        .packages
+        .iter()
+        .filter_map(|package| {
+            let relative = package
+                .canonical_root
+                .strip_prefix(&canonical_root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+            (!relative.is_empty()).then(|| (package.name.clone(), relative))
+        })
+        .collect();
+    prefixes.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    prefixes
+}
+
+pub(crate) fn owning_package<'a>(prefixes: &'a [(String, String)], file: &str) -> Option<&'a str> {
+    prefixes
+        .iter()
+        .find(|(_, prefix)| {
+            file.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .map(|(name, _)| name.as_str())
+}
+
+/// Deterministic prompt pack: the enumerated children (bodies quoted as
+/// data, fingerprints pinned inline so the pack participates in the input
+/// fingerprint) plus minimal deterministic topology for orientation.
+fn render_summary_pack(
+    conn: &Connection,
+    scope: &summary::SummaryScope,
+    children: &[summary::SummaryChild],
+) -> Result<String> {
+    let mut rendered = format!(
+        "## Scope: {} {}\n\n## Children\n",
+        scope.level, scope.display
+    );
+    for child in children {
+        rendered.push_str(&format!(
+            "\n### [{}] {} `{}` (fingerprint {})\n{}\n",
+            child.reference,
+            child.artifact_type,
+            child.name.as_deref().unwrap_or("unnamed"),
+            child.fingerprint,
+            child.body_json,
+        ));
+    }
+    rendered.push_str("\n## Topology\n");
+    match scope.level.as_str() {
+        "file" => {
+            let path = scope.scope_key.strip_prefix("file:").unwrap_or_default();
+            let (imports_out, imported_by): (i64, i64) = conn.query_row(
+                "SELECT
+                   (SELECT count(*) FROM module_edges edge
+                    JOIN files source ON source.id=edge.from_file WHERE source.path=?1),
+                   (SELECT count(*) FROM module_edges edge
+                    JOIN files target ON target.id=edge.to_file WHERE target.path=?1)",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            rendered.push_str(&format!(
+                "- imports: {imports_out} requests out, {imported_by} files import this file\n"
+            ));
+        }
+        "module" | "repository" => {
+            rendered.push_str(&format!("- summarized children: {}\n", children.len()));
+        }
+        _ => {}
+    }
+    Ok(rendered)
 }
 
 #[cfg(test)]
