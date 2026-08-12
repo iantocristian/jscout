@@ -1,10 +1,10 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-11.
+> Status: authoritative plan as of 2026-08-12.
 >
-> G1–G5 of semantic scouting are implemented. G6, evidence-backed symbol
-> cards, is next. Product-value testing is intentionally paused until the
-> semantic-v1 completion boundary.
+> G1–G9 are implemented. Semantic v1 has reached its implementation boundary;
+> product-value testing remains paused until the engineering verification gate
+> below is green.
 
 ## Document policy
 
@@ -110,10 +110,10 @@ agent, indexer, or semantic authority.
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
 | General entities | Routes, GraphQL operations, environment/configuration keys, database resources, feature flags, and external-service hosts with canonical identity plus evidence-bearing occurrences |
 | Dependency scope | Opt-in named packages; realpath-normalized workspace/dependency identity, pnpm layout/version handling, source-over-dist preference, bundle/minification limits, and dependency origin excluded from retrieval by default |
-| Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, repository overview, ranked paths, semantic-memory attachment, and opt-in structural expansion |
-| Agent integration | CLI, MCP profiles, project-local agent guide, response budgets, privacy-minimal telemetry, and isolated evaluation database support |
-| Semantic memory | Validated agent write-back; candidate-closed generated workflows; automatic deterministic seeds; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
-| Model gateway | `@earendil-works/pi-ai` 0.84.1 sidecar, protocol-v1 JSONL over stdio, provider/auth registry, cancellation, normalized usage/errors, and `llm doctor` |
+| Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, ranked paths, filtered semantic-memory queries, exact source drill-down, fresh-only overview overlays, and opt-in structural expansion |
+| Agent integration | CLI, MCP profiles, project-local agent guide, whole-response budgets, privacy-minimal telemetry, packaged companion gateway, and isolated evaluation database support |
+| Semantic memory | Validated agent write-back; candidate-closed generated workflows; evidence-backed selected symbol cards; bottom-up child-cited file/module/repository summaries; exact-vocabulary concepts with derived file/chunk tags; fingerprint-pinned child relations and upward freshness propagation; automatic deterministic discovery; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
+| Model gateway | Pinned `@earendil-works/pi-ai` sidecar, protocol-v1 JSONL over stdio, provider/auth registry, bounded same-model retries, cancellation, controlled/redacted errors, installed-layout packaging, Node-version enforcement, and auth-aware `llm doctor` |
 
 ## Deterministic repository plane
 
@@ -288,31 +288,39 @@ The model cannot add anchors outside the deterministic candidate set. It may
 declare the pack incomplete; that records an incomplete run and publishes no
 workflow.
 
-## Remaining semantic-v1 roadmap
+### Implemented selected symbol cards (G6)
 
-### G6 — selected symbol cards (next)
+Cards reuse the same gateway, run ledger, evidence pack, support validator,
+freshness engine, and immutable supersession as workflows.
 
-Generate cards only for exported symbols, entity endpoints, workflow
-participants, and explicitly requested anchors. Reuse the gateway, run ledger,
-evidence pack, support validator, freshness engine, and immutable supersession.
+1. Select subjects deterministically: exported production symbols, runtime
+   boundary endpoints, and participants of current published workflows,
+   deduped by anchor and capped with a reported discovered count; or resolve
+   explicitly requested anchors. One run per subject.
+2. Build evidence from the subject's declaring file plus its depth-1 resolved
+   edges, rendered deterministically. Those edges and entity annotations are
+   deterministic facts the prompt forbids restating as claims: a card that
+   repeats signatures or call lists spends tokens on what the index already
+   knows.
+3. Fingerprint the snapshot, subject, evidence, schema, prompt, gateway
+   protocol, model, and request policy, and reuse a matching completed run
+   unless rebuild is explicit.
+4. Require `purpose` with exact evidence; accept `architectural_role`,
+   `domain_terms`, `side_effects`, `invariants`, and `failure_modes` only when
+   each individual claim carries its own line ranges. Unsupported optional
+   fields are omitted, never filled speculatively, and an unsupported claim
+   fails the run rather than downgrading the card.
+5. Publish one artifact per subject anchor with one JSON-pointer support per
+   claim per range at `likely` confidence, under the same atomic recheck.
 
-Cards may describe purpose, architectural role, domain terms, side effects,
-invariants, and failure modes. They must not spend model tokens restating
-signatures or deterministic calls. Every individual claim needs exact support;
-unsupported optional fields are omitted rather than filled speculatively.
+The model may declare the evidence insufficient; that records an incomplete
+run and publishes no card. Refresh selects stale/degraded current cards and
+replays their recorded subject and model into immutable successors.
 
-Required engineering work:
+### Implemented hierarchical summaries (G7)
 
-- versioned card schema and submit tool;
-- deterministic selection and `--dry-run` planning;
-- bounded evidence focused on the selected symbol and direct structural
-  context;
-- claim-level support validation and artifact fingerprinting;
-- reuse, refresh, cancellation, snapshot-race, and no-partial-write coverage.
-
-### G7 — hierarchical summaries
-
-Build bottom-up rather than prompting over the repository at once:
+The governing specification, unchanged — build bottom-up rather than prompting
+over the repository at once:
 
 - file summaries from validated cards/workflows plus deterministic topology;
 - module/package summaries from selected child claims;
@@ -323,34 +331,131 @@ ultimately to exact source support. A changed child degrades or stales its
 parents even when the parent's own text is unchanged. Prose without a support
 chain is not indexable memory.
 
-### G8 — concepts
+As implemented, summaries reuse the same gateway, run ledger, support
+validator, freshness engine, and immutable supersession as workflows and cards.
 
-Infer concepts from validated workflow/card vocabulary, not from embedding
-clusters and not by tagging every chunk with a separate model call.
+1. Discover scopes deterministically per level from the index and the workspace
+   manifest set, never from the model: `file:<path>` from the files current
+   cards and workflows cite, `module:<package>` from the file summaries a
+   workspace package owns, and `repo` from module summaries plus the file
+   summaries no package owns. A scope with no current children is not a summary
+   subject; a child set that outgrows one bounded prompt is refused or skipped,
+   never silently truncated.
+2. Enumerate the children as `C1..Cn` with their bodies quoted as data and their
+   artifact fingerprints pinned inline, so the prompt pack itself participates
+   in the input fingerprint. That fingerprint is deliberately snapshot-free:
+   an unrelated repository change reuses the completed run.
+3. Require every claim — the one mandatory `overview` and each optional key
+   point — to cite the child references supporting it. Uncited prose fails
+   validation, an unknown reference fails validation, and a refusal
+   (`incomplete_reason`) is mutually exclusive with any claim.
+4. Publish one artifact per scope key, with one `summarizes` relation per cited
+   child per claim plus a whole-summary input dependency for every planned
+   child, all pinned to the fingerprints the summary was grounded on, at
+   `likely` confidence. Inside the publication transaction, recheck the
+   structural snapshot, exact current child set, and every child's pinned
+   fingerprint; any mismatch refuses the write whole.
+5. Run levels staged bottom-up under one `--max-calls` budget when no `--level`
+   is given, so each level is planned only after the previous level's artifacts
+   exist and a module summary sees the file summaries the same invocation just
+   published.
 
-- store normalized name, aliases, definition, linked artifacts, and supports;
-- auto-merge exact normalized aliases only;
-- keep ambiguous near-duplicates separate until a validated merge proposal;
-- derive file/chunk tags through evidence overlap;
-- confidence-limit concept relations and fingerprint all dependencies.
+Freshness propagates upward on read: a missing, superseded, or changed child
+stales its parent, and a current-but-not-fresh child degrades it, bounded by
+the three-level hierarchy. Refresh therefore needs no summary-specific
+selection rule — a summary whose child drifted is already non-fresh — and
+replans the recorded scope against the children current at refresh time.
+
+## Semantic-v1 final layers
+
+### Implemented G8 — concepts
+
+Concept scouting operates on a deliberately narrow, evidence-backed
+vocabulary rather than embedding clusters or arbitrary generated prose. The
+only admitted inputs are supported claims on current fingerprinted artifacts:
+a workflow's canonical `/name` and a card's string-valued
+`/domain_terms/<index>`. Unsupported values and every other body field are
+invisible to concept discovery.
+
+1. Group terms by the versioned `concept-normalizer/nfkc-lower-ws-v1`
+   identity: Unicode NFKC, Unicode lowercase, and trimmed/collapsed whitespace.
+   Punctuation is preserved, so `invoice-id` and `invoice id` remain different
+   identities.
+2. Plan one bounded model call per exact normalized group. Automatic discovery
+   requires an explicit command-level call budget; repeatable `--term` values
+   select existing groups through the same normalizer and default the budget to
+   their count. Oversized groups are refused rather than truncated.
+3. Let the model define the repository-specific concept, but not its identity,
+   aliases, or children. The alias list is the exhaustive set of observed
+   NFKC/whitespace-normalized display spellings, every claim cites enumerated
+   child artifacts, and every child is classified exactly once.
+4. Publish the normalized name, aliases, and definition with claim-level
+   `related_to` relations and whole-input dependencies. Do not copy a child's
+   source span onto generated prose: the fingerprinted child hop leads to its
+   exact supports without overstating what the span proves.
+   Child fingerprints, the normalizer version, prompt/schema/model policy, and
+   rendered input all participate in the run contract. Confidence is capped at
+   `likely`, or at `possible` when any child artifact or vocabulary support is
+   only possible.
+5. Recheck the structural snapshot, every child fingerprint, the exact current
+   vocabulary child set, and the current concept lineage inside publication.
+   Child drift makes the concept stale/degraded through the shared freshness
+   engine; `scout refresh` replans it and publishes an immutable successor.
+   Operationally, scout concepts after workflow/card sweeps. A newly published
+   child carrying an existing normalized term intentionally stales that concept;
+   mixed refresh orders children first, and every concept planning surface
+   refuses reuse or model spend until those dependencies are fresh.
+6. `memory`/`semantic_memory` derives bounded `concept_tags` only for selected
+   current, fresh concepts. Exact supports reached through claim-level child
+   relations project into deduplicated file associations and associations with
+   every overlapping indexed chunk. Tags are an R2 response view, not stored
+   semantic claims, and are dropped first when the complete response-byte
+   budget binds.
+
+Exact normalized spellings share one lineage. Fuzzy, stemming, punctuation,
+or embedding-based near-duplicate merging is deferred. The current schema has
+one predecessor per successor, so jscout also refuses ambiguous many-lineage
+merges instead of pretending a many-to-one merge occurred.
+
+Concept-to-child provenance uses `related_to` because its direction is
+concept → evidence-bearing workflow/card. The schema's `names_concept` value is
+reserved for a future explicit source-artifact → concept assertion; it does not
+describe the current generated provenance direction.
 
 This layer enables questions such as “which workflows touch invoice
 reconciliation?” without replacing the source evidence used to answer them.
 
-### G9 — retrieval, packaging, and operations
+### Implemented G9 — retrieval, packaging, and operations
 
-- semantic-specific CLI/MCP queries for workflows, cards, concepts, related
-  artifacts, freshness, and exact source drill-down;
-- deterministic repository overview with optional fresh semantic overlays;
-- bounded result sections rather than mixing prose into code ranking;
-- gateway packaging beside release binaries, supported Node-version checks,
-  and clear missing-runtime diagnostics;
-- documentation for Codex-plan auth, API providers, custom compatible
-  endpoints, proxy/TLS behavior, redaction, cancellation, and retries;
-- bounded retries only for classified transient/capacity failures; no hidden
-  provider, model, service-tier, or billing fallback.
+- `memory`/`semantic_memory` filter current or historical workflows, cards,
+  summaries, concepts, and annotations by text, type, freshness, exact evidence
+  anchor, or direct artifact relation. Results expose successors, bounded
+  relations, and pinned evidence paths to hash-verified source.
+- `overview`/`repository_overview` read deterministic inventory and optional
+  semantic overlays from one SQLite snapshot. Generated overlays are opt-in,
+  current/fresh only, separately labelled untrusted data, and are sacrificed
+  before deterministic inventory when the whole-response budget binds.
+- Semantic sections remain separate from BM25/vector ranking. CLI text search
+  no longer hides semantic matches when there are no code hits; neighborhood,
+  semantic memory, overview, and the existing code surfaces enforce complete
+  rendered-byte budgets.
+- Release packaging places the installed gateway and pinned dependencies beside
+  the Rust binary. Startup and doctor enforce the supported Node version and
+  produce controlled missing-runtime/dependency/auth diagnostics; deterministic
+  indexing and retrieval remain Node-free.
+- The gateway retries at most twice and only for classified transient/capacity
+  failures, retaining the exact provider, model, service tier, and billing
+  path. Auth/schema/context/quota/billing errors are terminal. Cancellation
+  interrupts requests and retry backoff; provider errors and credentials are
+  redacted from normal output.
+- Operator documentation covers ChatGPT-plan auth, API-key providers, custom
+  compatible endpoints, proxy/TLS boundaries, redaction, cancellation,
+  retries, packaging, and the non-network scope of `llm doctor`.
 
 ## Semantic-v1 completion boundary
+
+G1–G9 now satisfy this design boundary. The verification policy below remains
+the release gate before product-value evaluation.
 
 Semantic v1 is complete when:
 
@@ -367,8 +472,9 @@ Semantic v1 is complete when:
 
 ## Verification policy
 
-No further product-value evaluation is required before G6–G9. Implementation
-work still requires engineering verification:
+No further product-value evaluation is required during semantic-v1
+implementation. Before real repository testing, complete engineering
+verification:
 
 - Rust compile, formatting, lint, unit, migration, and existing regression
   tests;

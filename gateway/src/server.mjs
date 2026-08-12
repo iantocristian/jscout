@@ -9,6 +9,7 @@ import { CompletionError, startCompletion } from "./completion.mjs";
 import { errorPayload } from "./protocol.mjs";
 import {
   RegistryError,
+  billingPath,
   buildRegistry,
   describeModel,
   parseModelSpec,
@@ -20,11 +21,12 @@ export const CUSTOM_PROVIDERS_ENV = "JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS";
 export const OPENAI_BASE_URL_ENV = "JSCOUT_PI_AI_OPENAI_BASE_URL";
 const DEFAULT_AUTH_FILE = "~/.pi-ai/auth.json";
 
-export function createGatewayState({ env, versions, credentialStore, exit = process.exit }) {
+export function createGatewayState({ env, versions, credentialStore, retryPolicy, exit = process.exit }) {
   return {
     env,
     versions,
     credentialStore,
+    retryPolicy,
     exit,
     registry: null,
     registryError: null,
@@ -70,7 +72,7 @@ export async function handleMessage(state, message, send) {
         return;
       case "capabilities":
         requireGreeting(state);
-        handleCapabilities(state, message, send);
+        await handleCapabilities(state, message, send);
         return;
       case "complete":
         requireGreeting(state);
@@ -99,7 +101,7 @@ function requireGreeting(state) {
   }
 }
 
-function handleCapabilities(state, message, send) {
+async function handleCapabilities(state, message, send) {
   const { models, customProviderIds } = registry(state);
   const response = {
     id: message.id,
@@ -115,7 +117,23 @@ function handleCapabilities(state, message, send) {
   if (typeof message.model === "string" && message.model.length > 0) {
     const parsed = parseModelSpec(message.model);
     const model = models.getModel(parsed.provider, parsed.modelId);
-    response.model = model ? describeModel(model) : null;
+    if (model) {
+      let auth;
+      try {
+        auth = await models.checkAuth(model.provider, { signal: AbortSignal.timeout(10_000) });
+      } catch {
+        throw new CompletionError("auth", "provider authentication check failed");
+      }
+      response.model = {
+        ...describeModel(model),
+        billing_path: billingPath(parsed.provider, customProviderIds),
+        auth_configured: auth !== undefined,
+        auth_type: auth?.type ?? null,
+        auth_source: auth?.source ?? null,
+      };
+    } else {
+      response.model = null;
+    }
   }
   send(response);
 }
@@ -139,7 +157,6 @@ async function handleComplete(state, message, send) {
       active.reason = "timeout";
       controller.abort();
     }, timeoutMs);
-    active.timer.unref?.();
   }
   try {
     const { started, result } = await startCompletion({
@@ -147,6 +164,7 @@ async function handleComplete(state, message, send) {
       parsed,
       request: message,
       signal: controller.signal,
+      retry: state.retryPolicy,
     });
     send({ id: message.id, kind: "started", ...started });
     const submission = await result;
@@ -190,5 +208,5 @@ function toErrorPayload(error) {
   if (error instanceof RegistryError) {
     return errorPayload(error.code, error.message);
   }
-  return errorPayload("internal", error?.message ?? "internal gateway failure");
+  return errorPayload("internal", "internal gateway failure");
 }
