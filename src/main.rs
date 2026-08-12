@@ -18,6 +18,7 @@ mod scout;
 mod scouting;
 mod search;
 mod semantic;
+mod semantic_query;
 mod stats;
 mod store;
 mod structural;
@@ -209,6 +210,33 @@ enum Command {
         /// Maximum returned artifacts
         #[arg(short = 'k', long, default_value_t = 20)]
         limit: usize,
+        /// Restrict artifacts by type (repeatable or comma-separated)
+        #[arg(long = "type", value_delimiter = ',')]
+        artifact_types: Vec<String>,
+        /// Restrict computed freshness: fresh, degraded, or stale
+        #[arg(long, value_delimiter = ',')]
+        freshness: Vec<String>,
+        /// Load one artifact by id (historical artifacts are allowed)
+        #[arg(long)]
+        artifact: Option<i64>,
+        /// Include superseded artifacts in list/search mode
+        #[arg(long)]
+        include_superseded: bool,
+        /// Include exact, hash-verified source evidence (follows summary children)
+        #[arg(long)]
+        source: bool,
+        /// Maximum source evidence rows
+        #[arg(long, default_value_t = 12)]
+        source_limit: usize,
+        /// Maximum source bytes per evidence row
+        #[arg(long, default_value_t = semantic_query::DEFAULT_SOURCE_BYTE_LIMIT)]
+        source_bytes: usize,
+        /// Restrict source drill-down to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        file_origins: Vec<String>,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = semantic_query::DEFAULT_RESPONSE_BYTE_LIMIT)]
+        response_bytes: usize,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -596,11 +624,37 @@ fn main() -> Result<()> {
             root,
             query,
             limit,
+            artifact_types,
+            freshness,
+            artifact,
+            include_superseded,
+            source,
+            source_limit,
+            source_bytes,
+            file_origins,
+            response_bytes,
             database,
         } => {
             let conn = open_database(&root, database.as_deref())?;
-            let artifacts = semantic::search(&conn, &query, limit)?;
-            println!("{}", serde_json::to_string_pretty(&artifacts)?);
+            let result = semantic_query::query(
+                &root,
+                &conn,
+                &semantic_query::QueryOptions {
+                    query,
+                    artifact_id: artifact,
+                    artifact_types,
+                    freshness,
+                    include_superseded,
+                    limit,
+                    include_source: source,
+                    source_limit,
+                    source_byte_limit: source_bytes,
+                    file_origins,
+                    response_byte_limit: response_bytes,
+                    ..Default::default()
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
         Command::WorkflowCandidates {

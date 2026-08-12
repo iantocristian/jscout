@@ -807,6 +807,22 @@ pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<Semanti
     load_artifact_at_depth(conn, id, 3, &mut FreshnessContext::default())
 }
 
+/// Load several artifacts against one freshness context. Semantic retrieval
+/// commonly returns parents that share children; carrying one memo across the
+/// batch avoids recomputing the same hierarchy for every result while keeping
+/// the complete query inside its caller's SQLite read snapshot.
+pub(crate) fn load_artifacts(conn: &Connection, ids: &[i64]) -> Result<Vec<SemanticArtifact>> {
+    let mut context = FreshnessContext::default();
+    let mut artifacts = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if let Some(artifact) = load_artifact_at_depth(conn, id, 3, &mut context)? {
+            context.memo.insert(id, artifact.freshness.clone());
+            artifacts.push(artifact);
+        }
+    }
+    Ok(artifacts)
+}
+
 /// Shared state for one top-level artifact load: memoized child freshness
 /// plus the lazily built workspace ownership table needed to recompute a
 /// summary scope's expected child set.
