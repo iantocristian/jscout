@@ -7,9 +7,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -22,6 +22,11 @@ use super::{CompletionOutcome, GatewayError, LlmGateway, StartedInfo};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+static INTERRUPT_CONTROL: Mutex<Option<GatewayControl>> = Mutex::new(None);
+static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub struct ProcessGateway {
     child: Child,
@@ -40,13 +45,11 @@ struct GatewayWriter {
 /// Independent write-side handle. It can be moved to a signal/control thread
 /// while the main client is blocked waiting for a completion response.
 #[derive(Clone)]
-#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
 pub struct GatewayControl {
     writer: Arc<GatewayWriter>,
     active_request: Arc<Mutex<Option<String>>>,
 }
 
-#[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
 impl GatewayControl {
     /// Send cancellation for the current completion, if one is active.
     pub fn cancel_active(&self) -> Result<bool, GatewayError> {
@@ -60,6 +63,57 @@ impl GatewayControl {
         };
         self.writer.send(&Outbound::Cancel { target_id })?;
         Ok(true)
+    }
+}
+
+fn install_interrupt_handler() -> Result<(), GatewayError> {
+    let installation = INTERRUPT_HANDLER
+        .get_or_init(|| ctrlc::set_handler(handle_interrupt).map_err(|error| error.to_string()));
+    match installation {
+        Ok(()) => Ok(()),
+        Err(message) => Err(GatewayError::Spawn(format!(
+            "failed to install Ctrl-C handler: {message}"
+        ))),
+    }
+}
+
+fn handle_interrupt() {
+    if !request_interrupt_cancellation() {
+        std::process::exit(INTERRUPTED_EXIT_CODE);
+    }
+}
+
+fn request_interrupt_cancellation() -> bool {
+    if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let control = INTERRUPT_CONTROL
+        .lock()
+        .ok()
+        .and_then(|registered| registered.clone());
+    control
+        .as_ref()
+        .and_then(|control| control.cancel_active().ok())
+        .unwrap_or(false)
+}
+
+fn register_interrupt_control(control: GatewayControl) -> Result<(), GatewayError> {
+    install_interrupt_handler()?;
+    *INTERRUPT_CONTROL
+        .lock()
+        .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+fn unregister_interrupt_control(writer: &Arc<GatewayWriter>) {
+    if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
+        && registered
+            .as_ref()
+            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
+    {
+        *registered = None;
+        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -87,12 +141,8 @@ struct ActiveRequestGuard {
 }
 
 impl ActiveRequestGuard {
-    fn set(active_request: Arc<Mutex<Option<String>>>, id: String) -> Result<Self, GatewayError> {
-        *active_request
-            .lock()
-            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))? =
-            Some(id);
-        Ok(Self { active_request })
+    fn new(active_request: Arc<Mutex<Option<String>>>) -> Self {
+        Self { active_request }
     }
 }
 
@@ -101,6 +151,7 @@ impl Drop for ActiveRequestGuard {
         if let Ok(mut active) = self.active_request.lock() {
             *active = None;
         }
+        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -186,14 +237,34 @@ impl ProcessGateway {
     /// Convenience: resolve node + gateway from config and spawn.
     pub fn launch(gateway_path: Option<&Path>) -> anyhow::Result<Self> {
         let node = config::resolve_node()?;
+        config::verify_node_version(&node)?;
         let gateway = config::resolve_gateway(gateway_path)?;
-        Ok(Self::spawn(&node, &gateway)?)
+        let client = Self::spawn(&node, &gateway)?;
+        register_interrupt_control(client.control())?;
+        Ok(client)
     }
 
     fn send(&mut self, message: &Outbound) -> Result<String, GatewayError> {
         self.writer
             .send(message)
             .inspect_err(|_| self.poisoned = true)
+    }
+
+    /// Publish a completion frame and its cancel target under the same
+    /// active-request lock. A Ctrl-C handler can therefore never observe a
+    /// sent completion without also seeing the id it must cancel.
+    fn send_complete(
+        &mut self,
+        request: &CompleteRequest,
+    ) -> Result<(String, ActiveRequestGuard), GatewayError> {
+        let active_request = Arc::clone(&self.active_request);
+        let mut active = active_request
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))?;
+        let id = self.send(&Outbound::Complete(Box::new(request.clone())))?;
+        *active = Some(id.clone());
+        drop(active);
+        Ok((id, ActiveRequestGuard::new(active_request)))
     }
 
     /// Receive the next message for `id` within `timeout`. Messages for other
@@ -251,7 +322,6 @@ impl ProcessGateway {
         self.poisoned
     }
 
-    #[allow(dead_code)] // consumed by the Ctrl-C integration after the process seam
     pub fn control(&self) -> GatewayControl {
         GatewayControl {
             writer: Arc::clone(&self.writer),
@@ -295,8 +365,7 @@ impl ProcessGateway {
         timeout: Duration,
         grace: Duration,
     ) -> Result<CompletionOutcome, GatewayError> {
-        let id = self.send(&Outbound::Complete(Box::new(request.clone())))?;
-        let _active = ActiveRequestGuard::set(Arc::clone(&self.active_request), id.clone())?;
+        let (id, _active) = self.send_complete(request)?;
         let wire_timeout = timeout + grace;
         let started = match self.receive_for(&id, wire_timeout)? {
             Inbound::Started {
@@ -326,6 +395,7 @@ impl ProcessGateway {
                 tool_call,
                 stop_reason,
                 usage,
+                attempts,
                 response_model,
                 ..
             } => Ok(CompletionOutcome {
@@ -333,6 +403,7 @@ impl ProcessGateway {
                 tool_call,
                 stop_reason,
                 usage,
+                attempts,
                 response_model,
             }),
             Inbound::Error { error, .. } => Err(GatewayError::from_remote(error)),
@@ -346,6 +417,7 @@ impl ProcessGateway {
 
 impl Drop for ProcessGateway {
     fn drop(&mut self) {
+        unregister_interrupt_control(&self.writer);
         if !self.poisoned {
             let _ = self.send(&Outbound::Shutdown);
             let deadline = Instant::now() + SHUTDOWN_GRACE;
@@ -411,7 +483,10 @@ mod tests {
 
     use super::super::protocol::{ChatMessage, CompleteRequest, SubmitTool};
     use super::super::{GatewayError, LlmGateway};
-    use super::{ProcessGateway, write_fake_gateway};
+    use super::{
+        ProcessGateway, register_interrupt_control, request_interrupt_cancellation,
+        write_fake_gateway,
+    };
 
     const READY: &str = r#"{"protocol":1,"id":"r1","kind":"ready","versions":{"gateway":"0.0.0","pi_ai":"0.0.0","node":"22.19.0","protocol":1}}"#;
 
@@ -466,6 +541,7 @@ done"#
         assert_eq!(outcome.tool_call.name, "submit");
         assert_eq!(outcome.tool_call.arguments, json!({"ok": true}));
         assert_eq!(outcome.usage.total_tokens, 3);
+        assert_eq!(outcome.attempts, 1);
         drop(gateway); // shutdown path must not hang
         Ok(())
     }
@@ -495,7 +571,7 @@ done"#
     }
 
     #[test]
-    fn control_handle_cancels_while_completion_waits() -> anyhow::Result<()> {
+    fn registered_interrupt_control_cancels_while_completion_waits() -> anyhow::Result<()> {
         let body = format!(
             r#"while IFS= read -r line; do
   case "$line" in
@@ -512,16 +588,16 @@ done"#
 done"#
         );
         let mut gateway = spawn_with(&body)?;
-        let control = gateway.control();
+        register_interrupt_control(gateway.control())?;
         let canceler = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            control.cancel_active()
+            request_interrupt_cancellation()
         });
         let error = gateway
             .complete(&complete_request(), Duration::from_secs(5))
             .expect_err("completion should be canceled");
         assert!(matches!(error, GatewayError::Canceled(_)), "got {error:?}");
-        assert!(canceler.join().expect("cancel thread")?);
+        assert!(canceler.join().expect("cancel thread"));
         assert!(!gateway.poisoned());
         Ok(())
     }

@@ -10,15 +10,14 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
-import { createGatewayState, handleMessage } from "./server.mjs";
-import { errorPayload, parseMessage, readLines, writeMessage } from "./protocol.mjs";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 
 /// The pi-ai exports map does not expose ./package.json; walk up from the
 /// resolved ESM entry point to read the installed version.
 function piAiVersion() {
-  let dir = path.dirname(new URL(import.meta.resolve("@earendil-works/pi-ai")).pathname);
+  let dir = path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai")));
   while (dir !== path.dirname(dir)) {
     const candidate = path.join(dir, "package.json");
     if (fs.existsSync(candidate)) {
@@ -41,13 +40,22 @@ function nodeVersionSupported() {
   return true;
 }
 
-function main() {
+async function main() {
   if (!nodeVersionSupported()) {
     process.stderr.write(
       `jscout-pi-ai-gateway requires Node >= ${MINIMUM_NODE.join(".")}; running ${process.versions.node}\n`,
     );
     process.exit(1);
+    return;
   }
+
+  // Keep the version gate ahead of pi-ai imports: an unsupported runtime
+  // should fail with one controlled diagnostic, not an adapter syntax error.
+  const [{ createGatewayState, handleMessage }, protocol] = await Promise.all([
+    import("./server.mjs"),
+    import("./protocol.mjs"),
+  ]);
+  const { errorPayload, parseMessage, readLines, writeMessage } = protocol;
 
   const state = createGatewayState({
     env: process.env,
@@ -72,7 +80,7 @@ function main() {
         send({
           id: message.id,
           kind: "error",
-          error: errorPayload("internal", failure?.message ?? "internal gateway failure"),
+          error: errorPayload("internal", "internal gateway failure"),
         });
       });
     },
@@ -89,4 +97,10 @@ function main() {
   });
 }
 
-main();
+main().catch((failure) => {
+  const message = failure?.code === "ERR_MODULE_NOT_FOUND"
+    ? "gateway dependencies are missing; reinstall the bundled gateway"
+    : "gateway failed to initialize";
+  process.stderr.write(`jscout-pi-ai-gateway: ${message}\n`);
+  process.exitCode = 1;
+});

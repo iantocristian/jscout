@@ -4,6 +4,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,8 @@ pub const GATEWAY_ENV: &str = "JSCOUT_PI_AI_GATEWAY";
 pub const NODE_ENV: &str = "JSCOUT_NODE";
 pub const DEFAULT_MODEL: &str = "openai-codex:gpt-5.6-terra";
 pub const MODEL_EXAMPLE: &str = DEFAULT_MODEL;
+pub const MINIMUM_NODE_VERSION: (u64, u64, u64) = (22, 19, 0);
+pub const MINIMUM_NODE_VERSION_TEXT: &str = "22.19.0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSpec {
@@ -93,17 +96,30 @@ pub fn resolve_gateway(cli: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn companion_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        let mut ancestors = exe.parent();
-        // Installed layout: gateway/ beside the binary. Development layout:
-        // target/{debug,release}/jscout with gateway/ at the repository root.
-        for _ in 0..3 {
-            if let Some(dir) = ancestors {
-                candidates.push(dir.join("gateway/src/main.mjs"));
-                ancestors = dir.parent();
-            }
-        }
+    let Ok(exe) = env::current_exe() else {
+        return Vec::new();
+    };
+    companion_candidates_for(&exe)
+}
+
+fn companion_candidates_for(exe: &Path) -> Vec<PathBuf> {
+    let Some(binary_dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = vec![binary_dir.join("gateway/src/main.mjs")];
+    // Development-only fallback. Installed binaries must not discover an
+    // unrelated gateway in an arbitrary parent directory.
+    if matches!(
+        binary_dir.file_name().and_then(|name| name.to_str()),
+        Some("debug" | "release")
+    ) && binary_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("target")
+        && let Some(repository) = binary_dir.parent().and_then(Path::parent)
+    {
+        candidates.push(repository.join("gateway/src/main.mjs"));
     }
     candidates
 }
@@ -135,15 +151,60 @@ pub fn resolve_node() -> Result<PathBuf> {
     }
     let path_var = env::var_os("PATH").context("PATH is not set; cannot locate node")?;
     for dir in env::split_paths(&path_var) {
-        let candidate = dir.join("node");
-        if candidate.is_file() {
-            return Ok(candidate);
+        for executable in ["node", "node.exe"] {
+            let candidate = dir.join(executable);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
         }
     }
     bail!(
         "node not found on PATH: install Node >= 22.19.0 or set {NODE_ENV}; \
          the pi-ai gateway is a Node sidecar and cannot run without it"
     )
+}
+
+/// Run the selected Node executable and enforce the gateway's runtime floor.
+/// The returned text is safe to print: it is parsed from Node's version-only
+/// stdout, and stderr is deliberately excluded from diagnostics.
+pub fn verify_node_version(node: &Path) -> Result<String> {
+    let output = Command::new(node)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to run {} --version", node.display()))?;
+    if !output.status.success() {
+        bail!(
+            "{} --version failed; install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}",
+            node.display()
+        );
+    }
+    let reported = std::str::from_utf8(&output.stdout)
+        .context("node --version returned non-UTF-8 output")?
+        .trim();
+    let parsed = parse_node_version(reported)?;
+    if parsed < MINIMUM_NODE_VERSION {
+        bail!(
+            "Node {reported} is unsupported; install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}"
+        );
+    }
+    Ok(reported.to_string())
+}
+
+fn parse_node_version(reported: &str) -> Result<(u64, u64, u64)> {
+    let version = reported.strip_prefix('v').unwrap_or(reported);
+    let mut parts = version.split('.');
+    let major = parse_node_version_part(parts.next(), reported)?;
+    let minor = parse_node_version_part(parts.next(), reported)?;
+    let patch = parse_node_version_part(parts.next(), reported)?;
+    if parts.next().is_some() {
+        bail!("could not parse node --version output `{reported}`");
+    }
+    Ok((major, minor, patch))
+}
+
+fn parse_node_version_part(part: Option<&str>, reported: &str) -> Result<u64> {
+    part.and_then(|value| value.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not parse node --version output `{reported}`"))
 }
 
 /// Per-command request policy shared by scouting commands.
@@ -210,5 +271,31 @@ mod tests {
         assert!(RequestPolicy::new(1, 1, 0).is_err());
         let policy = RequestPolicy::new(300, 8, 200_000).expect("valid policy");
         assert_eq!(policy.timeout, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn node_version_parser_enforces_complete_numeric_semver() {
+        assert_eq!(parse_node_version("v22.19.0").unwrap(), (22, 19, 0));
+        assert_eq!(parse_node_version("24.1.3").unwrap(), (24, 1, 3));
+        for invalid in ["", "v22", "v22.19", "v22.19.x", "v22.19.0.1"] {
+            assert!(parse_node_version(invalid).is_err(), "accepted {invalid}");
+        }
+        assert!((22, 18, 9) < MINIMUM_NODE_VERSION);
+        assert!((22, 19, 0) >= MINIMUM_NODE_VERSION);
+    }
+
+    #[test]
+    fn gateway_discovery_uses_only_installed_or_explicit_dev_layouts() {
+        assert_eq!(
+            companion_candidates_for(Path::new("/opt/jscout/jscout")),
+            vec![PathBuf::from("/opt/jscout/gateway/src/main.mjs")]
+        );
+        assert_eq!(
+            companion_candidates_for(Path::new("/repo/target/release/jscout")),
+            vec![
+                PathBuf::from("/repo/target/release/gateway/src/main.mjs"),
+                PathBuf::from("/repo/gateway/src/main.mjs"),
+            ]
+        );
     }
 }

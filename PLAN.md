@@ -1,8 +1,8 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-11.
+> Status: authoritative plan as of 2026-08-12.
 >
-> G1–G7 of semantic scouting are implemented. G8, concepts, is next.
+> G1–G7 and G9 are implemented. G8, concepts, remains.
 > Product-value testing is intentionally paused until the semantic-v1
 > completion boundary.
 
@@ -110,10 +110,10 @@ agent, indexer, or semantic authority.
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
 | General entities | Routes, GraphQL operations, environment/configuration keys, database resources, feature flags, and external-service hosts with canonical identity plus evidence-bearing occurrences |
 | Dependency scope | Opt-in named packages; realpath-normalized workspace/dependency identity, pnpm layout/version handling, source-over-dist preference, bundle/minification limits, and dependency origin excluded from retrieval by default |
-| Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, repository overview, ranked paths, semantic-memory attachment, and opt-in structural expansion |
-| Agent integration | CLI, MCP profiles, project-local agent guide, response budgets, privacy-minimal telemetry, and isolated evaluation database support |
+| Retrieval | BM25 plus optional embeddings/RRF/reranking; snapshot-scoped anchors, file roles, definitions, who-uses, events, entity lookup, ranked paths, filtered semantic-memory queries, exact source drill-down, fresh-only overview overlays, and opt-in structural expansion |
+| Agent integration | CLI, MCP profiles, project-local agent guide, whole-response budgets, privacy-minimal telemetry, packaged companion gateway, and isolated evaluation database support |
 | Semantic memory | Validated agent write-back; candidate-closed generated workflows; evidence-backed selected symbol cards; bottom-up child-cited file/module/repository summaries with fingerprint-pinned child relations and upward freshness propagation; automatic deterministic seeds, card selection, and scope discovery; run reuse; explicit refresh; immutable successors; fresh/degraded/stale status |
-| Model gateway | `@earendil-works/pi-ai` 0.84.1 sidecar, protocol-v1 JSONL over stdio, provider/auth registry, cancellation, normalized usage/errors, and `llm doctor` |
+| Model gateway | Pinned `@earendil-works/pi-ai` sidecar, protocol-v1 JSONL over stdio, provider/auth registry, bounded same-model retries, cancellation, controlled/redacted errors, installed-layout packaging, Node-version enforcement, and auth-aware `llm doctor` |
 
 ## Deterministic repository plane
 
@@ -366,7 +366,7 @@ the three-level hierarchy. Refresh therefore needs no summary-specific
 selection rule — a summary whose child drifted is already non-fresh — and
 replans the recorded scope against the children current at refresh time.
 
-## Remaining semantic-v1 roadmap
+## Semantic-v1 roadmap
 
 ### G8 — concepts (next)
 
@@ -382,18 +382,32 @@ clusters and not by tagging every chunk with a separate model call.
 This layer enables questions such as “which workflows touch invoice
 reconciliation?” without replacing the source evidence used to answer them.
 
-### G9 — retrieval, packaging, and operations
+### Implemented G9 — retrieval, packaging, and operations
 
-- semantic-specific CLI/MCP queries for workflows, cards, concepts, related
-  artifacts, freshness, and exact source drill-down;
-- deterministic repository overview with optional fresh semantic overlays;
-- bounded result sections rather than mixing prose into code ranking;
-- gateway packaging beside release binaries, supported Node-version checks,
-  and clear missing-runtime diagnostics;
-- documentation for Codex-plan auth, API providers, custom compatible
-  endpoints, proxy/TLS behavior, redaction, cancellation, and retries;
-- bounded retries only for classified transient/capacity failures; no hidden
-  provider, model, service-tier, or billing fallback.
+- `memory`/`semantic_memory` filter current or historical workflows, cards,
+  summaries, concepts, and annotations by text, type, freshness, exact evidence
+  anchor, or direct artifact relation. Results expose successors, bounded
+  relations, and pinned evidence paths to hash-verified source.
+- `overview`/`repository_overview` read deterministic inventory and optional
+  semantic overlays from one SQLite snapshot. Generated overlays are opt-in,
+  current/fresh only, separately labelled untrusted data, and are sacrificed
+  before deterministic inventory when the whole-response budget binds.
+- Semantic sections remain separate from BM25/vector ranking. CLI text search
+  no longer hides semantic matches when there are no code hits; neighborhood,
+  semantic memory, overview, and the existing code surfaces enforce complete
+  rendered-byte budgets.
+- Release packaging places the installed gateway and pinned dependencies beside
+  the Rust binary. Startup and doctor enforce the supported Node version and
+  produce controlled missing-runtime/dependency/auth diagnostics; deterministic
+  indexing and retrieval remain Node-free.
+- The gateway retries at most twice and only for classified transient/capacity
+  failures, retaining the exact provider, model, service tier, and billing
+  path. Auth/schema/context/quota/billing errors are terminal. Cancellation
+  interrupts requests and retry backoff; provider errors and credentials are
+  redacted from normal output.
+- Operator documentation covers ChatGPT-plan auth, API-key providers, custom
+  compatible endpoints, proxy/TLS boundaries, redaction, cancellation,
+  retries, packaging, and the non-network scope of `llm doctor`.
 
 ## Semantic-v1 completion boundary
 
@@ -412,7 +426,7 @@ Semantic v1 is complete when:
 
 ## Verification policy
 
-No further product-value evaluation is required before G8–G9. Implementation
+No further product-value evaluation is required before G8. Implementation
 work still requires engineering verification:
 
 - Rust compile, formatting, lint, unit, migration, and existing regression

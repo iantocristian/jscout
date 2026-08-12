@@ -242,10 +242,16 @@ function normalizeBaseUrl(value, name) {
   } catch {
     throw new RegistryError("invalid_request", `${name} must be an absolute HTTP(S) URL`);
   }
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
     throw new RegistryError(
       "invalid_request",
-      `${name} must be an absolute HTTP(S) URL without embedded credentials`,
+      `${name} must be an absolute HTTP(S) URL without userinfo, query parameters, or fragments`,
     );
   }
   return url.toString().replace(/\/$/u, "");

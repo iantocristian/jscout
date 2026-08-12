@@ -908,6 +908,7 @@ fn execute_prepared_workflow(
     let usage_json = serde_json::to_string(&serde_json::json!({
         "usage": outcome.usage,
         "stop_reason": outcome.stop_reason,
+        "attempts": outcome.attempts,
         "response_model": outcome.response_model,
         "base_url": outcome.started.base_url,
     }))?;
@@ -1203,6 +1204,7 @@ fn execute_prepared_card(
     let usage_json = serde_json::to_string(&serde_json::json!({
         "usage": outcome.usage,
         "stop_reason": outcome.stop_reason,
+        "attempts": outcome.attempts,
         "response_model": outcome.response_model,
         "base_url": outcome.started.base_url,
     }))?;
@@ -1675,6 +1677,7 @@ fn execute_prepared_summary(
     let usage_json = serde_json::to_string(&serde_json::json!({
         "usage": outcome.usage,
         "stop_reason": outcome.stop_reason,
+        "attempts": outcome.attempts,
         "response_model": outcome.response_model,
         "base_url": outcome.started.base_url,
     }))?;
@@ -2503,6 +2506,10 @@ mod tests {
                     reasoning: true,
                     supports_service_tier: false,
                     supports_tools: true,
+                    billing_path: Some("api".into()),
+                    auth_configured: true,
+                    auth_type: Some("api_key".into()),
+                    auth_source: Some("test".into()),
                 }),
             ))
         }
@@ -2547,6 +2554,7 @@ mod tests {
                 total_tokens: 120,
                 cost_total: 0.0,
             },
+            attempts: 1,
             response_model: Some("faux-model".into()),
         }
     }

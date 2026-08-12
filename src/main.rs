@@ -18,6 +18,7 @@ mod scout;
 mod scouting;
 mod search;
 mod semantic;
+mod semantic_query;
 mod stats;
 mod store;
 mod structural;
@@ -209,6 +210,77 @@ enum Command {
         /// Maximum returned artifacts
         #[arg(short = 'k', long, default_value_t = 20)]
         limit: usize,
+        /// Restrict artifacts by type (repeatable or comma-separated)
+        #[arg(long = "type", value_delimiter = ',')]
+        artifact_types: Vec<String>,
+        /// Restrict computed freshness: fresh, degraded, or stale
+        #[arg(long, value_delimiter = ',')]
+        freshness: Vec<String>,
+        /// Load one artifact by id (historical artifacts are allowed)
+        #[arg(long)]
+        artifact: Option<i64>,
+        /// Restrict artifacts to those with direct evidence on this exact anchor
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Restrict artifacts to direct semantic relations with this artifact id
+        #[arg(long)]
+        related_to: Option<i64>,
+        /// Include superseded artifacts in list/search mode
+        #[arg(long)]
+        include_superseded: bool,
+        /// Include exact, hash-verified source evidence (follows summary children)
+        #[arg(long)]
+        source: bool,
+        /// Maximum source evidence rows
+        #[arg(long, default_value_t = 12)]
+        source_limit: usize,
+        /// Maximum semantic-relation hops followed during source drill-down
+        #[arg(long, default_value_t = 8)]
+        source_depth: usize,
+        /// Maximum source bytes per evidence row
+        #[arg(long, default_value_t = semantic_query::DEFAULT_SOURCE_BYTE_LIMIT)]
+        source_bytes: usize,
+        /// Restrict source drill-down to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        file_origins: Vec<String>,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = semantic_query::DEFAULT_RESPONSE_BYTE_LIMIT)]
+        response_bytes: usize,
+        /// Maximum direct evidence supports retained per artifact
+        #[arg(long, default_value_t = 8)]
+        supports_per_artifact: usize,
+        /// Maximum direct semantic relations returned
+        #[arg(long, default_value_t = 40)]
+        relation_limit: usize,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// Deterministic repository overview with an optional fresh semantic overlay
+    Overview {
+        /// Repository root used to locate the default index
+        root: PathBuf,
+        /// Restrict deterministic inventory to file origins
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        file_origins: Vec<String>,
+        /// Maximum top-level repository areas
+        #[arg(long, default_value_t = 20)]
+        area_limit: usize,
+        /// Maximum structural relation kinds
+        #[arg(long, default_value_t = 30)]
+        relation_limit: usize,
+        /// Attach a separately labelled overlay of current fresh semantic memory
+        #[arg(long)]
+        semantic: bool,
+        /// Maximum semantic overlay artifacts
+        #[arg(long, default_value_t = 8)]
+        semantic_limit: usize,
+        /// Restrict semantic overlay types (cards are excluded by default)
+        #[arg(long = "semantic-type", value_delimiter = ',')]
+        semantic_types: Vec<String>,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = 24_000)]
+        response_bytes: usize,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -290,6 +362,9 @@ enum Command {
         /// Restrict traversal to backing-file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
+        /// Maximum bytes in the complete rendered JSON response
+        #[arg(long, default_value_t = 24_000)]
+        response_bytes: usize,
     },
     /// Print or install the jscout agent-integration skill
     AgentGuide {
@@ -596,11 +671,73 @@ fn main() -> Result<()> {
             root,
             query,
             limit,
+            artifact_types,
+            freshness,
+            artifact,
+            anchor,
+            related_to,
+            include_superseded,
+            source,
+            source_limit,
+            source_depth,
+            source_bytes,
+            file_origins,
+            response_bytes,
+            supports_per_artifact,
+            relation_limit,
             database,
         } => {
             let conn = open_database(&root, database.as_deref())?;
-            let artifacts = semantic::search(&conn, &query, limit)?;
-            println!("{}", serde_json::to_string_pretty(&artifacts)?);
+            let result = semantic_query::query(
+                &root,
+                &conn,
+                &semantic_query::QueryOptions {
+                    query,
+                    artifact_id: artifact,
+                    anchor,
+                    related_to,
+                    artifact_types,
+                    freshness,
+                    include_superseded,
+                    limit,
+                    include_source: source,
+                    source_limit,
+                    evidence_relation_depth: source_depth,
+                    source_byte_limit: source_bytes,
+                    file_origins,
+                    response_byte_limit: response_bytes,
+                    supports_per_artifact,
+                    relation_limit,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        Command::Overview {
+            root,
+            file_origins,
+            area_limit,
+            relation_limit,
+            semantic,
+            semantic_limit,
+            semantic_types,
+            response_bytes,
+            database,
+        } => {
+            let conn = open_database(&root, database.as_deref())?;
+            let result = surface::overview_response(
+                &conn,
+                &surface::OverviewOptions {
+                    file_origins,
+                    area_limit,
+                    relation_limit,
+                    include_semantic: semantic,
+                    semantic_limit,
+                    semantic_types,
+                    response_byte_limit: response_bytes,
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
         Command::WorkflowCandidates {
@@ -648,9 +785,11 @@ fn main() -> Result<()> {
             kinds,
             file_roles,
             file_origins,
+            response_bytes,
         } => cmd_neighborhood(
             &root,
             &anchor,
+            response_bytes,
             structural::NeighborhoodOptions {
                 expected_snapshot: snapshot,
                 depth,
@@ -820,11 +959,19 @@ fn open_database(root: &Path, database: Option<&Path>) -> Result<rusqlite::Conne
 fn cmd_neighborhood(
     root: &Path,
     anchor: &str,
+    response_bytes: usize,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
     let conn = store::open(root)?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
-    println!("{}", serde_json::to_string_pretty(&neighborhood)?);
+    println!(
+        "{}",
+        mcp::render_bounded_object_arrays(
+            serde_json::to_value(neighborhood)?,
+            &["edges", "nodes"],
+            response_bytes,
+        )?
+    );
     Ok(())
 }
 
@@ -861,7 +1008,7 @@ fn cmd_search(
         return Ok(());
     }
     println!("snapshot: {}", result.snapshot);
-    if result.hits.is_empty() {
+    if result.hits.is_empty() && result.semantic_artifacts.is_empty() {
         println!("no results");
         return Ok(());
     }
@@ -911,7 +1058,31 @@ fn cmd_search(
             );
         }
     }
+    if !result.semantic_artifacts.is_empty() {
+        print!(
+            "{}",
+            render_semantic_memory_text(&result.semantic_artifacts)?
+        );
+    }
     Ok(())
+}
+
+fn render_semantic_memory_text(artifacts: &[semantic::SemanticArtifact]) -> Result<String> {
+    let mut rendered = String::from("\nsemantic memory (untrusted; verify in source):\n");
+    for artifact in artifacts {
+        rendered.push_str(&format!(
+            "  #{} {} {} [{}] confidence={}\n",
+            artifact.id,
+            artifact.artifact_type,
+            artifact.name.as_deref().unwrap_or("<unnamed>"),
+            artifact.freshness,
+            artifact.confidence,
+        ));
+        rendered.push_str("      ");
+        rendered.push_str(&serde_json::to_string(&artifact.body)?);
+        rendered.push('\n');
+    }
+    Ok(rendered)
 }
 
 fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> Result<()> {
@@ -1389,5 +1560,37 @@ fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
             "  skipped unresolvable: {}: {}",
             skipped.subject, skipped.reason
         );
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use anyhow::Result;
+    use serde_json::json;
+
+    use super::render_semantic_memory_text;
+    use crate::semantic::SemanticArtifact;
+
+    #[test]
+    fn text_search_memory_is_renderable_without_code_hits() -> Result<()> {
+        let rendered = render_semantic_memory_text(&[SemanticArtifact {
+            id: 7,
+            supersedes: None,
+            artifact_type: "workflow".into(),
+            name: Some("invoice settlement".into()),
+            trust: "untrusted".into(),
+            body: json!({ "description": "settles an invoice" }),
+            model: "test".into(),
+            prompt_version: "test/v1".into(),
+            confidence: "likely".into(),
+            source_snapshot: "snapshot".into(),
+            created_at: "now".into(),
+            freshness: "fresh".into(),
+            supports: Vec::new(),
+            relevance: 1.0,
+        }])?;
+        assert!(rendered.contains("semantic memory (untrusted; verify in source)"));
+        assert!(rendered.contains("invoice settlement [fresh]"));
+        Ok(())
     }
 }

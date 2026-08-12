@@ -26,10 +26,12 @@ jscout search /path/to/repo "checkout inventory"
 Everything deterministic — indexing, search, graph traversal, the MCP server —
 is the Rust binary alone, with no runtime dependencies. Generative scouting
 (`jscout scout …`, `jscout llm doctor`) additionally requires Node >= 22.19.0
-because model calls run through the bundled pi-ai gateway sidecar:
+because model calls run through the bundled pi-ai gateway sidecar. Release
+archives contain the gateway and its pinned dependencies; a source checkout
+needs one additional install step:
 
 ```bash
-cd gateway && npm install        # installs the pinned @earendil-works/pi-ai
+npm ci --prefix gateway          # exact package-lock installation
 jscout llm doctor                # verifies node, gateway, auth, and the model
 ```
 
@@ -59,9 +61,17 @@ jscout calls <root> METHOD     # exact member-call sites matched on the AST
 jscout watch <root> [--embed]  # hash-incremental parse; projection is currently rebuilt
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
-jscout mcp <root>              # MCP stdio server: semantic_search, neighborhood,
-                               #   who_uses, definition, file_outline, events, calls, annotate
-jscout memory <root> [query]   # inspect persistent semantic artifacts + freshness
+jscout entities <root> [query] # runtime, contract, route, config, data, flag, host entities
+jscout paths <root> A B        # bounded ranked paths between exact boundaries
+jscout overview <root>         # deterministic cold-start inventory
+  --semantic                   #   optional current/fresh untrusted memory overlay
+jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
+                               #   semantic_memory, exact evidence, and annotate tools
+jscout memory <root> [query]   # bounded semantic artifacts, relations, and freshness
+  --anchor EXACT_ANCHOR --source
+                               #   code-to-memory join + hash-verified source drill-down
+jscout memory <root> --artifact ID --source
+                               #   inspect a current or historical artifact exactly
 jscout annotate <root> in.json # write a validated semantic artifact
 jscout llm doctor              # verify Node, pi-ai, plan auth, and default model capabilities
 jscout scout workflows R       # auto-select deterministic workflow entry surfaces
@@ -79,6 +89,18 @@ jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
 jscout agent-guide --install R # install a project-local jscout skill
 ```
+
+Build a distributable archive containing both the Rust binary and installed
+gateway:
+
+```bash
+scripts/package-release.sh              # host target
+scripts/package-release.sh TARGET_TRIPLE
+```
+
+The archive is written under `target/release-packages/`. Extract it anywhere,
+put its directory on `PATH`, and keep the adjacent `gateway/` directory with
+the binary. Deterministic indexing and retrieval never start Node.
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
@@ -177,6 +199,38 @@ visible but are reported as non-refreshable; jscout does not guess their
 original boundary. A stale target whose recorded seed or scope no longer
 resolves is reported and skipped without blocking other refreshes.
 
+## Semantic retrieval
+
+`jscout memory` and the structural-profile MCP `semantic_memory` tool query
+persistent memory independently of BM25/vector code ranking. They filter by
+artifact type, computed freshness, exact evidence anchor, direct relation, or
+historical artifact id. Current artifacts are the default; an exact historical
+id reports `current: false` and its `superseded_by` successor.
+
+Add `--source` (MCP: `include_source=true`) to follow the artifact's pinned
+outgoing claim-citation relations to leaf supports. Empty-path whole-input
+dependencies remain visible in the relation section but are never presented as
+claim evidence. Every returned path identifies the intermediate artifact,
+relation, and JSON claim pointer; distinct claims that cite the same child stay
+distinct. `--source-depth` bounds relation traversal and the response reports
+depth/path truncation and skipped cycles explicitly.
+
+Source resolution uses the indexed file identity—including virtual dependency
+paths—then reads disk and compares the current bytes with the indexed hash. A
+disk change that has not been indexed returns `source_status: "index-stale"`.
+After re-indexing changed source, an older support returns
+`source_status: "source-stale"`. Neither case returns a misleading excerpt; an
+unavailable file is also explicit. Structural-context drift is reported
+separately as support freshness and does not hide hash-verified source bytes.
+
+`jscout overview` and MCP `repository_overview` return the deterministic corpus
+inventory from one pinned SQLite read snapshot. Generated memory is absent by
+default. `--semantic`/`include_semantic=true` adds a separately labelled,
+untrusted overlay containing only current artifacts whose computed freshness is
+`fresh`; cards require explicit type selection. Whole-response byte budgets
+drop overlay artifacts before deterministic inventory and report every
+omission. Generated prose never changes search scores.
+
 ## Configuration
 
 jscout is configured through CLI flags and process environment variables; it
@@ -201,7 +255,11 @@ first. API-key providers use their standard environment variables through
 pi-ai's built-in registry (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 `GEMINI_API_KEY`, …). `jscout llm doctor` reports exactly which provider,
 auth path, and billing path the selected model resolves to; plan, API, and
-custom billing paths are recorded distinctly and never pooled.
+custom billing paths are recorded distinctly and never pooled. Doctor performs
+no completion and spends no model tokens: it verifies the local runtime,
+gateway protocol, model catalog, and configured auth path, but it cannot prove
+that an account has remaining quota or that a remote endpoint is currently
+healthy.
 
 For API-key Terra through a non-default OpenAI gateway, configure the built-in
 provider rather than declaring a custom provider:
@@ -215,8 +273,9 @@ jscout llm doctor
 
 The endpoint must implement the OpenAI Responses API, streaming, and tool
 calls. `llm doctor` prints the resolved endpoint. URLs containing credentials
-are rejected; put the key only in `OPENAI_API_KEY`. `JSCOUT_PI_AI_GATEWAY` is
-unrelated: it names the local Node sidecar file, not the remote API endpoint.
+are rejected, as are URL query strings and fragments; put the key only in
+`OPENAI_API_KEY`. `JSCOUT_PI_AI_GATEWAY` is unrelated: it names the local Node
+sidecar file, not the remote API endpoint.
 
 Custom OpenAI-compatible providers target local keyless servers (Ollama,
 LM Studio, vLLM); the gateway sends a placeholder API key:
@@ -225,6 +284,28 @@ LM Studio, vLLM); the gateway sends a placeholder API key:
 [{"id": "local", "baseUrl": "http://127.0.0.1:11434/v1",
   "models": [{"id": "qwen3:32b", "contextWindow": 131072, "maxTokens": 32768}]}]
 ```
+
+The gateway owns one visible retry layer: at most two retries with 500 ms then
+1,000 ms backoff, only for classified connection, timeout, rate-limit, overload, or
+capacity failures. Every attempt keeps the exact provider, model, service tier,
+and billing path. Auth, schema, context-window, quota, credit, and billing
+failures are terminal; there is no hidden provider/model/tier fallback. The
+command timeout includes retries and backoff. The first Ctrl-C sends
+cancellation to the active gateway request; a second Ctrl-C, or an interrupt
+when no request is active, forces exit status 130.
+
+Normal gateway errors use stable controlled messages. Provider exception text,
+prompts, tool arguments, and credential values are not written to stderr or the
+run ledger; common key/token forms are redacted again at the protocol boundary.
+Do not enable third-party HTTP debug logging in a shell that contains secrets.
+
+jscout does not install a global proxy agent or reinterpret proxy variables;
+transport behavior remains provider-adapter specific. For a mandatory proxy,
+prefer an explicit compatible endpoint via
+`JSCOUT_PI_AI_OPENAI_BASE_URL`. Node reads `NODE_EXTRA_CA_CERTS` at process
+startup for private certificate authorities. Standard public HTTPS needs no
+TLS configuration. Keep proxy credentials out of endpoint URLs and environment
+values likely to be printed by unrelated tooling.
 
 Retrieval and diagnostics:
 

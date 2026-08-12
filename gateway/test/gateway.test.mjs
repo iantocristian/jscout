@@ -13,18 +13,30 @@ import {
   fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
+import { classifyProviderFailure } from "../src/completion.mjs";
 import { createGatewayState, handleMessage } from "../src/server.mjs";
-import { LineOverflowError, MAX_LINE_BYTES, parseMessage, readLines } from "../src/protocol.mjs";
+import {
+  LineOverflowError,
+  MAX_LINE_BYTES,
+  errorPayload,
+  parseMessage,
+  readLines,
+} from "../src/protocol.mjs";
 import { buildRegistry } from "../src/registry.mjs";
 
 const VERSIONS = { gateway: "0.1.0-test", pi_ai: "0.84.1", node: process.versions.node };
 
-function fauxState({ responses = [], exit } = {}) {
+function fauxState({ responses = [], retryPolicy, exit } = {}) {
   const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-model", reasoning: false }] });
   faux.setResponses(responses);
   const models = createModels();
   models.setProvider(faux.provider);
-  const state = createGatewayState({ env: {}, versions: VERSIONS, exit: exit ?? (() => {}) });
+  const state = createGatewayState({
+    env: {},
+    versions: VERSIONS,
+    retryPolicy,
+    exit: exit ?? (() => {}),
+  });
   state.registry = { models, customProviderIds: new Set() };
   return { state, faux };
 }
@@ -83,6 +95,9 @@ test("capabilities describes a known model and rejects malformed specs", async (
   assert.equal(capabilities.model.provider, "faux");
   assert.equal(capabilities.model.supports_tools, true);
   assert.equal(capabilities.model.supports_service_tier, false);
+  assert.equal(capabilities.model.billing_path, "api");
+  assert.equal(capabilities.model.auth_configured, true);
+  assert.equal(capabilities.model.auth_type, "api_key");
 
   await handleMessage(state, { protocol: 1, id: "cap-2", kind: "capabilities", model: "nope" }, send);
   assert.equal(sent.at(-1).error.code, "invalid_request");
@@ -117,6 +132,7 @@ test("complete returns started then exactly one submit-tool call", async () => {
     arguments: { ok: true },
   });
   assert.equal(result.stop_reason, "toolUse");
+  assert.equal(result.attempts, 1);
   assert.equal(typeof result.usage.total_tokens, "number");
   assert.ok(!JSON.stringify(result).includes("hidden reasoning"));
   assert.equal(state.active, null);
@@ -231,6 +247,94 @@ test("timeouts abort the completion with a retryable error", async () => {
   assert.equal(failure.error.retryable, true);
 });
 
+test("transient failures retry within one provider/model and report attempts", async () => {
+  const seenModels = [];
+  const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
+    responses: [
+      (context, options, providerState, model) => {
+        seenModels.push(`${model.provider}:${model.id}`);
+        return fauxAssistantMessage([], {
+          stopReason: "error",
+          errorMessage: "429 overloaded; echoed PROMPT_MARKER and sk-supersecret",
+        });
+      },
+      (context, options, providerState, model) => {
+        seenModels.push(`${model.provider}:${model.id}`);
+        return fauxAssistantMessage(
+          [fauxToolCall("submit_workflow_classification", { ok: true })],
+          { stopReason: "toolUse" },
+        );
+      },
+    ],
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  await handleMessage(state, completeRequest(), send);
+
+  assert.equal(sent.at(-1).kind, "result");
+  assert.equal(sent.at(-1).attempts, 2);
+  assert.equal(faux.state.callCount, 2);
+  assert.deepEqual(seenModels, ["faux:faux-model", "faux:faux-model"]);
+  assert.ok(!JSON.stringify(sent).includes("PROMPT_MARKER"));
+  assert.ok(!JSON.stringify(sent).includes("sk-supersecret"));
+});
+
+test("terminal quota and billing failures are never retried", async () => {
+  const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
+    responses: [
+      fauxAssistantMessage([], {
+        stopReason: "error",
+        errorMessage: "insufficient_quota billing token=supersecret PROMPT_MARKER",
+      }),
+      fauxAssistantMessage(
+        [fauxToolCall("submit_workflow_classification", { ok: true })],
+        { stopReason: "toolUse" },
+      ),
+    ],
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  await handleMessage(state, completeRequest(), send);
+
+  const failure = sent.at(-1);
+  assert.equal(failure.kind, "error");
+  assert.equal(failure.error.code, "billing");
+  assert.equal(failure.error.retryable, false);
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(failure.error.message, "provider quota or billing limit was reached");
+  assert.ok(!JSON.stringify(failure).includes("PROMPT_MARKER"));
+  assert.ok(!JSON.stringify(failure).includes("supersecret"));
+});
+
+test("cancellation interrupts retry backoff", async () => {
+  const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 2, baseDelayMs: 10_000, maxDelayMs: 10_000 },
+    responses: [
+      fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
+      fauxAssistantMessage(
+        [fauxToolCall("submit_workflow_classification", { ok: true })],
+        { stopReason: "toolUse" },
+      ),
+    ],
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  const completion = handleMessage(state, completeRequest(), send);
+  while (faux.state.callCount === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await handleMessage(
+    state,
+    { protocol: 1, id: "cancel-backoff", kind: "cancel", target_id: "req-1" },
+    send,
+  );
+  await completion;
+
+  assert.equal(faux.state.callCount, 1);
+  assert.ok(sent.some((message) => message.kind === "canceled" && message.id === "req-1"));
+});
+
 test("unknown models, unknown kinds, and unsupported options are stable errors", async () => {
   const { state } = fauxState();
   const { sent, send } = collector();
@@ -272,6 +376,40 @@ test("parseMessage rejects malformed lines and wrong protocol versions", () => {
   assert.match(parseMessage('{"protocol":2,"id":"x","kind":"hello"}').error, /unsupported protocol/);
   assert.match(parseMessage('{"protocol":1,"kind":"hello"}').error, /id/);
   assert.equal(parseMessage('{"protocol":1,"id":"x","kind":"hello"}').message.kind, "hello");
+});
+
+test("error payloads redact credential forms and never expose raw provider failures", () => {
+  const payload = errorPayload(
+    "provider",
+    "Bearer abc.def.ghi api_key=supersecret https://user:pass@example.test/v1?token=secret#fragment sk-supersecret",
+  );
+  const serialized = JSON.stringify(payload);
+  for (const secret of ["abc.def.ghi", "supersecret", "user", "pass", "token=secret", "fragment"]) {
+    assert.ok(!serialized.includes(secret), `leaked ${secret}`);
+  }
+
+  const classified = classifyProviderFailure("500 response echoed PROMPT_MARKER and sk-supersecret");
+  assert.equal(classified.code, "connection");
+  assert.equal(classified.message, "provider connection failed");
+  assert.ok(!classified.message.includes("PROMPT_MARKER"));
+
+  for (const transient of [
+    "rate limit reached for this API key",
+    "ResourceExhausted",
+    "EAI_AGAIN",
+    "stream ended before a terminal response event",
+  ]) {
+    assert.equal(classifyProviderFailure(transient).retryable, true, transient);
+  }
+  for (const terminal of [
+    "FreeUsageLimitError",
+    "usage_limit_reached",
+    "available balance is exhausted",
+  ]) {
+    const failure = classifyProviderFailure(terminal);
+    assert.equal(failure.code, "billing", terminal);
+    assert.equal(failure.retryable, false, terminal);
+  }
 });
 
 test("readLines splits frames and reports oversized lines without resync", async () => {
@@ -357,8 +495,22 @@ test("built-in OpenAI base URL override rejects unsafe endpoints", () => {
         credentialStore: { read: async () => undefined, list: async () => [] },
         openAIBaseUrl: "https://secret@example.test/v1",
       }),
-    /without embedded credentials/,
+    /without userinfo, query parameters, or fragments/,
   );
+  for (const unsafe of [
+    "https://gateway.example.test/v1?api_key=secret",
+    "https://gateway.example.test/v1#token",
+  ]) {
+    assert.throws(
+      () =>
+        buildRegistry({
+          authFile: "/unused",
+          credentialStore: { read: async () => undefined, list: async () => [] },
+          openAIBaseUrl: unsafe,
+        }),
+      /without userinfo, query parameters, or fragments/,
+    );
+  }
 });
 
 test("credential read-modify-write is serialized across gateway processes", async () => {
