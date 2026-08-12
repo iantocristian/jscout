@@ -15,6 +15,10 @@ const MAX_SUPPORTS: usize = 160;
 pub const MAX_WORKFLOW_CANDIDATES: usize = 31;
 const WORKFLOW_TRAVERSAL_NODE_LIMIT: usize = 100;
 const WORKFLOW_TRAVERSAL_EDGE_LIMIT: usize = 400;
+// Concepts may sit above repository -> module -> file -> card hierarchies.
+// Keep traversal bounded defensively, but deep enough that freshness reaches
+// exact source through the complete semantic-v1 stack.
+const FRESHNESS_RELATION_DEPTH: u8 = 8;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupportInput {
@@ -758,14 +762,20 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
         return Ok(Vec::new());
     }
     let mut statement = conn.prepare(
-        "SELECT a.id FROM semantic_artifacts a
+        "SELECT a.id, a.canonical_name, a.body_json FROM semantic_artifacts a
          WHERE NOT EXISTS(
            SELECT 1 FROM semantic_artifacts newer WHERE newer.supersedes_artifact_id=a.id
          )
-         ORDER BY a.id DESC LIMIT 200",
+         ORDER BY a.id DESC",
     )?;
-    let ids = statement
-        .query_map([], |row| row.get::<_, i64>(0))?
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let tokens: Vec<String> = query
         .split(|character: char| {
@@ -774,13 +784,10 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
         .filter(|token| token.len() > 1)
         .map(str::to_lowercase)
         .collect();
-    let mut artifacts = Vec::new();
-    for id in ids {
-        let Some(mut artifact) = load_artifact(conn, id)? else {
-            continue;
-        };
-        let name = artifact.name.as_deref().unwrap_or_default().to_lowercase();
-        let body = artifact.body.to_string().to_lowercase();
+    let mut ranked = Vec::new();
+    for (id, name, body_json) in rows {
+        let name = name.as_deref().unwrap_or_default().to_lowercase();
+        let body = body_json.to_lowercase();
         let matches = tokens
             .iter()
             .filter(|token| name.contains(token.as_str()) || body.contains(token.as_str()))
@@ -789,22 +796,32 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Semant
             continue;
         }
         let name_bonus = usize::from(!name.is_empty() && query.eq_ignore_ascii_case(&name));
-        artifact.relevance =
-            ((matches + name_bonus * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
-        artifacts.push(artifact);
+        let relevance = ((matches + name_bonus * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
+        ranked.push((id, relevance));
     }
-    artifacts.sort_by(|left, right| {
+    ranked.sort_by(|left, right| {
         right
-            .relevance
-            .total_cmp(&left.relevance)
-            .then_with(|| right.id.cmp(&left.id))
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| right.0.cmp(&left.0))
     });
-    artifacts.truncate(limit);
+    ranked.truncate(limit);
+    let ids = ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let relevance = ranked.into_iter().collect::<HashMap<_, _>>();
+    let mut artifacts = load_artifacts(conn, &ids)?;
+    for artifact in &mut artifacts {
+        artifact.relevance = relevance.get(&artifact.id).copied().unwrap_or_default();
+    }
     Ok(artifacts)
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
-    load_artifact_at_depth(conn, id, 3, &mut FreshnessContext::default())
+    load_artifact_at_depth(
+        conn,
+        id,
+        FRESHNESS_RELATION_DEPTH,
+        &mut FreshnessContext::default(),
+    )
 }
 
 /// Load several artifacts against one freshness context. Semantic retrieval
@@ -815,7 +832,9 @@ pub(crate) fn load_artifacts(conn: &Connection, ids: &[i64]) -> Result<Vec<Seman
     let mut context = FreshnessContext::default();
     let mut artifacts = Vec::with_capacity(ids.len());
     for &id in ids {
-        if let Some(artifact) = load_artifact_at_depth(conn, id, 3, &mut context)? {
+        if let Some(artifact) =
+            load_artifact_at_depth(conn, id, FRESHNESS_RELATION_DEPTH, &mut context)?
+        {
             context.memo.insert(id, artifact.freshness.clone());
             artifacts.push(artifact);
         }
@@ -840,10 +859,18 @@ impl FreshnessContext {
                     row.get(0)
                 })
                 .optional()?;
-            self.packages = Some(match root {
-                Some(root) => crate::scouting::plan::package_prefixes(std::path::Path::new(&root)),
-                None => Vec::new(),
-            });
+            let root = root.context(
+                "summary freshness requires the repository root recorded by `jscout index`",
+            )?;
+            let root = std::path::Path::new(&root);
+            if !root.is_dir() {
+                bail!(
+                    "summary freshness cannot resolve recorded repository root `{}`; \
+                     re-index this checkout or query with its original index",
+                    root.display()
+                );
+            }
+            self.packages = Some(crate::scouting::plan::package_prefixes(root));
         }
         Ok(self.packages.as_deref().expect("just populated"))
     }
@@ -1112,7 +1139,11 @@ fn child_adjusted_freshness(
             .unwrap_or_default()
             .to_string();
         let scope = name.clone().unwrap_or_default();
-        let packages = context.packages(conn)?.to_vec();
+        let packages = if matches!(level.as_str(), "module" | "repository") {
+            context.packages(conn)?.to_vec()
+        } else {
+            Vec::new()
+        };
         if !summary_child_set_current(conn, &packages, artifact_id, &level, &scope)? {
             worst = 2;
         }
@@ -1431,6 +1462,40 @@ mod tests {
             evidence_end_line: 1,
             confidence: "likely".into(),
         }
+    }
+
+    #[test]
+    fn semantic_search_does_not_hide_matches_older_than_two_hundred_rows() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("a.ts"), "export const a = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        for index in 0..=200 {
+            let body = if index == 0 {
+                json!({ "claim": "the uniquely ancient needle" })
+            } else {
+                json!({ "claim": format!("ordinary memory {index}") })
+            };
+            conn.execute(
+                "INSERT INTO semantic_artifacts(
+                   artifact_type, canonical_name, body_json, model, prompt_version,
+                   confidence, source_snapshot, created_at, artifact_fingerprint
+                 ) VALUES('annotation', ?1, ?2, 'test', 'test/v1', 'likely', ?3,
+                          strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?4)",
+                rusqlite::params![
+                    format!("memory-{index}"),
+                    body.to_string(),
+                    snapshot,
+                    format!("fingerprint-{index}"),
+                ],
+            )?;
+        }
+
+        let found = search(&conn, "uniquely ancient needle", 4)?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("memory-0"));
+        Ok(())
     }
 
     #[test]

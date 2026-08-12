@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{file_role, origin, structural};
+use crate::{file_role, origin, semantic, store, structural};
 
 #[derive(Debug, Clone)]
 pub struct EntityLookupOptions {
@@ -266,11 +266,82 @@ pub struct RepositoryOverview {
     pub areas: Vec<AreaOverview>,
     pub areas_truncated: bool,
     pub entity_inventory: Vec<InventoryCount>,
+    pub entity_inventory_truncated: bool,
     pub relations: Vec<RelationCount>,
     pub relations_truncated: bool,
 }
 
-pub fn overview(
+#[derive(Debug, Clone)]
+pub struct OverviewOptions {
+    pub file_origins: Vec<String>,
+    pub area_limit: usize,
+    pub relation_limit: usize,
+    pub include_semantic: bool,
+    pub semantic_limit: usize,
+    pub semantic_types: Vec<String>,
+    pub response_byte_limit: usize,
+}
+
+impl Default for OverviewOptions {
+    fn default() -> Self {
+        Self {
+            file_origins: origin::defaults(),
+            area_limit: 20,
+            relation_limit: 30,
+            include_semantic: false,
+            semantic_limit: 8,
+            semantic_types: Vec::new(),
+            response_byte_limit: 24_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticOverlayArtifact {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub name: Option<String>,
+    pub trust: String,
+    pub body: Value,
+    pub confidence: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub created_at: String,
+    pub freshness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticOverlay {
+    pub fresh_matched: usize,
+    pub excluded_non_fresh: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub artifacts: Vec<SemanticOverlayArtifact>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OverviewResponseBudget {
+    pub byte_limit: usize,
+    pub rendered_bytes: usize,
+    pub unbudgeted_bytes: usize,
+    pub truncated: bool,
+    pub omitted_semantic_artifacts: usize,
+    pub omitted_relations: usize,
+    pub omitted_areas: usize,
+    pub omitted_entity_inventory: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepositoryOverviewResponse {
+    #[serde(flatten)]
+    pub overview: RepositoryOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_overlay: Option<SemanticOverlay>,
+    pub response_budget: OverviewResponseBudget,
+}
+
+fn overview_unpinned(
     conn: &Connection,
     file_origins: &[String],
     area_limit: usize,
@@ -415,9 +486,190 @@ pub fn overview(
         areas,
         areas_truncated,
         entity_inventory,
+        entity_inventory_truncated: false,
         relations,
         relations_truncated,
     })
+}
+
+pub fn overview_response(
+    conn: &Connection,
+    options: &OverviewOptions,
+) -> Result<RepositoryOverviewResponse> {
+    if options.semantic_limit == 0 || options.semantic_limit > 100 {
+        bail!("semantic overview limit must be between 1 and 100");
+    }
+    if options.response_byte_limit == 0 {
+        bail!("overview response byte limit must be greater than zero");
+    }
+    validate_semantic_types(&options.semantic_types)?;
+    store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
+        let overview = overview_unpinned(
+            conn,
+            &options.file_origins,
+            options.area_limit,
+            options.relation_limit,
+        )?;
+        let semantic_overlay = options
+            .include_semantic
+            .then(|| semantic_overlay(conn, &options.semantic_types, options.semantic_limit))
+            .transpose()?;
+        let mut response = RepositoryOverviewResponse {
+            overview,
+            semantic_overlay,
+            response_budget: OverviewResponseBudget {
+                byte_limit: options.response_byte_limit,
+                ..Default::default()
+            },
+        };
+        apply_overview_budget(&mut response)?;
+        Ok(response)
+    })
+}
+
+fn validate_semantic_types(types: &[String]) -> Result<()> {
+    if let Some(invalid) = types.iter().find(|artifact_type| {
+        !matches!(
+            artifact_type.as_str(),
+            "workflow" | "card" | "concept" | "summary" | "annotation"
+        )
+    }) {
+        bail!("unknown semantic artifact type `{invalid}`");
+    }
+    Ok(())
+}
+
+fn semantic_overlay(
+    conn: &Connection,
+    configured_types: &[String],
+    limit: usize,
+) -> Result<SemanticOverlay> {
+    let default_types = ["summary", "concept", "workflow", "annotation"];
+    let types = if configured_types.is_empty() {
+        default_types.iter().copied().collect::<HashSet<_>>()
+    } else {
+        configured_types.iter().map(String::as_str).collect()
+    };
+    let mut statement = conn.prepare(
+        "SELECT artifact.id FROM semantic_artifacts artifact
+         WHERE NOT EXISTS(
+           SELECT 1 FROM semantic_artifacts successor
+           WHERE successor.supersedes_artifact_id=artifact.id
+         )
+         ORDER BY artifact.id DESC",
+    )?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let artifacts = semantic::load_artifacts(conn, &ids)?;
+    let mut excluded_non_fresh = 0;
+    let mut artifacts = artifacts
+        .into_iter()
+        .filter(|artifact| types.contains(artifact.artifact_type.as_str()))
+        .filter_map(|artifact| {
+            if artifact.freshness != "fresh" {
+                excluded_non_fresh += 1;
+                return None;
+            }
+            Some(artifact)
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| {
+        semantic_overlay_priority(left)
+            .cmp(&semantic_overlay_priority(right))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let fresh_matched = artifacts.len();
+    artifacts.truncate(limit);
+    let artifacts = artifacts
+        .into_iter()
+        .map(|artifact| SemanticOverlayArtifact {
+            id: artifact.id,
+            artifact_type: artifact.artifact_type,
+            name: artifact.name,
+            trust: artifact.trust,
+            body: artifact.body,
+            confidence: artifact.confidence,
+            model: artifact.model,
+            prompt_version: artifact.prompt_version,
+            created_at: artifact.created_at,
+            freshness: artifact.freshness,
+        })
+        .collect::<Vec<_>>();
+    let returned = artifacts.len();
+    Ok(SemanticOverlay {
+        fresh_matched,
+        excluded_non_fresh,
+        returned,
+        truncated: returned < fresh_matched,
+        artifacts,
+    })
+}
+
+fn semantic_overlay_priority(artifact: &semantic::SemanticArtifact) -> u8 {
+    match (artifact.artifact_type.as_str(), artifact.name.as_deref()) {
+        ("summary", Some("repo")) => 0,
+        ("concept", _) => 1,
+        ("workflow", _) => 2,
+        ("annotation", _) => 3,
+        ("summary", Some(name)) if name.starts_with("module:") => 4,
+        ("summary", _) => 5,
+        ("card", _) => 6,
+        _ => 7,
+    }
+}
+
+fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()> {
+    let byte_limit = response.response_budget.byte_limit;
+    let unbudgeted = settle_overview_bytes(response)?;
+    response.response_budget.unbudgeted_bytes = unbudgeted;
+    settle_overview_bytes(response)?;
+    while response.response_budget.rendered_bytes > byte_limit {
+        response.response_budget.truncated = true;
+        if let Some(overlay) = response.semantic_overlay.as_mut()
+            && overlay.artifacts.pop().is_some()
+        {
+            overlay.returned = overlay.artifacts.len();
+            overlay.truncated = true;
+            response.response_budget.omitted_semantic_artifacts += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
+        if response.overview.relations.pop().is_some() {
+            response.overview.relations_truncated = true;
+            response.response_budget.omitted_relations += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
+        if response.overview.areas.pop().is_some() {
+            response.overview.areas_truncated = true;
+            response.response_budget.omitted_areas += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
+        if response.overview.entity_inventory.pop().is_some() {
+            response.overview.entity_inventory_truncated = true;
+            response.response_budget.omitted_entity_inventory += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
+        let minimum = settle_overview_bytes(response)?;
+        bail!(
+            "overview response byte limit {byte_limit} is below the minimum envelope ({minimum} bytes)"
+        );
+    }
+    Ok(())
+}
+
+fn settle_overview_bytes(response: &mut RepositoryOverviewResponse) -> Result<usize> {
+    for _ in 0..8 {
+        let rendered = serde_json::to_string_pretty(response)?.len();
+        if response.response_budget.rendered_bytes == rendered {
+            return Ok(rendered);
+        }
+        response.response_budget.rendered_bytes = rendered;
+    }
+    Ok(serde_json::to_string_pretty(response)?.len())
 }
 
 fn repository_area(path: &str) -> String {
@@ -451,8 +703,12 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{EntityLookupOptions, entities, overview, repository_area};
-    use crate::{indexer, store};
+    use serde_json::json;
+
+    use super::{
+        EntityLookupOptions, OverviewOptions, entities, overview_response, repository_area,
+    };
+    use crate::{indexer, semantic, store, structural};
 
     #[test]
     fn entity_lookup_filters_evidence_and_overview_is_bounded() -> Result<()> {
@@ -494,7 +750,15 @@ mod tests {
         assert_eq!(bounded.matched_entities, 2);
         assert!(bounded.truncated);
 
-        let overview = overview(&conn, &crate::origin::defaults(), 1, 2)?;
+        let overview = overview_response(
+            &conn,
+            &OverviewOptions {
+                area_limit: 1,
+                relation_limit: 2,
+                ..Default::default()
+            },
+        )?
+        .overview;
         assert_eq!(overview.areas.len(), 1);
         assert_eq!(overview.areas[0].path, "packages/api");
         assert!(overview.relations.len() <= 2);
@@ -512,5 +776,61 @@ mod tests {
             repository_area("dependency:@scope/pkg@2.0.0#def456/src/index.ts"),
             "dependency:@scope/pkg@2.0.0#def456"
         );
+    }
+
+    #[test]
+    fn semantic_overview_includes_only_current_fresh_memory() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("flow.ts"),
+            "export function start() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = structural::resolve_current_anchor(&conn, "flow.ts:start")?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        semantic::annotate(
+            repo.path(),
+            &conn,
+            &semantic::AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(anchor.clone()),
+                body: json!({ "purpose": "starts the flow" }),
+                supports: vec![semantic::SupportInput {
+                    claim_path: "/purpose".into(),
+                    anchor,
+                    role: None,
+                    evidence_file: "flow.ts".into(),
+                    evidence_start_line: 1,
+                    evidence_end_line: 1,
+                    confidence: "likely".into(),
+                }],
+                confidence: "likely".into(),
+                snapshot,
+                supersedes: None,
+            },
+        )?;
+
+        let options = OverviewOptions {
+            include_semantic: true,
+            semantic_types: vec!["card".into()],
+            ..Default::default()
+        };
+        let fresh = overview_response(&conn, &options)?;
+        let overlay = fresh.semantic_overlay.expect("overlay requested");
+        assert_eq!(overlay.returned, 1);
+        assert_eq!(overlay.excluded_non_fresh, 0);
+        assert_eq!(overlay.artifacts[0].freshness, "fresh");
+
+        fs::write(
+            repo.path().join("flow.ts"),
+            "export function start() { return 2; }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let drifted = overview_response(&conn, &options)?;
+        let overlay = drifted.semantic_overlay.expect("overlay requested");
+        assert!(overlay.artifacts.is_empty());
+        assert_eq!(overlay.excluded_non_fresh, 1);
+        Ok(())
     }
 }

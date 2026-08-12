@@ -21,12 +21,14 @@ pub const MAX_ARTIFACT_LIMIT: usize = 100;
 pub const MAX_RELATION_LIMIT: usize = 200;
 pub const MAX_SOURCE_LIMIT: usize = 100;
 const MAX_SOURCE_BYTE_LIMIT: usize = 16_000;
-const EVIDENCE_RELATION_DEPTH: usize = 3;
+const EVIDENCE_RELATION_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub query: String,
     pub artifact_id: Option<i64>,
+    pub anchor: Option<String>,
+    pub related_to: Option<i64>,
     pub artifact_types: Vec<String>,
     pub freshness: Vec<String>,
     pub include_superseded: bool,
@@ -45,6 +47,8 @@ impl Default for QueryOptions {
         Self {
             query: String::new(),
             artifact_id: None,
+            anchor: None,
+            related_to: None,
             artifact_types: Vec::new(),
             freshness: Vec::new(),
             include_superseded: false,
@@ -68,6 +72,7 @@ pub struct ArtifactView {
     pub artifact_type: String,
     pub name: Option<String>,
     pub current: bool,
+    pub superseded_by: Option<i64>,
     pub trust: String,
     pub body: Value,
     pub model: String,
@@ -109,6 +114,7 @@ pub struct SourceEvidence {
     pub root_artifact_id: i64,
     pub evidence_artifact_id: i64,
     pub via_artifact_ids: Vec<i64>,
+    pub via_relations: Vec<EvidenceHop>,
     pub claim_path: String,
     pub relationship: String,
     pub anchor: String,
@@ -124,6 +130,13 @@ pub struct SourceEvidence {
     pub source_original_bytes: usize,
     pub source_rendered_bytes: usize,
     pub source_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvidenceHop {
+    pub artifact_id: i64,
+    pub relation: String,
+    pub claim_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -157,6 +170,7 @@ struct Candidate {
     name: Option<String>,
     body_json: String,
     current: bool,
+    superseded_by: Option<i64>,
     relevance: f64,
 }
 
@@ -177,6 +191,10 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
         let current = candidates
             .iter()
             .map(|candidate| (candidate.id, candidate.current))
+            .collect::<HashMap<_, _>>();
+        let superseded_by = candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.superseded_by))
             .collect::<HashMap<_, _>>();
 
         let mut loaded = semantic::load_artifacts(conn, &candidate_ids)?;
@@ -207,7 +225,14 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             };
         let semantic_artifacts = loaded
             .into_iter()
-            .map(|artifact| artifact_view(artifact, &current, options.supports_per_artifact))
+            .map(|artifact| {
+                artifact_view(
+                    artifact,
+                    &current,
+                    &superseded_by,
+                    options.supports_per_artifact,
+                )
+            })
             .collect();
         let mut result = QueryResult {
             snapshot,
@@ -255,6 +280,14 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     {
         bail!("unknown semantic freshness `{value}`");
     }
+    if let Some(value) = options.artifact_types.iter().find(|value| {
+        !matches!(
+            value.as_str(),
+            "workflow" | "card" | "concept" | "summary" | "annotation"
+        )
+    }) {
+        bail!("unknown semantic artifact type `{value}`");
+    }
     Ok(())
 }
 
@@ -265,21 +298,36 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
                 NOT EXISTS(
                   SELECT 1 FROM semantic_artifacts successor
                   WHERE successor.supersedes_artifact_id=artifact.id
-                ) AS current
+                ) AS current,
+                (SELECT successor.id FROM semantic_artifacts successor
+                 WHERE successor.supersedes_artifact_id=artifact.id) AS superseded_by
          FROM semantic_artifacts artifact
          WHERE (?1 IS NULL OR artifact.id=?1)
+           AND (?2 IS NULL OR EXISTS(
+             SELECT 1 FROM semantic_supports support
+             WHERE support.artifact_id=artifact.id AND support.anchor_key=?2
+           ))
+           AND (?3 IS NULL OR EXISTS(
+             SELECT 1 FROM semantic_relations relation
+             WHERE (relation.src_artifact_id=artifact.id AND relation.dst_artifact_id=?3)
+                OR (relation.dst_artifact_id=artifact.id AND relation.src_artifact_id=?3)
+           ))
          ORDER BY artifact.id DESC",
     )?;
-    let rows = statement.query_map([options.artifact_id], |row| {
-        Ok(Candidate {
-            id: row.get(0)?,
-            artifact_type: row.get(1)?,
-            name: row.get(2)?,
-            body_json: row.get(3)?,
-            current: row.get(4)?,
-            relevance: 0.0,
-        })
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params![options.artifact_id, options.anchor, options.related_to],
+        |row| {
+            Ok(Candidate {
+                id: row.get(0)?,
+                artifact_type: row.get(1)?,
+                name: row.get(2)?,
+                body_json: row.get(3)?,
+                current: row.get(4)?,
+                superseded_by: row.get(5)?,
+                relevance: 0.0,
+            })
+        },
+    )?;
     let mut candidates = Vec::new();
     for row in rows {
         let candidate = row?;
@@ -345,6 +393,7 @@ fn tokens(query: &str) -> Vec<String> {
 fn artifact_view(
     mut artifact: semantic::SemanticArtifact,
     current: &HashMap<i64, bool>,
+    superseded_by: &HashMap<i64, Option<i64>>,
     support_limit: usize,
 ) -> ArtifactView {
     let support_count = artifact.supports.len();
@@ -355,6 +404,7 @@ fn artifact_view(
         artifact_type: artifact.artifact_type,
         name: artifact.name,
         current: current.get(&artifact.id).copied().unwrap_or(false),
+        superseded_by: superseded_by.get(&artifact.id).copied().flatten(),
         trust: artifact.trust,
         body: artifact.body,
         model: artifact.model,
@@ -388,6 +438,7 @@ fn related_artifacts(
     }
 
     let mut rows = Vec::new();
+    let mut matched = 0_usize;
     let mut statement = conn.prepare_cached(
         "SELECT relation.src_artifact_id, relation.dst_artifact_id,
                 relation.relation, relation.claim_path, relation.confidence,
@@ -403,7 +454,7 @@ fn related_artifacts(
          ORDER BY relation.relation, relation.claim_path,
                   relation.src_artifact_id, relation.dst_artifact_id",
     )?;
-    'roots: for &root_id in root_ids {
+    for &root_id in root_ids {
         let mapped = statement.query_map([root_id], |row| {
             let source: i64 = row.get(0)?;
             let target: i64 = row.get(1)?;
@@ -419,14 +470,14 @@ fn related_artifacts(
             })
         })?;
         for row in mapped {
-            rows.push(row?);
-            if rows.len() > limit {
-                break 'roots;
+            let row = row?;
+            matched += 1;
+            if rows.len() < limit {
+                rows.push(row);
             }
         }
     }
-    let omitted = rows.len().saturating_sub(limit);
-    rows.truncate(limit);
+    let omitted = matched.saturating_sub(rows.len());
     let related_ids = rows
         .iter()
         .map(|row| row.related_id)
@@ -523,7 +574,7 @@ fn source_evidence(
     Ok((evidence, omitted_by_origin, omitted))
 }
 
-fn evidence_paths(conn: &Connection, root_id: i64) -> Result<BTreeMap<i64, Vec<i64>>> {
+fn evidence_paths(conn: &Connection, root_id: i64) -> Result<BTreeMap<i64, Vec<EvidenceHop>>> {
     let mut paths = BTreeMap::from([(root_id, Vec::new())]);
     let mut queue = VecDeque::from([(root_id, 0_usize)]);
     while let Some((artifact_id, depth)) = queue.pop_front() {
@@ -531,18 +582,26 @@ fn evidence_paths(conn: &Connection, root_id: i64) -> Result<BTreeMap<i64, Vec<i
             continue;
         }
         let mut statement = conn.prepare_cached(
-            "SELECT DISTINCT dst_artifact_id FROM semantic_relations
-             WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
+            "SELECT dst_artifact_id, relation, claim_path FROM semantic_relations
+             WHERE src_artifact_id=?1
+             ORDER BY dst_artifact_id, relation, claim_path",
         )?;
-        let rows = statement.query_map([artifact_id], |row| row.get::<_, i64>(0))?;
+        let rows = statement.query_map([artifact_id], |row| {
+            Ok(EvidenceHop {
+                artifact_id: row.get(0)?,
+                relation: row.get(1)?,
+                claim_path: row.get(2)?,
+            })
+        })?;
         let parent_path = paths.get(&artifact_id).cloned().unwrap_or_default();
         for row in rows {
-            let child_id = row?;
+            let hop = row?;
+            let child_id = hop.artifact_id;
             if paths.contains_key(&child_id) {
                 continue;
             }
             let mut path = parent_path.clone();
-            path.push(child_id);
+            path.push(hop);
             paths.insert(child_id, path);
             queue.push_back((child_id, depth + 1));
         }
@@ -577,14 +636,15 @@ fn evidence_file(conn: &Connection, path: &str) -> Result<Option<EvidenceFile>> 
 fn unavailable_source(
     root_artifact_id: i64,
     evidence_artifact_id: i64,
-    via_artifact_ids: Vec<i64>,
+    via_relations: Vec<EvidenceHop>,
     support: semantic::SemanticSupport,
     status: &str,
 ) -> SourceEvidence {
     SourceEvidence {
         root_artifact_id,
         evidence_artifact_id,
-        via_artifact_ids,
+        via_artifact_ids: via_relations.iter().map(|hop| hop.artifact_id).collect(),
+        via_relations,
         claim_path: support.claim_path,
         relationship: support.relationship,
         anchor: support.anchor,
@@ -608,7 +668,7 @@ fn render_source_evidence(
     conn: &Connection,
     root_artifact_id: i64,
     evidence_artifact_id: i64,
-    via_artifact_ids: Vec<i64>,
+    via_relations: Vec<EvidenceHop>,
     support: semantic::SemanticSupport,
     file: EvidenceFile,
     byte_limit: usize,
@@ -616,7 +676,8 @@ fn render_source_evidence(
     let mut result = SourceEvidence {
         root_artifact_id,
         evidence_artifact_id,
-        via_artifact_ids,
+        via_artifact_ids: via_relations.iter().map(|hop| hop.artifact_id).collect(),
+        via_relations,
         claim_path: support.claim_path,
         relationship: support.relationship,
         anchor: support.anchor,

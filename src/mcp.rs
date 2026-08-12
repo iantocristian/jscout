@@ -314,13 +314,16 @@ fn tool_defs(profile: ToolProfile) -> Value {
         },
         {
             "name": "repository_overview",
-            "description": "Deterministic repository overview: corpus totals, file origins/roles, bounded top-level areas, entity inventory, and structural relation counts. Contains no generated prose.",
+            "description": "Deterministic repository overview: corpus totals, file origins/roles, bounded top-level areas, entity inventory, and structural relation counts. Optionally attaches current fresh semantic artifacts as a separately labelled untrusted overlay.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"] },
                     "area_limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                     "relation_limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 100 },
+                    "include_semantic": { "type": "boolean", "default": false },
+                    "semantic_limit": { "type": "integer", "default": 8, "minimum": 1, "maximum": 100 },
+                    "semantic_types": { "type": "array", "items": { "type": "string", "enum": ["workflow", "card", "concept", "summary", "annotation"] }, "description": "Defaults to summaries, concepts, workflows, and annotations; cards require explicit opt-in" },
                     "response_bytes": { "type": "integer", "default": 24000 }
                 }
             }
@@ -333,6 +336,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "properties": {
                     "query": { "type": "string", "default": "", "description": "Optional lexical query over artifact names and bodies" },
                     "artifact": { "type": "integer", "description": "Load one artifact by id; historical ids are allowed" },
+                    "anchor": { "type": "string", "description": "Restrict to artifacts with direct evidence on this exact anchor" },
+                    "related_to": { "type": "integer", "description": "Restrict to artifacts directly related to this artifact id" },
                     "types": { "type": "array", "items": { "type": "string", "enum": ["workflow", "card", "concept", "summary", "annotation"] } },
                     "freshness": { "type": "array", "items": { "type": "string", "enum": ["fresh", "degraded", "stale"] } },
                     "include_superseded": { "type": "boolean", "default": false },
@@ -431,7 +436,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
                     "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Backing-file origin allowlist. Dependency nodes are excluded unless explicitly included" }
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Backing-file origin allowlist. Dependency nodes are excluded unless explicitly included" },
+                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1 }
                 },
                 "required": ["anchor"]
             }
@@ -763,19 +769,21 @@ fn call_tool(
             if profile == ToolProfile::Baseline {
                 anyhow::bail!("repository_overview is unavailable in the baseline MCP profile");
             }
-            let result = surface::overview(
+            let result = surface::overview_response(
                 conn,
-                &json_string_array_or(args, "origins", crate::origin::defaults),
-                (args["area_limit"].as_u64().unwrap_or(20) as usize).min(100),
-                (args["relation_limit"].as_u64().unwrap_or(30) as usize).min(100),
+                &surface::OverviewOptions {
+                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    area_limit: (args["area_limit"].as_u64().unwrap_or(20) as usize).min(100),
+                    relation_limit: (args["relation_limit"].as_u64().unwrap_or(30) as usize)
+                        .min(100),
+                    include_semantic: args["include_semantic"].as_bool().unwrap_or(false),
+                    semantic_limit: (args["semantic_limit"].as_u64().unwrap_or(8) as usize)
+                        .min(100),
+                    semantic_types: json_string_array(args, "semantic_types"),
+                    response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                },
             )?;
-            // Preserve the compact inventory longest: relation counts are easiest to
-            // re-derive, followed by area detail, when the whole-response budget binds.
-            render_bounded_object_arrays(
-                serde_json::to_value(result)?,
-                &["relations", "areas", "entity_inventory"],
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
-            )
+            Ok(serde_json::to_string_pretty(&result)?)
         }
         "semantic_memory" => {
             if profile == ToolProfile::Baseline {
@@ -787,6 +795,8 @@ fn call_tool(
                 &semantic_query::QueryOptions {
                     query: args["query"].as_str().unwrap_or("").to_string(),
                     artifact_id: args["artifact"].as_i64(),
+                    anchor: args["anchor"].as_str().map(str::to_string),
+                    related_to: args["related_to"].as_i64(),
                     artifact_types: json_string_array(args, "types"),
                     freshness: json_string_array(args, "freshness"),
                     include_superseded: args["include_superseded"].as_bool().unwrap_or(false),
@@ -849,7 +859,11 @@ fn call_tool(
                     .is_some_and(|roles| !roles.is_empty()),
             };
             let result = structural::neighborhood(conn, anchor, &options)?;
-            Ok(serde_json::to_string_pretty(&result)?)
+            render_bounded_object_arrays(
+                serde_json::to_value(result)?,
+                &["edges", "nodes"],
+                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+            )
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
@@ -924,6 +938,9 @@ fn render_bounded_object_arrays(
             );
         }
         response["response_budget"]["truncated"] = json!(true);
+        if response.get("truncated").is_some() {
+            response["truncated"] = json!(true);
+        }
         let remaining: usize = fields
             .iter()
             .map(|field| response[*field].as_array().map_or(0, Vec::len))
@@ -1093,7 +1110,10 @@ fn semantic_artifact_metrics(text: &str) -> SemanticArtifactMetrics {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return SemanticArtifactMetrics::default();
     };
-    let Some(artifacts) = value["semantic_artifacts"].as_array() else {
+    let artifacts = value["semantic_artifacts"]
+        .as_array()
+        .or_else(|| value["semantic_overlay"]["artifacts"].as_array());
+    let Some(artifacts) = artifacts else {
         return SemanticArtifactMetrics::default();
     };
     let mut metrics = SemanticArtifactMetrics {
@@ -1157,6 +1177,21 @@ mod tests {
         let properties = &paths["inputSchema"]["properties"];
         assert_eq!(properties["node_limit"]["maximum"], 200);
         assert_eq!(properties["edge_limit"]["maximum"], 800);
+    }
+
+    #[test]
+    fn neighborhood_schema_has_a_whole_response_budget() {
+        let structural = tool_defs(ToolProfile::Structural);
+        let neighborhood = structural
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == "neighborhood")
+            .expect("neighborhood definition");
+        assert_eq!(
+            neighborhood["inputSchema"]["properties"]["response_bytes"]["default"],
+            24_000
+        );
     }
 
     #[test]
@@ -1609,5 +1644,19 @@ mod tests {
         assert_eq!(metrics.fresh, 1);
         assert_eq!(metrics.degraded, 1);
         assert_eq!(metrics.stale, 1);
+
+        let overlay = semantic_artifact_metrics(
+            &json!({
+                "semantic_overlay": {
+                    "artifacts": [
+                        { "freshness": "fresh" },
+                        { "freshness": "fresh" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(overlay.returned, 2);
+        assert_eq!(overlay.fresh, 2);
     }
 }
