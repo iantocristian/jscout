@@ -503,15 +503,38 @@ A companion Node sidecar hosting the TypeScript checker (LanguageService or
 tsserver — an implementation decision, not a plan commitment) behind the
 same versioned JSONL-over-stdio pattern as the pi-ai gateway: `hello`,
 capabilities, query, cancellation, shutdown, request IDs, stable error
-codes. The sidecar answers exactly one kind of question in its first
-version: type-at-position — given a file, position, and snapshot, return
-the declared type's symbol name and declaration site(s).
+codes. The sidecar answers exactly one bounded question in its first version:
+resolve a statically named member at one indexed call occurrence. The request
+contains the repository-relative file, indexed file hash, exact call,
+receiver-expression, and property spans. The response contains the receiver's
+declared type and the called property's declaration site(s), grouped by the
+configured or inferred TypeScript project that produced the answer.
 
-Diagnostics are never requested, never read, and never surfaced. A broken
-or non-compiling project answers type queries like any other; compile
-errors cost the operator nothing. When the checker's answer is an error
-type or `any`-degraded, the sidecar reports "unknown" and jscout records
-nothing — fail-closed, no guessed edge.
+This requires an extraction/schema change before the sidecar is useful.
+`member_calls.start` currently identifies the start of the whole call, and the
+stored `object` covers only shallow identifier/`this` receivers; neither can
+identify the receiver in `dbs.wave.card.insert()`. G10 must persist exact
+`[start,end)` spans for the call, receiver expression, and property, including
+nested, `this.`-qualified, and optional-chain forms, and force affected files
+through re-extraction. Every request is bound to those spans and the indexed
+source hash. The sidecar accepts only indexed repository-relative query paths
+and rejects traversal, hash mismatches, and query locations outside the
+configured repository root.
+
+A file can belong to multiple `tsconfig` projects with different ambient types
+or path mappings. Project discovery and selection must therefore be
+deterministic: enumerate every owning configured project (or one explicitly
+identified inferred project), attach a stable project ID and effective compiler
+options to each answer, and never choose a target by server load order. Equal
+answers may coalesce. Conflicting targets remain a visible `possible` candidate
+set, or `unknown` when they cannot be mapped safely; they never become one
+arbitrary `likely` edge.
+
+Diagnostics are never enumerated, used as a gate, or surfaced. A broken or
+non-compiling project still attempts the requested member query rather than
+turning enrichment into a compile check. When the answer is an error type or
+`any`-degraded, the sidecar reports `unknown` and jscout records nothing —
+fail-closed, no guessed edge.
 
 The sidecar prefers the repository's own `typescript` installation so
 answers match the project's language version; a bundled fallback is
@@ -519,27 +542,57 @@ permitted but its version is always recorded in provenance. Absent Node,
 absent TypeScript, or an unhealthy sidecar leaves every existing surface
 working exactly as today.
 
+Checker program construction and queries may block the Node event loop. The
+protocol host must keep cancellation responsive by isolating checker work in a
+terminable worker or child process. Rust also enforces a hard per-request
+deadline and terminates an unresponsive sidecar; writing a cancel message alone
+is not considered cancellation support.
+
 ### Consumption
 
 Enrichment is an explicit pass (`jscout enrich`), never part of `index` or
-`watch` — the same rule that keeps model calls out of indexing. The pass
-takes indexed member-call sites whose receivers are property-hub
-candidates, asks the sidecar for the receiver type, and where the checker
-names a declaration that maps to an indexed symbol, records a targeted
-edge with provenance `checker` at confidence `likely` — narrowing a
-`possible` hub fan-out without deleting it. Contract-plane consumers may
-attach declared-type facts as documentary evidence under the same
-provenance.
+`watch`; deterministic indexing remains Node-free. The pass takes indexed
+member-call occurrences whose receivers currently reach property-hub
+candidates, asks the sidecar to resolve the called property on that receiver,
+and maps returned declaration sites to indexed symbol anchors.
 
-Checker edges are stored against the snapshot plus a checker-environment
-fingerprint (TypeScript version, tsconfig set, lockfile identity). Either
-drifting invalidates the enrichment, mirroring how module-resolution
-inputs already participate in the structural snapshot.
+Enrichment is occurrence-specific. A single `dbs.wave.card.insert()` result may
+add an edge from that call's enclosing file/symbol to `CardTable.insert`; it
+must never promote or replace the shared `member:insert` hub edge, which would
+leak the answer into unrelated `.insert()` calls. One unambiguous mapped target
+is `likely` with provenance `checker`. Multiple valid declaration targets —
+from unions, overload ownership, inheritance, or disagreeing projects — remain
+separate `possible` candidates. Existing hubs are retained for unexplained
+dynamic calls. Contract-plane consumers may attach the receiver's declared type
+as documentary evidence under the same provenance.
+
+Checker results are canonical typed facts, not writes made directly to the
+disposable graph projection. A dedicated enrichment table records at least the
+caller/file identity and hash, exact occurrence spans, project ID, resolved
+target anchor and fingerprint, confidence/provenance, and checker-input
+fingerprint. Projection rebuilds include only fresh facts and recreate their
+targeted edges; they neither erase the canonical facts nor make stale facts
+traversable.
+
+The checker-input fingerprint covers the exact TypeScript package/version,
+normalized config inheritance, effective compiler options, project selection,
+and identities/hashes of the config, source, and declaration inputs loaded by
+the checker. A lockfile hash may contribute but is not a freshness certificate
+for ambient/generated declarations or effective compiler settings. The pass is
+planned against one structural snapshot and publishes a completed batch in one
+transaction after rechecking that snapshot, occurrence source hashes, target
+anchors, and checker inputs; drift publishes nothing from the raced batch.
 
 Verification follows the gateway precedent: fake-sidecar protocol,
-unknown-type, crash, and cancellation tests in the default suite; no real
-TypeScript process in default tests; a doctor command reporting the
-resolved TypeScript version and project health before any enrichment run.
+unknown-type, crash, enforced-timeout, cancellation, and outside-root tests in
+the Rust suite. The sidecar's own suite uses a pinned TypeScript library and
+small fixtures for nested/`this`/optional receivers, two same-named methods on
+different receiver types, inheritance/overrides, multiple declaration
+candidates, overlapping `tsconfig` ownership, broken projects, and changed
+ambient declarations. Default tests do not launch a repository-sized checker
+process. A doctor command reports the resolved TypeScript version, discovered
+projects, configuration problems, and sidecar readiness — not diagnostic or
+compilation health — before enrichment runs.
 
 ### Why checker answers are `likely`, never `certain`
 
@@ -619,11 +672,12 @@ jscout provides a different repository-level surface:
 - bounded snapshot-labelled context for agent consumption;
 - persistent evidence-backed semantic and agent memory across sessions.
 
-Do not reimplement checker machinery. Optional type-at-position enrichment
-through a checker sidecar is planned as G10 (post-v1) — a deliberate pull of
-the original deferral trigger, scoped to receiver identity only and recorded
-at `likely` with `checker` provenance. Everything else typed navigation
-offers remains the LSP's job.
+Do not reimplement checker machinery. Optional occurrence-scoped
+receiver/member enrichment through a checker sidecar is planned as G10
+(post-v1) — a deliberate pull of the original deferral trigger. Unambiguous
+answers are recorded at `likely` with `checker` provenance; ambiguous answers
+remain candidates. Everything else typed navigation offers remains the LSP's
+job.
 
 ## Deferred or out of scope
 
