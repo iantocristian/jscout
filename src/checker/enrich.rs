@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use super::protocol::{DeclarationSite, InputValidation, MemberQuery, TypeScriptIdentity};
+use super::protocol::{
+    DeclarationSite, InputValidation, MemberQuery, ProjectAnswer, TypeScriptIdentity,
+};
 
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
@@ -66,8 +68,17 @@ struct ValidatedInput {
     project_id: String,
     query_file: String,
     kind: String,
+    role: &'static str,
     path: String,
     source_hash: String,
+}
+
+/// What one occurrence's whole checker answer contributed.
+#[derive(Debug, Default)]
+struct OccurrenceOutcome {
+    facts: Vec<PendingFact>,
+    unknown_answers: usize,
+    unmapped_declarations: usize,
 }
 
 struct PublishPlan<'a> {
@@ -139,8 +150,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_identity = Some(result.typescript.clone());
         }
 
-        let mut occurrence_facts = Vec::new();
-        for answer in result.projects {
+        for answer in &result.projects {
             validation
                 .entry((
                     answer.project_id.clone(),
@@ -151,47 +161,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                     project_id: answer.project_id.clone(),
                     fingerprint: answer.checker_input_fingerprint.clone(),
                 });
-            if answer.status != "resolved" {
-                unknown_answers += 1;
-                continue;
-            }
-            let mut occurrence_unmapped = 0_usize;
-            for declaration in answer.declarations {
-                match map_declaration(&conn, &occurrence.member, &declaration)? {
-                    Some(target) => occurrence_facts.push(PendingFact {
-                        occurrence: occurrence.clone(),
-                        project_id: answer.project_id.clone(),
-                        receiver_type: answer.receiver_type.clone(),
-                        target,
-                        confidence: String::new(),
-                        input_fingerprint: answer.checker_input_fingerprint.clone(),
-                    }),
-                    None => occurrence_unmapped += 1,
-                }
-            }
-            unmapped_declarations += occurrence_unmapped;
-            occurrence_facts.sort_by(|left, right| {
-                (&left.project_id, &left.target.anchor)
-                    .cmp(&(&right.project_id, &right.target.anchor))
-            });
-            occurrence_facts.dedup_by(|left, right| {
-                left.project_id == right.project_id && left.target.anchor == right.target.anchor
-            });
-            let target_count = occurrence_facts
-                .iter()
-                .map(|fact| fact.target.anchor.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            // Ambiguity is judged over the checker's WHOLE answer: a valid
-            // declaration that failed to map still means the checker saw more
-            // than one target, so the survivors never inherit a lone `likely`
-            // the checker did not assert.
-            let unambiguous = target_count == 1 && occurrence_unmapped == 0;
-            for fact in &mut occurrence_facts {
-                fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
-            }
         }
-        facts.extend(occurrence_facts);
+        let outcome = map_occurrence(&conn, occurrence, &result.projects)?;
+        unknown_answers += outcome.unknown_answers;
+        unmapped_declarations += outcome.unmapped_declarations;
+        facts.extend(outcome.facts);
         if (index + 1) % 100 == 0 {
             eprintln!(
                 "checker enrichment: queried {}/{} occurrences",
@@ -260,16 +234,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     }
     let validated_inputs = validated_inputs
         .into_iter()
-        .map(
-            |((project_id, query_file, kind, path), source_hash)| ValidatedInput {
+        .map(|((project_id, query_file, kind, path), source_hash)| {
+            Ok(ValidatedInput {
+                role: input_role(&conn, &kind, &path)?,
                 project_id,
                 query_file,
                 kind,
                 path,
                 source_hash,
-            },
-        )
-        .collect::<Vec<_>>();
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let identity = checker_identity.unwrap_or(capabilities.typescript.clone());
     let batch_fingerprint = batch_fingerprint(&validation_entries);
     let batch_id = publish(
@@ -355,6 +330,59 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
     Ok(())
 }
 
+/// Turn one occurrence's whole checker answer into pending facts.
+///
+/// Ambiguity is judged over the checker's WHOLE answer, not over the subset
+/// that happened to map: a valid declaration jscout cannot anchor (an
+/// interface member, a `.d.ts` overload, a declaration outside the root) still
+/// means the checker saw more than one target, so the survivors never inherit
+/// a lone `likely` the checker did not assert.
+fn map_occurrence(
+    conn: &Connection,
+    occurrence: &Occurrence,
+    answers: &[ProjectAnswer],
+) -> Result<OccurrenceOutcome> {
+    let mut outcome = OccurrenceOutcome::default();
+    for answer in answers {
+        if answer.status != "resolved" {
+            outcome.unknown_answers += 1;
+            continue;
+        }
+        let mut answer_unmapped = 0_usize;
+        for declaration in &answer.declarations {
+            match map_declaration(conn, &occurrence.member, declaration)? {
+                Some(target) => outcome.facts.push(PendingFact {
+                    occurrence: occurrence.clone(),
+                    project_id: answer.project_id.clone(),
+                    receiver_type: answer.receiver_type.clone(),
+                    target,
+                    confidence: String::new(),
+                    input_fingerprint: answer.checker_input_fingerprint.clone(),
+                }),
+                None => answer_unmapped += 1,
+            }
+        }
+        outcome.unmapped_declarations += answer_unmapped;
+        outcome.facts.sort_by(|left, right| {
+            (&left.project_id, &left.target.anchor).cmp(&(&right.project_id, &right.target.anchor))
+        });
+        outcome.facts.dedup_by(|left, right| {
+            left.project_id == right.project_id && left.target.anchor == right.target.anchor
+        });
+        let target_count = outcome
+            .facts
+            .iter()
+            .map(|fact| fact.target.anchor.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let unambiguous = target_count == 1 && answer_unmapped == 0;
+        for fact in &mut outcome.facts {
+            fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
+        }
+    }
+    Ok(outcome)
+}
+
 fn map_declaration(
     conn: &Connection,
     member: &str,
@@ -406,6 +434,30 @@ fn map_declaration(
         fingerprint: target_fingerprint(&anchor, &source_hash, start, end),
         anchor,
     }))
+}
+
+/// Split checker inputs into what per-fact freshness can police and what only
+/// batch-level revalidation can.
+///
+/// A repository source the index itself tracks is a `source` input: every
+/// published fact records that file's path and hash, so the projection can
+/// retire exactly the facts recorded against a file that changed and keep the
+/// rest. Everything else — the TypeScript runtime, the tsconfig chain,
+/// ambient/generated `.d.ts` declarations, anything outside the index — has no
+/// per-fact anchor, so it stays an `environment` input whose drift retires the
+/// whole batch.
+fn input_role(conn: &Connection, kind: &str, path: &str) -> Result<&'static str> {
+    if kind != "repository" || path.ends_with(".d.ts") {
+        return Ok("environment");
+    }
+    let indexed = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM files WHERE path=?1 AND origin IN ('repository', 'workspace')
+         )",
+        [path],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    Ok(if indexed { "source" } else { "environment" })
 }
 
 pub(crate) fn target_fingerprint(anchor: &str, source_hash: &str, start: i64, end: i64) -> String {
@@ -471,6 +523,11 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
             ],
         )?;
         let batch_id = conn.last_insert_rowid();
+        // Nothing reads a retired batch: projection, reuse, and revalidation
+        // all key on `active=1`. Drop the superseded ones here (their facts and
+        // input manifests cascade) so a repeatedly enriched repository keeps
+        // one batch instead of one per pass.
+        conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])?;
         let mut insert = conn.prepare_cached(
             "INSERT INTO checker_enrichments(
                batch_id, member_call_id, source_file_id, source_file, source_hash,
@@ -505,8 +562,9 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
         }
         let mut insert_input = conn.prepare_cached(
             "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, input_kind, input_path, source_hash
-             ) VALUES(?1,?2,?3,?4,?5,?6)",
+               batch_id, project_id, query_file, input_kind, input_role,
+               input_path, source_hash
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         )?;
         for input in plan.inputs {
             insert_input.execute(params![
@@ -514,6 +572,7 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
                 input.project_id,
                 input.query_file,
                 input.kind,
+                input.role,
                 input.path,
                 input.source_hash,
             ])?;
@@ -615,6 +674,136 @@ mod tests {
 
     use super::*;
 
+    /// Index one file and hand back its connection plus its indexed hash.
+    fn indexed(repo: &Path, source: &str) -> Result<(Connection, String)> {
+        fs::write(repo.join("main.ts"), source)?;
+        let conn = crate::store::open(repo)?;
+        crate::indexer::index_repo(repo, &conn)?;
+        let hash = conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok((conn, hash))
+    }
+
+    /// The checker reports a declaration by its *name* span; `at` locates the
+    /// same name the same way the sidecar's `declarationResult` does.
+    fn declaration_at(source: &str, anchor: &str, name: &str, hash: &str) -> DeclarationSite {
+        let start = source.find(anchor).expect("anchor present") as i64;
+        DeclarationSite {
+            file: Some("main.ts".into()),
+            outside_root: false,
+            start,
+            end: start + name.len() as i64,
+            source_hash: hash.to_string(),
+        }
+    }
+
+    fn answer(declarations: Vec<DeclarationSite>) -> ProjectAnswer {
+        ProjectAnswer {
+            project_id: "tsconfig.json".into(),
+            status: "resolved".into(),
+            receiver_type: Some("CardTable".into()),
+            declarations,
+            checker_input_fingerprint: "inputs".into(),
+        }
+    }
+
+    fn occurrence(conn: &Connection) -> Result<Occurrence> {
+        Ok(load_occurrences(conn)?
+            .into_iter()
+            .find(|occurrence| occurrence.member == "insert")
+            .expect("indexed insert occurrence"))
+    }
+
+    /// Anchoring by span containment alone let any declaration nested inside an
+    /// indexed symbol's body claim that symbol: an object-literal method inside
+    /// a function published a fabricated `likely` self-edge on the function.
+    /// Mapping must require the symbol to BE the member's declaration.
+    #[test]
+    fn an_object_literal_method_inside_a_function_maps_to_nothing_instead_of_its_container()
+    -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      export function caller(): void {\n\
+                      \x20 const rows = { insert(): void {} };\n\
+                      \x20 rows.insert();\n\
+                      }\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let literal_method_start =
+            source.rfind("insert(): void {}").expect("literal method") as i64;
+        let declaration = DeclarationSite {
+            file: Some("main.ts".into()),
+            outside_root: false,
+            start: literal_method_start,
+            end: literal_method_start + "insert".len() as i64,
+            source_hash: hash,
+        };
+
+        // The containment trap is live: indexed symbols really do enclose this
+        // declaration, so refusing it is a decision and not an accident.
+        let containers: i64 = conn.query_row(
+            "SELECT count(*) FROM symbols symbol JOIN files file ON file.id=symbol.file_id
+             WHERE file.path='main.ts'
+               AND symbol.decl_start<=?1 AND symbol.decl_end>=?2",
+            params![declaration.start, declaration.end],
+            |row| row.get(0),
+        )?;
+        assert!(containers > 0, "the enclosing symbol must exist");
+
+        assert!(map_declaration(&conn, "insert", &declaration)?.is_none());
+        let outcome = map_occurrence(&conn, &occurrence(&conn)?, &[answer(vec![declaration])])?;
+        assert!(
+            outcome.facts.is_empty(),
+            "an unindexed declaration must publish no edge, least of all a self-edge"
+        );
+        assert_eq!(outcome.unmapped_declarations, 1);
+        Ok(())
+    }
+
+    /// Ambiguity is judged over the checker's whole answer. Two valid targets
+    /// where only one maps (jscout indexes no members for erased interfaces)
+    /// must not collapse into a lone arbitrary `likely` edge.
+    #[test]
+    fn a_declaration_that_cannot_map_keeps_every_surviving_edge_possible() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      export interface Vendor { insert(): void }\n\
+                      declare const target: CardTable | Vendor;\n\
+                      target.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let class_member = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let interface_member = declaration_at(source, "insert(): void }", "insert", &hash);
+        assert!(
+            map_declaration(&conn, "insert", &class_member)?.is_some(),
+            "the class method is the mappable target"
+        );
+        assert!(
+            map_declaration(&conn, "insert", &interface_member)?.is_none(),
+            "the erased interface member has no indexed anchor"
+        );
+        let occurrence = occurrence(&conn)?;
+
+        let ambiguous = map_occurrence(
+            &conn,
+            &occurrence,
+            &[answer(vec![class_member.clone(), interface_member])],
+        )?;
+        assert_eq!(ambiguous.facts.len(), 1);
+        assert_eq!(ambiguous.unmapped_declarations, 1);
+        assert_eq!(
+            ambiguous.facts[0].confidence, "possible",
+            "a target the checker saw but jscout could not map still means ambiguity"
+        );
+
+        // Control: the same lone survivor is `likely` only when the checker
+        // itself named exactly one target.
+        let unambiguous = map_occurrence(&conn, &occurrence, &[answer(vec![class_member])])?;
+        assert_eq!(unambiguous.facts.len(), 1);
+        assert_eq!(unambiguous.unmapped_declarations, 0);
+        assert_eq!(unambiguous.facts[0].confidence, "likely");
+        Ok(())
+    }
+
     #[test]
     fn raced_snapshot_or_checker_input_publishes_nothing() -> Result<()> {
         let repo = tempfile::tempdir()?;
@@ -667,6 +856,7 @@ mod tests {
                     project_id: "tsconfig.json".into(),
                     query_file: "main.ts".into(),
                     kind: "absolute".into(),
+                    role: "environment",
                     path: ambient.to_string_lossy().into_owned(),
                     source_hash: expected,
                 }],
@@ -687,6 +877,42 @@ mod tests {
         )?;
         assert_eq!(batches, (1, 1));
         assert_eq!(active, 1);
+        Ok(())
+    }
+
+    /// Nothing reads a superseded batch, so a repeatedly enriched repository
+    /// must not accumulate one dead batch (and its facts and input manifest)
+    /// per pass.
+    #[test]
+    fn publishing_a_batch_prunes_the_one_it_supersedes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let plan = |fingerprint: &'static str| PublishPlan {
+            snapshot: &snapshot,
+            checker: &identity,
+            protocol: 1,
+            input_fingerprint: fingerprint,
+            facts: &[],
+            inputs: &[],
+        };
+
+        let first = publish(repo.path(), &conn, &plan("one"))?;
+        let second = publish(repo.path(), &conn, &plan("two"))?;
+        let third = publish(repo.path(), &conn, &plan("three"))?;
+        assert_ne!(first, second);
+
+        let surviving: Vec<(i64, i64)> = conn
+            .prepare("SELECT id, active FROM checker_enrichment_batches ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(surviving, vec![(third, 1)]);
         Ok(())
     }
 }

@@ -384,11 +384,18 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
   ON checker_enrichments(source_file, call_start);
 CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
   ON checker_enrichments(target_anchor);
+-- `input_role` splits checker freshness: `environment` inputs (the TypeScript
+-- runtime, the tsconfig chain, ambient declarations, anything the index does
+-- not track) are revalidated for the batch as a whole, while `source` inputs
+-- are repository files whose drift each published fact reports for itself
+-- through its own recorded source path and hash.
 CREATE TABLE IF NOT EXISTS checker_input_files(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL,
   query_file TEXT NOT NULL,
   input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+  input_role TEXT NOT NULL DEFAULT 'environment'
+    CHECK(input_role IN ('environment', 'source')),
   input_path TEXT NOT NULL,
   source_hash TEXT NOT NULL,
   PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
@@ -1022,10 +1029,25 @@ fn migrate(conn: &Connection) -> Result<()> {
                project_id TEXT NOT NULL,
                query_file TEXT NOT NULL,
                input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+               input_role TEXT NOT NULL DEFAULT 'environment'
+                 CHECK(input_role IN ('environment', 'source')),
                input_path TEXT NOT NULL,
                source_hash TEXT NOT NULL,
                PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
              );",
+        )?;
+    }
+
+    // v18 is unreleased (the last published schema is v16), so the checker
+    // freshness role was folded into its table definition rather than given a
+    // version of its own. A database built from an earlier v18 build of this
+    // branch still predates the column; backfilling it as `environment` keeps
+    // that database on the conservative whole-batch invalidation it already had.
+    if !has_column(conn, "checker_input_files", "input_role")? {
+        conn.execute(
+            "ALTER TABLE checker_input_files
+             ADD COLUMN input_role TEXT NOT NULL DEFAULT 'environment'",
+            [],
         )?;
     }
 
@@ -1254,7 +1276,7 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::{DB_FILE, file_source_path, open, open_path};
+    use super::{DB_FILE, file_source_path, has_column, open, open_path};
 
     #[test]
     fn opens_an_index_database_outside_the_repository_root() -> Result<()> {
@@ -1942,6 +1964,113 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(public_meta, 0, "stale projection must not stay public");
+        Ok(())
+    }
+
+    /// v16 is the last published schema, so the v17 span columns and the v18
+    /// checker tables are what a real installation migrates through when it
+    /// first sees checker enrichment.
+    #[test]
+    fn migrates_v16_to_occurrence_spans_and_checker_enrichment_tables() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let db_path = repo.path().join(".jscout.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '16');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '10');
+             INSERT INTO meta VALUES('resolution_hash', 'stale');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY, path TEXT, hash TEXT, role TEXT,
+               origin TEXT, package_path TEXT, package_instance_id INTEGER
+             );
+             INSERT INTO files VALUES(1, 'service.ts', 'indexed-hash', 'production',
+                                      'repository', NULL, NULL);
+             CREATE TABLE member_calls(
+               file_id INTEGER, chunk_id INTEGER, start INTEGER, end INTEGER,
+               line INTEGER, end_line INTEGER, prop TEXT, object TEXT, receiver TEXT
+             );
+             INSERT INTO member_calls VALUES(1, NULL, 12, 26, 3, 3, 'insert', 'card',
+                                             'dbs.wave.card');",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "18");
+
+        // v17: exact receiver/property spans exist, defaulted, and the cleared
+        // file hash forces the re-extraction that can populate them for real.
+        for column in [
+            "receiver_start",
+            "receiver_end",
+            "property_start",
+            "property_end",
+        ] {
+            assert!(
+                has_column(&conn, "member_calls", column)?,
+                "v17 must add member_calls.{column}"
+            );
+        }
+        let (spans, hash): ((i64, i64, i64, i64), String) = conn.query_row(
+            "SELECT call.receiver_start, call.receiver_end,
+                    call.property_start, call.property_end, file.hash
+             FROM member_calls call JOIN files file ON file.id=call.file_id",
+            [],
+            |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(spans, (0, 0, 0, 0));
+        assert_eq!(hash, "", "unspanned occurrences must be re-extracted");
+        let public_meta: i64 = conn.query_row(
+            "SELECT count(*) FROM meta
+             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(public_meta, 0, "stale projection must not stay public");
+
+        // v18: the canonical checker batch tables exist and are empty, with the
+        // one-active-batch invariant and the per-fact freshness role in place.
+        for table in [
+            "checker_enrichment_batches",
+            "checker_enrichments",
+            "checker_input_files",
+        ] {
+            let rows: i64 =
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(rows, 0, "v18 must create an empty {table}");
+        }
+        assert!(has_column(&conn, "checker_input_files", "input_role")?);
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
+            [],
+        )?;
+        let second_active = conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
+            [],
+        );
+        assert!(
+            second_active.is_err(),
+            "only one checker batch may be active"
+        );
         Ok(())
     }
 

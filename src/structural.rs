@@ -432,7 +432,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let files = load_files(conn)?;
     let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
-    let checker_inputs_fresh = checker_inputs_fresh(conn, snapshot)?;
+    let checker_environment_fresh = checker_environment_fresh(conn)?;
     let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
     for symbol in &symbols {
         if symbol.scope.is_empty() {
@@ -528,8 +528,8 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
-        if checker_inputs_fresh {
-            project_checker_enrichments(conn, snapshot, &files, &symbols, &mut insert_edge)?;
+        if checker_environment_fresh {
+            project_checker_enrichments(conn, &files, &symbols, &mut insert_edge)?;
         }
         if timing {
             eprintln!(
@@ -565,12 +565,21 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     Ok(())
 }
 
-fn checker_inputs_fresh(conn: &Connection, snapshot: &str) -> Result<bool> {
+/// Whether the active batch's *environment* still matches what the checker
+/// read: the TypeScript runtime, the tsconfig chain, ambient declarations, and
+/// every other input the index does not track. These have no per-fact anchor,
+/// so drift in any of them retires the whole batch.
+///
+/// Repository sources the index does track are deliberately excluded here.
+/// Each published fact records its own source file and hash, so
+/// `project_checker_enrichments` retires exactly the facts recorded against a
+/// changed file and keeps the rest — a one-character edit no longer costs a
+/// repository every checker edge it has.
+fn checker_environment_fresh(conn: &Connection) -> Result<bool> {
     let batch_id = conn
         .query_row(
-            "SELECT id FROM checker_enrichment_batches
-             WHERE active=1 AND source_snapshot=?1",
-            [snapshot],
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
@@ -584,7 +593,8 @@ fn checker_inputs_fresh(conn: &Connection, snapshot: &str) -> Result<bool> {
         .optional()?;
     let mut statement = conn.prepare(
         "SELECT input_kind, input_path, source_hash FROM checker_input_files
-         WHERE batch_id=?1 ORDER BY input_kind, input_path",
+         WHERE batch_id=?1 AND input_role='environment'
+         ORDER BY input_kind, input_path",
     )?;
     let rows = statement.query_map([batch_id], |row| {
         Ok((
@@ -614,19 +624,18 @@ fn checker_inputs_fresh(conn: &Connection, snapshot: &str) -> Result<bool> {
 }
 
 /// Whether an otherwise unchanged structural projection can be reused without
-/// revalidating checker-derived edges. No current-snapshot checker batch means
-/// there are no such edges to invalidate; a matching batch must still have an
-/// exact live input manifest.
-pub(crate) fn checker_projection_reusable(conn: &Connection, snapshot: &str) -> Result<bool> {
+/// revalidating checker-derived edges. No active checker batch means there are
+/// no such edges to invalidate. Otherwise reuse is safe only while the batch's
+/// environment inputs are unchanged: an unchanged snapshot already means every
+/// indexed source is unchanged, so the environment is all that can have moved
+/// underneath the existing edges.
+pub(crate) fn checker_projection_reusable(conn: &Connection) -> Result<bool> {
     let has_batch = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM checker_enrichment_batches
-           WHERE active=1 AND source_snapshot=?1
-         )",
-        [snapshot],
+        "SELECT EXISTS(SELECT 1 FROM checker_enrichment_batches WHERE active=1)",
+        [],
         |row| row.get::<_, i64>(0),
     )? != 0;
-    Ok(!has_batch || checker_inputs_fresh(conn, snapshot)?)
+    Ok(!has_batch || checker_environment_fresh(conn)?)
 }
 
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
@@ -2063,9 +2072,17 @@ struct CheckerProjection {
     receiver_types: BTreeSet<String>,
 }
 
+/// Recreate the targeted `checker` edges of the active batch, fact by fact.
+///
+/// Freshness is per fact and entirely identity-based: a fact projects only
+/// while its source file still carries the hash the checker read, its exact
+/// member-call occurrence still exists at the recorded spans, and its target
+/// anchor still fingerprints to the declaration that was mapped. Facts that
+/// fail any of those are left canonical but inert. The batch's own snapshot is
+/// therefore not a gate — binding to it would retire every fact in the
+/// repository whenever any one indexed file changed.
 fn project_checker_enrichments(
     conn: &Connection,
-    snapshot: &str,
     files: &HashMap<i64, String>,
     symbols: &[SymbolNode],
     insert_edge: &mut rusqlite::CachedStatement<'_>,
@@ -2102,10 +2119,9 @@ fn project_checker_enrichments(
          JOIN symbols target_symbol
            ON target.native_table='symbols' AND target.native_id=target_symbol.id
          JOIN files target_file ON target_file.id=target_symbol.file_id
-         WHERE batch.source_snapshot=?1
          ORDER BY enrichment.member_call_id, enrichment.target_anchor, enrichment.project_id",
     )?;
-    let rows = statement.query_map([snapshot], |row| {
+    let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
@@ -4778,11 +4794,29 @@ mod tests {
             [&snapshot],
         )?;
         let batch_id = conn.last_insert_rowid();
+        write(
+            repo.path(),
+            "tsconfig.json",
+            "{\"files\":[\"service.ts\"]}\n",
+        )?;
+        let config_hash = blake3::hash(&fs::read(repo.path().join("tsconfig.json"))?)
+            .to_hex()
+            .to_string();
         conn.execute(
             "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, input_kind, input_path, source_hash
-             ) VALUES(?1,'tsconfig.json','service.ts','repository','service.ts',?2)",
-            rusqlite::params![batch_id, source_hash,],
+               batch_id, project_id, query_file, input_kind, input_role,
+               input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','service.ts','repository','environment',
+                      'tsconfig.json',?2)",
+            rusqlite::params![batch_id, config_hash],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_input_files(
+               batch_id, project_id, query_file, input_kind, input_role,
+               input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','service.ts','repository','source',
+                      'service.ts',?2)",
+            rusqlite::params![batch_id, source_hash],
         )?;
         conn.execute(
             "INSERT INTO checker_enrichments(
@@ -4828,14 +4862,16 @@ mod tests {
         )?;
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
-        assert!(super::checker_projection_reusable(&conn, &snapshot)?);
+        assert!(super::checker_projection_reusable(&conn)?);
 
+        // Environment drift (here the owning tsconfig) has no per-fact anchor,
+        // so it retires the whole batch's edges without erasing its facts.
         write(
             repo.path(),
-            "service.ts",
-            "class Service { load() { return 1; } }\nfunction run(client: Service) { client.load(); }\n",
+            "tsconfig.json",
+            "{\"files\":[\"service.ts\"],\"x\":1}\n",
         )?;
-        assert!(!super::checker_projection_reusable(&conn, &snapshot)?);
+        assert!(!super::checker_projection_reusable(&conn)?);
         rebuild_projection(&conn, &snapshot)?;
         let stale_edges: i64 = conn.query_row(
             "SELECT count(*) FROM resolved_edges
@@ -4850,6 +4886,179 @@ mod tests {
         )?;
         assert_eq!(stale_edges, 0);
         assert_eq!(retained_facts, 1);
+        Ok(())
+    }
+
+    /// Source drift is judged per fact, not per batch: editing one file must
+    /// retire that file's checker edge and leave every other file's alone.
+    /// Before the split, one boolean input gate meant a one-character edit
+    /// anywhere in the project dropped every checker edge in the repository.
+    #[test]
+    fn a_source_edit_retires_only_the_facts_recorded_against_that_file() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write(
+            repo.path(),
+            "tables.ts",
+            "export class CardTable { insert() {} }\n",
+        )?;
+        for file in ["left.ts", "right.ts"] {
+            write(
+                repo.path(),
+                file,
+                "import { CardTable } from './tables';\n\
+                 export function run(table: CardTable) { table.insert(); }\n",
+            )?;
+        }
+        write(
+            repo.path(),
+            "tsconfig.json",
+            "{\"files\":[\"tables.ts\",\"left.ts\",\"right.ts\"]}\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = super::current_snapshot(&conn)?;
+        let (target, target_hash, target_start, target_end): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT node.node_key, file.hash, symbol.decl_start, symbol.decl_end
+                 FROM graph_nodes node
+                 JOIN symbols symbol
+                   ON node.native_table='symbols' AND node.native_id=symbol.id
+                 JOIN files file ON file.id=symbol.file_id
+                 WHERE node.display_name='insert' AND file.path='tables.ts'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let fingerprint =
+            crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end);
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(?1,'5.9.3','bundled','inputs',1,datetime('now'),1)",
+            [&snapshot],
+        )?;
+        let batch_id = conn.last_insert_rowid();
+        let config_hash = blake3::hash(&fs::read(repo.path().join("tsconfig.json"))?)
+            .to_hex()
+            .to_string();
+        conn.execute(
+            "INSERT INTO checker_input_files(
+               batch_id, project_id, query_file, input_kind, input_role,
+               input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','left.ts','repository','environment',
+                      'tsconfig.json',?2)",
+            rusqlite::params![batch_id, config_hash],
+        )?;
+        for file in ["tables.ts", "left.ts", "right.ts"] {
+            let (call, file_id, hash, spans): (i64, i64, String, [i64; 6]) = match conn
+                .query_row(
+                    "SELECT call.rowid, file.id, file.hash, call.start, call.end,
+                            call.receiver_start, call.receiver_end,
+                            call.property_start, call.property_end
+                     FROM member_calls call JOIN files file ON file.id=call.file_id
+                     WHERE file.path=?1 AND call.prop='insert'",
+                    [file],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            [
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                            ],
+                        ))
+                    },
+                )
+                .ok()
+            {
+                Some(row) => row,
+                None => {
+                    // tables.ts has no call of its own; it is only an input.
+                    let hash: String =
+                        conn.query_row("SELECT hash FROM files WHERE path=?1", [file], |row| {
+                            row.get(0)
+                        })?;
+                    conn.execute(
+                        "INSERT INTO checker_input_files(
+                           batch_id, project_id, query_file, input_kind, input_role,
+                           input_path, source_hash
+                         ) VALUES(?1,'tsconfig.json','left.ts','repository','source',?2,?3)",
+                        rusqlite::params![batch_id, file, hash],
+                    )?;
+                    continue;
+                }
+            };
+            conn.execute(
+                "INSERT INTO checker_input_files(
+                   batch_id, project_id, query_file, input_kind, input_role,
+                   input_path, source_hash
+                 ) VALUES(?1,'tsconfig.json','left.ts','repository','source',?2,?3)",
+                rusqlite::params![batch_id, file, hash],
+            )?;
+            conn.execute(
+                "INSERT INTO checker_enrichments(
+                   batch_id, member_call_id, source_file_id, source_file, source_hash,
+                   call_start, call_end, receiver_start, receiver_end,
+                   property_start, property_end, project_id, receiver_type,
+                   target_anchor, target_fingerprint, confidence, provenance,
+                   checker_input_fingerprint
+                 ) VALUES(
+                   ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
+                   'tsconfig.json','CardTable',?12,?13,'likely','checker','inputs'
+                 )",
+                rusqlite::params![
+                    batch_id,
+                    call,
+                    file_id,
+                    file,
+                    hash,
+                    spans[0],
+                    spans[1],
+                    spans[2],
+                    spans[3],
+                    spans[4],
+                    spans[5],
+                    target,
+                    fingerprint,
+                ],
+            )?;
+        }
+        rebuild_projection(&conn, &snapshot)?;
+        let projected = |conn: &rusqlite::Connection| -> Result<Vec<String>> {
+            let mut statement = conn.prepare(
+                "SELECT file.path FROM resolved_edges edge
+                 JOIN files file ON file.id=edge.source_file_id
+                 WHERE edge.kind='member_call' AND edge.provenance='checker'
+                 ORDER BY file.path",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        };
+        assert_eq!(projected(&conn)?, vec!["left.ts", "right.ts"]);
+
+        write(
+            repo.path(),
+            "left.ts",
+            "import { CardTable } from './tables';\n\
+             export function run(table: CardTable) { const t = table; t.insert(); }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        assert_eq!(
+            projected(&conn)?,
+            vec!["right.ts"],
+            "an edit to left.ts must not cost right.ts its checker edge"
+        );
+        let retained: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 2, "canonical facts survive their projection");
         Ok(())
     }
 

@@ -321,7 +321,7 @@ fn index_repo_impl(
         resolution_hash: Some(resolution.clone()),
     };
     let projection_started = std::time::Instant::now();
-    if previous == current && crate::structural::checker_projection_reusable(conn, &snapshot)? {
+    if previous == current && crate::structural::checker_projection_reusable(conn)? {
         // The projection is a pure function of the canonical tables: the
         // snapshot covers every extracted row (file content identity) and the
         // resolution hash covers module edges, whose inputs (tsconfigs,
