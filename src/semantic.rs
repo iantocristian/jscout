@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -655,6 +655,7 @@ pub(crate) fn persist_validated_artifact(
     relations: &[RelationInput],
     provenance: &ArtifactProvenance<'_>,
 ) -> Result<i64> {
+    validate_relation_contract(conn, input, relations)?;
     let body_json = serde_json::to_string(&input.body)?;
     let mut support_rows: Vec<Vec<String>> = supports
         .iter()
@@ -757,6 +758,76 @@ pub(crate) fn persist_validated_artifact(
     })()
 }
 
+fn validate_relation_contract(
+    conn: &Connection,
+    input: &AnnotateInput,
+    relations: &[RelationInput],
+) -> Result<()> {
+    for relation in relations {
+        validate_confidence(&relation.confidence)?;
+        if confidence_rank(&relation.confidence) < confidence_rank(&input.confidence) {
+            bail!(
+                "artifact confidence {} exceeds relation confidence {}",
+                input.confidence,
+                relation.confidence
+            );
+        }
+        if !relation.claim_path.is_empty() && input.body.pointer(&relation.claim_path).is_none() {
+            bail!(
+                "relation claim_path `{}` does not exist in body",
+                relation.claim_path
+            );
+        }
+        let child: Option<(Option<String>, String)> = conn
+            .query_row(
+                "SELECT artifact_fingerprint, confidence FROM semantic_artifacts WHERE id=?1",
+                [relation.dst_artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((fingerprint, child_confidence)) = child else {
+            bail!(
+                "semantic relation target {} does not exist",
+                relation.dst_artifact_id
+            );
+        };
+        if fingerprint.as_deref() != Some(relation.dst_fingerprint.as_str()) {
+            bail!(
+                "semantic relation target {} fingerprint changed",
+                relation.dst_artifact_id
+            );
+        }
+        if confidence_rank(&relation.confidence) > confidence_rank(&child_confidence) {
+            bail!(
+                "relation confidence {} exceeds child artifact confidence {}",
+                relation.confidence,
+                child_confidence
+            );
+        }
+    }
+    // Generated concepts are relation-backed and carry no direct supports.
+    // Retain read/write compatibility with legacy direct-support concept rows,
+    // but never allow a new relation-backed row with an uncovered claim.
+    if input.artifact_type == "concept" && input.supports.is_empty() {
+        let mut required_claims = Vec::new();
+        collect_claim_paths(&input.body, "", &mut required_claims);
+        for claim_path in required_claims {
+            if !relations.iter().any(|relation| {
+                relation.relation == "related_to" && relation.claim_path == claim_path
+            }) {
+                bail!("concept claim `{claim_path}` requires a fingerprinted child relation");
+            }
+        }
+        if !relations
+            .iter()
+            .any(|relation| relation.relation == "related_to" && relation.claim_path.is_empty())
+        {
+            bail!("concept publication requires whole-input child dependencies");
+        }
+    }
+    Ok(())
+}
+
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SemanticArtifact>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -849,6 +920,7 @@ pub(crate) fn load_artifacts(conn: &Connection, ids: &[i64]) -> Result<Vec<Seman
 struct FreshnessContext {
     memo: HashMap<i64, String>,
     packages: Option<Vec<(String, String)>>,
+    concept_children: Option<BTreeMap<String, std::collections::BTreeSet<i64>>>,
 }
 
 impl FreshnessContext {
@@ -873,6 +945,16 @@ impl FreshnessContext {
             self.packages = Some(crate::scouting::plan::package_prefixes(root));
         }
         Ok(self.packages.as_deref().expect("just populated"))
+    }
+
+    fn concept_children(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<&BTreeMap<String, std::collections::BTreeSet<i64>>> {
+        if self.concept_children.is_none() {
+            self.concept_children = Some(current_concept_children(conn)?);
+        }
+        Ok(self.concept_children.as_ref().expect("just populated"))
     }
 }
 
@@ -960,6 +1042,134 @@ pub(crate) fn summary_child_set_current(
     let rows = statement.query_map([artifact_id], |row| row.get::<_, i64>(0))?;
     let stored = rows.collect::<std::result::Result<std::collections::BTreeSet<i64>, _>>()?;
     Ok(stored == expected_summary_child_ids(conn, packages, level, scope_key)?)
+}
+
+/// Current workflow/card artifacts that establish one exact normalized
+/// concept vocabulary key. Workflow names and card domain terms are the only
+/// admitted vocabulary sources; free-form descriptions and card prose never
+/// become concept inputs implicitly.
+pub(crate) fn expected_concept_child_ids(
+    conn: &Connection,
+    normalized_key: &str,
+) -> Result<std::collections::BTreeSet<i64>> {
+    Ok(current_concept_children(conn)?
+        .remove(normalized_key)
+        .unwrap_or_default())
+}
+
+/// Build every current exact vocabulary group once. Batch semantic retrieval
+/// may load many concepts; caching this map in `FreshnessContext` avoids
+/// reparsing all card bodies independently for each concept.
+fn current_concept_children(
+    conn: &Connection,
+) -> Result<BTreeMap<String, std::collections::BTreeSet<i64>>> {
+    let mut expected: BTreeMap<String, std::collections::BTreeSet<i64>> = BTreeMap::new();
+
+    let mut workflows = conn.prepare_cached(
+        "SELECT artifact.id, artifact.canonical_name
+         FROM semantic_artifacts artifact
+         WHERE artifact.artifact_type='workflow'
+           AND artifact.artifact_fingerprint IS NOT NULL
+           AND EXISTS(
+             SELECT 1 FROM semantic_supports support
+             WHERE support.artifact_id=artifact.id AND support.claim_path='/name'
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )",
+    )?;
+    let rows = workflows.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (id, name) = row?;
+        if let Some(name) = name {
+            let normalized = crate::scouting::concept::normalize(&name);
+            if !normalized.is_empty() {
+                expected.entry(normalized).or_default().insert(id);
+            }
+        }
+    }
+
+    let mut cards = conn.prepare_cached(
+        "SELECT DISTINCT artifact.id, artifact.body_json, support.claim_path
+         FROM semantic_artifacts artifact
+         JOIN semantic_supports support ON support.artifact_id=artifact.id
+         WHERE artifact.artifact_type='card'
+           AND artifact.artifact_fingerprint IS NOT NULL
+           AND support.claim_path LIKE '/domain_terms/%'
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )",
+    )?;
+    let rows = cards.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, body_json, claim_path) = row?;
+        let body: Value = serde_json::from_str(&body_json)
+            .with_context(|| format!("semantic card {id} has invalid body JSON"))?;
+        let Some(index) = concept_domain_term_index(&claim_path) else {
+            continue;
+        };
+        let Some(term) = body
+            .get("domain_terms")
+            .and_then(Value::as_array)
+            .and_then(|terms| terms.get(index))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let normalized = crate::scouting::concept::normalize(term);
+        if !normalized.is_empty() {
+            expected.entry(normalized).or_default().insert(id);
+        }
+    }
+    Ok(expected)
+}
+
+/// Only canonical array-element pointers emitted by the card contract are
+/// admitted. Prefix-like or nested paths must not widen concept vocabulary.
+fn concept_domain_term_index(claim_path: &str) -> Option<usize> {
+    let index = claim_path.strip_prefix("/domain_terms/")?;
+    if index.is_empty() || index.contains('/') {
+        return None;
+    }
+    let parsed = index.parse::<usize>().ok()?;
+    (parsed.to_string() == index).then_some(parsed)
+}
+
+/// True when a concept's whole-input dependency rows cover the complete
+/// current exact vocabulary group. This detects a matching workflow/card
+/// published after the concept without conflating near-duplicate terms.
+#[cfg(test)]
+pub(crate) fn concept_child_set_current(
+    conn: &Connection,
+    artifact_id: i64,
+    normalized_key: &str,
+) -> Result<bool> {
+    let expected = expected_concept_child_ids(conn, normalized_key)?;
+    concept_child_set_matches(conn, artifact_id, &expected)
+}
+
+fn concept_child_set_matches(
+    conn: &Connection,
+    artifact_id: i64,
+    expected: &std::collections::BTreeSet<i64>,
+) -> Result<bool> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT dst_artifact_id FROM semantic_relations
+         WHERE src_artifact_id=?1 AND relation='related_to' AND claim_path=''",
+    )?;
+    let rows = statement.query_map([artifact_id], |row| row.get::<_, i64>(0))?;
+    let stored = rows.collect::<std::result::Result<std::collections::BTreeSet<i64>, _>>()?;
+    Ok(&stored == expected)
 }
 
 fn load_artifact_at_depth(
@@ -1148,6 +1358,17 @@ fn child_adjusted_freshness(
             worst = 2;
         }
     }
+    if artifact_type == "concept" && worst < 2 {
+        let normalized_key = name.as_deref().unwrap_or_default();
+        let expected = context
+            .concept_children(conn)?
+            .get(normalized_key)
+            .cloned()
+            .unwrap_or_default();
+        if !concept_child_set_matches(conn, artifact_id, &expected)? {
+            worst = 2;
+        }
+    }
     let mut statement = conn.prepare_cached(
         "SELECT DISTINCT dst_artifact_id, dst_fingerprint FROM semantic_relations
          WHERE src_artifact_id=?1 ORDER BY dst_artifact_id",
@@ -1210,9 +1431,11 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     validate_confidence(&input.confidence)?;
     if !matches!(
         input.artifact_type.as_str(),
-        "workflow" | "annotation" | "card" | "summary"
+        "workflow" | "annotation" | "card" | "summary" | "concept"
     ) {
-        bail!("semantic artifact type must be one of: workflow, annotation, card, summary");
+        bail!(
+            "semantic artifact type must be one of: workflow, annotation, card, summary, concept"
+        );
     }
     if !input.body.is_object() {
         bail!("semantic artifact body must be a JSON object");
@@ -1220,14 +1443,15 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     if serde_json::to_vec(&input.body)?.len() > MAX_BODY_BYTES {
         bail!("semantic artifact body exceeds {MAX_BODY_BYTES} bytes");
     }
-    // A summary's claims are supported by `summarizes` relations pinned to
-    // child artifact fingerprints, not by direct source spans: the scouting
-    // layer enforces claim-to-child coverage and the publication transaction
-    // rechecks child currency. Prose without that chain never validates.
+    // Parent semantic artifacts are relation-backed. Their generated claims
+    // are grounded in fingerprinted child artifacts; attaching a child's leaf
+    // span directly to parent prose would erase that semantic hop.
+    if matches!(input.artifact_type.as_str(), "summary" | "concept")
+        && input.supports.len() > MAX_SUPPORTS
+    {
+        bail!("semantic artifacts allow at most {MAX_SUPPORTS} supports");
+    }
     if input.artifact_type == "summary" {
-        if input.supports.len() > MAX_SUPPORTS {
-            bail!("semantic artifacts allow at most {MAX_SUPPORTS} supports");
-        }
         let Some(scope) = input.name.as_deref().filter(|name| !name.is_empty()) else {
             bail!("summary artifacts require their scope key as the name");
         };
@@ -1248,7 +1472,9 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
         }
         return Ok(());
     }
-    if input.supports.is_empty() || input.supports.len() > MAX_SUPPORTS {
+    if input.artifact_type != "concept"
+        && (input.supports.is_empty() || input.supports.len() > MAX_SUPPORTS)
+    {
         bail!("semantic artifacts require 1..={MAX_SUPPORTS} supports");
     }
     let mut required_claims = Vec::new();
@@ -1257,14 +1483,61 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
         !(claim_path.starts_with("/participants/")
             && (claim_path.ends_with("/anchor") || claim_path.ends_with("/scope")))
     });
-    for claim_path in required_claims {
-        if !input
-            .supports
-            .iter()
-            .any(|support| support.claim_path == claim_path)
-        {
-            bail!("semantic claim `{claim_path}` requires evidence support");
+    if input.artifact_type != "concept" {
+        for claim_path in &required_claims {
+            if !input
+                .supports
+                .iter()
+                .any(|support| support.claim_path == *claim_path)
+            {
+                bail!("semantic claim `{claim_path}` requires evidence support");
+            }
         }
+    }
+    if input.artifact_type == "concept" {
+        let body = input
+            .body
+            .as_object()
+            .expect("semantic body was validated as an object");
+        if body.len() != 2 || !body.contains_key("definition") || !body.contains_key("aliases") {
+            bail!("concept body allows exactly `definition` and `aliases`");
+        }
+        let Some(name) = input.name.as_deref().filter(|name| !name.is_empty()) else {
+            bail!("concept artifacts require a normalized canonical name");
+        };
+        if crate::scouting::concept::normalize(name) != name {
+            bail!("concept canonical name must use the current concept normalizer");
+        }
+        if input
+            .body
+            .get("definition")
+            .and_then(Value::as_str)
+            .is_none_or(|definition| definition.trim().is_empty())
+        {
+            bail!("concept body requires a non-empty string `definition`");
+        }
+        let aliases = input
+            .body
+            .get("aliases")
+            .and_then(Value::as_array)
+            .context("concept body requires an `aliases` array")?;
+        if aliases.is_empty() {
+            bail!("concept body requires at least one alias");
+        }
+        let mut seen = HashSet::new();
+        for alias in aliases {
+            let alias = alias
+                .as_str()
+                .filter(|alias| !alias.trim().is_empty())
+                .context("concept aliases must be non-empty strings")?;
+            if crate::scouting::concept::normalize(alias) != name {
+                bail!("concept alias `{alias}` does not normalize to `{name}`");
+            }
+            if !seen.insert(crate::scouting::concept::normalize_display(alias)) {
+                bail!("concept alias `{alias}` is duplicated");
+            }
+        }
+        return Ok(());
     }
     if input.artifact_type == "annotation" {
         if input.body.get("claim").and_then(Value::as_str).is_none() {
@@ -1462,6 +1735,396 @@ mod tests {
             evidence_end_line: 1,
             confidence: "likely".into(),
         }
+    }
+
+    fn publish_workflow(
+        root: &std::path::Path,
+        conn: &rusqlite::Connection,
+        anchor: &str,
+        name: &str,
+        supersedes: Option<i64>,
+    ) -> Result<super::SemanticArtifact> {
+        annotate(
+            root,
+            conn,
+            &AnnotateInput {
+                artifact_type: "workflow".into(),
+                name: Some(name.into()),
+                body: json!({
+                    "participants": [{
+                        "anchor": anchor,
+                        "role": "establishes vocabulary",
+                        "scope": "defining",
+                    }],
+                }),
+                supports: vec![
+                    support("/name", anchor, "domain.ts"),
+                    support("/participants/0/role", anchor, "domain.ts"),
+                ],
+                confidence: "likely".into(),
+                snapshot: structural::current_snapshot(conn)?,
+                supersedes,
+            },
+        )
+    }
+
+    fn publish_card(
+        root: &std::path::Path,
+        conn: &rusqlite::Connection,
+        anchor: &str,
+        terms: &[&str],
+        supersedes: Option<i64>,
+    ) -> Result<super::SemanticArtifact> {
+        let mut supports = vec![support("/purpose", anchor, "domain.ts")];
+        supports.extend(
+            terms
+                .iter()
+                .enumerate()
+                .map(|(index, _)| support(&format!("/domain_terms/{index}"), anchor, "domain.ts")),
+        );
+        annotate(
+            root,
+            conn,
+            &AnnotateInput {
+                artifact_type: "card".into(),
+                name: Some(anchor.into()),
+                body: json!({
+                    "purpose": "establishes repository vocabulary",
+                    "domain_terms": terms,
+                }),
+                supports,
+                confidence: "likely".into(),
+                snapshot: structural::current_snapshot(conn)?,
+                supersedes,
+            },
+        )
+    }
+
+    fn artifact_fingerprint(conn: &rusqlite::Connection, id: i64) -> Result<String> {
+        Ok(conn.query_row(
+            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn persist_test_concept(
+        root: &std::path::Path,
+        conn: &rusqlite::Connection,
+        anchor: &str,
+        children: &[i64],
+        whole_dependencies: bool,
+    ) -> Result<i64> {
+        let input = AnnotateInput {
+            artifact_type: "concept".into(),
+            name: Some("invoice settlement".into()),
+            body: json!({
+                "definition": "The repository-specific invoice settlement boundary",
+                "aliases": ["Invoice Settlement"],
+            }),
+            supports: vec![
+                support("/definition", anchor, "domain.ts"),
+                support("/aliases/0", anchor, "domain.ts"),
+            ],
+            confidence: "likely".into(),
+            snapshot: structural::current_snapshot(conn)?,
+            supersedes: None,
+        };
+        let (snapshot, supports) = super::validate_annotate_input(root, conn, &input)?;
+        let mut relations = Vec::new();
+        for &child in children {
+            let fingerprint = artifact_fingerprint(conn, child)?;
+            relations.push(super::RelationInput {
+                claim_path: "/definition".into(),
+                relation: "related_to".into(),
+                dst_artifact_id: child,
+                dst_fingerprint: fingerprint.clone(),
+                confidence: "likely".into(),
+            });
+            if whole_dependencies {
+                relations.push(super::RelationInput {
+                    claim_path: String::new(),
+                    relation: "related_to".into(),
+                    dst_artifact_id: child,
+                    dst_fingerprint: fingerprint,
+                    confidence: "likely".into(),
+                });
+            }
+        }
+        super::persist_validated_artifact(
+            conn,
+            &input,
+            &snapshot,
+            &supports,
+            &relations,
+            &super::ArtifactProvenance {
+                model: "test",
+                prompt_version: "concept-scout/v1",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )
+    }
+
+    #[test]
+    fn concept_semantic_shape_is_closed_normalized_and_supported() -> Result<()> {
+        let base = AnnotateInput {
+            artifact_type: "concept".into(),
+            name: Some("invoice settlement".into()),
+            body: json!({
+                "definition": "The invoice settlement boundary in this repository",
+                "aliases": ["Invoice Settlement", "invoice settlement"],
+            }),
+            supports: vec![
+                support("/definition", "anchor", "domain.ts"),
+                support("/aliases/0", "anchor", "domain.ts"),
+                support("/aliases/1", "anchor", "domain.ts"),
+            ],
+            confidence: "likely".into(),
+            snapshot: "snapshot".into(),
+            supersedes: None,
+        };
+        super::validate_input(&base)?;
+
+        let noncanonical_name = AnnotateInput {
+            name: Some("Invoice  Settlement".into()),
+            ..base.clone()
+        };
+        assert!(
+            super::validate_input(&noncanonical_name)
+                .unwrap_err()
+                .to_string()
+                .contains("current concept normalizer")
+        );
+
+        let near_alias = AnnotateInput {
+            body: json!({
+                "definition": "The invoice settlement boundary in this repository",
+                "aliases": ["invoice-settlement"],
+            }),
+            supports: vec![
+                support("/definition", "anchor", "domain.ts"),
+                support("/aliases/0", "anchor", "domain.ts"),
+            ],
+            ..base.clone()
+        };
+        assert!(
+            super::validate_input(&near_alias)
+                .unwrap_err()
+                .to_string()
+                .contains("does not normalize")
+        );
+
+        let duplicate_display = AnnotateInput {
+            body: json!({
+                "definition": "The invoice settlement boundary in this repository",
+                "aliases": ["Invoice\u{3000}Settlement", "Invoice Settlement"],
+            }),
+            ..base.clone()
+        };
+        assert!(
+            super::validate_input(&duplicate_display)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicated")
+        );
+
+        let extra_field = AnnotateInput {
+            body: json!({
+                "definition": "The invoice settlement boundary in this repository",
+                "aliases": ["Invoice Settlement", "invoice settlement"],
+                "model_note": "not part of the persisted concept contract",
+            }),
+            supports: base
+                .supports
+                .iter()
+                .cloned()
+                .chain(std::iter::once(support(
+                    "/model_note",
+                    "anchor",
+                    "domain.ts",
+                )))
+                .collect(),
+            ..base
+        };
+        assert!(
+            super::validate_input(&extra_field)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly `definition` and `aliases`")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expected_concept_children_use_only_exact_supported_current_vocabulary() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("domain.ts"),
+            "export function alpha() { return 1; }\n\
+             export function beta() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let alpha = "sym:domain.ts#::alpha@1";
+        let beta = "sym:domain.ts#::beta@1";
+
+        let old_workflow = publish_workflow(repo.path(), &conn, alpha, "Invoice Settlement", None)?;
+        let card = publish_card(
+            repo.path(),
+            &conn,
+            beta,
+            &["invoice settlement", "invoice-settlement"],
+            None,
+        )?;
+        annotate(
+            repo.path(),
+            &conn,
+            &AnnotateInput {
+                artifact_type: "annotation".into(),
+                name: Some("free prose".into()),
+                body: json!({"claim": "invoice settlement appears only as prose"}),
+                supports: vec![support("/claim", alpha, "domain.ts")],
+                confidence: "likely".into(),
+                snapshot: structural::current_snapshot(&conn)?,
+                supersedes: None,
+            },
+        )?;
+
+        // A prefix-like support path is not the exact card array-element
+        // pointer admitted by deterministic planning.
+        conn.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type,canonical_name,body_json,model,prompt_version,confidence,
+               source_snapshot,created_at,artifact_fingerprint
+             ) VALUES('card',?1,?2,'test','test/v1','likely',?3,
+                      '2026-08-12T00:00:00Z','malformed-fingerprint')",
+            rusqlite::params![
+                alpha,
+                json!({
+                    "purpose": "malformed historical row",
+                    "domain_terms": ["invoice settlement"],
+                })
+                .to_string(),
+                structural::current_snapshot(&conn)?,
+            ],
+        )?;
+        let malformed_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO semantic_supports(
+               artifact_id,claim_path,anchor_key,evidence_file,evidence_start_line,
+               evidence_end_line,source_hash,context_hash,confidence
+             ) VALUES(?1,'/domain_terms/0/nested',?2,'domain.ts',1,1,
+                      'source','context','likely')",
+            rusqlite::params![malformed_id, alpha],
+        )?;
+
+        assert_eq!(
+            super::expected_concept_child_ids(&conn, "invoice settlement")?,
+            [old_workflow.id, card.id].into_iter().collect()
+        );
+        assert_eq!(
+            super::expected_concept_child_ids(&conn, "invoice-settlement")?,
+            [card.id].into_iter().collect()
+        );
+        assert!(super::expected_concept_child_ids(&conn, "appears only as prose")?.is_empty());
+
+        let replacement = publish_workflow(
+            repo.path(),
+            &conn,
+            alpha,
+            "Payment Completion",
+            Some(old_workflow.id),
+        )?;
+        assert_eq!(
+            super::expected_concept_child_ids(&conn, "invoice settlement")?,
+            [card.id].into_iter().collect()
+        );
+        assert_eq!(
+            super::expected_concept_child_ids(&conn, "payment completion")?,
+            [replacement.id].into_iter().collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concept_freshness_tracks_exact_whole_child_set_additions_and_removals() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("domain.ts"),
+            "export function alpha() { return 1; }\n\
+             export function beta() { return 2; }\n\
+             export function gamma() { return 3; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let alpha = "sym:domain.ts#::alpha@1";
+        let beta = "sym:domain.ts#::beta@1";
+        let gamma = "sym:domain.ts#::gamma@1";
+        let workflow = publish_workflow(repo.path(), &conn, alpha, "Invoice Settlement", None)?;
+
+        let claim_only = persist_test_concept(repo.path(), &conn, alpha, &[workflow.id], false)?;
+        assert!(
+            !super::concept_child_set_current(&conn, claim_only, "invoice settlement")?,
+            "claim relations do not substitute for whole-input dependencies"
+        );
+
+        let first = persist_test_concept(repo.path(), &conn, alpha, &[workflow.id], true)?;
+        assert!(super::concept_child_set_current(
+            &conn,
+            first,
+            "invoice settlement"
+        )?);
+        assert_eq!(
+            super::load_artifact(&conn, first)?
+                .expect("concept exists")
+                .freshness,
+            "fresh"
+        );
+
+        // Punctuation is preserved by the normalizer, so a near variant does
+        // not widen this concept's child set.
+        publish_card(repo.path(), &conn, beta, &["invoice-settlement"], None)?;
+        assert_eq!(
+            super::load_artifact(&conn, first)?
+                .expect("concept exists")
+                .freshness,
+            "fresh"
+        );
+
+        let matching = publish_card(repo.path(), &conn, gamma, &["invoice settlement"], None)?;
+        assert_eq!(
+            super::load_artifact(&conn, first)?
+                .expect("concept exists")
+                .freshness,
+            "stale",
+            "a newly added matching child invalidates the old exhaustive set"
+        );
+
+        let second =
+            persist_test_concept(repo.path(), &conn, alpha, &[workflow.id, matching.id], true)?;
+        assert_eq!(
+            super::load_artifact(&conn, second)?
+                .expect("concept exists")
+                .freshness,
+            "fresh"
+        );
+
+        publish_card(
+            repo.path(),
+            &conn,
+            gamma,
+            &["invoice-settlement"],
+            Some(matching.id),
+        )?;
+        assert_eq!(
+            super::load_artifact(&conn, second)?
+                .expect("concept exists")
+                .freshness,
+            "stale",
+            "removing a matching current child invalidates the stored exhaustive set"
+        );
+        Ok(())
     }
 
     #[test]
