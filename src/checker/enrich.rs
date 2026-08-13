@@ -346,6 +346,15 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
 }
 
 fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
+    let deterministically_resolved = conn
+        .prepare(
+            "SELECT DISTINCT CAST(json_extract(detail_json, '$.memberCallId') AS INTEGER)
+             FROM resolved_edges
+             WHERE confidence IN ('certain', 'likely') AND provenance!='checker'
+               AND json_type(detail_json, '$.memberCallId')='integer'",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
     let mut statement = conn.prepare(
         "SELECT call.rowid, file.id, file.path, file.hash,
                 call.start, call.end, call.receiver_start, call.receiver_end,
@@ -362,13 +371,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
                   SELECT 1 FROM entity_occurrences entity
                   WHERE entity.file_id=file.id
                     AND entity.start<=call.start AND entity.end>=call.start
-                ) THEN 0 ELSE 1 END,
-                EXISTS(
-                  SELECT 1 FROM resolved_edges edge
-                  WHERE edge.confidence IN ('certain', 'likely')
-                    AND edge.provenance!='checker'
-                    AND CAST(json_extract(edge.detail_json, '$.memberCallId') AS INTEGER)=call.rowid
-                )
+                ) THEN 0 ELSE 1 END
          FROM member_calls call
          JOIN files file ON file.id=call.file_id
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
@@ -395,7 +398,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
             role: row.get(11)?,
             package: row.get(12)?,
             boundary_rank: row.get(13)?,
-            deterministically_resolved: row.get(14)?,
+            deterministically_resolved: deterministically_resolved.contains(&row.get(0)?),
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -443,17 +446,32 @@ fn spread_occurrences(occurrences: Vec<Occurrence>) -> Vec<Occurrence> {
             .push_back(occurrence);
     }
     let mut ordered = Vec::new();
-    for packages in tiers.values_mut() {
-        while packages
-            .values()
-            .any(|files| files.values().any(|queue| !queue.is_empty()))
-        {
-            for files in packages.values_mut() {
-                for queue in files.values_mut() {
-                    if let Some(occurrence) = queue.pop_front() {
-                        ordered.push(occurrence);
-                    }
-                }
+    for (_, packages) in tiers {
+        let mut active_packages = packages
+            .into_iter()
+            .map(|(package, files)| {
+                (
+                    package,
+                    files
+                        .into_values()
+                        .collect::<VecDeque<VecDeque<Occurrence>>>(),
+                )
+            })
+            .collect::<VecDeque<_>>();
+        while let Some((package, mut files)) = active_packages.pop_front() {
+            let mut occurrences = files
+                .pop_front()
+                .expect("active packages contain non-empty file queues");
+            ordered.push(
+                occurrences
+                    .pop_front()
+                    .expect("active files contain an occurrence"),
+            );
+            if !occurrences.is_empty() {
+                files.push_back(occurrences);
+            }
+            if !files.is_empty() {
+                active_packages.push_back((package, files));
             }
         }
     }
@@ -1738,7 +1756,7 @@ mod tests {
         let ordered = spread_occurrences(occurrences);
         assert_eq!(
             ordered.iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![1, 3, 4, 2, 5, 6]
+            vec![1, 4, 3, 5, 2, 6]
         );
     }
 
@@ -1761,6 +1779,24 @@ mod tests {
         let mut all = options();
         all.include_all = true;
         assert_eq!(select_eligible(candidates, &all).len(), 3);
+    }
+
+    #[test]
+    fn manual_default_keeps_all_one_hundred_fifty_thousand_eligible_occurrences() {
+        let occurrences = (0..150_000)
+            .map(|id| {
+                planned_occurrence(
+                    id,
+                    &format!("package-{}", id % 64),
+                    &format!("package-{}/file-{}.ts", id % 64, id % 1024),
+                    "production",
+                    id % 2,
+                )
+            })
+            .collect::<Vec<_>>();
+        let eligible = select_eligible(occurrences, &options());
+        assert_eq!(eligible.len(), 150_000);
+        assert_eq!(spread_occurrences(eligible).len(), 150_000);
     }
 
     #[test]
