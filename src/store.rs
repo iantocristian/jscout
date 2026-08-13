@@ -341,10 +341,10 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
--- Canonical TypeScript-checker facts are retained across projection rebuilds.
--- Source/target identities are deliberately not foreign keys: a re-index may
--- replace native rows, after which freshness checks keep these facts inert
--- without erasing their provenance.
+-- Canonical TypeScript-checker facts are retained across projection rebuilds
+-- within one structural snapshot. A full snapshot refresh deletes the batch.
+-- Source/target identities are deliberately not foreign keys because a
+-- projection rebuild must not cascade through canonical checker facts.
 CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
   id INTEGER PRIMARY KEY,
   source_snapshot TEXT NOT NULL,
@@ -1250,7 +1250,9 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 /// forced re-index at fresh-index cost. The caller owns the surrounding
 /// transaction and must re-insert every file before committing. Semantic
 /// memory (scout_runs, scout_classifications, semantic_*), package identity
-/// (package_instances), and the content-addressed embedding cache survive.
+/// (package_instances), checker facts, and the content-addressed embedding
+/// cache survive. [`reset_snapshot_state`] widens this to every
+/// snapshot-derived table for the normal fixed-snapshot refresh path.
 pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     crate::embed::clear_vector_rows(conn)?;
     // Children before parents, so foreign-key enforcement only ever checks
@@ -1277,6 +1279,22 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DROP TABLE chunks_fts;",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    Ok(())
+}
+
+/// Delete every row whose identity or meaning belongs to one repository
+/// snapshot while preserving the expensive content-addressed embedding cache
+/// and durable semantic memory. The caller owns the transaction and must not
+/// publish a new snapshot marker until extraction, resolution, projection, and
+/// cached-vector rematerialization have completed.
+pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
+    reset_extraction_state(conn)?;
+    conn.execute_batch(
+        "DELETE FROM checker_enrichment_batches;
+         DELETE FROM package_instances;
+         DELETE FROM meta
+         WHERE key IN ('root', 'snapshot', 'projection_version', 'resolution_hash');",
+    )?;
     Ok(())
 }
 

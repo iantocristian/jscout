@@ -19,7 +19,7 @@ schemas, and exported API types without claiming they execute.
 
 ```bash
 cargo build --release            # binary at target/release/jscout
-jscout index /path/to/repo       # build .jscout.db beside the sources
+jscout index /path/to/repo       # rebuild the current structural snapshot
 jscout search /path/to/repo "checkout inventory"
 ```
 
@@ -63,7 +63,7 @@ installs do not need Python, uv, PyTorch, or model downloads.
 ## Commands
 
 ```
-jscout index <root>            # build/update .jscout.db (incremental, content-hash based)
+jscout index <root>            # rebuild disposable structural state in .jscout.db
                                #   --database PATH isolates index/memory state
                                #   --deps pkg,@scope/pkg indexes named dependency internals
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
@@ -516,6 +516,13 @@ Matching semantic memory is attached to CLI and structural-profile search by
 default; use `--no-memory` or `--memory-limit` to control it. Every artifact carries
 evidence supports and a computed `fresh`, `degraded`, or `stale` label. The
 complete response-byte limit includes semantic artifacts.
+
+`jscout index` reparses the current checkout instead of carrying cheap
+structural rows across snapshots. It preserves content-hash embedding cache
+rows and semantic memory, then rematerializes current vector occurrences from
+the cache. Checker enrichment is snapshot-bound and is removed by a full index;
+run `jscout enrich` again when occurrence-specific checker edges are required.
+`jscout watch` remains hash-incremental and is a separate coordination mode.
 
 ## Confidence tiers
 

@@ -59,7 +59,7 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Build or update the index database (.jscout.db in the repo root)
+    /// Rebuild the structural snapshot (.jscout.db in the repo root)
     Index {
         /// Repository root
         root: PathBuf,
@@ -1286,7 +1286,7 @@ fn render_semantic_memory_text(artifacts: &[semantic::SemanticArtifact]) -> Resu
 fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> Result<()> {
     let started = std::time::Instant::now();
     let conn = open_database(root, database)?;
-    let o = indexer::index_repo_with_options(
+    let o = indexer::refresh_repo_with_options(
         root,
         &conn,
         &indexer::IndexOptions {
@@ -1304,7 +1304,7 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
         started.elapsed()
     );
     if o.extraction_reset {
-        println!("forced re-extraction: rebuilt the extraction tables wholesale");
+        println!("snapshot refresh: rebuilt disposable structural state");
     }
     indexer::report_failures(&o);
     if !dependencies.is_empty() {
