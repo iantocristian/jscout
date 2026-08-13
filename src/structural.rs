@@ -432,7 +432,6 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     let files = load_files(conn)?;
     let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
-    let checker_freshness = checker_project_freshness(conn)?;
     let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
     for symbol in &symbols {
         if symbol.scope.is_empty() {
@@ -528,13 +527,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
-        project_checker_enrichments(
-            conn,
-            &files,
-            &symbols,
-            &checker_freshness.fresh,
-            &mut insert_edge,
-        )?;
+        project_checker_enrichments(conn, &files, &symbols, snapshot, &mut insert_edge)?;
         if timing {
             eprintln!(
                 "timing project-checker-enrichments={:?}",
@@ -569,166 +562,25 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct CheckerProjectFreshness {
-    all: BTreeSet<(String, String)>,
-    fresh: BTreeSet<(String, String)>,
-    coverage_complete: bool,
-}
-
-/// Revalidate every input the checker loaded, grouped by TypeScript project
-/// and checker fingerprint. Indexed sources compare against canonical file
-/// hashes; configs, runtime/compiler files, ambient declarations, and other
-/// unindexed inputs are rehashed from disk. A project is fresh only when its
-/// complete recorded manifest is present and unchanged.
-fn checker_project_freshness(conn: &Connection) -> Result<CheckerProjectFreshness> {
-    let batch_id = conn
-        .query_row(
-            "SELECT id FROM checker_enrichment_batches WHERE active=1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    let Some(batch_id) = batch_id else {
-        return Ok(CheckerProjectFreshness {
-            coverage_complete: true,
-            ..Default::default()
-        });
-    };
-    let repository_root = conn
-        .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?;
-    let coverage_complete = conn.query_row(
-        "SELECT NOT EXISTS(
-           SELECT 1
-           FROM checker_enrichments enrichment
-           LEFT JOIN checker_occurrence_projects project
-             ON project.batch_id=enrichment.batch_id
-            AND project.member_call_id=enrichment.member_call_id
-            AND project.project_id=enrichment.project_id
-            AND project.checker_input_fingerprint=enrichment.checker_input_fingerprint
-           WHERE enrichment.batch_id=?1 AND project.project_id IS NULL
-         )",
-        [batch_id],
-        |row| row.get::<_, i64>(0),
-    )? != 0;
-    let mut projects = conn.prepare(
-        "SELECT DISTINCT project.project_id,
-                         project.checker_input_fingerprint
-         FROM checker_occurrence_projects project
-         WHERE project.batch_id=?1
-         ORDER BY project.project_id, project.checker_input_fingerprint",
-    )?;
-    let identities = projects
-        .query_map([batch_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut freshness = CheckerProjectFreshness {
-        all: identities.iter().cloned().collect(),
-        fresh: BTreeSet::new(),
-        coverage_complete,
-    };
-    let mut inputs = conn.prepare(
-        "SELECT input_kind, input_role, input_path, source_hash
-         FROM checker_input_files
-         WHERE batch_id=?1 AND project_id=?2 AND checker_input_fingerprint=?3
-         ORDER BY input_kind, input_path",
-    )?;
-    for (project_id, fingerprint) in identities {
-        let rows = inputs.query_map(params![batch_id, project_id, fingerprint], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut saw_input = false;
-        let mut project_fresh = true;
-        for row in rows {
-            saw_input = true;
-            let (kind, role, stored_path, expected) = row?;
-            let actual = if role == "source" {
-                conn.query_row(
-                    "SELECT hash FROM files
-                     WHERE path=?1 AND origin IN ('repository', 'workspace')",
-                    [&stored_path],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            } else {
-                let path = if kind == "repository" {
-                    repository_root
-                        .as_deref()
-                        .map(|root| std::path::Path::new(root).join(&stored_path))
-                } else {
-                    Some(std::path::PathBuf::from(&stored_path))
-                };
-                path.and_then(|path| std::fs::read(path).ok())
-                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-            };
-            if actual.as_deref() != Some(expected.as_str()) {
-                project_fresh = false;
-            }
-        }
-        if saw_input && project_fresh {
-            freshness.fresh.insert((project_id, fingerprint));
+/// Remove the optional checker batch and its projected edges without changing
+/// the deterministic structural snapshot. Watch uses this before an explicit
+/// enrichment cycle so config-only events fail closed even when module
+/// resolution produces the same snapshot hash.
+pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute("DELETE FROM checker_enrichment_batches", [])?;
+        conn.execute("DELETE FROM resolved_edges WHERE provenance='checker'", [])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
         }
     }
-    Ok(freshness)
-}
-
-/// Whether an otherwise unchanged structural projection can be reused without
-/// revalidating checker-derived edges. Reuse is safe only when every project
-/// that contributed a fact still has its complete recorded input manifest.
-pub(crate) fn checker_projection_reusable(conn: &Connection) -> Result<bool> {
-    let freshness = checker_project_freshness(conn)?;
-    Ok(freshness.coverage_complete && freshness.all == freshness.fresh)
-}
-
-/// Active checker projects whose recorded inputs no longer match. Used by
-/// watch mode to explain what it is about to replenish.
-pub(crate) fn stale_checker_projects(conn: &Connection) -> Result<Vec<String>> {
-    let freshness = checker_project_freshness(conn)?;
-    Ok(freshness
-        .all
-        .difference(&freshness.fresh)
-        .map(|(project, _)| project.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
-}
-
-/// Physical paths whose drift can invalidate the active checker plane. Watch
-/// uses this allow-list to react to ambient/config/runtime inputs without
-/// treating all of node_modules as ordinary source noise.
-pub(crate) fn checker_input_paths(
-    conn: &Connection,
-    root: &std::path::Path,
-) -> Result<BTreeSet<std::path::PathBuf>> {
-    let mut statement = conn.prepare(
-        "SELECT DISTINCT input.input_kind, input.input_path
-         FROM checker_input_files input
-         JOIN checker_enrichment_batches batch
-           ON batch.id=input.batch_id AND batch.active=1
-         ORDER BY input.input_kind, input.input_path",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut paths = BTreeSet::new();
-    for row in rows {
-        let (kind, path) = row?;
-        paths.insert(if kind == "repository" {
-            root.join(path)
-        } else {
-            std::path::PathBuf::from(path)
-        });
-    }
-    Ok(paths)
+    Ok(())
 }
 
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
@@ -2168,42 +2020,34 @@ struct CheckerProjection {
 
 #[derive(Debug, Default)]
 struct CheckerOccurrenceCoverage {
-    all_fresh: bool,
     unknown_projects: BTreeSet<String>,
 }
 
 fn checker_occurrence_coverage(
     conn: &Connection,
-    fresh_projects: &BTreeSet<(String, String)>,
+    snapshot: &str,
 ) -> Result<HashMap<i64, CheckerOccurrenceCoverage>> {
     let mut statement = conn.prepare(
-        "SELECT project.member_call_id, project.project_id,
-                project.checker_input_fingerprint, project.status
+        "SELECT project.member_call_id, project.project_id, project.status
          FROM checker_occurrence_projects project
          JOIN checker_enrichment_batches batch
            ON batch.id=project.batch_id AND batch.active=1
+          AND batch.source_snapshot=?1
          ORDER BY project.member_call_id, project.project_id",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([snapshot], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
         ))
     })?;
     let mut coverage = HashMap::new();
     for row in rows {
-        let (member_call_id, project, fingerprint, status) = row?;
+        let (member_call_id, project, status) = row?;
         let entry = coverage
             .entry(member_call_id)
-            .or_insert_with(|| CheckerOccurrenceCoverage {
-                all_fresh: true,
-                unknown_projects: BTreeSet::new(),
-            });
-        if !fresh_projects.contains(&(project.clone(), fingerprint)) {
-            entry.all_fresh = false;
-        }
+            .or_insert_with(CheckerOccurrenceCoverage::default);
         if status == "unknown" {
             entry.unknown_projects.insert(project);
         }
@@ -2213,20 +2057,18 @@ fn checker_occurrence_coverage(
 
 /// Recreate the targeted `checker` edges of the active batch, fact by fact.
 ///
-/// Freshness is identity-based at both the fact and owning-project-coverage
-/// levels. A fact projects only while its source occurrence and target still
-/// match and every project that owned that occurrence has its complete input
-/// manifest. Unknown owners remain visible in edge detail; their drift still
-/// retires the occurrence because a recomputation may produce a conflicting
-/// target. Facts that fail a gate remain canonical but inert.
+/// A checker batch belongs to exactly one structural snapshot. Within that
+/// snapshot, source occurrence and target fingerprints are still checked
+/// defensively. A new snapshot drops (full refresh) or ignores (incremental
+/// watch optimization) the whole batch rather than revalidating input files.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,
     symbols: &[SymbolNode],
-    fresh_projects: &BTreeSet<(String, String)>,
+    snapshot: &str,
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
-    let coverage = checker_occurrence_coverage(conn, fresh_projects)?;
+    let coverage = checker_occurrence_coverage(conn, snapshot)?;
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
         symbols_by_file
@@ -2239,14 +2081,14 @@ fn project_checker_enrichments(
                 call.line, enrichment.call_start, enrichment.call_end,
                 enrichment.receiver_start, enrichment.receiver_end,
                 enrichment.property_start, enrichment.property_end,
-                enrichment.project_id, enrichment.checker_input_fingerprint,
-                enrichment.receiver_type,
+                enrichment.project_id, enrichment.receiver_type,
                 enrichment.target_anchor, enrichment.target_fingerprint,
                 enrichment.confidence,
                 target_file.hash, target_symbol.decl_start, target_symbol.decl_end
          FROM checker_enrichments enrichment
          JOIN checker_enrichment_batches batch
            ON batch.id=enrichment.batch_id AND batch.active=1
+          AND batch.source_snapshot=?1
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
@@ -2262,7 +2104,7 @@ fn project_checker_enrichments(
          JOIN files target_file ON target_file.id=target_symbol.file_id
          ORDER BY enrichment.member_call_id, enrichment.target_anchor, enrichment.project_id",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([snapshot], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
@@ -2275,14 +2117,13 @@ fn project_checker_enrichments(
             row.get::<_, i64>(8)?,
             row.get::<_, i64>(9)?,
             row.get::<_, String>(10)?,
-            row.get::<_, String>(11)?,
-            row.get::<_, Option<String>>(12)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, String>(12)?,
             row.get::<_, String>(13)?,
             row.get::<_, String>(14)?,
             row.get::<_, String>(15)?,
-            row.get::<_, String>(16)?,
+            row.get::<_, i64>(16)?,
             row.get::<_, i64>(17)?,
-            row.get::<_, i64>(18)?,
         ))
     })?;
     let mut projected: BTreeMap<(i64, String), CheckerProjection> = BTreeMap::new();
@@ -2299,7 +2140,6 @@ fn project_checker_enrichments(
             property_start,
             property_end,
             project,
-            input_fingerprint,
             receiver_type,
             target,
             fingerprint,
@@ -2311,11 +2151,6 @@ fn project_checker_enrichments(
         let Some(occurrence_coverage) = coverage.get(&member_call_id) else {
             continue;
         };
-        if !occurrence_coverage.all_fresh
-            || !fresh_projects.contains(&(project.clone(), input_fingerprint))
-        {
-            continue;
-        }
         if crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end)
             != fingerprint
         {
@@ -3055,7 +2890,7 @@ fn cached_graph_degree(
 }
 
 fn workflow_direct_kind(kind: &str) -> bool {
-    matches!(kind, "call" | "render" | "extend")
+    matches!(kind, "call" | "render" | "extend" | "member_call")
 }
 
 fn workflow_general_association_kind(kind: &str) -> Option<&'static str> {
@@ -4947,30 +4782,6 @@ mod tests {
             [&snapshot],
         )?;
         let batch_id = conn.last_insert_rowid();
-        write(
-            repo.path(),
-            "tsconfig.json",
-            "{\"files\":[\"service.ts\"]}\n",
-        )?;
-        let config_hash = blake3::hash(&fs::read(repo.path().join("tsconfig.json"))?)
-            .to_hex()
-            .to_string();
-        conn.execute(
-            "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, checker_input_fingerprint,
-               input_kind, input_role, input_path, source_hash
-             ) VALUES(?1,'tsconfig.json','service.ts','inputs','repository','environment',
-                      'tsconfig.json',?2)",
-            rusqlite::params![batch_id, config_hash],
-        )?;
-        conn.execute(
-            "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, checker_input_fingerprint,
-               input_kind, input_role, input_path, source_hash
-             ) VALUES(?1,'tsconfig.json','service.ts','inputs','repository','source',
-                      'service.ts',?2)",
-            rusqlite::params![batch_id, source_hash],
-        )?;
         conn.execute(
             "INSERT INTO checker_enrichments(
                batch_id, member_call_id, source_file_id, source_file, source_hash,
@@ -5004,34 +4815,6 @@ mod tests {
              ) VALUES(?1,?2,'tsconfig.json','inputs','resolved')",
             rusqlite::params![batch_id, member_call_id],
         )?;
-        write(
-            repo.path(),
-            "tsconfig.stray.json",
-            "{\"files\":[\"service.ts\"]}\n",
-        )?;
-        let stray_config_hash = blake3::hash(&fs::read(repo.path().join("tsconfig.stray.json"))?)
-            .to_hex()
-            .to_string();
-        conn.execute(
-            "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, checker_input_fingerprint,
-               input_kind, input_role, input_path, source_hash
-             )
-             SELECT batch_id, 'tsconfig.stray.json', query_file, 'stray-inputs',
-                    input_kind, input_role, input_path, source_hash
-             FROM checker_input_files
-             WHERE batch_id=?1 AND project_id='tsconfig.json'
-               AND input_role='source'",
-            [batch_id],
-        )?;
-        conn.execute(
-            "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, checker_input_fingerprint,
-               input_kind, input_role, input_path, source_hash
-             ) VALUES(?1,'tsconfig.stray.json','service.ts','stray-inputs',
-                      'repository','environment','tsconfig.stray.json',?2)",
-            rusqlite::params![batch_id, stray_config_hash],
-        )?;
         conn.execute(
             "INSERT INTO checker_occurrence_projects(
                batch_id, member_call_id, project_id,
@@ -5057,11 +4840,11 @@ mod tests {
         )?;
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
-        let checker_detail: String = conn.query_row(
-            "SELECT detail_json FROM resolved_edges
+        let (checker_source, checker_detail): (String, String) = conn.query_row(
+            "SELECT src_key, detail_json FROM resolved_edges
              WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",
             [&target],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let checker_detail: serde_json::Value = serde_json::from_str(&checker_detail)?;
         assert_eq!(
@@ -5069,39 +4852,32 @@ mod tests {
             serde_json::json!(["tsconfig.stray.json"]),
             "unknown owning projects stay visible without demoting the clean resolution"
         );
-        assert!(super::checker_projection_reusable(&conn)?);
-
-        // Even though the stray owner was `unknown` and did not demote the
-        // clean answer, drift in that owner's inputs can introduce a conflict.
-        // Retire this occurrence until enrichment checks it again.
-        write(
-            repo.path(),
-            "tsconfig.stray.json",
-            "{\"files\":[\"service.ts\"],\"x\":1}\n",
-        )?;
-        assert!(!super::checker_projection_reusable(&conn)?);
-        rebuild_projection(&conn, &snapshot)?;
-        let stale_edges: i64 = conn.query_row(
-            "SELECT count(*) FROM resolved_edges
-             WHERE kind='member_call' AND provenance='checker'",
+        let workflow =
+            workflow_neighborhood(&conn, &checker_source, 1, 20, 40, &origin::defaults())?;
+        assert!(
+            workflow.nodes.iter().any(|node| node.key == target),
+            "a likely checker-resolved member call must participate in workflow discovery"
+        );
+        super::clear_checker_plane(&conn)?;
+        let cleared: (i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM checker_enrichment_batches),
+               (SELECT count(*) FROM resolved_edges WHERE provenance='checker'),
+               (SELECT count(*) FROM resolved_edges
+                  WHERE provenance='member-name-match'
+                    AND dst_key='member:unknown:load')",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let retained_facts: i64 = conn.query_row(
-            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
-            [batch_id],
-            |row| row.get(0),
-        )?;
-        assert_eq!(stale_edges, 0);
-        assert_eq!(retained_facts, 1);
+        assert_eq!(cleared, (0, 0, 1));
         Ok(())
     }
 
-    /// A checker fact depends on its TypeScript project's complete input
-    /// manifest, not only on its caller and target files. Drift invalidates the
-    /// affected project while facts from an independent project remain usable.
+    /// Checker facts are one disposable plane, not independently freshened
+    /// project fragments. A structural snapshot change suppresses the entire
+    /// old batch until enrichment publishes a batch for the new snapshot.
     #[test]
-    fn transitive_source_drift_retires_only_the_affected_project() -> Result<()> {
+    fn checker_batch_is_inert_after_snapshot_changes() -> Result<()> {
         let repo = tempfile::tempdir()?;
         write(
             repo.path(),
@@ -5153,31 +4929,6 @@ mod tests {
             let project = format!("tsconfig.{side}.json");
             let query_file = format!("{side}.ts");
             let input_fingerprint = format!("{side}-inputs");
-            for input_file in [
-                "tables.ts".to_string(),
-                format!("{side}-types.ts"),
-                query_file.clone(),
-            ] {
-                let hash: String = conn.query_row(
-                    "SELECT hash FROM files WHERE path=?1",
-                    [&input_file],
-                    |row| row.get(0),
-                )?;
-                conn.execute(
-                    "INSERT INTO checker_input_files(
-                       batch_id, project_id, query_file, checker_input_fingerprint,
-                       input_kind, input_role, input_path, source_hash
-                     ) VALUES(?1,?2,?3,?4,'repository','source',?5,?6)",
-                    rusqlite::params![
-                        batch_id,
-                        project,
-                        query_file,
-                        input_fingerprint,
-                        input_file,
-                        hash
-                    ],
-                )?;
-            }
             let (call, file_id, hash, spans): (i64, i64, String, [i64; 6]) = conn.query_row(
                 "SELECT call.rowid, file.id, file.hash, call.start, call.end,
                             call.receiver_start, call.receiver_end,
@@ -5258,17 +5009,19 @@ mod tests {
              export type Selected = OtherTable;\n",
         )?;
         indexer::index_repo(repo.path(), &conn)?;
-        assert_eq!(
-            projected(&conn)?,
-            vec!["right.ts"],
-            "a transitive left-project input must retire left without costing right"
+        assert!(
+            projected(&conn)?.is_empty(),
+            "an old-snapshot checker batch must not project partial survivors"
         );
         let retained: i64 = conn.query_row(
             "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
             [batch_id],
             |row| row.get(0),
         )?;
-        assert_eq!(retained, 2, "canonical facts survive their projection");
+        assert_eq!(
+            retained, 2,
+            "incremental watch may retain inert facts until the next full refresh"
+        );
         Ok(())
     }
 

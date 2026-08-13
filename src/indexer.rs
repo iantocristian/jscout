@@ -33,9 +33,9 @@ pub struct IndexOutcome {
     /// False when the structural projection was provably identical (same
     /// snapshot, projection version, and module resolution) and was kept.
     pub projection_rebuilt: bool,
-    /// True when a forced re-extraction (cleared file hashes, e.g. after a
-    /// schema migration) truncated the extraction tables wholesale instead of
-    /// replacing files one at a time.
+    /// True when the disposable snapshot tables were truncated wholesale,
+    /// either for an explicit fixed-snapshot refresh or a forced extractor
+    /// re-extraction, instead of replacing files one at a time.
     pub extraction_reset: bool,
 }
 
@@ -126,19 +126,38 @@ pub(crate) fn resolver_options(
     }
 }
 
-/// Index (or re-index) a repository. Files whose content hash is unchanged
-/// are skipped; changed files are fully replaced.
+/// Incrementally index a repository. Kept for watcher operation and tests;
+/// the user-facing fixed-snapshot command uses [`refresh_repo_with_options`].
 #[cfg(test)]
 pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     index_repo_with_options(root, conn, &IndexOptions::default())
 }
 
+/// Incrementally update the structural snapshot. Files whose content hash is
+/// unchanged are skipped. Watch uses this as an optimization; callers needing
+/// a reliable checkout snapshot should use [`refresh_repo_with_options`].
 pub fn index_repo_with_options(
     root: &Path,
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    index_repo_impl(root, conn, options, true)
+    index_repo_impl(root, conn, options, true, IndexMode::Incremental)
+}
+
+/// Rebuild every repository-derived row for the current checkout while
+/// preserving content-addressed embeddings and semantic memory.
+pub fn refresh_repo_with_options(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    index_repo_impl(root, conn, options, true, IndexMode::FullRefresh)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexMode {
+    Incremental,
+    FullRefresh,
 }
 
 /// The pre-reset code path: always replace files one at a time, even when
@@ -150,7 +169,7 @@ pub(crate) fn index_repo_without_extraction_reset(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    index_repo_impl(root, conn, options, false)
+    index_repo_impl(root, conn, options, false, IndexMode::Incremental)
 }
 
 fn index_repo_impl(
@@ -158,6 +177,7 @@ fn index_repo_impl(
     conn: &Connection,
     options: &IndexOptions,
     allow_extraction_reset: bool,
+    mode: IndexMode,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     ensure_extraction_version(conn)?;
@@ -179,7 +199,9 @@ fn index_repo_impl(
         extraction_reset: false,
     };
 
-    let mut existing: HashMap<String, (i64, String, String)> = {
+    let mut existing: HashMap<String, (i64, String, String)> = if mode == IndexMode::FullRefresh {
+        HashMap::new()
+    } else {
         let mut stmt =
             conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
         let rows = stmt.query_map([], |r| {
@@ -195,7 +217,7 @@ fn index_repo_impl(
         rows.collect::<std::result::Result<_, _>>()?
     };
 
-    // Migrations force re-extraction by clearing file hashes, and the
+    // Extractor-version changes force re-extraction by clearing file hashes, and the
     // first-party loop commits atomically, so a real database sits at ~100%
     // or ~0% cleared; the half-way threshold only guards hand-edited state.
     // At that scale, per-file replacement is pathological: every
@@ -206,13 +228,17 @@ fn index_repo_impl(
         .values()
         .filter(|(_, hash, _)| hash.is_empty())
         .count();
-    let extraction_reset =
-        allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len();
+    let extraction_reset = mode == IndexMode::FullRefresh
+        || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
 
     let mut seen: std::collections::HashSet<String> = Default::default();
     conn.execute_batch("BEGIN")?;
     if extraction_reset {
-        store::reset_extraction_state(conn)?;
+        if mode == IndexMode::FullRefresh {
+            store::reset_snapshot_state(conn)?;
+        } else {
+            store::reset_extraction_state(conn)?;
+        }
         existing.clear();
         outcome.extraction_reset = true;
     }
@@ -321,14 +347,15 @@ fn index_repo_impl(
         resolution_hash: Some(resolution.clone()),
     };
     let projection_started = std::time::Instant::now();
-    if previous == current && crate::structural::checker_projection_reusable(conn)? {
+    if previous == current {
         // The projection is a pure function of the canonical tables: the
         // snapshot covers every extracted row (file content identity) and the
         // resolution hash covers module edges, whose inputs (tsconfigs,
-        // manifests, node_modules layout) live outside indexed content. An
-        // active checker batch adds its own exact input manifest to this
-        // reuse gate. Identical inputs under the same projection version
-        // republish the existing rows instead of rebuilding them.
+        // manifests, node_modules layout) live outside indexed content.
+        // Checker publication rebuilds the projection immediately and its
+        // batch is accepted only for this exact snapshot. Identical inputs
+        // under the same projection version can therefore republish the
+        // existing rows.
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = current.publish(conn);
         match result {
@@ -1050,8 +1077,9 @@ mod tests {
 
     use super::{
         IndexOptions, index_repo, index_repo_with_options, index_repo_without_extraction_reset,
+        refresh_repo_with_options,
     };
-    use crate::{origin, query, search, store, structural};
+    use crate::{embed, origin, query, search, semantic, store, structural};
 
     #[test]
     fn reports_the_file_and_stage_for_read_failures() -> Result<()> {
@@ -2032,6 +2060,115 @@ mod tests {
             .iter()
             .map(|(name, sql)| Ok((*name, dump_section(conn, sql)?)))
             .collect()
+    }
+
+    #[test]
+    fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "export function run() { return 'stable'; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        let first = index_repo(repo.path(), &conn)?;
+        assert_eq!((first.indexed, first.unchanged), (1, 0));
+
+        let snapshot = structural::current_snapshot(&conn)?;
+        let (chunk_hash, source_hash): (String, String) = conn.query_row(
+            "SELECT chunk.hash, file.hash
+             FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+             WHERE file.path='main.ts' ORDER BY chunk.id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let anchor = "file:main.ts";
+        let context_hash = semantic::context_hash(&conn, anchor)?;
+
+        // Durable cache and memory rows deliberately coexist with disposable
+        // rows in one database.
+        conn.execute_batch(
+            "INSERT INTO embedding_profiles(
+               id, provider, model, config_fingerprint, dimensions, config_json
+             ) VALUES(1, 'test', 'tiny', 'test-profile', 2, '{}');
+             INSERT INTO checker_enrichment_batches(
+               id, source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(1, 'old', '5.9.3', 'test', 'checker-fp', 1,
+                      '2026-01-01T00:00:00Z', 1);
+             INSERT INTO package_instances(
+               id, origin, name, canonical_root, locator, manifest_hash
+             ) VALUES(99, 'dependency', 'obsolete', '/obsolete/package',
+                      'obsolete@1', 'manifest');
+             INSERT INTO scout_runs(
+               id, scout_kind, status, gateway_protocol, provider, model,
+               billing_path, prompt_version, source_snapshot,
+               input_fingerprint, request_hash, started_at, completed_at
+             ) VALUES(7, 'workflow', 'completed', 1, 'test', 'test-model',
+                      'api', 'v1', 'old', 'memory-fp', 'request',
+                      '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+             INSERT INTO scout_classifications(
+               run_id, anchor_key, decision, role, evidence_json
+             ) VALUES(7, 'file:main.ts', 'defining', 'entry', '{}');
+             INSERT INTO semantic_artifacts(
+               id, artifact_type, canonical_name, body_json, model,
+               prompt_version, confidence, source_snapshot, created_at,
+               scout_run_id, input_fingerprint, artifact_fingerprint
+             ) VALUES(3, 'annotation', 'stable behavior', '{}', 'test-model',
+                      'v1', 'likely', 'old', '2026-01-01T00:01:00Z', 7,
+                      'memory-fp', 'artifact-fp');",
+        )?;
+        conn.execute(
+            "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES(?1, 1, ?2)",
+            rusqlite::params![chunk_hash, vec![0_u8; 8]],
+        )?;
+        conn.execute(
+            "INSERT INTO semantic_supports(
+               artifact_id, claim_path, anchor_key, role, evidence_file,
+               evidence_start_line, evidence_end_line, source_hash,
+               context_hash, confidence
+             ) VALUES(3, '$', ?1, 'evidence', 'main.ts', 1, 1, ?2, ?3, 'likely')",
+            rusqlite::params![anchor, source_hash, context_hash],
+        )?;
+        embed::materialize_cached_embeddings(&conn)?;
+        assert_eq!(
+            semantic::load_artifact(&conn, 3)?.unwrap().freshness,
+            "fresh"
+        );
+
+        let refreshed = refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+        assert!(refreshed.extraction_reset);
+        assert_eq!(
+            (refreshed.indexed, refreshed.unchanged, refreshed.failed),
+            (1, 0, 0)
+        );
+        assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+
+        let counts: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_profiles),
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM embedding_index_entries),
+               (SELECT count(*) FROM semantic_artifacts),
+               (SELECT count(*) FROM checker_enrichment_batches),
+               (SELECT count(*) FROM package_instances WHERE id=99)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (1, 1, 1, 1, 0, 0));
+        assert_eq!(
+            semantic::load_artifact(&conn, 3)?.unwrap().freshness,
+            "fresh"
+        );
+        Ok(())
     }
 
     #[test]

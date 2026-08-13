@@ -46,8 +46,8 @@ pub fn serve(
 ) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = match database_path {
-        Some(path) => store::open_path(path)?,
-        None => store::open(&root)?,
+        Some(path) => store::open_path_read_only(path)?,
+        None => store::open_read_only(&root)?,
     };
     let provider = embed::Provider::from_env()?;
     let telemetry_path = telemetry_path
@@ -113,15 +113,37 @@ pub fn serve(
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
-                let result = call_tool(
-                    &root,
-                    &conn,
-                    provider.as_ref(),
-                    profile,
-                    source_view,
-                    name,
-                    &args,
-                );
+                let result = if name == "annotate" && profile == ToolProfile::Structural {
+                    // The server is read-only until the one write-capable tool
+                    // is actually selected. Keep schema writes and writer locks
+                    // out of every retrieval-only MCP session.
+                    let write_conn = match database_path {
+                        Some(path) => store::open_path(path),
+                        None => store::open(&root),
+                    };
+                    match write_conn {
+                        Ok(write_conn) => call_tool(
+                            &root,
+                            &write_conn,
+                            provider.as_ref(),
+                            profile,
+                            source_view,
+                            name,
+                            &args,
+                        ),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    call_tool(
+                        &root,
+                        &conn,
+                        provider.as_ref(),
+                        profile,
+                        source_view,
+                        name,
+                        &args,
+                    )
+                };
                 log_tool_call(
                     &mut telemetry,
                     &conn,

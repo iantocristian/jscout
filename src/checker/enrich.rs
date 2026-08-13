@@ -66,11 +66,7 @@ struct PendingFact {
 
 #[derive(Debug, Clone)]
 struct ValidatedInput {
-    project_id: String,
-    query_file: String,
-    input_fingerprint: String,
     kind: String,
-    role: &'static str,
     path: String,
     source_hash: String,
 }
@@ -213,9 +209,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     {
         bail!("checker inputs changed while enrichment was running; published nothing");
     }
-    let mut validated_inputs = BTreeMap::<(String, String, String, String, String), String>::new();
+    let mut validated_inputs = BTreeMap::<(String, String), String>::new();
     for entry in &checked.results {
-        let input_fingerprint = entry
+        entry
             .fingerprint
             .as_ref()
             .context("checker omitted a validated project fingerprint")?;
@@ -233,13 +229,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                 ),
                 Err(_) => ("absolute".to_string(), input.path.clone()),
             };
-            let key = (
-                entry.project_id.clone(),
-                entry.file.clone(),
-                input_fingerprint.clone(),
-                kind,
-                stored_path,
-            );
+            let key = (kind, stored_path);
             if let Some(previous) = validated_inputs.insert(key, input.source_hash.clone())
                 && previous != input.source_hash
             {
@@ -249,20 +239,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     }
     let validated_inputs = validated_inputs
         .into_iter()
-        .map(
-            |((project_id, query_file, input_fingerprint, kind, path), source_hash)| {
-                Ok(ValidatedInput {
-                    role: input_role(&conn, &kind, &path)?,
-                    project_id,
-                    query_file,
-                    input_fingerprint,
-                    kind,
-                    path,
-                    source_hash,
-                })
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+        .map(|((kind, path), source_hash)| ValidatedInput {
+            kind,
+            path,
+            source_hash,
+        })
+        .collect::<Vec<_>>();
     let identity = checker_identity.unwrap_or(capabilities.typescript.clone());
     let batch_fingerprint = batch_fingerprint(&validation_entries);
     let batch_id = publish(
@@ -472,27 +454,6 @@ fn map_declaration(
     }))
 }
 
-/// Split checker inputs by how their current content identity is recovered.
-///
-/// Indexed repository sources use the canonical `files.hash`; configs,
-/// ambient/generated declarations, the TypeScript runtime, and other
-/// unindexed paths are rehashed from disk. Both remain part of the owning
-/// project's manifest, so drift invalidates that project rather than one
-/// endpoint fact or the repository's whole checker plane.
-fn input_role(conn: &Connection, kind: &str, path: &str) -> Result<&'static str> {
-    if kind != "repository" || path.ends_with(".d.ts") {
-        return Ok("environment");
-    }
-    let indexed = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM files WHERE path=?1 AND origin IN ('repository', 'workspace')
-         )",
-        [path],
-        |row| row.get::<_, i64>(0),
-    )? != 0;
-    Ok(if indexed { "source" } else { "environment" })
-}
-
 pub(crate) fn target_fingerprint(anchor: &str, source_hash: &str, start: i64, end: i64) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-checker-target-v1\0");
@@ -559,10 +520,10 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
             ],
         )?;
         let batch_id = conn.last_insert_rowid();
-        // Nothing reads a retired batch: projection, reuse, and revalidation
-        // all key on `active=1`. Drop the superseded ones here (their facts and
-        // input manifests cascade) so a repeatedly enriched repository keeps
-        // one batch instead of one per pass.
+        // Nothing reads a retired batch: projection keys on `active=1` and the
+        // exact source snapshot. Drop the superseded one and its facts so a
+        // repeatedly enriched repository keeps one batch instead of one per
+        // pass.
         conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])?;
         let mut insert = conn.prepare_cached(
             "INSERT INTO checker_enrichments(
@@ -609,24 +570,6 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
                 project.project_id,
                 project.input_fingerprint,
                 project.status,
-            ])?;
-        }
-        let mut insert_input = conn.prepare_cached(
-            "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, checker_input_fingerprint,
-               input_kind, input_role, input_path, source_hash
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        )?;
-        for input in plan.inputs {
-            insert_input.execute(params![
-                batch_id,
-                input.project_id,
-                input.query_file,
-                input.input_fingerprint,
-                input.kind,
-                input.role,
-                input.path,
-                input.source_hash,
             ])?;
         }
         Ok(batch_id)
@@ -991,11 +934,7 @@ mod tests {
                 facts: &[],
                 projects: &[],
                 inputs: &[ValidatedInput {
-                    project_id: "tsconfig.json".into(),
-                    query_file: "main.ts".into(),
-                    input_fingerprint: "inputs".into(),
                     kind: "absolute".into(),
-                    role: "environment",
                     path: ambient.to_string_lossy().into_owned(),
                     source_hash: expected,
                 }],
@@ -1020,8 +959,7 @@ mod tests {
     }
 
     /// Nothing reads a superseded batch, so a repeatedly enriched repository
-    /// must not accumulate one dead batch (and its facts and input manifest)
-    /// per pass.
+    /// must not accumulate one dead batch and its facts per pass.
     #[test]
     fn publishing_a_batch_prunes_the_one_it_supersedes() -> Result<()> {
         let repo = tempfile::tempdir()?;

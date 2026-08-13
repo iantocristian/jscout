@@ -59,7 +59,7 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Build or update the index database (.jscout.db in the repo root)
+    /// Rebuild the structural snapshot (.jscout.db in the repo root)
     Index {
         /// Repository root
         root: PathBuf,
@@ -777,7 +777,7 @@ fn main() -> Result<()> {
             input,
             database,
         } => {
-            let conn = open_database(&root, database.as_deref())?;
+            let conn = open_database_for_write(&root, database.as_deref())?;
             let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
             let artifact = semantic::annotate_request(&root, &conn, input)?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
@@ -804,7 +804,7 @@ fn main() -> Result<()> {
             concept_tag_limit,
             database,
         } => {
-            let conn = open_database(&root, database.as_deref())?;
+            let conn = open_database_read_only(&root, database.as_deref())?;
             let result = semantic_query::query(
                 &root,
                 &conn,
@@ -842,7 +842,7 @@ fn main() -> Result<()> {
             response_bytes,
             database,
         } => {
-            let conn = open_database(&root, database.as_deref())?;
+            let conn = open_database_read_only(&root, database.as_deref())?;
             let result = surface::overview_response(
                 &conn,
                 &surface::OverviewOptions {
@@ -866,7 +866,7 @@ fn main() -> Result<()> {
             candidate_limit,
             database,
         } => {
-            let conn = open_database(&root, database.as_deref())?;
+            let conn = open_database_read_only(&root, database.as_deref())?;
             let candidates = semantic::workflow_candidates(
                 &root,
                 &conn,
@@ -1148,10 +1148,17 @@ fn main() -> Result<()> {
     }
 }
 
-fn open_database(root: &Path, database: Option<&Path>) -> Result<rusqlite::Connection> {
+fn open_database_for_write(root: &Path, database: Option<&Path>) -> Result<rusqlite::Connection> {
     match database {
         Some(path) => store::open_path(path),
         None => store::open(root),
+    }
+}
+
+fn open_database_read_only(root: &Path, database: Option<&Path>) -> Result<rusqlite::Connection> {
+    match database {
+        Some(path) => store::open_path_read_only(path),
+        None => store::open_read_only(root),
     }
 }
 
@@ -1161,7 +1168,7 @@ fn cmd_neighborhood(
     response_bytes: usize,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
-    let conn = store::open(root)?;
+    let conn = store::open_read_only(root)?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
     println!(
         "{}",
@@ -1194,7 +1201,7 @@ fn cmd_search(
     json: bool,
     options: search::SearchOptions,
 ) -> Result<()> {
-    let conn = store::open(root)?;
+    let conn = store::open_read_only(root)?;
     let provider = if no_vector {
         None
     } else {
@@ -1285,8 +1292,8 @@ fn render_semantic_memory_text(artifacts: &[semantic::SemanticArtifact]) -> Resu
 
 fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> Result<()> {
     let started = std::time::Instant::now();
-    let conn = open_database(root, database)?;
-    let o = indexer::index_repo_with_options(
+    let conn = open_database_for_write(root, database)?;
+    let o = indexer::refresh_repo_with_options(
         root,
         &conn,
         &indexer::IndexOptions {
@@ -1304,7 +1311,7 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
         started.elapsed()
     );
     if o.extraction_reset {
-        println!("forced re-extraction: rebuilt the extraction tables wholesale");
+        println!("snapshot refresh: rebuilt disposable structural state");
     }
     indexer::report_failures(&o);
     if !dependencies.is_empty() {
@@ -1329,7 +1336,7 @@ fn cmd_calls(
     query: &calls::CallQuery,
     json: bool,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_read_only(root, database)?;
     let result = calls::query(root, &conn, query)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1381,7 +1388,7 @@ fn cmd_calls(
 }
 
 fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Result<()> {
-    let conn = store::open(root)?;
+    let conn = store::open_read_only(root)?;
     let sites = query::events_in_origins(&conn, name, file_origins)?;
     if sites.is_empty() {
         println!("no event sites found");
@@ -1407,7 +1414,7 @@ fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Resul
 }
 
 fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) -> Result<()> {
-    let conn = store::open(root)?;
+    let conn = store::open_read_only(root)?;
     let graph = query::ModuleGraph::load(&conn)?;
     let targets = query::find_symbols_in_origins(&conn, spec, file_origins)?;
     if targets.is_empty() {
@@ -1567,7 +1574,7 @@ fn cmd_scout_workflows(
     dry_run: bool,
     options: scouting::WorkflowScoutOptions,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::workflows(
         root,
         &conn,
@@ -1595,7 +1602,7 @@ fn cmd_scout_summaries(
     dry_run: bool,
     options: scouting::SummaryScoutOptions,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_for_write(root, database)?;
     if dry_run {
         println!(
             "{}",
@@ -1618,7 +1625,7 @@ fn cmd_scout_cards(
     dry_run: bool,
     options: scouting::CardScoutOptions,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::cards(root, &conn, &options.anchors)?;
     if dry_run {
         println!(
@@ -1640,7 +1647,7 @@ fn cmd_scout_concepts(
     dry_run: bool,
     options: scouting::ConceptScoutOptions,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::concepts(&conn, &options.terms)?;
     if dry_run {
         println!(
@@ -1663,7 +1670,7 @@ fn cmd_scout_refresh(
     dry_run: bool,
     policy: llm::config::RequestPolicy,
 ) -> Result<()> {
-    let conn = open_database(root, database)?;
+    let conn = open_database_for_write(root, database)?;
     let selection = scouting::refresh::select(&conn, artifacts)?;
     if dry_run {
         let plans = scouting::plan_refresh(root, &conn, &selection)?;

@@ -1,10 +1,10 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-12.
+> Status: authoritative plan as of 2026-08-13.
 >
 > G1–G10 are implemented. Semantic v1 has reached its implementation boundary;
-> product-value testing remains paused until the engineering verification gate
-> below is green.
+> G11 snapshot simplification is in progress. Product-value testing remains
+> paused until the engineering verification gate below is green.
 
 ## Document policy
 
@@ -76,6 +76,56 @@ Semantic artifacts are returned as `fresh`, `degraded`, `stale`, or
 10. Dependency internals, possible-confidence expansion, and structural
     expansion remain explicit scope choices.
 
+## Snapshot lifecycle and logical storage planes
+
+**Amendment — disposable snapshot boundary (2026-08-13).** This section is
+authoritative over older text that describes retaining checker facts across
+reindexing or maintaining cross-snapshot checker-input freshness. jscout uses
+one SQLite database with three logical lifecycles, not three physical
+databases:
+
+| Plane | Contents | Lifecycle |
+|---|---|---|
+| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Any row whose meaning depends on repository layout or a snapshot anchor is deleted first. |
+| **Durable content cache** | Embedding profiles and content-hash-keyed embedding vectors | Preserved across snapshot rebuilds. Current chunk occurrences are rematerialized from cached vectors; only unseen content is embedded. |
+| **Durable semantic memory** | Scout runs/classifications and `semantic_*` artifacts, relations, and evidence supports | Preserved across snapshot rebuilds. Evidence hashes and current anchors determine whether a claim is fresh, degraded, stale, or superseded. |
+
+The database file is an implementation container, not a shared lifecycle.
+Physical database splitting adds backup, transaction, and deployment
+complexity without improving this contract and is not planned.
+
+`jscout index` is the reliable fixed-snapshot path. Its target behavior is a
+full disposable-plane rebuild followed by resolution, projection, and vector
+occurrence rematerialization, with publication of a current snapshot only
+after those required phases succeed. Rebuilding source-derived state is cheap;
+recomputing embeddings and discarding reviewed semantic memory are not.
+
+Checker enrichment is also snapshot-bound. A full index deletes checker facts;
+`jscout enrich` may repopulate them for that exact published snapshot. No
+version ladder, transitive input manifest, or cross-snapshot revalidation is
+required to carry checker answers through a rebuild. Within one snapshot,
+publication still validates source hashes, occurrence spans, project answers,
+and the snapshot race boundary.
+
+Watch mode is a separate coordination problem, not the correctness model for
+indexing. It may use incremental work as an optimization, but branch switches,
+submodule changes, lockfile/configuration changes, missed events, or uncertain
+ownership must converge through the same full snapshot refresh. Watcher
+optimization must not make the non-watcher index path stateful or fragile.
+
+Query surfaces should open an existing published snapshot without silently
+creating or migrating structural state. Commands that refresh the snapshot,
+materialize embeddings, publish checker enrichment, or write semantic memory
+retain only the write authority their operation requires.
+
+The historical v1→v18 in-place migration ladder is retired. A database at the
+current schema opens normally. Schemas at or above the v16 durable-format floor
+keep embedding and semantic-memory tables while dropping and recreating the
+entire disposable plane once. Older or future-incompatible durable formats fail
+with instructions to preserve the old file. Future durable-plane changes need
+an explicit export/import or cache-compatibility decision, not migrations for
+source-derived tables.
+
 ## System architecture
 
 ```text
@@ -111,7 +161,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v16; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v18; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -483,8 +533,8 @@ No further product-value evaluation is required during semantic-v1
 implementation. Before real repository testing, complete engineering
 verification:
 
-- Rust compile, formatting, lint, unit, migration, and existing regression
-  tests;
+- Rust compile, formatting, lint, unit, schema-compatibility, and existing
+  regression tests;
 - fake-provider gateway protocol/config/auth tests;
 - schema rejection, cancellation, timeout, child-crash, snapshot-race, and
   no-partial-write tests;
@@ -558,8 +608,8 @@ does not demote otherwise agreeing resolved answers. Canonical occurrence
 coverage retains its project ID, status, and input fingerprint; projected
 checker edges expose those IDs as `unknownProjects`. Multiple mapped targets or
 an unmappable declaration from a resolved answer still make every survivor
-`possible`. Drift in any owning project's inputs — including an `unknown`
-project — suppresses the occurrence until enrichment recomputes all owners.
+`possible`. The complete answer is published as one batch bound to the current
+structural snapshot; it is never freshened project by project.
 
 Diagnostics are never enumerated, used as a gate, or surfaced. A broken or
 non-compiling project still attempts the requested member query rather than
@@ -598,39 +648,28 @@ separate `possible` candidates. Existing hubs are retained for unexplained
 dynamic calls. Contract-plane consumers may attach the receiver's declared type
 as documentary evidence under the same provenance.
 
-Checker results are canonical typed facts, not writes made directly to the
-disposable graph projection. A dedicated enrichment table records at least the
+Checker results are typed facts in the disposable snapshot plane, not writes
+made directly to the graph projection. A dedicated enrichment table records the
 caller/file identity and hash, exact occurrence spans, project ID, resolved
 target anchor and fingerprint, confidence/provenance, and checker-input
-fingerprint. Projection rebuilds include only fresh facts and recreate their
-targeted edges; they neither erase the canonical facts nor make stale facts
-traversable.
+fingerprint. Projection rebuilds include only the active batch whose
+`source_snapshot` exactly matches the snapshot being projected.
 
 The checker-input fingerprint covers the exact TypeScript package/version,
 normalized config inheritance, effective compiler options, project selection,
 and identities/hashes of the config, source, and declaration inputs loaded by
-the checker. A lockfile hash may contribute but is not a freshness certificate
-for ambient/generated declarations or effective compiler settings. The pass is
-planned against one structural snapshot and publishes a completed batch in one
-transaction after rechecking that snapshot, occurrence source hashes, target
-anchors, and checker inputs; drift publishes nothing from the raced batch. Only
-one batch is retained: publishing supersedes and drops its predecessor.
-
-As implemented, "only fresh facts" is enforced per TypeScript project and
-checker-input fingerprint. The sidecar returns the complete input manifest for
-each project. Indexed repository/workspace sources are compared with canonical
-file hashes; the TypeScript package, `tsconfig` chain, ambient/generated
-declarations, and other unindexed paths are rehashed from disk. Drift in any
-input retires every fact produced by that project while leaving independent
-projects available. This covers transitive type inputs: changing file A
-suppresses a fact in file B when A participated in B's checker answer.
+the checker. It is retained as provenance and used to detect an input race
+during the enrichment command, not as a cross-snapshot freshness join. The pass
+publishes only after rechecking its structural snapshot, occurrence source
+hashes, target anchors, and current checker inputs. Drift during the run
+publishes nothing. Only one batch is retained; a full `jscout index` deletes it.
 
 `jscout watch --enrich` makes replenishment automatic. Each relevant event is
-debounced, indexed first (which rebuilds without stale project edges), then
-enriched. A checker failure leaves those edges suppressed and is retried after
-the next relevant event. Because the fingerprint hashes machine-absolute
-paths, a database moved to another path or host never revalidates and projects no
-checker edges until enrichment runs there — enrichment is host-local by design.
+debounced, indexed first, then enriched. A checker failure leaves the current
+snapshot without checker edges and is retried after the next relevant
+repository event. External-input watching and generation cancellation belong
+to the later watcher coordinator; the fixed-snapshot path does not retain a
+manifest-rehashing subsystem for them.
 
 Verification follows the gateway precedent: fake-sidecar protocol,
 unknown-type, crash, enforced-timeout, cancellation, and outside-root tests in
@@ -675,6 +714,48 @@ watch-resident checker daemons, and any checker influence over deterministic
 structural facts.
 Agents wanting full typed navigation should use an LSP; G10 only closes
 the receiver-identity gap inside jscout's own evidence model.
+
+## In-progress G11 — fixed-snapshot simplification
+
+G11 makes the normal, non-watcher index path the primary correctness surface
+and removes lifecycle machinery that only attempted to preserve cheap derived
+facts. It does not change extraction semantics or add another storage file.
+
+Implementation order:
+
+1. Include occurrence-specific checker `member_call` edges in deterministic
+   workflow traversal. **Complete.**
+2. Bound semantic supports and discard optional semantic overlays before exact
+   source hits when a response budget binds. **Complete.**
+3. Make the three logical storage lifecycles executable in the existing
+   database. `jscout index` clears and rebuilds the disposable plane while
+   retaining embeddings and semantic memory, then rematerializes cached vector
+   occurrences. **Complete.**
+4. Remove checker cross-snapshot retention from the fixed-snapshot path. A
+   rebuild drops checker batches; enrichment republishes an exact-snapshot
+   batch explicitly. Per-project manifest rehash/freshness joins are removed.
+   **Complete.**
+5. Separate query-only database opening from schema creation/migration and
+   snapshot publication. Retire the historical in-place migration ladder;
+   durable-compatible schemas preserve cache/memory while recreating the
+   disposable plane, and incompatible durable schemas fail explicitly.
+   **Complete.**
+6. Treat watch as a later coordinator over the same refresh/enrich operations,
+   with a full-refresh fallback for branch, submodule, configuration, and event
+   uncertainty. **Pending; not a blocker for fixed-snapshot use.**
+
+Acceptance checks:
+
+- rebuilding an unchanged checkout reparses the disposable plane but reuses
+  content-hash embedding cache rows;
+- materialized vector occurrences exactly match chunks in the new snapshot;
+- semantic artifacts and their run ledger survive, while evidence freshness is
+  recalculated against the new snapshot;
+- checker facts and package-instance ownership from the old snapshot do not
+  survive a full rebuild;
+- a failed required phase never leaves an old snapshot marker describing new
+  or partially rebuilt structural rows;
+- query-only commands do not create or migrate a missing database.
 
 ## Evaluation decisions already made
 

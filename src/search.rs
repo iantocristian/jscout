@@ -8,6 +8,7 @@ use crate::{embed, file_role, origin, semantic, store, structural};
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
+const DEFAULT_RENDERED_SUPPORT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ExpansionOptions {
@@ -95,6 +96,7 @@ pub struct ResponseBudget {
     pub truncated: bool,
     pub omitted_hits: usize,
     pub omitted_semantic_artifacts: usize,
+    pub omitted_semantic_supports: usize,
     pub omitted_nodes: usize,
     pub omitted_edges: usize,
     pub truncated_snippets: usize,
@@ -506,8 +508,48 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
     let unbudgeted = settle_rendered_bytes(result)?;
     result.response_budget.unbudgeted_bytes = unbudgeted;
 
+    // Search attaches semantic memory as secondary context. A stored artifact
+    // can carry up to 160 evidence rows, but rendering all of them here can
+    // consume the whole response before primary code or explicitly requested
+    // structural context appears. The dedicated semantic-memory surface owns
+    // deeper evidence retrieval; search keeps a bounded preview.
+    for artifact in &mut result.semantic_artifacts {
+        let omitted = artifact
+            .supports
+            .len()
+            .saturating_sub(DEFAULT_RENDERED_SUPPORT_LIMIT);
+        if omitted > 0 {
+            artifact.supports.truncate(DEFAULT_RENDERED_SUPPORT_LIMIT);
+            result.response_budget.omitted_semantic_supports += omitted;
+            result.response_budget.truncated = true;
+        }
+    }
+
     while settle_rendered_bytes(result)? > byte_limit {
         result.response_budget.truncated = true;
+
+        // Semantic memory is an untrusted, optional attachment to search. Shed
+        // lower-ranked artifacts and redundant evidence before source-backed
+        // code hits or an explicitly requested structural expansion.
+        if result.semantic_artifacts.len() > 1 {
+            result.semantic_artifacts.pop();
+            result.response_budget.omitted_semantic_artifacts += 1;
+            continue;
+        }
+        if let Some(artifact) = result
+            .semantic_artifacts
+            .iter_mut()
+            .rev()
+            .find(|artifact| artifact.supports.len() > 1)
+        {
+            artifact.supports.pop();
+            result.response_budget.omitted_semantic_supports += 1;
+            continue;
+        }
+        if result.semantic_artifacts.pop().is_some() {
+            result.response_budget.omitted_semantic_artifacts += 1;
+            continue;
+        }
 
         if let Some(expansion) = result.expansion.as_mut() {
             if !expansion.nodes.is_empty() {
@@ -533,16 +575,6 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
                 expansion.payload_bytes = expansion_payload_bytes(expansion)?;
                 continue;
             }
-        }
-
-        // Preserve the highest-ranked semantic artifact over ordinary code hits.
-        // A warm-memory response that silently budgets away its only artifact
-        // has not delivered the requested treatment. Lower-ranked artifacts are
-        // still expendable before we reduce primary hits.
-        if result.semantic_artifacts.len() > 1 {
-            result.semantic_artifacts.pop();
-            result.response_budget.omitted_semantic_artifacts += 1;
-            continue;
         }
 
         let rendered = result.response_budget.rendered_bytes;
@@ -593,13 +625,6 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
         }
         if result.hits.pop().is_some() {
             result.response_budget.omitted_hits += 1;
-            continue;
-        }
-
-        // The final artifact is removed only when it cannot fit in the
-        // response envelope by itself.
-        if result.semantic_artifacts.pop().is_some() {
-            result.response_budget.omitted_semantic_artifacts += 1;
             continue;
         }
 
@@ -869,7 +894,7 @@ mod tests {
     };
     use crate::{
         file_role, indexer, origin,
-        semantic::SemanticArtifact,
+        semantic::{SemanticArtifact, SemanticSupport},
         store,
         structural::{GraphEdge, GraphNode},
     };
@@ -1054,7 +1079,7 @@ mod tests {
                 truncated: false,
             }),
             response_budget: ResponseBudget {
-                byte_limit: 1_500,
+                byte_limit: 1_600,
                 ..Default::default()
             },
         };
@@ -1065,12 +1090,12 @@ mod tests {
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
-        assert!(result.response_budget.rendered_bytes <= 1_500);
+        assert!(result.response_budget.rendered_bytes <= 1_600);
         Ok(())
     }
 
     #[test]
-    fn response_budget_preserves_top_memory_before_code_hits() -> Result<()> {
+    fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
             hits: vec![Hit {
@@ -1120,11 +1145,63 @@ mod tests {
         };
 
         apply_response_budget(&mut result)?;
-        assert_eq!(result.semantic_artifacts.len(), 1);
-        assert_eq!(result.response_budget.omitted_semantic_artifacts, 0);
+        assert!(result.semantic_artifacts.is_empty());
+        assert_eq!(result.response_budget.omitted_semantic_artifacts, 1);
+        assert_eq!(result.hits.len(), 1);
+        assert!(result.hits[0].snippet_truncated);
         assert!(result.response_budget.truncated);
-        assert!(result.response_budget.omitted_hits > 0 || result.hits[0].snippet_truncated);
         assert!(result.response_budget.rendered_bytes <= 2_000);
+        Ok(())
+    }
+
+    #[test]
+    fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Result<()> {
+        let supports = (0..20)
+            .map(|index| SemanticSupport {
+                claim_path: format!("/claims/{index}"),
+                anchor: format!("sym:src/workflow.ts#::step{index}@{}", index + 1),
+                relationship: "supporting-stage-evidence".into(),
+                role: Some(format!("workflow stage {index}")),
+                evidence_file: "src/workflow.ts".into(),
+                evidence_start_line: index + 1,
+                evidence_end_line: index + 1,
+                source_hash: "s".repeat(64),
+                context_hash: "c".repeat(64),
+                confidence: "likely".into(),
+                freshness: "fresh".into(),
+            })
+            .collect();
+        let mut result = SearchResult {
+            snapshot: "s".repeat(64),
+            hits: Vec::new(),
+            semantic_artifacts: vec![SemanticArtifact {
+                id: 1,
+                supersedes: None,
+                artifact_type: "workflow".into(),
+                name: Some("large workflow".into()),
+                trust: "untrusted-semantic-memory".into(),
+                body: serde_json::json!({ "purpose": "exercise bounded rendering" }),
+                model: "agent-reported".into(),
+                prompt_version: "annotate/v2".into(),
+                confidence: "likely".into(),
+                source_snapshot: "s".repeat(64),
+                created_at: "2026-08-13T00:00:00Z".into(),
+                freshness: "fresh".into(),
+                supports,
+                relevance: 1.0,
+            }],
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 100_000,
+                ..Default::default()
+            },
+        };
+
+        apply_response_budget(&mut result)?;
+        assert_eq!(result.semantic_artifacts[0].supports.len(), 8);
+        assert_eq!(result.response_budget.omitted_semantic_supports, 12);
+        assert!(result.response_budget.truncated);
+        assert!(result.response_budget.unbudgeted_bytes > result.response_budget.rendered_bytes);
         Ok(())
     }
 
