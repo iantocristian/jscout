@@ -339,9 +339,10 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
 ///
 /// Ambiguity is judged over the checker's WHOLE answer, not over the subset
 /// that happened to map: a valid declaration jscout cannot anchor (an
-/// interface member, a `.d.ts` overload, a declaration outside the root) still
-/// means the checker saw more than one target, so the survivors never inherit
-/// a lone `likely` the checker did not assert.
+/// interface member, a `.d.ts` overload, a declaration outside the root) or a
+/// project that could not answer still means the whole occurrence was not
+/// uniquely resolved, so survivors never inherit a `likely` the checker did
+/// not assert across every owning project.
 fn map_occurrence(
     conn: &Connection,
     occurrence: &Occurrence,
@@ -353,7 +354,6 @@ fn map_occurrence(
             outcome.unknown_answers += 1;
             continue;
         }
-        let mut answer_unmapped = 0_usize;
         for declaration in &answer.declarations {
             match map_declaration(conn, &occurrence.member, declaration)? {
                 Some(target) => outcome.facts.push(PendingFact {
@@ -364,26 +364,26 @@ fn map_occurrence(
                     confidence: String::new(),
                     input_fingerprint: answer.checker_input_fingerprint.clone(),
                 }),
-                None => answer_unmapped += 1,
+                None => outcome.unmapped_declarations += 1,
             }
         }
-        outcome.unmapped_declarations += answer_unmapped;
-        outcome.facts.sort_by(|left, right| {
-            (&left.project_id, &left.target.anchor).cmp(&(&right.project_id, &right.target.anchor))
-        });
-        outcome.facts.dedup_by(|left, right| {
-            left.project_id == right.project_id && left.target.anchor == right.target.anchor
-        });
-        let target_count = outcome
-            .facts
-            .iter()
-            .map(|fact| fact.target.anchor.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
-        let unambiguous = target_count == 1 && answer_unmapped == 0;
-        for fact in &mut outcome.facts {
-            fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
-        }
+    }
+    outcome.facts.sort_by(|left, right| {
+        (&left.project_id, &left.target.anchor).cmp(&(&right.project_id, &right.target.anchor))
+    });
+    outcome.facts.dedup_by(|left, right| {
+        left.project_id == right.project_id && left.target.anchor == right.target.anchor
+    });
+    let target_count = outcome
+        .facts
+        .iter()
+        .map(|fact| fact.target.anchor.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let unambiguous =
+        target_count == 1 && outcome.unmapped_declarations == 0 && outcome.unknown_answers == 0;
+    for fact in &mut outcome.facts {
+        fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
     }
     Ok(outcome)
 }
@@ -711,6 +711,14 @@ mod tests {
         }
     }
 
+    fn project_answer(project_id: &str, declarations: Vec<DeclarationSite>) -> ProjectAnswer {
+        ProjectAnswer {
+            project_id: project_id.into(),
+            checker_input_fingerprint: format!("{project_id}-inputs"),
+            ..answer(declarations)
+        }
+    }
+
     fn occurrence(conn: &Connection) -> Result<Occurrence> {
         Ok(load_occurrences(conn)?
             .into_iter()
@@ -804,6 +812,78 @@ mod tests {
         assert_eq!(unambiguous.facts.len(), 1);
         assert_eq!(unambiguous.unmapped_declarations, 0);
         assert_eq!(unambiguous.facts[0].confidence, "likely");
+        Ok(())
+    }
+
+    #[test]
+    fn later_project_cannot_upgrade_an_earlier_ambiguous_answer() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      export interface Vendor { insert(): void }\n\
+                      declare const target: CardTable | Vendor;\n\
+                      target.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let class_member = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let interface_member = declaration_at(source, "insert(): void }", "insert", &hash);
+        let occurrence = occurrence(&conn)?;
+
+        for answers in [
+            vec![
+                project_answer(
+                    "tsconfig.a.json",
+                    vec![class_member.clone(), interface_member.clone()],
+                ),
+                project_answer("tsconfig.b.json", vec![class_member.clone()]),
+            ],
+            vec![
+                project_answer("tsconfig.b.json", vec![class_member.clone()]),
+                project_answer(
+                    "tsconfig.a.json",
+                    vec![class_member.clone(), interface_member.clone()],
+                ),
+            ],
+        ] {
+            let outcome = map_occurrence(&conn, &occurrence, &answers)?;
+            assert_eq!(outcome.facts.len(), 2);
+            assert_eq!(outcome.unmapped_declarations, 1);
+            assert!(
+                outcome
+                    .facts
+                    .iter()
+                    .all(|fact| fact.confidence == "possible"),
+                "confidence must be independent of project answer order"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_owning_project_keeps_a_surviving_target_possible() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const target: CardTable;\n\
+                      target.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let class_member = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let occurrence = occurrence(&conn)?;
+        let unknown = ProjectAnswer {
+            project_id: "tsconfig.unknown.json".into(),
+            status: "unknown".into(),
+            receiver_type: None,
+            declarations: Vec::new(),
+            checker_input_fingerprint: "unknown-inputs".into(),
+        };
+        let outcome = map_occurrence(
+            &conn,
+            &occurrence,
+            &[
+                project_answer("tsconfig.resolved.json", vec![class_member]),
+                unknown,
+            ],
+        )?;
+        assert_eq!(outcome.unknown_answers, 1);
+        assert_eq!(outcome.facts.len(), 1);
+        assert_eq!(outcome.facts[0].confidence, "possible");
         Ok(())
     }
 
