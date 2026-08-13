@@ -31,6 +31,11 @@ function fixture(files) {
 function client(root) {
   const child = spawn(process.execPath, [sidecar, root], { stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map();
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
   const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
   lines.on("line", (line) => {
     const message = JSON.parse(line);
@@ -46,6 +51,7 @@ function client(root) {
   return {
     child,
     request,
+    stderr: () => stderr,
     async close() {
       await request("shutdown");
       child.stdin.end();
@@ -53,6 +59,23 @@ function client(root) {
     },
   };
 }
+
+test("prints the actual Node worker error while keeping a stable protocol error", async () => {
+  const root = fixture({ "main.ts": "export const value = 1;\n" });
+  const checker = client(root);
+  await checker.request("hello");
+  fs.rmSync(root, { recursive: true, force: true });
+
+  const response = await checker.request("capabilities");
+  assert.equal(response.kind, "error");
+  assert.equal(response.error.code, "checker_crash");
+  assert.equal(response.error.message, "checker worker failed");
+  await checker.close();
+
+  assert.match(checker.stderr(), /worker error during capabilities/);
+  assert.match(checker.stderr(), /ENOENT/u);
+  assert.match(checker.stderr(), /realpath/u);
+});
 
 function queryFor(source, call, receiver, property) {
   const callStart = Buffer.byteLength(source.slice(0, source.lastIndexOf(call)));

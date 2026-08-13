@@ -29,6 +29,14 @@ function terminateWorker() {
   if (old) void old.terminate();
 }
 
+function reportWorkerError(error) {
+  const request = active ? ` during ${active.kind} (${active.id})` : "";
+  const detail = error instanceof Error
+    ? error.stack ?? `${error.name}: ${error.message}`
+    : String(error);
+  process.stderr.write(`jscout-checker: worker error${request}:\n${detail}\n`);
+}
+
 function ensureWorker() {
   if (worker) return worker;
   const created = new Worker(workerUrl, { workerData: { root } });
@@ -38,7 +46,8 @@ function ensureWorker() {
     active = undefined;
     send({ id: completed.id, ...message.payload });
   });
-  created.on("error", () => {
+  created.on("error", (error) => {
+    reportWorkerError(error);
     if (active) {
       send({
         id: active.id,
