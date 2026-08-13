@@ -684,3 +684,15 @@ confidence. jscout constructs the stored body and support pointers. Generic
 every distinct stable cross-file production stage as a participant; internal
 or leaf stages are `supporting`, not compressed into another participant's
 prose role.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in jscout by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.
