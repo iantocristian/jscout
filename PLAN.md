@@ -2,9 +2,11 @@
 
 > Status: authoritative plan as of 2026-08-13.
 >
-> G1–G10 are implemented. Semantic v1 has reached its implementation boundary;
-> G11 snapshot simplification is in progress. Product-value testing remains
-> paused until the engineering verification gate below is green.
+> G1–G10 have functional implementations, but G10 is not accepted for
+> large-repository operation until its required scale correction passes. G11
+> snapshot simplification is in progress. Semantic v1 has reached its
+> implementation boundary; product-value testing remains paused until the
+> engineering verification gate below is green.
 
 ## Document policy
 
@@ -564,10 +566,19 @@ extend the semantic-v1 completion boundary, and nothing in v1 depends on it.
 
 **Amendment — watch replenishment (2026-08-13).** The original G10 rule that
 enrichment never runs during `watch` is replaced by the explicit
-`jscout watch --enrich` option. Each refresh launches one bounded sidecar pass
-after deterministic indexing has suppressed stale checker edges, then exits
-the sidecar. This does not authorize a persistent watch-resident TypeScript
-daemon, hidden checker execution in plain `watch`, or checker work in `index`.
+`jscout watch --enrich` option. Each refresh launches one explicitly configured
+sidecar pass after deterministic indexing has suppressed stale checker edges,
+then exits the sidecar. This does not authorize a persistent watch-resident
+TypeScript daemon, hidden checker execution in plain `watch`, or checker work in
+`index`.
+
+**Amendment — large-repository execution (2026-08-13).** A real repository run
+planned 150,213 eligible member-call occurrences, progressed slowly through
+10,900 one-at-a-time queries, then lost the run when the checker worker crashed.
+This falsifies the current implementation's claim to be bounded at repository
+scale. Raising the V8 heap only postpones the failure; exhaustive `enrich` and
+`watch --enrich` are not considered operational on large repositories until
+the scale correction below passes its acceptance checks.
 
 ### Shape
 
@@ -575,10 +586,11 @@ A companion Node sidecar hosting the TypeScript checker (LanguageService or
 tsserver — an implementation decision, not a plan commitment) behind the
 same versioned JSONL-over-stdio pattern as the pi-ai gateway: `hello`,
 capabilities, query, cancellation, shutdown, request IDs, stable error
-codes. The sidecar answers exactly one bounded question in its first version:
-resolve a statically named member at one indexed call occurrence. The request
+codes. The sidecar answers exactly one semantic question in its first version:
+resolve a statically named member at an indexed call occurrence. The scalable
+protocol batches that question over bounded groups of occurrences. Each item
 contains the repository-relative file, indexed file hash, exact call,
-receiver-expression, and property spans. The response contains the receiver's
+receiver-expression, and property spans. Results contain the receiver's
 declared type and the called property's declaration site(s), grouped by the
 configured or inferred TypeScript project that produced the answer.
 
@@ -608,7 +620,8 @@ does not demote otherwise agreeing resolved answers. Canonical occurrence
 coverage retains its project ID, status, and input fingerprint; projected
 checker edges expose those IDs as `unknownProjects`. Multiple mapped targets or
 an unmappable declaration from a resolved answer still make every survivor
-`possible`. The complete answer is published as one batch bound to the current
+`possible`. The complete answer for the selected plan, including explicit
+omitted/failed coverage, is published as one batch bound to the current
 structural snapshot; it is never freshened project by project.
 
 Diagnostics are never enumerated, used as a gate, or surfaced. A broken or
@@ -628,15 +641,19 @@ Checker program construction and queries may block the Node event loop. The
 protocol host must keep cancellation responsive by isolating checker work in a
 terminable worker or child process. Rust also enforces a hard per-request
 deadline and terminates an unresponsive sidecar; writing a cancel message alone
-is not considered cancellation support.
+is not considered cancellation support. Worker lifetime is a memory boundary,
+not merely a cancellation mechanism: a completed or failed project worker is
+terminated so its complete TypeScript `Program` is reclaimed before another
+large project is admitted.
 
 ### Consumption
 
 Enrichment is an explicit pass (`jscout enrich`) and an explicit watch option
 (`jscout watch --enrich`); deterministic indexing remains Node-free. The pass
-takes indexed member-call occurrences whose receivers currently reach property-hub
-candidates, asks the sidecar to resolve the called property on that receiver,
-and maps returned declaration sites to indexed symbol anchors.
+takes a bounded, reported plan of indexed member-call occurrences whose
+receivers currently reach property-hub candidates, asks the sidecar to resolve
+the called property on each receiver, and maps returned declaration sites to
+indexed symbol anchors.
 
 Enrichment is occurrence-specific. A single `dbs.wave.card.insert()` result may
 add an edge from that call's enclosing file/symbol to `CardTable.insert`; it
@@ -653,7 +670,9 @@ made directly to the graph projection. A dedicated enrichment table records the
 caller/file identity and hash, exact occurrence spans, project ID, resolved
 target anchor and fingerprint, confidence/provenance, and checker-input
 fingerprint. Projection rebuilds include only the active batch whose
-`source_snapshot` exactly matches the snapshot being projected.
+`source_snapshot` exactly matches the snapshot being projected. Inactive staging
+runs may coexist temporarily so bounded work can be committed and resumed, but
+they are never traversable and do not weaken the one-active-batch rule.
 
 The checker-input fingerprint covers the exact TypeScript package/version,
 normalized config inheritance, effective compiler options, project selection,
@@ -661,15 +680,174 @@ and identities/hashes of the config, source, and declaration inputs loaded by
 the checker. It is retained as provenance and used to detect an input race
 during the enrichment command, not as a cross-snapshot freshness join. The pass
 publishes only after rechecking its structural snapshot, occurrence source
-hashes, target anchors, and current checker inputs. Drift during the run
-publishes nothing. Only one batch is retained; a full `jscout index` deletes it.
+hashes, target anchors, and current checker inputs. A structural snapshot race
+publishes nothing; the scale-corrected path withholds and reports a project
+whose external inputs drift while allowing explicitly covered unaffected
+projects to assemble one partial batch. Only one batch is active; a full
+`jscout index` deletes active and staging checker state.
 
 `jscout watch --enrich` makes replenishment automatic. Each relevant event is
 debounced, indexed first, then enriched. A checker failure leaves the current
-snapshot without checker edges and is retried after the next relevant
-repository event. External-input watching and generation cancellation belong
-to the later watcher coordinator; the fixed-snapshot path does not retain a
+snapshot without checker edges unless the scale-corrected planner reaches a
+controlled partial activation with explicit coverage. Either condition remains
+retryable. External-input watching and generation cancellation belong to the
+later watcher coordinator; the fixed-snapshot path does not retain a
 manifest-rehashing subsystem for them.
+
+### Required G10 scale correction
+
+The TypeScript semantic operation stays in Node. OXC and Rust do not attempt to
+reimplement TypeScript's version-specific type system, configured-project
+semantics, ambient declarations, aliases, unions, overloads, or declaration
+ownership. The correction moves planning, resource policy, durable progress,
+and publication into Rust while making the Node boundary coarse-grained and
+memory-bounded.
+
+The current exhaustive path has five specific defects that must be removed:
+
+1. Candidate selection accepts every repository/workspace member call whose
+   property name appears on any indexed symbol. Common names therefore create
+   large low-value plans even when deterministic resolution already explains
+   the call or the file is a test/fixture.
+2. Rust and Node reread and hash the same file for individual occurrences, and
+   the protocol makes one round trip per occurrence.
+3. Node searches project ownership repeatedly, constructs a complete
+   TypeScript `Program` for each encountered `tsconfig`, and retains every
+   program/checker/input manifest in an unbounded process-wide cache. Overlapping
+   monorepo projects retain duplicate source graphs.
+4. Rust holds all pending facts until the final transaction. A crash loses the
+   complete run and leaves no resumable progress.
+5. Final validation clears the program cache and rebuilds every used project,
+   repeating the most expensive operation before publication.
+
+#### Rust-owned plan and budgets
+
+`jscout enrich --dry-run` must produce a deterministic plan before TypeScript
+program construction or type queries. Planning has a Rust candidate phase and
+a configuration-only sidecar phase that resolves file-to-project ownership;
+neither builds a project `Program`. The plan reports discovered, eligible,
+selected, and skipped occurrences by file role, package/area, property, file,
+and planned project ownership. It pins the structural snapshot, selection
+policy, and ordered occurrence IDs in a plan fingerprint.
+
+The default plan:
+
+- includes `repository`/`workspace` production and unknown-role files;
+- excludes test, fixture, generated, and documentation roles unless selected;
+- excludes occurrences already explained by a direct `certain` or `likely`
+  structural edge;
+- requires at least one current property-hub target candidate;
+- ranks exported/entity/workflow boundaries and watcher-supplied changed files
+  ahead of unanchored internal calls, with deterministic tie-breaking;
+- selects at most 10,000 occurrences.
+
+Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
+plan. `--max-occurrences N` changes the hard cap. Exhaustive coverage requires
+an explicit `--all`; it is never silently implied by the bare command. Hitting
+a cap is successful partial enrichment only when the report and stored batch
+coverage expose the omitted count. An occurrence without a checker fact keeps
+the existing `possible` property-hub path, so bounded coverage cannot fabricate
+certainty or create a false negative.
+
+Rust owns source-hash verification and caches it once per distinct file for the
+run. It also owns declaration-to-anchor mapping, selection coverage, budgets,
+staging, resume, final source/target/snapshot checks, and projection activation.
+Node never receives database access or repository source contents over the
+protocol; it receives repository-relative paths, indexed hashes, and spans.
+
+#### Project scheduling and batched protocol
+
+Project discovery builds one reverse file-to-owning-project index. Ownership is
+enumerated once for the planned file set, not rediscovered for each occurrence.
+Conflicting owners remain visible under the existing ambiguity rules.
+
+Rust schedules one configured project at a time by default. A project worker
+constructs one TypeScript `Program`, resolves bounded batches grouped by source
+file, returns the results plus one project input manifest/fingerprint, and then
+exits. The host must not retain an unbounded `programCache`; any future
+parallelism is explicit and capped, with one as the default until measurement
+justifies more.
+
+`resolve_members` replaces per-occurrence `resolve_member` in the hot path.
+Each frame contains at most 512 occurrences and at most 1 MiB of serialized
+request data; responses obey the same byte bound and split before exceeding it.
+Within a project, each source file is read, hashed, converted from byte to UTF-16
+coordinates, and walked into an occurrence map once. Configuration problems,
+TypeScript identity, effective options, and input manifests are emitted once
+per project rather than copied into every occurrence response.
+
+The project fingerprint is computed during the one program construction. After
+its final query batch, the worker rehashes the exact input manifest without
+rebuilding the `Program`; Rust rechecks the returned files before activation.
+The current destroy-everything-and-rebuild validation pass is removed.
+
+#### Durable staging, resume, and partial coverage
+
+An enrichment run is keyed by structural snapshot, plan fingerprint, checker
+protocol/version, TypeScript identity, and execution policy. Rust commits
+bounded inactive staging rows after each successful query batch or project.
+Restarting the same command resumes the matching run; a changed snapshot or
+plan starts a new run and makes the old staging rows collectible. Staging has a
+bounded retention policy and never enters `resolved_edges`.
+
+One failed project does not erase successful work from unrelated projects. Its
+occurrences publish no targeted edge, its coverage is recorded as failed, and
+the command reports partial failure. An occurrence owned by a failed,
+cancelled, or unprocessed project cannot receive a `likely` checker edge from a
+different owner; it remains on the `possible` fallback unless every owning
+project needed by the confidence decision completed. Malformed or internally
+inconsistent answers still reject the affected project atomically.
+
+Final activation is one short transaction. It rechecks the exact structural
+snapshot, selected occurrence/file hashes, mapped target fingerprints, and
+project input manifests, then marks one assembled batch active and rebuilds its
+checker projection. Drifted project results are withheld and reported; a
+structural snapshot race activates nothing. Only active rows are public.
+
+#### Operations and watcher interaction
+
+Progress output names the current project and file and reports projects,
+files, occurrences, staged facts, elapsed phase time, and Node RSS/heap usage.
+A worker crash must carry the actual Node error/stack through the synchronous
+protocol error as well as stderr, together with the active project, file, batch,
+and progress counters; independent stdout/stderr drain timing must not erase the
+diagnostic. Reports separate program-build, type-query, hashing, IPC, mapping,
+and publication time.
+
+`checker doctor` reports overlapping-project counts and largest configured
+projects so an operator can see likely cost before execution. Heap overrides
+remain diagnostic escape hatches, not the scalability mechanism.
+
+`watch --enrich` uses the same planner, cap, batching, and staging machinery.
+Changed files are ranked first; the watcher never implies `--all`. A newer
+structural generation cancels between batches, and staged work may resume only
+when its exact snapshot and plan still match. The G12 coordinator must not be
+declared operational with `--enrich` until this correction is implemented.
+
+#### Scale-correction acceptance checks
+
+- a 150,000-occurrence synthetic plan is capped at 10,000 by default, reports
+  exact omitted coverage, and requires `--all` for exhaustive selection;
+- protocol request count scales with bounded batches/projects rather than one
+  request per occurrence, with frame byte/item limits tested;
+- peak Node memory is bounded by the largest admitted project plus one response
+  batch, not the sum of every project encountered; completed project workers
+  are observed exiting before the next large project is admitted;
+- the same source file is read/hashed/walked once per owning project, not once
+  per occurrence;
+- overlapping projects preserve ambiguity and a failed owner prevents an
+  unjustified `likely` edge;
+- killing the checker after staged progress and rerunning resumes the exact
+  snapshot/plan without redoing committed batches or exposing staging rows;
+- a source, target, config, ambient declaration, or TypeScript-runtime change
+  during the run cannot activate raced facts;
+- a project failure can publish explicitly incomplete coverage for unaffected
+  projects while returning a non-zero/partial status;
+- an actual Node exception/OOM is visible in the command's final error even if
+  stderr forwarding loses a race;
+- n8n and Twenty full-plan dry runs plus bounded real runs record wall time,
+  throughput, peak RSS/heap, selected/omitted coverage, and resume behavior
+  before full-repository `enrich` or `watch --enrich` is recommended.
 
 Verification follows the gateway precedent: fake-sidecar protocol,
 unknown-type, crash, enforced-timeout, cancellation, and outside-root tests in
@@ -923,8 +1101,9 @@ disposable snapshot reset:
 
 - plain `watch` leaves checker facts absent;
 - `watch --enrich` publishes one batch bound to the new exact snapshot;
-- failed, timed-out, cancelled, or superseded enrichment leaves checker facts
-  absent and schedules an enrichment retry;
+- a failure before controlled activation leaves checker facts absent; a
+  scale-planner partial activation exposes only its explicit coverage and keeps
+  failed project coverage pending for retry;
 - a newer structural generation always takes precedence over retrying
   enrichment for an older snapshot.
 
