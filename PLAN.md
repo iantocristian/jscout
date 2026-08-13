@@ -742,15 +742,20 @@ The default plan:
 - spreads selection within each rank tier by deterministic round-robin across
   packages, then across files within each package, with occurrence ID as the
   final in-file order; lexicographic package, file, anchor, or property order
-  must not let one prefix consume the remaining budget;
-- selects at most 10,000 occurrences.
+  must not let one prefix monopolize early staged progress or an explicitly
+  capped run;
+- selects every eligible occurrence; batching, project-worker disposal, and
+  durable staging bound resources rather than discarding repository coverage.
 
 Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
-plan. `--max-occurrences N` changes the hard cap. Exhaustive coverage requires
-an explicit `--all`; it is never silently implied by the bare command. Hitting
-a cap is successful partial enrichment only when the report and stored batch
-coverage expose the omitted count. An occurrence without a checker fact keeps
-the existing `possible` property-hub path, so bounded coverage cannot fabricate
+plan. `--max-occurrences N` is an operator-requested runtime cap applied after
+the deterministic spread order; without it, manual `jscout enrich` has no
+occurrence-count cap. `--all` broadens eligibility to normally excluded roles
+and already `certain`/`likely` calls for audit or diagnostic runs; it is not
+required for ordinary complete repository enrichment. Hitting an explicit cap
+is successful partial enrichment only when the report and stored batch coverage
+expose the omitted count. An occurrence without a checker fact keeps the
+existing `possible` property-hub path, so bounded coverage cannot fabricate
 certainty or create a false negative.
 
 Rust owns source-hash verification and caches it once per distinct file for the
@@ -822,23 +827,29 @@ and publication time.
 projects so an operator can see likely cost before execution. Heap overrides
 remain diagnostic escape hatches, not the scalability mechanism.
 
-`watch --enrich` uses the same planner, cap, batching, and staging machinery.
-Changed files are ranked first; the watcher never implies `--all`. A newer
-structural generation cancels between batches, and staged work may resume only
-when its exact snapshot and plan still match. After structural indexing,
-checker program construction waits for a configurable enrichment quiet period,
-defaulting to the G12 two-second trailing quiet period; any newer event resets
-that wait. Sustained churn may therefore starve checker enrichment by design
-while deterministic indexing continues to converge. A cancelled enrichment is
-not immediately relaunched: the coordinator waits for the next quiet point,
-then resumes only exact matching staged work or starts one new plan. The G12
-coordinator must not be declared operational with `--enrich` until this
-correction is implemented.
+`watch --enrich` uses the same planner, batching, staging, and optional explicit
+`--max-occurrences` machinery. Changed files in the current generation define
+its ordinary incremental scope and are ranked first; startup/full-refresh
+generations may cover the complete eligible repository, and the watcher never
+implies `--all`. A newer structural generation cancels between batches, and
+staged work may resume only when its exact snapshot and plan still match. After
+structural indexing, checker program construction waits for a configurable
+enrichment quiet period, defaulting to the G12 two-second trailing quiet period;
+any newer event resets that wait. Sustained churn may therefore starve checker
+enrichment by design while deterministic indexing continues to converge. A
+cancelled enrichment is not immediately relaunched: the coordinator waits for
+the next quiet point, then resumes only exact matching staged work or starts one
+new plan. The G12 coordinator must not be declared operational with `--enrich`
+until this correction is implemented.
 
 #### Scale-correction acceptance checks
 
-- a 150,000-occurrence synthetic plan is capped at 10,000 by default, reports
-  exact omitted coverage, and requires `--all` for exhaustive selection;
+- a 150,000-eligible-occurrence synthetic plan selects all 150,000 by default
+  and completes through bounded batches, project-worker disposal, and durable
+  staging without an occurrence-count override;
+- the same plan with `--max-occurrences 10000` selects exactly 10,000 in spread
+  order and reports exact omitted coverage, while `--all` is tested separately
+  as an eligibility override rather than a completeness switch;
 - a skewed plan spreads each rank tier across packages and files instead of
   spending its budget on one lexicographic prefix, while repeated planning
   produces byte-identical ordering and fingerprints;
