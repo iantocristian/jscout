@@ -562,6 +562,27 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove the optional checker batch and its projected edges without changing
+/// the deterministic structural snapshot. Watch uses this before an explicit
+/// enrichment cycle so config-only events fail closed even when module
+/// resolution produces the same snapshot hash.
+pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute("DELETE FROM checker_enrichment_batches", [])?;
+        conn.execute("DELETE FROM resolved_edges WHERE provenance='checker'", [])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
     let mut files = HashMap::new();
     let mut stmt = conn.prepare("SELECT id, path FROM files ORDER BY path")?;
@@ -4837,6 +4858,18 @@ mod tests {
             workflow.nodes.iter().any(|node| node.key == target),
             "a likely checker-resolved member call must participate in workflow discovery"
         );
+        super::clear_checker_plane(&conn)?;
+        let cleared: (i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM checker_enrichment_batches),
+               (SELECT count(*) FROM resolved_edges WHERE provenance='checker'),
+               (SELECT count(*) FROM resolved_edges
+                  WHERE provenance='member-name-match'
+                    AND dst_key='member:unknown:load')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(cleared, (0, 0, 1));
         Ok(())
     }
 

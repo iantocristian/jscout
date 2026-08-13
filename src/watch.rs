@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use notify::{RecursiveMode, Watcher};
 
-use crate::{checker, embed, indexer, store, walk};
+use crate::{checker, embed, indexer, store, structural, walk};
 
 pub struct WatchOptions<'a> {
     pub embed_on_change: bool,
@@ -69,6 +69,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         dependencies: options.dependencies.to_vec(),
         ..Default::default()
     };
+    if options.enrich_on_change {
+        structural::clear_checker_plane(&conn)?;
+    }
     let outcome = indexer::index_repo_with_options(&root, &conn, &index_options)?;
     eprintln!(
         "initial: {} indexed, {} unchanged, {} failed — watching {} for changes (ctrl-c to stop)",
@@ -86,14 +89,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     if options.embed_on_change && provider.is_none() {
         eprintln!("warning: --embed set but no provider configured; skipping embeddings");
     }
-    let mut enrichment_pending = options.enrich_on_change;
     if options.enrich_on_change {
         if outcome.failed > 0 {
             eprintln!(
                 "checker enrichment deferred because initial indexing failed; watch will retry"
             );
         } else {
-            enrichment_pending = !run_checker_enrichment(&root, options);
+            run_checker_enrichment(&root, options);
         }
     }
 
@@ -118,6 +120,12 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         {
             continue;
         }
+        if options.enrich_on_change
+            && let Err(error) = structural::clear_checker_plane(&conn)
+        {
+            eprintln!("checker plane reset failed; skipping watch cycle: {error}");
+            continue;
+        }
         let started = std::time::Instant::now();
         match indexer::index_repo_with_options(&root, &conn, &index_options) {
             Ok(o) => {
@@ -131,14 +139,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     );
                     indexer::report_failures(&o);
                 }
-                if options.enrich_on_change && (changed || enrichment_pending) {
+                if options.enrich_on_change {
                     if o.failed > 0 {
-                        enrichment_pending = true;
                         eprintln!(
-                            "checker enrichment deferred because indexing failed; stale edges remain suppressed"
+                            "checker enrichment deferred because indexing failed; checker edges remain absent"
                         );
                     } else {
-                        enrichment_pending = !run_checker_enrichment(&root, options);
+                        run_checker_enrichment(&root, options);
                     }
                 }
                 if changed && let Some(p) = &provider {
