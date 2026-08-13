@@ -518,7 +518,7 @@ Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.
 The old per-version migration ladder has been removed. Writer commands accept
-the v15+ durable format by preserving embedding/semantic-memory tables and
+the v16+ durable format by preserving embedding/semantic-memory tables and
 recreating all disposable snapshot tables once. Older durable formats are
 rejected; preserve such a file before creating a fresh current database.
 

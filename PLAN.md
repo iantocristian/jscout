@@ -119,7 +119,7 @@ materialize embeddings, publish checker enrichment, or write semantic memory
 retain only the write authority their operation requires.
 
 The historical v1→v18 in-place migration ladder is retired. A database at the
-current schema opens normally. Schemas at or above the v15 durable-format floor
+current schema opens normally. Schemas at or above the v16 durable-format floor
 keep embedding and semantic-memory tables while dropping and recreating the
 entire disposable plane once. Older or future-incompatible durable formats fail
 with instructions to preserve the old file. Future durable-plane changes need

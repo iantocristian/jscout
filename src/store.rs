@@ -6,7 +6,7 @@ use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
 pub const SCHEMA_VERSION: &str = "18";
-const DURABLE_SCHEMA_FLOOR: u32 = 15;
+const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
 
@@ -884,7 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema() -> Result<()> {
+    fn v16_durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema() -> Result<()>
+    {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("floor.db");
         let conn = open_path(&database)?;
@@ -909,7 +910,7 @@ mod tests {
                checker_input_fingerprint, sidecar_protocol, created_at, active
              ) VALUES('old', '5.9.3', 'test', 'checker', 1,
                       '2026-01-01T00:00:00Z', 1);
-             UPDATE meta SET value='15' WHERE key='schema_version';",
+             UPDATE meta SET value='16' WHERE key='schema_version';",
         )?;
         crate::embed::materialize_cached_embeddings(&conn)?;
         drop(conn);
@@ -948,6 +949,50 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn genuine_v15_embedding_schema_is_rejected_without_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v15.db");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '15');
+             CREATE TABLE embeddings(
+               chunk_hash TEXT NOT NULL,
+               model TEXT NOT NULL,
+               dim INTEGER NOT NULL,
+               vec BLOB NOT NULL,
+               PRIMARY KEY(chunk_hash, model)
+             );
+             INSERT INTO embeddings VALUES(
+               'old', 'ambiguous-model', 2, X'0000000000000000'
+             );",
+        )?;
+        drop(legacy);
+
+        let error = open_path(&database).expect_err("v15 predates durable embedding profiles");
+        assert!(error.to_string().contains("unsupported durable schema v15"));
+
+        let unchanged = Connection::open(&database)?;
+        let version: String = unchanged.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        let legacy_rows: i64 =
+            unchanged.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
+        let legacy_columns: i64 = unchanged.query_row(
+            "SELECT count(*) FROM pragma_table_info('embeddings')
+             WHERE name IN ('model', 'dim')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "15");
+        assert_eq!(legacy_rows, 1);
+        assert_eq!(legacy_columns, 2);
         Ok(())
     }
 
