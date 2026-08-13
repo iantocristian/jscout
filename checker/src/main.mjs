@@ -14,7 +14,7 @@ import {
   writeMessage,
 } from "./protocol.mjs";
 
-const SIDECAR_VERSION = "0.1.0";
+const SIDECAR_VERSION = "0.2.0";
 const root = path.resolve(process.argv[2] ?? ".");
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 let worker;
@@ -37,6 +37,13 @@ function reportWorkerError(error) {
   process.stderr.write(`jscout-checker: worker error${request}:\n${detail}\n`);
 }
 
+function workerFailureMessage(error) {
+  const detail = error instanceof Error
+    ? error.stack ?? `${error.name}: ${error.message}`
+    : String(error);
+  return detail.replaceAll(root, "<repository>").slice(0, 64 * 1024);
+}
+
 function ensureWorker() {
   if (worker) return worker;
   const created = new Worker(workerUrl, { workerData: { root } });
@@ -52,7 +59,7 @@ function ensureWorker() {
       send({
         id: active.id,
         kind: "error",
-        error: errorPayload("checker_crash", "checker worker failed"),
+        error: errorPayload("checker_crash", workerFailureMessage(error)),
       });
       active = undefined;
     }
@@ -97,8 +104,11 @@ function handle(message) {
       });
       break;
     case "capabilities":
+    case "plan_members":
     case "resolve_member":
+    case "resolve_members":
     case "validate_inputs":
+    case "validate_project":
       dispatch(message);
       break;
     case "cancel": {

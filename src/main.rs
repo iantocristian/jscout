@@ -37,7 +37,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "jscout",
-    about = "Runtime-level JS/TS codebase indexer for RAG"
+    about = "Runtime-level JS/TS codebase indexer for RAG",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -330,7 +331,7 @@ enum Command {
         #[arg(long)]
         enrich: bool,
         /// Hard deadline for each checker request in seconds
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 300)]
         enrich_timeout: u64,
         /// Checker sidecar entry file for development and diagnostics
         #[arg(long)]
@@ -397,8 +398,29 @@ enum Command {
         /// Repository root (must be indexed)
         root: PathBuf,
         /// Hard deadline for each checker request in seconds
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 300)]
         timeout: u64,
+        /// Restrict enrichment to repository-relative file paths or directory prefixes
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Restrict enrichment to workspace/package names
+        #[arg(long = "package")]
+        packages: Vec<String>,
+        /// Restrict enrichment to called property names
+        #[arg(long = "member")]
+        members: Vec<String>,
+        /// Restrict enrichment to file roles
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        /// Explicitly stop after this many spread-ordered occurrences
+        #[arg(long)]
+        max_occurrences: Option<usize>,
+        /// Include normally excluded roles; ordinary enrichment is already complete
+        #[arg(long)]
+        all: bool,
+        /// Print the deterministic ownership/selection plan without building TypeScript Programs
+        #[arg(long)]
+        dry_run: bool,
         /// Checker sidecar entry file for development and diagnostics
         #[arg(long)]
         sidecar_path: Option<PathBuf>,
@@ -945,6 +967,13 @@ fn main() -> Result<()> {
         Command::Enrich {
             root,
             timeout,
+            files,
+            packages,
+            members,
+            roles,
+            max_occurrences,
+            all,
+            dry_run,
             sidecar_path,
             database,
         } => {
@@ -954,6 +983,13 @@ fn main() -> Result<()> {
                     database: database.as_deref(),
                     sidecar: sidecar_path.as_deref(),
                     timeout: std::time::Duration::from_secs(timeout),
+                    files,
+                    packages,
+                    members,
+                    roles,
+                    max_occurrences,
+                    include_all: all,
+                    dry_run,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1885,5 +1921,57 @@ mod main_tests {
         assert!(enrich);
         assert_eq!(enrich_timeout, 45);
         assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
+    }
+
+    #[test]
+    fn enrichment_plan_controls_parse_without_implying_a_default_cap() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "enrich",
+            ".",
+            "--dry-run",
+            "--file",
+            "packages/core",
+            "--package",
+            "@scope/core",
+            "--member",
+            "insert",
+            "--role",
+            "test",
+            "--max-occurrences",
+            "25",
+            "--all",
+        ])
+        .expect("enrichment plan controls parse");
+        let Command::Enrich {
+            files,
+            packages,
+            members,
+            roles,
+            max_occurrences,
+            all,
+            dry_run,
+            ..
+        } = command
+        else {
+            panic!("expected enrich")
+        };
+        assert_eq!(files, ["packages/core"]);
+        assert_eq!(packages, ["@scope/core"]);
+        assert_eq!(members, ["insert"]);
+        assert_eq!(roles, ["test"]);
+        assert_eq!(max_occurrences, Some(25));
+        assert!(all);
+        assert!(dry_run);
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "enrich", "."]).expect("default enrich parses");
+        let Command::Enrich {
+            max_occurrences, ..
+        } = command
+        else {
+            panic!("expected enrich")
+        };
+        assert_eq!(max_occurrences, None);
     }
 }

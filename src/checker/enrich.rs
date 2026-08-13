@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use super::protocol::{
-    DeclarationSite, InputValidation, MemberQuery, ProjectAnswer, TypeScriptIdentity,
+    DeclarationSite, FileOwnership, InputValidation, MemberQuery, ProjectAnswer, TypeScriptIdentity,
 };
 
 #[derive(Debug, Clone)]
@@ -16,6 +16,13 @@ pub struct EnrichOptions<'a> {
     pub database: Option<&'a Path>,
     pub sidecar: Option<&'a Path>,
     pub timeout: Duration,
+    pub files: Vec<String>,
+    pub packages: Vec<String>,
+    pub members: Vec<String>,
+    pub roles: Vec<String>,
+    pub max_occurrences: Option<usize>,
+    pub include_all: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +30,12 @@ pub struct EnrichReport {
     pub snapshot: String,
     pub batch_id: i64,
     pub occurrences_queried: usize,
+    pub occurrences_discovered: usize,
+    pub occurrences_eligible: usize,
+    pub occurrences_selected: usize,
+    pub occurrences_omitted: usize,
+    pub occurrences_resumed: usize,
+    pub request_batches: usize,
     pub unknown_answers: usize,
     pub unknown_projects: Vec<String>,
     pub unmapped_declarations: usize,
@@ -30,7 +43,11 @@ pub struct EnrichReport {
     pub checker_version: String,
     pub checker_source: String,
     pub projects: usize,
+    pub configured_projects: usize,
     pub configuration_problems: usize,
+    pub dry_run: bool,
+    pub peak_rss_bytes: u64,
+    pub peak_heap_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +63,10 @@ struct Occurrence {
     property_start: i64,
     property_end: i64,
     member: String,
+    role: String,
+    package: String,
+    boundary_rank: i64,
+    deterministically_resolved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +109,7 @@ struct OccurrenceOutcome {
     unmapped_declarations: usize,
 }
 
+#[cfg(test)]
 struct PublishPlan<'a> {
     snapshot: &'a str,
     checker: &'a TypeScriptIdentity,
@@ -102,6 +124,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if options.timeout.is_zero() {
         bail!("--timeout must be greater than zero seconds");
     }
+    if options.max_occurrences == Some(0) {
+        bail!("--max-occurrences must be greater than zero");
+    }
     let canonical_root = fs::canonicalize(root)
         .with_context(|| format!("repository root does not exist: {}", root.display()))?;
     let conn = match options.database {
@@ -109,177 +134,207 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         None => crate::store::open(&canonical_root)?,
     };
     let snapshot = crate::structural::current_snapshot(&conn)?;
-    let occurrences = load_occurrences(&conn)?;
-    let mut checker = super::launch(&canonical_root, options.sidecar)?;
-    checker
+    let discovered = load_occurrences(&conn)?;
+    let occurrences_discovered = discovered.len();
+    let eligible = select_eligible(discovered, options);
+    let occurrences_eligible = eligible.len();
+    let ordered = spread_occurrences(eligible);
+    let selected = match options.max_occurrences {
+        Some(limit) => ordered.into_iter().take(limit).collect::<Vec<_>>(),
+        None => ordered,
+    };
+    if selected.is_empty() {
+        bail!("no eligible member-call occurrences matched the enrichment plan");
+    }
+    verify_selected_sources(&canonical_root, &conn, &selected)?;
+
+    let mut planner = super::launch(&canonical_root, options.sidecar)?;
+    planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let capabilities = checker.capabilities(options.timeout)?;
-    let mut facts = Vec::new();
-    let mut projects = Vec::new();
-    let mut validation = BTreeMap::<(String, String), InputValidation>::new();
-    let mut unknown_answers = 0;
-    let mut unmapped_declarations = 0;
-    let mut checker_identity: Option<TypeScriptIdentity> = None;
+    let ownership = planner.plan_members(
+        selected
+            .iter()
+            .map(|occurrence| occurrence.file.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        options.timeout,
+    )?;
+    let protocol = planner.versions.protocol;
+    drop(planner);
+    let project_plan = build_project_plan(&selected, &ownership.files)?;
+    let plan_fingerprint = plan_fingerprint(
+        &snapshot,
+        &selected,
+        &project_plan,
+        &ownership.typescript,
+        protocol,
+        options,
+    );
 
-    for (index, occurrence) in occurrences.iter().enumerate() {
-        let source = source_path(&canonical_root, &conn, occurrence)?;
-        verify_source_hash(&source, &occurrence.hash, &occurrence.file)?;
-        let result = checker.resolve_member(
-            MemberQuery {
-                file: occurrence.file.clone(),
-                indexed_hash: occurrence.hash.clone(),
-                call_start: occurrence.call_start,
-                call_end: occurrence.call_end,
-                receiver_start: occurrence.receiver_start,
-                receiver_end: occurrence.receiver_end,
-                property_start: occurrence.property_start,
-                property_end: occurrence.property_end,
-            },
-            options.timeout,
-        )?;
-        if result.indexed_hash != occurrence.hash || result.source_hash != occurrence.hash {
-            bail!(
-                "checker returned a source identity that does not match indexed file {}",
-                occurrence.file
-            );
-        }
-        let _configuration_problem_count = result.configuration_problems.len();
-        if let Some(identity) = &checker_identity {
-            if identity.version != result.typescript.version
-                || identity.source != result.typescript.source
-            {
-                bail!("checker TypeScript identity changed during the enrichment batch");
-            }
-        } else {
-            checker_identity = Some(result.typescript.clone());
-        }
-
-        for answer in &result.projects {
-            validation
-                .entry((
-                    answer.project_id.clone(),
-                    answer.checker_input_fingerprint.clone(),
-                ))
-                .or_insert_with(|| InputValidation {
-                    file: occurrence.file.clone(),
-                    project_id: answer.project_id.clone(),
-                    fingerprint: answer.checker_input_fingerprint.clone(),
-                });
-        }
-        let outcome = map_occurrence(&conn, occurrence, &result.projects)?;
-        unknown_answers += outcome.unknown_answers;
-        unmapped_declarations += outcome.unmapped_declarations;
-        facts.extend(outcome.facts);
-        projects.extend(outcome.projects);
-        if (index + 1) % 100 == 0 {
-            eprintln!(
-                "checker enrichment: queried {}/{} occurrences",
-                index + 1,
-                occurrences.len()
-            );
-        }
+    if options.dry_run {
+        return Ok(EnrichReport {
+            snapshot,
+            batch_id: 0,
+            occurrences_queried: 0,
+            occurrences_discovered,
+            occurrences_eligible,
+            occurrences_selected: selected.len(),
+            occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+            occurrences_resumed: 0,
+            request_batches: 0,
+            unknown_answers: 0,
+            unknown_projects: Vec::new(),
+            unmapped_declarations: 0,
+            facts_published: 0,
+            checker_version: ownership.typescript.version,
+            checker_source: ownership.typescript.source,
+            projects: project_plan.len(),
+            configured_projects: ownership.projects.len(),
+            configuration_problems: ownership.configuration_problems.len(),
+            dry_run: true,
+            peak_rss_bytes: 0,
+            peak_heap_bytes: 0,
+        });
     }
 
-    let validation_entries = validation.into_values().collect::<Vec<_>>();
-    let checked = checker.validate_inputs(validation_entries.clone(), options.timeout)?;
-    let expected_validation = validation_entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.project_id.as_str(),
-                entry.file.as_str(),
-                entry.fingerprint.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let returned_validation = checked
-        .results
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .fingerprint
-                .as_deref()
-                .map(|fingerprint| (entry.project_id.as_str(), entry.file.as_str(), fingerprint))
-        })
-        .collect::<BTreeSet<_>>();
-    if !checked.valid
-        || checked.results.iter().any(|entry| !entry.valid)
-        || returned_validation != expected_validation
-    {
-        bail!("checker inputs changed while enrichment was running; published nothing");
-    }
-    let mut validated_inputs = BTreeMap::<(String, String), String>::new();
-    for entry in &checked.results {
-        entry
-            .fingerprint
-            .as_ref()
-            .context("checker omitted a validated project fingerprint")?;
-        for input in &entry.inputs {
-            if !Path::new(&input.path).is_absolute() {
-                bail!("checker returned a non-absolute input path; published nothing");
-            }
-            let absolute_path = Path::new(&input.path);
-            let (kind, stored_path) = match absolute_path.strip_prefix(&canonical_root) {
-                Ok(relative) => (
-                    "repository".to_string(),
-                    relative
-                        .to_string_lossy()
-                        .replace(std::path::MAIN_SEPARATOR, "/"),
-                ),
-                Err(_) => ("absolute".to_string(), input.path.clone()),
-            };
-            let key = (kind, stored_path);
-            if let Some(previous) = validated_inputs.insert(key, input.source_hash.clone())
-                && previous != input.source_hash
-            {
-                bail!("checker returned conflicting hashes for one input; published nothing");
-            }
-        }
-    }
-    let validated_inputs = validated_inputs
-        .into_iter()
-        .map(|((kind, path), source_hash)| ValidatedInput {
-            kind,
-            path,
-            source_hash,
-        })
-        .collect::<Vec<_>>();
-    let identity = checker_identity.unwrap_or(capabilities.typescript.clone());
-    let batch_fingerprint = batch_fingerprint(&validation_entries);
-    let batch_id = publish(
+    if let Some(batch_id) = reusable_active_batch(
         &canonical_root,
         &conn,
-        &PublishPlan {
-            snapshot: &snapshot,
-            checker: &identity,
-            protocol: checker.versions.protocol,
-            input_fingerprint: &batch_fingerprint,
-            facts: &facts,
-            projects: &projects,
-            inputs: &validated_inputs,
-        },
+        &snapshot,
+        &plan_fingerprint,
+        project_plan.keys(),
+    )? {
+        let facts_published = conn.query_row(
+            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let unknown_projects = load_unknown_projects(&conn, batch_id)?;
+        return Ok(EnrichReport {
+            snapshot,
+            batch_id,
+            occurrences_queried: 0,
+            occurrences_discovered,
+            occurrences_eligible,
+            occurrences_selected: selected.len(),
+            occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+            occurrences_resumed: selected.len(),
+            request_batches: 0,
+            unknown_answers: 0,
+            unknown_projects,
+            unmapped_declarations: 0,
+            facts_published,
+            checker_version: ownership.typescript.version,
+            checker_source: ownership.typescript.source,
+            projects: project_plan.len(),
+            configured_projects: ownership.projects.len(),
+            configuration_problems: ownership.configuration_problems.len(),
+            dry_run: false,
+            peak_rss_bytes: 0,
+            peak_heap_bytes: 0,
+        });
+    }
+
+    let batch_id = open_staging_batch(
+        &conn,
+        &snapshot,
+        &plan_fingerprint,
+        &ownership.typescript,
+        protocol,
+        selected.len(),
+        &project_plan,
     )?;
+    let mut occurrences_queried = 0;
+    let mut occurrences_resumed = 0;
+    let mut request_batches = 0;
+    let mut unknown_answers = 0;
+    let mut unmapped_declarations = 0;
+    let mut peak_rss_bytes = 0;
+    let mut peak_heap_bytes = 0;
+    let mut failed_projects = Vec::new();
+
+    for (project_index, (project_id, occurrences)) in project_plan.iter().enumerate() {
+        if project_complete_and_fresh(&canonical_root, &conn, batch_id, project_id)? {
+            occurrences_resumed += occurrences.len();
+            continue;
+        }
+        let mut completed = completed_occurrences(&conn, batch_id, project_id)?;
+        if completed.len() == occurrences.len() {
+            reset_project_staging(&conn, batch_id, project_id)?;
+            completed.clear();
+        }
+        let pending = occurrences
+            .iter()
+            .filter(|occurrence| !completed.contains(&occurrence.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        occurrences_resumed += completed.len();
+        mark_project_pending(&conn, batch_id, project_id)?;
+        eprintln!(
+            "checker enrichment: project {}/{} {} ({} pending, {} resumed)",
+            project_index + 1,
+            project_plan.len(),
+            project_id,
+            pending.len(),
+            completed.len()
+        );
+        let project_result = execute_project(
+            &canonical_root,
+            options,
+            &conn,
+            batch_id,
+            project_id,
+            &pending,
+            &ownership.typescript,
+            &mut request_batches,
+            &mut occurrences_queried,
+            &mut unknown_answers,
+            &mut unmapped_declarations,
+            &mut peak_rss_bytes,
+            &mut peak_heap_bytes,
+        );
+        if let Err(error) = project_result {
+            mark_project_failed(&conn, batch_id, project_id, &error.to_string())?;
+            eprintln!("checker enrichment: project {project_id} failed: {error:#}");
+            failed_projects.push(project_id.clone());
+        }
+    }
+
+    if !failed_projects.is_empty() {
+        bail!(
+            "checker enrichment staged batch {batch_id} but {} project(s) failed: {}; rerun the same command to resume",
+            failed_projects.len(),
+            failed_projects.join(", ")
+        );
+    }
+
+    let facts_published = activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot)?;
     crate::structural::rebuild_projection(&conn, &snapshot)?;
 
     Ok(EnrichReport {
         snapshot,
         batch_id,
-        occurrences_queried: occurrences.len(),
+        occurrences_queried,
+        occurrences_discovered,
+        occurrences_eligible,
+        occurrences_selected: selected.len(),
+        occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+        occurrences_resumed,
+        request_batches,
         unknown_answers,
-        unknown_projects: projects
-            .iter()
-            .filter(|project| project.status == "unknown")
-            .map(|project| project.project_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
+        unknown_projects: load_unknown_projects(&conn, batch_id)?,
         unmapped_declarations,
-        facts_published: facts.len(),
-        checker_version: identity.version,
-        checker_source: identity.source,
-        projects: capabilities.projects.len(),
-        configuration_problems: capabilities.configuration_problems.len(),
+        facts_published,
+        checker_version: ownership.typescript.version,
+        checker_source: ownership.typescript.source,
+        projects: project_plan.len(),
+        configured_projects: ownership.projects.len(),
+        configuration_problems: ownership.configuration_problems.len(),
+        dry_run: false,
+        peak_rss_bytes,
+        peak_heap_bytes,
     })
 }
 
@@ -287,9 +342,29 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
     let mut statement = conn.prepare(
         "SELECT call.rowid, file.id, file.path, file.hash,
                 call.start, call.end, call.receiver_start, call.receiver_end,
-                call.property_start, call.property_end, call.prop
+                call.property_start, call.property_end, call.prop, file.role,
+                COALESCE(package.name,
+                  CASE WHEN instr(file.path, '/') > 0
+                       THEN substr(file.path, 1, instr(file.path, '/') - 1)
+                       ELSE '(root)' END),
+                CASE WHEN EXISTS(
+                  SELECT 1 FROM symbols owner
+                  WHERE owner.file_id=file.id AND owner.exported=1
+                    AND owner.start<=call.start AND owner.end>=call.start
+                ) OR EXISTS(
+                  SELECT 1 FROM entity_occurrences entity
+                  WHERE entity.file_id=file.id
+                    AND entity.start<=call.start AND entity.end>=call.start
+                ) THEN 0 ELSE 1 END,
+                EXISTS(
+                  SELECT 1 FROM resolved_edges edge
+                  WHERE edge.confidence IN ('certain', 'likely')
+                    AND edge.provenance!='checker'
+                    AND CAST(json_extract(edge.detail_json, '$.memberCallId') AS INTEGER)=call.rowid
+                )
          FROM member_calls call
          JOIN files file ON file.id=call.file_id
+         LEFT JOIN package_instances package ON package.id=file.package_instance_id
          WHERE file.origin IN ('repository', 'workspace')
            AND call.end > call.start
            AND call.receiver_end > call.receiver_start
@@ -310,22 +385,861 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
             property_start: row.get(8)?,
             property_end: row.get(9)?,
             member: row.get(10)?,
+            role: row.get(11)?,
+            package: row.get(12)?,
+            boundary_rank: row.get(13)?,
+            deterministically_resolved: row.get(14)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-fn source_path(root: &Path, conn: &Connection, occurrence: &Occurrence) -> Result<PathBuf> {
-    let path = crate::store::file_source_path(conn, root, occurrence.file_id)?;
-    let canonical = fs::canonicalize(&path)
-        .with_context(|| format!("indexed source is missing: {}", occurrence.file))?;
-    if !canonical.starts_with(root) {
-        bail!(
-            "indexed query source resolves outside repository root: {}",
-            occurrence.file
+fn select_eligible(occurrences: Vec<Occurrence>, options: &EnrichOptions<'_>) -> Vec<Occurrence> {
+    occurrences
+        .into_iter()
+        .filter(|occurrence| {
+            (!occurrence.deterministically_resolved || options.include_all)
+                && (if options.roles.is_empty() {
+                    options.include_all
+                        || matches!(occurrence.role.as_str(), "production" | "unknown")
+                } else {
+                    options.roles.contains(&occurrence.role)
+                })
+                && (options.files.is_empty()
+                    || options.files.iter().any(|file| {
+                        occurrence.file == *file
+                            || occurrence
+                                .file
+                                .strip_prefix(file)
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                    }))
+                && (options.packages.is_empty() || options.packages.contains(&occurrence.package))
+                && (options.members.is_empty() || options.members.contains(&occurrence.member))
+        })
+        .collect()
+}
+
+/// Stable rank-tier spreading. This ordering matters for visible progress and
+/// for an explicitly capped diagnostic run, but uncapped manual enrichment
+/// still consumes every eligible occurrence.
+fn spread_occurrences(occurrences: Vec<Occurrence>) -> Vec<Occurrence> {
+    let mut tiers =
+        BTreeMap::<i64, BTreeMap<String, BTreeMap<String, VecDeque<Occurrence>>>>::new();
+    for occurrence in occurrences {
+        tiers
+            .entry(occurrence.boundary_rank)
+            .or_default()
+            .entry(occurrence.package.clone())
+            .or_default()
+            .entry(occurrence.file.clone())
+            .or_default()
+            .push_back(occurrence);
+    }
+    let mut ordered = Vec::new();
+    for packages in tiers.values_mut() {
+        while packages
+            .values()
+            .any(|files| files.values().any(|queue| !queue.is_empty()))
+        {
+            for files in packages.values_mut() {
+                for queue in files.values_mut() {
+                    if let Some(occurrence) = queue.pop_front() {
+                        ordered.push(occurrence);
+                    }
+                }
+            }
+        }
+    }
+    ordered
+}
+
+fn verify_selected_sources(root: &Path, conn: &Connection, selected: &[Occurrence]) -> Result<()> {
+    let mut files = BTreeMap::new();
+    for occurrence in selected {
+        files
+            .entry((occurrence.file_id, occurrence.file.as_str()))
+            .or_insert(occurrence.hash.as_str());
+    }
+    for ((file_id, display), hash) in files {
+        let path = crate::store::file_source_path(conn, root, file_id)?;
+        verify_source_hash(&path, hash, display)?;
+    }
+    Ok(())
+}
+
+fn build_project_plan(
+    selected: &[Occurrence],
+    ownership: &[FileOwnership],
+) -> Result<BTreeMap<String, Vec<Occurrence>>> {
+    let owners = ownership
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry.project_ids.as_slice()))
+        .collect::<HashMap<_, _>>();
+    let mut plan = BTreeMap::<String, Vec<Occurrence>>::new();
+    for occurrence in selected {
+        let project_ids = owners.get(occurrence.file.as_str()).with_context(|| {
+            format!("checker omitted project ownership for {}", occurrence.file)
+        })?;
+        if project_ids.is_empty() {
+            bail!("checker returned no owning project for {}", occurrence.file);
+        }
+        for project_id in *project_ids {
+            plan.entry(project_id.clone())
+                .or_default()
+                .push(occurrence.clone());
+        }
+    }
+    for occurrences in plan.values_mut() {
+        occurrences.sort_by(|left, right| {
+            (&left.file, left.call_start, left.id).cmp(&(&right.file, right.call_start, right.id))
+        });
+    }
+    Ok(plan)
+}
+
+fn plan_fingerprint(
+    snapshot: &str,
+    selected: &[Occurrence],
+    projects: &BTreeMap<String, Vec<Occurrence>>,
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+    options: &EnrichOptions<'_>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-checker-plan-v2\0");
+    for value in [
+        snapshot,
+        &checker.version,
+        &checker.source,
+        &protocol.to_string(),
+        if options.include_all {
+            "all"
+        } else {
+            "default"
+        },
+        &options
+            .max_occurrences
+            .map_or_else(|| "uncapped".into(), |value| value.to_string()),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    for occurrence in selected {
+        hasher.update(occurrence.id.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    for (project, occurrences) in projects {
+        hasher.update(project.as_bytes());
+        hasher.update(b"\0");
+        for occurrence in occurrences {
+            hasher.update(occurrence.id.to_string().as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn reusable_active_batch<'a>(
+    root: &Path,
+    conn: &Connection,
+    snapshot: &str,
+    plan_fingerprint: &str,
+    project_ids: impl Iterator<Item = &'a String>,
+) -> Result<Option<i64>> {
+    let project_ids = project_ids.collect::<Vec<_>>();
+    let Some(batch_id) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE source_snapshot=?1 AND plan_fingerprint=?2 AND active=1",
+            params![snapshot, plan_fingerprint],
+            |row| row.get(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let complete: i64 = conn.query_row(
+        "SELECT count(*) FROM checker_project_runs
+         WHERE batch_id=?1 AND status='completed'
+           AND completed_occurrences=selected_occurrences",
+        [batch_id],
+        |row| row.get(0),
+    )?;
+    if complete as usize != project_ids.len() {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare(
+        "SELECT input_kind, input_path, source_hash FROM checker_project_inputs
+         WHERE batch_id=?1 ORDER BY input_kind, input_path",
+    )?;
+    let mut inputs = BTreeMap::<(String, String), String>::new();
+    for row in statement.query_map([batch_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (kind, path, hash) = row?;
+        if let Some(previous) = inputs.insert((kind, path), hash.clone())
+            && previous != hash
+        {
+            return Ok(None);
+        }
+    }
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    for ((kind, path), source_hash) in inputs {
+        let input = ValidatedInput {
+            kind,
+            path,
+            source_hash,
+        };
+        let fresh = fs::read(input_path(root, &input))
+            .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
+            .unwrap_or(false);
+        if !fresh {
+            return Ok(None);
+        }
+    }
+    Ok(Some(batch_id))
+}
+
+fn open_staging_batch(
+    conn: &Connection,
+    snapshot: &str,
+    plan_fingerprint: &str,
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+    selected_occurrences: usize,
+    projects: &BTreeMap<String, Vec<Occurrence>>,
+) -> Result<i64> {
+    if let Some(batch_id) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE source_snapshot=?1 AND plan_fingerprint=?2 AND active=0
+               AND checker_version=?3 AND checker_source=?4
+               AND sidecar_protocol=?5
+             ORDER BY id DESC LIMIT 1",
+            params![
+                snapshot,
+                plan_fingerprint,
+                checker.version,
+                checker.source,
+                protocol
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(batch_id);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<i64> {
+        conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])?;
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+               selected_occurrences, total_projects, created_at, active
+             ) VALUES(?1,?2,?3,'',?4,?5,?6,?7,datetime('now'),0)",
+            params![
+                snapshot,
+                checker.version,
+                checker.source,
+                protocol,
+                plan_fingerprint,
+                selected_occurrences as i64,
+                projects.len() as i64
+            ],
+        )?;
+        let batch_id = conn.last_insert_rowid();
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO checker_project_runs(
+               batch_id, project_id, status, selected_occurrences,
+               completed_occurrences, updated_at
+             ) VALUES(?1,?2,'pending',?3,0,datetime('now'))",
+        )?;
+        for (project_id, occurrences) in projects {
+            insert.execute(params![batch_id, project_id, occurrences.len() as i64])?;
+        }
+        Ok(batch_id)
+    })();
+    match result {
+        Ok(batch_id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(batch_id)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn project_complete_and_fresh(
+    root: &Path,
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+) -> Result<bool> {
+    let status = conn
+        .query_row(
+            "SELECT status FROM checker_project_runs WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if status.as_deref() != Some("completed") {
+        return Ok(false);
+    }
+    let mut statement = conn.prepare(
+        "SELECT input_kind, input_path, source_hash FROM checker_project_inputs
+         WHERE batch_id=?1 AND project_id=?2 ORDER BY input_kind, input_path",
+    )?;
+    let inputs = statement
+        .query_map(params![batch_id, project_id], |row| {
+            Ok(ValidatedInput {
+                kind: row.get(0)?,
+                path: row.get(1)?,
+                source_hash: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if inputs.is_empty() {
+        return Ok(false);
+    }
+    Ok(inputs.iter().all(|input| {
+        fs::read(input_path(root, input))
+            .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
+            .unwrap_or(false)
+    }))
+}
+
+fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "DELETE FROM checker_enrichments WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+        )?;
+        conn.execute(
+            "DELETE FROM checker_occurrence_projects WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+        )?;
+        conn.execute(
+            "DELETE FROM checker_project_inputs WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET status='pending', completed_occurrences=0,
+                 checker_input_fingerprint=NULL, error=NULL, updated_at=datetime('now')
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn completed_occurrences(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+) -> Result<BTreeSet<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT member_call_id FROM checker_occurrence_projects
+         WHERE batch_id=?1 AND project_id=?2 ORDER BY member_call_id",
+    )?;
+    let rows = statement.query_map(params![batch_id, project_id], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+fn mark_project_pending(conn: &Connection, batch_id: i64, project_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE checker_project_runs
+         SET status='pending', error=NULL, updated_at=datetime('now')
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+    )?;
+    Ok(())
+}
+
+fn mark_project_failed(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    error: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE checker_project_runs
+         SET status='failed', error=?3, updated_at=datetime('now')
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id, error],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_project(
+    root: &Path,
+    options: &EnrichOptions<'_>,
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrences: &[Occurrence],
+    expected_identity: &TypeScriptIdentity,
+    request_batches: &mut usize,
+    occurrences_queried: &mut usize,
+    unknown_answers: &mut usize,
+    unmapped_declarations: &mut usize,
+    peak_rss_bytes: &mut u64,
+    peak_heap_bytes: &mut u64,
+) -> Result<()> {
+    const MAX_BATCH_ITEMS: usize = 128;
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+    let mut checker = super::launch(root, options.sidecar)?;
+    checker
+        .register_interrupts()
+        .context("failed to install checker Ctrl-C handler")?;
+    let mut project_fingerprint: Option<String> = None;
+    let mut offset = 0;
+    while offset < occurrences.len() {
+        let mut end = (offset + MAX_BATCH_ITEMS).min(occurrences.len());
+        while end > offset + 1 {
+            let queries = occurrences[offset..end]
+                .iter()
+                .map(member_query)
+                .collect::<Vec<_>>();
+            let encoded = super::protocol::encode(
+                "size-check",
+                &super::protocol::Outbound::ResolveMembers {
+                    project_id: project_id.to_string(),
+                    queries,
+                },
+            )?;
+            if encoded.len() <= MAX_REQUEST_BYTES {
+                break;
+            }
+            end = offset + (end - offset) / 2;
+        }
+        let result = loop {
+            let batch = &occurrences[offset..end];
+            *request_batches += 1;
+            match checker.resolve_members(
+                project_id.to_string(),
+                batch.iter().map(member_query).collect(),
+                options.timeout,
+            ) {
+                Ok(result) => break result,
+                Err(super::process::CheckerError::Remote { code, .. })
+                    if code == "oversized_batch" && end > offset + 1 =>
+                {
+                    end = offset + (end - offset) / 2;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let batch = &occurrences[offset..end];
+        *occurrences_queried += batch.len();
+        if result.project_id != project_id
+            || result.typescript.version != expected_identity.version
+            || result.typescript.source != expected_identity.source
+            || result.results.len() != batch.len()
+        {
+            bail!("checker returned an inconsistent project batch for {project_id}");
+        }
+        if let Some(expected) = &project_fingerprint {
+            if expected != &result.checker_input_fingerprint {
+                bail!("checker input fingerprint changed during project {project_id}");
+            }
+        } else {
+            project_fingerprint = Some(result.checker_input_fingerprint.clone());
+        }
+        *peak_rss_bytes = (*peak_rss_bytes).max(result.resources.rss_bytes);
+        *peak_heap_bytes = (*peak_heap_bytes).max(result.resources.heap_used_bytes);
+        let mut facts = Vec::new();
+        let mut projects = Vec::new();
+        for (occurrence, item) in batch.iter().zip(&result.results) {
+            if item.indexed_hash != occurrence.hash || item.source_hash != occurrence.hash {
+                bail!(
+                    "checker returned a source identity that does not match indexed file {}",
+                    occurrence.file
+                );
+            }
+            if item.answer.project_id != project_id
+                || item.answer.checker_input_fingerprint != result.checker_input_fingerprint
+            {
+                bail!("checker returned a mismatched answer for project {project_id}");
+            }
+            let outcome = map_occurrence(conn, occurrence, std::slice::from_ref(&item.answer))?;
+            *unknown_answers += outcome.unknown_answers;
+            *unmapped_declarations += outcome.unmapped_declarations;
+            facts.extend(outcome.facts);
+            projects.extend(outcome.projects);
+        }
+        stage_batch(conn, batch_id, project_id, batch, &facts, &projects)?;
+        offset = end;
+        eprintln!(
+            "checker enrichment: {project_id} staged {}/{} occurrences; rss={} MiB heap={}/{} MiB",
+            offset,
+            occurrences.len(),
+            result.resources.rss_bytes / (1024 * 1024),
+            result.resources.heap_used_bytes / (1024 * 1024),
+            result.resources.heap_total_bytes / (1024 * 1024)
         );
     }
-    Ok(canonical)
+    let fingerprint =
+        project_fingerprint.context("checker project completed without an input fingerprint")?;
+    let validation =
+        checker.validate_project(project_id.to_string(), fingerprint.clone(), options.timeout)?;
+    if validation.project_id != project_id
+        || validation.fingerprint.as_deref() != Some(fingerprint.as_str())
+        || !validation.valid
+    {
+        bail!("checker inputs changed while project {project_id} was running");
+    }
+    complete_project(
+        root,
+        conn,
+        batch_id,
+        project_id,
+        &fingerprint,
+        &validation.inputs,
+        *peak_rss_bytes,
+        *peak_heap_bytes,
+    )
+}
+
+fn member_query(occurrence: &Occurrence) -> MemberQuery {
+    MemberQuery {
+        file: occurrence.file.clone(),
+        indexed_hash: occurrence.hash.clone(),
+        call_start: occurrence.call_start,
+        call_end: occurrence.call_end,
+        receiver_start: occurrence.receiver_start,
+        receiver_end: occurrence.receiver_end,
+        property_start: occurrence.property_start,
+        property_end: occurrence.property_end,
+    }
+}
+
+fn stage_batch(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrences: &[Occurrence],
+    facts: &[PendingFact],
+    projects: &[PendingProjectAnswer],
+) -> Result<()> {
+    if projects.len() != occurrences.len()
+        || projects
+            .iter()
+            .zip(occurrences)
+            .any(|(project, occurrence)| project.occurrence.id != occurrence.id)
+    {
+        bail!("checker batch did not cover every occurrence in request order");
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let mut insert = conn.prepare_cached(
+            "INSERT OR REPLACE INTO checker_enrichments(
+               batch_id, member_call_id, source_file_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id, receiver_type,
+               target_anchor, target_fingerprint, confidence, provenance,
+               checker_input_fingerprint
+             ) VALUES(
+               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'checker',?17
+             )",
+        )?;
+        for fact in facts {
+            insert.execute(params![
+                batch_id,
+                fact.occurrence.id,
+                fact.occurrence.file_id,
+                fact.occurrence.file,
+                fact.occurrence.hash,
+                fact.occurrence.call_start,
+                fact.occurrence.call_end,
+                fact.occurrence.receiver_start,
+                fact.occurrence.receiver_end,
+                fact.occurrence.property_start,
+                fact.occurrence.property_end,
+                fact.project_id,
+                fact.receiver_type,
+                fact.target.anchor,
+                fact.target.fingerprint,
+                fact.confidence,
+                fact.input_fingerprint,
+            ])?;
+        }
+        let mut insert_project = conn.prepare_cached(
+            "INSERT OR REPLACE INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for project in projects {
+            insert_project.execute(params![
+                batch_id,
+                project.occurrence.id,
+                project.project_id,
+                project.input_fingerprint,
+                project.status,
+            ])?;
+        }
+        let completed: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET completed_occurrences=?3, updated_at=datetime('now')
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id, completed],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_project(
+    root: &Path,
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    fingerprint: &str,
+    inputs: &[super::protocol::CheckerInputFile],
+    peak_rss_bytes: u64,
+    peak_heap_bytes: u64,
+) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "DELETE FROM checker_project_inputs WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+        )?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO checker_project_inputs(
+               batch_id, project_id, input_kind, input_path, source_hash
+             ) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        let mut seen = BTreeMap::<(String, String), String>::new();
+        for input in inputs {
+            let path = Path::new(&input.path);
+            if !path.is_absolute() {
+                bail!("checker returned a non-absolute project input path");
+            }
+            let (kind, stored_path) = match path.strip_prefix(root) {
+                Ok(relative) => (
+                    "repository".to_string(),
+                    relative
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
+                ),
+                Err(_) => ("absolute".to_string(), input.path.clone()),
+            };
+            let key = (kind, stored_path);
+            if let Some(previous) = seen.insert(key, input.source_hash.clone())
+                && previous != input.source_hash
+            {
+                bail!("checker returned conflicting hashes for one project input");
+            }
+        }
+        for ((kind, path), hash) in seen {
+            insert.execute(params![batch_id, project_id, kind, path, hash])?;
+        }
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET status='completed', checker_input_fingerprint=?3,
+                 peak_rss_bytes=?4, peak_heap_bytes=?5, error=NULL,
+                 updated_at=datetime('now')
+             WHERE batch_id=?1 AND project_id=?2
+               AND completed_occurrences=selected_occurrences",
+            params![
+                batch_id,
+                project_id,
+                fingerprint,
+                peak_rss_bytes as i64,
+                peak_heap_bytes as i64
+            ],
+        )?;
+        if conn.changes() != 1 {
+            bail!("project {project_id} did not stage every selected occurrence");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn activate_staging_batch(
+    root: &Path,
+    conn: &Connection,
+    batch_id: i64,
+    snapshot: &str,
+) -> Result<usize> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<usize> {
+        if crate::structural::current_snapshot(conn)? != snapshot {
+            bail!("structural snapshot changed while enrichment was running; staged work retained");
+        }
+        let incomplete: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1
+               AND (status!='completed' OR completed_occurrences!=selected_occurrences)",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if incomplete != 0 {
+            bail!("checker staging batch has {incomplete} incomplete project(s)");
+        }
+
+        let mut input_statement = conn.prepare(
+            "SELECT input_kind, input_path, source_hash
+             FROM checker_project_inputs WHERE batch_id=?1
+             ORDER BY input_kind, input_path",
+        )?;
+        let input_rows = input_statement
+            .query_map([batch_id], |row| {
+                Ok(ValidatedInput {
+                    kind: row.get(0)?,
+                    path: row.get(1)?,
+                    source_hash: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut inputs = BTreeMap::<(String, String), String>::new();
+        for input in input_rows {
+            let key = (input.kind, input.path);
+            if let Some(previous) = inputs.insert(key, input.source_hash.clone())
+                && previous != input.source_hash
+            {
+                bail!("checker projects disagreed on one input hash; staged work retained");
+            }
+        }
+        for ((kind, path), source_hash) in inputs {
+            let input = ValidatedInput {
+                kind,
+                path,
+                source_hash,
+            };
+            verify_source_hash(&input_path(root, &input), &input.source_hash, &input.path)?;
+        }
+
+        let mut targets = conn.prepare(
+            "SELECT DISTINCT enrichment.target_anchor, enrichment.target_fingerprint
+             FROM checker_enrichments enrichment WHERE enrichment.batch_id=?1",
+        )?;
+        for target in targets.query_map([batch_id], |row| {
+            Ok(Target {
+                anchor: row.get(0)?,
+                fingerprint: row.get(1)?,
+            })
+        })? {
+            recheck_target(conn, &target?)?;
+        }
+
+        // Cross-project ambiguity is known only after every owner has
+        // completed. A different mapped target in any owner demotes every
+        // surviving candidate for that occurrence.
+        conn.execute(
+            "UPDATE checker_enrichments
+             SET confidence='possible'
+             WHERE batch_id=?1 AND member_call_id IN (
+               SELECT member_call_id FROM checker_enrichments
+               WHERE batch_id=?1
+               GROUP BY member_call_id
+               HAVING count(DISTINCT target_anchor)>1
+                  OR min(CASE confidence WHEN 'possible' THEN 0 ELSE 1 END)=0
+             )",
+            [batch_id],
+        )?;
+
+        let fingerprints = conn
+            .prepare(
+                "SELECT project_id, checker_input_fingerprint
+                 FROM checker_project_runs WHERE batch_id=?1 ORDER BY project_id",
+            )?
+            .query_map([batch_id], |row| {
+                Ok(InputValidation {
+                    project_id: row.get(0)?,
+                    file: String::new(),
+                    fingerprint: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let input_fingerprint = batch_fingerprint(&fingerprints);
+        conn.execute(
+            "UPDATE checker_enrichment_batches
+             SET active=0 WHERE active=1 AND id!=?1",
+            [batch_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_enrichment_batches
+             SET active=1, checker_input_fingerprint=?2 WHERE id=?1 AND active=0",
+            params![batch_id, input_fingerprint],
+        )?;
+        if conn.changes() != 1 {
+            bail!("checker staging batch disappeared before activation");
+        }
+        conn.execute(
+            "DELETE FROM checker_enrichment_batches WHERE id!=?1 AND active=0",
+            [batch_id],
+        )?;
+        let facts = conn.query_row(
+            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(facts as usize)
+    })();
+    match result {
+        Ok(facts) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(facts)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn load_unknown_projects(conn: &Connection, batch_id: i64) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT project_id FROM checker_occurrence_projects
+         WHERE batch_id=?1 AND status='unknown' ORDER BY project_id",
+    )?;
+    let rows = statement.query_map([batch_id], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> {
@@ -484,6 +1398,7 @@ fn batch_fingerprint(entries: &[InputValidation]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
 fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<i64> {
@@ -594,6 +1509,7 @@ fn input_path(root: &Path, input: &ValidatedInput) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn recheck_occurrence(root: &Path, conn: &Connection, occurrence: &Occurrence) -> Result<()> {
     let current = conn
         .query_row(
@@ -668,6 +1584,131 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+
+    fn planned_occurrence(
+        id: i64,
+        package: &str,
+        file: &str,
+        role: &str,
+        boundary_rank: i64,
+    ) -> Occurrence {
+        Occurrence {
+            id,
+            file_id: id,
+            file: file.into(),
+            hash: "hash".into(),
+            call_start: id,
+            call_end: id + 10,
+            receiver_start: id,
+            receiver_end: id + 3,
+            property_start: id + 4,
+            property_end: id + 9,
+            member: "run".into(),
+            role: role.into(),
+            package: package.into(),
+            boundary_rank,
+            deterministically_resolved: false,
+        }
+    }
+
+    fn options() -> EnrichOptions<'static> {
+        EnrichOptions {
+            database: None,
+            sidecar: None,
+            timeout: Duration::from_secs(1),
+            files: Vec::new(),
+            packages: Vec::new(),
+            members: Vec::new(),
+            roles: Vec::new(),
+            max_occurrences: None,
+            include_all: false,
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn spread_order_covers_packages_and_files_before_repeating_a_prefix() {
+        let occurrences = vec![
+            planned_occurrence(1, "alpha", "alpha/a.ts", "production", 0),
+            planned_occurrence(2, "alpha", "alpha/a.ts", "production", 0),
+            planned_occurrence(3, "alpha", "alpha/b.ts", "production", 0),
+            planned_occurrence(4, "beta", "beta/a.ts", "production", 0),
+            planned_occurrence(5, "beta", "beta/a.ts", "production", 0),
+            planned_occurrence(6, "gamma", "gamma/a.ts", "production", 1),
+        ];
+        let ordered = spread_occurrences(occurrences);
+        assert_eq!(
+            ordered.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1, 3, 4, 2, 5, 6]
+        );
+    }
+
+    #[test]
+    fn default_eligibility_excludes_nonproduction_and_exact_resolver_answers() {
+        let mut resolved = planned_occurrence(2, "alpha", "alpha/b.ts", "production", 0);
+        resolved.deterministically_resolved = true;
+        let candidates = vec![
+            planned_occurrence(1, "alpha", "alpha/a.ts", "production", 0),
+            resolved,
+            planned_occurrence(3, "alpha", "alpha/test.ts", "test", 0),
+        ];
+        assert_eq!(
+            select_eligible(candidates.clone(), &options())
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let mut all = options();
+        all.include_all = true;
+        assert_eq!(select_eligible(candidates, &all).len(), 3);
+    }
+
+    #[test]
+    fn staged_batches_survive_connection_reopen_for_resume() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, _) = indexed(repo.path(), source)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let projects = BTreeMap::from([("tsconfig.json".into(), vec![occurrence.clone()])]);
+        let batch_id = open_staging_batch(&conn, &snapshot, "plan", &identity, 2, 1, &projects)?;
+        let answer = ProjectAnswer {
+            project_id: "tsconfig.json".into(),
+            status: "unknown".into(),
+            receiver_type: None,
+            declarations: Vec::new(),
+            checker_input_fingerprint: "inputs".into(),
+        };
+        let outcome = map_occurrence(&conn, &occurrence, &[answer])?;
+        stage_batch(
+            &conn,
+            batch_id,
+            "tsconfig.json",
+            std::slice::from_ref(&occurrence),
+            &outcome.facts,
+            &outcome.projects,
+        )?;
+        drop(conn);
+
+        let reopened = crate::store::open(repo.path())?;
+        assert_eq!(
+            completed_occurrences(&reopened, batch_id, "tsconfig.json")?,
+            BTreeSet::from([occurrence.id])
+        );
+        let active: i64 = reopened.query_row(
+            "SELECT active FROM checker_enrichment_batches WHERE id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(active, 0, "staged progress must remain non-public");
+        Ok(())
+    }
 
     /// Index one file and hand back its connection plus its indexed hash.
     fn indexed(repo: &Path, source: &str) -> Result<(Connection, String)> {

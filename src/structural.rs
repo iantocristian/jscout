@@ -566,6 +566,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
 /// the deterministic structural snapshot. Watch uses this before an explicit
 /// enrichment cycle so config-only events fail closed even when module
 /// resolution produces the same snapshot hash.
+#[cfg(test)]
 pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {

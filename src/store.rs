@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "18";
+pub const SCHEMA_VERSION: &str = "19";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -176,6 +176,8 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "DROP TABLE IF EXISTS embedding_index_entries;
              DROP TABLE IF EXISTS checker_occurrence_projects;
+             DROP TABLE IF EXISTS checker_project_inputs;
+             DROP TABLE IF EXISTS checker_project_runs;
              DROP TABLE IF EXISTS checker_input_files;
              DROP TABLE IF EXISTS checker_enrichments;
              DROP TABLE IF EXISTS checker_enrichment_batches;
@@ -203,7 +205,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%';
-             UPDATE meta SET value='18' WHERE key='schema_version';",
+             UPDATE meta SET value='19' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -221,7 +223,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '18')
+INSERT INTO meta(key, value) VALUES('schema_version', '19')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -517,11 +519,41 @@ CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
   checker_source TEXT NOT NULL,
   checker_input_fingerprint TEXT NOT NULL,
   sidecar_protocol INTEGER NOT NULL,
+  plan_fingerprint TEXT NOT NULL DEFAULT '',
+  selected_occurrences INTEGER NOT NULL DEFAULT 0,
+  total_projects INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
   ON checker_enrichment_batches(active) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS idx_checker_staging_plan
+  ON checker_enrichment_batches(source_snapshot, plan_fingerprint, active);
+
+CREATE TABLE IF NOT EXISTS checker_project_runs(
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+  selected_occurrences INTEGER NOT NULL,
+  completed_occurrences INTEGER NOT NULL DEFAULT 0,
+  checker_input_fingerprint TEXT,
+  peak_rss_bytes INTEGER NOT NULL DEFAULT 0,
+  peak_heap_bytes INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(batch_id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS checker_project_inputs(
+  batch_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+  input_path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  PRIMARY KEY(batch_id, project_id, input_kind, input_path),
+  FOREIGN KEY(batch_id, project_id)
+    REFERENCES checker_project_runs(batch_id, project_id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS checker_enrichments(
   id INTEGER PRIMARY KEY,
@@ -1035,7 +1067,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "18");
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(database.is_file());
         Ok(())
     }

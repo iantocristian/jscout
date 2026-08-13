@@ -1,15 +1,30 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outbound {
     Hello,
     Capabilities,
-    ResolveMember { query: MemberQuery },
-    ValidateInputs { entries: Vec<InputValidation> },
-    Cancel { target_id: String },
+    PlanMembers {
+        files: Vec<String>,
+    },
+    #[cfg(test)]
+    ResolveMember {
+        query: MemberQuery,
+    },
+    ResolveMembers {
+        project_id: String,
+        queries: Vec<MemberQuery>,
+    },
+    ValidateProject {
+        project_id: String,
+        fingerprint: String,
+    },
+    Cancel {
+        target_id: String,
+    },
     Shutdown,
 }
 
@@ -43,13 +58,22 @@ pub enum Inbound {
         id: String,
         capabilities: Capabilities,
     },
+    PlanMembersResult {
+        id: String,
+        result: MemberPlanResult,
+    },
+    #[cfg(test)]
     ResolveMemberResult {
         id: String,
         result: MemberResult,
     },
-    ValidateInputsResult {
+    ResolveMembersResult {
         id: String,
-        result: ValidationResult,
+        result: MemberBatchResult,
+    },
+    ValidateProjectResult {
+        id: String,
+        result: ProjectValidationResult,
     },
     Error {
         id: String,
@@ -75,12 +99,15 @@ impl Inbound {
         match self {
             Self::Ready { id, .. }
             | Self::CapabilitiesResult { id, .. }
-            | Self::ResolveMemberResult { id, .. }
-            | Self::ValidateInputsResult { id, .. }
+            | Self::PlanMembersResult { id, .. }
+            | Self::ResolveMembersResult { id, .. }
+            | Self::ValidateProjectResult { id, .. }
             | Self::Error { id, .. }
             | Self::Canceled { id, .. }
             | Self::CancelResult { id, .. }
             | Self::ShutdownResult { id } => id,
+            #[cfg(test)]
+            Self::ResolveMemberResult { id, .. } => id,
         }
     }
 }
@@ -119,6 +146,8 @@ pub struct ConfigurationProblem {
     pub message: String,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemberResult {
     pub indexed_hash: String,
@@ -127,6 +156,44 @@ pub struct MemberResult {
     pub projects: Vec<ProjectAnswer>,
     #[serde(default)]
     pub configuration_problems: Vec<ConfigurationProblem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberPlanResult {
+    pub typescript: TypeScriptIdentity,
+    pub files: Vec<FileOwnership>,
+    pub projects: Vec<ProjectSummary>,
+    #[serde(default)]
+    pub configuration_problems: Vec<ConfigurationProblem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileOwnership {
+    pub file: String,
+    pub project_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberBatchResult {
+    pub project_id: String,
+    pub typescript: TypeScriptIdentity,
+    pub checker_input_fingerprint: String,
+    pub results: Vec<MemberProjectResult>,
+    pub resources: ResourceUsage,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberProjectResult {
+    pub indexed_hash: String,
+    pub source_hash: String,
+    pub answer: ProjectAnswer,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ResourceUsage {
+    pub rss_bytes: u64,
+    pub heap_used_bytes: u64,
+    pub heap_total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,25 +217,18 @@ pub struct DeclarationSite {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ValidationResult {
-    pub valid: bool,
-    pub results: Vec<ValidationEntryResult>,
+pub struct CheckerInputFile {
+    pub path: String,
+    pub source_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ValidationEntryResult {
+pub struct ProjectValidationResult {
     pub project_id: String,
-    pub file: String,
     pub fingerprint: Option<String>,
     pub valid: bool,
     #[serde(default)]
     pub inputs: Vec<CheckerInputFile>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CheckerInputFile {
-    pub path: String,
-    pub source_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,7 +275,7 @@ mod tests {
         )
         .expect("frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("json");
-        assert_eq!(frame["protocol"], 1);
+        assert_eq!(frame["protocol"], 2);
         assert_eq!(frame["query"]["receiver_start"], 10);
         assert_eq!(frame["query"]["property_end"], 27);
     }

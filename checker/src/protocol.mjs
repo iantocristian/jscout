@@ -1,6 +1,6 @@
 import readline from "node:readline";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const MAX_LINE_BYTES = 4 * 1024 * 1024;
 
 export function writeMessage(stream, message) {
