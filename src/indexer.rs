@@ -34,7 +34,7 @@ pub struct IndexOutcome {
     /// snapshot, projection version, and module resolution) and was kept.
     pub projection_rebuilt: bool,
     /// True when the disposable snapshot tables were truncated wholesale,
-    /// either for an explicit fixed-snapshot refresh or a forced migration
+    /// either for an explicit fixed-snapshot refresh or a forced extractor
     /// re-extraction, instead of replacing files one at a time.
     pub extraction_reset: bool,
 }
@@ -217,7 +217,7 @@ fn index_repo_impl(
         rows.collect::<std::result::Result<_, _>>()?
     };
 
-    // Migrations force re-extraction by clearing file hashes, and the
+    // Extractor-version changes force re-extraction by clearing file hashes, and the
     // first-party loop commits atomically, so a real database sits at ~100%
     // or ~0% cleared; the half-way threshold only guards hand-edited state.
     // At that scale, per-file replacement is pathological: every
@@ -347,14 +347,15 @@ fn index_repo_impl(
         resolution_hash: Some(resolution.clone()),
     };
     let projection_started = std::time::Instant::now();
-    if previous == current && crate::structural::checker_projection_reusable(conn)? {
+    if previous == current {
         // The projection is a pure function of the canonical tables: the
         // snapshot covers every extracted row (file content identity) and the
         // resolution hash covers module edges, whose inputs (tsconfigs,
-        // manifests, node_modules layout) live outside indexed content. An
-        // active checker batch adds its own exact input manifest to this
-        // reuse gate. Identical inputs under the same projection version
-        // republish the existing rows instead of rebuilding them.
+        // manifests, node_modules layout) live outside indexed content.
+        // Checker publication rebuilds the projection immediately and its
+        // batch is accepted only for this exact snapshot. Identical inputs
+        // under the same projection version can therefore republish the
+        // existing rows.
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = current.publish(conn);
         match result {

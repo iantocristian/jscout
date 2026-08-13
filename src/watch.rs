@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use notify::{RecursiveMode, Watcher};
 
-use crate::{checker, embed, indexer, store, structural, walk};
+use crate::{checker, embed, indexer, store, walk};
 
 pub struct WatchOptions<'a> {
     pub embed_on_change: bool,
@@ -93,7 +93,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                 "checker enrichment deferred because initial indexing failed; watch will retry"
             );
         } else {
-            enrichment_pending = !run_checker_enrichment(&root, &conn, options);
+            enrichment_pending = !run_checker_enrichment(&root, options);
         }
     }
 
@@ -112,20 +112,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
-        let checker_inputs = if options.enrich_on_change {
-            match structural::checker_input_paths(&conn, &root) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    eprintln!("checker input watch-list failed: {error}");
-                    Default::default()
-                }
-            }
-        } else {
-            Default::default()
-        };
         if !pending
             .iter()
-            .any(|path| (!is_noise(path) && is_relevant(path)) || checker_inputs.contains(path))
+            .any(|path| !is_noise(path) && is_relevant(path))
         {
             continue;
         }
@@ -149,7 +138,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             "checker enrichment deferred because indexing failed; stale edges remain suppressed"
                         );
                     } else {
-                        enrichment_pending = !run_checker_enrichment(&root, &conn, options);
+                        enrichment_pending = !run_checker_enrichment(&root, options);
                     }
                 }
                 if changed && let Some(p) = &provider {
@@ -166,28 +155,10 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Replenish the checker plane after indexing has already removed facts whose
-/// project manifests drifted. Failure never resurrects those old edges; watch
-/// keeps running and retries on the next relevant filesystem event.
-fn run_checker_enrichment(
-    root: &Path,
-    conn: &rusqlite::Connection,
-    options: &WatchOptions<'_>,
-) -> bool {
-    match structural::stale_checker_projects(conn) {
-        Ok(projects) if !projects.is_empty() => {
-            eprintln!(
-                "checker inputs changed for {} project(s); stale edges are suppressed: {}",
-                projects.len(),
-                projects.join(", ")
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!("checker freshness inspection failed: {error}");
-            return false;
-        }
-    }
+/// Replenish the checker plane for the structural snapshot just published.
+/// Failure leaves that snapshot without checker edges; watch keeps running and
+/// retries on the next relevant repository event.
+fn run_checker_enrichment(root: &Path, options: &WatchOptions<'_>) -> bool {
     match checker::enrich(
         root,
         &checker::EnrichOptions {
@@ -205,7 +176,7 @@ fn run_checker_enrichment(
         }
         Err(error) => {
             eprintln!(
-                "checker enrichment failed; stale edges remain suppressed and watch will retry: {error}"
+                "checker enrichment failed; this snapshot has no checker edges and watch will retry: {error}"
             );
             false
         }

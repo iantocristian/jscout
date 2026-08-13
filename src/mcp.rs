@@ -115,7 +115,7 @@ pub fn serve(
                 let started = Instant::now();
                 let result = if name == "annotate" && profile == ToolProfile::Structural {
                     // The server is read-only until the one write-capable tool
-                    // is actually selected. Keep migrations and writer locks
+                    // is actually selected. Keep schema writes and writer locks
                     // out of every retrieval-only MCP session.
                     let write_conn = match database_path {
                         Some(path) => store::open_path(path),

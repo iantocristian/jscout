@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
 pub const SCHEMA_VERSION: &str = "18";
+const DURABLE_SCHEMA_FLOOR: u32 = 15;
 
 static SQLITE_VEC: Once = Once::new();
 
@@ -104,6 +105,42 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
 pub fn open_path(path: &Path) -> Result<Connection> {
     register_sqlite_vec();
     let conn = Connection::open(path)?;
+    let has_schema: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_schema {
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .context("index database has no schema version")?;
+        if version != SCHEMA_VERSION {
+            let parsed = version.parse::<u32>().with_context(|| {
+                format!(
+                    "index database `{}` has invalid schema version `{version}`",
+                    path.display()
+                )
+            })?;
+            if parsed < DURABLE_SCHEMA_FLOOR
+                || parsed
+                    > SCHEMA_VERSION
+                        .parse::<u32>()
+                        .expect("numeric schema version")
+            {
+                bail!(
+                    "index database `{}` uses unsupported durable schema v{version}; preserve the old file if its embedding cache or semantic memory matters, then create a fresh index",
+                    path.display()
+                );
+            }
+            rebuild_legacy_disposable_schema(&conn)?;
+        }
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -111,10 +148,81 @@ pub fn open_path(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// One compatibility boundary replaces the historical per-version ladder.
+/// Schemas at or above the durable floor already have the current embedding
+/// cache and semantic-memory shapes; discard every source-derived table and
+/// let the current schema recreate it. Dynamic sqlite-vec tables are retained
+/// but emptied because their rows materialize snapshot-local chunk IDs.
+fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
+    let vector_tables = {
+        let mut statement = conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name GLOB 'vec_embeddings_[0-9]*'
+               AND substr(name, length('vec_embeddings_') + 1) NOT GLOB '*[^0-9]*'
+             ORDER BY name",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        for table in vector_tables {
+            let dimensions = table.trim_start_matches("vec_embeddings_");
+            if dimensions.is_empty() || !dimensions.bytes().all(|byte| byte.is_ascii_digit()) {
+                bail!("invalid sqlite-vec table name `{table}`");
+            }
+            conn.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS embedding_index_entries;
+             DROP TABLE IF EXISTS checker_occurrence_projects;
+             DROP TABLE IF EXISTS checker_input_files;
+             DROP TABLE IF EXISTS checker_enrichments;
+             DROP TABLE IF EXISTS checker_enrichment_batches;
+             DROP TABLE IF EXISTS entity_edges;
+             DROP TABLE IF EXISTS entity_occurrences;
+             DROP TABLE IF EXISTS entities;
+             DROP TABLE IF EXISTS entity_sites;
+             DROP TABLE IF EXISTS resolved_edges;
+             DROP TABLE IF EXISTS graph_nodes;
+             DROP TABLE IF EXISTS contract_imports;
+             DROP TABLE IF EXISTS contract_exports;
+             DROP TABLE IF EXISTS module_edges;
+             DROP TABLE IF EXISTS refs;
+             DROP TABLE IF EXISTS events;
+             DROP TABLE IF EXISTS member_calls;
+             DROP TABLE IF EXISTS imports;
+             DROP TABLE IF EXISTS exports;
+             DROP TABLE IF EXISTS chunks_fts;
+             DROP TABLE IF EXISTS chunks;
+             DROP TABLE IF EXISTS symbols;
+             DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS package_instances;
+             DELETE FROM meta
+             WHERE key IN (
+               'root', 'snapshot', 'projection_version', 'resolution_hash',
+               'extraction_version'
+             ) OR key LIKE 'embedding_index_synced_v1:%';
+             UPDATE meta SET value='18' WHERE key='schema_version';",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+INSERT INTO meta(key, value) VALUES('schema_version', '18')
+  ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
   id INTEGER PRIMARY KEY,
@@ -443,7 +551,7 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
   ON checker_enrichments(target_anchor);
 -- One row per owning-project answer, including `unknown`. Facts record mapped
 -- targets; this table preserves coverage so partial checker success stays
--- visible and every owning project's input drift can retire the occurrence.
+-- visible in the exact-snapshot projection.
 CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   member_call_id INTEGER NOT NULL,
@@ -452,24 +560,6 @@ CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
   status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
   PRIMARY KEY(batch_id, member_call_id, project_id)
 );
--- Checker inputs are retained per TypeScript project and checker fingerprint.
--- `source` inputs can be compared with indexed file hashes; `environment`
--- inputs (configs, compiler/runtime files, ambient declarations, and other
--- unindexed paths) are rehashed from disk. Drift retires occurrences whose
--- owning-project coverage includes the affected project/fingerprint.
-CREATE TABLE IF NOT EXISTS checker_input_files(
-  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
-  project_id TEXT NOT NULL,
-  query_file TEXT NOT NULL,
-  checker_input_fingerprint TEXT NOT NULL,
-  input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
-  input_role TEXT NOT NULL DEFAULT 'environment'
-    CHECK(input_role IN ('environment', 'source')),
-  input_path TEXT NOT NULL,
-  source_hash TEXT NOT NULL,
-  PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
-);
-
 -- One row per generative model run. Failures, exclusions, cost, and
 -- provenance stay attributable; artifacts reference the run that produced
 -- them. Statuses: running | completed | incomplete | failed | canceled |
@@ -576,9 +666,6 @@ CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
 "#,
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
-    migrate(conn)?;
-    // These indexes refer to columns introduced by migrations, so create them
-    // only after legacy tables have been upgraded.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_files_origin ON files(origin);
          CREATE INDEX IF NOT EXISTS idx_files_package_instance ON files(package_instance_id);
@@ -608,568 +695,6 @@ pub(crate) fn with_read_snapshot<T>(
     }
 }
 
-/// Migrations only preserve canonical/source rows where that is safe. Graph
-/// projections are disposable and are rebuilt by the next index operation.
-fn migrate(conn: &Connection) -> Result<()> {
-    let version: u32 = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .and_then(|v: String| v.parse().ok())
-        .unwrap_or(0);
-
-    // v1 -> v2: embeddings PK was chunk_hash alone, so different models
-    // overwrote each other's vectors. The table is a cache — drop and rebuild.
-    if version < 2 {
-        let pk_cols: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('embeddings') WHERE pk > 0",
-            [],
-            |r| r.get(0),
-        )?;
-        if pk_cols < 2 {
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS embeddings;
-                 CREATE TABLE embeddings(
-                   chunk_hash TEXT NOT NULL,
-                   model TEXT NOT NULL,
-                   dim INTEGER NOT NULL,
-                   vec BLOB NOT NULL,
-                   PRIMARY KEY (chunk_hash, model)
-                 );",
-            )?;
-        }
-    }
-
-    if version < 3 {
-        if !has_column(conn, "symbols", "decl_start")? {
-            conn.execute("ALTER TABLE symbols ADD COLUMN decl_start INTEGER", [])?;
-        }
-        if !has_column(conn, "symbols", "decl_end")? {
-            conn.execute("ALTER TABLE symbols ADD COLUMN decl_end INTEGER", [])?;
-        }
-        if !has_column(conn, "symbols", "scope_chain")? {
-            conn.execute(
-                "ALTER TABLE symbols ADD COLUMN scope_chain TEXT NOT NULL DEFAULT ''",
-                [],
-            )?;
-        }
-        conn.execute(
-            "UPDATE symbols
-             SET decl_start = COALESCE(decl_start, start),
-                 decl_end = COALESCE(decl_end, end)",
-            [],
-        )?;
-
-        if !has_column(conn, "refs", "id")? || !has_column(conn, "refs", "start")? {
-            conn.execute_batch(
-                "ALTER TABLE refs RENAME TO refs_v2;
-                 CREATE TABLE refs(
-                   id INTEGER PRIMARY KEY,
-                   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                   chunk_id INTEGER,
-                   start INTEGER NOT NULL,
-                   line INTEGER NOT NULL,
-                   kind TEXT NOT NULL,
-                   confidence TEXT NOT NULL,
-                   target_request TEXT,
-                   target_name TEXT NOT NULL,
-                   local INTEGER NOT NULL DEFAULT 0,
-                   detail TEXT
-                 );
-                 INSERT INTO refs(
-                   file_id, chunk_id, start, line, kind, confidence,
-                   target_request, target_name, local, detail
-                 )
-                 SELECT file_id, chunk_id, 0, line, kind, confidence,
-                        target_request, target_name, local, detail
-                 FROM refs_v2;
-                 DROP TABLE refs_v2;
-                 CREATE INDEX idx_refs_file ON refs(file_id);
-                 CREATE INDEX idx_refs_target ON refs(target_name);",
-            )?;
-        }
-
-        // Force canonical extraction once so declaration spans and reference
-        // offsets are populated for repositories indexed under schema v2.
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    if version < 4 {
-        if !has_column(conn, "member_calls", "start")? {
-            conn.execute(
-                "ALTER TABLE member_calls ADD COLUMN start INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-
-        // Member-call ownership in the traversal projection requires exact
-        // source offsets. Force canonical extraction because legacy rows can
-        // only be migrated with a placeholder offset.
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    if version < 5 {
-        if !has_column(conn, "files", "role")? {
-            conn.execute(
-                "ALTER TABLE files ADD COLUMN role TEXT NOT NULL DEFAULT 'unknown'",
-                [],
-            )?;
-        }
-        // Role-aware result payloads must not appear current until every file
-        // has passed through the classifier on the next index operation.
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // The idempotent schema batch creates v6 semantic tables. Preserve their
-    // rows across later source indexing so support fingerprints can expose
-    // stale and degraded memory instead of silently deleting it.
-
-    // v6 -> v7: module_edges gains resolution provenance so the projector can
-    // distinguish heuristic workspace mappings from direct resolver results.
-    // Edges are rebuilt on every index; only invalidate the public snapshot so
-    // stale certain-labelled projections stop serving. (Fresh databases get
-    // the column from the schema batch; has_column makes this idempotent.)
-    if version < 7 {
-        if !has_column(conn, "module_edges", "resolution")? {
-            conn.execute("ALTER TABLE module_edges ADD COLUMN resolution TEXT", [])?;
-        }
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v7 -> v8: package instances become the ownership boundary for
-    // workspace and dependency files. Existing repository files remain
-    // first-party by default; the next index operation can refine workspace
-    // membership without forcing unchanged source through extraction again.
-    if version < 8 {
-        if !has_column(conn, "files", "origin")? {
-            conn.execute(
-                "ALTER TABLE files ADD COLUMN origin TEXT NOT NULL DEFAULT 'repository'
-                 CHECK(origin IN ('repository', 'workspace', 'dependency'))",
-                [],
-            )?;
-        }
-        if !has_column(conn, "files", "package_instance_id")? {
-            conn.execute(
-                "ALTER TABLE files ADD COLUMN package_instance_id INTEGER
-                 REFERENCES package_instances(id) ON DELETE CASCADE",
-                [],
-            )?;
-        }
-        if !has_column(conn, "files", "package_path")? {
-            conn.execute("ALTER TABLE files ADD COLUMN package_path TEXT", [])?;
-        }
-        if !has_column(conn, "module_edges", "package_instance_id")? {
-            conn.execute(
-                "ALTER TABLE module_edges ADD COLUMN package_instance_id INTEGER
-                 REFERENCES package_instances(id) ON DELETE SET NULL",
-                [],
-            )?;
-        }
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v8 -> v9: runtime/general entities preserve per-site spans and trust
-    // labels separately from snapshot-canonical identity. Existing files must
-    // pass through extraction once to populate entity_sites.
-    if version < 9 {
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v9 -> v10: the contract plane shares the evidence/occurrence machinery
-    // but not runtime edge semantics. SQLite cannot widen a CHECK constraint,
-    // so discard these derived rows and recreate the four tables. Source files
-    // are forced through extraction to repopulate both runtime and contract
-    // evidence on the next index operation.
-    if version < 10 {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS entity_edges;
-             DROP TABLE IF EXISTS entity_occurrences;
-             DROP TABLE IF EXISTS entities;
-             DROP TABLE IF EXISTS entity_sites;
-             CREATE TABLE entity_sites(
-               id INTEGER PRIMARY KEY,
-               file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-               chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
-               start INTEGER NOT NULL,
-               end INTEGER NOT NULL,
-               line INTEGER NOT NULL,
-               end_line INTEGER NOT NULL,
-               plane TEXT NOT NULL CHECK(plane IN ('runtime', 'contract', 'general')),
-               entity_type TEXT NOT NULL,
-               role TEXT NOT NULL,
-               identity_kind TEXT NOT NULL CHECK(identity_kind IN ('literal', 'reference')),
-               identity_name TEXT NOT NULL,
-               identity_start INTEGER NOT NULL,
-               target_name TEXT,
-               target_start INTEGER,
-               extractor TEXT NOT NULL,
-               provenance TEXT NOT NULL,
-               confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
-               detail_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE INDEX idx_entity_sites_file ON entity_sites(file_id);
-             CREATE INDEX idx_entity_sites_identity
-               ON entity_sites(entity_type, identity_name);
-             CREATE TABLE entities(
-               id INTEGER PRIMARY KEY,
-               entity_key TEXT UNIQUE NOT NULL,
-               plane TEXT NOT NULL CHECK(plane IN ('runtime', 'contract', 'general')),
-               entity_type TEXT NOT NULL,
-               name TEXT NOT NULL,
-               identity_anchor TEXT,
-               meta_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE INDEX idx_entities_type_name ON entities(entity_type, name);
-             CREATE TABLE entity_occurrences(
-               id INTEGER PRIMARY KEY,
-               entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-               site_id INTEGER UNIQUE NOT NULL REFERENCES entity_sites(id) ON DELETE CASCADE,
-               file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-               chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
-               start INTEGER NOT NULL,
-               end INTEGER NOT NULL,
-               line INTEGER NOT NULL,
-               end_line INTEGER NOT NULL,
-               role TEXT NOT NULL,
-               extractor TEXT NOT NULL,
-               provenance TEXT NOT NULL,
-               confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
-               detail_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE INDEX idx_entity_occurrences_entity
-               ON entity_occurrences(entity_id, role);
-             CREATE INDEX idx_entity_occurrences_file
-               ON entity_occurrences(file_id, start);
-             CREATE TABLE entity_edges(
-               id INTEGER PRIMARY KEY,
-               occurrence_id INTEGER NOT NULL REFERENCES entity_occurrences(id) ON DELETE CASCADE,
-               target_key TEXT NOT NULL,
-               kind TEXT NOT NULL,
-               confidence TEXT NOT NULL CHECK(confidence IN ('certain', 'likely', 'possible')),
-               provenance TEXT NOT NULL,
-               detail_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE INDEX idx_entity_edges_occurrence
-               ON entity_edges(occurrence_id, kind);
-             CREATE INDEX idx_entity_edges_target
-               ON entity_edges(target_key, kind);",
-        )?;
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v10 -> v11: deterministic general-entity extractors were added without
-    // changing their generic evidence schema. Force unchanged files through
-    // extraction once so an upgraded index cannot look current while lacking
-    // routes, GraphQL operations, environment variables, database resources,
-    // feature flags, and external hosts.
-    if version < 11 {
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v11 -> v12: module resolution remains shared by the runtime and
-    // contract planes, but projection must distinguish requests that occur
-    // only in type/documentary bindings. Module edges are disposable and are
-    // rebuilt on the next index operation.
-    if version < 12 {
-        if !has_column(conn, "module_edges", "type_only")? {
-            conn.execute(
-                "ALTER TABLE module_edges
-                 ADD COLUMN type_only INTEGER NOT NULL DEFAULT 0
-                 CHECK(type_only IN (0, 1))",
-                [],
-            )?;
-        }
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-    }
-
-    // v12 -> v13: the scout run ledger and semantic relations land through
-    // the idempotent schema batch; existing semantic artifacts gain run and
-    // fingerprint identity. Fingerprints are backfilled from the canonical
-    // serialized body, provenance, and sorted supports so parent artifacts
-    // can depend on children by content, not by id alone. Semantic rows are
-    // canonical, so nothing structural is invalidated.
-    if version < 13 {
-        for (column, definition) in [
-            (
-                "scout_run_id",
-                "scout_run_id INTEGER REFERENCES scout_runs(id)",
-            ),
-            ("input_fingerprint", "input_fingerprint TEXT"),
-            ("artifact_fingerprint", "artifact_fingerprint TEXT"),
-        ] {
-            if !has_column(conn, "semantic_artifacts", column)? {
-                conn.execute(
-                    &format!("ALTER TABLE semantic_artifacts ADD COLUMN {definition}"),
-                    [],
-                )?;
-            }
-        }
-        backfill_artifact_fingerprints(conn)?;
-    }
-
-    // v13 -> v14: persist the deterministic inputs needed to reproduce a
-    // scout. Older runs remain attributable but cannot be refreshed by
-    // guessing their original seeds or traversal limits.
-    if version < 14 && !has_column(conn, "scout_runs", "config_json")? {
-        conn.execute(
-            "ALTER TABLE scout_runs ADD COLUMN config_json TEXT NOT NULL DEFAULT '{}'",
-            [],
-        )?;
-    }
-
-    // v14 -> v15: member calls learn their complete call span and static
-    // receiver chain so evidence lines inside a multiline call join their
-    // enclosing call by containment, never by start-line equality.
-    if version < 15 {
-        if !has_column(conn, "member_calls", "end")? {
-            conn.execute(
-                "ALTER TABLE member_calls ADD COLUMN end INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        if !has_column(conn, "member_calls", "end_line")? {
-            conn.execute(
-                "ALTER TABLE member_calls ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        if !has_column(conn, "member_calls", "receiver")? {
-            conn.execute("ALTER TABLE member_calls ADD COLUMN receiver TEXT", [])?;
-        }
-        // Legacy rows only know where a call starts; spans and receivers can
-        // only come from re-extraction.
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-        )?;
-    }
-
-    // v15 -> v16: model names are insufficient cache provenance, and Rust's
-    // full-table cosine loop is replaced by sqlite-vec vec0 indexes. Vectors
-    // are a disposable cache, so legacy rows are intentionally not guessed
-    // into a provider/configuration identity.
-    if version < 16 {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS embedding_index_entries;
-             DROP TABLE IF EXISTS embeddings;
-             DROP TABLE IF EXISTS embedding_profiles;
-             CREATE TABLE embedding_profiles(
-               id INTEGER PRIMARY KEY,
-               provider TEXT NOT NULL,
-               model TEXT NOT NULL,
-               config_fingerprint TEXT UNIQUE NOT NULL,
-               dimensions INTEGER NOT NULL,
-               config_json TEXT NOT NULL
-             );
-             CREATE TABLE embeddings(
-               chunk_hash TEXT NOT NULL,
-               profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
-               vec BLOB NOT NULL,
-               PRIMARY KEY (chunk_hash, profile_id)
-             );
-             CREATE TABLE embedding_index_entries(
-               id INTEGER PRIMARY KEY,
-               chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
-               profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
-               UNIQUE (chunk_id, profile_id)
-             );
-             CREATE INDEX idx_embedding_entries_profile
-               ON embedding_index_entries(profile_id, chunk_id);",
-        )?;
-    }
-
-    // v16 -> v17: checker enrichment addresses one exact member occurrence.
-    // Legacy rows know the complete call but not the receiver/property spans,
-    // so only re-extraction can populate trustworthy query locations.
-    if version < 17 {
-        for (column, declaration) in [
-            ("receiver_start", "INTEGER NOT NULL DEFAULT 0"),
-            ("receiver_end", "INTEGER NOT NULL DEFAULT 0"),
-            ("property_start", "INTEGER NOT NULL DEFAULT 0"),
-            ("property_end", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            if !has_column(conn, "member_calls", column)? {
-                conn.execute(
-                    &format!("ALTER TABLE member_calls ADD COLUMN {column} {declaration}"),
-                    [],
-                )?;
-            }
-        }
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-        )?;
-    }
-
-    // v17 -> v18: canonical, snapshot-bound checker enrichment batches.
-    if version < 18 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
-               id INTEGER PRIMARY KEY,
-               source_snapshot TEXT NOT NULL,
-               checker_version TEXT NOT NULL,
-               checker_source TEXT NOT NULL,
-               checker_input_fingerprint TEXT NOT NULL,
-               sidecar_protocol INTEGER NOT NULL,
-               created_at TEXT NOT NULL,
-               active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
-             );
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
-               ON checker_enrichment_batches(active) WHERE active = 1;
-             CREATE TABLE IF NOT EXISTS checker_enrichments(
-               id INTEGER PRIMARY KEY,
-               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
-               member_call_id INTEGER NOT NULL,
-               source_file_id INTEGER NOT NULL,
-               source_file TEXT NOT NULL,
-               source_hash TEXT NOT NULL,
-               call_start INTEGER NOT NULL,
-               call_end INTEGER NOT NULL,
-               receiver_start INTEGER NOT NULL,
-               receiver_end INTEGER NOT NULL,
-               property_start INTEGER NOT NULL,
-               property_end INTEGER NOT NULL,
-               project_id TEXT NOT NULL,
-               receiver_type TEXT,
-               target_anchor TEXT NOT NULL,
-               target_fingerprint TEXT NOT NULL,
-               confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
-               provenance TEXT NOT NULL CHECK(provenance = 'checker'),
-               checker_input_fingerprint TEXT NOT NULL,
-               UNIQUE(batch_id, member_call_id, project_id, target_anchor)
-             );
-             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
-               ON checker_enrichments(source_file, call_start);
-             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
-               ON checker_enrichments(target_anchor);
-             CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
-               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
-               member_call_id INTEGER NOT NULL,
-               project_id TEXT NOT NULL,
-               checker_input_fingerprint TEXT NOT NULL,
-               status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
-               PRIMARY KEY(batch_id, member_call_id, project_id)
-             );
-             CREATE TABLE IF NOT EXISTS checker_input_files(
-               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
-               project_id TEXT NOT NULL,
-               query_file TEXT NOT NULL,
-               checker_input_fingerprint TEXT NOT NULL,
-               input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
-               input_role TEXT NOT NULL DEFAULT 'environment'
-                 CHECK(input_role IN ('environment', 'source')),
-               input_path TEXT NOT NULL,
-               source_hash TEXT NOT NULL,
-               PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
-             );",
-        )?;
-    }
-
-    // v18 is unreleased (the last published schema is v16), so checker
-    // freshness additions are folded into its table definition rather than
-    // consuming more versions. Intermediate v18 databases are upgraded below.
-    if !has_column(conn, "checker_input_files", "input_role")? {
-        conn.execute(
-            "ALTER TABLE checker_input_files
-             ADD COLUMN input_role TEXT NOT NULL DEFAULT 'environment'",
-            [],
-        )?;
-    }
-    if !has_column(conn, "checker_input_files", "checker_input_fingerprint")? {
-        conn.execute(
-            "ALTER TABLE checker_input_files
-             ADD COLUMN checker_input_fingerprint TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-        // v18 is still unreleased, but databases created by intermediate
-        // builds may already contain checker manifests. Recover the project
-        // fingerprint when it is unique; ambiguous/missing values stay empty
-        // and therefore fail closed during projection.
-        conn.execute(
-            "UPDATE checker_input_files AS input
-             SET checker_input_fingerprint=COALESCE((
-               SELECT MIN(enrichment.checker_input_fingerprint)
-               FROM checker_enrichments enrichment
-               WHERE enrichment.batch_id=input.batch_id
-                 AND enrichment.project_id=input.project_id
-               HAVING COUNT(DISTINCT enrichment.checker_input_fingerprint)=1
-             ), '')",
-            [],
-        )?;
-    }
-    // Intermediate v18 databases predate explicit owning-project coverage.
-    // Do not infer `unknown` answers from target facts; absent coverage makes
-    // their old checker edges fail closed until enrichment runs again.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
-           batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
-           member_call_id INTEGER NOT NULL,
-           project_id TEXT NOT NULL,
-           checker_input_fingerprint TEXT NOT NULL,
-           status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
-           PRIMARY KEY(batch_id, member_call_id, project_id)
-         );",
-    )?;
-
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version',?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [SCHEMA_VERSION],
-    )?;
-    Ok(())
-}
-
 /// Canonical provenance fields of one semantic artifact.
 pub(crate) struct ArtifactIdentity<'a> {
     pub artifact_type: &'a str,
@@ -1183,7 +708,7 @@ pub(crate) struct ArtifactIdentity<'a> {
 
 /// Canonical content identity of a semantic artifact: serialized body,
 /// provenance, confidence, snapshot, and every support in sorted order.
-/// Shared by the migration backfill and every new artifact write.
+/// Shared by every artifact write and hierarchical freshness check.
 pub(crate) fn artifact_fingerprint(
     identity: &ArtifactIdentity<'_>,
     supports: &mut [Vec<String>],
@@ -1213,94 +738,9 @@ pub(crate) fn artifact_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
-type ArtifactRow = (
-    i64,
-    String,
-    Option<String>,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
-
-fn backfill_artifact_fingerprints(conn: &Connection) -> Result<()> {
-    let artifacts: Vec<ArtifactRow> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, artifact_type, canonical_name, body_json, model,
-                    prompt_version, confidence, source_snapshot
-             FROM semantic_artifacts WHERE artifact_fingerprint IS NULL",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-            ))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    for (id, artifact_type, canonical_name, body, model, prompt_version, confidence, snapshot) in
-        artifacts
-    {
-        let mut supports = load_support_fingerprint_rows(conn, id)?;
-        let fingerprint = artifact_fingerprint(
-            &ArtifactIdentity {
-                artifact_type: &artifact_type,
-                canonical_name: canonical_name.as_deref(),
-                body_json: &body,
-                model: &model,
-                prompt_version: &prompt_version,
-                confidence: &confidence,
-                source_snapshot: &snapshot,
-            },
-            &mut supports,
-        );
-        conn.execute(
-            "UPDATE semantic_artifacts SET artifact_fingerprint=?1 WHERE id=?2",
-            params![fingerprint, id],
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn load_support_fingerprint_rows(
-    conn: &Connection,
-    artifact_id: i64,
-) -> Result<Vec<Vec<String>>> {
-    let mut stmt = conn.prepare(
-        "SELECT claim_path, anchor_key, COALESCE(role, ''), evidence_file,
-                evidence_start_line, evidence_end_line, source_hash, context_hash, confidence
-         FROM semantic_supports WHERE artifact_id=?1",
-    )?;
-    let rows = stmt.query_map([artifact_id], |row| {
-        Ok(vec![
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?.to_string(),
-            row.get::<_, i64>(5)?.to_string(),
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-        ])
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let sql = format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)");
-    Ok(conn.query_row(&sql, [column], |r| r.get::<_, i64>(0))? != 0)
-}
-
 /// Wholesale replacement for per-file deletion when (nearly) every file is
-/// about to be re-extracted, e.g. after a migration cleared file hashes.
+/// about to be re-extracted, e.g. after an extractor-version change clears
+/// file hashes.
 /// Cascading [`delete_file`] through tens of thousands of files re-scans the
 /// large evidence tables and the FTS index once per file; truncating every
 /// extraction-derived table and the disposable projection outright keeps a
@@ -1406,7 +846,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DB_FILE, file_source_path, has_column, open, open_path, open_path_read_only, open_read_only,
+        DB_FILE, SCHEMA_VERSION, file_source_path, open, open_path, open_path_read_only,
+        open_read_only,
     };
 
     #[test]
@@ -1423,20 +864,90 @@ mod tests {
         let old = Connection::open(&old_database)?;
         old.execute_batch(
             "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '17');
+             INSERT INTO meta VALUES('schema_version', '14');
              INSERT INTO meta VALUES('snapshot', 'old');
              INSERT INTO meta VALUES('projection_version', 'old');",
         )?;
         drop(old);
         let error = open_path_read_only(&old_database)
             .expect_err("old schema must not migrate during read-only open");
-        assert!(error.to_string().contains("schema v17"));
+        assert!(error.to_string().contains("schema v14"));
+        let error = open_path(&old_database).expect_err("writer must not migrate old schemas");
+        assert!(error.to_string().contains("unsupported durable schema v14"));
         let unchanged = Connection::open(&old_database)?.query_row(
             "SELECT value FROM meta WHERE key='schema_version'",
             [],
             |row| row.get::<_, String>(0),
         )?;
-        assert_eq!(unchanged, "17");
+        assert_eq!(unchanged, "14");
+        Ok(())
+    }
+
+    #[test]
+    fn durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("floor.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "INSERT INTO files(path, hash, role) VALUES('old.ts', 'source', 'production');
+             INSERT INTO chunks(
+               file_id, kind, start, end, start_line, end_line, hash, content
+             ) VALUES(1, 'module', 0, 1, 1, 1, 'chunk', 'x');
+             INSERT INTO embedding_profiles(
+               id, provider, model, config_fingerprint, dimensions, config_json
+             ) VALUES(1, 'test', 'tiny', 'profile', 2, '{}');
+             INSERT INTO embeddings(chunk_hash, profile_id, vec)
+             VALUES('chunk', 1, X'0000000000000000');
+             INSERT INTO semantic_artifacts(
+               id, artifact_type, canonical_name, body_json, model,
+               prompt_version, confidence, source_snapshot, created_at,
+               input_fingerprint, artifact_fingerprint
+             ) VALUES(1, 'annotation', 'memory', '{}', 'agent', 'v1',
+                      'likely', 'old', '2026-01-01T00:00:00Z', 'input', 'artifact');
+             INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES('old', '5.9.3', 'test', 'checker', 1,
+                      '2026-01-01T00:00:00Z', 1);
+             UPDATE meta SET value='15' WHERE key='schema_version';",
+        )?;
+        crate::embed::materialize_cached_embeddings(&conn)?;
+        drop(conn);
+
+        let upgraded = open_path(&database)?;
+        let counts: (i64, i64, i64, i64, i64) = upgraded.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_profiles),
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM semantic_artifacts),
+               (SELECT count(*) FROM files),
+               (SELECT count(*) FROM checker_enrichment_batches)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (1, 1, 1, 0, 0));
+        let materialized: (i64, i64) = upgraded.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_index_entries),
+               (SELECT count(*) FROM vec_embeddings_2)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(materialized, (0, 0));
+        let version: String = upgraded.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
         Ok(())
     }
 
@@ -1485,45 +996,6 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v15_embedding_cache_to_profiled_sqlite_vec_storage() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(DB_FILE);
-        let connection = Connection::open(&database)?;
-        connection.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '15');
-             CREATE TABLE embeddings(
-               chunk_hash TEXT NOT NULL,
-               model TEXT NOT NULL,
-               dim INTEGER NOT NULL,
-               vec BLOB NOT NULL,
-               PRIMARY KEY(chunk_hash, model)
-             );
-             INSERT INTO embeddings VALUES('old', 'ambiguous-model', 2, X'00000000');",
-        )?;
-        drop(connection);
-
-        let connection = open(repo.path())?;
-        let version: String = connection.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let legacy_columns: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('embeddings')
-             WHERE name IN ('model', 'dim')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(legacy_columns, 0);
-        let cached: i64 =
-            connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
-        assert_eq!(cached, 0, "legacy model-only provenance is not reusable");
-        Ok(())
-    }
-
-    #[test]
     fn indexes_high_volume_evidence_tables_by_file() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = open(repo.path())?;
@@ -1535,739 +1007,6 @@ mod tests {
             )?;
             assert_eq!(column, "file_id", "{index} must index file_id first");
         }
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v2_symbols_and_references_without_preserving_stale_projection() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let db_path = repo.path().join(".jscout.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '2');
-             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
-             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');
-             CREATE TABLE symbols(
-               id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
-               start INTEGER, end INTEGER, line INTEGER, exported INTEGER
-             );
-             INSERT INTO symbols VALUES(1, 1, 'old', 'function', 3, 8, 1, 1);
-             CREATE TABLE refs(
-               file_id INTEGER, chunk_id INTEGER, line INTEGER, kind TEXT,
-               confidence TEXT, target_request TEXT, target_name TEXT,
-               local INTEGER, detail TEXT
-             );
-             INSERT INTO refs VALUES(1, NULL, 1, 'call', 'certain', NULL, 'old', 1, NULL);
-             CREATE INDEX idx_refs_file ON refs(file_id);
-             CREATE INDEX idx_refs_target ON refs(target_name);",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let symbol: (i64, i64, String) = conn.query_row(
-            "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        assert_eq!(symbol, (3, 8, String::new()));
-        let reference: (i64, i64) = conn.query_row(
-            "SELECT id, start FROM refs WHERE target_name='old'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        assert!(reference.0 > 0);
-        assert_eq!(reference.1, 0);
-        let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
-        assert!(hash.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v3_member_calls_and_forces_offset_reextraction() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let db_path = repo.path().join(".jscout.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '3');
-             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
-             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');
-             CREATE TABLE member_calls(
-               file_id INTEGER, chunk_id INTEGER, line INTEGER,
-               prop TEXT, object TEXT
-             );
-             INSERT INTO member_calls VALUES(1, NULL, 7, 'load', 'client');",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let member_call: (i64, i64) = conn.query_row(
-            "SELECT start, line FROM member_calls WHERE prop='load'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        assert_eq!(member_call, (0, 7));
-        let hash: String = conn.query_row("SELECT hash FROM files WHERE id=1", [], |r| r.get(0))?;
-        assert!(hash.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v4_files_with_unknown_roles_and_invalidates_snapshot() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let db_path = repo.path().join(".jscout.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '4');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '2');
-             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, hash TEXT);
-             INSERT INTO files VALUES(1, 'old.ts', 'old-hash');",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let role: String = conn.query_row("SELECT role FROM files WHERE id=1", [], |r| r.get(0))?;
-        assert_eq!(role, "unknown");
-        let snapshots: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v5_by_adding_empty_semantic_memory_tables() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '5');",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        let artifacts: i64 =
-            conn.query_row("SELECT COUNT(*) FROM semantic_artifacts", [], |row| {
-                row.get(0)
-            })?;
-        let supports: i64 =
-            conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
-                row.get(0)
-            })?;
-        assert_eq!(version, "18");
-        assert_eq!((artifacts, supports), (0, 0));
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v6_by_adding_module_edge_resolution_provenance() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '6');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '2');
-             CREATE TABLE module_edges(
-               from_file INTEGER NOT NULL, request TEXT NOT NULL,
-               to_file INTEGER, package TEXT
-             );
-             INSERT INTO module_edges VALUES(1, './x', 2, NULL);",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(version, "18");
-        // Legacy rows read as NULL resolution (treated as plain resolver).
-        let resolution: Option<String> = conn.query_row(
-            "SELECT resolution FROM module_edges WHERE from_file=1",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(resolution, None);
-        let snapshots: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v7_with_first_party_origin_and_package_identity_columns() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '7');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
-               role TEXT NOT NULL DEFAULT 'unknown'
-             );
-             INSERT INTO files VALUES(1, 'src/old.ts', 'old-hash', 'production');
-             CREATE TABLE module_edges(
-               from_file INTEGER NOT NULL, request TEXT NOT NULL,
-               to_file INTEGER, package TEXT, resolution TEXT
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let identity: (String, Option<i64>, Option<String>) = conn.query_row(
-            "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!(identity, ("repository".into(), None, None));
-        let package_column = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('module_edges')
-             WHERE name='package_instance_id'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        assert_eq!(package_column, 1);
-        let snapshots: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v8_with_entity_planes_and_forces_reextraction() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '8');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
-               role TEXT NOT NULL DEFAULT 'unknown',
-               origin TEXT NOT NULL DEFAULT 'repository',
-               package_instance_id INTEGER, package_path TEXT
-             );
-             INSERT INTO files VALUES(
-               1, 'src/old.ts', 'old-hash', 'production', 'repository', NULL, NULL
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let hash: String =
-            conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
-        assert!(hash.is_empty());
-        let tables: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master
-             WHERE type='table' AND name IN (
-               'entity_sites', 'entities', 'entity_occurrences', 'entity_edges'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(tables, 4);
-        let snapshots: i64 = conn.query_row(
-            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v9_to_contract_plane_and_forces_reextraction() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '9');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
-               role TEXT NOT NULL DEFAULT 'unknown',
-               origin TEXT NOT NULL DEFAULT 'repository',
-               package_instance_id INTEGER, package_path TEXT
-             );
-             INSERT INTO files VALUES(
-               1, 'src/old.ts', 'old-hash', 'production', 'repository', NULL, NULL
-             );
-             CREATE TABLE entity_sites(
-               id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, chunk_id INTEGER,
-               start INTEGER NOT NULL, end INTEGER NOT NULL, line INTEGER NOT NULL,
-               end_line INTEGER NOT NULL,
-               plane TEXT NOT NULL CHECK(plane IN ('runtime', 'general')),
-               entity_type TEXT NOT NULL, role TEXT NOT NULL,
-               identity_kind TEXT NOT NULL, identity_name TEXT NOT NULL,
-               identity_start INTEGER NOT NULL, target_name TEXT, target_start INTEGER,
-               extractor TEXT NOT NULL, provenance TEXT NOT NULL,
-               confidence TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}'
-             );
-             CREATE TABLE entities(
-               id INTEGER PRIMARY KEY, entity_key TEXT UNIQUE NOT NULL,
-               plane TEXT NOT NULL CHECK(plane IN ('runtime', 'general')),
-               entity_type TEXT NOT NULL, name TEXT NOT NULL,
-               identity_anchor TEXT, meta_json TEXT NOT NULL DEFAULT '{}'
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let hash: String =
-            conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
-        assert!(hash.is_empty());
-        conn.execute(
-            "INSERT INTO entities(
-               entity_key, plane, entity_type, name, identity_anchor, meta_json
-             ) VALUES('contract:interface:src/old.ts#Old', 'contract', 'interface',
-                      'Old', NULL, '{}')",
-            [],
-        )?;
-        let snapshots: i64 = conn.query_row(
-            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v10_by_forcing_general_entity_extraction() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '10');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '6');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT,
-               role TEXT NOT NULL DEFAULT 'unknown',
-               origin TEXT NOT NULL DEFAULT 'repository',
-               package_instance_id INTEGER, package_path TEXT
-             );
-             INSERT INTO files VALUES(
-               1, 'src/old.ts', 'old-hash', 'production', 'repository', NULL, NULL
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        let hash: String =
-            conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
-        assert!(hash.is_empty());
-        let snapshots: i64 = conn.query_row(
-            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v11_with_type_only_module_edge_classification() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '11');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '7');
-             CREATE TABLE module_edges(
-               from_file INTEGER NOT NULL, request TEXT NOT NULL,
-               to_file INTEGER, package TEXT, resolution TEXT,
-               package_instance_id INTEGER
-             );
-             INSERT INTO module_edges VALUES(1, './types', 2, NULL, 'resolver', NULL);",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        let type_only: i64 = conn.query_row(
-            "SELECT type_only FROM module_edges WHERE from_file=1",
-            [],
-            |row| row.get(0),
-        )?;
-        let snapshots: i64 = conn.query_row(
-            "SELECT count(*) FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        assert_eq!(type_only, 0);
-        assert_eq!(snapshots, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v12_with_run_ledger_and_backfilled_artifact_fingerprints() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '12');
-             CREATE TABLE semantic_artifacts(
-               id INTEGER PRIMARY KEY,
-               supersedes_artifact_id INTEGER,
-               artifact_type TEXT NOT NULL,
-               canonical_name TEXT,
-               body_json TEXT NOT NULL,
-               model TEXT NOT NULL,
-               prompt_version TEXT NOT NULL,
-               confidence TEXT NOT NULL,
-               source_snapshot TEXT NOT NULL,
-               created_at TEXT NOT NULL
-             );
-             INSERT INTO semantic_artifacts VALUES(
-               1, NULL, 'workflow', 'invoice retry', '{\"claim\":1}',
-               'agent-reported', 'annotate/v2', 'likely', 'snap-1', '2026-08-01T00:00:00Z'
-             );
-             CREATE TABLE semantic_supports(
-               artifact_id INTEGER NOT NULL,
-               claim_path TEXT NOT NULL,
-               anchor_key TEXT NOT NULL,
-               role TEXT,
-               evidence_file TEXT NOT NULL,
-               evidence_start_line INTEGER NOT NULL,
-               evidence_end_line INTEGER NOT NULL,
-               source_hash TEXT NOT NULL,
-               context_hash TEXT NOT NULL,
-               confidence TEXT NOT NULL
-             );
-             INSERT INTO semantic_supports VALUES(
-               1, '/claim', 'sym:a.ts#::run@1', NULL, 'a.ts', 1, 4, 'h1', 'c1', 'likely'
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-
-        // The backfilled fingerprint equals a recomputation from canonical parts.
-        let stored: String = conn.query_row(
-            "SELECT artifact_fingerprint FROM semantic_artifacts WHERE id=1",
-            [],
-            |row| row.get(0),
-        )?;
-        let mut supports = super::load_support_fingerprint_rows(&conn, 1)?;
-        let expected = super::artifact_fingerprint(
-            &super::ArtifactIdentity {
-                artifact_type: "workflow",
-                canonical_name: Some("invoice retry"),
-                body_json: "{\"claim\":1}",
-                model: "agent-reported",
-                prompt_version: "annotate/v2",
-                confidence: "likely",
-                source_snapshot: "snap-1",
-            },
-            &mut supports,
-        );
-        assert_eq!(stored, expected);
-
-        // Run-ledger tables exist with their claim index.
-        let objects: i64 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name IN (
-               'scout_runs', 'scout_classifications', 'semantic_relations',
-               'idx_scout_runs_active'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(objects, 4);
-
-        // Agent-authored rows keep run identity NULL after migration.
-        let identity: (Option<i64>, Option<String>) = conn.query_row(
-            "SELECT scout_run_id, input_fingerprint FROM semantic_artifacts WHERE id=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!(identity, (None, None));
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v13_scout_runs_with_replay_configuration() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let database = repo.path().join(".jscout.db");
-        let conn = Connection::open(&database)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '13');
-             CREATE TABLE scout_runs(
-               id INTEGER PRIMARY KEY,
-               scout_kind TEXT NOT NULL,
-               status TEXT NOT NULL,
-               gateway_protocol INTEGER NOT NULL,
-               provider TEXT NOT NULL,
-               model TEXT NOT NULL,
-               billing_path TEXT NOT NULL,
-               reasoning TEXT,
-               prompt_version TEXT NOT NULL,
-               source_snapshot TEXT NOT NULL,
-               input_fingerprint TEXT NOT NULL,
-               request_hash TEXT NOT NULL,
-               usage_json TEXT,
-               error_code TEXT,
-               started_at TEXT NOT NULL,
-               completed_at TEXT
-             );
-             INSERT INTO scout_runs VALUES(
-               1,'workflow','completed',1,'faux','model','api',NULL,
-               'workflow-scout/v1','snapshot','input','request',NULL,NULL,
-               '2026-08-10T00:00:00Z','2026-08-10T00:01:00Z'
-             );",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let (version, config): (String, String) = conn.query_row(
-            "SELECT meta.value, run.config_json
-             FROM meta JOIN scout_runs run ON run.id=1
-             WHERE meta.key='schema_version'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert_eq!(version, "18");
-        assert_eq!(config, "{}");
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_v14_member_calls_with_call_spans_and_receivers() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let db_path = repo.path().join(".jscout.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '14');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '10');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT, role TEXT,
-               origin TEXT, package_path TEXT, package_instance_id INTEGER
-             );
-             INSERT INTO files VALUES(1, 'old.ts', 'old-hash', 'production',
-                                      'repository', NULL, NULL);
-             CREATE TABLE member_calls(
-               file_id INTEGER, chunk_id INTEGER, start INTEGER, line INTEGER,
-               prop TEXT, object TEXT
-             );
-             INSERT INTO member_calls VALUES(1, NULL, 12, 3, 'insert', 'card');",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-        // Columns exist with the migration defaults; real values require
-        // re-extraction, which the cleared hash forces.
-        let (end, end_line, receiver, hash): (i64, i64, Option<String>, String) = conn.query_row(
-            "SELECT call.end, call.end_line, call.receiver, file.hash
-             FROM member_calls call JOIN files file ON file.id=call.file_id
-             WHERE call.prop='insert'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        assert_eq!((end, end_line, receiver, hash.as_str()), (0, 0, None, ""));
-        let public_meta: i64 = conn.query_row(
-            "SELECT count(*) FROM meta
-             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(public_meta, 0, "stale projection must not stay public");
-        Ok(())
-    }
-
-    /// v16 is the last published schema, so the v17 span columns and the v18
-    /// checker tables are what a real installation migrates through when it
-    /// first sees checker enrichment.
-    #[test]
-    fn migrates_v16_to_occurrence_spans_and_checker_enrichment_tables() -> Result<()> {
-        let repo = tempfile::tempdir()?;
-        let db_path = repo.path().join(".jscout.db");
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-             INSERT INTO meta VALUES('schema_version', '16');
-             INSERT INTO meta VALUES('snapshot', 'stale');
-             INSERT INTO meta VALUES('projection_version', '10');
-             INSERT INTO meta VALUES('resolution_hash', 'stale');
-             CREATE TABLE files(
-               id INTEGER PRIMARY KEY, path TEXT, hash TEXT, role TEXT,
-               origin TEXT, package_path TEXT, package_instance_id INTEGER
-             );
-             INSERT INTO files VALUES(1, 'service.ts', 'indexed-hash', 'production',
-                                      'repository', NULL, NULL);
-             CREATE TABLE member_calls(
-               file_id INTEGER, chunk_id INTEGER, start INTEGER, end INTEGER,
-               line INTEGER, end_line INTEGER, prop TEXT, object TEXT, receiver TEXT
-             );
-             INSERT INTO member_calls VALUES(1, NULL, 12, 26, 3, 3, 'insert', 'card',
-                                             'dbs.wave.card');",
-        )?;
-        drop(conn);
-
-        let conn = open(repo.path())?;
-        let version: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='schema_version'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(version, "18");
-
-        // v17: exact receiver/property spans exist, defaulted, and the cleared
-        // file hash forces the re-extraction that can populate them for real.
-        for column in [
-            "receiver_start",
-            "receiver_end",
-            "property_start",
-            "property_end",
-        ] {
-            assert!(
-                has_column(&conn, "member_calls", column)?,
-                "v17 must add member_calls.{column}"
-            );
-        }
-        let (spans, hash): ((i64, i64, i64, i64), String) = conn.query_row(
-            "SELECT call.receiver_start, call.receiver_end,
-                    call.property_start, call.property_end, file.hash
-             FROM member_calls call JOIN files file ON file.id=call.file_id",
-            [],
-            |row| {
-                Ok((
-                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        assert_eq!(spans, (0, 0, 0, 0));
-        assert_eq!(hash, "", "unspanned occurrences must be re-extracted");
-        let public_meta: i64 = conn.query_row(
-            "SELECT count(*) FROM meta
-             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(public_meta, 0, "stale projection must not stay public");
-
-        // v18: the canonical checker batch tables exist and are empty, with the
-        // one-active-batch invariant and the per-fact freshness role in place.
-        for table in [
-            "checker_enrichment_batches",
-            "checker_enrichments",
-            "checker_occurrence_projects",
-            "checker_input_files",
-        ] {
-            let rows: i64 =
-                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })?;
-            assert_eq!(rows, 0, "v18 must create an empty {table}");
-        }
-        assert!(has_column(&conn, "checker_input_files", "input_role")?);
-        assert!(has_column(
-            &conn,
-            "checker_input_files",
-            "checker_input_fingerprint"
-        )?);
-        conn.execute(
-            "INSERT INTO checker_enrichment_batches(
-               source_snapshot, checker_version, checker_source,
-               checker_input_fingerprint, sidecar_protocol, created_at, active
-             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
-            [],
-        )?;
-        let second_active = conn.execute(
-            "INSERT INTO checker_enrichment_batches(
-               source_snapshot, checker_version, checker_source,
-               checker_input_fingerprint, sidecar_protocol, created_at, active
-             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
-            [],
-        );
-        assert!(
-            second_active.is_err(),
-            "only one checker batch may be active"
-        );
         Ok(())
     }
 

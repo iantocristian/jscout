@@ -167,39 +167,30 @@ demote an otherwise clean, agreeing resolution. The edge's `detail_json`
 reports the incomplete owner under `unknownProjects`, and the enrichment report
 lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multiple
 targets or a declaration jscout cannot map — still makes every survivor
-`possible`. If any owning project input later changes, including an unknown
-owner's inputs, the occurrence is suppressed until enrichment recomputes it.
+`possible`.
 
 Results are stored as one canonical fingerprinted batch; publishing a new batch
-drops the one it supersedes. A raced batch publishes nothing. Each request has a
-hard deadline (`--timeout`, default 30 seconds); timeout kills the sidecar
-process. Ctrl-C terminates active checker work rather than leaving a blocked
-TypeScript worker behind.
+drops the one it supersedes. The sidecar's complete input set is checked again
+before publication to catch changes during the command, but it is not persisted
+as a cross-snapshot freshness manifest. A raced batch publishes nothing. Each
+request has a hard deadline (`--timeout`, default 30 seconds); timeout kills the
+sidecar process. Ctrl-C terminates active checker work rather than leaving a
+blocked TypeScript worker behind.
 
-### What a rebuild keeps
+### Checker snapshot lifecycle
 
-Every checker fact is bound to the complete input manifest of the TypeScript
-project that produced it. Indexed source inputs are compared with canonical
-file hashes; the TypeScript runtime, `tsconfig` inheritance chain,
-ambient/generated declarations, and other unindexed inputs are rehashed from
-disk. If any input changes, facts from that project stop being traversable at
-the next rebuild. Unaffected projects retain their checker edges.
+Every checker batch is bound to exactly one structural snapshot. Projection
+accepts it only when `source_snapshot` matches; there is no per-project
+cross-snapshot revalidation. `jscout index` deletes the old checker batch while
+preserving embeddings and semantic memory, so run `jscout enrich` after a full
+index when those occurrence-specific edges are needed.
 
-`jscout watch --enrich` performs the full safe cycle: reindex, suppress stale
-project facts, and run enrichment to publish replacements atomically. If the
-checker fails or times out, stale edges remain suppressed and watch retries on
-the next relevant change. Without `--enrich`, freshness still fails closed and
-`jscout enrich` can replenish the checker plane manually.
-
-Canonical facts are never erased by a rebuild; they stop being traversable and
-become projectable again when their complete project inputs match. One
-host-local consequence is deliberate:
-
-- The checker-input fingerprint hashes machine-absolute paths, so a database
-  copied or moved to another path (or another machine) never revalidates its
-  enrichments and simply projects no checker edges until `jscout enrich` runs
-  again there. Enrichment is host-local by design; this is conservative
-  invalidation, not corruption.
+`jscout watch --enrich` performs the incremental cycle: reindex first, then
+publish a checker batch for the resulting snapshot. If the checker fails or
+times out, that snapshot has no checker edges and watch retries after the next
+relevant repository event. Branch/submodule uncertainty and external-input
+watching remain work for the later watcher coordinator; they do not complicate
+the fixed-snapshot index path.
 
 ## Semantic scouting
 
@@ -526,6 +517,10 @@ run `jscout enrich` again when occurrence-specific checker edges are required.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.
+The old per-version migration ladder has been removed. Writer commands accept
+the v15+ durable format by preserving embedding/semantic-memory tables and
+recreating all disposable snapshot tables once. Older durable formats are
+rejected; preserve such a file before creating a fresh current database.
 
 ## Confidence tiers
 
