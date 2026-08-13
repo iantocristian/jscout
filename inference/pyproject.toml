@@ -1,4 +1,5 @@
 [project]
+license = "MIT OR Apache-2.0"
 name = "jscout-local-inference"
 version = "0.1.0"
 description = "Optional local BGE-M3 embedding and reranking service for jscout"
