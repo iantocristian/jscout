@@ -2,9 +2,9 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::protocol::{
@@ -14,6 +14,11 @@ use super::protocol::{
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
+static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub enum CheckerError {
@@ -85,6 +90,57 @@ impl CheckerControl {
         };
         self.writer.send(&Outbound::Cancel { target_id })?;
         Ok(true)
+    }
+}
+
+fn install_interrupt_handler() -> Result<(), CheckerError> {
+    let installation = INTERRUPT_HANDLER
+        .get_or_init(|| ctrlc::set_handler(handle_interrupt).map_err(|error| error.to_string()));
+    match installation {
+        Ok(()) => Ok(()),
+        Err(message) => Err(CheckerError::Spawn(format!(
+            "failed to install Ctrl-C handler: {message}"
+        ))),
+    }
+}
+
+fn handle_interrupt() {
+    if !request_interrupt_cancellation() {
+        std::process::exit(INTERRUPTED_EXIT_CODE);
+    }
+}
+
+fn request_interrupt_cancellation() -> bool {
+    if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let control = INTERRUPT_CONTROL
+        .lock()
+        .ok()
+        .and_then(|registered| registered.clone());
+    control
+        .as_ref()
+        .and_then(|control| control.cancel_active().ok())
+        .unwrap_or(false)
+}
+
+fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
+    install_interrupt_handler()?;
+    *INTERRUPT_CONTROL
+        .lock()
+        .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+fn unregister_interrupt_control(writer: &Arc<Writer>) {
+    if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
+        && registered
+            .as_ref()
+            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
+    {
+        *registered = None;
+        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -178,6 +234,13 @@ impl ProcessChecker {
             writer: Arc::clone(&self.writer),
             active: Arc::clone(&self.active),
         }
+    }
+
+    /// Install the process-wide Ctrl-C router once and point it at this
+    /// sidecar. Re-registering is safe, which lets watch mode launch repeated
+    /// bounded enrichment passes in one process.
+    pub fn register_interrupts(&self) -> Result<(), CheckerError> {
+        register_interrupt_control(self.control())
     }
 
     pub fn capabilities(&mut self, timeout: Duration) -> Result<Capabilities, CheckerError> {
@@ -312,6 +375,7 @@ impl ProcessChecker {
 
 impl Drop for ProcessChecker {
     fn drop(&mut self) {
+        unregister_interrupt_control(&self.writer);
         self.clear_active();
         if !self.poisoned {
             let _ = self.writer.send(&Outbound::Shutdown);

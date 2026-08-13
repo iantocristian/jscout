@@ -2,10 +2,18 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use notify::{RecursiveMode, Watcher};
 
-use crate::{embed, indexer, store, walk};
+use crate::{checker, embed, indexer, store, structural, walk};
+
+pub struct WatchOptions<'a> {
+    pub embed_on_change: bool,
+    pub dependencies: &'a [String],
+    pub enrich_on_change: bool,
+    pub enrich_timeout: Duration,
+    pub checker_sidecar: Option<&'a Path>,
+}
 
 /// Paths that should trigger re-indexing even though they aren't source files:
 /// resolution config changes alter the module graph.
@@ -13,15 +21,21 @@ fn is_relevant(path: &Path) -> bool {
     if walk::is_indexable(path) {
         return true;
     }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
     matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("package.json")
-            | Some("package-lock.json")
-            | Some("pnpm-lock.yaml")
-            | Some("yarn.lock")
-            | Some("tsconfig.json")
-            | Some("jsconfig.json")
-    )
+        name,
+        "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "tsconfig.json"
+            | "jsconfig.json"
+    ) || (name.starts_with("tsconfig.") && name.ends_with(".json"))
+        || name.ends_with(".d.ts")
+        || name.ends_with(".d.mts")
+        || name.ends_with(".d.cts")
 }
 
 fn is_noise(path: &Path) -> bool {
@@ -36,14 +50,26 @@ fn is_noise(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(store::DB_FILE))
 }
 
-pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Result<()> {
+pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
+    if options.enrich_on_change && options.enrich_timeout.is_zero() {
+        bail!("--enrich-timeout must be greater than zero seconds");
+    }
     let root = root.canonicalize()?;
+    // Subscribe before the initial index/enrichment. Those passes can be long;
+    // events that arrive while they run must remain queued for the first loop
+    // iteration instead of falling into an unobserved startup window.
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
     let conn = store::open(&root)?;
-    let options = indexer::IndexOptions {
-        dependencies: dependencies.to_vec(),
+    let index_options = indexer::IndexOptions {
+        dependencies: options.dependencies.to_vec(),
         ..Default::default()
     };
-    let outcome = indexer::index_repo_with_options(&root, &conn, &options)?;
+    let outcome = indexer::index_repo_with_options(&root, &conn, &index_options)?;
     eprintln!(
         "initial: {} indexed, {} unchanged, {} failed — watching {} for changes (ctrl-c to stop)",
         outcome.indexed,
@@ -52,20 +78,24 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
         root.display()
     );
     indexer::report_failures(&outcome);
-    let provider = if embed_on_change {
+    let provider = if options.embed_on_change {
         embed::Provider::from_env()?
     } else {
         None
     };
-    if embed_on_change && provider.is_none() {
+    if options.embed_on_change && provider.is_none() {
         eprintln!("warning: --embed set but no provider configured; skipping embeddings");
     }
-
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
+    let mut enrichment_pending = options.enrich_on_change;
+    if options.enrich_on_change {
+        if outcome.failed > 0 {
+            eprintln!(
+                "checker enrichment deferred because initial indexing failed; watch will retry"
+            );
+        } else {
+            enrichment_pending = !run_checker_enrichment(&root, &conn, options);
+        }
+    }
 
     while let Ok(first) = rx.recv() {
         // The outer receive blocks until something happens; then debounce
@@ -82,20 +112,47 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
-        if !pending.iter().any(|p| !is_noise(p) && is_relevant(p)) {
+        let checker_inputs = if options.enrich_on_change {
+            match structural::checker_input_paths(&conn, &root) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("checker input watch-list failed: {error}");
+                    Default::default()
+                }
+            }
+        } else {
+            Default::default()
+        };
+        if !pending
+            .iter()
+            .any(|path| (!is_noise(path) && is_relevant(path)) || checker_inputs.contains(path))
+        {
             continue;
         }
         let started = std::time::Instant::now();
-        match indexer::index_repo_with_options(&root, &conn, &options) {
-            Ok(o) if o.indexed > 0 || o.failed > 0 => {
-                eprintln!(
-                    "re-indexed {} files ({} failed) in {:?}",
-                    o.indexed,
-                    o.failed,
-                    started.elapsed()
-                );
-                indexer::report_failures(&o);
-                if let Some(p) = &provider {
+        match indexer::index_repo_with_options(&root, &conn, &index_options) {
+            Ok(o) => {
+                let changed = o.indexed > 0 || o.projection_rebuilt;
+                if o.indexed > 0 || o.failed > 0 {
+                    eprintln!(
+                        "re-indexed {} files ({} failed) in {:?}",
+                        o.indexed,
+                        o.failed,
+                        started.elapsed()
+                    );
+                    indexer::report_failures(&o);
+                }
+                if options.enrich_on_change && (changed || enrichment_pending) {
+                    if o.failed > 0 {
+                        enrichment_pending = true;
+                        eprintln!(
+                            "checker enrichment deferred because indexing failed; stale edges remain suppressed"
+                        );
+                    } else {
+                        enrichment_pending = !run_checker_enrichment(&root, &conn, options);
+                    }
+                }
+                if changed && let Some(p) = &provider {
                     match embed::embed_missing(&conn, p, 64) {
                         Ok((done, _)) if done > 0 => eprintln!("embedded {done} new chunks"),
                         Ok(_) => {}
@@ -103,11 +160,56 @@ pub fn watch(root: &Path, embed_on_change: bool, dependencies: &[String]) -> Res
                     }
                 }
             }
-            Ok(_) => {}
             Err(e) => eprintln!("re-index failed: {e}"),
         }
     }
     Ok(())
+}
+
+/// Replenish the checker plane after indexing has already removed facts whose
+/// project manifests drifted. Failure never resurrects those old edges; watch
+/// keeps running and retries on the next relevant filesystem event.
+fn run_checker_enrichment(
+    root: &Path,
+    conn: &rusqlite::Connection,
+    options: &WatchOptions<'_>,
+) -> bool {
+    match structural::stale_checker_projects(conn) {
+        Ok(projects) if !projects.is_empty() => {
+            eprintln!(
+                "checker inputs changed for {} project(s); stale edges are suppressed: {}",
+                projects.len(),
+                projects.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("checker freshness inspection failed: {error}");
+            return false;
+        }
+    }
+    match checker::enrich(
+        root,
+        &checker::EnrichOptions {
+            database: None,
+            sidecar: options.checker_sidecar,
+            timeout: options.enrich_timeout,
+        },
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "checker enriched {} facts from {} occurrence(s) across {} configured project(s)",
+                report.facts_published, report.occurrences_queried, report.projects
+            );
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "checker enrichment failed; stale edges remain suppressed and watch will retry: {error}"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +223,8 @@ mod tests {
         assert!(is_relevant(Path::new("pnpm-lock.yaml")));
         assert!(is_relevant(Path::new("package-lock.json")));
         assert!(is_relevant(Path::new("yarn.lock")));
+        assert!(is_relevant(Path::new("tsconfig.server.json")));
+        assert!(is_relevant(Path::new("types/ambient.d.ts")));
         assert!(is_noise(Path::new("node_modules/dep/index.js")));
         assert!(!is_noise(Path::new("pnpm-lock.yaml")));
     }

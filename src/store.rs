@@ -384,15 +384,16 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
   ON checker_enrichments(source_file, call_start);
 CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
   ON checker_enrichments(target_anchor);
--- `input_role` splits checker freshness: `environment` inputs (the TypeScript
--- runtime, the tsconfig chain, ambient declarations, anything the index does
--- not track) are revalidated for the batch as a whole, while `source` inputs
--- are repository files whose drift each published fact reports for itself
--- through its own recorded source path and hash.
+-- Checker inputs are retained per TypeScript project and checker fingerprint.
+-- `source` inputs can be compared with indexed file hashes; `environment`
+-- inputs (configs, compiler/runtime files, ambient declarations, and other
+-- unindexed paths) are rehashed from disk. Drift retires only facts produced
+-- by the affected project/fingerprint.
 CREATE TABLE IF NOT EXISTS checker_input_files(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL,
   query_file TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
   input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
   input_role TEXT NOT NULL DEFAULT 'environment'
     CHECK(input_role IN ('environment', 'source')),
@@ -1028,6 +1029,7 @@ fn migrate(conn: &Connection) -> Result<()> {
                batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
                project_id TEXT NOT NULL,
                query_file TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
                input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
                input_role TEXT NOT NULL DEFAULT 'environment'
                  CHECK(input_role IN ('environment', 'source')),
@@ -1038,15 +1040,35 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // v18 is unreleased (the last published schema is v16), so the checker
-    // freshness role was folded into its table definition rather than given a
-    // version of its own. A database built from an earlier v18 build of this
-    // branch still predates the column; backfilling it as `environment` keeps
-    // that database on the conservative whole-batch invalidation it already had.
+    // v18 is unreleased (the last published schema is v16), so checker
+    // freshness additions are folded into its table definition rather than
+    // consuming more versions. Intermediate v18 databases are upgraded below.
     if !has_column(conn, "checker_input_files", "input_role")? {
         conn.execute(
             "ALTER TABLE checker_input_files
              ADD COLUMN input_role TEXT NOT NULL DEFAULT 'environment'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "checker_input_files", "checker_input_fingerprint")? {
+        conn.execute(
+            "ALTER TABLE checker_input_files
+             ADD COLUMN checker_input_fingerprint TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        // v18 is still unreleased, but databases created by intermediate
+        // builds may already contain checker manifests. Recover the project
+        // fingerprint when it is unique; ambiguous/missing values stay empty
+        // and therefore fail closed during projection.
+        conn.execute(
+            "UPDATE checker_input_files AS input
+             SET checker_input_fingerprint=COALESCE((
+               SELECT MIN(enrichment.checker_input_fingerprint)
+               FROM checker_enrichments enrichment
+               WHERE enrichment.batch_id=input.batch_id
+                 AND enrichment.project_id=input.project_id
+               HAVING COUNT(DISTINCT enrichment.checker_input_fingerprint)=1
+             ), '')",
             [],
         )?;
     }
@@ -2053,6 +2075,11 @@ mod tests {
             assert_eq!(rows, 0, "v18 must create an empty {table}");
         }
         assert!(has_column(&conn, "checker_input_files", "input_role")?);
+        assert!(has_column(
+            &conn,
+            "checker_input_files",
+            "checker_input_fingerprint"
+        )?);
         conn.execute(
             "INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,

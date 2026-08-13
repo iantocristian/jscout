@@ -67,6 +67,7 @@ struct PendingFact {
 struct ValidatedInput {
     project_id: String,
     query_file: String,
+    input_fingerprint: String,
     kind: String,
     role: &'static str,
     path: String,
@@ -103,13 +104,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let snapshot = crate::structural::current_snapshot(&conn)?;
     let occurrences = load_occurrences(&conn)?;
     let mut checker = super::launch(&canonical_root, options.sidecar)?;
-    let cancellation = checker.control();
-    ctrlc::set_handler(move || {
-        if !matches!(cancellation.cancel_active(), Ok(true)) {
-            std::process::exit(130);
-        }
-    })
-    .context("failed to install checker Ctrl-C handler")?;
+    checker
+        .register_interrupts()
+        .context("failed to install checker Ctrl-C handler")?;
     let capabilities = checker.capabilities(options.timeout)?;
     let mut facts = Vec::new();
     let mut validation = BTreeMap::<(String, String), InputValidation>::new();
@@ -203,8 +200,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     {
         bail!("checker inputs changed while enrichment was running; published nothing");
     }
-    let mut validated_inputs = BTreeMap::<(String, String, String, String), String>::new();
+    let mut validated_inputs = BTreeMap::<(String, String, String, String, String), String>::new();
     for entry in &checked.results {
+        let input_fingerprint = entry
+            .fingerprint
+            .as_ref()
+            .context("checker omitted a validated project fingerprint")?;
         for input in &entry.inputs {
             if !Path::new(&input.path).is_absolute() {
                 bail!("checker returned a non-absolute input path; published nothing");
@@ -222,6 +223,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             let key = (
                 entry.project_id.clone(),
                 entry.file.clone(),
+                input_fingerprint.clone(),
                 kind,
                 stored_path,
             );
@@ -234,16 +236,19 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     }
     let validated_inputs = validated_inputs
         .into_iter()
-        .map(|((project_id, query_file, kind, path), source_hash)| {
-            Ok(ValidatedInput {
-                role: input_role(&conn, &kind, &path)?,
-                project_id,
-                query_file,
-                kind,
-                path,
-                source_hash,
-            })
-        })
+        .map(
+            |((project_id, query_file, input_fingerprint, kind, path), source_hash)| {
+                Ok(ValidatedInput {
+                    role: input_role(&conn, &kind, &path)?,
+                    project_id,
+                    query_file,
+                    input_fingerprint,
+                    kind,
+                    path,
+                    source_hash,
+                })
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
     let identity = checker_identity.unwrap_or(capabilities.typescript.clone());
     let batch_fingerprint = batch_fingerprint(&validation_entries);
@@ -436,16 +441,13 @@ fn map_declaration(
     }))
 }
 
-/// Split checker inputs into what per-fact freshness can police and what only
-/// batch-level revalidation can.
+/// Split checker inputs by how their current content identity is recovered.
 ///
-/// A repository source the index itself tracks is a `source` input: every
-/// published fact records that file's path and hash, so the projection can
-/// retire exactly the facts recorded against a file that changed and keep the
-/// rest. Everything else — the TypeScript runtime, the tsconfig chain,
-/// ambient/generated `.d.ts` declarations, anything outside the index — has no
-/// per-fact anchor, so it stays an `environment` input whose drift retires the
-/// whole batch.
+/// Indexed repository sources use the canonical `files.hash`; configs,
+/// ambient/generated declarations, the TypeScript runtime, and other
+/// unindexed paths are rehashed from disk. Both remain part of the owning
+/// project's manifest, so drift invalidates that project rather than one
+/// endpoint fact or the repository's whole checker plane.
 fn input_role(conn: &Connection, kind: &str, path: &str) -> Result<&'static str> {
     if kind != "repository" || path.ends_with(".d.ts") {
         return Ok("environment");
@@ -562,15 +564,16 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
         }
         let mut insert_input = conn.prepare_cached(
             "INSERT INTO checker_input_files(
-               batch_id, project_id, query_file, input_kind, input_role,
-               input_path, source_hash
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+               batch_id, project_id, query_file, checker_input_fingerprint,
+               input_kind, input_role, input_path, source_hash
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         )?;
         for input in plan.inputs {
             insert_input.execute(params![
                 batch_id,
                 input.project_id,
                 input.query_file,
+                input.input_fingerprint,
                 input.kind,
                 input.role,
                 input.path,
@@ -855,6 +858,7 @@ mod tests {
                 inputs: &[ValidatedInput {
                     project_id: "tsconfig.json".into(),
                     query_file: "main.ts".into(),
+                    input_fingerprint: "inputs".into(),
                     kind: "absolute".into(),
                     role: "environment",
                     path: ambient.to_string_lossy().into_owned(),
