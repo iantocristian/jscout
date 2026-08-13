@@ -738,7 +738,11 @@ The default plan:
   structural edge;
 - requires at least one current property-hub target candidate;
 - ranks exported/entity/workflow boundaries and watcher-supplied changed files
-  ahead of unanchored internal calls, with deterministic tie-breaking;
+  ahead of unanchored internal calls;
+- spreads selection within each rank tier by deterministic round-robin across
+  packages, then across files within each package, with occurrence ID as the
+  final in-file order; lexicographic package, file, anchor, or property order
+  must not let one prefix consume the remaining budget;
 - selects at most 10,000 occurrences.
 
 Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
@@ -821,13 +825,26 @@ remain diagnostic escape hatches, not the scalability mechanism.
 `watch --enrich` uses the same planner, cap, batching, and staging machinery.
 Changed files are ranked first; the watcher never implies `--all`. A newer
 structural generation cancels between batches, and staged work may resume only
-when its exact snapshot and plan still match. The G12 coordinator must not be
-declared operational with `--enrich` until this correction is implemented.
+when its exact snapshot and plan still match. After structural indexing,
+checker program construction waits for a configurable enrichment quiet period,
+defaulting to the G12 two-second trailing quiet period; any newer event resets
+that wait. Sustained churn may therefore starve checker enrichment by design
+while deterministic indexing continues to converge. A cancelled enrichment is
+not immediately relaunched: the coordinator waits for the next quiet point,
+then resumes only exact matching staged work or starts one new plan. The G12
+coordinator must not be declared operational with `--enrich` until this
+correction is implemented.
 
 #### Scale-correction acceptance checks
 
 - a 150,000-occurrence synthetic plan is capped at 10,000 by default, reports
   exact omitted coverage, and requires `--all` for exhaustive selection;
+- a skewed plan spreads each rank tier across packages and files instead of
+  spending its budget on one lexicographic prefix, while repeated planning
+  produces byte-identical ordering and fingerprints;
+- direct `certain`/`likely` structural resolutions are excluded from the
+  default plan while unresolved and `possible` property-hub occurrences remain
+  eligible and are counted explicitly;
 - protocol request count scales with bounded batches/projects rather than one
   request per occurrence, with frame byte/item limits tested;
 - peak Node memory is bounded by the largest admitted project plus one response
@@ -845,6 +862,9 @@ declared operational with `--enrich` until this correction is implemented.
   projects while returning a non-zero/partial status;
 - an actual Node exception/OOM is visible in the command's final error even if
   stderr forwarding loses a race;
+- sustained filesystem churn starts no checker program before the enrichment
+  quiet period, cancels active work at a batch boundary, does not immediately
+  restart it, and produces one resumable/new plan after the next quiet point;
 - n8n and Twenty full-plan dry runs plus bounded real runs record wall time,
   throughput, peak RSS/heap, selected/omitted coverage, and resume behavior
   before full-repository `enrich` or `watch --enrich` is recommended.
