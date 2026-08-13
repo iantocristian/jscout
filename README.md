@@ -162,6 +162,14 @@ all of them. Conflicting declarations remain separate `possible` candidates;
 one mapped declaration becomes an occurrence-specific `likely` edge with
 `checker` provenance. `any`, error, and unknown receiver types publish no edge.
 
+If another owning project returns `unknown`, that incomplete answer does not
+demote an otherwise clean, agreeing resolution. The edge's `detail_json`
+reports the incomplete owner under `unknownProjects`, and the enrichment report
+lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multiple
+targets or a declaration jscout cannot map — still makes every survivor
+`possible`. If any owning project input later changes, including an unknown
+owner's inputs, the occurrence is suppressed until enrichment recomputes it.
+
 Results are stored as one canonical fingerprinted batch; publishing a new batch
 drops the one it supersedes. A raced batch publishes nothing. Each request has a
 hard deadline (`--timeout`, default 30 seconds); timeout kills the sidecar

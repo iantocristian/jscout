@@ -512,6 +512,13 @@ recurring gap between candidate-set answers and behavioral ones, and the
 owner has accepted the cost. This section replaces the deferral; it does not
 extend the semantic-v1 completion boundary, and nothing in v1 depends on it.
 
+**Amendment — watch replenishment (2026-08-13).** The original G10 rule that
+enrichment never runs during `watch` is replaced by the explicit
+`jscout watch --enrich` option. Each refresh launches one bounded sidecar pass
+after deterministic indexing has suppressed stale checker edges, then exits
+the sidecar. This does not authorize a persistent watch-resident TypeScript
+daemon, hidden checker execution in plain `watch`, or checker work in `index`.
+
 ### Shape
 
 A companion Node sidecar hosting the TypeScript checker (LanguageService or
@@ -545,11 +552,21 @@ answers may coalesce. Conflicting targets remain a visible `possible` candidate
 set, or `unknown` when they cannot be mapped safely; they never become one
 arbitrary `likely` edge.
 
+An owning project that returns `unknown` is incomplete coverage, not evidence
+against a clean resolution produced by another owning project. It therefore
+does not demote otherwise agreeing resolved answers. Canonical occurrence
+coverage retains its project ID, status, and input fingerprint; projected
+checker edges expose those IDs as `unknownProjects`. Multiple mapped targets or
+an unmappable declaration from a resolved answer still make every survivor
+`possible`. Drift in any owning project's inputs — including an `unknown`
+project — suppresses the occurrence until enrichment recomputes all owners.
+
 Diagnostics are never enumerated, used as a gate, or surfaced. A broken or
 non-compiling project still attempts the requested member query rather than
 turning enrichment into a compile check. When the answer is an error type or
-`any`-degraded, the sidecar reports `unknown` and jscout records nothing —
-fail-closed, no guessed edge.
+`any`-degraded, the sidecar reports `unknown` and jscout records no target fact
+for that project — no guessed edge. Its owning-project coverage is still
+recorded and surfaced as described above.
 
 The sidecar prefers the repository's own `typescript` installation so
 answers match the project's language version; a bundled fallback is
@@ -653,8 +670,9 @@ observing agreement.
 
 ### Out of scope for G10
 
-Diagnostics, rename/refactor safety, call hierarchy, emit, watch-mode
-daemons, and any checker influence over deterministic structural facts.
+Diagnostics, rename/refactor safety, call hierarchy, emit, persistent
+watch-resident checker daemons, and any checker influence over deterministic
+structural facts.
 Agents wanting full typed navigation should use an LSP; G10 only closes
 the receiver-identity gap inside jscout's own evidence model.
 
