@@ -3055,7 +3055,7 @@ fn cached_graph_degree(
 }
 
 fn workflow_direct_kind(kind: &str) -> bool {
-    matches!(kind, "call" | "render" | "extend")
+    matches!(kind, "call" | "render" | "extend" | "member_call")
 }
 
 fn workflow_general_association_kind(kind: &str) -> Option<&'static str> {
@@ -5057,17 +5057,23 @@ mod tests {
         )?;
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
-        let checker_detail: String = conn.query_row(
-            "SELECT detail_json FROM resolved_edges
+        let (checker_source, checker_detail): (String, String) = conn.query_row(
+            "SELECT src_key, detail_json FROM resolved_edges
              WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",
             [&target],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let checker_detail: serde_json::Value = serde_json::from_str(&checker_detail)?;
         assert_eq!(
             checker_detail["unknownProjects"],
             serde_json::json!(["tsconfig.stray.json"]),
             "unknown owning projects stay visible without demoting the clean resolution"
+        );
+        let workflow =
+            workflow_neighborhood(&conn, &checker_source, 1, 20, 40, &origin::defaults())?;
+        assert!(
+            workflow.nodes.iter().any(|node| node.key == target),
+            "a likely checker-resolved member call must participate in workflow discovery"
         );
         assert!(super::checker_projection_reusable(&conn)?);
 
