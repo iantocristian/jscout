@@ -696,6 +696,16 @@ manifest-rehashing subsystem for them.
 
 ### Required G10 scale correction
 
+**Implementation status (2026-08-14).** The correction below is implemented in
+checker protocol v2 and schema v19: complete-by-default/manual planning,
+configuration-only ownership discovery, package/file spread ordering, bounded
+per-project batches, one disposable Program worker per project, once-per-project
+source mapping, durable batch staging/resume, controlled partial activation,
+input/target/snapshot rechecks, resource progress, and synchronous worker-crash
+details. Unit, protocol, projection, and small end-to-end gates pass. The
+large-repository acceptance runs and sustained-churn G12 coordinator gate remain
+open, so the top-level operational qualification is intentionally unchanged.
+
 The TypeScript semantic operation stays in Node. OXC and Rust do not attempt to
 reimplement TypeScript's version-specific type system, configured-project
 semantics, ambient declarations, aliases, unions, overloads, or declaration
