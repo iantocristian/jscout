@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 pub const DB_FILE: &str = ".jscout.db";
+pub const SCHEMA_VERSION: &str = "18";
 
 static SQLITE_VEC: Once = Once::new();
 
@@ -39,6 +40,62 @@ pub fn db_path(root: &Path) -> std::path::PathBuf {
 
 pub fn open(root: &Path) -> Result<Connection> {
     open_path(&db_path(root))
+}
+
+/// Open an already-published index without creating files, migrating schema,
+/// or acquiring write authority. Query surfaces use this path so a typo or an
+/// unindexed checkout cannot silently create a database that looks usable.
+pub fn open_read_only(root: &Path) -> Result<Connection> {
+    open_path_read_only(&db_path(root))
+}
+
+pub fn open_path_read_only(path: &Path) -> Result<Connection> {
+    if !path.is_file() {
+        bail!(
+            "index database `{}` does not exist; run `jscout index` first",
+            path.display()
+        );
+    }
+    register_sqlite_vec();
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open index database {} read-only", path.display()))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "query_only", "ON")?;
+
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "index database `{}` has no readable schema; run `jscout index`",
+                path.display()
+            )
+        })?;
+    if version != SCHEMA_VERSION {
+        bail!(
+            "index database `{}` uses schema v{version}, but this jscout requires v{SCHEMA_VERSION}; run `jscout index`",
+            path.display()
+        );
+    }
+    let published: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM meta WHERE key='snapshot'
+         ) AND EXISTS(
+           SELECT 1 FROM meta WHERE key='projection_version'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !published {
+        bail!(
+            "index database `{}` has no published structural snapshot; run `jscout index`",
+            path.display()
+        );
+    }
+    Ok(conn)
 }
 
 /// Open an index database independently of the repository root. Evaluation
@@ -1106,9 +1163,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     )?;
 
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','18')
+        "INSERT INTO meta(key, value) VALUES('schema_version',?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
+        [SCHEMA_VERSION],
     )?;
     Ok(())
 }
@@ -1348,7 +1405,69 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::{DB_FILE, file_source_path, has_column, open, open_path};
+    use super::{
+        DB_FILE, file_source_path, has_column, open, open_path, open_path_read_only, open_read_only,
+    };
+
+    #[test]
+    fn read_only_open_never_creates_or_migrates_an_index() -> Result<()> {
+        let missing_root = tempfile::tempdir()?;
+        let missing_database = missing_root.path().join(DB_FILE);
+        let error =
+            open_read_only(missing_root.path()).expect_err("missing read-only index must fail");
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!missing_database.exists());
+
+        let old_directory = tempfile::tempdir()?;
+        let old_database = old_directory.path().join("old.db");
+        let old = Connection::open(&old_database)?;
+        old.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '17');
+             INSERT INTO meta VALUES('snapshot', 'old');
+             INSERT INTO meta VALUES('projection_version', 'old');",
+        )?;
+        drop(old);
+        let error = open_path_read_only(&old_database)
+            .expect_err("old schema must not migrate during read-only open");
+        assert!(error.to_string().contains("schema v17"));
+        let unchanged = Connection::open(&old_database)?.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        assert_eq!(unchanged, "17");
+        Ok(())
+    }
+
+    #[test]
+    fn published_index_opens_query_only() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("published.db");
+        let writer = open_path(&database)?;
+        writer.execute_batch(
+            "INSERT INTO meta(key, value) VALUES('snapshot', 'snapshot');
+             INSERT INTO meta(key, value) VALUES('projection_version', 'projection');",
+        )?;
+        drop(writer);
+
+        let reader = open_path_read_only(&database)?;
+        let snapshot: String =
+            reader.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(snapshot, "snapshot");
+        assert!(
+            reader
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES('forbidden', 'write')",
+                    []
+                )
+                .is_err(),
+            "query-only connection accepted a write"
+        );
+        Ok(())
+    }
 
     #[test]
     fn opens_an_index_database_outside_the_repository_root() -> Result<()> {

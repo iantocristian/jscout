@@ -523,6 +523,9 @@ rows and semantic memory, then rematerializes current vector occurrences from
 the cache. Checker enrichment is snapshot-bound and is removed by a full index;
 run `jscout enrich` again when occurrence-specific checker edges are required.
 `jscout watch` remains hash-incremental and is a separate coordination mode.
+Retrieval-only CLI commands and MCP sessions open an existing published index
+read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
+server opens a writer lazily only when its `annotate` tool is selected.
 
 ## Confidence tiers
 
