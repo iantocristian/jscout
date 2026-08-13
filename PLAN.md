@@ -715,7 +715,7 @@ structural facts.
 Agents wanting full typed navigation should use an LSP; G10 only closes
 the receiver-identity gap inside jscout's own evidence model.
 
-## In-progress G11 — fixed-snapshot simplification
+## G11 — fixed-snapshot simplification
 
 G11 makes the normal, non-watcher index path the primary correctness surface
 and removes lifecycle machinery that only attempted to preserve cheap derived
@@ -739,10 +739,12 @@ Implementation order:
    snapshot publication. Retire the historical in-place migration ladder;
    durable-compatible schemas preserve cache/memory while recreating the
    disposable plane, and incompatible durable schemas fail explicitly.
-   **Complete.**
+   **Complete for retrieval surfaces.** `scout --dry-run` still opens a writer
+   before planning and is a known command-authority cleanup; `embed` is
+   intentionally a writer because it materializes the durable vector cache.
 6. Treat watch as a later coordinator over the same refresh/enrich operations,
    with a full-refresh fallback for branch, submodule, configuration, and event
-   uncertainty. **Pending; not a blocker for fixed-snapshot use.**
+   uncertainty. **Specified separately as G12 below.**
 
 Acceptance checks:
 
@@ -753,9 +755,252 @@ Acceptance checks:
   recalculated against the new snapshot;
 - checker facts and package-instance ownership from the old snapshot do not
   survive a full rebuild;
-- a failed required phase never leaves an old snapshot marker describing new
-  or partially rebuilt structural rows;
-- query-only commands do not create or migrate a missing database.
+- a genuine v15 embedding layout is rejected without mutation, while the v16
+  durable floor preserves compatible embedding and semantic-memory rows;
+- a fatal required-phase failure never publishes a snapshot marker describing
+  new or partially rebuilt structural rows; individual file read/extraction
+  failures may publish the same visibly reported partial snapshot as
+  `jscout index`;
+- retrieval-only commands do not create or migrate a missing database;
+  semantic dry-run planners should follow the same rule after the noted
+  command-authority cleanup.
+
+## Planned G12 — watcher coordinator
+
+G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
+is an in-process coordinator over the same explicit operations used outside
+watch mode; it is not an independent indexing implementation and does not
+make incremental state the product's correctness model.
+
+### Contract
+
+The watcher guarantees eventual convergence to the current checkout while it
+is running. A successful generation executes:
+
+```text
+full structural refresh
+  -> rematerialize vectors already present in the content cache
+  -> optionally embed unseen content (`--embed`)
+  -> optionally enrich the exact published snapshot (`--enrich`)
+```
+
+The first implementation runs a full disposable-plane refresh at startup and
+after every accepted change generation. Source-derived state is cheap and
+disposable; content-hash embeddings and semantic memory survive. Per-file
+incremental extraction is an optimization that may return only after measured
+watch latency justifies its additional invalidation rules.
+
+G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
+database generations, or a second structural database would add lifecycle
+machinery that the fixed-snapshot design intentionally removed. Existing
+n8n/Twenty reports put repository indexing between roughly 7 and 50 seconds,
+depending on the enabled planes and checkout; these are scale observations,
+not a latency target. A query may report that no snapshot is published for the
+entire structural-refresh interval, and every cycle logs its actual phase
+durations.
+
+`--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
+does not start the TypeScript checker, and never preserves checker facts from
+the previous generation. Dependency selectors remain authoritative and must
+be supplied to watch exactly as they are to index.
+
+### Generation state machine
+
+Filesystem notifications are wake-up hints, not proof that the index is
+current. Except for the immediate startup refresh, the transition from dirty
+to refreshing waits for a configurable trailing quiet period, default two
+seconds. Each relevant event resets the quiet period. The previously published
+snapshot remains queryable while waiting; continuous editing delays refresh
+rather than causing back-to-back full-refresh outages. Events received during
+a refresh begin a new quiet period after that refresh finishes.
+
+The coordinator owns a monotonically increasing desired generation and
+retains dirty state until every required phase for that generation has
+finished:
+
+```text
+clean
+  -> dirty(generation, reasons)
+  -> refreshing(generation)
+  -> embedding(generation, snapshot)   [only with --embed]
+  -> enriching(generation, snapshot)   [only with --enrich]
+  -> clean | degraded(snapshot, warnings)
+
+any phase + newer event -> dirty(newer generation)
+any failed phase        -> retry-wait(same generation, phase) -> retry
+```
+
+Events received during a phase are not consumed by that phase. They advance
+the desired generation and force another structural refresh before the
+watcher can become clean. Structural work is allowed to finish rather than be
+cancelled mid-transaction; optional embedding work stops between batches and
+checker work terminates its bounded sidecar when superseded. Before starting
+either optional phase, the coordinator drains pending events and skips that
+phase if a newer structural generation is already required.
+
+A structural refresh that returns individual file failures may expose the
+same explicitly reported partial snapshot as `jscout index`. The watcher
+reports every path/stage/error and retries the generation without requiring
+another filesystem event. Three consecutive refreshes with the same failure
+fingerprint (path, stage, and error) make the snapshot `degraded` rather than
+permanently dirty: optional embedding and enrichment may then run against that
+exact partial snapshot, while the failed paths remain on the reconciliation
+retry set. A relevant event, changed failure fingerprint, or successful read
+resets the threshold. Fatal refresh errors never enter this bounded
+degradation path and remain dirty until a required phase succeeds.
+
+Failures use bounded exponential backoff, reset by new input or a successful
+phase. Retry state lives in memory. Restarting watch always subscribes first
+and then performs a full refresh, so no persistent watcher journal or recovery
+schema is required.
+
+### Trigger and reconciliation policy
+
+Every relevant event initially selects the same full-refresh path; event
+classification exists to explain and broaden observation, not to choose a
+less-correct update algorithm.
+
+Jscout-owned output paths are excluded before relevance classification and
+before the unknown-event escalation rule. The exclusion set is exact, not a
+broad `.jscout*` pattern: the active database path, its SQLite `-wal`, `-shm`,
+and journal sidecars, and explicitly configured telemetry or temporary output
+paths. A future watch `--database` option must register the selected path in
+this set whether it is inside or outside the repository. An event containing
+only excluded paths does not advance the desired generation. This also keeps
+two watchers on one database from triggering each other with SQLite writes;
+database locking remains a separate concern handled below.
+
+Triggers include:
+
+- indexed source create, update, delete, and rename events;
+- `package.json`, supported lockfiles, tsconfig/jsconfig files, declaration
+  files, and other resolver configuration;
+- resolved Git worktree control paths such as `HEAD` and the index, including
+  branch switches and worktree-specific Git directories;
+- `.gitmodules`, submodule control paths, and submodule worktree changes;
+- selected dependency locator entries and canonical package roots, including
+  pnpm/Yarn symlink replacement and package installation changes;
+- exact checker inputs reported by the most recent enrichment pass, including
+  TypeScript, ambient declarations, configs, and inputs under `node_modules`
+  or an external package store;
+- notification overflow, backend errors, or unknown non-excluded event shapes.
+
+After each refresh or enrichment, the coordinator reconciles its narrow
+external watches with the newly resolved package instances and checker input
+set. These paths are ephemeral coordinator state, not a cross-snapshot
+freshness manifest stored in SQLite.
+
+Failure to register a narrow external watch retries with backoff. Three
+consecutive failures for the same path move that path to `degraded` coverage:
+the coordinator logs it, relies on periodic reconciliation for that path, and
+retries registration on the next reconciliation tick or when the external
+path set changes. Persistent registration failure does not itself keep the
+structural generation dirty or cause a full-refresh loop.
+
+Notification backends can miss events, so a configurable reconciliation timer
+(default ten minutes) schedules a full refresh even when no event arrived.
+Setting the interval to zero explicitly gives up bounded recovery from missed
+events and degraded watch coverage. The default deliberately spends cheap
+structural work instead of building another durable fingerprint system. The
+timer, watcher errors, and uncertain ownership all enter the same dirty
+generation path after the self-output exclusion has run.
+
+### Phase and database ownership
+
+Only one phase runs at a time. Each phase opens its own SQLite connection and
+closes it on completion; watch does not retain a writer connection that one
+failed transaction can wedge forever. Writer connections use a finite
+`busy_timeout`, and lock contention enters the normal retry path.
+
+Every manually managed transaction must roll back on every error, including a
+failed commit. The coordinator serializes its refresh, embedding, and
+enrichment phases, while SQLite remains the arbiter when another jscout
+process writes concurrently. G12 does not introduce an application-level
+lease until a demonstrated concurrent-writer failure requires one.
+
+A structural refresh always removes the previous checker plane as part of the
+disposable snapshot reset:
+
+- plain `watch` leaves checker facts absent;
+- `watch --enrich` publishes one batch bound to the new exact snapshot;
+- failed, timed-out, cancelled, or superseded enrichment leaves checker facts
+  absent and schedules an enrichment retry;
+- a newer structural generation always takes precedence over retrying
+  enrichment for an older snapshot.
+
+Embedding failure does not invalidate an otherwise current structural
+snapshot. It leaves the embedding phase pending and retries missing hashes;
+the durable cache makes completed vectors reusable. No watcher failure may
+delete semantic memory or content-hash embedding rows.
+
+### Implementation order
+
+1. Extract a coordinator with injectable event input, clock, and phase
+   executor. Track desired/completed generations, dirty reasons, per-phase
+   retry state, debounce, degraded snapshots/coverage, and structured cycle
+   telemetry without timing-dependent tests.
+2. Replace watch's incremental indexing call with the normal full-refresh
+   operation. Open a fresh connection per phase, configure `busy_timeout`,
+   audit rollback paths, implement bounded stable-file-failure degradation,
+   and make fatal failures retry automatically.
+3. Make checker invalidation unconditional through the structural refresh;
+   sequence optional embedding and exact-snapshot enrichment, and add
+   generation checks plus cancellation between/within optional work.
+4. Add exact self-output exclusion plus Git/worktree, submodule,
+   selected-dependency, and dynamically reported checker-input watches. Treat
+   notification backend errors as full-refresh uncertainty and persistent
+   registration failures as degraded timer-backed coverage.
+5. Add periodic reconciliation, bounded retry/backoff, concise generation and
+   phase logging, then remove assumptions that another repository event is
+   required to recover from failure.
+6. Update README operational guidance only after the coordinator behavior is
+   implemented. Do not describe the current incremental watcher as satisfying
+   G12 before the acceptance suite passes.
+
+### Acceptance checks
+
+- startup subscribes before work begins, then runs a full refresh;
+- ordinary generations wait for the default two-second quiet period, and the
+  previous snapshot remains published during that debounce;
+- an event arriving during refresh, embedding, or enrichment causes a later
+  generation and cannot be lost when the current cycle completes;
+- refresh, commit, lock, embedding, and enrichment failures retry without a
+  new filesystem event and cannot wedge subsequent cycles;
+- notification overflow or an unclassifiable event forces a full refresh;
+- database/WAL/SHM, configured telemetry, and other registered jscout-output
+  writes alone never create a generation, including with two watchers;
+- three persistent registration failures degrade that path to timer-backed
+  coverage without causing a refresh loop, and registration is retried later;
+- branch switches replace the complete file set without retaining old files,
+  projections, package ownership, vector occurrences, or checker facts;
+- submodule, manifest, lockfile, selected dependency, symlink-target, tsconfig,
+  TypeScript runtime, and ambient declaration changes converge;
+- edit -> enrich -> revert cannot reactivate a checker batch created before
+  intervening external checker-input changes;
+- no reachable G12 code path invokes incremental indexing or skips the
+  full-refresh checker-batch deletion;
+- plain watch never serves checker edges from an older generation;
+- `watch --enrich` publishes checker facts only for the current exact snapshot,
+  and superseded checker work is cancelled or discarded;
+- a transient failed-file result remains dirty initially, reports the exact
+  path/stage/error, and converges after the file becomes readable;
+- three identical failed-file generations publish a visibly degraded snapshot,
+  allow exact-snapshot enrichment, and retain periodic retry coverage;
+- the default ten-minute reconciliation repairs a deliberately dropped
+  notification, while explicitly disabling it reports the lost guarantee;
+- repeated full generations reuse cached embeddings, embed only unseen
+  content when requested, and preserve semantic artifacts and run history;
+- no path through plain watch invokes pi-ai, the checker sidecar, embedding, or
+  other optional spending without its explicit flag.
+
+### Out of scope for G12
+
+- publish-then-swap or uninterrupted query availability during refresh;
+- a persistent daemon/service manager or background watch installation;
+- a durable watcher event journal or cross-snapshot checker-input manifest;
+- per-file incremental correctness logic before a measured latency need;
+- blanket `node_modules` watching or dependency indexing;
+- hidden scouting, summarization, or other generative work.
 
 ## Evaluation decisions already made
 
