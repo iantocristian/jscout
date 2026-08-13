@@ -236,6 +236,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             peak_heap_bytes: 0,
         });
     }
+    if deactivate_stale_active_batch(&canonical_root, &conn, &snapshot)? {
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+    }
 
     let batch_id = open_staging_batch(
         &conn,
@@ -296,21 +299,25 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut peak_heap_bytes,
         );
         if let Err(error) = project_result {
-            mark_project_failed(&conn, batch_id, project_id, &error.to_string())?;
+            mark_project_failed(&conn, batch_id, project_id, occurrences, &error.to_string())?;
             eprintln!("checker enrichment: project {project_id} failed: {error:#}");
             failed_projects.push(project_id.clone());
         }
     }
 
     if !failed_projects.is_empty() {
+        let facts_published =
+            activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, true)?;
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
         bail!(
-            "checker enrichment staged batch {batch_id} but {} project(s) failed: {}; rerun the same command to resume",
+            "checker enrichment activated partial batch {batch_id} with {facts_published} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible; rerun the same command to resume",
             failed_projects.len(),
             failed_projects.join(", ")
         );
     }
 
-    let facts_published = activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot)?;
+    let facts_published =
+        activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, false)?;
     crate::structural::rebuild_projection(&conn, &snapshot)?;
 
     Ok(EnrichReport {
@@ -606,6 +613,53 @@ fn reusable_active_batch<'a>(
     Ok(Some(batch_id))
 }
 
+fn deactivate_stale_active_batch(root: &Path, conn: &Connection, snapshot: &str) -> Result<bool> {
+    let Some(batch_id) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE active=1 AND source_snapshot=?1",
+            [snapshot],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let projects = conn
+        .prepare(
+            "SELECT project_id FROM checker_project_runs
+             WHERE batch_id=?1 AND status='completed' ORDER BY project_id",
+        )?
+        .query_map([batch_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut stale = false;
+    for project_id in projects {
+        if !project_complete_and_fresh(root, conn, batch_id, &project_id)? {
+            stale = true;
+            break;
+        }
+    }
+    if !stale {
+        return Ok(false);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = conn.execute(
+        "UPDATE checker_enrichment_batches SET active=0
+         WHERE id=?1 AND active=1 AND source_snapshot=?2",
+        params![batch_id, snapshot],
+    );
+    match result {
+        Ok(changed) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(changed == 1)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error.into())
+        }
+    }
+}
+
 fn open_staging_batch(
     conn: &Connection,
     snapshot: &str,
@@ -618,10 +672,15 @@ fn open_staging_batch(
     if let Some(batch_id) = conn
         .query_row(
             "SELECT id FROM checker_enrichment_batches
-             WHERE source_snapshot=?1 AND plan_fingerprint=?2 AND active=0
+             WHERE source_snapshot=?1 AND plan_fingerprint=?2
                AND checker_version=?3 AND checker_source=?4
                AND sidecar_protocol=?5
-             ORDER BY id DESC LIMIT 1",
+               AND (active=0 OR EXISTS(
+                 SELECT 1 FROM checker_project_runs run
+                 WHERE run.batch_id=checker_enrichment_batches.id
+                   AND run.status!='completed'
+               ))
+             ORDER BY active DESC, id DESC LIMIT 1",
             params![
                 snapshot,
                 plan_fingerprint,
@@ -758,7 +817,8 @@ fn completed_occurrences(
 ) -> Result<BTreeSet<i64>> {
     let mut statement = conn.prepare(
         "SELECT member_call_id FROM checker_occurrence_projects
-         WHERE batch_id=?1 AND project_id=?2 ORDER BY member_call_id",
+         WHERE batch_id=?1 AND project_id=?2 AND status!='failed'
+         ORDER BY member_call_id",
     )?;
     let rows = statement.query_map(params![batch_id, project_id], |row| row.get(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -778,14 +838,35 @@ fn mark_project_failed(
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
+    occurrences: &[Occurrence],
     error: &str,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE checker_project_runs
-         SET status='failed', error=?3, updated_at=datetime('now')
-         WHERE batch_id=?1 AND project_id=?2",
-        params![batch_id, project_id, error],
-    )?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        let mut insert = conn.prepare_cached(
+            "INSERT OR IGNORE INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,?3,'','failed')",
+        )?;
+        for occurrence in occurrences {
+            insert.execute(params![batch_id, occurrence.id, project_id])?;
+        }
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET status='failed', error=?3, updated_at=datetime('now')
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id, error],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1105,21 +1186,38 @@ fn activate_staging_batch(
     conn: &Connection,
     batch_id: i64,
     snapshot: &str,
+    allow_failed_projects: bool,
 ) -> Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
         if crate::structural::current_snapshot(conn)? != snapshot {
             bail!("structural snapshot changed while enrichment was running; staged work retained");
         }
-        let incomplete: i64 = conn.query_row(
+        let pending: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
              WHERE batch_id=?1
-               AND (status!='completed' OR completed_occurrences!=selected_occurrences)",
+               AND status='pending'",
             [batch_id],
             |row| row.get(0),
         )?;
-        if incomplete != 0 {
-            bail!("checker staging batch has {incomplete} incomplete project(s)");
+        let failed: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1 AND status='failed'",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if pending != 0 || (!allow_failed_projects && failed != 0) {
+            bail!("checker staging batch has {pending} pending and {failed} failed project(s)");
+        }
+        let malformed_completed: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1 AND status='completed'
+               AND completed_occurrences!=selected_occurrences",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if malformed_completed != 0 {
+            bail!("checker staging batch has incomplete projects marked completed");
         }
 
         let mut input_statement = conn.prepare(
@@ -1186,7 +1284,8 @@ fn activate_staging_batch(
         let fingerprints = conn
             .prepare(
                 "SELECT project_id, checker_input_fingerprint
-                 FROM checker_project_runs WHERE batch_id=?1 ORDER BY project_id",
+                 FROM checker_project_runs
+                 WHERE batch_id=?1 AND status='completed' ORDER BY project_id",
             )?
             .query_map([batch_id], |row| {
                 Ok(InputValidation {
@@ -1204,7 +1303,7 @@ fn activate_staging_batch(
         )?;
         conn.execute(
             "UPDATE checker_enrichment_batches
-             SET active=1, checker_input_fingerprint=?2 WHERE id=?1 AND active=0",
+             SET active=1, checker_input_fingerprint=?2 WHERE id=?1",
             params![batch_id, input_fingerprint],
         )?;
         if conn.changes() != 1 {
@@ -1707,6 +1806,82 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(active, 0, "staged progress must remain non-public");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resumable()
+    -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let projects = BTreeMap::from([
+            ("tsconfig.good.json".into(), vec![occurrence.clone()]),
+            ("tsconfig.failed.json".into(), vec![occurrence.clone()]),
+        ]);
+        let batch_id = open_staging_batch(&conn, &snapshot, "partial", &identity, 2, 1, &projects)?;
+
+        let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let good = project_answer("tsconfig.good.json", vec![declaration]);
+        let outcome = map_occurrence(&conn, &occurrence, &[good])?;
+        stage_batch(
+            &conn,
+            batch_id,
+            "tsconfig.good.json",
+            std::slice::from_ref(&occurrence),
+            &outcome.facts,
+            &outcome.projects,
+        )?;
+        complete_project(
+            repo.path(),
+            &conn,
+            batch_id,
+            "tsconfig.good.json",
+            "tsconfig.good.json-inputs",
+            &[super::super::protocol::CheckerInputFile {
+                path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+                source_hash: hash,
+            }],
+            1,
+            1,
+        )?;
+        mark_project_failed(
+            &conn,
+            batch_id,
+            "tsconfig.failed.json",
+            std::slice::from_ref(&occurrence),
+            "synthetic failure",
+        )?;
+
+        assert_eq!(
+            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)?,
+            1
+        );
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+        let (confidence, detail): (String, String) = conn.query_row(
+            "SELECT confidence, detail_json FROM resolved_edges
+             WHERE provenance='checker' AND source_ref_id=?1",
+            [occurrence.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(confidence, "possible");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail)?["failedProjects"],
+            serde_json::json!(["tsconfig.failed.json"])
+        );
+        assert_eq!(
+            open_staging_batch(&conn, &snapshot, "partial", &identity, 2, 1, &projects)?,
+            batch_id,
+            "the partial active batch must remain the resume target"
+        );
+        assert!(completed_occurrences(&conn, batch_id, "tsconfig.failed.json")?.is_empty());
         Ok(())
     }
 

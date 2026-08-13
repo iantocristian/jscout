@@ -589,7 +589,7 @@ CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
   member_call_id INTEGER NOT NULL,
   project_id TEXT NOT NULL,
   checker_input_fingerprint TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+  status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown', 'failed')),
   PRIMARY KEY(batch_id, member_call_id, project_id)
 );
 -- One row per generative model run. Failures, exclusions, cost, and

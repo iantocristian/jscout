@@ -346,7 +346,7 @@ function buildProject(project) {
     options: normalizeOption(project.options),
     inputs: sourceInputs.map(({ identity, source_hash }) => [identity, source_hash]),
   })));
-  builtProject = { project, program, checker, fingerprint, inputFiles };
+  builtProject = { project, program, checker, fingerprint, inputFiles, sourceFiles: new Map() };
   return builtProject;
 }
 
@@ -549,8 +549,7 @@ function resolveMembers(projectId, queries) {
     }
   }
   const built = buildProject(project);
-  const buffers = new Map();
-  const results = queries.map((query) => resolveInProject(built, query, buffers));
+  const results = queries.map((query) => resolveInProject(built, query, built.sourceFiles));
   const response = {
     project_id: projectId,
     typescript: { version: ts.version, source: runtime.source },
