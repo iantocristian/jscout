@@ -415,7 +415,7 @@ enum Command {
         /// Explicitly stop after this many spread-ordered occurrences
         #[arg(long)]
         max_occurrences: Option<usize>,
-        /// Include normally excluded roles; ordinary enrichment is already complete
+        /// Include normally excluded roles and already-resolved calls
         #[arg(long)]
         all: bool,
         /// Print the deterministic ownership/selection plan without building TypeScript Programs
