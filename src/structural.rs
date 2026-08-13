@@ -573,6 +573,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
 struct CheckerProjectFreshness {
     all: BTreeSet<(String, String)>,
     fresh: BTreeSet<(String, String)>,
+    coverage_complete: bool,
 }
 
 /// Revalidate every input the checker loaded, grouped by TypeScript project
@@ -589,19 +590,36 @@ fn checker_project_freshness(conn: &Connection) -> Result<CheckerProjectFreshnes
         )
         .optional()?;
     let Some(batch_id) = batch_id else {
-        return Ok(CheckerProjectFreshness::default());
+        return Ok(CheckerProjectFreshness {
+            coverage_complete: true,
+            ..Default::default()
+        });
     };
     let repository_root = conn
         .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
             row.get::<_, String>(0)
         })
         .optional()?;
+    let coverage_complete = conn.query_row(
+        "SELECT NOT EXISTS(
+           SELECT 1
+           FROM checker_enrichments enrichment
+           LEFT JOIN checker_occurrence_projects project
+             ON project.batch_id=enrichment.batch_id
+            AND project.member_call_id=enrichment.member_call_id
+            AND project.project_id=enrichment.project_id
+            AND project.checker_input_fingerprint=enrichment.checker_input_fingerprint
+           WHERE enrichment.batch_id=?1 AND project.project_id IS NULL
+         )",
+        [batch_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
     let mut projects = conn.prepare(
-        "SELECT DISTINCT enrichment.project_id,
-                         enrichment.checker_input_fingerprint
-         FROM checker_enrichments enrichment
-         WHERE enrichment.batch_id=?1
-         ORDER BY enrichment.project_id, enrichment.checker_input_fingerprint",
+        "SELECT DISTINCT project.project_id,
+                         project.checker_input_fingerprint
+         FROM checker_occurrence_projects project
+         WHERE project.batch_id=?1
+         ORDER BY project.project_id, project.checker_input_fingerprint",
     )?;
     let identities = projects
         .query_map([batch_id], |row| {
@@ -611,6 +629,7 @@ fn checker_project_freshness(conn: &Connection) -> Result<CheckerProjectFreshnes
     let mut freshness = CheckerProjectFreshness {
         all: identities.iter().cloned().collect(),
         fresh: BTreeSet::new(),
+        coverage_complete,
     };
     let mut inputs = conn.prepare(
         "SELECT input_kind, input_role, input_path, source_hash
@@ -667,7 +686,7 @@ fn checker_project_freshness(conn: &Connection) -> Result<CheckerProjectFreshnes
 /// that contributed a fact still has its complete recorded input manifest.
 pub(crate) fn checker_projection_reusable(conn: &Connection) -> Result<bool> {
     let freshness = checker_project_freshness(conn)?;
-    Ok(freshness.all == freshness.fresh)
+    Ok(freshness.coverage_complete && freshness.all == freshness.fresh)
 }
 
 /// Active checker projects whose recorded inputs no longer match. Used by
@@ -2143,18 +2162,63 @@ struct CheckerProjection {
     property_end: i64,
     confidence: String,
     projects: BTreeSet<String>,
+    unknown_projects: BTreeSet<String>,
     receiver_types: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct CheckerOccurrenceCoverage {
+    all_fresh: bool,
+    unknown_projects: BTreeSet<String>,
+}
+
+fn checker_occurrence_coverage(
+    conn: &Connection,
+    fresh_projects: &BTreeSet<(String, String)>,
+) -> Result<HashMap<i64, CheckerOccurrenceCoverage>> {
+    let mut statement = conn.prepare(
+        "SELECT project.member_call_id, project.project_id,
+                project.checker_input_fingerprint, project.status
+         FROM checker_occurrence_projects project
+         JOIN checker_enrichment_batches batch
+           ON batch.id=project.batch_id AND batch.active=1
+         ORDER BY project.member_call_id, project.project_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut coverage = HashMap::new();
+    for row in rows {
+        let (member_call_id, project, fingerprint, status) = row?;
+        let entry = coverage
+            .entry(member_call_id)
+            .or_insert_with(|| CheckerOccurrenceCoverage {
+                all_fresh: true,
+                unknown_projects: BTreeSet::new(),
+            });
+        if !fresh_projects.contains(&(project.clone(), fingerprint)) {
+            entry.all_fresh = false;
+        }
+        if status == "unknown" {
+            entry.unknown_projects.insert(project);
+        }
+    }
+    Ok(coverage)
 }
 
 /// Recreate the targeted `checker` edges of the active batch, fact by fact.
 ///
-/// Freshness is per fact and entirely identity-based: a fact projects only
-/// while its source file still carries the hash the checker read, its exact
-/// member-call occurrence still exists at the recorded spans, and its target
-/// anchor still fingerprints to the declaration that was mapped. Facts that
-/// fail any of those are left canonical but inert. The batch's own snapshot is
-/// therefore not a gate — binding to it would retire every fact in the
-/// repository whenever any one indexed file changed.
+/// Freshness is identity-based at both the fact and owning-project-coverage
+/// levels. A fact projects only while its source occurrence and target still
+/// match and every project that owned that occurrence has its complete input
+/// manifest. Unknown owners remain visible in edge detail; their drift still
+/// retires the occurrence because a recomputation may produce a conflicting
+/// target. Facts that fail a gate remain canonical but inert.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,
@@ -2162,6 +2226,7 @@ fn project_checker_enrichments(
     fresh_projects: &BTreeSet<(String, String)>,
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
+    let coverage = checker_occurrence_coverage(conn, fresh_projects)?;
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
         symbols_by_file
@@ -2243,7 +2308,12 @@ fn project_checker_enrichments(
             target_start,
             target_end,
         ) = row?;
-        if !fresh_projects.contains(&(project.clone(), input_fingerprint)) {
+        let Some(occurrence_coverage) = coverage.get(&member_call_id) else {
+            continue;
+        };
+        if !occurrence_coverage.all_fresh
+            || !fresh_projects.contains(&(project.clone(), input_fingerprint))
+        {
             continue;
         }
         if crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end)
@@ -2276,6 +2346,7 @@ fn project_checker_enrichments(
                 property_end,
                 confidence: confidence.clone(),
                 projects: BTreeSet::new(),
+                unknown_projects: occurrence_coverage.unknown_projects.clone(),
                 receiver_types: BTreeSet::new(),
             });
         projection.projects.insert(project);
@@ -2302,6 +2373,7 @@ fn project_checker_enrichments(
                 "receiver": [projection.receiver_start, projection.receiver_end],
                 "property": [projection.property_start, projection.property_end],
                 "projects": projection.projects,
+                "unknownProjects": projection.unknown_projects,
                 "receiverTypes": projection.receiver_types,
                 "occurrenceSpecific": true
             })
@@ -4925,6 +4997,48 @@ mod tests {
                 target_fingerprint,
             ],
         )?;
+        conn.execute(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,'tsconfig.json','inputs','resolved')",
+            rusqlite::params![batch_id, member_call_id],
+        )?;
+        write(
+            repo.path(),
+            "tsconfig.stray.json",
+            "{\"files\":[\"service.ts\"]}\n",
+        )?;
+        let stray_config_hash = blake3::hash(&fs::read(repo.path().join("tsconfig.stray.json"))?)
+            .to_hex()
+            .to_string();
+        conn.execute(
+            "INSERT INTO checker_input_files(
+               batch_id, project_id, query_file, checker_input_fingerprint,
+               input_kind, input_role, input_path, source_hash
+             )
+             SELECT batch_id, 'tsconfig.stray.json', query_file, 'stray-inputs',
+                    input_kind, input_role, input_path, source_hash
+             FROM checker_input_files
+             WHERE batch_id=?1 AND project_id='tsconfig.json'
+               AND input_role='source'",
+            [batch_id],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_input_files(
+               batch_id, project_id, query_file, checker_input_fingerprint,
+               input_kind, input_role, input_path, source_hash
+             ) VALUES(?1,'tsconfig.stray.json','service.ts','stray-inputs',
+                      'repository','environment','tsconfig.stray.json',?2)",
+            rusqlite::params![batch_id, stray_config_hash],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,'tsconfig.stray.json','stray-inputs','unknown')",
+            rusqlite::params![batch_id, member_call_id],
+        )?;
         rebuild_projection(&conn, &snapshot)?;
 
         let checker_edges: i64 = conn.query_row(
@@ -4943,13 +5057,26 @@ mod tests {
         )?;
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
+        let checker_detail: String = conn.query_row(
+            "SELECT detail_json FROM resolved_edges
+             WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| row.get(0),
+        )?;
+        let checker_detail: serde_json::Value = serde_json::from_str(&checker_detail)?;
+        assert_eq!(
+            checker_detail["unknownProjects"],
+            serde_json::json!(["tsconfig.stray.json"]),
+            "unknown owning projects stay visible without demoting the clean resolution"
+        );
         assert!(super::checker_projection_reusable(&conn)?);
 
-        // Environment drift (here the owning tsconfig) has no per-fact anchor,
-        // so it retires the whole batch's edges without erasing its facts.
+        // Even though the stray owner was `unknown` and did not demote the
+        // clean answer, drift in that owner's inputs can introduce a conflict.
+        // Retire this occurrence until enrichment checks it again.
         write(
             repo.path(),
-            "tsconfig.json",
+            "tsconfig.stray.json",
             "{\"files\":[\"service.ts\"],\"x\":1}\n",
         )?;
         assert!(!super::checker_projection_reusable(&conn)?);
@@ -5073,6 +5200,13 @@ mod tests {
                         ],
                     ))
                 },
+            )?;
+            conn.execute(
+                "INSERT INTO checker_occurrence_projects(
+                   batch_id, member_call_id, project_id,
+                   checker_input_fingerprint, status
+                 ) VALUES(?1,?2,?3,?4,'resolved')",
+                rusqlite::params![batch_id, call, &project, &input_fingerprint],
             )?;
             conn.execute(
                 "INSERT INTO checker_enrichments(

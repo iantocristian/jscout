@@ -384,11 +384,22 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
   ON checker_enrichments(source_file, call_start);
 CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
   ON checker_enrichments(target_anchor);
+-- One row per owning-project answer, including `unknown`. Facts record mapped
+-- targets; this table preserves coverage so partial checker success stays
+-- visible and every owning project's input drift can retire the occurrence.
+CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  member_call_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+  PRIMARY KEY(batch_id, member_call_id, project_id)
+);
 -- Checker inputs are retained per TypeScript project and checker fingerprint.
 -- `source` inputs can be compared with indexed file hashes; `environment`
 -- inputs (configs, compiler/runtime files, ambient declarations, and other
--- unindexed paths) are rehashed from disk. Drift retires only facts produced
--- by the affected project/fingerprint.
+-- unindexed paths) are rehashed from disk. Drift retires occurrences whose
+-- owning-project coverage includes the affected project/fingerprint.
 CREATE TABLE IF NOT EXISTS checker_input_files(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL,
@@ -1025,6 +1036,14 @@ fn migrate(conn: &Connection) -> Result<()> {
                ON checker_enrichments(source_file, call_start);
              CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
                ON checker_enrichments(target_anchor);
+             CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               member_call_id INTEGER NOT NULL,
+               project_id TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+               PRIMARY KEY(batch_id, member_call_id, project_id)
+             );
              CREATE TABLE IF NOT EXISTS checker_input_files(
                batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
                project_id TEXT NOT NULL,
@@ -1072,6 +1091,19 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Intermediate v18 databases predate explicit owning-project coverage.
+    // Do not infer `unknown` answers from target facts; absent coverage makes
+    // their old checker edges fail closed until enrichment runs again.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+           batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+           member_call_id INTEGER NOT NULL,
+           project_id TEXT NOT NULL,
+           checker_input_fingerprint TEXT NOT NULL,
+           status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+           PRIMARY KEY(batch_id, member_call_id, project_id)
+         );",
+    )?;
 
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version','18')
@@ -2066,6 +2098,7 @@ mod tests {
         for table in [
             "checker_enrichment_batches",
             "checker_enrichments",
+            "checker_occurrence_projects",
             "checker_input_files",
         ] {
             let rows: i64 =

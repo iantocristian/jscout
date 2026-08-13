@@ -24,6 +24,7 @@ pub struct EnrichReport {
     pub batch_id: i64,
     pub occurrences_queried: usize,
     pub unknown_answers: usize,
+    pub unknown_projects: Vec<String>,
     pub unmapped_declarations: usize,
     pub facts_published: usize,
     pub checker_version: String,
@@ -74,10 +75,19 @@ struct ValidatedInput {
     source_hash: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingProjectAnswer {
+    occurrence: Occurrence,
+    project_id: String,
+    input_fingerprint: String,
+    status: &'static str,
+}
+
 /// What one occurrence's whole checker answer contributed.
 #[derive(Debug, Default)]
 struct OccurrenceOutcome {
     facts: Vec<PendingFact>,
+    projects: Vec<PendingProjectAnswer>,
     unknown_answers: usize,
     unmapped_declarations: usize,
 }
@@ -88,6 +98,7 @@ struct PublishPlan<'a> {
     protocol: u32,
     input_fingerprint: &'a str,
     facts: &'a [PendingFact],
+    projects: &'a [PendingProjectAnswer],
     inputs: &'a [ValidatedInput],
 }
 
@@ -109,6 +120,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         .context("failed to install checker Ctrl-C handler")?;
     let capabilities = checker.capabilities(options.timeout)?;
     let mut facts = Vec::new();
+    let mut projects = Vec::new();
     let mut validation = BTreeMap::<(String, String), InputValidation>::new();
     let mut unknown_answers = 0;
     let mut unmapped_declarations = 0;
@@ -163,6 +175,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         unknown_answers += outcome.unknown_answers;
         unmapped_declarations += outcome.unmapped_declarations;
         facts.extend(outcome.facts);
+        projects.extend(outcome.projects);
         if (index + 1) % 100 == 0 {
             eprintln!(
                 "checker enrichment: queried {}/{} occurrences",
@@ -261,6 +274,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             protocol: checker.versions.protocol,
             input_fingerprint: &batch_fingerprint,
             facts: &facts,
+            projects: &projects,
             inputs: &validated_inputs,
         },
     )?;
@@ -271,6 +285,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         batch_id,
         occurrences_queried: occurrences.len(),
         unknown_answers,
+        unknown_projects: projects
+            .iter()
+            .filter(|project| project.status == "unknown")
+            .map(|project| project.project_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         unmapped_declarations,
         facts_published: facts.len(),
         checker_version: identity.version,
@@ -339,10 +360,10 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
 ///
 /// Ambiguity is judged over the checker's WHOLE answer, not over the subset
 /// that happened to map: a valid declaration jscout cannot anchor (an
-/// interface member, a `.d.ts` overload, a declaration outside the root) or a
-/// project that could not answer still means the whole occurrence was not
-/// uniquely resolved, so survivors never inherit a `likely` the checker did
-/// not assert across every owning project.
+/// interface member, a `.d.ts` overload, or a declaration outside the root
+/// still means the resolved candidate set was ambiguous. Owning projects that
+/// return `unknown` are retained as coverage metadata but do not contradict a
+/// clean resolution from another project.
 fn map_occurrence(
     conn: &Connection,
     occurrence: &Occurrence,
@@ -350,6 +371,17 @@ fn map_occurrence(
 ) -> Result<OccurrenceOutcome> {
     let mut outcome = OccurrenceOutcome::default();
     for answer in answers {
+        let status = if answer.status == "resolved" {
+            "resolved"
+        } else {
+            "unknown"
+        };
+        outcome.projects.push(PendingProjectAnswer {
+            occurrence: occurrence.clone(),
+            project_id: answer.project_id.clone(),
+            input_fingerprint: answer.checker_input_fingerprint.clone(),
+            status,
+        });
         if answer.status != "resolved" {
             outcome.unknown_answers += 1;
             continue;
@@ -380,8 +412,7 @@ fn map_occurrence(
         .map(|fact| fact.target.anchor.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let unambiguous =
-        target_count == 1 && outcome.unmapped_declarations == 0 && outcome.unknown_answers == 0;
+    let unambiguous = target_count == 1 && outcome.unmapped_declarations == 0;
     for fact in &mut outcome.facts {
         fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
     }
@@ -500,8 +531,11 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
             bail!("structural snapshot changed while enrichment was running; published nothing");
         }
         for fact in plan.facts {
-            recheck_occurrence(root, conn, fact)?;
+            recheck_occurrence(root, conn, &fact.occurrence)?;
             recheck_target(conn, &fact.target)?;
+        }
+        for project in plan.projects {
+            recheck_occurrence(root, conn, &project.occurrence)?;
         }
         for input in plan.inputs {
             let path = input_path(root, input);
@@ -562,6 +596,21 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
                 fact.input_fingerprint,
             ])?;
         }
+        let mut insert_project = conn.prepare_cached(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for project in plan.projects {
+            insert_project.execute(params![
+                batch_id,
+                project.occurrence.id,
+                project.project_id,
+                project.input_fingerprint,
+                project.status,
+            ])?;
+        }
         let mut insert_input = conn.prepare_cached(
             "INSERT INTO checker_input_files(
                batch_id, project_id, query_file, checker_input_fingerprint,
@@ -602,7 +651,7 @@ fn input_path(root: &Path, input: &ValidatedInput) -> PathBuf {
     }
 }
 
-fn recheck_occurrence(root: &Path, conn: &Connection, fact: &PendingFact) -> Result<()> {
+fn recheck_occurrence(root: &Path, conn: &Connection, occurrence: &Occurrence) -> Result<()> {
     let current = conn
         .query_row(
             "SELECT file.id, file.hash, call.start, call.end,
@@ -610,7 +659,7 @@ fn recheck_occurrence(root: &Path, conn: &Connection, fact: &PendingFact) -> Res
                     call.property_start, call.property_end
              FROM member_calls call JOIN files file ON file.id=call.file_id
              WHERE call.rowid=?1 AND file.path=?2",
-            params![fact.occurrence.id, fact.occurrence.file],
+            params![occurrence.id, occurrence.file],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -626,20 +675,20 @@ fn recheck_occurrence(root: &Path, conn: &Connection, fact: &PendingFact) -> Res
         )
         .optional()?;
     let expected = (
-        fact.occurrence.file_id,
-        fact.occurrence.hash.clone(),
-        fact.occurrence.call_start,
-        fact.occurrence.call_end,
-        fact.occurrence.receiver_start,
-        fact.occurrence.receiver_end,
-        fact.occurrence.property_start,
-        fact.occurrence.property_end,
+        occurrence.file_id,
+        occurrence.hash.clone(),
+        occurrence.call_start,
+        occurrence.call_end,
+        occurrence.receiver_start,
+        occurrence.receiver_end,
+        occurrence.property_start,
+        occurrence.property_end,
     );
     if current != Some(expected) {
         bail!("member-call occurrence changed while enrichment was running; published nothing");
     }
-    let path = crate::store::file_source_path(conn, root, fact.occurrence.file_id)?;
-    verify_source_hash(&path, &fact.occurrence.hash, &fact.occurrence.file)
+    let path = crate::store::file_source_path(conn, root, occurrence.file_id)?;
+    verify_source_hash(&path, &occurrence.hash, &occurrence.file)
 }
 
 fn recheck_target(conn: &Connection, target: &Target) -> Result<()> {
@@ -858,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_owning_project_keeps_a_surviving_target_possible() -> Result<()> {
+    fn an_unknown_owning_project_is_visible_without_demoting_a_clean_resolution() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let source = "export class CardTable { insert(): void {} }\n\
                       declare const target: CardTable;\n\
@@ -883,7 +932,11 @@ mod tests {
         )?;
         assert_eq!(outcome.unknown_answers, 1);
         assert_eq!(outcome.facts.len(), 1);
-        assert_eq!(outcome.facts[0].confidence, "possible");
+        assert_eq!(outcome.facts[0].confidence, "likely");
+        assert_eq!(outcome.projects.len(), 2);
+        assert!(outcome.projects.iter().any(|project| {
+            project.project_id == "tsconfig.unknown.json" && project.status == "unknown"
+        }));
         Ok(())
     }
 
@@ -916,6 +969,7 @@ mod tests {
                 protocol: 1,
                 input_fingerprint: "new",
                 facts: &[],
+                projects: &[],
                 inputs: &[],
             },
         )
@@ -935,6 +989,7 @@ mod tests {
                 protocol: 1,
                 input_fingerprint: "new",
                 facts: &[],
+                projects: &[],
                 inputs: &[ValidatedInput {
                     project_id: "tsconfig.json".into(),
                     query_file: "main.ts".into(),
@@ -984,6 +1039,7 @@ mod tests {
             protocol: 1,
             input_fingerprint: fingerprint,
             facts: &[],
+            projects: &[],
             inputs: &[],
         };
 
