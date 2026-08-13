@@ -703,8 +703,12 @@ per-project batches, one disposable Program worker per project, once-per-project
 source mapping, durable batch staging/resume, controlled partial activation,
 input/target/snapshot rechecks, resource progress, and synchronous worker-crash
 details. Unit, protocol, projection, and small end-to-end gates pass. The
-large-repository acceptance runs and sustained-churn G12 coordinator gate remain
-open, so the top-level operational qualification is intentionally unchanged.
+n8n full-plan dry run selects all 121,705 eligible occurrences from 284,183
+discovered across 235 owning/inferred projects in 4.8 seconds; a real bounded
+100-occurrence/three-project slice completes 300 project answers in three
+protocol requests while reclaiming each worker between projects. The full real
+n8n/Twenty runs and sustained-churn G12 coordinator gate remain open, so the
+top-level operational qualification is intentionally unchanged.
 
 The TypeScript semantic operation stays in Node. OXC and Rust do not attempt to
 reimplement TypeScript's version-specific type system, configured-project
