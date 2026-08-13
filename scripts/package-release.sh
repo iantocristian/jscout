@@ -48,17 +48,21 @@ fi
 
 staging="$(mktemp -d "$output_dir/.jscout-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
-mkdir -p "$staging/$bundle/gateway"
+mkdir -p "$staging/$bundle/gateway" "$staging/$bundle/checker"
 cp "$binary" "$staging/$bundle/$binary_name"
 cp README.md "$staging/$bundle/README.md"
 cp PLAN.md "$staging/$bundle/PLAN.md"
 cp .env.example "$staging/$bundle/.env.example"
 cp gateway/package.json gateway/package-lock.json "$staging/$bundle/gateway/"
 cp -R gateway/src "$staging/$bundle/gateway/src"
+cp checker/package.json checker/package-lock.json "$staging/$bundle/checker/"
+cp -R checker/src "$staging/$bundle/checker/src"
 
 # Install the exact lockfile into the release tree. The installed binary then
 # discovers gateway/src/main.mjs beside itself without a source checkout.
-npm ci --omit=dev --ignore-scripts --prefix "$staging/$bundle/gateway" >&2
+npm_cache="$staging/.npm-cache"
+npm ci --omit=dev --ignore-scripts --cache "$npm_cache" --prefix "$staging/$bundle/gateway" >&2
+npm ci --omit=dev --ignore-scripts --cache "$npm_cache" --prefix "$staging/$bundle/checker" >&2
 partial="$staging/$bundle.tar.gz"
 tar -C "$staging" -czf "$partial" "$bundle"
 mv "$partial" "$archive"

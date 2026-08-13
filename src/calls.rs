@@ -537,13 +537,73 @@ mod tests {
         )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
-        let (line, end_line, receiver): (i64, i64, Option<String>) = conn.query_row(
-            "SELECT line, end_line, receiver FROM member_calls WHERE prop='insert'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        type StoredMemberSpans = (i64, i64, Option<String>, (i64, i64), (i64, i64));
+        let (line, end_line, receiver, receiver_span, property_span): StoredMemberSpans = conn
+            .query_row(
+                "SELECT line, end_line, receiver, receiver_start, receiver_end,
+                    property_start, property_end
+             FROM member_calls WHERE prop='insert'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        (row.get(3)?, row.get(4)?),
+                        (row.get(5)?, row.get(6)?),
+                    ))
+                },
+            )?;
         assert_eq!((line, end_line), (2, 5));
         assert_eq!(receiver.as_deref(), Some("dbs.wave.card"));
+        let source = std::fs::read_to_string(repo.path().join("multi.ts"))?;
+        assert_eq!(
+            &source[receiver_span.0 as usize..receiver_span.1 as usize],
+            "dbs.wave.card"
+        );
+        assert_eq!(
+            &source[property_span.0 as usize..property_span.1 as usize],
+            "insert"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn member_occurrence_spans_cover_this_and_optional_chains() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "class Runner {\n  constructor(private service: any) {}\n  go() { this.service.run(); }\n}\n\
+                      declare const dbs: any;\n\
+                      dbs.wave.card?.insert();\n";
+        std::fs::write(repo.path().join("occurrences.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let mut statement = conn.prepare(
+            "SELECT prop, receiver, receiver_start, receiver_end,
+                    property_start, property_end
+             FROM member_calls WHERE prop IN ('run', 'insert') ORDER BY start",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "run");
+        assert_eq!(rows[0].1.as_deref(), Some("this.service"));
+        assert_eq!(rows[1].0, "insert");
+        assert_eq!(rows[1].1.as_deref(), Some("dbs.wave.card"));
+        for (property, _, receiver_start, receiver_end, property_start, property_end) in rows {
+            let receiver = &source[receiver_start as usize..receiver_end as usize];
+            let property_source = &source[property_start as usize..property_end as usize];
+            assert!(matches!(receiver, "this.service" | "dbs.wave.card"));
+            assert_eq!(property_source, property);
+        }
         Ok(())
     }
 }

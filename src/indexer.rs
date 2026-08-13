@@ -321,13 +321,14 @@ fn index_repo_impl(
         resolution_hash: Some(resolution.clone()),
     };
     let projection_started = std::time::Instant::now();
-    if previous == current {
+    if previous == current && crate::structural::checker_projection_reusable(conn)? {
         // The projection is a pure function of the canonical tables: the
         // snapshot covers every extracted row (file content identity) and the
         // resolution hash covers module edges, whose inputs (tsconfigs,
-        // manifests, node_modules layout) live outside indexed content.
-        // Identical inputs under the same projection version republish the
-        // existing rows instead of rebuilding them.
+        // manifests, node_modules layout) live outside indexed content. An
+        // active checker batch adds its own exact input manifest to this
+        // reuse gate. Identical inputs under the same projection version
+        // republish the existing rows instead of rebuilding them.
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = current.publish(conn);
         match result {
@@ -602,8 +603,9 @@ fn insert_file(
 
     let mut ins_mc = conn.prepare_cached(
         "INSERT INTO member_calls(
-           file_id, chunk_id, start, end, line, end_line, prop, object, receiver
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+           file_id, chunk_id, start, end, line, end_line, prop, object, receiver,
+           receiver_start, receiver_end, property_start, property_end
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
     )?;
     for m in &data.graph.member_calls {
         ins_mc.execute(params![
@@ -616,6 +618,10 @@ fn insert_file(
             m.prop,
             m.object,
             m.receiver,
+            m.receiver_start,
+            m.receiver_end,
+            m.property_start,
+            m.property_end,
         ])?;
     }
 

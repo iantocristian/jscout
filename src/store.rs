@@ -202,7 +202,11 @@ CREATE TABLE IF NOT EXISTS member_calls(
   end_line INTEGER NOT NULL DEFAULT 0,
   prop TEXT NOT NULL,
   object TEXT,
-  receiver TEXT                     -- full static chain, e.g. dbs.wave.card
+  receiver TEXT,                    -- full static chain, e.g. dbs.wave.card
+  receiver_start INTEGER NOT NULL DEFAULT 0,
+  receiver_end INTEGER NOT NULL DEFAULT 0,
+  property_start INTEGER NOT NULL DEFAULT 0,
+  property_end INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
@@ -336,6 +340,78 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
   ON resolved_edges(src_key, confidence, kind);
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
+
+-- Canonical TypeScript-checker facts are retained across projection rebuilds.
+-- Source/target identities are deliberately not foreign keys: a re-index may
+-- replace native rows, after which freshness checks keep these facts inert
+-- without erasing their provenance.
+CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
+  id INTEGER PRIMARY KEY,
+  source_snapshot TEXT NOT NULL,
+  checker_version TEXT NOT NULL,
+  checker_source TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
+  sidecar_protocol INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
+  ON checker_enrichment_batches(active) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS checker_enrichments(
+  id INTEGER PRIMARY KEY,
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  member_call_id INTEGER NOT NULL,
+  source_file_id INTEGER NOT NULL,
+  source_file TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  call_start INTEGER NOT NULL,
+  call_end INTEGER NOT NULL,
+  receiver_start INTEGER NOT NULL,
+  receiver_end INTEGER NOT NULL,
+  property_start INTEGER NOT NULL,
+  property_end INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  receiver_type TEXT,
+  target_anchor TEXT NOT NULL,
+  target_fingerprint TEXT NOT NULL,
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  provenance TEXT NOT NULL CHECK(provenance = 'checker'),
+  checker_input_fingerprint TEXT NOT NULL,
+  UNIQUE(batch_id, member_call_id, project_id, target_anchor)
+);
+CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
+  ON checker_enrichments(source_file, call_start);
+CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
+  ON checker_enrichments(target_anchor);
+-- One row per owning-project answer, including `unknown`. Facts record mapped
+-- targets; this table preserves coverage so partial checker success stays
+-- visible and every owning project's input drift can retire the occurrence.
+CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  member_call_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+  PRIMARY KEY(batch_id, member_call_id, project_id)
+);
+-- Checker inputs are retained per TypeScript project and checker fingerprint.
+-- `source` inputs can be compared with indexed file hashes; `environment`
+-- inputs (configs, compiler/runtime files, ambient declarations, and other
+-- unindexed paths) are rehashed from disk. Drift retires occurrences whose
+-- owning-project coverage includes the affected project/fingerprint.
+CREATE TABLE IF NOT EXISTS checker_input_files(
+  batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  query_file TEXT NOT NULL,
+  checker_input_fingerprint TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+  input_role TEXT NOT NULL DEFAULT 'environment'
+    CHECK(input_role IN ('environment', 'source')),
+  input_path TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
+);
 
 -- One row per generative model run. Failures, exclusions, cost, and
 -- provenance stay attributable; artifacts reference the run that produced
@@ -893,8 +969,144 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // v16 -> v17: checker enrichment addresses one exact member occurrence.
+    // Legacy rows know the complete call but not the receiver/property spans,
+    // so only re-extraction can populate trustworthy query locations.
+    if version < 17 {
+        for (column, declaration) in [
+            ("receiver_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("receiver_end", "INTEGER NOT NULL DEFAULT 0"),
+            ("property_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("property_end", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !has_column(conn, "member_calls", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE member_calls ADD COLUMN {column} {declaration}"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute("UPDATE files SET hash = ''", [])?;
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            [],
+        )?;
+    }
+
+    // v17 -> v18: canonical, snapshot-bound checker enrichment batches.
+    if version < 18 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
+               id INTEGER PRIMARY KEY,
+               source_snapshot TEXT NOT NULL,
+               checker_version TEXT NOT NULL,
+               checker_source TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
+               sidecar_protocol INTEGER NOT NULL,
+               created_at TEXT NOT NULL,
+               active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_checker_one_active_batch
+               ON checker_enrichment_batches(active) WHERE active = 1;
+             CREATE TABLE IF NOT EXISTS checker_enrichments(
+               id INTEGER PRIMARY KEY,
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               member_call_id INTEGER NOT NULL,
+               source_file_id INTEGER NOT NULL,
+               source_file TEXT NOT NULL,
+               source_hash TEXT NOT NULL,
+               call_start INTEGER NOT NULL,
+               call_end INTEGER NOT NULL,
+               receiver_start INTEGER NOT NULL,
+               receiver_end INTEGER NOT NULL,
+               property_start INTEGER NOT NULL,
+               property_end INTEGER NOT NULL,
+               project_id TEXT NOT NULL,
+               receiver_type TEXT,
+               target_anchor TEXT NOT NULL,
+               target_fingerprint TEXT NOT NULL,
+               confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+               provenance TEXT NOT NULL CHECK(provenance = 'checker'),
+               checker_input_fingerprint TEXT NOT NULL,
+               UNIQUE(batch_id, member_call_id, project_id, target_anchor)
+             );
+             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_source
+               ON checker_enrichments(source_file, call_start);
+             CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
+               ON checker_enrichments(target_anchor);
+             CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               member_call_id INTEGER NOT NULL,
+               project_id TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+               PRIMARY KEY(batch_id, member_call_id, project_id)
+             );
+             CREATE TABLE IF NOT EXISTS checker_input_files(
+               batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+               project_id TEXT NOT NULL,
+               query_file TEXT NOT NULL,
+               checker_input_fingerprint TEXT NOT NULL,
+               input_kind TEXT NOT NULL CHECK(input_kind IN ('repository', 'absolute')),
+               input_role TEXT NOT NULL DEFAULT 'environment'
+                 CHECK(input_role IN ('environment', 'source')),
+               input_path TEXT NOT NULL,
+               source_hash TEXT NOT NULL,
+               PRIMARY KEY(batch_id, project_id, query_file, input_kind, input_path)
+             );",
+        )?;
+    }
+
+    // v18 is unreleased (the last published schema is v16), so checker
+    // freshness additions are folded into its table definition rather than
+    // consuming more versions. Intermediate v18 databases are upgraded below.
+    if !has_column(conn, "checker_input_files", "input_role")? {
+        conn.execute(
+            "ALTER TABLE checker_input_files
+             ADD COLUMN input_role TEXT NOT NULL DEFAULT 'environment'",
+            [],
+        )?;
+    }
+    if !has_column(conn, "checker_input_files", "checker_input_fingerprint")? {
+        conn.execute(
+            "ALTER TABLE checker_input_files
+             ADD COLUMN checker_input_fingerprint TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        // v18 is still unreleased, but databases created by intermediate
+        // builds may already contain checker manifests. Recover the project
+        // fingerprint when it is unique; ambiguous/missing values stay empty
+        // and therefore fail closed during projection.
+        conn.execute(
+            "UPDATE checker_input_files AS input
+             SET checker_input_fingerprint=COALESCE((
+               SELECT MIN(enrichment.checker_input_fingerprint)
+               FROM checker_enrichments enrichment
+               WHERE enrichment.batch_id=input.batch_id
+                 AND enrichment.project_id=input.project_id
+               HAVING COUNT(DISTINCT enrichment.checker_input_fingerprint)=1
+             ), '')",
+            [],
+        )?;
+    }
+    // Intermediate v18 databases predate explicit owning-project coverage.
+    // Do not infer `unknown` answers from target facts; absent coverage makes
+    // their old checker edges fail closed until enrichment runs again.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
+           batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
+           member_call_id INTEGER NOT NULL,
+           project_id TEXT NOT NULL,
+           checker_input_fingerprint TEXT NOT NULL,
+           status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown')),
+           PRIMARY KEY(batch_id, member_call_id, project_id)
+         );",
+    )?;
+
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','16')
+        "INSERT INTO meta(key, value) VALUES('schema_version','18')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
@@ -1118,7 +1330,7 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use super::{DB_FILE, file_source_path, open, open_path};
+    use super::{DB_FILE, file_source_path, has_column, open, open_path};
 
     #[test]
     fn opens_an_index_database_outside_the_repository_root() -> Result<()> {
@@ -1130,7 +1342,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         assert!(database.is_file());
         Ok(())
     }
@@ -1160,7 +1372,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let legacy_columns: i64 = connection.query_row(
             "SELECT count(*) FROM pragma_table_info('embeddings')
              WHERE name IN ('model', 'dim')",
@@ -1221,7 +1433,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let symbol: (i64, i64, String) = conn.query_row(
             "SELECT decl_start, decl_end, scope_chain FROM symbols WHERE id=1",
             [],
@@ -1264,7 +1476,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let member_call: (i64, i64) = conn.query_row(
             "SELECT start, line FROM member_calls WHERE prop='load'",
             [],
@@ -1328,7 +1540,7 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM semantic_supports", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         assert_eq!((artifacts, supports), (0, 0));
         Ok(())
     }
@@ -1357,7 +1569,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         // Legacy rows read as NULL resolution (treated as plain resolver).
         let resolution: Option<String> = conn.query_row(
             "SELECT resolution FROM module_edges WHERE from_file=1",
@@ -1401,7 +1613,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let identity: (String, Option<i64>, Option<String>) = conn.query_row(
             "SELECT origin, package_instance_id, package_path FROM files WHERE id=1",
             [],
@@ -1451,7 +1663,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1517,7 +1729,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1565,7 +1777,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         let hash: String =
             conn.query_row("SELECT hash FROM files WHERE id=1", [], |row| row.get(0))?;
         assert!(hash.is_empty());
@@ -1613,7 +1825,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         assert_eq!(type_only, 0);
         assert_eq!(snapshots, 0);
         Ok(())
@@ -1667,7 +1879,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
 
         // The backfilled fingerprint equals a recomputation from canonical parts.
         let stored: String = conn.query_row(
@@ -1753,7 +1965,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         assert_eq!(config, "{}");
         Ok(())
     }
@@ -1788,7 +2000,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(version, "16");
+        assert_eq!(version, "18");
         // Columns exist with the migration defaults; real values require
         // re-extraction, which the cleared hash forces.
         let (end, end_line, receiver, hash): (i64, i64, Option<String>, String) = conn.query_row(
@@ -1806,6 +2018,119 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(public_meta, 0, "stale projection must not stay public");
+        Ok(())
+    }
+
+    /// v16 is the last published schema, so the v17 span columns and the v18
+    /// checker tables are what a real installation migrates through when it
+    /// first sees checker enrichment.
+    #[test]
+    fn migrates_v16_to_occurrence_spans_and_checker_enrichment_tables() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let db_path = repo.path().join(".jscout.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '16');
+             INSERT INTO meta VALUES('snapshot', 'stale');
+             INSERT INTO meta VALUES('projection_version', '10');
+             INSERT INTO meta VALUES('resolution_hash', 'stale');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY, path TEXT, hash TEXT, role TEXT,
+               origin TEXT, package_path TEXT, package_instance_id INTEGER
+             );
+             INSERT INTO files VALUES(1, 'service.ts', 'indexed-hash', 'production',
+                                      'repository', NULL, NULL);
+             CREATE TABLE member_calls(
+               file_id INTEGER, chunk_id INTEGER, start INTEGER, end INTEGER,
+               line INTEGER, end_line INTEGER, prop TEXT, object TEXT, receiver TEXT
+             );
+             INSERT INTO member_calls VALUES(1, NULL, 12, 26, 3, 3, 'insert', 'card',
+                                             'dbs.wave.card');",
+        )?;
+        drop(conn);
+
+        let conn = open(repo.path())?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, "18");
+
+        // v17: exact receiver/property spans exist, defaulted, and the cleared
+        // file hash forces the re-extraction that can populate them for real.
+        for column in [
+            "receiver_start",
+            "receiver_end",
+            "property_start",
+            "property_end",
+        ] {
+            assert!(
+                has_column(&conn, "member_calls", column)?,
+                "v17 must add member_calls.{column}"
+            );
+        }
+        let (spans, hash): ((i64, i64, i64, i64), String) = conn.query_row(
+            "SELECT call.receiver_start, call.receiver_end,
+                    call.property_start, call.property_end, file.hash
+             FROM member_calls call JOIN files file ON file.id=call.file_id",
+            [],
+            |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(spans, (0, 0, 0, 0));
+        assert_eq!(hash, "", "unspanned occurrences must be re-extracted");
+        let public_meta: i64 = conn.query_row(
+            "SELECT count(*) FROM meta
+             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(public_meta, 0, "stale projection must not stay public");
+
+        // v18: the canonical checker batch tables exist and are empty, with the
+        // one-active-batch invariant and the per-fact freshness role in place.
+        for table in [
+            "checker_enrichment_batches",
+            "checker_enrichments",
+            "checker_occurrence_projects",
+            "checker_input_files",
+        ] {
+            let rows: i64 =
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(rows, 0, "v18 must create an empty {table}");
+        }
+        assert!(has_column(&conn, "checker_input_files", "input_role")?);
+        assert!(has_column(
+            &conn,
+            "checker_input_files",
+            "checker_input_fingerprint"
+        )?);
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
+            [],
+        )?;
+        let second_active = conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES('s','5.9.3','bundled','f',1,datetime('now'),1)",
+            [],
+        );
+        assert!(
+            second_active.is_err(),
+            "only one checker batch may be active"
+        );
         Ok(())
     }
 

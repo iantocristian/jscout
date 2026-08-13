@@ -1,5 +1,6 @@
 mod agent;
 mod calls;
+mod checker;
 mod chunk;
 mod dependency;
 mod embed;
@@ -325,6 +326,15 @@ enum Command {
         /// Keep these installed dependency packages in the watched index
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
+        /// Re-run TypeScript checker enrichment after relevant indexed changes
+        #[arg(long)]
+        enrich: bool,
+        /// Hard deadline for each checker request in seconds
+        #[arg(long, default_value_t = 30)]
+        enrich_timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
     },
     /// Show all usages of a symbol: NAME or path-substring:NAME
     WhoUses {
@@ -382,6 +392,25 @@ enum Command {
         #[arg(long)]
         install: Option<PathBuf>,
     },
+    /// Enrich exact member-call occurrences with bounded TypeScript checker facts
+    Enrich {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Hard deadline for each checker request in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
+    /// TypeScript checker sidecar diagnostics
+    Checker {
+        #[command(subcommand)]
+        command: CheckerCommand,
+    },
     /// Model-gateway operations (generative calls run in a Node sidecar)
     Llm {
         #[command(subcommand)]
@@ -396,6 +425,21 @@ enum Command {
     Scout {
         #[command(subcommand)]
         command: ScoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckerCommand {
+    /// Report TypeScript version, projects, config problems, and readiness
+    Doctor {
+        /// Repository root whose configured projects are discovered
+        root: PathBuf,
+        /// Hard deadline for project discovery in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
     },
 }
 
@@ -840,7 +884,19 @@ fn main() -> Result<()> {
             root,
             embed,
             dependencies,
-        } => watch::watch(&root, embed, &dependencies),
+            enrich,
+            enrich_timeout,
+            sidecar_path,
+        } => watch::watch(
+            &root,
+            &watch::WatchOptions {
+                embed_on_change: embed,
+                dependencies: &dependencies,
+                enrich_on_change: enrich,
+                enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
+                checker_sidecar: sidecar_path.as_deref(),
+            },
+        ),
         Command::WhoUses {
             root,
             spec,
@@ -886,6 +942,34 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Enrich {
+            root,
+            timeout,
+            sidecar_path,
+            database,
+        } => {
+            let report = checker::enrich(
+                &root,
+                &checker::EnrichOptions {
+                    database: database.as_deref(),
+                    sidecar: sidecar_path.as_deref(),
+                    timeout: std::time::Duration::from_secs(timeout),
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Checker { command } => match command {
+            CheckerCommand::Doctor {
+                root,
+                timeout,
+                sidecar_path,
+            } => checker::doctor(
+                &root,
+                sidecar_path.as_deref(),
+                std::time::Duration::from_secs(timeout),
+            ),
+        },
         Command::Llm { command } => match command {
             LlmCommand::Doctor {
                 model,
@@ -1701,6 +1785,8 @@ fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
 
 #[cfg(test)]
 mod main_tests {
+    use std::path::PathBuf;
+
     use anyhow::Result;
     use serde_json::json;
 
@@ -1762,5 +1848,35 @@ mod main_tests {
             panic!("expected search")
         };
         assert!(lexical_only);
+    }
+
+    #[test]
+    fn watch_checker_enrichment_controls_parse_independently() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "watch",
+            ".",
+            "--embed",
+            "--enrich",
+            "--enrich-timeout",
+            "45",
+            "--sidecar-path",
+            "checker.mjs",
+        ])
+        .expect("watch enrichment controls parse");
+        let Command::Watch {
+            embed,
+            enrich,
+            enrich_timeout,
+            sidecar_path,
+            ..
+        } = command
+        else {
+            panic!("expected watch")
+        };
+        assert!(embed);
+        assert!(enrich);
+        assert_eq!(enrich_timeout, 45);
+        assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
     }
 }

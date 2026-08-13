@@ -23,23 +23,24 @@ jscout index /path/to/repo       # build .jscout.db beside the sources
 jscout search /path/to/repo "checkout inventory"
 ```
 
-Everything deterministic — indexing, search, graph traversal, the MCP server —
-is the Rust binary alone, with no runtime dependencies. Generative scouting
-(`jscout scout …`, `jscout llm doctor`) additionally requires Node >= 22.19.0
-because model calls run through the bundled pi-ai gateway sidecar. Release
-archives contain the gateway and its pinned dependencies; a source checkout
-needs one additional install step:
+Core deterministic indexing, search, graph traversal, and the MCP server use
+the Rust binary alone. Generative scouting and the explicit optional
+TypeScript-checker enrichment pass additionally require Node >= 22.19.0.
+Release archives contain both pinned sidecars and their dependencies; a source
+checkout needs these install steps:
 
 ```bash
 npm ci --prefix gateway          # exact package-lock installation
+npm ci --prefix checker          # pinned TypeScript checker fallback
 jscout llm doctor                # verifies node, gateway, auth, and the model
+jscout checker doctor /path/to/repo
 ```
 
-The gateway entry (`gateway/src/main.mjs`) is discovered beside the jscout
-binary in an installed layout, or at the repository root when running
-`target/{debug,release}/jscout` in development. `--gateway-path` or
-`JSCOUT_PI_AI_GATEWAY` overrides discovery explicitly; there is no fallback
-search beyond these locations. The default model
+The gateway and checker entries are discovered beside the jscout binary in an
+installed layout, or at the repository root when running
+`target/{debug,release}/jscout` in development. `JSCOUT_PI_AI_GATEWAY` and
+`JSCOUT_CHECKER_SIDECAR` override their respective entries explicitly. The
+default model
 `openai-codex:gpt-5.6-terra` bills to a ChatGPT plan through pi-ai's OAuth
 credential store; see [Configuration](#configuration) for the complete
 environment surface and auth setup.
@@ -74,7 +75,10 @@ jscout workflow-candidates R S # experimental fingerprinted candidate-set diagno
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout calls <root> METHOD     # exact member-call sites matched on the AST
                                #   --arg merge=replace --receiver wave.card --json
-jscout watch <root> [--embed]  # hash-incremental parse; projection is currently rebuilt
+jscout checker doctor <root>   # checker version, projects, config problems, readiness
+jscout enrich <root>           # explicit occurrence-scoped TypeScript checker pass
+jscout watch <root> [--embed] [--enrich]
+                               # hash-incremental parse plus optional vector/checker refresh
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
 jscout inference serve         # run the optional local embedding/reranking service
@@ -110,8 +114,8 @@ jscout agent-guide             # print agent integration guidance
 jscout agent-guide --install R # install a project-local jscout skill
 ```
 
-Build a distributable archive containing both the Rust binary and installed
-gateway:
+Build a distributable archive containing the Rust binary and both installed
+sidecars:
 
 ```bash
 scripts/package-release.sh              # host target
@@ -119,8 +123,9 @@ scripts/package-release.sh TARGET_TRIPLE
 ```
 
 The archive is written under `target/release-packages/`. Extract it anywhere,
-put its directory on `PATH`, and keep the adjacent `gateway/` directory with
-the binary. Deterministic indexing and retrieval never start Node.
+put its directory on `PATH`, and keep the adjacent `gateway/` and `checker/`
+directories with the binary. Indexing and retrieval never start Node;
+`jscout enrich` is the only structural command that starts the checker.
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
@@ -138,6 +143,63 @@ Traversal defaults to `certain`/`likely` edges. Use
 explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
+
+## TypeScript checker enrichment
+
+`jscout enrich <root>` is a bounded pass over indexed member-call occurrences.
+It asks one question per occurrence: which declaration owns this statically
+named property on this exact receiver? `index` stays deterministic and
+Node-free; `jscout watch --enrich` explicitly opts into rerunning the same pass
+after relevant changes. Enrichment never requests diagnostics and does not
+replace deterministic name-matched member hubs.
+
+The sidecar prefers the repository's installed `typescript`; otherwise it uses
+the pinned bundled fallback. `jscout checker doctor <root>` reports that choice,
+every discovered owning `tsconfig`, and configuration-read problems. Query
+paths, indexed BLAKE3 hashes, and exact call/receiver/property byte spans are
+verified before checker work. A file owned by multiple projects is queried in
+all of them. Conflicting declarations remain separate `possible` candidates;
+one mapped declaration becomes an occurrence-specific `likely` edge with
+`checker` provenance. `any`, error, and unknown receiver types publish no edge.
+
+If another owning project returns `unknown`, that incomplete answer does not
+demote an otherwise clean, agreeing resolution. The edge's `detail_json`
+reports the incomplete owner under `unknownProjects`, and the enrichment report
+lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multiple
+targets or a declaration jscout cannot map — still makes every survivor
+`possible`. If any owning project input later changes, including an unknown
+owner's inputs, the occurrence is suppressed until enrichment recomputes it.
+
+Results are stored as one canonical fingerprinted batch; publishing a new batch
+drops the one it supersedes. A raced batch publishes nothing. Each request has a
+hard deadline (`--timeout`, default 30 seconds); timeout kills the sidecar
+process. Ctrl-C terminates active checker work rather than leaving a blocked
+TypeScript worker behind.
+
+### What a rebuild keeps
+
+Every checker fact is bound to the complete input manifest of the TypeScript
+project that produced it. Indexed source inputs are compared with canonical
+file hashes; the TypeScript runtime, `tsconfig` inheritance chain,
+ambient/generated declarations, and other unindexed inputs are rehashed from
+disk. If any input changes, facts from that project stop being traversable at
+the next rebuild. Unaffected projects retain their checker edges.
+
+`jscout watch --enrich` performs the full safe cycle: reindex, suppress stale
+project facts, and run enrichment to publish replacements atomically. If the
+checker fails or times out, stale edges remain suppressed and watch retries on
+the next relevant change. Without `--enrich`, freshness still fails closed and
+`jscout enrich` can replenish the checker plane manually.
+
+Canonical facts are never erased by a rebuild; they stop being traversable and
+become projectable again when their complete project inputs match. One
+host-local consequence is deliberate:
+
+- The checker-input fingerprint hashes machine-absolute paths, so a database
+  copied or moved to another path (or another machine) never revalidates its
+  enrichments and simply projects no checker edges until `jscout enrich` runs
+  again there. Enrichment is host-local by design; this is conservative
+  invalidation, not corruption.
 
 ## Semantic scouting
 
@@ -306,7 +368,8 @@ jscout is configured through CLI flags and process environment variables; it
 never auto-loads a `.env` file. [.env.example](.env.example) is the safe
 copy-paste template. CLI flags always win over environment variables.
 
-Generative scouting (`jscout scout …`, `jscout llm doctor`):
+Node sidecars and generative scouting (`jscout enrich`, `jscout scout …`,
+`jscout checker/llm doctor`):
 
 | Variable | Effect |
 |---|---|
@@ -316,7 +379,8 @@ Generative scouting (`jscout scout …`, `jscout llm doctor`):
 | `JSCOUT_PI_AI_OPENAI_BASE_URL` | Replace only the built-in `openai` provider endpoint. The model catalog, Responses transport, and `OPENAI_API_KEY` auth remain intact. |
 | `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` | Validated JSON array of additional local OpenAI-compatible providers (see below). |
 | `JSCOUT_PI_AI_GATEWAY` | Path to the gateway entry file when it is not discoverable beside the binary. Overridden by `--gateway-path`. Names a file, never a shell command. |
-| `JSCOUT_NODE` | Node executable used to launch the gateway; default is `node` on `PATH`. Names a file, never a shell command. |
+| `JSCOUT_CHECKER_SIDECAR` | Path to the checker entry file when it is not discoverable beside the binary. Overridden by `jscout enrich/checker doctor --sidecar-path`. |
+| `JSCOUT_NODE` | Node executable used to launch the gateway and checker; default is `node` on `PATH`. Names a file, never a shell command. |
 
 The plan-backed `openai-codex:*` default reads pi-ai's OAuth store; jscout
 never creates or writes credentials, so sign in with pi-ai's own tooling

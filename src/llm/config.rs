@@ -135,8 +135,15 @@ fn existing_file(path: &Path, source: &str) -> Result<PathBuf> {
     }
 }
 
-/// Node runtime: `JSCOUT_NODE`, then `node` on PATH.
+/// Node runtime for the pi-ai gateway: `JSCOUT_NODE`, then `node` on PATH.
 pub fn resolve_node() -> Result<PathBuf> {
+    resolve_node_for("the pi-ai gateway")
+}
+
+/// Node runtime for a named sidecar. Both of jscout's sidecars share one Node
+/// resolution, so the failure names the sidecar the caller actually wanted
+/// rather than telling a `jscout enrich` user about the gateway.
+pub fn resolve_node_for(sidecar: &str) -> Result<PathBuf> {
     if let Ok(value) = env::var(NODE_ENV)
         && !value.trim().is_empty()
     {
@@ -159,8 +166,8 @@ pub fn resolve_node() -> Result<PathBuf> {
         }
     }
     bail!(
-        "node not found on PATH: install Node >= 22.19.0 or set {NODE_ENV}; \
-         the pi-ai gateway is a Node sidecar and cannot run without it"
+        "node not found on PATH: install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}; \
+         {sidecar} is a Node sidecar and cannot run without it"
     )
 }
 
