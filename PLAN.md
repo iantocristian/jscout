@@ -565,9 +565,9 @@ is not considered cancellation support.
 
 ### Consumption
 
-Enrichment is an explicit pass (`jscout enrich`), never part of `index` or
-`watch`; deterministic indexing remains Node-free. The pass takes indexed
-member-call occurrences whose receivers currently reach property-hub
+Enrichment is an explicit pass (`jscout enrich`) and an explicit watch option
+(`jscout watch --enrich`); deterministic indexing remains Node-free. The pass
+takes indexed member-call occurrences whose receivers currently reach property-hub
 candidates, asks the sidecar to resolve the called property on that receiver,
 and maps returned declaration sites to indexed symbol anchors.
 
@@ -599,19 +599,20 @@ transaction after rechecking that snapshot, occurrence source hashes, target
 anchors, and checker inputs; drift publishes nothing from the raced batch. Only
 one batch is retained: publishing supersedes and drops its predecessor.
 
-As implemented, "only fresh facts" is enforced at two granularities. Inputs the
-index itself tracks — repository sources — are policed per fact, because each
-fact records its own source path/hash, occurrence spans, and target
-fingerprint; an edit retires exactly the facts recorded against that file.
-Inputs the index does not track — the TypeScript package, the `tsconfig` chain,
-ambient/generated declarations, anything outside the index — have no per-fact
-anchor and retire the whole batch. The batch's planning snapshot is therefore
-not itself a projection gate: binding to it would retire every fact in a
-repository whenever any one file changed, which is the opposite of the rule
-above. The accepted cost is that an edit to one file cannot retire a fact in
-another file whose answer that edit changed; re-running `jscout enrich`
-re-derives it. Because the fingerprint hashes machine-absolute paths, a
-database moved to another path or host never revalidates and projects no
+As implemented, "only fresh facts" is enforced per TypeScript project and
+checker-input fingerprint. The sidecar returns the complete input manifest for
+each project. Indexed repository/workspace sources are compared with canonical
+file hashes; the TypeScript package, `tsconfig` chain, ambient/generated
+declarations, and other unindexed paths are rehashed from disk. Drift in any
+input retires every fact produced by that project while leaving independent
+projects available. This covers transitive type inputs: changing file A
+suppresses a fact in file B when A participated in B's checker answer.
+
+`jscout watch --enrich` makes replenishment automatic. Each relevant event is
+debounced, indexed first (which rebuilds without stale project edges), then
+enriched. A checker failure leaves those edges suppressed and is retried after
+the next relevant event. Because the fingerprint hashes machine-absolute
+paths, a database moved to another path or host never revalidates and projects no
 checker edges until enrichment runs there — enrichment is host-local by design.
 
 Verification follows the gateway precedent: fake-sidecar protocol,
