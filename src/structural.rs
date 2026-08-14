@@ -882,9 +882,18 @@ fn project_references(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, start, line, kind, confidence,
-                target_request, target_name, local, detail
-         FROM refs ORDER BY file_id, start, id",
+        "SELECT reference.id, reference.file_id, reference.start, reference.line,
+                reference.kind, reference.confidence, reference.target_request,
+                reference.target_name, reference.local, reference.detail,
+                member_call.rowid
+         FROM refs reference
+         LEFT JOIN member_calls member_call
+           ON member_call.file_id=reference.file_id
+          AND member_call.receiver_start=reference.start
+          AND member_call.prop=reference.target_name
+          AND reference.local=0
+          AND reference.detail LIKE 'via namespace %'
+         ORDER BY reference.file_id, reference.start, reference.id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -898,10 +907,23 @@ fn project_references(
             r.get::<_, String>(7)?,
             r.get::<_, i64>(8)? != 0,
             r.get::<_, Option<String>>(9)?,
+            r.get::<_, Option<i64>>(10)?,
         ))
     })?;
     for row in rows {
-        let (id, file_id, start, line, kind, confidence, request, name, local, detail) = row?;
+        let (
+            id,
+            file_id,
+            start,
+            line,
+            kind,
+            confidence,
+            request,
+            name,
+            local,
+            detail,
+            member_call_id,
+        ) = row?;
         let Some(path) = files.get(&file_id) else {
             continue;
         };
@@ -973,15 +995,22 @@ fn project_references(
         } else {
             "semantic+resolver"
         };
-        let edge_detail = json!({
+        let mut edge_detail = json!({
             "request": &request,
             "targetName": &name,
             "detail": &detail,
             "ambiguousTarget": targets.ambiguous,
             "candidateCount": targets.keys.len(),
             "candidates": targets.ambiguous.then_some(&targets.keys),
-        })
-        .to_string();
+        });
+        // Namespace imports are the one member-call shape whose property
+        // target the deterministic reference resolver already identifies
+        // exactly. Carry the occurrence identity so checker planning can
+        // avoid asking TypeScript the same question again.
+        if let Some(member_call_id) = member_call_id {
+            edge_detail["memberCallId"] = member_call_id.into();
+        }
+        let edge_detail = edge_detail.to_string();
         for target in &targets.keys {
             insert_edge.execute(params![
                 source,

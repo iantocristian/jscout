@@ -703,8 +703,9 @@ per-project batches, one disposable Program worker per project, once-per-project
 source mapping, durable batch staging/resume, controlled partial activation,
 input/target/snapshot rechecks, resource progress, and synchronous worker-crash
 details. Unit, protocol, projection, and small end-to-end gates pass. The
-n8n full-plan dry run selects all 121,705 eligible occurrences from 284,183
-discovered across 235 owning/inferred projects in 4.8 seconds; a real bounded
+n8n full-plan dry run selects all 121,060 eligible occurrences from 284,183
+discovered across 234 owning/inferred projects in 5.6 seconds after excluding
+645 exact namespace-member calls already answered by the structural resolver; a real bounded
 100-occurrence/three-project slice completes 300 project answers in three
 protocol requests while reclaiming each worker between projects. The full real
 n8n/Twenty runs and sustained-churn G12 coordinator gate remain open, so the
@@ -748,8 +749,10 @@ The default plan:
 
 - includes `repository`/`workspace` production and unknown-role files;
 - excludes test, fixture, generated, and documentation roles unless selected;
-- excludes occurrences already explained by a direct `certain` or `likely`
-  structural edge;
+- excludes occurrences already explained by a direct, occurrence-bound
+  `certain` or `likely` structural edge (currently including namespace-member
+  calls resolved through the module/export graph); line or name coincidence is
+  never sufficient;
 - requires at least one current property-hub target candidate;
 - ranks exported/entity/workflow boundaries and watcher-supplied changed files
   ahead of unanchored internal calls;
@@ -815,7 +818,10 @@ bounded retention policy and never enters `resolved_edges`.
 
 One failed project does not erase successful work from unrelated projects. Its
 occurrences publish no targeted edge, its coverage is recorded as failed, and
-the command reports partial failure. An occurrence owned by a failed,
+the command reports partial failure. Partial activation requires at least one
+completed project; an all-failed run exits non-zero and cannot retire a
+previously active batch. A zero-fact partial run likewise cannot replace an
+existing active batch for the same snapshot. An occurrence owned by a failed,
 cancelled, or unprocessed project cannot receive a `likely` checker edge from a
 different owner; it remains on the `possible` fallback unless every owning
 project needed by the confidence decision completed. Malformed or internally
@@ -840,6 +846,11 @@ and publication time.
 `checker doctor` reports overlapping-project counts and largest configured
 projects so an operator can see likely cost before execution. Heap overrides
 remain diagnostic escape hatches, not the scalability mechanism.
+
+One Ctrl-C cancels the active project worker and aborts the complete enrichment
+operation; it is never converted into failed-project coverage followed by work
+on later projects or partial activation. Already staged batches stay inactive
+and resumable. A second Ctrl-C remains the forced-exit path.
 
 `watch --enrich` uses the same planner, batching, staging, and optional explicit
 `--max-occurrences` machinery. Changed files in the current generation define
@@ -879,6 +890,9 @@ until this correction is implemented.
   per occurrence;
 - overlapping projects preserve ambiguity and a failed owner prevents an
   unjustified `likely` edge;
+- an all-failed run and a zero-fact partial run preserve the previously active
+  batch, while one Ctrl-C stops the project loop without activating partial
+  coverage;
 - killing the checker after staged progress and rerunning resumes the exact
   snapshot/plan without redoing committed batches or exposing staging rows;
 - a source, target, config, ambient declaration, or TypeScript-runtime change

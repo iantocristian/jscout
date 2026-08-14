@@ -126,12 +126,24 @@ fn request_interrupt_cancellation() -> bool {
         .unwrap_or(false)
 }
 
+/// Start one top-level checker operation. Per-project sidecars may replace the
+/// active cancel target, but they must not clear an interrupt that already
+/// canceled an earlier project in the same operation.
+pub(crate) fn begin_interrupt_scope() -> Result<(), CheckerError> {
+    install_interrupt_handler()?;
+    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+pub(crate) fn interrupt_pending() -> bool {
+    INTERRUPT_PENDING.load(Ordering::SeqCst)
+}
+
 fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
     install_interrupt_handler()?;
     *INTERRUPT_CONTROL
         .lock()
         .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
-    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -142,7 +154,6 @@ fn unregister_interrupt_control(writer: &Arc<Writer>) {
             .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
     {
         *registered = None;
-        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -238,9 +249,9 @@ impl ProcessChecker {
         }
     }
 
-    /// Install the process-wide Ctrl-C router once and point it at this
-    /// sidecar. Re-registering is safe, which lets watch mode launch repeated
-    /// bounded enrichment passes in one process.
+    /// Point the process-wide Ctrl-C router at this sidecar. Registering a new
+    /// per-project worker deliberately preserves the enclosing operation's
+    /// interrupt state; `begin_interrupt_scope` resets it once per pass.
     pub fn register_interrupts(&self) -> Result<(), CheckerError> {
         register_interrupt_control(self.control())
     }

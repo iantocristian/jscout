@@ -127,6 +127,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if options.max_occurrences == Some(0) {
         bail!("--max-occurrences must be greater than zero");
     }
+    super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
     let canonical_root = fs::canonicalize(root)
         .with_context(|| format!("repository root does not exist: {}", root.display()))?;
     let conn = match options.database {
@@ -259,6 +260,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut failed_projects = Vec::new();
 
     for (project_index, (project_id, occurrences)) in project_plan.iter().enumerate() {
+        if super::process::interrupt_pending() {
+            bail!("checker enrichment interrupted; staged work retained");
+        }
         if project_complete_and_fresh(&canonical_root, &conn, batch_id, project_id)? {
             occurrences_resumed += occurrences.len();
             continue;
@@ -299,10 +303,19 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut peak_heap_bytes,
         );
         if let Err(error) = project_result {
+            if project_was_interrupted(&error) {
+                bail!(
+                    "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
+                );
+            }
             mark_project_failed(&conn, batch_id, project_id, occurrences, &error.to_string())?;
             eprintln!("checker enrichment: project {project_id} failed: {error:#}");
             failed_projects.push(project_id.clone());
         }
+    }
+
+    if super::process::interrupt_pending() {
+        bail!("checker enrichment interrupted before activation; staged work retained");
     }
 
     if !failed_projects.is_empty() {
@@ -343,6 +356,16 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         peak_rss_bytes,
         peak_heap_bytes,
     })
+}
+
+fn project_was_interrupted(error: &anyhow::Error) -> bool {
+    super::process::interrupt_pending() || canceled_checker_error(error)
+}
+
+fn canceled_checker_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<super::process::CheckerError>()
+        .is_some_and(|error| matches!(error, super::process::CheckerError::Canceled(_)))
 }
 
 fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
@@ -912,6 +935,8 @@ fn execute_project(
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
     let mut project_fingerprint: Option<String> = None;
+    let mut project_peak_rss_bytes = 0;
+    let mut project_peak_heap_bytes = 0;
     let mut offset = 0;
     while offset < occurrences.len() {
         let mut end = (offset + MAX_BATCH_ITEMS).min(occurrences.len());
@@ -965,8 +990,10 @@ fn execute_project(
         } else {
             project_fingerprint = Some(result.checker_input_fingerprint.clone());
         }
-        *peak_rss_bytes = (*peak_rss_bytes).max(result.resources.rss_bytes);
-        *peak_heap_bytes = (*peak_heap_bytes).max(result.resources.heap_used_bytes);
+        project_peak_rss_bytes = project_peak_rss_bytes.max(result.resources.rss_bytes);
+        project_peak_heap_bytes = project_peak_heap_bytes.max(result.resources.heap_used_bytes);
+        *peak_rss_bytes = (*peak_rss_bytes).max(project_peak_rss_bytes);
+        *peak_heap_bytes = (*peak_heap_bytes).max(project_peak_heap_bytes);
         let mut facts = Vec::new();
         let mut projects = Vec::new();
         for (occurrence, item) in batch.iter().zip(&result.results) {
@@ -1015,8 +1042,8 @@ fn execute_project(
         project_id,
         &fingerprint,
         &validation.inputs,
-        *peak_rss_bytes,
-        *peak_heap_bytes,
+        project_peak_rss_bytes,
+        project_peak_heap_bytes,
     )
 }
 
@@ -1226,6 +1253,33 @@ fn activate_staging_batch(
         )?;
         if pending != 0 || (!allow_failed_projects && failed != 0) {
             bail!("checker staging batch has {pending} pending and {failed} failed project(s)");
+        }
+        let completed: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1 AND status='completed'",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if completed == 0 {
+            bail!(
+                "checker staging batch has no completed projects; the previously active batch was retained"
+            );
+        }
+        let staged_facts: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        let previous_active: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_enrichment_batches
+             WHERE active=1 AND source_snapshot=?1 AND id!=?2",
+            params![snapshot, batch_id],
+            |row| row.get(0),
+        )?;
+        if staged_facts == 0 && previous_active != 0 {
+            bail!(
+                "checker staging batch has no targeted facts; the previously active batch was retained"
+            );
         }
         let malformed_completed: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
@@ -1782,6 +1836,57 @@ mod tests {
     }
 
     #[test]
+    fn checker_cancellation_is_an_operation_interrupt_not_a_failed_project() {
+        let canceled = anyhow::Error::new(super::super::process::CheckerError::Canceled(
+            "requested".into(),
+        ));
+        assert!(canceled_checker_error(&canceled));
+
+        let failed = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "checker_crash".into(),
+            message: "worker failed".into(),
+        });
+        assert!(!canceled_checker_error(&failed));
+    }
+
+    #[test]
+    fn namespace_member_resolved_by_the_structural_graph_is_not_requeried() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("library.ts"),
+            "export function run(): void {}\n",
+        )?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import * as library from './library';\nlibrary.run();\n",
+        )?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+
+        let calls = load_occurrences(&conn)?;
+        let call = calls
+            .iter()
+            .find(|occurrence| occurrence.member == "run")
+            .expect("namespace member call");
+        assert!(call.deterministically_resolved);
+        let call_id = call.id;
+        assert!(select_eligible(calls.clone(), &options()).is_empty());
+
+        let mut all = options();
+        all.include_all = true;
+        assert_eq!(select_eligible(calls, &all).len(), 1);
+        let bound_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE confidence IN ('certain', 'likely')
+               AND CAST(json_extract(detail_json, '$.memberCallId') AS INTEGER)=?1",
+            [call_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(bound_edges, 1);
+        Ok(())
+    }
+
+    #[test]
     fn manual_default_keeps_all_one_hundred_fifty_thousand_eligible_occurrences() {
         let occurrences = (0..150_000)
             .map(|id| {
@@ -1918,6 +2023,97 @@ mod tests {
             "the partial active batch must remain the resume target"
         );
         assert!(completed_occurrences(&conn, batch_id, "tsconfig.failed.json")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn all_failed_batch_cannot_replace_a_healthy_active_batch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+
+        let healthy_projects =
+            BTreeMap::from([("tsconfig.healthy.json".into(), vec![occurrence.clone()])]);
+        let healthy_batch = open_staging_batch(
+            &conn,
+            &snapshot,
+            "healthy-plan",
+            &identity,
+            2,
+            1,
+            &healthy_projects,
+        )?;
+        let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let answer = project_answer("tsconfig.healthy.json", vec![declaration]);
+        let outcome = map_occurrence(&conn, &occurrence, &[answer])?;
+        stage_batch(
+            &conn,
+            healthy_batch,
+            "tsconfig.healthy.json",
+            std::slice::from_ref(&occurrence),
+            &outcome.facts,
+            &outcome.projects,
+        )?;
+        complete_project(
+            repo.path(),
+            &conn,
+            healthy_batch,
+            "tsconfig.healthy.json",
+            "tsconfig.healthy.json-inputs",
+            &[super::super::protocol::CheckerInputFile {
+                path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+                source_hash: hash,
+            }],
+            1,
+            1,
+        )?;
+        assert_eq!(
+            activate_staging_batch(repo.path(), &conn, healthy_batch, &snapshot, false)?,
+            1
+        );
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+
+        let failed_projects =
+            BTreeMap::from([("tsconfig.failed.json".into(), vec![occurrence.clone()])]);
+        let failed_batch = open_staging_batch(
+            &conn,
+            &snapshot,
+            "failed-plan",
+            &identity,
+            2,
+            1,
+            &failed_projects,
+        )?;
+        mark_project_failed(
+            &conn,
+            failed_batch,
+            "tsconfig.failed.json",
+            std::slice::from_ref(&occurrence),
+            "synthetic failure",
+        )?;
+        let error = activate_staging_batch(repo.path(), &conn, failed_batch, &snapshot, true)
+            .expect_err("an all-failed batch must not activate");
+        assert!(error.to_string().contains("no completed projects"));
+
+        let active_batch: i64 = conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(active_batch, healthy_batch);
+        let live_edges: i64 = conn.query_row(
+            "SELECT count(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(live_edges, 1);
         Ok(())
     }
 
