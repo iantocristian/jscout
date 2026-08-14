@@ -304,6 +304,9 @@ enum Command {
         /// Restrict semantic overlay types (cards are excluded by default)
         #[arg(long = "semantic-type", value_delimiter = ',')]
         semantic_types: Vec<String>,
+        /// Maximum current reconnaissance classifications with cited explanations
+        #[arg(long, default_value_t = 12)]
+        reconnaissance_limit: usize,
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = 24_000)]
         response_bytes: usize,
@@ -932,6 +935,7 @@ fn main() -> Result<()> {
             semantic,
             semantic_limit,
             semantic_types,
+            reconnaissance_limit,
             response_bytes,
             database,
         } => {
@@ -945,6 +949,7 @@ fn main() -> Result<()> {
                     include_semantic: semantic,
                     semantic_limit,
                     semantic_types,
+                    reconnaissance_limit,
                     response_byte_limit: response_bytes,
                 },
             )?;

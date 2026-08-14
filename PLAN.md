@@ -163,7 +163,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v20; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v21; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -1312,8 +1312,10 @@ roles:
 Each bounded evidence pack includes manifests and scripts, config
 `extends`/`references`/`include`/`exclude`, file-kind and language counts,
 representative outlines, imports/exports, and deterministic entity/relation
-summaries. Current `production`/`documentation` labels are excluded from the
-prompt so the scout cannot merely repeat the heuristic under review.
+summaries. Ambiguous `production`/`documentation`/`unknown` labels are excluded
+from the prompt so the scout cannot merely repeat the heuristic under review.
+Whole-scope counts expose only the high-precision surfaces `handwritten`,
+`test`, `fixture`, and `generated`; representative content remains bounded.
 
 The scout publishes immutable, fingerprinted scope/project classifications:
 
@@ -1341,6 +1343,10 @@ immutable prior result without another model call.
 Classifications are policy metadata, not graph facts. Files are never deleted
 from L1. Only current, fresh classifications affect downstream defaults:
 
+- deterministic artifact role, scouted scope role, and derived effective role
+  are separate. `test`, `fixture`, and `generated` are protected facts; a
+  runtime scope may rescue ambiguous documentation/unknown files but cannot
+  promote protected artifacts into the product corpus;
 - primary search applies a penalty to auxiliary scopes but retains recall and
   supports explicit inclusion. The penalty is applied once to the final fused
   or reranked order, not compounded independently in each retrieval arm;
@@ -1354,6 +1360,21 @@ from L1. Only current, fresh classifications affect downstream defaults:
   inclusion rather than silently hiding code. Index-time policy reconciliation
   is fail-neutral: it warns and clears the disposable policy projection rather
   than allowing optional semantic metadata to block L1 publication.
+
+For package/area subjects, whole-scope artifact counts guide rather than
+constrain classification. `unknown`/`possible` remains legal, and co-located
+tests, fixtures, or generated output do not alone require `mixed`; deterministic
+effective roles already protect those files. `mixed` represents multiple
+semantic purposes worth bounded subdivision. Project classification continues
+to describe why the configuration exists and is not forced mixed by member
+file kinds. Duplicate valid citations are removed in model order and valid
+citations after the first eight are truncated locally; unknown or empty
+citations fail closed. The disposable current-classification projection keeps
+explanations and bounded cited evidence for `repository_overview`, including
+neutral mixed/unknown results and protected-role conflicts. When durable
+history exists but no scope classification matches current evidence, overview
+reports the stale/upgrade state and the explicit re-scout command; a zero
+reconnaissance limit omits the overlay entirely.
 
 The implementation includes a dry-run showing every planned subject,
 classification input, subdivision depth/budget decision, reuse/freshness

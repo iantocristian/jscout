@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-pub const EVIDENCE_ALGORITHM: &str = "repository-recon-evidence/v2";
+pub const EVIDENCE_ALGORITHM: &str = "repository-recon-evidence/v3";
 pub const REPRESENTATIVE_FILE_LIMIT: usize = 8;
 pub const ROLES: &[&str] = &[
     "runtime",
@@ -106,6 +106,15 @@ pub struct NewClassification<'a> {
 pub struct FilePolicy {
     pub classification_id: i64,
     pub subject_key: String,
+    pub scope_role: String,
+    pub effective_role: String,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectPolicy {
+    pub classification_id: i64,
+    pub subject_key: String,
     pub role: String,
     pub depth: usize,
 }
@@ -114,13 +123,18 @@ pub struct FilePolicy {
 struct PolicyCandidate {
     id: i64,
     subject_key: String,
+    subject_kind: String,
     selector: SubjectSelector,
     selector_json: String,
     role: String,
     confidence: String,
+    explanation: String,
+    citations_json: String,
+    cited_evidence_json: String,
     parent_subject_key: Option<String>,
     depth: usize,
     evidence_fingerprint: String,
+    prompt_version: String,
 }
 
 pub fn build_scope_state(
@@ -270,9 +284,12 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
     let candidates = {
         let mut statement = conn.prepare(
             "SELECT classification.id, classification.subject_key,
-                    classification.selector_json, classification.role,
-                    classification.confidence, classification.parent_subject_key,
-                    classification.depth, classification.evidence_fingerprint
+                    classification.subject_kind, classification.selector_json,
+                    classification.role, classification.confidence,
+                    classification.explanation, classification.citations_json,
+                    classification.cited_evidence_json,
+                    classification.parent_subject_key, classification.depth,
+                    classification.evidence_fingerprint, run.prompt_version
              FROM repository_classifications classification
              JOIN scout_runs run ON run.id=classification.run_id
              WHERE run.status='completed'
@@ -280,7 +297,7 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
              ORDER BY classification.id DESC",
         )?;
         let rows = statement.query_map([], |row| {
-            let selector_json = row.get::<_, String>(2)?;
+            let selector_json = row.get::<_, String>(3)?;
             let selector = serde_json::from_str(&selector_json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     selector_json.len(),
@@ -291,13 +308,18 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
             Ok(PolicyCandidate {
                 id: row.get(0)?,
                 subject_key: row.get(1)?,
+                subject_kind: row.get(2)?,
                 selector_json,
                 selector,
-                role: row.get(3)?,
-                confidence: row.get(4)?,
-                parent_subject_key: row.get(5)?,
-                depth: row.get::<_, i64>(6)? as usize,
-                evidence_fingerprint: row.get(7)?,
+                role: row.get(4)?,
+                confidence: row.get(5)?,
+                explanation: row.get(6)?,
+                citations_json: row.get(7)?,
+                cited_evidence_json: row.get(8)?,
+                parent_subject_key: row.get(9)?,
+                depth: row.get::<_, i64>(10)? as usize,
+                evidence_fingerprint: row.get(11)?,
+                prompt_version: row.get(12)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -355,11 +377,13 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
                 .and_then(|(parent_candidate, _)| parent_candidate.parent_subject_key.as_ref());
         }
     }
-    let mut selected = current
+    let active = current
         .into_iter()
-        .filter_map(|(subject, value)| {
-            (actionable(&value.0) && !suppressed.contains(&subject)).then_some(value)
-        })
+        .filter_map(|(subject, value)| (!suppressed.contains(&subject)).then_some(value))
+        .collect::<Vec<_>>();
+    let mut selected = active
+        .iter()
+        .filter(|(candidate, _)| actionable(candidate))
         .collect::<Vec<_>>();
     selected.sort_by(|(left, _), (right, _)| {
         left.selector
@@ -372,25 +396,88 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
         conn.execute("DELETE FROM repository_file_policy", [])?;
+        conn.execute("DELETE FROM repository_current_classifications", [])?;
+        let file_roles = {
+            let mut statement = conn.prepare("SELECT id, role FROM files ORDER BY id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<BTreeMap<_, _>, _>>()?
+        };
+        let mut current_statement = conn.prepare_cached(
+            "INSERT INTO repository_current_classifications(
+               classification_id,subject_key,subject_kind,role,confidence,
+               explanation,citations_json,cited_evidence_json,member_count,
+               deterministic_roles_json,effective_roles_json,conflict_files,
+               depth,prompt_version
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        )?;
+        for (classification, members) in &active {
+            let is_actionable = actionable(classification);
+            let mut deterministic_counts = BTreeMap::<String, usize>::new();
+            let mut effective_counts = BTreeMap::<String, usize>::new();
+            let mut conflicts = 0;
+            for member in members {
+                let deterministic = file_roles
+                    .get(&member.id)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                *deterministic_counts
+                    .entry(deterministic.into())
+                    .or_default() += 1;
+                let effective = if is_actionable {
+                    effective_file_role(deterministic, &classification.role)
+                } else {
+                    deterministic
+                };
+                *effective_counts.entry(effective.into()).or_default() += 1;
+                if is_actionable && effective != classification.role {
+                    conflicts += 1;
+                }
+            }
+            current_statement.execute(params![
+                classification.id,
+                classification.subject_key,
+                classification.subject_kind,
+                classification.role,
+                classification.confidence,
+                classification.explanation,
+                classification.citations_json,
+                classification.cited_evidence_json,
+                members.len() as i64,
+                serde_json::to_string(&deterministic_counts)?,
+                serde_json::to_string(&effective_counts)?,
+                conflicts,
+                classification.depth as i64,
+                classification.prompt_version,
+            ])?;
+        }
         let mut statement = conn.prepare_cached(
             "INSERT INTO repository_file_policy(
-               file_id, classification_id, subject_key, role, source_hash, depth
-             ) VALUES(?1,?2,?3,?4,?5,?6)
+               file_id,classification_id,subject_key,scope_role,effective_role,
+               source_hash,depth
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(file_id) DO UPDATE SET
                classification_id=excluded.classification_id,
                subject_key=excluded.subject_key,
-               role=excluded.role,
+               scope_role=excluded.scope_role,
+               effective_role=excluded.effective_role,
                source_hash=excluded.source_hash,
                depth=excluded.depth",
         )?;
         let mut written = 0;
         for (classification, members) in &selected {
             for member in members {
+                let deterministic = file_roles
+                    .get(&member.id)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
                 statement.execute(params![
                     member.id,
                     classification.id,
                     classification.subject_key,
                     classification.role,
+                    effective_file_role(deterministic, &classification.role),
                     member.hash,
                     classification.depth as i64,
                 ])?;
@@ -416,7 +503,12 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
 /// projection and keep the freshly published structural index fully usable.
 pub fn reconcile_file_policy_after_index(root: &Path, conn: &Connection) {
     if let Err(error) = reconcile_file_policy(root, conn) {
-        let clear_error = conn.execute("DELETE FROM repository_file_policy", []).err();
+        let clear_error = conn
+            .execute_batch(
+                "DELETE FROM repository_file_policy;
+                 DELETE FROM repository_current_classifications;",
+            )
+            .err();
         eprintln!(
             "repository reconnaissance policy unavailable after index; using neutral defaults: {error}"
         );
@@ -425,6 +517,18 @@ pub fn reconcile_file_policy_after_index(root: &Path, conn: &Connection) {
                 "failed to clear repository reconnaissance policy after reconciliation error: {clear_error}"
             );
         }
+    }
+}
+
+/// Combine the high-precision deterministic artifact role with the semantic
+/// purpose of its containing scope. Test, fixture, and generated are hard
+/// artifact facts; a coarse runtime classification must not erase them.
+/// Documentation and unknown remain intentionally overridable because those
+/// bootstrap labels are ambiguous in document-domain repositories.
+pub fn effective_file_role<'a>(deterministic_role: &'a str, scope_role: &'a str) -> &'a str {
+    match deterministic_role {
+        "test" | "fixture" | "generated" => deterministic_role,
+        _ => scope_role,
     }
 }
 
@@ -439,7 +543,8 @@ fn actionable(candidate: &PolicyCandidate) -> bool {
 pub fn file_policy_by_path(conn: &Connection, path: &str) -> Result<Option<FilePolicy>> {
     Ok(conn
         .query_row(
-            "SELECT policy.classification_id, policy.subject_key, policy.role, policy.depth
+            "SELECT policy.classification_id, policy.subject_key,
+                    policy.scope_role, policy.effective_role, policy.depth
              FROM repository_file_policy policy
              JOIN files file ON file.id=policy.file_id
              WHERE file.path=?1",
@@ -448,8 +553,9 @@ pub fn file_policy_by_path(conn: &Connection, path: &str) -> Result<Option<FileP
                 Ok(FilePolicy {
                     classification_id: row.get(0)?,
                     subject_key: row.get(1)?,
-                    role: row.get(2)?,
-                    depth: row.get::<_, i64>(3)? as usize,
+                    scope_role: row.get(2)?,
+                    effective_role: row.get(3)?,
+                    depth: row.get::<_, i64>(4)? as usize,
                 })
             },
         )
@@ -465,11 +571,13 @@ pub fn effective_runtime(
         .map(|path| file_policy_by_path(conn, path))
         .transpose()?
         .flatten();
-    Ok(match policy.as_ref().map(|policy| policy.role.as_str()) {
-        Some("runtime") => true,
-        Some(role) if is_auxiliary(role) => false,
-        _ => deterministic_role == Some("production"),
-    })
+    Ok(
+        match policy.as_ref().map(|policy| policy.effective_role.as_str()) {
+            Some("runtime") => true,
+            Some(role) if is_auxiliary(role) => false,
+            _ => deterministic_role == Some("production"),
+        },
+    )
 }
 
 pub fn project_policy(
@@ -477,7 +585,7 @@ pub fn project_policy(
     project_id: &str,
     membership_fingerprint: &str,
     config_fingerprint: &str,
-) -> Result<Option<FilePolicy>> {
+) -> Result<Option<ProjectPolicy>> {
     let policy = conn
         .query_row(
             "SELECT classification.id, classification.subject_key,
@@ -498,7 +606,7 @@ pub fn project_policy(
             ],
             |row| {
                 Ok((
-                    FilePolicy {
+                    ProjectPolicy {
                         classification_id: row.get(0)?,
                         subject_key: row.get(1)?,
                         role: row.get(2)?,
@@ -522,7 +630,7 @@ pub fn project_policy(
 pub fn chunk_policy_penalty(conn: &Connection, chunk_id: i64) -> Result<f64> {
     let role = conn
         .query_row(
-            "SELECT policy.role
+            "SELECT policy.effective_role
              FROM chunks chunk
              JOIN repository_file_policy policy ON policy.file_id=chunk.file_id
              WHERE chunk.id=?1",
@@ -740,7 +848,7 @@ mod tests {
             model: "gpt-5.6-terra".into(),
             billing_path: "plan".into(),
             reasoning: None,
-            prompt_version: "repository-recon/v1".into(),
+            prompt_version: "repository-recon/v2".into(),
             source_snapshot: "snapshot".into(),
             input_fingerprint: fingerprint.into(),
             request_hash: "request".into(),
@@ -840,7 +948,9 @@ mod tests {
         ledger::finish_run(&conn, run_id, RunOutcome::Completed, None, None)?;
         assert_eq!(reconcile_file_policy(repo.path(), &conn)?, 1);
         assert_eq!(
-            file_policy_by_path(&conn, "docs/read.ts")?.unwrap().role,
+            file_policy_by_path(&conn, "docs/read.ts")?
+                .unwrap()
+                .effective_role,
             "documentation"
         );
 
@@ -867,7 +977,9 @@ mod tests {
         crate::indexer::index_repo(repo.path(), &conn)?;
         assert_eq!(reconcile_file_policy(repo.path(), &conn)?, 1);
         assert_eq!(
-            file_policy_by_path(&conn, "docs/read.ts")?.unwrap().role,
+            file_policy_by_path(&conn, "docs/read.ts")?
+                .unwrap()
+                .effective_role,
             "documentation"
         );
 
@@ -1037,7 +1149,7 @@ mod tests {
         assert_eq!(
             file_policy_by_path(&conn, "mixed/docs/guide.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "documentation"
         );
 
@@ -1054,7 +1166,7 @@ mod tests {
         assert_eq!(
             file_policy_by_path(&conn, "mixed/docs/guide.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "runtime"
         );
 
@@ -1071,7 +1183,7 @@ mod tests {
         assert_eq!(
             file_policy_by_path(&conn, "mixed/docs/guide.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "documentation"
         );
         Ok(())
@@ -1165,11 +1277,15 @@ mod tests {
         ledger::finish_run(&conn, doc_run_id, RunOutcome::Completed, None, None)?;
         reconcile_file_policy(repo.path(), &conn)?;
         assert_eq!(
-            file_policy_by_path(&conn, "docs/runtime.ts")?.unwrap().role,
+            file_policy_by_path(&conn, "docs/runtime.ts")?
+                .unwrap()
+                .effective_role,
             "runtime"
         );
         assert_eq!(
-            file_policy_by_path(&conn, "doc/guide.ts")?.unwrap().role,
+            file_policy_by_path(&conn, "doc/guide.ts")?
+                .unwrap()
+                .effective_role,
             "documentation"
         );
 
@@ -1185,6 +1301,80 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.display_name == "start")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_scope_preserves_test_fixture_and_generated_artifact_roles() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("src/fixtures"))?;
+        std::fs::create_dir_all(repo.path().join("src/generated"))?;
+        std::fs::write(repo.path().join("src/run.ts"), "export const run = 1;\n")?;
+        std::fs::write(
+            repo.path().join("src/run.test.ts"),
+            "test('run', () => 1);\n",
+        )?;
+        std::fs::write(
+            repo.path().join("src/fixtures/data.ts"),
+            "export const fixture = 1;\n",
+        )?;
+        std::fs::write(
+            repo.path().join("src/generated/schema.ts"),
+            "// @generated\nexport const schema = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let selector = SubjectSelector::RepositoryArea {
+            scope: "src".into(),
+            direct_only: false,
+        };
+        let state = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:src".into(),
+            selector.clone(),
+        )?;
+        let run_id = run(&conn, "runtime-protected-artifacts")?;
+        persist_classification(
+            &conn,
+            &NewClassification {
+                run_id,
+                subject_key: &state.subject_key,
+                subject_kind: "area",
+                selector: &selector,
+                parent_subject_key: None,
+                depth: 0,
+                role: "runtime",
+                confidence: "likely",
+                explanation: "runtime scope with protected artifacts",
+                citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
+                evidence_fingerprint: &state.evidence_fingerprint,
+                classification_fingerprint: "runtime-protected-artifacts",
+                source_snapshot: "snapshot",
+            },
+        )?;
+        ledger::finish_run(&conn, run_id, RunOutcome::Completed, None, None)?;
+        reconcile_file_policy(repo.path(), &conn)?;
+
+        let cases = [
+            ("src/run.ts", "runtime"),
+            ("src/run.test.ts", "test"),
+            ("src/fixtures/data.ts", "fixture"),
+            ("src/generated/schema.ts", "generated"),
+        ];
+        for (path, expected) in cases {
+            let policy = file_policy_by_path(&conn, path)?.expect("active scope policy");
+            assert_eq!(policy.scope_role, "runtime");
+            assert_eq!(policy.effective_role, expected);
+        }
+        let conflicts: i64 = conn.query_row(
+            "SELECT conflict_files FROM repository_current_classifications
+             WHERE subject_key='area:repository:src'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(conflicts, 3);
         Ok(())
     }
 }

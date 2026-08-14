@@ -339,7 +339,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
         },
         {
             "name": "repository_overview",
-            "description": "Deterministic repository overview: corpus totals, file origins/roles, bounded top-level areas, entity inventory, and structural relation counts. Optionally attaches current fresh semantic artifacts as a separately labelled untrusted overlay.",
+            "description": "Deterministic repository overview with current evidence-cited reconnaissance policy, corpus totals, file origins/roles, bounded areas, entity inventory, and structural relation counts. Optionally attaches current fresh semantic memory as a separate untrusted overlay.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -349,6 +349,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "include_semantic": { "type": "boolean", "default": false },
                     "semantic_limit": { "type": "integer", "default": 8, "minimum": 1, "maximum": 100 },
                     "semantic_types": { "type": "array", "items": { "type": "string", "enum": ["workflow", "card", "concept", "summary", "annotation"] }, "description": "Defaults to summaries, concepts, workflows, and annotations; cards require explicit opt-in" },
+                    "reconnaissance_limit": { "type": "integer", "default": 12, "minimum": 0, "maximum": 100 },
                     "response_bytes": { "type": "integer", "default": 24000 }
                 }
             }
@@ -819,6 +820,9 @@ fn call_tool(
                     semantic_limit: (args["semantic_limit"].as_u64().unwrap_or(8) as usize)
                         .min(100),
                     semantic_types: json_string_array(args, "semantic_types"),
+                    reconnaissance_limit: (args["reconnaissance_limit"].as_u64().unwrap_or(12)
+                        as usize)
+                        .min(100),
                     response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
                 },
             )?;

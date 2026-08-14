@@ -3164,7 +3164,7 @@ fn failed_report(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::time::Duration;
 
@@ -3326,6 +3326,7 @@ mod tests {
             member_count: state.members.len(),
             language_counts: Default::default(),
             chunk_kind_counts: Default::default(),
+            surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
             items: vec![EvidenceItem {
                 id: "E001".into(),
                 kind: "aggregate".into(),
@@ -3386,13 +3387,13 @@ mod tests {
         assert_eq!(
             recon::file_policy_by_path(&conn, "mixed/runtime.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "runtime"
         );
         assert_eq!(
             recon::file_policy_by_path(&conn, "mixed/docs/guide.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "documentation"
         );
         let cited: String = conn.query_row(
@@ -3495,6 +3496,7 @@ mod tests {
                     member_count: state.members.len(),
                     language_counts: Default::default(),
                     chunk_kind_counts: Default::default(),
+                    surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
                     items: vec![EvidenceItem {
                         id: "E001".into(),
                         kind: "aggregate".into(),
@@ -3555,7 +3557,7 @@ mod tests {
         assert_eq!(
             recon::file_policy_by_path(&conn, "src/run.ts")?
                 .unwrap()
-                .role,
+                .effective_role,
             "runtime"
         );
         Ok(())

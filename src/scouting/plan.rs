@@ -845,7 +845,8 @@ fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>
          JOIN files file ON file.id=node.file_id
          LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
-           AND (policy.role='runtime' OR (policy.file_id IS NULL AND file.role='production'))
+           AND (policy.effective_role='runtime'
+             OR (policy.file_id IS NULL AND file.role='production'))
            AND file.origin IN ('repository','workspace')
          ORDER BY node.node_key",
     )?;
@@ -917,7 +918,8 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
          JOIN files file ON file.id=node.file_id
          LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
-           AND (policy.role='runtime' OR (policy.file_id IS NULL AND file.role='production'))
+           AND (policy.effective_role='runtime'
+             OR (policy.file_id IS NULL AND file.role='production'))
            AND file.origin IN ('repository','workspace')
          ORDER BY node.node_key",
     )?;
@@ -974,7 +976,8 @@ fn runtime_boundary_endpoints(conn: &Connection) -> Result<BTreeMap<String, Vec<
                 src.node_kind, dst.node_kind,
                 COALESCE(src_file.role, ''), COALESCE(src_file.origin, ''),
                 COALESCE(dst_file.role, ''), COALESCE(dst_file.origin, ''),
-                COALESCE(src_policy.role, ''), COALESCE(dst_policy.role, '')
+                COALESCE(src_policy.effective_role, ''),
+                COALESCE(dst_policy.effective_role, '')
          FROM resolved_edges edge
          JOIN graph_nodes src ON src.node_key=edge.src_key
          JOIN graph_nodes dst ON dst.node_key=edge.dst_key

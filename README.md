@@ -165,10 +165,11 @@ the neutral structural index and optional expensive work. It classifies exact
 workspace packages, unowned directory areas, and configured TypeScript/JavaScript
 projects as `runtime`, `tooling`, `documentation`, `test`, `generated`, `mixed`,
 or `unknown`. The model receives manifests/configuration, aggregate file kinds,
-and bounded representative outlines/imports/exports/entities. It does not
-receive the indexer's existing file-role labels, so a directory called `docs`
-can still be classified as runtime when its evidence says that it implements
-the product.
+and bounded representative outlines/imports/exports/entities. Ambiguous
+documentation/unknown path labels remain hidden. Whole-scope counts expose
+only the high-precision artifact surfaces `handwritten`, `test`, `fixture`,
+and `generated`, so the scout can recognize material outside the representative
+sample without treating a directory name as semantic truth.
 
 Run the deterministic inspection first:
 
@@ -191,6 +192,12 @@ directories plus a direct-file residual. One command shares `--max-calls`,
 `--max-subjects` (default 256), `--max-depth` (default 3), and
 `--context-bytes` across the entire recursive plan. Reaching a bound leaves the
 unresolved subject neutral; it never invents a narrower role.
+Whole-scope artifact counts guide classification but do not constrain the
+answer: `unknown`/`possible` is always legal, and co-located tests, fixtures, or
+generated output do not by themselves make a runtime package `mixed`.
+`mixed` means that the evidence supports multiple semantic purposes worth
+bounded subdivision. Deterministic per-file roles protect auxiliary artifacts
+whether or not subdivision is useful.
 When a later scout gives a parent scope a definite role, that parent controls
 the current projection and suppresses policy from descendants created by an
 older `mixed` result. The descendant rows remain immutable history and can
@@ -204,6 +211,10 @@ evidence or membership change in the subject restores neutral fallback, and a
 return to an identical branch fingerprint reuses the prior run without another
 model call. Only fresh `likely` classifications affect defaults:
 
+- deterministic file role and scouted scope role remain separate. The derived
+  effective role protects `test`, `fixture`, and `generated` from a coarse
+  runtime override; runtime may rescue ambiguous `documentation`/`unknown`,
+  while auxiliary scope roles may demote otherwise production files;
 - search retains every hit but penalizes auxiliary scopes unless an explicit
   `--file-role` filter is supplied;
 - workflow/card automatic planning excludes auxiliary scopes and permits a
@@ -217,12 +228,26 @@ model call. Only fresh `likely` classifications affect defaults:
 Each classification stores the exact cited evidence objects, including the
 bounded content shown to the model, so historical citations remain auditable
 after the source or deterministic pack changes.
+Duplicate valid citations are removed in model order and valid citations after
+the first eight are truncated without another model call. Empty or unknown
+citations still fail validation, and the scouting report records normalization
+counts.
 If policy reconciliation cannot read or validate its optional inputs during
 `index`, jscout warns, clears the disposable policy projection, and keeps the
 new L1 snapshot available with neutral defaults.
-Diagnostic search JSON retains `file_role` and adds `repository_role` only when
-an active reconnaissance policy exists; compact output presents the effective
-role without adding a second metadata field.
+Scout prompt/evidence upgrades can intentionally invalidate earlier
+classifications. When historical scope classifications exist but none match
+current evidence, `repository_overview` reports `no_current_classifications`
+and points to `jscout scout repository` instead of silently omitting the layer.
+Diagnostic search JSON retains deterministic `file_role` and adds the derived
+`repository_role` only when an active reconnaissance policy exists; compact
+output presents the effective role without adding a second metadata field.
+`jscout overview` and MCP `repository_overview` attach a bounded, explicitly
+untrusted `reconnaissance` section whenever current classifications exist. It
+prioritizes mixed/unknown/conflicting scopes and includes role counts, effective
+file counts, explanations, citation IDs, and bounded evidence excerpts. Use
+`--reconnaissance-limit` or MCP `reconnaissance_limit` to cap it; set the limit
+to `0` to omit reconnaissance from the response.
 
 ## TypeScript checker enrichment
 

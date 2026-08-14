@@ -27,13 +27,14 @@ use crate::llm::{GatewayError, LlmGateway};
 use crate::recon::{self, MemberFile, SubjectSelector, SubjectState};
 use crate::{scouting::ledger, structural};
 
-pub const PROMPT_VERSION: &str = "repository-recon/v1";
+pub const PROMPT_VERSION: &str = "repository-recon/v2";
 pub const SUBMIT_TOOL_NAME: &str = "submit_repository_classification";
 pub const DEFAULT_MAX_SUBJECTS: usize = 256;
 pub const DEFAULT_MAX_DEPTH: usize = 3;
 
 const MAX_EXPLANATION_CHARS: usize = 600;
 const MAX_CITATIONS: usize = 8;
+const MAX_CITATION_REPAIR_INPUT: usize = 32;
 const MAX_OUTLINES_PER_FILE: usize = 3;
 const MAX_DISK_EVIDENCE_CHARS: usize = 12_000;
 
@@ -85,6 +86,10 @@ pub struct RepositoryEvidencePack {
     pub member_count: usize,
     pub language_counts: BTreeMap<String, usize>,
     pub chunk_kind_counts: BTreeMap<String, usize>,
+    /// High-precision artifact surfaces across every member file. Ambiguous
+    /// documentation/unknown bootstrap roles are folded into `handwritten`;
+    /// only test, fixture, and generated remain distinct.
+    pub surface_counts: BTreeMap<String, usize>,
     pub items: Vec<EvidenceItem>,
     #[serde(skip)]
     pub rendered: String,
@@ -142,6 +147,8 @@ pub struct ValidatedClassification {
     pub confidence: String,
     pub explanation: String,
     pub citations: Vec<String>,
+    pub duplicate_citations_removed: usize,
+    pub excess_citations_truncated: usize,
 }
 
 #[derive(Debug)]
@@ -174,8 +181,7 @@ pub fn submit_tool_schema(evidence_ids: &[String]) -> Value {
             "evidence": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": MAX_CITATIONS,
-                "uniqueItems": true,
+                "maxItems": MAX_CITATION_REPAIR_INPUT,
                 "items": { "type": "string", "enum": evidence_ids }
             }
         }
@@ -202,28 +208,44 @@ pub fn validate(
     if explanation.chars().count() > MAX_EXPLANATION_CHARS {
         bail!("repository explanation exceeds {MAX_EXPLANATION_CHARS} characters");
     }
-    if submission.evidence.is_empty() || submission.evidence.len() > MAX_CITATIONS {
-        bail!("repository classification requires 1-{MAX_CITATIONS} evidence citations");
+    if submission.evidence.is_empty() {
+        bail!("repository classification requires at least one evidence citation");
+    }
+    if submission.evidence.len() > MAX_CITATION_REPAIR_INPUT {
+        bail!(
+            "repository classification exceeds the {MAX_CITATION_REPAIR_INPUT}-citation repair bound"
+        );
     }
     let known = evidence
         .items
         .iter()
         .map(|item| item.id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut unique = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut citations = Vec::new();
+    let mut duplicate_citations_removed = 0;
+    let mut excess_citations_truncated = 0;
     for citation in &submission.evidence {
         if !known.contains(citation.as_str()) {
             bail!("classification cites unknown evidence `{citation}`");
         }
-        if !unique.insert(citation.clone()) {
-            bail!("classification repeats evidence `{citation}`");
+        if !seen.insert(citation.clone()) {
+            duplicate_citations_removed += 1;
+            continue;
         }
+        if citations.len() == MAX_CITATIONS {
+            excess_citations_truncated += 1;
+            continue;
+        }
+        citations.push(citation.clone());
     }
     Ok(ValidatedClassification {
         role: submission.role.clone(),
         confidence: submission.confidence.clone(),
         explanation: explanation.to_string(),
-        citations: unique.into_iter().collect(),
+        citations,
+        duplicate_citations_removed,
+        excess_citations_truncated,
     })
 }
 
@@ -532,11 +554,18 @@ fn build_evidence(
     }
     let representatives =
         recon::representative_members(&subject.state.members, recon::REPRESENTATIVE_FILE_LIMIT);
-    let member_ids = representatives
+    let representative_ids = representatives
         .iter()
         .map(|member| member.id)
         .collect::<Vec<_>>();
-    let chunk_kind_counts = chunk_kind_counts(conn, &member_ids)?;
+    let member_ids = subject
+        .state
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
+    let chunk_kind_counts = chunk_kind_counts(conn, &representative_ids)?;
+    let surface_counts = surface_counts(conn, &member_ids)?;
     let mut items = Vec::new();
     push_item(
         &mut items,
@@ -545,10 +574,11 @@ fn build_evidence(
         None,
         None,
         format!(
-            "{} indexed files; languages/extensions: {}; sampled AST chunk kinds: {}",
+            "{} indexed files; languages/extensions: {}; sampled AST chunk kinds: {}; whole-scope artifact surfaces: {}",
             subject.state.members.len(),
             render_counts(&language_counts),
             render_counts(&chunk_kind_counts),
+            render_counts(&surface_counts),
         ),
     );
 
@@ -579,11 +609,39 @@ fn build_evidence(
         member_count: subject.state.members.len(),
         language_counts,
         chunk_kind_counts,
+        surface_counts,
         items,
         rendered: String::new(),
     };
     pack.rendered = serde_json::to_string_pretty(&pack)?;
     Ok(pack)
+}
+
+fn surface_counts(conn: &Connection, member_ids: &[i64]) -> Result<BTreeMap<String, usize>> {
+    if member_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ids = serde_json::to_string(member_ids)?;
+    let mut statement = conn.prepare(
+        "SELECT role, count(*) FROM files
+         WHERE id IN (SELECT value FROM json_each(?1))
+         GROUP BY role ORDER BY role",
+    )?;
+    let rows = statement.query_map([ids], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    let mut surfaces = BTreeMap::new();
+    for row in rows {
+        let (role, count) = row?;
+        let surface = match role.as_str() {
+            "test" => "test",
+            "fixture" => "fixture",
+            "generated" => "generated",
+            _ => "handwritten",
+        };
+        *surfaces.entry(surface.into()).or_default() += count;
+    }
+    Ok(surfaces)
 }
 
 fn chunk_kind_counts(conn: &Connection, member_ids: &[i64]) -> Result<BTreeMap<String, usize>> {
@@ -753,7 +811,7 @@ fn build_request(item: &RepositoryPlanItem, options: &RepositoryScoutOptions) ->
         .iter()
         .map(|evidence| evidence.id.clone())
         .collect::<Vec<_>>();
-    let system = "You classify one exact repository scope or TypeScript project from a deterministic evidence pack. Current jscout path-role labels are withheld. Choose runtime, tooling, documentation, test, generated, mixed, or unknown. Use mixed only when materially different child areas coexist and subdivision is necessary; use unknown/possible when the pack is insufficient. Never infer runtime behavior from a directory or config name alone. Cite only supplied evidence IDs and submit exactly once through the tool.".to_string();
+    let system = "You classify one exact repository scope or TypeScript project from a deterministic evidence pack. Ambiguous path-role labels are withheld; whole-scope artifact counts expose only high-precision handwritten/test/fixture/generated distinctions. Choose runtime, tooling, documentation, test, generated, mixed, or unknown. For a package/area, use mixed only when the evidence supports multiple semantic purposes for which one scope role would be materially misleading. Co-located tests, fixtures, or generated artifacts alone do not require mixed because their deterministic per-file roles remain protected. For a project, classify why the configuration exists; mixed member file kinds do not by themselves make the project mixed. Use unknown/possible when the pack is insufficient. Never infer runtime behavior from a directory or config name alone. Cite supplied evidence IDs in relevance order and submit exactly once through the tool.".to_string();
     let user = format!(
         "Subject: {}\nKind: {}\nDisplay: {}\nMembers: {}\n\n{}",
         item.subject_key,
@@ -839,7 +897,7 @@ fn input_fingerprint(
     base_url: Option<&str>,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-repository-recon-input-v1\0");
+    hasher.update(b"jscout-repository-recon-input-v2\0");
     for part in [
         item.subject_key.as_str(),
         item.evidence_fingerprint.as_str(),
@@ -929,6 +987,7 @@ pub fn dry_run_report(
         "notes": [
             "current_classification reports subject-local freshness independent of the structural snapshot",
             "reusable and would_call use the resolved gateway/model-policy fingerprint; dry-run makes no provider generation calls",
+            "whole-scope artifact surface counts are guidance, not a validation constraint; unknown/possible remains legal",
             "mixed subdivision shares both --max-subjects and --max-calls and is visible only after a result exists",
         ],
         "plan": rendered,
@@ -1170,19 +1229,17 @@ fn execute_one(
         ));
     }
     let citations_json = serde_json::to_string(&validated.citations)?;
-    let citations = validated
+    let cited_evidence = validated
         .citations
         .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let cited_evidence_json = serde_json::to_string(
-        &item
-            .evidence
-            .items
-            .iter()
-            .filter(|evidence| citations.contains(evidence.id.as_str()))
-            .collect::<Vec<_>>(),
-    )?;
+        .filter_map(|citation| {
+            item.evidence
+                .items
+                .iter()
+                .find(|evidence| evidence.id == *citation)
+        })
+        .collect::<Vec<_>>();
+    let cited_evidence_json = serde_json::to_string(&cited_evidence)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<()> {
         recon::persist_classification(
@@ -1223,6 +1280,18 @@ fn execute_one(
     }
     let mut decisions = BTreeMap::new();
     decisions.insert(validated.role.clone(), 1);
+    if validated.duplicate_citations_removed > 0 {
+        decisions.insert(
+            "citation_duplicates_removed".into(),
+            validated.duplicate_citations_removed,
+        );
+    }
+    if validated.excess_citations_truncated > 0 {
+        decisions.insert(
+            "citation_excess_truncated".into(),
+            validated.excess_citations_truncated,
+        );
+    }
     Ok((
         ScoutReport {
             kind: "repository".into(),
@@ -1441,10 +1510,16 @@ fn child_identity(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, fs};
+
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{EvidenceItem, RepositoryEvidencePack, Submission, validate};
+    use super::{
+        DiscoveredSubject, EvidenceItem, RepositoryEvidencePack, Submission, build_evidence,
+        validate,
+    };
+    use crate::{indexer, recon, store};
 
     fn evidence() -> RepositoryEvidencePack {
         RepositoryEvidencePack {
@@ -1454,6 +1529,7 @@ mod tests {
             member_count: 2,
             language_counts: Default::default(),
             chunk_kind_counts: Default::default(),
+            surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
             items: vec![EvidenceItem {
                 id: "E001".into(),
                 kind: "outline".into(),
@@ -1492,6 +1568,110 @@ mod tests {
             "evidence": ["E001"],
         }))?;
         assert!(validate(&submission, &evidence()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn citation_repair_preserves_order_deduplicates_and_truncates() -> Result<()> {
+        let mut evidence = evidence();
+        evidence.items = (1..=10)
+            .map(|index| EvidenceItem {
+                id: format!("E{index:03}"),
+                kind: "outline".into(),
+                source: Some(format!("src/{index}.ts")),
+                start_line: Some(1),
+                end_line: Some(1),
+                content: format!("evidence {index}"),
+            })
+            .collect();
+        let submission = Submission {
+            role: "runtime".into(),
+            confidence: "likely".into(),
+            explanation: "runtime exports".into(),
+            evidence: vec![
+                "E003".into(),
+                "E001".into(),
+                "E003".into(),
+                "E002".into(),
+                "E004".into(),
+                "E005".into(),
+                "E006".into(),
+                "E007".into(),
+                "E008".into(),
+                "E009".into(),
+                "E010".into(),
+            ],
+        };
+        let validated = validate(&submission, &evidence)?;
+        assert_eq!(
+            validated.citations,
+            [
+                "E003", "E001", "E002", "E004", "E005", "E006", "E007", "E008"
+            ]
+        );
+        assert_eq!(validated.duplicate_citations_removed, 1);
+        assert_eq!(validated.excess_citations_truncated, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_mixtures_do_not_constrain_the_semantic_role() -> Result<()> {
+        let mut evidence = evidence();
+        evidence.surface_counts =
+            BTreeMap::from([("generated".into(), 1), ("handwritten".into(), 1)]);
+        for (role, confidence) in [
+            ("runtime", "likely"),
+            ("generated", "likely"),
+            ("mixed", "possible"),
+            ("unknown", "possible"),
+        ] {
+            let submission = Submission {
+                role: role.into(),
+                confidence: confidence.into(),
+                explanation: "evidence-backed semantic classification".into(),
+                evidence: vec!["E001".into()],
+            };
+            assert_eq!(validate(&submission, &evidence)?.role, role);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_surface_counts_cover_every_scope_member() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src/generated"))?;
+        for index in 0..9 {
+            fs::write(
+                repo.path().join(format!("src/{index:02}.ts")),
+                format!("export const value{index} = {index};\n"),
+            )?;
+        }
+        fs::write(
+            repo.path().join("src/generated/client.ts"),
+            "export const generatedClient = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let selector = recon::SubjectSelector::RepositoryArea {
+            scope: "src".into(),
+            direct_only: false,
+        };
+        let state =
+            recon::build_scope_state(repo.path(), &conn, "area:repository:src".into(), selector)?;
+        let subject = DiscoveredSubject {
+            subject_key: state.subject_key.clone(),
+            subject_kind: "area".into(),
+            display_name: "src".into(),
+            parent_subject_key: None,
+            depth: 0,
+            state,
+        };
+
+        let evidence = build_evidence(repo.path(), &conn, &subject)?;
+        assert_eq!(evidence.surface_counts.values().sum::<usize>(), 10);
+        assert_eq!(evidence.surface_counts["handwritten"], 9);
+        assert_eq!(evidence.surface_counts["generated"], 1);
+        assert!(evidence.rendered.contains("whole-scope artifact surfaces"));
         Ok(())
     }
 }

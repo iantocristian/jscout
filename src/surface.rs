@@ -7,6 +7,9 @@ use serde_json::Value;
 
 use crate::{file_role, origin, semantic, store, structural};
 
+const OVERVIEW_CITATIONS_PER_CLASSIFICATION: usize = 3;
+const OVERVIEW_CITATION_CHARS: usize = 320;
+
 #[derive(Debug, Clone)]
 pub struct EntityLookupOptions {
     pub query: String,
@@ -282,6 +285,7 @@ pub struct OverviewOptions {
     pub include_semantic: bool,
     pub semantic_limit: usize,
     pub semantic_types: Vec<String>,
+    pub reconnaissance_limit: usize,
     pub response_byte_limit: usize,
 }
 
@@ -294,6 +298,7 @@ impl Default for OverviewOptions {
             include_semantic: false,
             semantic_limit: 8,
             semantic_types: Vec::new(),
+            reconnaissance_limit: 12,
             response_byte_limit: 24_000,
         }
     }
@@ -323,6 +328,50 @@ pub struct SemanticOverlay {
     pub artifacts: Vec<SemanticOverlayArtifact>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconnaissanceCitation {
+    pub id: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<[usize; 2]>,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconnaissanceClassification {
+    pub subject: String,
+    pub kind: String,
+    pub role: String,
+    pub confidence: String,
+    pub policy: String,
+    pub explanation: String,
+    pub citation_ids: Vec<String>,
+    pub cited_evidence: Vec<ReconnaissanceCitation>,
+    pub cited_evidence_truncated: bool,
+    pub member_count: usize,
+    pub deterministic_file_roles: BTreeMap<String, usize>,
+    pub effective_file_roles: BTreeMap<String, usize>,
+    pub conflict_files: usize,
+    pub depth: usize,
+    pub prompt_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconnaissanceOverlay {
+    pub trust: &'static str,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_hint: Option<&'static str>,
+    pub matched: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub roles: BTreeMap<String, usize>,
+    pub effective_file_roles: BTreeMap<String, usize>,
+    pub classifications: Vec<ReconnaissanceClassification>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OverviewResponseBudget {
     pub byte_limit: usize,
@@ -333,6 +382,7 @@ pub struct OverviewResponseBudget {
     pub omitted_relations: usize,
     pub omitted_areas: usize,
     pub omitted_entity_inventory: usize,
+    pub omitted_reconnaissance_classifications: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +391,8 @@ pub struct RepositoryOverviewResponse {
     pub overview: RepositoryOverview,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_overlay: Option<SemanticOverlay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnaissance: Option<ReconnaissanceOverlay>,
     pub response_budget: OverviewResponseBudget,
 }
 
@@ -511,6 +563,9 @@ pub fn overview_response(
     if options.response_byte_limit == 0 {
         bail!("overview response byte limit must be greater than zero");
     }
+    if options.reconnaissance_limit > 100 {
+        bail!("reconnaissance overview limit must be between 0 and 100");
+    }
     validate_semantic_types(&options.semantic_types)?;
     store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
         let overview = overview_unpinned(
@@ -523,6 +578,12 @@ pub fn overview_response(
             .include_semantic
             .then(|| semantic_overlay(conn, &options.semantic_types, options.semantic_limit))
             .transpose()?;
+        let reconnaissance = (options.reconnaissance_limit > 0)
+            .then(|| {
+                reconnaissance_overlay(conn, &options.file_origins, options.reconnaissance_limit)
+            })
+            .transpose()?
+            .flatten();
         let omitted_semantic_artifacts = semantic_overlay.as_ref().map_or(0, |overlay| {
             overlay.fresh_matched.saturating_sub(overlay.returned)
         });
@@ -533,13 +594,18 @@ pub fn overview_response(
         let omitted_entity_inventory = overview
             .entity_inventory_matched
             .saturating_sub(overview.entity_inventory.len());
+        let omitted_reconnaissance_classifications = reconnaissance.as_ref().map_or(0, |overlay| {
+            overlay.matched.saturating_sub(overlay.returned)
+        });
         let initially_truncated = omitted_semantic_artifacts > 0
             || omitted_relations > 0
             || omitted_areas > 0
-            || omitted_entity_inventory > 0;
+            || omitted_entity_inventory > 0
+            || omitted_reconnaissance_classifications > 0;
         let mut response = RepositoryOverviewResponse {
             overview,
             semantic_overlay,
+            reconnaissance,
             response_budget: OverviewResponseBudget {
                 byte_limit: options.response_byte_limit,
                 truncated: initially_truncated,
@@ -547,11 +613,221 @@ pub fn overview_response(
                 omitted_relations,
                 omitted_areas,
                 omitted_entity_inventory,
+                omitted_reconnaissance_classifications,
                 ..Default::default()
             },
         };
         apply_overview_budget(&mut response)?;
         Ok(response)
+    })
+}
+
+fn reconnaissance_overlay(
+    conn: &Connection,
+    file_origins: &[String],
+    limit: usize,
+) -> Result<Option<ReconnaissanceOverlay>> {
+    let matched: usize = conn.query_row(
+        "SELECT count(*) FROM repository_current_classifications",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? as usize),
+    )?;
+    if matched == 0 {
+        let historical: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM repository_classifications classification
+               JOIN scout_runs run ON run.id=classification.run_id
+               WHERE run.status='completed'
+                 AND classification.subject_kind IN ('package','area')
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok(historical.then_some(ReconnaissanceOverlay {
+            trust: "untrusted_semantic_policy",
+            status: "no_current_classifications",
+            refresh_hint: Some(
+                "historical reconnaissance exists but does not match current evidence; run `jscout scout repository` to refresh optional policy",
+            ),
+            matched: 0,
+            returned: 0,
+            truncated: false,
+            roles: BTreeMap::new(),
+            effective_file_roles: BTreeMap::new(),
+            classifications: Vec::new(),
+        }));
+    }
+    let mut roles = BTreeMap::new();
+    let mut statement = conn.prepare(
+        "SELECT role, count(*) FROM repository_current_classifications
+         GROUP BY role ORDER BY role",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    for row in rows {
+        let (role, count) = row?;
+        roles.insert(role, count);
+    }
+
+    let mut effective_file_roles = BTreeMap::<String, usize>::new();
+    let origins_json = serde_json::to_string(file_origins)?;
+    let mut statement = conn.prepare(
+        "SELECT COALESCE(policy.effective_role, file.role), count(*)
+         FROM files file
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
+         WHERE file.origin IN (SELECT value FROM json_each(?1))
+         GROUP BY COALESCE(policy.effective_role, file.role)
+         ORDER BY COALESCE(policy.effective_role, file.role)",
+    )?;
+    let rows = statement.query_map([origins_json], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    for row in rows {
+        let (role, count) = row?;
+        effective_file_roles.insert(role, count);
+    }
+
+    let mut statement = conn.prepare(
+        "SELECT subject_key,subject_kind,role,confidence,explanation,
+                citations_json,cited_evidence_json,member_count,
+                deterministic_roles_json,effective_roles_json,conflict_files,
+                depth,prompt_version
+         FROM repository_current_classifications
+         ORDER BY
+           CASE role WHEN 'mixed' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
+           CASE confidence WHEN 'possible' THEN 0 ELSE 1 END,
+           (conflict_files > 0) DESC,
+           CASE role WHEN 'runtime' THEN 1 ELSE 0 END,
+           conflict_files DESC, subject_key
+         LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)? as usize,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)? as usize,
+            row.get::<_, i64>(11)? as usize,
+            row.get::<_, String>(12)?,
+        ))
+    })?;
+    let mut classifications = Vec::new();
+    for row in rows {
+        let (
+            subject,
+            kind,
+            role,
+            confidence,
+            explanation,
+            citations_json,
+            cited_evidence_json,
+            member_count,
+            deterministic_roles_json,
+            effective_roles_json,
+            conflict_files,
+            depth,
+            prompt_version,
+        ) = row?;
+        let citation_ids = serde_json::from_str::<Vec<String>>(&citations_json)?;
+        let cited_evidence_values = serde_json::from_str::<Vec<Value>>(&cited_evidence_json)?;
+        let cited_evidence_matched = cited_evidence_values.len();
+        let cited_evidence = cited_evidence_values
+            .into_iter()
+            .take(OVERVIEW_CITATIONS_PER_CLASSIFICATION)
+            .map(reconnaissance_citation)
+            .collect::<Result<Vec<_>>>()?;
+        let policy = if confidence == "likely"
+            && matches!(
+                role.as_str(),
+                "runtime" | "tooling" | "documentation" | "test" | "generated"
+            ) {
+            "active"
+        } else {
+            "neutral"
+        };
+        classifications.push(ReconnaissanceClassification {
+            subject,
+            kind,
+            role,
+            confidence,
+            policy: policy.into(),
+            explanation,
+            citation_ids,
+            cited_evidence_truncated: cited_evidence_matched > cited_evidence.len(),
+            cited_evidence,
+            member_count,
+            deterministic_file_roles: parse_count_map(&deterministic_roles_json)?,
+            effective_file_roles: parse_count_map(&effective_roles_json)?,
+            conflict_files,
+            depth,
+            prompt_version,
+        });
+    }
+    let returned = classifications.len();
+    Ok(Some(ReconnaissanceOverlay {
+        trust: "untrusted_semantic_policy",
+        status: "current",
+        refresh_hint: None,
+        matched,
+        returned,
+        truncated: returned < matched,
+        roles,
+        effective_file_roles,
+        classifications,
+    }))
+}
+
+fn parse_count_map(value: &str) -> Result<BTreeMap<String, usize>> {
+    Ok(serde_json::from_str(value)?)
+}
+
+fn reconnaissance_citation(value: Value) -> Result<ReconnaissanceCitation> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let source = value
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let start = value.get("start_line").and_then(Value::as_u64);
+    let end = value.get("end_line").and_then(Value::as_u64);
+    let lines = start
+        .zip(end)
+        .map(|(start, end)| [start as usize, end as usize]);
+    let content = value
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let excerpt = if content.chars().count() <= OVERVIEW_CITATION_CHARS {
+        content.to_string()
+    } else {
+        content
+            .chars()
+            .take(OVERVIEW_CITATION_CHARS)
+            .collect::<String>()
+            + "…"
+    };
+    Ok(ReconnaissanceCitation {
+        id,
+        kind,
+        source,
+        lines,
+        excerpt,
     })
 }
 
@@ -685,6 +961,17 @@ fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()
             settle_overview_bytes(response)?;
             continue;
         }
+        if let Some(overlay) = response.reconnaissance.as_mut()
+            && overlay.classifications.pop().is_some()
+        {
+            overlay.returned = overlay.classifications.len();
+            overlay.truncated = true;
+            response
+                .response_budget
+                .omitted_reconnaissance_classifications += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
         let minimum = settle_overview_bytes(response)?;
         bail!(
             "overview response byte limit {byte_limit} is below the minimum envelope ({minimum} bytes)"
@@ -752,7 +1039,7 @@ mod tests {
     use super::{
         EntityLookupOptions, OverviewOptions, entities, overview_response, repository_area,
     };
-    use crate::{indexer, semantic, store, structural};
+    use crate::{indexer, recon, semantic, store, structural};
 
     #[test]
     fn entity_lookup_filters_evidence_and_overview_is_bounded() -> Result<()> {
@@ -820,6 +1107,119 @@ mod tests {
             repository_area("dependency:@scope/pkg@2.0.0#def456/src/index.ts"),
             "dependency:@scope/pkg@2.0.0#def456"
         );
+    }
+
+    #[test]
+    fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("docs"))?;
+        fs::write(
+            repo.path().join("docs/runtime.ts"),
+            "export function renderDocument() { return 1; }\n",
+        )?;
+        fs::write(
+            repo.path().join("docs/runtime.test.ts"),
+            "test('render', () => renderDocument());\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let selector = recon::SubjectSelector::RepositoryArea {
+            scope: "docs".into(),
+            direct_only: false,
+        };
+        let state = recon::build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:docs".into(),
+            selector.clone(),
+        )?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'openai-codex','gpt-5.6-terra',
+                      'plan','repository-recon/v2',?1,'overview-recon',
+                      'overview-recon','{}','now','now')",
+            [&snapshot],
+        )?;
+        let run_id = conn.last_insert_rowid();
+        let cited = json!([{
+            "id": "E001",
+            "kind": "outline",
+            "source": "docs/runtime.ts",
+            "start_line": 1,
+            "end_line": 1,
+            "content": "exported function `renderDocument`"
+        }]);
+        recon::persist_classification(
+            &conn,
+            &recon::NewClassification {
+                run_id,
+                subject_key: &state.subject_key,
+                subject_kind: "area",
+                selector: &selector,
+                parent_subject_key: None,
+                depth: 0,
+                role: "runtime",
+                confidence: "likely",
+                explanation: "document-domain runtime implementation",
+                citations_json: "[\"E001\"]",
+                cited_evidence_json: &cited.to_string(),
+                evidence_fingerprint: &state.evidence_fingerprint,
+                classification_fingerprint: "overview-recon",
+                source_snapshot: &snapshot,
+            },
+        )?;
+        recon::reconcile_file_policy(repo.path(), &conn)?;
+
+        let response = overview_response(&conn, &OverviewOptions::default())?;
+        let overlay = response
+            .reconnaissance
+            .expect("current reconnaissance overlay");
+        assert_eq!(overlay.trust, "untrusted_semantic_policy");
+        assert_eq!(overlay.status, "current");
+        assert!(overlay.refresh_hint.is_none());
+        assert_eq!(overlay.roles["runtime"], 1);
+        assert_eq!(overlay.effective_file_roles["runtime"], 1);
+        assert_eq!(overlay.effective_file_roles["test"], 1);
+        assert_eq!(overlay.classifications[0].conflict_files, 1);
+        assert_eq!(overlay.classifications[0].citation_ids, ["E001"]);
+        assert_eq!(
+            overlay.classifications[0].cited_evidence[0]
+                .source
+                .as_deref(),
+            Some("docs/runtime.ts")
+        );
+
+        let without_reconnaissance = overview_response(
+            &conn,
+            &OverviewOptions {
+                reconnaissance_limit: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(without_reconnaissance.reconnaissance.is_none());
+
+        fs::write(
+            repo.path().join("docs/added-after-scout.ts"),
+            "export const later = 1;\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let stale = overview_response(&conn, &OverviewOptions::default())?
+            .reconnaissance
+            .expect("historical reconnaissance status");
+        assert_eq!(stale.status, "no_current_classifications");
+        assert_eq!(stale.matched, 0);
+        assert!(stale.classifications.is_empty());
+        assert!(
+            stale
+                .refresh_hint
+                .expect("refresh hint")
+                .contains("jscout scout repository")
+        );
+        Ok(())
     }
 
     #[test]
