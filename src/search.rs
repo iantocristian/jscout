@@ -97,6 +97,7 @@ pub struct SearchResult {
 pub struct RetrievalStatus {
     pub lexical: &'static str,
     pub vector: &'static str,
+    pub reranker: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_action: Option<&'static str>,
 }
@@ -106,6 +107,7 @@ impl RetrievalStatus {
         Self {
             lexical: "active",
             vector: "disabled",
+            reranker: "disabled",
             vector_action: None,
         }
     }
@@ -114,6 +116,7 @@ impl RetrievalStatus {
         Self {
             lexical: "active",
             vector: "active",
+            reranker: "disabled",
             vector_action: None,
         }
     }
@@ -122,8 +125,17 @@ impl RetrievalStatus {
         Self {
             lexical: "active",
             vector: "degraded",
+            reranker: "disabled",
             vector_action: Some("run jscout embed <root>; inspect stderr if it fails"),
         }
+    }
+
+    fn reranker_active(&mut self) {
+        self.reranker = "active";
+    }
+
+    fn reranker_degraded(&mut self) {
+        self.reranker = "degraded";
     }
 }
 
@@ -192,6 +204,7 @@ fn bm25_ranking(
     conn: &Connection,
     q: &str,
     limit: usize,
+    file_roles: &[String],
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
     let fq = fts_query(q);
@@ -207,11 +220,21 @@ fn bm25_ranking(
            AND ((?2 AND file.origin='repository')
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
-         ORDER BY r LIMIT ?5",
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+         ORDER BY r LIMIT ?7",
     )?;
     let flags = origin_flags(file_origins);
+    let roles_json = serde_json::to_string(file_roles)?;
     let rows = stmt.query_map(
-        rusqlite::params![fq, flags.0, flags.1, flags.2, limit as i64],
+        rusqlite::params![
+            fq,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+            limit as i64
+        ],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
     )?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -374,7 +397,7 @@ fn ranked_hits(
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
     let t0 = std::time::Instant::now();
-    let mut rankings = vec![bm25_ranking(conn, q, pool, file_origins)?];
+    let mut rankings = vec![bm25_ranking(conn, q, pool, file_roles, file_origins)?];
     let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
@@ -388,6 +411,9 @@ fn ranked_hits(
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
         }
+    }
+    for ranking in &mut rankings {
+        prefilter_ranking_by_role(conn, ranking, file_roles)?;
     }
     let mut fused = rrf(&rankings, 60.0);
 
@@ -407,29 +433,23 @@ fn ranked_hits(
         let top: Vec<(i64, String)> = fused
             .iter()
             .take(pool_n)
-            .filter_map(|(id, _)| {
-                conn.query_row("SELECT content FROM chunks WHERE id = ?1", [id], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-                .map(|mut text| {
-                    if text.len() > max_chars {
-                        let mut cut = max_chars;
-                        while !text.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        text.truncate(cut);
-                    }
-                    (*id, text)
-                })
-            })
+            .map(|(id, _)| reranker_document(conn, *id, max_chars))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect();
         if !top.is_empty() {
             let t = std::time::Instant::now();
             match reranker.rerank(q, &top) {
-                Ok(reranked) if !reranked.is_empty() => fused = reranked,
+                Ok(reranked) if !reranked.is_empty() => {
+                    fused = merge_reranked_prefix(&fused, reranked);
+                    retrieval.reranker_active();
+                }
                 Ok(_) => {}
-                Err(e) => eprintln!("rerank unavailable, using RRF order: {e}"),
+                Err(e) => {
+                    retrieval.reranker_degraded();
+                    eprintln!("rerank unavailable, using RRF order: {e}");
+                }
             }
             if timing {
                 eprintln!("timing: rerank({}) {:?}", top.len(), t.elapsed());
@@ -451,6 +471,92 @@ fn ranked_hits(
         }
     }
     Ok((hits, retrieval))
+}
+
+fn merge_reranked_prefix(fused: &[(i64, f64)], mut reranked: Vec<(i64, f64)>) -> Vec<(i64, f64)> {
+    let reranked_ids = reranked
+        .iter()
+        .map(|(chunk_id, _)| *chunk_id)
+        .collect::<HashSet<_>>();
+    reranked.extend(
+        fused
+            .iter()
+            .filter(|(chunk_id, _)| !reranked_ids.contains(chunk_id))
+            .copied(),
+    );
+    reranked
+}
+
+fn prefilter_ranking_by_role(
+    conn: &Connection,
+    ranking: &mut Vec<(i64, f64)>,
+    file_roles: &[String],
+) -> Result<()> {
+    if file_roles.is_empty() {
+        return Ok(());
+    }
+    let allowed = file_roles
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut filtered = Vec::with_capacity(ranking.len());
+    let mut role_statement = conn.prepare_cached(
+        "SELECT file.role
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE chunk.id=?1",
+    )?;
+    for &(chunk_id, score) in ranking.iter() {
+        let role = role_statement.query_row([chunk_id], |row| row.get::<_, String>(0));
+        if role.is_ok_and(|role| allowed.contains(role.as_str())) {
+            filtered.push((chunk_id, score));
+        }
+    }
+    *ranking = filtered;
+    Ok(())
+}
+
+fn reranker_document(
+    conn: &Connection,
+    chunk_id: i64,
+    max_chars: usize,
+) -> Result<Option<(i64, String)>> {
+    let row = conn.query_row(
+        "SELECT file.path, file.role, file.origin, chunk.kind, chunk.name,
+                chunk.start_line, chunk.end_line, chunk.content, package.name
+         FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         WHERE chunk.id=?1",
+        [chunk_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        },
+    );
+    let (file, role, origin, kind, name, start_line, end_line, content, package) = match row {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let scope = package.unwrap_or_else(|| {
+        file.split_once('/')
+            .map_or_else(|| "(root)".to_string(), |(scope, _)| scope.to_string())
+    });
+    let symbol = name.as_deref().unwrap_or("(anonymous)");
+    let mut document = format!(
+        "path: {file}\nscope: {scope}\nsymbol: {symbol}\nkind: {kind}\nrole: {role}\norigin: {origin}\nlines: {start_line}-{end_line}\n\n{content}"
+    );
+    truncate_utf8(&mut document, max_chars);
+    Ok(Some((chunk_id, document)))
 }
 
 fn record_vector_ranking(
@@ -1077,8 +1183,8 @@ mod tests {
 
     use super::{
         DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
-        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, record_vector_ranking,
-        search,
+        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, merge_reranked_prefix,
+        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1091,6 +1197,7 @@ mod tests {
     fn vector_retrieval_status_distinguishes_active_disabled_and_degraded() {
         let disabled = RetrievalStatus::vector_disabled();
         assert_eq!(disabled.vector, "disabled");
+        assert_eq!(disabled.reranker, "disabled");
         assert!(disabled.vector_action.is_none());
 
         let mut rankings = Vec::new();
@@ -1104,6 +1211,32 @@ mod tests {
         );
         assert_eq!(degraded.vector, "degraded");
         assert!(degraded.vector_action.is_some());
+
+        let mut reranked = degraded;
+        reranked.reranker_active();
+        assert_eq!(reranked.reranker, "active");
+        reranked.reranker_degraded();
+        assert_eq!(reranked.reranker, "degraded");
+    }
+
+    #[test]
+    fn reranking_a_prefix_preserves_every_unreranked_tail_candidate() {
+        let fused = (1..=60).map(|id| (id, id as f64)).collect::<Vec<_>>();
+        let reranked = (1..=50)
+            .rev()
+            .map(|id| (id, -(id as f64)))
+            .collect::<Vec<_>>();
+        let merged = merge_reranked_prefix(&fused, reranked);
+        assert_eq!(merged.len(), 60);
+        assert_eq!(merged[0].0, 50);
+        assert_eq!(merged[49].0, 1);
+        assert_eq!(
+            merged[50..]
+                .iter()
+                .map(|(chunk_id, _)| *chunk_id)
+                .collect::<Vec<_>>(),
+            (51..=60).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1293,7 +1426,7 @@ mod tests {
                 truncated: false,
             }),
             response_budget: ResponseBudget {
-                byte_limit: 1_600,
+                byte_limit: 1_650,
                 ..Default::default()
             },
         };
@@ -1304,7 +1437,7 @@ mod tests {
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
-        assert!(result.response_budget.rendered_bytes <= 1_600);
+        assert!(result.response_budget.rendered_bytes <= 1_650);
         Ok(())
     }
 
@@ -1449,6 +1582,31 @@ mod tests {
         )?;
         let conn = store::open(repo.path())?;
         indexer::index_repo(repo.path(), &conn)?;
+
+        let production_chunk = conn.query_row(
+            "SELECT chunk.id FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+             WHERE file.path='src/service.ts' ORDER BY chunk.id LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let (_, reranker_text) =
+            reranker_document(&conn, production_chunk, 4_000)?.expect("indexed reranker candidate");
+        assert!(reranker_text.contains("path: src/service.ts"));
+        assert!(reranker_text.contains("scope: src"));
+        assert!(reranker_text.contains("symbol: performRoleFilteredWork"));
+        assert!(reranker_text.contains("kind: function"));
+        assert!(reranker_text.contains("role: production"));
+        assert!(reranker_text.contains("origin: repository"));
+
+        let test_chunk = conn.query_row(
+            "SELECT chunk.id FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+             WHERE file.path='tests/service.test.ts' ORDER BY chunk.id LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut fused_candidates = vec![(test_chunk, 0.9), (production_chunk, 0.8)];
+        prefilter_ranking_by_role(&conn, &mut fused_candidates, &["production".into()])?;
+        assert_eq!(fused_candidates, vec![(production_chunk, 0.8)]);
 
         let test_only = search(
             &conn,

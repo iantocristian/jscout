@@ -1270,8 +1270,8 @@ fn cmd_search(
     }
     println!("snapshot: {}", result.snapshot);
     println!(
-        "retrieval: lexical={} vector={}",
-        result.retrieval.lexical, result.retrieval.vector
+        "retrieval: lexical={} vector={} reranker={}",
+        result.retrieval.lexical, result.retrieval.vector, result.retrieval.reranker
     );
     if let Some(action) = result.retrieval.vector_action {
         println!("vector action: {action}");
