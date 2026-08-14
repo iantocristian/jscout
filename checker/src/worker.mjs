@@ -22,7 +22,10 @@ function loadTypeScript() {
 
 const runtime = loadTypeScript();
 const ts = runtime.ts;
-const programCache = new Map();
+// Production enrichment dedicates one worker process to one configured
+// project. Keeping more than one Program here made peak memory proportional to
+// every overlapping tsconfig encountered by a repository-wide run.
+let builtProject;
 const occurrenceCache = new WeakMap();
 let discoveryCache;
 
@@ -206,7 +209,15 @@ function configuredProjects(force = false) {
   }
   projects.sort((left, right) => left.id.localeCompare(right.id));
   problems.sort((left, right) => left.project_id.localeCompare(right.project_id));
-  discoveryCache = { projects, problems };
+  const ownersByFile = new Map();
+  for (const project of projects) {
+    for (const file of project.fileNames) {
+      const owners = ownersByFile.get(file) ?? [];
+      owners.push(project);
+      ownersByFile.set(file, owners);
+    }
+  }
+  discoveryCache = { projects, problems, ownersByFile };
   return discoveryCache;
 }
 
@@ -259,7 +270,7 @@ function configInputs(config, seen = new Set()) {
 
 function owningProjects(queryFile, force = false) {
   const discovered = configuredProjects(force);
-  const owners = discovered.projects.filter((project) => project.fileNames.includes(queryFile));
+  const owners = discovered.ownersByFile.get(queryFile) ?? [];
   if (owners.length > 0) return { owners, problems: discovered.problems };
   const relative = path.relative(root, queryFile).split(path.sep).join("/");
   return {
@@ -281,8 +292,22 @@ function owningProjects(queryFile, force = false) {
   };
 }
 
-function buildProject(project, force = false) {
-  if (!force && programCache.has(project.id)) return programCache.get(project.id);
+function projectById(projectId, queryFile) {
+  const discovered = configuredProjects();
+  const configured = discovered.projects.find((project) => project.id === projectId);
+  if (configured) return configured;
+  const relative = path.relative(root, queryFile).split(path.sep).join("/");
+  if (projectId !== `inferred:${relative}`) {
+    throw coded("project_not_found", `query file is not owned by project ${projectId}`);
+  }
+  return owningProjects(queryFile).owners.find((project) => project.id === projectId);
+}
+
+function buildProject(project) {
+  if (builtProject?.project.id === project.id) return builtProject;
+  if (builtProject) {
+    throw coded("project_switch", "one checker worker may resolve only one configured project");
+  }
   // The program gets the EFFECTIVE options: normalizing absolute paths here
   // breaks baseUrl/paths resolution and silently degrades every mapped
   // receiver to `any`. Normalization exists for the fingerprint only.
@@ -313,7 +338,7 @@ function buildProject(project, force = false) {
     .filter((value, index, all) => all.findIndex((other) => other.path === value.path) === index)
     .sort((left, right) => left.path.localeCompare(right.path));
   const fingerprint = digestText(JSON.stringify(stable({
-    protocol: 1,
+    protocol: 2,
     typescript: { version: ts.version, source: runtime.source },
     compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
@@ -321,9 +346,8 @@ function buildProject(project, force = false) {
     options: normalizeOption(project.options),
     inputs: sourceInputs.map(({ identity, source_hash }) => [identity, source_hash]),
   })));
-  const built = { program, checker, fingerprint, inputFiles };
-  programCache.set(project.id, built);
-  return built;
+  builtProject = { project, program, checker, fingerprint, inputFiles, sourceFiles: new Map() };
+  return builtProject;
 }
 
 function byteToUtf16(buffer, offset, label) {
@@ -422,6 +446,146 @@ function declarationResult(declaration) {
   };
 }
 
+function planMembers(files) {
+  if (!Array.isArray(files)) throw coded("protocol", "plan_members requires files");
+  const unique = [...new Set(files)].sort();
+  const ownership = unique.map((file) => {
+    const queryFile = resolveQueryFile(file);
+    return {
+      file,
+      project_ids: owningProjects(queryFile).owners.map((project) => project.id).sort(),
+    };
+  });
+  const discovered = configuredProjects();
+  return {
+    typescript: { version: ts.version, source: runtime.source },
+    files: ownership,
+    projects: discovered.projects.map((project) => ({
+      project_id: project.id,
+      file_count: project.fileNames.length,
+    })),
+    configuration_problems: discovered.problems,
+  };
+}
+
+function resolveInProject(built, query, buffers) {
+  const queryFile = resolveQueryFile(query.file);
+  let sourceRecord = buffers.get(queryFile);
+  if (!sourceRecord) {
+    const buffer = fs.readFileSync(queryFile);
+    sourceRecord = { buffer, hash: sourceHash(buffer) };
+    buffers.set(queryFile, sourceRecord);
+  }
+  if (typeof query.indexed_hash !== "string") {
+    throw coded("protocol", "resolve_members queries require indexed_hash");
+  }
+  if (query.indexed_hash !== sourceRecord.hash) {
+    throw coded("hash_mismatch", `query source changed after indexing: ${query.file}`);
+  }
+  const spans = requestSpans(sourceRecord.buffer, query);
+  const source = built.program.getSourceFile(queryFile);
+  let answer;
+  if (!source) {
+    answer = { status: "unknown" };
+  } else {
+    const occurrence = findMemberCall(source, spans);
+    if (!occurrence) {
+      throw coded("span_mismatch", `exact indexed member-call occurrence was not found: ${query.file}`);
+    }
+    const receiverType = built.checker.getTypeAtLocation(occurrence.member.expression);
+    if (degradedType(receiverType)) {
+      answer = { status: "unknown" };
+    } else {
+      const declarations = symbolDeclarations(built.checker, receiverType, occurrence.member)
+        .map(declarationResult)
+        .filter(Boolean)
+        .filter((value, index, all) => all.findIndex((other) => JSON.stringify(other) === JSON.stringify(value)) === index)
+        .sort((left, right) => (left.file ?? "").localeCompare(right.file ?? "") || left.start - right.start);
+      answer = {
+        status: declarations.length > 0 ? "resolved" : "unknown",
+        receiver_type: normalizeTypeText(built.checker.typeToString(
+          receiverType,
+          occurrence.member.expression,
+          ts.TypeFormatFlags.NoTruncation,
+        )),
+        declarations,
+      };
+    }
+  }
+  return {
+    indexed_hash: query.indexed_hash,
+    source_hash: sourceRecord.hash,
+    answer: {
+      project_id: built.project.id,
+      ...answer,
+      checker_input_fingerprint: built.fingerprint,
+    },
+  };
+}
+
+function resources() {
+  const usage = process.memoryUsage();
+  return {
+    rss_bytes: usage.rss,
+    heap_used_bytes: usage.heapUsed,
+    heap_total_bytes: usage.heapTotal,
+  };
+}
+
+function resolveMembers(projectId, queries) {
+  if (typeof projectId !== "string" || projectId.length === 0) {
+    throw coded("protocol", "resolve_members requires project_id");
+  }
+  if (!Array.isArray(queries) || queries.length === 0 || queries.length > 512) {
+    throw coded("protocol", "resolve_members requires between 1 and 512 queries");
+  }
+  const firstFile = resolveQueryFile(queries[0].file);
+  const project = projectById(projectId, firstFile);
+  if (!project) throw coded("project_not_found", `project not found: ${projectId}`);
+  for (const query of queries) {
+    const queryFile = resolveQueryFile(query.file);
+    if (!owningProjects(queryFile).owners.some((owner) => owner.id === projectId)) {
+      throw coded("project_mismatch", `${query.file} is not owned by ${projectId}`);
+    }
+  }
+  const built = buildProject(project);
+  const results = queries.map((query) => resolveInProject(built, query, built.sourceFiles));
+  const response = {
+    project_id: projectId,
+    typescript: { version: ts.version, source: runtime.source },
+    checker_input_fingerprint: built.fingerprint,
+    results,
+    resources: resources(),
+  };
+  if (Buffer.byteLength(JSON.stringify(response)) > 1024 * 1024) {
+    throw coded("oversized_batch", "resolve_members response exceeds 1 MiB; retry a smaller batch");
+  }
+  return response;
+}
+
+function validateProject(projectId, fingerprint) {
+  if (!builtProject || builtProject.project.id !== projectId) {
+    throw coded("project_not_loaded", "validate_project must follow resolve_members in the same worker");
+  }
+  let inputsValid = true;
+  for (const input of builtProject.inputFiles) {
+    try {
+      if (sourceHash(fs.readFileSync(input.path)) !== input.source_hash) inputsValid = false;
+    } catch {
+      inputsValid = false;
+    }
+  }
+  return {
+    project_id: projectId,
+    fingerprint: builtProject.fingerprint,
+    valid: fingerprint === builtProject.fingerprint && inputsValid,
+    inputs: builtProject.inputFiles.map(({ path: inputPath, source_hash }) => ({
+      path: inputPath,
+      source_hash,
+    })),
+  };
+}
+
 function resolveMember(query) {
   const queryFile = resolveQueryFile(query.file);
   const buffer = fs.readFileSync(queryFile);
@@ -434,6 +598,7 @@ function resolveMember(query) {
   const { owners, problems } = owningProjects(queryFile);
   const answers = [];
   for (const project of owners) {
+    builtProject = undefined;
     const built = buildProject(project);
     const source = built.program.getSourceFile(queryFile);
     if (!source) {
@@ -464,6 +629,7 @@ function resolveMember(query) {
       checker_input_fingerprint: built.fingerprint,
     });
   }
+  builtProject = undefined;
   return {
     indexed_hash: query.indexed_hash,
     source_hash: actualHash,
@@ -474,14 +640,14 @@ function resolveMember(query) {
 }
 
 function validateInputs(entries) {
-  programCache.clear();
+  builtProject = undefined;
   discoveryCache = undefined;
   const results = [];
   for (const entry of entries) {
     const queryFile = resolveQueryFile(entry.file);
     const { owners } = owningProjects(queryFile);
     const project = owners.find((candidate) => candidate.id === entry.project_id);
-    const fingerprint = project ? buildProject(project, true).fingerprint : null;
+    const fingerprint = project ? buildProject(project).fingerprint : null;
     results.push({
       project_id: entry.project_id,
       file: entry.file,
@@ -492,6 +658,7 @@ function validateInputs(entries) {
         source_hash,
       })) : [],
     });
+    builtProject = undefined;
   }
   return { valid: results.every((result) => result.valid), results };
 }
@@ -514,10 +681,22 @@ parentPort.on("message", (message) => {
     let payload;
     if (message.kind === "capabilities") {
       payload = { kind: "capabilities_result", capabilities: capabilities() };
+    } else if (message.kind === "plan_members") {
+      payload = { kind: "plan_members_result", result: planMembers(message.files ?? []) };
     } else if (message.kind === "resolve_member") {
       payload = { kind: "resolve_member_result", result: resolveMember(message.query ?? {}) };
+    } else if (message.kind === "resolve_members") {
+      payload = {
+        kind: "resolve_members_result",
+        result: resolveMembers(message.project_id, message.queries ?? []),
+      };
     } else if (message.kind === "validate_inputs") {
       payload = { kind: "validate_inputs_result", result: validateInputs(message.entries ?? []) };
+    } else if (message.kind === "validate_project") {
+      payload = {
+        kind: "validate_project_result",
+        result: validateProject(message.project_id, message.fingerprint),
+      };
     } else {
       throw coded("unsupported", "unsupported checker worker request");
     }

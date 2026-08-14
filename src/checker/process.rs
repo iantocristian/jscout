@@ -7,9 +7,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use super::protocol::MemberResult;
 use super::protocol::{
-    Capabilities, Inbound, InputValidation, MemberQuery, MemberResult, Outbound, PROTOCOL_VERSION,
-    ValidationResult, Versions, encode,
+    Capabilities, Inbound, MemberBatchResult, MemberPlanResult, MemberQuery, Outbound,
+    PROTOCOL_VERSION, ProjectValidationResult, Versions, encode,
 };
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,12 +126,24 @@ fn request_interrupt_cancellation() -> bool {
         .unwrap_or(false)
 }
 
+/// Start one top-level checker operation. Per-project sidecars may replace the
+/// active cancel target, but they must not clear an interrupt that already
+/// canceled an earlier project in the same operation.
+pub(crate) fn begin_interrupt_scope() -> Result<(), CheckerError> {
+    install_interrupt_handler()?;
+    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+pub(crate) fn interrupt_pending() -> bool {
+    INTERRUPT_PENDING.load(Ordering::SeqCst)
+}
+
 fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
     install_interrupt_handler()?;
     *INTERRUPT_CONTROL
         .lock()
         .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
-    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -140,7 +154,6 @@ fn unregister_interrupt_control(writer: &Arc<Writer>) {
             .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
     {
         *registered = None;
-        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -236,9 +249,9 @@ impl ProcessChecker {
         }
     }
 
-    /// Install the process-wide Ctrl-C router once and point it at this
-    /// sidecar. Re-registering is safe, which lets watch mode launch repeated
-    /// bounded enrichment passes in one process.
+    /// Point the process-wide Ctrl-C router at this sidecar. Registering a new
+    /// per-project worker deliberately preserves the enclosing operation's
+    /// interrupt state; `begin_interrupt_scope` resets it once per pass.
     pub fn register_interrupts(&self) -> Result<(), CheckerError> {
         register_interrupt_control(self.control())
     }
@@ -255,6 +268,29 @@ impl ProcessChecker {
         }
     }
 
+    pub fn plan_members(
+        &mut self,
+        files: Vec<String>,
+        timeout: Duration,
+    ) -> Result<MemberPlanResult, CheckerError> {
+        let id = self.send_active(&Outbound::PlanMembers { files })?;
+        let result = match self.receive_for(&id, timeout) {
+            Ok(Inbound::PlanMembersResult { result, .. }) => Ok(result),
+            Ok(Inbound::Error { error, .. }) => Err(CheckerError::Remote {
+                code: error.code,
+                message: error.message,
+            }),
+            Ok(Inbound::Canceled { reason, .. }) => {
+                Err(CheckerError::Canceled(reason.unwrap_or_default()))
+            }
+            Ok(other) => Err(unexpected("plan_members_result", &other)),
+            Err(error) => Err(error),
+        };
+        self.clear_active();
+        result
+    }
+
+    #[cfg(test)]
     pub fn resolve_member(
         &mut self,
         query: MemberQuery,
@@ -277,14 +313,18 @@ impl ProcessChecker {
         result
     }
 
-    pub fn validate_inputs(
+    pub fn resolve_members(
         &mut self,
-        entries: Vec<InputValidation>,
+        project_id: String,
+        queries: Vec<MemberQuery>,
         timeout: Duration,
-    ) -> Result<ValidationResult, CheckerError> {
-        let id = self.send_active(&Outbound::ValidateInputs { entries })?;
+    ) -> Result<MemberBatchResult, CheckerError> {
+        let id = self.send_active(&Outbound::ResolveMembers {
+            project_id,
+            queries,
+        })?;
         let result = match self.receive_for(&id, timeout) {
-            Ok(Inbound::ValidateInputsResult { result, .. }) => Ok(result),
+            Ok(Inbound::ResolveMembersResult { result, .. }) => Ok(result),
             Ok(Inbound::Error { error, .. }) => Err(CheckerError::Remote {
                 code: error.code,
                 message: error.message,
@@ -292,7 +332,33 @@ impl ProcessChecker {
             Ok(Inbound::Canceled { reason, .. }) => {
                 Err(CheckerError::Canceled(reason.unwrap_or_default()))
             }
-            Ok(other) => Err(unexpected("validate_inputs_result", &other)),
+            Ok(other) => Err(unexpected("resolve_members_result", &other)),
+            Err(error) => Err(error),
+        };
+        self.clear_active();
+        result
+    }
+
+    pub fn validate_project(
+        &mut self,
+        project_id: String,
+        fingerprint: String,
+        timeout: Duration,
+    ) -> Result<ProjectValidationResult, CheckerError> {
+        let id = self.send_active(&Outbound::ValidateProject {
+            project_id,
+            fingerprint,
+        })?;
+        let result = match self.receive_for(&id, timeout) {
+            Ok(Inbound::ValidateProjectResult { result, .. }) => Ok(result),
+            Ok(Inbound::Error { error, .. }) => Err(CheckerError::Remote {
+                code: error.code,
+                message: error.message,
+            }),
+            Ok(Inbound::Canceled { reason, .. }) => {
+                Err(CheckerError::Canceled(reason.unwrap_or_default()))
+            }
+            Ok(other) => Err(unexpected("validate_project_result", &other)),
             Err(error) => Err(error),
         };
         self.clear_active();
@@ -410,13 +476,13 @@ mod tests {
     // Canned protocol frames. Request IDs are deterministic per process: the
     // client numbers from r1, so hello is r1, the one resolve_member is r2, and
     // the cancel that follows it is r3.
-    const READY: &str = r#"{"protocol":1,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":1}}"#;
-    const UNKNOWN_RESULT: &str = r#"{"protocol":1,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:a.ts","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
-    const OUTSIDE_ERROR: &str = r#"{"protocol":1,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
-    const CANCELED: &str = r#"{"protocol":1,"id":"r2","kind":"canceled","reason":"requested"}"#;
+    const READY: &str = r#"{"protocol":2,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":2}}"#;
+    const UNKNOWN_RESULT: &str = r#"{"protocol":2,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:a.ts","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
+    const OUTSIDE_ERROR: &str = r#"{"protocol":2,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
+    const CANCELED: &str = r#"{"protocol":2,"id":"r2","kind":"canceled","reason":"requested"}"#;
     const CANCEL_RESULT: &str =
-        r#"{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
-    const SHUTDOWN_RESULT: &str = r#"{"protocol":1,"id":"r3","kind":"shutdown_result"}"#;
+        r#"{"protocol":2,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
+    const SHUTDOWN_RESULT: &str = r#"{"protocol":2,"id":"r3","kind":"shutdown_result"}"#;
 
     /// Write an executable fake sidecar (a `/bin/sh` script) answering the
     /// protocol from canned case patterns, and return it as the "node" binary

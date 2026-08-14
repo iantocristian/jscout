@@ -566,6 +566,7 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
 /// the deterministic structural snapshot. Watch uses this before an explicit
 /// enrichment cycle so config-only events fail closed even when module
 /// resolution produces the same snapshot hash.
+#[cfg(test)]
 pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
@@ -881,9 +882,18 @@ fn project_references(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, start, line, kind, confidence,
-                target_request, target_name, local, detail
-         FROM refs ORDER BY file_id, start, id",
+        "SELECT reference.id, reference.file_id, reference.start, reference.line,
+                reference.kind, reference.confidence, reference.target_request,
+                reference.target_name, reference.local, reference.detail,
+                member_call.rowid
+         FROM refs reference
+         LEFT JOIN member_calls member_call
+           ON member_call.file_id=reference.file_id
+          AND member_call.receiver_start=reference.start
+          AND member_call.prop=reference.target_name
+          AND reference.local=0
+          AND reference.detail LIKE 'via namespace %'
+         ORDER BY reference.file_id, reference.start, reference.id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -897,10 +907,23 @@ fn project_references(
             r.get::<_, String>(7)?,
             r.get::<_, i64>(8)? != 0,
             r.get::<_, Option<String>>(9)?,
+            r.get::<_, Option<i64>>(10)?,
         ))
     })?;
     for row in rows {
-        let (id, file_id, start, line, kind, confidence, request, name, local, detail) = row?;
+        let (
+            id,
+            file_id,
+            start,
+            line,
+            kind,
+            confidence,
+            request,
+            name,
+            local,
+            detail,
+            member_call_id,
+        ) = row?;
         let Some(path) = files.get(&file_id) else {
             continue;
         };
@@ -972,15 +995,22 @@ fn project_references(
         } else {
             "semantic+resolver"
         };
-        let edge_detail = json!({
+        let mut edge_detail = json!({
             "request": &request,
             "targetName": &name,
             "detail": &detail,
             "ambiguousTarget": targets.ambiguous,
             "candidateCount": targets.keys.len(),
             "candidates": targets.ambiguous.then_some(&targets.keys),
-        })
-        .to_string();
+        });
+        // Namespace imports are the one member-call shape whose property
+        // target the deterministic reference resolver already identifies
+        // exactly. Carry the occurrence identity so checker planning can
+        // avoid asking TypeScript the same question again.
+        if let Some(member_call_id) = member_call_id {
+            edge_detail["memberCallId"] = member_call_id.into();
+        }
+        let edge_detail = edge_detail.to_string();
         for target in &targets.keys {
             insert_edge.execute(params![
                 source,
@@ -2015,12 +2045,14 @@ struct CheckerProjection {
     confidence: String,
     projects: BTreeSet<String>,
     unknown_projects: BTreeSet<String>,
+    failed_projects: BTreeSet<String>,
     receiver_types: BTreeSet<String>,
 }
 
 #[derive(Debug, Default)]
 struct CheckerOccurrenceCoverage {
     unknown_projects: BTreeSet<String>,
+    failed_projects: BTreeSet<String>,
 }
 
 fn checker_occurrence_coverage(
@@ -2028,11 +2060,14 @@ fn checker_occurrence_coverage(
     snapshot: &str,
 ) -> Result<HashMap<i64, CheckerOccurrenceCoverage>> {
     let mut statement = conn.prepare(
-        "SELECT project.member_call_id, project.project_id, project.status
+        "SELECT project.member_call_id, project.project_id, project.status,
+                run.status
          FROM checker_occurrence_projects project
          JOIN checker_enrichment_batches batch
            ON batch.id=project.batch_id AND batch.active=1
           AND batch.source_snapshot=?1
+         JOIN checker_project_runs run
+           ON run.batch_id=project.batch_id AND run.project_id=project.project_id
          ORDER BY project.member_call_id, project.project_id",
     )?;
     let rows = statement.query_map([snapshot], |row| {
@@ -2040,15 +2075,18 @@ fn checker_occurrence_coverage(
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut coverage = HashMap::new();
     for row in rows {
-        let (member_call_id, project, status) = row?;
+        let (member_call_id, project, status, run_status) = row?;
         let entry = coverage
             .entry(member_call_id)
             .or_insert_with(CheckerOccurrenceCoverage::default);
-        if status == "unknown" {
+        if run_status == "failed" {
+            entry.failed_projects.insert(project);
+        } else if status == "unknown" {
             entry.unknown_projects.insert(project);
         }
     }
@@ -2089,6 +2127,10 @@ fn project_checker_enrichments(
          JOIN checker_enrichment_batches batch
            ON batch.id=enrichment.batch_id AND batch.active=1
           AND batch.source_snapshot=?1
+         JOIN checker_project_runs run
+           ON run.batch_id=enrichment.batch_id
+          AND run.project_id=enrichment.project_id
+          AND run.status='completed'
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
@@ -2182,6 +2224,7 @@ fn project_checker_enrichments(
                 confidence: confidence.clone(),
                 projects: BTreeSet::new(),
                 unknown_projects: occurrence_coverage.unknown_projects.clone(),
+                failed_projects: occurrence_coverage.failed_projects.clone(),
                 receiver_types: BTreeSet::new(),
             });
         projection.projects.insert(project);
@@ -2189,6 +2232,9 @@ fn project_checker_enrichments(
             projection.receiver_types.insert(receiver_type);
         }
         if confidence == "possible" {
+            projection.confidence = "possible".into();
+        }
+        if !projection.failed_projects.is_empty() {
             projection.confidence = "possible".into();
         }
     }
@@ -2209,6 +2255,7 @@ fn project_checker_enrichments(
                 "property": [projection.property_start, projection.property_end],
                 "projects": projection.projects,
                 "unknownProjects": projection.unknown_projects,
+                "failedProjects": projection.failed_projects,
                 "receiverTypes": projection.receiver_types,
                 "occurrenceSpecific": true
             })
@@ -4782,6 +4829,18 @@ mod tests {
             [&snapshot],
         )?;
         let batch_id = conn.last_insert_rowid();
+        for (project, fingerprint) in [
+            ("tsconfig.json", "inputs"),
+            ("tsconfig.stray.json", "stray-inputs"),
+        ] {
+            conn.execute(
+                "INSERT INTO checker_project_runs(
+                   batch_id, project_id, status, selected_occurrences,
+                   completed_occurrences, checker_input_fingerprint, updated_at
+                 ) VALUES(?1,?2,'completed',1,1,?3,datetime('now'))",
+                rusqlite::params![batch_id, project, fingerprint],
+            )?;
+        }
         conn.execute(
             "INSERT INTO checker_enrichments(
                batch_id, member_call_id, source_file_id, source_file, source_hash,
@@ -4852,6 +4911,29 @@ mod tests {
             serde_json::json!(["tsconfig.stray.json"]),
             "unknown owning projects stay visible without demoting the clean resolution"
         );
+        conn.execute(
+            "UPDATE checker_project_runs SET status='failed'
+             WHERE batch_id=?1 AND project_id='tsconfig.stray.json'",
+            [batch_id],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
+        let (failed_confidence, failed_detail): (String, String) = conn.query_row(
+            "SELECT confidence, detail_json FROM resolved_edges
+             WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(failed_confidence, "possible");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&failed_detail)?["failedProjects"],
+            serde_json::json!(["tsconfig.stray.json"])
+        );
+        conn.execute(
+            "UPDATE checker_project_runs SET status='completed'
+             WHERE batch_id=?1 AND project_id='tsconfig.stray.json'",
+            [batch_id],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
         let workflow =
             workflow_neighborhood(&conn, &checker_source, 1, 20, 40, &origin::defaults())?;
         assert!(
@@ -4929,6 +5011,13 @@ mod tests {
             let project = format!("tsconfig.{side}.json");
             let query_file = format!("{side}.ts");
             let input_fingerprint = format!("{side}-inputs");
+            conn.execute(
+                "INSERT INTO checker_project_runs(
+                   batch_id, project_id, status, selected_occurrences,
+                   completed_occurrences, checker_input_fingerprint, updated_at
+                 ) VALUES(?1,?2,'completed',1,1,?3,datetime('now'))",
+                rusqlite::params![batch_id, &project, &input_fingerprint],
+            )?;
             let (call, file_id, hash, spans): (i64, i64, String, [i64; 6]) = conn.query_row(
                 "SELECT call.rowid, file.id, file.hash, call.start, call.end,
                             call.receiver_start, call.receiver_end,

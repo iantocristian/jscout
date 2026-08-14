@@ -63,6 +63,7 @@ installs do not need Python, uv, PyTorch, or model downloads.
 ## Commands
 
 ```
+jscout --version                 # installed binary/package version
 jscout index <root>            # rebuild disposable structural state in .jscout.db
                                #   --database PATH isolates index/memory state
                                #   --deps pkg,@scope/pkg indexes named dependency internals
@@ -77,6 +78,10 @@ jscout calls <root> METHOD     # exact member-call sites matched on the AST
                                #   --arg merge=replace --receiver wave.card --json
 jscout checker doctor <root>   # checker version, projects, config problems, readiness
 jscout enrich <root>           # explicit occurrence-scoped TypeScript checker pass
+                               #   --dry-run plans ownership without building Programs
+                               #   --file/--package/--member/--role narrow eligibility
+                               #   --max-occurrences N explicitly requests partial coverage
+                               #   --all includes normally excluded roles/resolved calls
 jscout watch <root> [--embed] [--enrich]
                                # hash-incremental parse plus optional vector/checker refresh
                                #   repeat --deps from index to retain that corpus
@@ -146,19 +151,33 @@ callers without materializing every call-site × symbol pair.
 
 ## TypeScript checker enrichment
 
-`jscout enrich <root>` is a bounded pass over indexed member-call occurrences.
-It asks one question per occurrence: which declaration owns this statically
-named property on this exact receiver? `index` stays deterministic and
-Node-free; `jscout watch --enrich` explicitly opts into rerunning the same pass
-after relevant changes. Enrichment never requests diagnostics and does not
-replace deterministic name-matched member hubs.
+`jscout enrich <root>` resolves every eligible indexed member-call occurrence
+by default. The semantic question remains occurrence-specific — which
+declaration owns this statically named property on this exact receiver? — but
+the protocol sends bounded batches instead of one process round trip per call.
+`index` stays deterministic and Node-free; `jscout watch --enrich` explicitly
+opts into the same machinery after relevant changes. Enrichment never requests
+diagnostics and does not replace deterministic name-matched member hubs.
+
+Eligibility defaults to repository/workspace production and unknown-role calls
+that still reach property candidates. Tests, fixtures, generated files,
+documentation, and exact calls already explained by a direct deterministic
+`certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
+or `--role` to narrow that set. `--all` broadens it to the normally excluded
+cases; it is not needed for ordinary complete repository coverage.
+`--max-occurrences N` is the only occurrence-count cap and deliberately creates
+partial coverage. Ordering is deterministic and spread across packages and
+files within each priority tier. `--dry-run` reports discovered, eligible,
+selected, omitted, project, and configuration counts after a configuration-only
+ownership pass and does not construct a TypeScript Program.
 
 The sidecar prefers the repository's installed `typescript`; otherwise it uses
 the pinned bundled fallback. `jscout checker doctor <root>` reports that choice,
 every discovered owning `tsconfig`, and configuration-read problems. Query
 paths, indexed BLAKE3 hashes, and exact call/receiver/property byte spans are
-verified before checker work. A file owned by multiple projects is queried in
-all of them. Conflicting declarations remain separate `possible` candidates;
+verified before checker work. A reverse ownership index assigns planned files
+once. A file owned by multiple projects is queried in all of them. Conflicting
+declarations remain separate `possible` candidates;
 one mapped declaration becomes an occurrence-specific `likely` edge with
 `checker` provenance. `any`, error, and unknown receiver types publish no edge.
 
@@ -169,13 +188,26 @@ lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multipl
 targets or a declaration jscout cannot map — still makes every survivor
 `possible`.
 
-Results are stored as one canonical fingerprinted batch; publishing a new batch
-drops the one it supersedes. The sidecar's complete input set is checked again
-before publication to catch changes during the command, but it is not persisted
-as a cross-snapshot freshness manifest. A raced batch publishes nothing. Each
-request has a hard deadline (`--timeout`, default 30 seconds); timeout kills the
-sidecar process. Ctrl-C terminates active checker work rather than leaving a
-blocked TypeScript worker behind.
+Rust schedules one configured project at a time. Its disposable Node worker
+constructs one TypeScript Program, resolves batches of at most 128 calls (the
+protocol accepts at most 512 and enforces 1 MiB request/response frames),
+rehashes the exact project input manifest without rebuilding the Program, and
+then exits so its heap is reclaimed before the next project starts.
+
+Results are committed to SQLite staging after every successful batch. The run
+key includes the structural snapshot, deterministic plan, TypeScript identity,
+and checker protocol. A killed Rust process leaves those rows non-public;
+rerunning the same command resumes the missing occurrence/project pairs. A
+controlled project failure activates only completed projects, marks the failed
+owner in coverage, and forces affected targeted edges to `possible`; that same
+batch remains the resume target. After every project completes, Rust rechecks
+the structural snapshot, distinct checker inputs, and mapped target
+fingerprints, publishes the complete canonical batch, and drops the superseded
+batch. A structural race remains staged and publishes nothing.
+Each request has a hard deadline (`--timeout`, default 300 seconds); timeout
+kills only the current project worker. Progress names the project and reports
+staged occurrences plus Node RSS and heap usage. Worker crashes return the
+actual Node error/stack in the command error as well as stderr.
 
 ### Checker snapshot lifecycle
 
@@ -185,12 +217,12 @@ cross-snapshot revalidation. `jscout index` deletes the old checker batch while
 preserving embeddings and semantic memory, so run `jscout enrich` after a full
 index when those occurrence-specific edges are needed.
 
-`jscout watch --enrich` performs the incremental cycle: reindex first, then
-publish a checker batch for the resulting snapshot. If the checker fails or
-times out, that snapshot has no checker edges and watch retries after the next
-relevant repository event. Branch/submodule uncertainty and external-input
-watching remain work for the later watcher coordinator; they do not complicate
-the fixed-snapshot index path.
+`jscout watch --enrich` performs the cycle: reindex first, then run the same
+project-batched, resumable checker pass for the resulting snapshot. A newer
+snapshot cannot mix with older staging. If the checker fails or times out,
+staged work stays non-public and a later pass for the exact snapshot can resume
+it. The later watcher coordinator owns quiet-point scheduling under sustained
+churn; plain `watch` never starts Node.
 
 ## Semantic scouting
 

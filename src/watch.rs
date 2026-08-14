@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use notify::{RecursiveMode, Watcher};
 
-use crate::{checker, embed, indexer, store, structural, walk};
+use crate::{checker, embed, indexer, store, walk};
 
 pub struct WatchOptions<'a> {
     pub embed_on_change: bool,
@@ -69,9 +69,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         dependencies: options.dependencies.to_vec(),
         ..Default::default()
     };
-    if options.enrich_on_change {
-        structural::clear_checker_plane(&conn)?;
-    }
     let outcome = indexer::index_repo_with_options(&root, &conn, &index_options)?;
     eprintln!(
         "initial: {} indexed, {} unchanged, {} failed — watching {} for changes (ctrl-c to stop)",
@@ -120,12 +117,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         {
             continue;
         }
-        if options.enrich_on_change
-            && let Err(error) = structural::clear_checker_plane(&conn)
-        {
-            eprintln!("checker plane reset failed; skipping watch cycle: {error}");
-            continue;
-        }
         let started = std::time::Instant::now();
         match indexer::index_repo_with_options(&root, &conn, &index_options) {
             Ok(o) => {
@@ -163,8 +154,8 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
 }
 
 /// Replenish the checker plane for the structural snapshot just published.
-/// Failure leaves that snapshot without checker edges; watch keeps running and
-/// retries on the next relevant repository event.
+/// Failed project work stays in inactive staging for an exact-plan retry.
+/// Structural indexing owns invalidation when it publishes a new snapshot.
 fn run_checker_enrichment(root: &Path, options: &WatchOptions<'_>) -> bool {
     match checker::enrich(
         root,
@@ -172,6 +163,13 @@ fn run_checker_enrichment(root: &Path, options: &WatchOptions<'_>) -> bool {
             database: None,
             sidecar: options.checker_sidecar,
             timeout: options.enrich_timeout,
+            files: Vec::new(),
+            packages: Vec::new(),
+            members: Vec::new(),
+            roles: Vec::new(),
+            max_occurrences: None,
+            include_all: false,
+            dry_run: false,
         },
     ) {
         Ok(report) => {
@@ -183,7 +181,7 @@ fn run_checker_enrichment(root: &Path, options: &WatchOptions<'_>) -> bool {
         }
         Err(error) => {
             eprintln!(
-                "checker enrichment failed; this snapshot has no checker edges and watch will retry: {error}"
+                "checker enrichment failed; completed work remains staged for an exact-snapshot retry: {error}"
             );
             false
         }

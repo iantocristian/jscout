@@ -46,7 +46,7 @@ function client(root) {
   const request = (kind, body = {}) => new Promise((resolve) => {
     const id = `t${sequence += 1}`;
     pending.set(id, resolve);
-    child.stdin.write(`${JSON.stringify({ protocol: 1, id, kind, ...body })}\n`);
+    child.stdin.write(`${JSON.stringify({ protocol: 2, id, kind, ...body })}\n`);
   });
   return {
     child,
@@ -60,7 +60,7 @@ function client(root) {
   };
 }
 
-test("prints the actual Node worker error while keeping a stable protocol error", async () => {
+test("prints and returns the actual Node worker error", async () => {
   const root = fixture({ "main.ts": "export const value = 1;\n" });
   const checker = client(root);
   await checker.request("hello");
@@ -69,7 +69,8 @@ test("prints the actual Node worker error while keeping a stable protocol error"
   const response = await checker.request("capabilities");
   assert.equal(response.kind, "error");
   assert.equal(response.error.code, "checker_crash");
-  assert.equal(response.error.message, "checker worker failed");
+  assert.match(response.error.message, /ENOENT/u);
+  assert.match(response.error.message, /realpath/u);
   await checker.close();
 
   assert.match(checker.stderr(), /worker error during capabilities/);
@@ -126,6 +127,50 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
     assert.equal(message.result.projects[0].status, "resolved");
     assert.equal(message.result.projects[0].declarations[0].file, "main.ts");
   }
+  await checker.close();
+});
+
+test("plans ownership without a Program and resolves a bounded project batch", async (context) => {
+  const source = [
+    "class Alpha { save(): void {} }",
+    "class Beta { run(): void {} }",
+    "declare const alpha: Alpha; declare const beta: Beta;",
+    "alpha.save()",
+    "beta.run()",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true }, files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts", "main.ts"] });
+  assert.equal(plan.kind, "plan_members_result");
+  assert.deepEqual(plan.result.files, [{ file: "main.ts", project_ids: ["tsconfig.json"] }]);
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [
+      queryFor(source, "alpha.save()", "alpha", "save"),
+      queryFor(source, "beta.run()", "beta", "run"),
+    ],
+  });
+  assert.equal(resolved.kind, "resolve_members_result");
+  assert.equal(resolved.result.results.length, 2);
+  assert.ok(resolved.result.results.every((item) => item.answer.status === "resolved"));
+  assert.ok(resolved.result.resources.rss_bytes > 0);
+
+  const validation = await checker.request("validate_project", {
+    project_id: "tsconfig.json",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.kind, "validate_project_result");
+  assert.equal(validation.result.valid, true);
+  assert.ok(validation.result.inputs.some((input) => input.path.endsWith("main.ts")));
   await checker.close();
 });
 
