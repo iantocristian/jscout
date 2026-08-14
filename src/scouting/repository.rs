@@ -86,10 +86,10 @@ pub struct RepositoryEvidencePack {
     pub member_count: usize,
     pub language_counts: BTreeMap<String, usize>,
     pub chunk_kind_counts: BTreeMap<String, usize>,
-    /// High-precision artifact surfaces among the bounded representative
-    /// files. Ambiguous documentation/unknown bootstrap roles are folded into
-    /// `handwritten`; only test, fixture, and generated remain distinct.
-    pub sampled_surface_counts: BTreeMap<String, usize>,
+    /// High-precision artifact surfaces across every member file. Ambiguous
+    /// documentation/unknown bootstrap roles are folded into `handwritten`;
+    /// only test, fixture, and generated remain distinct.
+    pub surface_counts: BTreeMap<String, usize>,
     pub items: Vec<EvidenceItem>,
     #[serde(skip)]
     pub rendered: String,
@@ -239,11 +239,6 @@ pub fn validate(
         }
         citations.push(citation.clone());
     }
-    if mixed_scope_required(evidence) && submission.role != "mixed" {
-        bail!(
-            "scope contains both meaningful handwritten and generated/test surfaces; role must be mixed"
-        );
-    }
     Ok(ValidatedClassification {
         role: submission.role.clone(),
         confidence: submission.confidence.clone(),
@@ -252,33 +247,6 @@ pub fn validate(
         duplicate_citations_removed,
         excess_citations_truncated,
     })
-}
-
-fn mixed_scope_required(evidence: &RepositoryEvidencePack) -> bool {
-    if !matches!(evidence.subject_kind.as_str(), "package" | "area") {
-        return false;
-    }
-    let handwritten = evidence
-        .sampled_surface_counts
-        .get("handwritten")
-        .copied()
-        .unwrap_or_default();
-    let generated = evidence
-        .sampled_surface_counts
-        .get("generated")
-        .copied()
-        .unwrap_or_default();
-    let tests = evidence
-        .sampled_surface_counts
-        .get("test")
-        .copied()
-        .unwrap_or_default()
-        + evidence
-            .sampled_surface_counts
-            .get("fixture")
-            .copied()
-            .unwrap_or_default();
-    handwritten > 0 && (generated > 0 || tests >= 2)
 }
 
 pub fn plan(
@@ -586,12 +554,18 @@ fn build_evidence(
     }
     let representatives =
         recon::representative_members(&subject.state.members, recon::REPRESENTATIVE_FILE_LIMIT);
-    let member_ids = representatives
+    let representative_ids = representatives
         .iter()
         .map(|member| member.id)
         .collect::<Vec<_>>();
-    let chunk_kind_counts = chunk_kind_counts(conn, &member_ids)?;
-    let sampled_surface_counts = sampled_surface_counts(conn, &member_ids)?;
+    let member_ids = subject
+        .state
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
+    let chunk_kind_counts = chunk_kind_counts(conn, &representative_ids)?;
+    let surface_counts = surface_counts(conn, &member_ids)?;
     let mut items = Vec::new();
     push_item(
         &mut items,
@@ -600,11 +574,11 @@ fn build_evidence(
         None,
         None,
         format!(
-            "{} indexed files; languages/extensions: {}; sampled AST chunk kinds: {}; sampled artifact surfaces: {}",
+            "{} indexed files; languages/extensions: {}; sampled AST chunk kinds: {}; whole-scope artifact surfaces: {}",
             subject.state.members.len(),
             render_counts(&language_counts),
             render_counts(&chunk_kind_counts),
-            render_counts(&sampled_surface_counts),
+            render_counts(&surface_counts),
         ),
     );
 
@@ -635,7 +609,7 @@ fn build_evidence(
         member_count: subject.state.members.len(),
         language_counts,
         chunk_kind_counts,
-        sampled_surface_counts,
+        surface_counts,
         items,
         rendered: String::new(),
     };
@@ -643,10 +617,7 @@ fn build_evidence(
     Ok(pack)
 }
 
-fn sampled_surface_counts(
-    conn: &Connection,
-    member_ids: &[i64],
-) -> Result<BTreeMap<String, usize>> {
+fn surface_counts(conn: &Connection, member_ids: &[i64]) -> Result<BTreeMap<String, usize>> {
     if member_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -840,7 +811,7 @@ fn build_request(item: &RepositoryPlanItem, options: &RepositoryScoutOptions) ->
         .iter()
         .map(|evidence| evidence.id.clone())
         .collect::<Vec<_>>();
-    let system = "You classify one exact repository scope or TypeScript project from a deterministic evidence pack. Ambiguous path-role labels are withheld; sampled artifact surfaces expose only high-precision handwritten/test/fixture/generated distinctions. Choose runtime, tooling, documentation, test, generated, mixed, or unknown. For a package/area, use mixed when one role applied uniformly would materially misclassify meaningful handwritten runtime and generated/test surfaces, even when they share one directory. A single incidental test need not force mixed. For a project, classify why the configuration exists; mixed member file kinds do not by themselves make the project mixed. Use unknown/possible when the pack is insufficient. Never infer runtime behavior from a directory or config name alone. Cite supplied evidence IDs in relevance order and submit exactly once through the tool.".to_string();
+    let system = "You classify one exact repository scope or TypeScript project from a deterministic evidence pack. Ambiguous path-role labels are withheld; whole-scope artifact counts expose only high-precision handwritten/test/fixture/generated distinctions. Choose runtime, tooling, documentation, test, generated, mixed, or unknown. For a package/area, use mixed only when the evidence supports multiple semantic purposes for which one scope role would be materially misleading. Co-located tests, fixtures, or generated artifacts alone do not require mixed because their deterministic per-file roles remain protected. For a project, classify why the configuration exists; mixed member file kinds do not by themselves make the project mixed. Use unknown/possible when the pack is insufficient. Never infer runtime behavior from a directory or config name alone. Cite supplied evidence IDs in relevance order and submit exactly once through the tool.".to_string();
     let user = format!(
         "Subject: {}\nKind: {}\nDisplay: {}\nMembers: {}\n\n{}",
         item.subject_key,
@@ -1016,6 +987,7 @@ pub fn dry_run_report(
         "notes": [
             "current_classification reports subject-local freshness independent of the structural snapshot",
             "reusable and would_call use the resolved gateway/model-policy fingerprint; dry-run makes no provider generation calls",
+            "whole-scope artifact surface counts are guidance, not a validation constraint; unknown/possible remains legal",
             "mixed subdivision shares both --max-subjects and --max-calls and is visible only after a result exists",
         ],
         "plan": rendered,
@@ -1538,12 +1510,16 @@ fn child_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs};
 
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{EvidenceItem, RepositoryEvidencePack, Submission, validate};
+    use super::{
+        DiscoveredSubject, EvidenceItem, RepositoryEvidencePack, Submission, build_evidence,
+        validate,
+    };
+    use crate::{indexer, recon, store};
 
     fn evidence() -> RepositoryEvidencePack {
         RepositoryEvidencePack {
@@ -1553,7 +1529,7 @@ mod tests {
             member_count: 2,
             language_counts: Default::default(),
             chunk_kind_counts: Default::default(),
-            sampled_surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
+            surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
             items: vec![EvidenceItem {
                 id: "E001".into(),
                 kind: "outline".into(),
@@ -1639,39 +1615,63 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_handwritten_and_generated_scope_requires_mixed() -> Result<()> {
+    fn artifact_mixtures_do_not_constrain_the_semantic_role() -> Result<()> {
         let mut evidence = evidence();
-        evidence.sampled_surface_counts =
+        evidence.surface_counts =
             BTreeMap::from([("generated".into(), 1), ("handwritten".into(), 1)]);
-        let runtime = Submission {
-            role: "runtime".into(),
-            confidence: "likely".into(),
-            explanation: "runtime and generated surfaces".into(),
-            evidence: vec!["E001".into()],
-        };
-        let error = validate(&runtime, &evidence).expect_err("mixed scope must not be flattened");
-        assert!(error.to_string().contains("role must be mixed"));
-
-        let mixed = Submission {
-            role: "mixed".into(),
-            ..runtime
-        };
-        assert_eq!(validate(&mixed, &evidence)?.role, "mixed");
+        for (role, confidence) in [
+            ("runtime", "likely"),
+            ("generated", "likely"),
+            ("mixed", "possible"),
+            ("unknown", "possible"),
+        ] {
+            let submission = Submission {
+                role: role.into(),
+                confidence: confidence.into(),
+                explanation: "evidence-backed semantic classification".into(),
+                evidence: vec!["E001".into()],
+            };
+            assert_eq!(validate(&submission, &evidence)?.role, role);
+        }
         Ok(())
     }
 
     #[test]
-    fn one_incidental_test_does_not_force_mixed() -> Result<()> {
-        let mut evidence = evidence();
-        evidence.sampled_surface_counts =
-            BTreeMap::from([("handwritten".into(), 7), ("test".into(), 1)]);
-        let submission = Submission {
-            role: "runtime".into(),
-            confidence: "likely".into(),
-            explanation: "runtime with one incidental test".into(),
-            evidence: vec!["E001".into()],
+    fn artifact_surface_counts_cover_every_scope_member() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src/generated"))?;
+        for index in 0..9 {
+            fs::write(
+                repo.path().join(format!("src/{index:02}.ts")),
+                format!("export const value{index} = {index};\n"),
+            )?;
+        }
+        fs::write(
+            repo.path().join("src/generated/client.ts"),
+            "export const generatedClient = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let selector = recon::SubjectSelector::RepositoryArea {
+            scope: "src".into(),
+            direct_only: false,
         };
-        assert_eq!(validate(&submission, &evidence)?.role, "runtime");
+        let state =
+            recon::build_scope_state(repo.path(), &conn, "area:repository:src".into(), selector)?;
+        let subject = DiscoveredSubject {
+            subject_key: state.subject_key.clone(),
+            subject_kind: "area".into(),
+            display_name: "src".into(),
+            parent_subject_key: None,
+            depth: 0,
+            state,
+        };
+
+        let evidence = build_evidence(repo.path(), &conn, &subject)?;
+        assert_eq!(evidence.surface_counts.values().sum::<usize>(), 10);
+        assert_eq!(evidence.surface_counts["handwritten"], 9);
+        assert_eq!(evidence.surface_counts["generated"], 1);
+        assert!(evidence.rendered.contains("whole-scope artifact surfaces"));
         Ok(())
     }
 }

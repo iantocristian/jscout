@@ -349,7 +349,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "include_semantic": { "type": "boolean", "default": false },
                     "semantic_limit": { "type": "integer", "default": 8, "minimum": 1, "maximum": 100 },
                     "semantic_types": { "type": "array", "items": { "type": "string", "enum": ["workflow", "card", "concept", "summary", "annotation"] }, "description": "Defaults to summaries, concepts, workflows, and annotations; cards require explicit opt-in" },
-                    "reconnaissance_limit": { "type": "integer", "default": 12, "minimum": 1, "maximum": 100 },
+                    "reconnaissance_limit": { "type": "integer", "default": 12, "minimum": 0, "maximum": 100 },
                     "response_bytes": { "type": "integer", "default": 24000 }
                 }
             }

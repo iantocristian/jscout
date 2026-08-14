@@ -361,6 +361,9 @@ pub struct ReconnaissanceClassification {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReconnaissanceOverlay {
     pub trust: &'static str,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_hint: Option<&'static str>,
     pub matched: usize,
     pub returned: usize,
     pub truncated: bool,
@@ -560,8 +563,8 @@ pub fn overview_response(
     if options.response_byte_limit == 0 {
         bail!("overview response byte limit must be greater than zero");
     }
-    if options.reconnaissance_limit == 0 || options.reconnaissance_limit > 100 {
-        bail!("reconnaissance overview limit must be between 1 and 100");
+    if options.reconnaissance_limit > 100 {
+        bail!("reconnaissance overview limit must be between 0 and 100");
     }
     validate_semantic_types(&options.semantic_types)?;
     store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
@@ -575,8 +578,12 @@ pub fn overview_response(
             .include_semantic
             .then(|| semantic_overlay(conn, &options.semantic_types, options.semantic_limit))
             .transpose()?;
-        let reconnaissance =
-            reconnaissance_overlay(conn, &options.file_origins, options.reconnaissance_limit)?;
+        let reconnaissance = (options.reconnaissance_limit > 0)
+            .then(|| {
+                reconnaissance_overlay(conn, &options.file_origins, options.reconnaissance_limit)
+            })
+            .transpose()?
+            .flatten();
         let omitted_semantic_artifacts = semantic_overlay.as_ref().map_or(0, |overlay| {
             overlay.fresh_matched.saturating_sub(overlay.returned)
         });
@@ -626,7 +633,29 @@ fn reconnaissance_overlay(
         |row| Ok(row.get::<_, i64>(0)? as usize),
     )?;
     if matched == 0 {
-        return Ok(None);
+        let historical: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM repository_classifications classification
+               JOIN scout_runs run ON run.id=classification.run_id
+               WHERE run.status='completed'
+                 AND classification.subject_kind IN ('package','area')
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        return Ok(historical.then_some(ReconnaissanceOverlay {
+            trust: "untrusted_semantic_policy",
+            status: "no_current_classifications",
+            refresh_hint: Some(
+                "historical reconnaissance exists but does not match current evidence; run `jscout scout repository` to refresh optional policy",
+            ),
+            matched: 0,
+            returned: 0,
+            truncated: false,
+            roles: BTreeMap::new(),
+            effective_file_roles: BTreeMap::new(),
+            classifications: Vec::new(),
+        }));
     }
     let mut roles = BTreeMap::new();
     let mut statement = conn.prepare(
@@ -745,6 +774,8 @@ fn reconnaissance_overlay(
     let returned = classifications.len();
     Ok(Some(ReconnaissanceOverlay {
         trust: "untrusted_semantic_policy",
+        status: "current",
+        refresh_hint: None,
         matched,
         returned,
         truncated: returned < matched,
@@ -1148,6 +1179,8 @@ mod tests {
             .reconnaissance
             .expect("current reconnaissance overlay");
         assert_eq!(overlay.trust, "untrusted_semantic_policy");
+        assert_eq!(overlay.status, "current");
+        assert!(overlay.refresh_hint.is_none());
         assert_eq!(overlay.roles["runtime"], 1);
         assert_eq!(overlay.effective_file_roles["runtime"], 1);
         assert_eq!(overlay.effective_file_roles["test"], 1);
@@ -1158,6 +1191,33 @@ mod tests {
                 .source
                 .as_deref(),
             Some("docs/runtime.ts")
+        );
+
+        let without_reconnaissance = overview_response(
+            &conn,
+            &OverviewOptions {
+                reconnaissance_limit: 0,
+                ..Default::default()
+            },
+        )?;
+        assert!(without_reconnaissance.reconnaissance.is_none());
+
+        fs::write(
+            repo.path().join("docs/added-after-scout.ts"),
+            "export const later = 1;\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let stale = overview_response(&conn, &OverviewOptions::default())?
+            .reconnaissance
+            .expect("historical reconnaissance status");
+        assert_eq!(stale.status, "no_current_classifications");
+        assert_eq!(stale.matched, 0);
+        assert!(stale.classifications.is_empty());
+        assert!(
+            stale
+                .refresh_hint
+                .expect("refresh hint")
+                .contains("jscout scout repository")
         );
         Ok(())
     }

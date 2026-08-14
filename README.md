@@ -166,10 +166,10 @@ workspace packages, unowned directory areas, and configured TypeScript/JavaScrip
 projects as `runtime`, `tooling`, `documentation`, `test`, `generated`, `mixed`,
 or `unknown`. The model receives manifests/configuration, aggregate file kinds,
 and bounded representative outlines/imports/exports/entities. Ambiguous
-documentation/unknown path labels remain hidden. The representatives expose
+documentation/unknown path labels remain hidden. Whole-scope counts expose
 only the high-precision artifact surfaces `handwritten`, `test`, `fixture`,
-and `generated`, so the scout can recognize mixed material without treating a
-directory name as semantic truth.
+and `generated`, so the scout can recognize material outside the representative
+sample without treating a directory name as semantic truth.
 
 Run the deterministic inspection first:
 
@@ -192,11 +192,12 @@ directories plus a direct-file residual. One command shares `--max-calls`,
 `--max-subjects` (default 256), `--max-depth` (default 3), and
 `--context-bytes` across the entire recursive plan. Reaching a bound leaves the
 unresolved subject neutral; it never invents a narrower role.
-Validation requires `mixed` when a package/area sample contains handwritten
-files plus generated output, or handwritten files plus at least two
-test/fixture files. One incidental test does not force every runtime package
-to become mixed. A same-directory mixture that cannot subdivide stays neutral,
-with deterministic per-file roles carrying policy.
+Whole-scope artifact counts guide classification but do not constrain the
+answer: `unknown`/`possible` is always legal, and co-located tests, fixtures, or
+generated output do not by themselves make a runtime package `mixed`.
+`mixed` means that the evidence supports multiple semantic purposes worth
+bounded subdivision. Deterministic per-file roles protect auxiliary artifacts
+whether or not subdivision is useful.
 When a later scout gives a parent scope a definite role, that parent controls
 the current projection and suppresses policy from descendants created by an
 older `mixed` result. The descendant rows remain immutable history and can
@@ -234,6 +235,10 @@ counts.
 If policy reconciliation cannot read or validate its optional inputs during
 `index`, jscout warns, clears the disposable policy projection, and keeps the
 new L1 snapshot available with neutral defaults.
+Scout prompt/evidence upgrades can intentionally invalidate earlier
+classifications. When historical scope classifications exist but none match
+current evidence, `repository_overview` reports `no_current_classifications`
+and points to `jscout scout repository` instead of silently omitting the layer.
 Diagnostic search JSON retains deterministic `file_role` and adds the derived
 `repository_role` only when an active reconnaissance policy exists; compact
 output presents the effective role without adding a second metadata field.
@@ -241,7 +246,8 @@ output presents the effective role without adding a second metadata field.
 untrusted `reconnaissance` section whenever current classifications exist. It
 prioritizes mixed/unknown/conflicting scopes and includes role counts, effective
 file counts, explanations, citation IDs, and bounded evidence excerpts. Use
-`--reconnaissance-limit` or MCP `reconnaissance_limit` to cap it.
+`--reconnaissance-limit` or MCP `reconnaissance_limit` to cap it; set the limit
+to `0` to omit reconnaissance from the response.
 
 ## TypeScript checker enrichment
 

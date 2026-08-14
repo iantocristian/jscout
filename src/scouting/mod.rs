@@ -3326,7 +3326,7 @@ mod tests {
             member_count: state.members.len(),
             language_counts: Default::default(),
             chunk_kind_counts: Default::default(),
-            sampled_surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
+            surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
             items: vec![EvidenceItem {
                 id: "E001".into(),
                 kind: "aggregate".into(),
@@ -3496,7 +3496,7 @@ mod tests {
                     member_count: state.members.len(),
                     language_counts: Default::default(),
                     chunk_kind_counts: Default::default(),
-                    sampled_surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
+                    surface_counts: BTreeMap::from([("handwritten".into(), 2)]),
                     items: vec![EvidenceItem {
                         id: "E001".into(),
                         kind: "aggregate".into(),

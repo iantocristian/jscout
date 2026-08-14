@@ -1314,8 +1314,8 @@ Each bounded evidence pack includes manifests and scripts, config
 representative outlines, imports/exports, and deterministic entity/relation
 summaries. Ambiguous `production`/`documentation`/`unknown` labels are excluded
 from the prompt so the scout cannot merely repeat the heuristic under review.
-Representative files expose only the high-precision surfaces `handwritten`,
-`test`, `fixture`, and `generated`.
+Whole-scope counts expose only the high-precision surfaces `handwritten`,
+`test`, `fixture`, and `generated`; representative content remains bounded.
 
 The scout publishes immutable, fingerprinted scope/project classifications:
 
@@ -1361,16 +1361,20 @@ from L1. Only current, fresh classifications affect downstream defaults:
   is fail-neutral: it warns and clears the disposable policy projection rather
   than allowing optional semantic metadata to block L1 publication.
 
-For package/area subjects, a bounded guard requires `mixed` when sampled
-evidence contains handwritten files plus generated output, or handwritten
-files plus at least two test/fixture files. A same-directory mixture remains
-neutral when no bounded subdivision exists. Project classification continues
+For package/area subjects, whole-scope artifact counts guide rather than
+constrain classification. `unknown`/`possible` remains legal, and co-located
+tests, fixtures, or generated output do not alone require `mixed`; deterministic
+effective roles already protect those files. `mixed` represents multiple
+semantic purposes worth bounded subdivision. Project classification continues
 to describe why the configuration exists and is not forced mixed by member
 file kinds. Duplicate valid citations are removed in model order and valid
 citations after the first eight are truncated locally; unknown or empty
 citations fail closed. The disposable current-classification projection keeps
 explanations and bounded cited evidence for `repository_overview`, including
-neutral mixed/unknown results and protected-role conflicts.
+neutral mixed/unknown results and protected-role conflicts. When durable
+history exists but no scope classification matches current evidence, overview
+reports the stale/upgrade state and the explicit re-scout command; a zero
+reconnaissance limit omits the overlay entirely.
 
 The implementation includes a dry-run showing every planned subject,
 classification input, subdivision depth/budget decision, reuse/freshness
