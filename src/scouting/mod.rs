@@ -3409,6 +3409,30 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
 
+        let mut dry_gateway = FakeGateway::new(Vec::new());
+        let dry =
+            super::repository::dry_run_report(&conn, &mut dry_gateway, &make_plan(), &options)?;
+        assert_eq!(dry["calls_planned"], json!(0));
+        assert_eq!(dry["reusable_items"], json!(1));
+        assert_eq!(dry["plan"]["items"][0]["reusable"], json!(true));
+        assert_eq!(dry["plan"]["items"][0]["would_call"], json!(false));
+        assert_eq!(dry_gateway.calls, 0);
+
+        let mut rebuild_options = options.clone();
+        rebuild_options.rebuild = true;
+        let mut rebuild_gateway = FakeGateway::new(Vec::new());
+        let rebuild = super::repository::dry_run_report(
+            &conn,
+            &mut rebuild_gateway,
+            &make_plan(),
+            &rebuild_options,
+        )?;
+        assert_eq!(rebuild["calls_planned"], json!(1));
+        assert_eq!(rebuild["reusable_items"], json!(0));
+        assert_eq!(rebuild["plan"]["items"][0]["reusable"], json!(false));
+        assert_eq!(rebuild["plan"]["items"][0]["would_call"], json!(true));
+        assert_eq!(rebuild_gateway.calls, 0);
+
         let mut reused = FakeGateway::new(Vec::new());
         let report =
             super::repository::execute(repo.path(), &conn, &mut reused, &options, make_plan())?;
