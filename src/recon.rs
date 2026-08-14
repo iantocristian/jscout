@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 pub const EVIDENCE_ALGORITHM: &str = "repository-recon-evidence/v2";
-const REPRESENTATIVE_FILE_LIMIT: usize = 8;
+pub const REPRESENTATIVE_FILE_LIMIT: usize = 8;
 pub const ROLES: &[&str] = &[
     "runtime",
     "tooling",
@@ -197,7 +197,7 @@ pub fn evidence_fingerprint(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn representative_members(members: &[MemberFile], limit: usize) -> Vec<&MemberFile> {
+pub fn representative_members(members: &[MemberFile], limit: usize) -> Vec<&MemberFile> {
     if members.len() <= limit {
         return members.iter().collect();
     }
@@ -257,6 +257,7 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         subject_key: String,
         selector: SubjectSelector,
         role: String,
+        confidence: String,
         depth: usize,
         evidence_fingerprint: String,
     }
@@ -265,15 +266,12 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         let mut statement = conn.prepare(
             "SELECT classification.id, classification.subject_key,
                     classification.selector_json, classification.role,
-                    classification.depth, classification.evidence_fingerprint
+                    classification.confidence, classification.depth,
+                    classification.evidence_fingerprint
              FROM repository_classifications classification
              JOIN scout_runs run ON run.id=classification.run_id
              WHERE run.status='completed'
                AND classification.subject_kind IN ('package','area')
-               AND classification.confidence='likely'
-               AND classification.role IN (
-                 'runtime','tooling','documentation','test','generated'
-               )
              ORDER BY classification.id DESC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -290,8 +288,9 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
                 subject_key: row.get(1)?,
                 selector,
                 role: row.get(3)?,
-                depth: row.get::<_, i64>(4)? as usize,
-                evidence_fingerprint: row.get(5)?,
+                confidence: row.get(4)?,
+                depth: row.get::<_, i64>(5)? as usize,
+                evidence_fingerprint: row.get(6)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -311,7 +310,14 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         )?;
         if state.evidence_fingerprint == candidate.evidence_fingerprint {
             resolved_subjects.insert(candidate.subject_key.clone());
-            selected.push((candidate, state.members));
+            if candidate.confidence == "likely"
+                && matches!(
+                    candidate.role.as_str(),
+                    "runtime" | "tooling" | "documentation" | "test" | "generated"
+                )
+            {
+                selected.push((candidate, state.members));
+            }
         }
     }
     selected.sort_by(|(left, _), (right, _)| {
@@ -406,15 +412,15 @@ pub fn project_policy(
     membership_fingerprint: &str,
     config_fingerprint: &str,
 ) -> Result<Option<FilePolicy>> {
-    Ok(conn
+    let policy = conn
         .query_row(
             "SELECT classification.id, classification.subject_key,
-                    classification.role, classification.depth
+                    classification.role, classification.depth,
+                    classification.confidence
              FROM repository_classifications classification
              JOIN scout_runs run ON run.id=classification.run_id
              WHERE classification.subject_key=?1
                AND classification.subject_kind='project'
-               AND classification.confidence='likely'
                AND json_extract(classification.selector_json, '$.membership_fingerprint')=?2
                AND json_extract(classification.selector_json, '$.config_fingerprint')=?3
                AND run.status='completed'
@@ -425,15 +431,26 @@ pub fn project_policy(
                 config_fingerprint,
             ],
             |row| {
-                Ok(FilePolicy {
-                    classification_id: row.get(0)?,
-                    subject_key: row.get(1)?,
-                    role: row.get(2)?,
-                    depth: row.get::<_, i64>(3)? as usize,
-                })
+                Ok((
+                    FilePolicy {
+                        classification_id: row.get(0)?,
+                        subject_key: row.get(1)?,
+                        role: row.get(2)?,
+                        depth: row.get::<_, i64>(3)? as usize,
+                    },
+                    row.get::<_, String>(4)?,
+                ))
             },
         )
-        .optional()?)
+        .optional()?;
+    Ok(policy.and_then(|(policy, confidence)| {
+        (confidence == "likely"
+            && matches!(
+                policy.role.as_str(),
+                "runtime" | "tooling" | "documentation" | "test" | "generated"
+            ))
+        .then_some(policy)
+    }))
 }
 
 pub fn chunk_policy_penalty(conn: &Connection, chunk_id: i64) -> Result<f64> {
@@ -753,6 +770,32 @@ mod tests {
             file_policy_by_path(&conn, "docs/read.ts")?.unwrap().role,
             "documentation"
         );
+
+        // A newer neutral answer for the same exact evidence must shadow the
+        // older actionable answer. Filtering for `likely` before choosing the
+        // newest row would incorrectly reactivate stale policy here.
+        let neutral_run_id = run(&conn, "classification-neutral")?;
+        persist_classification(
+            &conn,
+            &NewClassification {
+                run_id: neutral_run_id,
+                subject_key: &docs.subject_key,
+                subject_kind: "area",
+                selector: &docs_selector,
+                parent_subject_key: None,
+                depth: 0,
+                role: "mixed",
+                confidence: "possible",
+                explanation: "evidence is mixed",
+                citations_json: "[\"E001\"]",
+                evidence_fingerprint: &docs.evidence_fingerprint,
+                classification_fingerprint: "classification-neutral",
+                source_snapshot: "snapshot",
+            },
+        )?;
+        ledger::finish_run(&conn, neutral_run_id, RunOutcome::Completed, None, None)?;
+        assert_eq!(reconcile_file_policy(repo.path(), &conn)?, 0);
+        assert!(file_policy_by_path(&conn, "docs/read.ts")?.is_none());
         Ok(())
     }
 

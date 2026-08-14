@@ -2136,6 +2136,48 @@ mod tests {
                 .iter()
                 .any(|reason| reason.starts_with("repository-recon:"))
         }));
+
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'test','test','custom','test',
+                      'snapshot','project-policy-neutral','neutral','{}','now','now')",
+            [],
+        )?;
+        let selector = serde_json::to_string(&crate::recon::SubjectSelector::Project {
+            config: "tsconfig.runtime.json".into(),
+            membership_fingerprint: "members-runtime".into(),
+            config_fingerprint: "config-runtime".into(),
+        })?;
+        conn.execute(
+            "INSERT INTO repository_classifications(
+               run_id,subject_key,subject_kind,selector_json,depth,role,confidence,
+               explanation,citations_json,evidence_fingerprint,
+               classification_fingerprint,source_snapshot,created_at
+             ) VALUES(?1,'project:tsconfig.runtime.json','project',?2,0,'unknown',
+                      'possible','insufficient','[\"E001\"]','neutral','neutral',
+                      'snapshot','now')",
+            rusqlite::params![conn.last_insert_rowid(), selector],
+        )?;
+        let mut neutral_projects = vec![ProjectSummary {
+            project_id: "tsconfig.runtime.json".into(),
+            file_count: 1,
+            purpose: "tooling".into(),
+            purpose_reasons: vec!["filename".into()],
+            membership_fingerprint: "members-runtime".into(),
+            config_fingerprint: "config-runtime".into(),
+        }];
+        let mut neutral_ownership = vec![FileOwnership {
+            file: "only.ts".into(),
+            project_ids: Vec::new(),
+            excluded_project_ids: vec!["tsconfig.runtime.json".into()],
+            tooling_fallback: false,
+        }];
+        apply_repository_project_policy(&conn, &mut neutral_ownership, &mut neutral_projects)?;
+        assert_eq!(neutral_projects[0].purpose, "tooling");
+        assert_eq!(neutral_projects[0].purpose_reasons, ["filename"]);
         Ok(())
     }
 

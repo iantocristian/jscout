@@ -34,7 +34,6 @@ pub const DEFAULT_MAX_DEPTH: usize = 3;
 
 const MAX_EXPLANATION_CHARS: usize = 600;
 const MAX_CITATIONS: usize = 8;
-const MAX_REPRESENTATIVE_FILES: usize = 8;
 const MAX_OUTLINES_PER_FILE: usize = 3;
 const MAX_DISK_EVIDENCE_CHARS: usize = 12_000;
 
@@ -531,7 +530,8 @@ fn build_evidence(
             .to_ascii_lowercase();
         *language_counts.entry(extension).or_insert(0) += 1;
     }
-    let representatives = representative_members(&subject.state.members, MAX_REPRESENTATIVE_FILES);
+    let representatives =
+        recon::representative_members(&subject.state.members, recon::REPRESENTATIVE_FILE_LIMIT);
     let member_ids = representatives
         .iter()
         .map(|member| member.id)
@@ -600,18 +600,6 @@ fn chunk_kind_counts(conn: &Connection, member_ids: &[i64]) -> Result<BTreeMap<S
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-fn representative_members(members: &[MemberFile], limit: usize) -> Vec<&MemberFile> {
-    if members.len() <= limit {
-        return members.iter().collect();
-    }
-    (0..limit)
-        .map(|index| {
-            let offset = index * (members.len() - 1) / (limit - 1);
-            &members[offset]
-        })
-        .collect()
 }
 
 fn add_file_evidence(
