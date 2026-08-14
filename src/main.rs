@@ -1364,10 +1364,12 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
             ..Default::default()
         },
     )?;
+    // `jscout index` is a full snapshot refresh: per-file hash reuse never
+    // applies here (watch owns the incremental path), so an "unchanged" count
+    // would always read 0 and misreport the rebuild as failed change detection.
     println!(
-        "indexed {} files ({} unchanged, {} failed) — {} chunks, {} refs in {:?}",
+        "indexed {} files ({} failed) — {} chunks, {} refs in {:?}",
         o.indexed,
-        o.unchanged,
         o.failed,
         o.chunks,
         o.refs,
