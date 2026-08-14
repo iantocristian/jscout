@@ -1293,8 +1293,13 @@ jscout index
 The deterministic planner discovers subjects without consulting current file
 roles:
 
-- workspace packages and bounded directory areas, recursively subdividing an
-  area only when it is classified as mixed;
+- workspace packages and bounded directory areas. A `mixed` area may subdivide
+  at most three directory levels below its initial subject, the complete plan
+  may contain at most 256 subjects, subdivision and classification share the
+  command-wide `--max-calls` limit, and each serialized evidence pack must fit
+  `--context-bytes`. Reaching any bound leaves the unresolved area `mixed`,
+  which has neutral downstream policy, rather than silently guessing a child
+  role;
 - TypeScript/JavaScript project configurations discovered by the checker
   configuration-only pass;
 - repository-owned files outside a workspace package, grouped by stable path
@@ -1313,8 +1318,21 @@ The scout publishes immutable, fingerprinted scope/project classifications:
 - exact scope or config identity;
 - `likely`/`possible` confidence, model provenance, and cited evidence spans or
   config fields;
-- a fingerprint over membership, evidence, prompt/schema/model policy, and the
-  structural snapshot.
+- a reusable classification fingerprint over the exact subject identity,
+  ordered repository-relative membership, evidence-pack input hashes, the
+  deterministic evidence-selection algorithm, and prompt/schema/model policy.
+  Evidence inputs include manifest/config contents, aggregate file-kind and
+  language counts, and the exact selected outline/import/export/entity rows.
+
+The repository structural snapshot is recorded on the scouting run for audit
+and response labelling, but it is deliberately excluded from classification
+identity and freshness. Planning and publication recheck the subject
+fingerprint, not global snapshot equality. An unrelated edit, reindex, or
+branch change elsewhere therefore reuses the classification; membership or
+evidence changes inside the subject stale only that subject and its ancestors.
+A removed subject has no current identity to which its old classification can
+apply. Returning to a branch with the same subject fingerprint may reuse the
+immutable prior result without another model call.
 
 Classifications are policy metadata, not graph facts. Files are never deleted
 from L1. Only current, fresh classifications affect downstream defaults:
@@ -1331,10 +1349,14 @@ from L1. Only current, fresh classifications affect downstream defaults:
   inclusion rather than silently hiding code.
 
 The first implementation must add a dry-run showing every planned subject,
-classification input, and downstream inclusion decision. Acceptance requires
-fixtures where the same `doc`/`docs` and `tsconfig` names receive different
-roles from different repository evidence, plus a stale-overlay test proving
-that source/config drift restores neutral inclusion.
+classification input, subdivision depth/budget decision, reuse/freshness
+decision, and downstream inclusion decision. Acceptance requires fixtures
+where the same `doc`/`docs` and `tsconfig` names receive different roles from
+different repository evidence; an unrelated reindex and an outside-scope
+branch edit preserve freshness; in-scope membership/evidence drift restores
+neutral inclusion only for the affected subject/ancestors; returning to an
+identical fingerprint reuses the prior classification; and depth, subject,
+call, and context limits terminate mixed subdivision deterministically.
 
 ## Evaluation decisions already made
 
