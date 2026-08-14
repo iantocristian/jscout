@@ -150,7 +150,12 @@ test("plans ownership without a Program and resolves a bounded project batch", a
 
   const plan = await checker.request("plan_members", { files: ["main.ts", "main.ts"] });
   assert.equal(plan.kind, "plan_members_result");
-  assert.deepEqual(plan.result.files, [{ file: "main.ts", project_ids: ["tsconfig.json"] }]);
+  assert.deepEqual(plan.result.files, [{
+    file: "main.ts",
+    project_ids: ["tsconfig.json"],
+    excluded_project_ids: [],
+    tooling_fallback: false,
+  }]);
 
   const resolved = await checker.request("resolve_members", {
     project_id: "tsconfig.json",
@@ -171,6 +176,126 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   assert.equal(validation.kind, "validate_project_result");
   assert.equal(validation.result.valid, true);
   assert.ok(validation.result.inputs.some((input) => input.path.endsWith("main.ts")));
+  await checker.close();
+});
+
+test("excludes tooling config ownership only when a non-tooling owner remains", async (context) => {
+  const shared = "declare const shared: { run(): void };\nshared.run()\n";
+  const lintOnly = "declare const lintOnly: { run(): void };\nlintOnly.run()\n";
+  const root = fixture({
+    "main.ts": shared,
+    "lint-only.ts": lintOnly,
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.eslint.json": JSON.stringify({
+      extends: "./tsconfig.json",
+      compilerOptions: { allowJs: true },
+      files: ["main.ts", "lint-only.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts", "lint-only.ts"] });
+  assert.equal(plan.kind, "plan_members_result");
+  assert.deepEqual(plan.result.files, [
+    {
+      file: "lint-only.ts",
+      project_ids: ["tsconfig.eslint.json"],
+      excluded_project_ids: [],
+      tooling_fallback: true,
+    },
+    {
+      file: "main.ts",
+      project_ids: ["tsconfig.json"],
+      excluded_project_ids: ["tsconfig.eslint.json"],
+      tooling_fallback: false,
+    },
+  ]);
+  assert.deepEqual(
+    plan.result.projects.map(({ project_id, purpose, purpose_reasons }) => ({
+      project_id,
+      purpose,
+      purpose_reasons,
+    })),
+    [
+      {
+        project_id: "tsconfig.eslint.json",
+        purpose: "tooling",
+        purpose_reasons: ["tooling-filename"],
+      },
+      { project_id: "tsconfig.json", purpose: "general", purpose_reasons: [] },
+    ],
+  );
+
+  const fallback = await checker.request("resolve_members", {
+    project_id: "tsconfig.eslint.json",
+    queries: [{
+      ...queryFor(lintOnly, "lintOnly.run()", "lintOnly", "run"),
+      file: "lint-only.ts",
+    }],
+  });
+  assert.equal(fallback.kind, "resolve_members_result", JSON.stringify(fallback));
+  assert.equal(fallback.result.results[0].answer.status, "resolved");
+  await checker.close();
+});
+
+test("does not classify noEmit as tooling without an independent lint signal", async (context) => {
+  const root = fixture({
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.check.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      files: ["main.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.equal(plan.kind, "plan_members_result");
+  assert.deepEqual(plan.result.files[0], {
+    file: "main.ts",
+    project_ids: ["tsconfig.check.json", "tsconfig.json"],
+    excluded_project_ids: [],
+    tooling_fallback: false,
+  });
+  assert.ok(plan.result.projects.every((project) => project.purpose === "general"));
+  await checker.close();
+});
+
+test("uses an explicit lint script to corroborate a noEmit tooling config", async (context) => {
+  const root = fixture({
+    "package.json": JSON.stringify({
+      scripts: { "lint:types": "tsc -p tsconfig.check.json" },
+    }),
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.check.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      files: ["main.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.deepEqual(plan.result.files[0], {
+    file: "main.ts",
+    project_ids: ["tsconfig.json"],
+    excluded_project_ids: ["tsconfig.check.json"],
+    tooling_fallback: false,
+  });
+  const tooling = plan.result.projects.find(
+    (project) => project.project_id === "tsconfig.check.json",
+  );
+  assert.equal(tooling.purpose, "tooling");
+  assert.deepEqual(tooling.purpose_reasons, ["tooling-script:lint:types"]);
   await checker.close();
 });
 

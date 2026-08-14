@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use super::protocol::{
-    DeclarationSite, FileOwnership, InputValidation, MemberQuery, ProjectAnswer, TypeScriptIdentity,
+    DeclarationSite, FileOwnership, InputValidation, MemberQuery, ProjectAnswer, ProjectSummary,
+    TypeScriptIdentity,
 };
 
 #[derive(Debug, Clone)]
@@ -45,9 +46,30 @@ pub struct EnrichReport {
     pub projects: usize,
     pub configured_projects: usize,
     pub configuration_problems: usize,
+    pub occurrences_avoided_by_tooling_filter: usize,
+    pub occurrences_using_tooling_fallback: usize,
+    pub project_decisions: Vec<ProjectDecision>,
     pub dry_run: bool,
     pub peak_rss_bytes: u64,
     pub peak_heap_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectDecision {
+    pub project_id: String,
+    pub purpose: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub purpose_reasons: Vec<String>,
+    pub selected_occurrences: usize,
+    pub excluded_occurrences: usize,
+    pub fallback_occurrences: usize,
+}
+
+struct ProjectPlanning {
+    projects: BTreeMap<String, Vec<Occurrence>>,
+    decisions: Vec<ProjectDecision>,
+    occurrences_avoided_by_tooling_filter: usize,
+    occurrences_using_tooling_fallback: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +186,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     )?;
     let protocol = planner.versions.protocol;
     drop(planner);
-    let project_plan = build_project_plan(&selected, &ownership.files)?;
+    let ProjectPlanning {
+        projects: project_plan,
+        decisions: project_decisions,
+        occurrences_avoided_by_tooling_filter,
+        occurrences_using_tooling_fallback,
+    } = build_project_plan(&selected, &ownership.files, &ownership.projects)?;
     let plan_fingerprint = plan_fingerprint(
         &snapshot,
         &selected,
@@ -194,6 +221,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
+            occurrences_avoided_by_tooling_filter,
+            occurrences_using_tooling_fallback,
+            project_decisions,
             dry_run: true,
             peak_rss_bytes: 0,
             peak_heap_bytes: 0,
@@ -232,6 +262,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
+            occurrences_avoided_by_tooling_filter,
+            occurrences_using_tooling_fallback,
+            project_decisions,
             dry_run: false,
             peak_rss_bytes: 0,
             peak_heap_bytes: 0,
@@ -352,6 +385,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         projects: project_plan.len(),
         configured_projects: ownership.projects.len(),
         configuration_problems: ownership.configuration_problems.len(),
+        occurrences_avoided_by_tooling_filter,
+        occurrences_using_tooling_fallback,
+        project_decisions,
         dry_run: false,
         peak_rss_bytes,
         peak_heap_bytes,
@@ -518,23 +554,54 @@ fn verify_selected_sources(root: &Path, conn: &Connection, selected: &[Occurrenc
 fn build_project_plan(
     selected: &[Occurrence],
     ownership: &[FileOwnership],
-) -> Result<BTreeMap<String, Vec<Occurrence>>> {
+    projects: &[ProjectSummary],
+) -> Result<ProjectPlanning> {
     let owners = ownership
         .iter()
-        .map(|entry| (entry.file.as_str(), entry.project_ids.as_slice()))
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let summaries = projects
+        .iter()
+        .map(|project| (project.project_id.as_str(), project))
         .collect::<HashMap<_, _>>();
     let mut plan = BTreeMap::<String, Vec<Occurrence>>::new();
+    let mut decisions = BTreeMap::<String, ProjectDecision>::new();
+    let mut occurrences_avoided_by_tooling_filter = 0;
+    let mut occurrences_using_tooling_fallback = 0;
     for occurrence in selected {
-        let project_ids = owners.get(occurrence.file.as_str()).with_context(|| {
+        let ownership = owners.get(occurrence.file.as_str()).with_context(|| {
             format!("checker omitted project ownership for {}", occurrence.file)
         })?;
-        if project_ids.is_empty() {
+        if ownership.project_ids.is_empty() {
             bail!("checker returned no owning project for {}", occurrence.file);
         }
-        for project_id in *project_ids {
+        if ownership
+            .project_ids
+            .iter()
+            .any(|project_id| ownership.excluded_project_ids.contains(project_id))
+        {
+            bail!(
+                "checker selected and excluded the same project owner for {}",
+                occurrence.file
+            );
+        }
+        if ownership.tooling_fallback {
+            occurrences_using_tooling_fallback += 1;
+        }
+        for project_id in &ownership.project_ids {
             plan.entry(project_id.clone())
                 .or_default()
                 .push(occurrence.clone());
+            let decision = project_decision(&mut decisions, &summaries, project_id);
+            decision.selected_occurrences += 1;
+            if ownership.tooling_fallback {
+                decision.fallback_occurrences += 1;
+            }
+        }
+        for project_id in &ownership.excluded_project_ids {
+            let decision = project_decision(&mut decisions, &summaries, project_id);
+            decision.excluded_occurrences += 1;
+            occurrences_avoided_by_tooling_filter += 1;
         }
     }
     for occurrences in plan.values_mut() {
@@ -542,7 +609,31 @@ fn build_project_plan(
             (&left.file, left.call_start, left.id).cmp(&(&right.file, right.call_start, right.id))
         });
     }
-    Ok(plan)
+    Ok(ProjectPlanning {
+        projects: plan,
+        decisions: decisions.into_values().collect(),
+        occurrences_avoided_by_tooling_filter,
+        occurrences_using_tooling_fallback,
+    })
+}
+
+fn project_decision<'a>(
+    decisions: &'a mut BTreeMap<String, ProjectDecision>,
+    summaries: &HashMap<&str, &ProjectSummary>,
+    project_id: &str,
+) -> &'a mut ProjectDecision {
+    decisions.entry(project_id.to_string()).or_insert_with(|| {
+        let summary = summaries.get(project_id);
+        ProjectDecision {
+            project_id: project_id.to_string(),
+            purpose: summary.map_or_else(|| "inferred".into(), |summary| summary.purpose.clone()),
+            purpose_reasons: summary
+                .map_or_else(Vec::new, |summary| summary.purpose_reasons.clone()),
+            selected_occurrences: 0,
+            excluded_occurrences: 0,
+            fallback_occurrences: 0,
+        }
+    })
 }
 
 fn plan_fingerprint(
@@ -1833,6 +1924,61 @@ mod tests {
         let mut all = options();
         all.include_all = true;
         assert_eq!(select_eligible(candidates, &all).len(), 3);
+    }
+
+    #[test]
+    fn tooling_ownership_is_excluded_with_a_non_tooling_owner_and_retained_as_fallback()
+    -> Result<()> {
+        let selected = vec![
+            planned_occurrence(1, "root", "shared.ts", "production", 0),
+            planned_occurrence(2, "root", "lint-only.ts", "production", 0),
+        ];
+        let ownership = vec![
+            FileOwnership {
+                file: "shared.ts".into(),
+                project_ids: vec!["tsconfig.json".into()],
+                excluded_project_ids: vec!["tsconfig.eslint.json".into()],
+                tooling_fallback: false,
+            },
+            FileOwnership {
+                file: "lint-only.ts".into(),
+                project_ids: vec!["tsconfig.eslint.json".into()],
+                excluded_project_ids: Vec::new(),
+                tooling_fallback: true,
+            },
+        ];
+        let projects = vec![
+            ProjectSummary {
+                project_id: "tsconfig.eslint.json".into(),
+                file_count: 2,
+                purpose: "tooling".into(),
+                purpose_reasons: vec!["tooling-filename".into()],
+            },
+            ProjectSummary {
+                project_id: "tsconfig.json".into(),
+                file_count: 1,
+                purpose: "general".into(),
+                purpose_reasons: Vec::new(),
+            },
+        ];
+
+        let planning = build_project_plan(&selected, &ownership, &projects)?;
+        assert_eq!(planning.occurrences_avoided_by_tooling_filter, 1);
+        assert_eq!(planning.occurrences_using_tooling_fallback, 1);
+        assert_eq!(planning.projects["tsconfig.json"][0].file, "shared.ts");
+        assert_eq!(
+            planning.projects["tsconfig.eslint.json"][0].file,
+            "lint-only.ts"
+        );
+        let tooling = planning
+            .decisions
+            .iter()
+            .find(|decision| decision.project_id == "tsconfig.eslint.json")
+            .expect("tooling decision");
+        assert_eq!(tooling.selected_occurrences, 1);
+        assert_eq!(tooling.excluded_occurrences, 1);
+        assert_eq!(tooling.fallback_occurrences, 1);
+        Ok(())
     }
 
     #[test]
