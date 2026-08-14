@@ -70,7 +70,7 @@ pub fn classify(path: &Path, source: &str) -> &'static str {
         "test"
     } else if has_component(
         &components,
-        &["doc", "docs", "documentation", ".storybook", "stories"],
+        &["docs", "documentation", ".storybook", "stories"],
     ) || has_file_marker(file, &[".stories.", ".story."])
     {
         "documentation"
@@ -166,6 +166,36 @@ mod tests {
         assert_eq!(
             classify(Path::new("packages/api/tests/generated/run.test.ts"), ""),
             "generated"
+        );
+    }
+
+    #[test]
+    fn singular_doc_directories_are_production_not_documentation() {
+        assert_eq!(
+            classify(
+                Path::new("packages/backend/server/src/core/doc/writer.ts"),
+                ""
+            ),
+            "production"
+        );
+        assert_eq!(
+            classify(
+                Path::new("packages/common/nbstore/src/sync/doc/peer.ts"),
+                ""
+            ),
+            "production"
+        );
+        assert_eq!(
+            classify(Path::new("packages/api/docs/guide.ts"), ""),
+            "documentation"
+        );
+        assert_eq!(
+            classify(Path::new("packages/api/documentation/guide.ts"), ""),
+            "documentation"
+        );
+        assert_eq!(
+            super::penalty(Some(classify(Path::new("src/doc/job.ts"), ""))),
+            1.0
         );
     }
 }

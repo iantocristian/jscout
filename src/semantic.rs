@@ -2506,6 +2506,42 @@ mod tests {
     }
 
     #[test]
+    fn workflow_candidates_keep_seed_symbols_under_singular_doc_directories() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src/doc"))?;
+        fs::write(
+            repo.path().join("src/doc/job.ts"),
+            "export function dispatchJob() { return handleJob(); }\n\
+             export function handleJob() { return 1; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let role: String = conn.query_row(
+            "SELECT role FROM files WHERE path='src/doc/job.ts'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(role, "production");
+
+        let seed = "sym:src/doc/job.ts#::dispatchJob@1";
+        let candidates = workflow_candidates(
+            repo.path(),
+            &conn,
+            &[seed.into()],
+            &WorkflowCandidateOptions::default(),
+        )?;
+        let candidate = candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.anchor == seed)
+            .expect("the production seed must remain in its own candidate set");
+        assert!(candidate.seed);
+        assert_eq!(candidate.file, "src/doc/job.ts");
+        Ok(())
+    }
+
+    #[test]
     fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
