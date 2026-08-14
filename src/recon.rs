@@ -96,6 +96,7 @@ pub struct NewClassification<'a> {
     pub confidence: &'a str,
     pub explanation: &'a str,
     pub citations_json: &'a str,
+    pub cited_evidence_json: &'a str,
     pub evidence_fingerprint: &'a str,
     pub classification_fingerprint: &'a str,
     pub source_snapshot: &'a str,
@@ -107,6 +108,19 @@ pub struct FilePolicy {
     pub subject_key: String,
     pub role: String,
     pub depth: usize,
+}
+
+#[derive(Debug)]
+struct PolicyCandidate {
+    id: i64,
+    subject_key: String,
+    selector: SubjectSelector,
+    selector_json: String,
+    role: String,
+    confidence: String,
+    parent_subject_key: Option<String>,
+    depth: usize,
+    evidence_fingerprint: String,
 }
 
 pub fn build_scope_state(
@@ -224,8 +238,9 @@ pub fn persist_classification(
         "INSERT INTO repository_classifications(
            run_id, subject_key, subject_kind, selector_json, parent_subject_key,
            depth, role, confidence, explanation, citations_json,
-           evidence_fingerprint, classification_fingerprint, source_snapshot, created_at
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,
+           cited_evidence_json, evidence_fingerprint, classification_fingerprint,
+           source_snapshot, created_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
                   strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![
             classification.run_id,
@@ -238,6 +253,7 @@ pub fn persist_classification(
             classification.confidence,
             classification.explanation,
             classification.citations_json,
+            classification.cited_evidence_json,
             classification.evidence_fingerprint,
             classification.classification_fingerprint,
             classification.source_snapshot,
@@ -251,23 +267,12 @@ pub fn persist_classification(
 /// does not mask an older exact match, which is what makes branch-return reuse
 /// work without mutating immutable history.
 pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
-    #[derive(Debug)]
-    struct Candidate {
-        id: i64,
-        subject_key: String,
-        selector: SubjectSelector,
-        role: String,
-        confidence: String,
-        depth: usize,
-        evidence_fingerprint: String,
-    }
-
     let candidates = {
         let mut statement = conn.prepare(
             "SELECT classification.id, classification.subject_key,
                     classification.selector_json, classification.role,
-                    classification.confidence, classification.depth,
-                    classification.evidence_fingerprint
+                    classification.confidence, classification.parent_subject_key,
+                    classification.depth, classification.evidence_fingerprint
              FROM repository_classifications classification
              JOIN scout_runs run ON run.id=classification.run_id
              WHERE run.status='completed'
@@ -283,43 +288,79 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
                     Box::new(error),
                 )
             })?;
-            Ok(Candidate {
+            Ok(PolicyCandidate {
                 id: row.get(0)?,
                 subject_key: row.get(1)?,
+                selector_json,
                 selector,
                 role: row.get(3)?,
                 confidence: row.get(4)?,
-                depth: row.get::<_, i64>(5)? as usize,
-                evidence_fingerprint: row.get(6)?,
+                parent_subject_key: row.get(5)?,
+                depth: row.get::<_, i64>(6)? as usize,
+                evidence_fingerprint: row.get(7)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut selected = Vec::<(Candidate, Vec<MemberFile>)>::new();
+    let mut states = BTreeMap::<(String, String), SubjectState>::new();
+    let mut current = BTreeMap::<String, (PolicyCandidate, Vec<MemberFile>)>::new();
     let mut resolved_subjects = BTreeSet::new();
     for candidate in candidates {
         if resolved_subjects.contains(&candidate.subject_key) {
             continue;
         }
-        let state = build_scope_state(
-            root,
-            conn,
+        let cache_key = (
             candidate.subject_key.clone(),
-            candidate.selector.clone(),
-        )?;
+            candidate.selector_json.clone(),
+        );
+        if !states.contains_key(&cache_key) {
+            states.insert(
+                cache_key.clone(),
+                build_scope_state(
+                    root,
+                    conn,
+                    candidate.subject_key.clone(),
+                    candidate.selector.clone(),
+                )?,
+            );
+        }
+        let state = &states[&cache_key];
         if state.evidence_fingerprint == candidate.evidence_fingerprint {
             resolved_subjects.insert(candidate.subject_key.clone());
-            if candidate.confidence == "likely"
-                && matches!(
-                    candidate.role.as_str(),
-                    "runtime" | "tooling" | "documentation" | "test" | "generated"
-                )
-            {
-                selected.push((candidate, state.members));
-            }
+            current.insert(
+                candidate.subject_key.clone(),
+                (candidate, state.members.clone()),
+            );
         }
     }
+    let definite = current
+        .iter()
+        .filter_map(|(subject, (candidate, _))| actionable(candidate).then_some(subject.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut suppressed = BTreeSet::new();
+    for (subject, (candidate, _)) in &current {
+        let mut ancestor = candidate.parent_subject_key.as_ref();
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = ancestor {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            if definite.contains(parent) {
+                suppressed.insert(subject.clone());
+                break;
+            }
+            ancestor = current
+                .get(parent)
+                .and_then(|(parent_candidate, _)| parent_candidate.parent_subject_key.as_ref());
+        }
+    }
+    let mut selected = current
+        .into_iter()
+        .filter_map(|(subject, value)| {
+            (actionable(&value.0) && !suppressed.contains(&subject)).then_some(value)
+        })
+        .collect::<Vec<_>>();
     selected.sort_by(|(left, _), (right, _)| {
         left.selector
             .specificity()
@@ -368,6 +409,31 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
             Err(error)
         }
     }
+}
+
+/// L1 publication must never depend on the optional semantic policy plane.
+/// If current evidence cannot be read or reconciled, remove the disposable
+/// projection and keep the freshly published structural index fully usable.
+pub fn reconcile_file_policy_after_index(root: &Path, conn: &Connection) {
+    if let Err(error) = reconcile_file_policy(root, conn) {
+        let clear_error = conn.execute("DELETE FROM repository_file_policy", []).err();
+        eprintln!(
+            "repository reconnaissance policy unavailable after index; using neutral defaults: {error}"
+        );
+        if let Some(clear_error) = clear_error {
+            eprintln!(
+                "failed to clear repository reconnaissance policy after reconciliation error: {clear_error}"
+            );
+        }
+    }
+}
+
+fn actionable(candidate: &PolicyCandidate) -> bool {
+    candidate.confidence == "likely"
+        && matches!(
+            candidate.role.as_str(),
+            "runtime" | "tooling" | "documentation" | "test" | "generated"
+        )
 }
 
 pub fn file_policy_by_path(conn: &Connection, path: &str) -> Result<Option<FilePolicy>> {
@@ -687,6 +753,39 @@ mod tests {
         Ok(run_id)
     }
 
+    fn classify(
+        conn: &rusqlite::Connection,
+        state: &super::SubjectState,
+        parent_subject_key: Option<&str>,
+        depth: usize,
+        role: &str,
+        confidence: &str,
+        fingerprint: &str,
+    ) -> Result<i64> {
+        let run_id = run(conn, fingerprint)?;
+        let classification_id = persist_classification(
+            conn,
+            &NewClassification {
+                run_id,
+                subject_key: &state.subject_key,
+                subject_kind: "area",
+                selector: &state.selector,
+                parent_subject_key,
+                depth,
+                role,
+                confidence,
+                explanation: "test classification",
+                citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
+                evidence_fingerprint: &state.evidence_fingerprint,
+                classification_fingerprint: fingerprint,
+                source_snapshot: "snapshot",
+            },
+        )?;
+        ledger::finish_run(conn, run_id, RunOutcome::Completed, None, None)?;
+        Ok(classification_id)
+    }
+
     #[test]
     fn scope_matching_is_literal_and_root_direct_is_bounded() {
         assert!(path_in_scope("src/a.ts", "src", false));
@@ -732,6 +831,7 @@ mod tests {
                 confidence: "likely",
                 explanation: "guide source",
                 citations_json: "[\"aggregate:file-kinds\"]",
+                cited_evidence_json: "[]",
                 evidence_fingerprint: &docs.evidence_fingerprint,
                 classification_fingerprint: "classification-1",
                 source_snapshot: "snapshot",
@@ -788,6 +888,7 @@ mod tests {
                 confidence: "possible",
                 explanation: "evidence is mixed",
                 citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
                 evidence_fingerprint: &docs.evidence_fingerprint,
                 classification_fingerprint: "classification-neutral",
                 source_snapshot: "snapshot",
@@ -856,6 +957,127 @@ mod tests {
     }
 
     #[test]
+    fn index_publishes_l1_and_clears_policy_when_optional_reconciliation_fails() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("src"))?;
+        std::fs::write(repo.path().join("src/run.ts"), "export const run = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let state = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:src".into(),
+            SubjectSelector::RepositoryArea {
+                scope: "src".into(),
+                direct_only: false,
+            },
+        )?;
+        let classification_id =
+            classify(&conn, &state, None, 0, "runtime", "likely", "valid-policy")?;
+        reconcile_file_policy(repo.path(), &conn)?;
+        assert!(file_policy_by_path(&conn, "src/run.ts")?.is_some());
+
+        // Corrupt durable policy metadata stands in for any optional-plane
+        // read/reconciliation failure. The subsequent structural index still
+        // succeeds and removes the projection instead of serving old policy.
+        conn.execute(
+            "UPDATE repository_classifications SET selector_json='{' WHERE id=?1",
+            [classification_id],
+        )?;
+        std::fs::write(repo.path().join("src/run.ts"), "export const run = 2;\n")?;
+        let outcome = crate::indexer::index_repo(repo.path(), &conn)?;
+        assert_eq!(outcome.failed, 0);
+        assert!(file_policy_by_path(&conn, "src/run.ts")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn definite_parent_suppresses_old_descendants_until_parent_is_mixed_again() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("mixed/docs"))?;
+        std::fs::write(
+            repo.path().join("mixed/runtime.ts"),
+            "export const runtime = 1;\n",
+        )?;
+        std::fs::write(
+            repo.path().join("mixed/docs/guide.ts"),
+            "export const guide = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let parent = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:mixed".into(),
+            SubjectSelector::RepositoryArea {
+                scope: "mixed".into(),
+                direct_only: false,
+            },
+        )?;
+        let child = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:mixed/docs".into(),
+            SubjectSelector::RepositoryArea {
+                scope: "mixed/docs".into(),
+                direct_only: false,
+            },
+        )?;
+        classify(&conn, &parent, None, 0, "mixed", "likely", "parent-mixed")?;
+        classify(
+            &conn,
+            &child,
+            Some(&parent.subject_key),
+            1,
+            "documentation",
+            "likely",
+            "child-docs",
+        )?;
+        reconcile_file_policy(repo.path(), &conn)?;
+        assert_eq!(
+            file_policy_by_path(&conn, "mixed/docs/guide.ts")?
+                .unwrap()
+                .role,
+            "documentation"
+        );
+
+        classify(
+            &conn,
+            &parent,
+            None,
+            0,
+            "runtime",
+            "likely",
+            "parent-runtime",
+        )?;
+        reconcile_file_policy(repo.path(), &conn)?;
+        assert_eq!(
+            file_policy_by_path(&conn, "mixed/docs/guide.ts")?
+                .unwrap()
+                .role,
+            "runtime"
+        );
+
+        classify(
+            &conn,
+            &parent,
+            None,
+            0,
+            "mixed",
+            "likely",
+            "parent-mixed-again",
+        )?;
+        reconcile_file_policy(repo.path(), &conn)?;
+        assert_eq!(
+            file_policy_by_path(&conn, "mixed/docs/guide.ts")?
+                .unwrap()
+                .role,
+            "documentation"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fresh_scope_policy_overrides_ambiguous_doc_path_heuristics_for_workflows() -> Result<()> {
         let repo = tempfile::tempdir()?;
         std::fs::create_dir_all(repo.path().join("doc"))?;
@@ -902,6 +1124,7 @@ mod tests {
                 confidence: "likely",
                 explanation: "runtime document-domain implementation",
                 citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
                 evidence_fingerprint: &state.evidence_fingerprint,
                 classification_fingerprint: "runtime-docs",
                 source_snapshot: "snapshot",
@@ -933,6 +1156,7 @@ mod tests {
                 confidence: "likely",
                 explanation: "reader-facing guide implementation",
                 citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
                 evidence_fingerprint: &doc_state.evidence_fingerprint,
                 classification_fingerprint: "documentation-doc",
                 source_snapshot: "snapshot",

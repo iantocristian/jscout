@@ -187,6 +187,10 @@ directories plus a direct-file residual. One command shares `--max-calls`,
 `--max-subjects` (default 256), `--max-depth` (default 3), and
 `--context-bytes` across the entire recursive plan. Reaching a bound leaves the
 unresolved subject neutral; it never invents a narrower role.
+When a later scout gives a parent scope a definite role, that parent controls
+the current projection and suppresses policy from descendants created by an
+older `mixed` result. The descendant rows remain immutable history and can
+reactivate if the parent later returns to `mixed`.
 
 Classifications are immutable durable policy metadata, not graph facts. Their
 freshness covers ordered subject membership, manifests/configs, and the bounded
@@ -206,6 +210,12 @@ model call. Only fresh `likely` classifications affect defaults:
   auxiliary project when it is a file's sole owner.
 
 `possible`, `mixed`, `unknown`, stale, and missing classifications are neutral.
+Each classification stores the exact cited evidence objects, including the
+bounded content shown to the model, so historical citations remain auditable
+after the source or deterministic pack changes.
+If policy reconciliation cannot read or validate its optional inputs during
+`index`, jscout warns, clears the disposable policy projection, and keeps the
+new L1 snapshot available with neutral defaults.
 Diagnostic search JSON retains `file_role` and adds `repository_role` only when
 an active reconnaissance policy exists; compact output presents the effective
 role without adding a second metadata field.

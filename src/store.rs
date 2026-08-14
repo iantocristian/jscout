@@ -646,6 +646,7 @@ CREATE TABLE IF NOT EXISTS repository_classifications(
   confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
   explanation TEXT NOT NULL,
   citations_json TEXT NOT NULL,
+  cited_evidence_json TEXT NOT NULL DEFAULT '[]',
   evidence_fingerprint TEXT NOT NULL,
   classification_fingerprint TEXT NOT NULL,
   source_snapshot TEXT NOT NULL,
@@ -751,6 +752,24 @@ CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
          CREATE INDEX IF NOT EXISTS idx_module_edges_package_instance
            ON module_edges(package_instance_id);",
     )?;
+    // The cited-evidence payload was added while schema v20 was under review.
+    // Keep databases created by an earlier v20 commit usable without dropping
+    // their new durable reconnaissance history.
+    let has_cited_evidence: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info('repository_classifications')
+           WHERE name='cited_evidence_json'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_cited_evidence {
+        conn.execute(
+            "ALTER TABLE repository_classifications
+             ADD COLUMN cited_evidence_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1052,6 +1071,28 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn early_v20_reconnaissance_table_gains_auditable_cited_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("early-v20.db");
+        let conn = open_path(&database)?;
+        conn.execute(
+            "ALTER TABLE repository_classifications DROP COLUMN cited_evidence_json",
+            [],
+        )?;
+        drop(conn);
+
+        let reopened = open_path(&database)?;
+        let columns: i64 = reopened.query_row(
+            "SELECT count(*) FROM pragma_table_info('repository_classifications')
+             WHERE name='cited_evidence_json'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(columns, 1);
         Ok(())
     }
 

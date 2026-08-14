@@ -1108,8 +1108,14 @@ fn execute_one(
         }
     };
 
-    let current = refresh_state(root, conn, &item)?;
-    if current.evidence_fingerprint != item.evidence_fingerprint {
+    let incomplete_reason = match refresh_state(root, conn, &item) {
+        Ok(current) if current.evidence_fingerprint == item.evidence_fingerprint => None,
+        Ok(_) => Some("subject evidence changed during scouting; nothing was published".into()),
+        Err(error) => Some(format!(
+            "subject evidence could not be rechecked after scouting; nothing was published: {error}"
+        )),
+    };
+    if let Some(incomplete_reason) = incomplete_reason {
         ledger::finish_run(
             conn,
             run_id,
@@ -1117,12 +1123,38 @@ fn execute_one(
             Some(&usage_json),
             Some("inputs_changed"),
         )?;
-        bail!(
-            "repository subject `{}` changed during scouting; nothing was published",
-            item.subject_key
-        );
+        return Ok((
+            ScoutReport {
+                kind: "repository".into(),
+                subject: item.subject_key,
+                run_id,
+                status: "incomplete".into(),
+                started: Some(outcome.started.clone()),
+                artifact_id: None,
+                candidate_count: 1,
+                decisions: BTreeMap::new(),
+                usage: Some(outcome.usage),
+                billing_path: outcome.started.billing_path,
+                incomplete_reason: Some(incomplete_reason),
+                failure: None,
+            },
+            None,
+        ));
     }
     let citations_json = serde_json::to_string(&validated.citations)?;
+    let citations = validated
+        .citations
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let cited_evidence_json = serde_json::to_string(
+        &item
+            .evidence
+            .items
+            .iter()
+            .filter(|evidence| citations.contains(evidence.id.as_str()))
+            .collect::<Vec<_>>(),
+    )?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<()> {
         recon::persist_classification(
@@ -1138,6 +1170,7 @@ fn execute_one(
                 confidence: &validated.confidence,
                 explanation: &validated.explanation,
                 citations_json: &citations_json,
+                cited_evidence_json: &cited_evidence_json,
                 evidence_fingerprint: &item.evidence_fingerprint,
                 classification_fingerprint: &spec.input_fingerprint,
                 source_snapshot: snapshot,

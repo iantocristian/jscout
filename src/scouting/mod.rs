@@ -3395,6 +3395,19 @@ mod tests {
                 .role,
             "documentation"
         );
+        let cited: String = conn.query_row(
+            "SELECT cited_evidence_json FROM repository_classifications
+             WHERE subject_key='area:repository:mixed/docs' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let cited: serde_json::Value = serde_json::from_str(&cited)?;
+        assert_eq!(cited[0]["id"], "E001");
+        assert!(
+            cited[0]["content"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
 
         let mut reused = FakeGateway::new(Vec::new());
         let report =
@@ -3408,6 +3421,119 @@ mod tests {
                 .all(|report| report.status == "reused")
         );
         assert_eq!(reused.calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_subject_drift_is_incomplete_and_does_not_abort_later_subjects() -> Result<()> {
+        use super::repository::{
+            CurrentClassification, EvidenceItem, RepositoryEvidencePack, RepositoryPlan,
+            RepositoryPlanItem, RepositoryScoutOptions,
+        };
+        use crate::recon::{self, SubjectSelector};
+
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("docs"))?;
+        std::fs::create_dir_all(repo.path().join("src"))?;
+        std::fs::write(
+            repo.path().join("docs/guide.ts"),
+            "export const guide = 1;\n",
+        )?;
+        std::fs::write(repo.path().join("src/run.ts"), "export const run = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let item = |scope: &str| -> Result<RepositoryPlanItem> {
+            let subject_key = format!("area:repository:{scope}");
+            let selector = SubjectSelector::RepositoryArea {
+                scope: scope.into(),
+                direct_only: false,
+            };
+            let state = recon::build_scope_state(
+                repo.path(),
+                &conn,
+                subject_key.clone(),
+                selector.clone(),
+            )?;
+            Ok(RepositoryPlanItem {
+                subject_key: subject_key.clone(),
+                subject_kind: "area".into(),
+                display_name: scope.into(),
+                parent_subject_key: None,
+                depth: 0,
+                selector,
+                evidence_fingerprint: state.evidence_fingerprint.clone(),
+                member_count: state.members.len(),
+                evidence: RepositoryEvidencePack {
+                    algorithm: recon::EVIDENCE_ALGORITHM,
+                    subject_key,
+                    subject_kind: "area".into(),
+                    member_count: state.members.len(),
+                    language_counts: Default::default(),
+                    chunk_kind_counts: Default::default(),
+                    items: vec![EvidenceItem {
+                        id: "E001".into(),
+                        kind: "aggregate".into(),
+                        source: None,
+                        start_line: None,
+                        end_line: None,
+                        content: format!("bounded evidence for {scope}"),
+                    }],
+                    rendered: format!("bounded evidence for {scope}"),
+                },
+                current_classification: None::<CurrentClassification>,
+                downstream_policy: "neutral inclusion".into(),
+                potential_children: Vec::new(),
+                state,
+            })
+        };
+        let plan = RepositoryPlan {
+            snapshot,
+            max_subjects: 2,
+            max_depth: 0,
+            subject_limit_reached: false,
+            configured_projects: 0,
+            configuration_problems: Vec::new(),
+            items: vec![item("docs")?, item("src")?],
+            omitted_subjects: Vec::new(),
+        };
+        let options = RepositoryScoutOptions {
+            model: ModelSpec::parse("faux:faux-model")?,
+            reasoning: None,
+            service_tier: None,
+            policy: RequestPolicy::new(30, 2, 240_000)?,
+            rebuild: false,
+            max_subjects: 2,
+            max_depth: 0,
+        };
+        let root = repo.path().to_path_buf();
+        let db_path = store::db_path(repo.path());
+        let mut completions = 0;
+        let mut gateway = FakeGateway::new(vec![
+            Ok(repository_outcome("documentation")),
+            Ok(repository_outcome("runtime")),
+        ]);
+        gateway.on_complete = Some(Box::new(move || {
+            completions += 1;
+            if completions == 1 {
+                std::fs::write(root.join("docs/guide.ts"), "export const guide = 2;\n")
+                    .expect("change first subject");
+                let racing = store::open_path(&db_path).expect("open racing connection");
+                indexer::index_repo(&root, &racing).expect("publish racing index");
+            }
+        }));
+
+        let report = super::repository::execute(repo.path(), &conn, &mut gateway, &options, plan)?;
+        assert_eq!(report.model_calls, 2);
+        assert_eq!(report.reports[0].status, "incomplete");
+        assert_eq!(report.reports[1].status, "completed");
+        assert!(recon::file_policy_by_path(&conn, "docs/guide.ts")?.is_none());
+        assert_eq!(
+            recon::file_policy_by_path(&conn, "src/run.ts")?
+                .unwrap()
+                .role,
+            "runtime"
+        );
         Ok(())
     }
 

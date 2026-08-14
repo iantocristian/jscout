@@ -419,9 +419,6 @@ fn ranked_hits(
     for ranking in &mut rankings {
         prefilter_ranking_by_role(conn, ranking, file_roles)?;
         ranking.truncate(pool);
-        if file_roles.is_empty() {
-            apply_repository_policy_penalty(conn, ranking)?;
-        }
     }
     let mut fused = rrf(&rankings, 60.0);
 

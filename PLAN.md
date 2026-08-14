@@ -1301,7 +1301,9 @@ roles:
   which has neutral downstream policy, rather than silently guessing a child
   role. Subdivision includes a direct-file residual when a mixed scope contains
   both direct files and child directories, so root-level implementation files
-  are not stranded under the mixed parent;
+  are not stranded under the mixed parent. Descendant classifications remain
+  immutable history, but a current definite parent suppresses their projected
+  policy; they may reactivate if the parent later returns to `mixed`;
 - TypeScript/JavaScript project configurations discovered by the checker
   configuration-only pass;
 - repository-owned files outside a workspace package, grouped by stable path
@@ -1340,7 +1342,8 @@ Classifications are policy metadata, not graph facts. Files are never deleted
 from L1. Only current, fresh classifications affect downstream defaults:
 
 - primary search applies a penalty to auxiliary scopes but retains recall and
-  supports explicit inclusion;
+  supports explicit inclusion. The penalty is applied once to the final fused
+  or reranked order, not compounded independently in each retrieval arm;
 - workflow candidates exclude fresh, likely auxiliary scopes by default;
 - embedding can explicitly select the product corpus before expensive vector
   generation;
@@ -1348,7 +1351,9 @@ from L1. Only current, fresh classifications affect downstream defaults:
   scheduling. A tooling project is skipped for a file only when a non-tooling
   owning project remains; a sole owner is retained as a fallback;
 - stale, possible, mixed, or missing classifications fall back to neutral
-  inclusion rather than silently hiding code.
+  inclusion rather than silently hiding code. Index-time policy reconciliation
+  is fail-neutral: it warns and clears the disposable policy projection rather
+  than allowing optional semantic metadata to block L1 publication.
 
 The implementation includes a dry-run showing every planned subject,
 classification input, subdivision depth/budget decision, reuse/freshness
