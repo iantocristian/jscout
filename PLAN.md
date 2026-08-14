@@ -498,6 +498,15 @@ reconciliation?” without replacing the source evidence used to answer them.
   no longer hides semantic matches when there are no code hits; neighborhood,
   semantic memory, overview, and the existing code surfaces enforce complete
   rendered-byte budgets.
+- Agent-facing search and neighborhood transport is compact by default. The
+  full canonical representation remains available only through explicit debug
+  mode. Whole-response shedding preserves the top code hit, removes optional
+  semantic memory and low-ranked relations first, and caps search-attached
+  evidence at eight supports globally rather than eight per artifact.
+- Embedding documents are content-only because durable vectors are keyed by
+  content hash. The document-text format is versioned in the profile
+  fingerprint, and embedding selection groups missing work by hash so duplicate
+  chunk occurrences cause one provider request and one cached vector.
 - Release packaging places the installed gateway and pinned dependencies beside
   the Rust binary. Startup and doctor enforce the supported Node version and
   produce controlled missing-runtime/dependency/auth diagnostics; deterministic
