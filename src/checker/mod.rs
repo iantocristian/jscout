@@ -82,7 +82,15 @@ pub fn doctor(root: &Path, sidecar: Option<&Path>, timeout: std::time::Duration)
     );
     println!("configured projects: {}", capabilities.projects.len());
     for project in capabilities.projects {
-        println!("  {} ({} files)", project.project_id, project.file_count);
+        let reasons = if project.purpose_reasons.is_empty() {
+            String::new()
+        } else {
+            format!("; evidence: {}", project.purpose_reasons.join(", "))
+        };
+        println!(
+            "  {} ({} files; purpose: {}{})",
+            project.project_id, project.file_count, project.purpose, reasons
+        );
     }
     println!(
         "configuration problems: {}",

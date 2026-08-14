@@ -541,6 +541,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&compact)?;
         assert_eq!(value["retrieval"]["lexical"], "active");
         assert_eq!(value["retrieval"]["vector"], "disabled");
+        assert_eq!(value["retrieval"]["reranker"], "disabled");
         assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
         assert_eq!(value["hits"][0]["symbol"], "start");
         assert_eq!(value["hits"][0]["anchor"], root);

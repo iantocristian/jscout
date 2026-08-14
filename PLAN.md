@@ -507,12 +507,17 @@ reconciliation?” without replacing the source evidence used to answer them.
   content hash. The document-text format is versioned in the profile
   fingerprint, and embedding selection groups missing work by hash so duplicate
   chunk occurrences cause one provider request and one cached vector.
-- Every search response reports lexical/vector retrieval status. A configured
-  vector stage that cannot use its requested profile is `degraded`, not
+- Every search response reports lexical/vector/reranker retrieval status. A
+  configured vector stage that cannot use its requested profile is `degraded`, not
   indistinguishable from an active hybrid search. The `content-v2` document
   format intentionally requires existing embedded repositories to create one
   new profile with `jscout embed`; prior profiles remain stored and are never
   mixed into the new vector space.
+- File-role filters apply before fusion and reranker pool construction.
+  Cross-encoder inputs carry occurrence-specific path, scope, symbol, kind,
+  role, origin, and span context, and reranking preserves the untouched RRF
+  tail. This repairs the context-starved input without changing the reranker
+  default; a real-query remeasurement must precede any default flip.
 - Release packaging places the installed gateway and pinned dependencies beside
   the Rust binary. Startup and doctor enforce the supported Node version and
   produce controlled missing-runtime/dependency/auth diagnostics; deterministic
@@ -594,6 +599,17 @@ This falsifies the current implementation's claim to be bounded at repository
 scale. Raising the V8 heap only postpones the failure; exhaustive `enrich` and
 `watch --enrich` are not considered operational on large repositories until
 the scale correction below passes its acceptance checks.
+
+**Amendment — tooling-project ownership (2026-08-14).** Configuration-only
+planning now classifies only high-confidence lint projects as `tooling` from
+explicit filename/extends evidence or a lint script corroborated by `noEmit`.
+For each file, tooling owners are excluded only when at least one non-tooling
+owner remains; otherwise they remain fallback owners. Doctor output records
+project purpose/evidence, while enrichment dry runs record selected, excluded,
+and fallback occurrence counts per affected project. Generic `noEmit` and broad
+include patterns never classify a project by themselves. G13 remains
+responsible for ambiguous project purpose rather than extending this bootstrap
+with repository-specific exceptions.
 
 ### Shape
 
@@ -1277,8 +1293,13 @@ jscout index
 The deterministic planner discovers subjects without consulting current file
 roles:
 
-- workspace packages and bounded directory areas, recursively subdividing an
-  area only when it is classified as mixed;
+- workspace packages and bounded directory areas. A `mixed` area may subdivide
+  at most three directory levels below its initial subject, the complete plan
+  may contain at most 256 subjects, subdivision and classification share the
+  command-wide `--max-calls` limit, and each serialized evidence pack must fit
+  `--context-bytes`. Reaching any bound leaves the unresolved area `mixed`,
+  which has neutral downstream policy, rather than silently guessing a child
+  role;
 - TypeScript/JavaScript project configurations discovered by the checker
   configuration-only pass;
 - repository-owned files outside a workspace package, grouped by stable path
@@ -1297,8 +1318,21 @@ The scout publishes immutable, fingerprinted scope/project classifications:
 - exact scope or config identity;
 - `likely`/`possible` confidence, model provenance, and cited evidence spans or
   config fields;
-- a fingerprint over membership, evidence, prompt/schema/model policy, and the
-  structural snapshot.
+- a reusable classification fingerprint over the exact subject identity,
+  ordered repository-relative membership, evidence-pack input hashes, the
+  deterministic evidence-selection algorithm, and prompt/schema/model policy.
+  Evidence inputs include manifest/config contents, aggregate file-kind and
+  language counts, and the exact selected outline/import/export/entity rows.
+
+The repository structural snapshot is recorded on the scouting run for audit
+and response labelling, but it is deliberately excluded from classification
+identity and freshness. Planning and publication recheck the subject
+fingerprint, not global snapshot equality. An unrelated edit, reindex, or
+branch change elsewhere therefore reuses the classification; membership or
+evidence changes inside the subject stale only that subject and its ancestors.
+A removed subject has no current identity to which its old classification can
+apply. Returning to a branch with the same subject fingerprint may reuse the
+immutable prior result without another model call.
 
 Classifications are policy metadata, not graph facts. Files are never deleted
 from L1. Only current, fresh classifications affect downstream defaults:
@@ -1315,10 +1349,14 @@ from L1. Only current, fresh classifications affect downstream defaults:
   inclusion rather than silently hiding code.
 
 The first implementation must add a dry-run showing every planned subject,
-classification input, and downstream inclusion decision. Acceptance requires
-fixtures where the same `doc`/`docs` and `tsconfig` names receive different
-roles from different repository evidence, plus a stale-overlay test proving
-that source/config drift restores neutral inclusion.
+classification input, subdivision depth/budget decision, reuse/freshness
+decision, and downstream inclusion decision. Acceptance requires fixtures
+where the same `doc`/`docs` and `tsconfig` names receive different roles from
+different repository evidence; an unrelated reindex and an outside-scope
+branch edit preserve freshness; in-scope membership/evidence drift restores
+neutral inclusion only for the affected subject/ancestors; returning to an
+identical fingerprint reuses the prior classification; and depth, subject,
+call, and context limits terminate mixed subdivision deterministically.
 
 ## Evaluation decisions already made
 
@@ -1350,6 +1388,7 @@ Relevant result summaries include:
 - [agent surfaces](eval/results/agent-surfaces-2026-08-10.md)
 - [logical workflow routing](eval/results/workflow-logical-routing-2026-08-10.md)
 - [dependency indexing](eval/results/dependency-indexing-2026-08-10.md)
+- [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
 
 ## Positioning versus tsserver/LSP
 

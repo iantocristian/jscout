@@ -137,6 +137,14 @@ pub struct Capabilities {
 pub struct ProjectSummary {
     pub project_id: String,
     pub file_count: usize,
+    #[serde(default = "default_project_purpose")]
+    pub purpose: String,
+    #[serde(default)]
+    pub purpose_reasons: Vec<String>,
+}
+
+fn default_project_purpose() -> String {
+    "general".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -171,6 +179,10 @@ pub struct MemberPlanResult {
 pub struct FileOwnership {
     pub file: String,
     pub project_ids: Vec<String>,
+    #[serde(default)]
+    pub excluded_project_ids: Vec<String>,
+    #[serde(default)]
+    pub tooling_fallback: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -157,6 +157,80 @@ function configProblem(config, error) {
   };
 }
 
+function nearestPackageScripts(config) {
+  let directory = path.dirname(config);
+  while (insideRoot(directory)) {
+    const manifest = path.join(directory, "package.json");
+    if (fs.existsSync(manifest)) {
+      try {
+        const scripts = JSON.parse(fs.readFileSync(manifest, "utf8")).scripts;
+        return scripts && typeof scripts === "object" ? scripts : {};
+      } catch {
+        return {};
+      }
+    }
+    if (directory === root) break;
+    directory = path.dirname(directory);
+  }
+  return {};
+}
+
+function projectPurpose(config, rawConfig, parsed) {
+  const id = path.relative(root, config).split(path.sep).join("/");
+  const basename = path.basename(config).toLowerCase();
+  const filenameTokens = basename.replace(/\.json$/u, "").split(/[._-]+/u);
+  const reasons = [];
+  if (filenameTokens.includes("eslint") || filenameTokens.includes("lint")) {
+    reasons.push("tooling-filename");
+  }
+
+  const inherited = Array.isArray(rawConfig.extends)
+    ? rawConfig.extends
+    : rawConfig.extends ? [rawConfig.extends] : [];
+  if (inherited.some(
+    (value) => typeof value === "string"
+      && /(?:^|[._/@-])(?:eslint|lint)(?:$|[._/@-])/iu.test(value),
+  )) {
+    reasons.push("tooling-extends");
+  }
+
+  const scripts = nearestPackageScripts(config);
+  const scriptReferences = Object.entries(scripts)
+    .filter(([name, command]) => {
+      if (
+        typeof command !== "string"
+        || !/(?:^|[:._-])(?:eslint|lint)(?:$|[:._-])/iu.test(name)
+      ) {
+        return false;
+      }
+      const normalized = command.split(path.sep).join("/");
+      return normalized.includes(id) || normalized.includes(path.basename(config));
+    })
+    .map(([name]) => name)
+    .sort();
+  // noEmit is common in legitimate runtime/typecheck projects, so it can only
+  // corroborate an explicit tooling script; it never classifies a project by
+  // itself. Lint-labelled filenames/extends are already high-confidence.
+  const scriptedNoEmit = scriptReferences.length > 0
+    && parsed.options.noEmit === true;
+  if (scriptedNoEmit) reasons.push(`tooling-script:${scriptReferences.join(",")}`);
+  const explicitTooling = reasons.includes("tooling-filename")
+    || reasons.includes("tooling-extends");
+  return {
+    purpose: explicitTooling || scriptedNoEmit ? "tooling" : "general",
+    purposeReasons: reasons,
+  };
+}
+
+function projectSummary(project) {
+  return {
+    project_id: project.id,
+    file_count: project.fileNames.length,
+    purpose: project.purpose ?? "general",
+    purpose_reasons: project.purposeReasons ?? [],
+  };
+}
+
 function configuredProjects(force = false) {
   if (!force && discoveryCache) return discoveryCache;
   const projects = [];
@@ -192,6 +266,7 @@ function configuredProjects(force = false) {
       for (const error of parsed.errors) problems.push(configProblem(config, error));
       continue;
     }
+    const purpose = projectPurpose(config, read.config, parsed);
     projects.push({
       id: path.relative(root, config).split(path.sep).join("/"),
       config,
@@ -205,6 +280,7 @@ function configuredProjects(force = false) {
         }
       }),
       projectReferences: parsed.projectReferences,
+      ...purpose,
     });
   }
   projects.sort((left, right) => left.id.localeCompare(right.id));
@@ -270,8 +346,24 @@ function configInputs(config, seen = new Set()) {
 
 function owningProjects(queryFile, force = false) {
   const discovered = configuredProjects(force);
-  const owners = discovered.ownersByFile.get(queryFile) ?? [];
-  if (owners.length > 0) return { owners, problems: discovered.problems };
+  const discoveredOwners = discovered.ownersByFile.get(queryFile) ?? [];
+  if (discoveredOwners.length > 0) {
+    const primary = discoveredOwners.filter((project) => project.purpose !== "tooling");
+    if (primary.length > 0) {
+      return {
+        owners: primary,
+        excludedOwners: discoveredOwners.filter((project) => project.purpose === "tooling"),
+        toolingFallback: false,
+        problems: discovered.problems,
+      };
+    }
+    return {
+      owners: discoveredOwners,
+      excludedOwners: [],
+      toolingFallback: discoveredOwners.some((project) => project.purpose === "tooling"),
+      problems: discovered.problems,
+    };
+  }
   const relative = path.relative(root, queryFile).split(path.sep).join("/");
   return {
     owners: [{
@@ -287,7 +379,11 @@ function owningProjects(queryFile, force = false) {
       },
       fileNames: [queryFile],
       projectReferences: undefined,
+      purpose: "inferred",
+      purposeReasons: ["no-configured-owner"],
     }],
+    excludedOwners: [],
+    toolingFallback: false,
     problems: discovered.problems,
   };
 }
@@ -451,19 +547,19 @@ function planMembers(files) {
   const unique = [...new Set(files)].sort();
   const ownership = unique.map((file) => {
     const queryFile = resolveQueryFile(file);
+    const decision = owningProjects(queryFile);
     return {
       file,
-      project_ids: owningProjects(queryFile).owners.map((project) => project.id).sort(),
+      project_ids: decision.owners.map((project) => project.id).sort(),
+      excluded_project_ids: decision.excludedOwners.map((project) => project.id).sort(),
+      tooling_fallback: decision.toolingFallback,
     };
   });
   const discovered = configuredProjects();
   return {
     typescript: { version: ts.version, source: runtime.source },
     files: ownership,
-    projects: discovered.projects.map((project) => ({
-      project_id: project.id,
-      file_count: project.fileNames.length,
-    })),
+    projects: discovered.projects.map(projectSummary),
     configuration_problems: discovered.problems,
   };
 }
@@ -667,10 +763,7 @@ function capabilities() {
   const discovered = configuredProjects();
   return {
     typescript: { version: ts.version, source: runtime.source },
-    projects: discovered.projects.map((project) => ({
-      project_id: project.id,
-      file_count: project.fileNames.length,
-    })),
+    projects: discovered.projects.map(projectSummary),
     configuration_problems: discovered.problems,
     question: "resolve_statically_named_member_at_indexed_call_occurrence",
   };

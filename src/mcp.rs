@@ -203,7 +203,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Reports lexical/vector stage status, compact ranked code chunks, and optional graph context; set debug for the full diagnostic representation.",
+            "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Reports lexical/vector/reranker stage status, compact ranked code chunks, and optional graph context; set debug for the full diagnostic representation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1078,11 +1078,16 @@ fn log_tool_call(
         .ok()
         .map(|text| semantic_artifact_metrics(text))
         .unwrap_or_default();
-    let retrieval_vector = result
+    let retrieval = result
         .as_ref()
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let retrieval_vector = retrieval
+        .as_ref()
         .and_then(|value| value["retrieval"]["vector"].as_str().map(str::to_string));
+    let retrieval_reranker = retrieval
+        .as_ref()
+        .and_then(|value| value["retrieval"]["reranker"].as_str().map(str::to_string));
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let record = json!({
@@ -1110,6 +1115,7 @@ fn log_tool_call(
         "semantic_artifacts_stale": semantic_metrics.stale,
         "semantic_artifacts_written": usize::from(tool == "annotate" && ok),
         "retrieval_vector": retrieval_vector,
+        "retrieval_reranker": retrieval_reranker,
         "snapshot": snapshot,
     });
     if serde_json::to_writer(&mut *file, &record).is_err()
