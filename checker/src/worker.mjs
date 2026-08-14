@@ -109,6 +109,16 @@ function relativeIdentity(file) {
   return `outside:${digestText(canonical).slice(0, 24)}:${path.basename(canonical)}`;
 }
 
+// Parsed project file names are already absolute, normalized configuration
+// outputs. Fingerprinting membership must not realpath every file in every
+// overlapping project during the configuration-only inventory pass: large
+// monorepos can own the same source through hundreds of tsconfigs.
+function projectMemberIdentity(file) {
+  const absolute = path.resolve(file);
+  if (insideRoot(absolute)) return path.relative(root, absolute).split(path.sep).join("/");
+  return `outside:${digestText(absolute).slice(0, 24)}:${path.basename(absolute)}`;
+}
+
 function resolveQueryFile(relativePath) {
   if (typeof relativePath !== "string" || relativePath.length === 0 || path.isAbsolute(relativePath)) {
     throw coded("outside_root", "query file must be a non-empty repository-relative path");
@@ -223,11 +233,20 @@ function projectPurpose(config, rawConfig, parsed) {
 }
 
 function projectSummary(project) {
+  project.membershipFingerprint ??= digestText(
+    [...project.fileNames].map((file) => projectMemberIdentity(file)).sort().join("\0"),
+  );
+  project.configFingerprint ??= digestText(JSON.stringify(
+    (project.config ? configInputs(project.config) : [])
+      .map(({ identity, source_hash }) => ({ identity, source_hash })),
+  ));
   return {
     project_id: project.id,
     file_count: project.fileNames.length,
     purpose: project.purpose ?? "general",
     purpose_reasons: project.purposeReasons ?? [],
+    membership_fingerprint: project.membershipFingerprint,
+    config_fingerprint: project.configFingerprint,
   };
 }
 

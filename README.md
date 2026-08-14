@@ -79,6 +79,8 @@ jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout calls <root> METHOD     # exact member-call sites matched on the AST
                                #   --arg merge=replace --receiver wave.card --json
 jscout checker doctor <root>   # checker version, projects, config problems, readiness
+jscout scout repository <root> # classify repository/package/project purpose from evidence
+  --max-calls N                #   explicit model budget; --dry-run makes no model calls
 jscout enrich <root>           # explicit occurrence-scoped TypeScript checker pass
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
@@ -88,6 +90,7 @@ jscout watch <root> [--embed] [--enrich]
                                # hash-incremental parse plus optional vector/checker refresh
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
+  --product                    #   fresh runtime recon + neutral production fallback only
 jscout inference serve         # run the optional local embedding/reranking service
 jscout inference doctor        # verify its endpoint, device, models, and dimensions
 jscout entities <root> [query] # runtime, contract, route, config, data, flag, host entities
@@ -131,8 +134,10 @@ scripts/package-release.sh TARGET_TRIPLE
 
 The archive is written under `target/release-packages/`. Extract it anywhere,
 put its directory on `PATH`, and keep the adjacent `gateway/` and `checker/`
-directories with the binary. Indexing and retrieval never start Node;
-`jscout enrich` is the only structural command that starts the checker.
+directories with the binary. Indexing and retrieval do not start Node.
+`jscout enrich` starts the checker for typed member-call resolution;
+`jscout scout repository` starts both the checker inventory and the pi-ai
+gateway because configured projects are explicit reconnaissance subjects.
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
@@ -150,6 +155,70 @@ Traversal defaults to `certain`/`likely` edges. Use
 explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
+
+## Repository reconnaissance
+
+`jscout scout repository <root> --max-calls N` is the explicit G13 pass between
+the neutral structural index and optional expensive work. It classifies exact
+workspace packages, unowned directory areas, and configured TypeScript/JavaScript
+projects as `runtime`, `tooling`, `documentation`, `test`, `generated`, `mixed`,
+or `unknown`. The model receives manifests/configuration, aggregate file kinds,
+and bounded representative outlines/imports/exports/entities. It does not
+receive the indexer's existing file-role labels, so a directory called `docs`
+can still be classified as runtime when its evidence says that it implements
+the product.
+
+Run the deterministic inspection first:
+
+```bash
+jscout scout repository /path/to/repo --max-calls 64 --dry-run
+jscout scout repository /path/to/repo --max-calls 64
+JSCOUT_EMBED_PROVIDER=local jscout embed /path/to/repo --product
+jscout enrich /path/to/repo
+```
+
+The dry run prints every initial subject, the exact evidence pack and request
+size, current/reusable classification, downstream decision, possible children,
+and depth/subject/context bounds. It starts the checker inventory but does not
+start the LLM gateway and makes no model calls.
+
+`mixed` package/area results subdivide deterministically into immediate child
+directories plus a direct-file residual. One command shares `--max-calls`,
+`--max-subjects` (default 256), `--max-depth` (default 3), and
+`--context-bytes` across the entire recursive plan. Reaching a bound leaves the
+unresolved subject neutral; it never invents a narrower role.
+When a later scout gives a parent scope a definite role, that parent controls
+the current projection and suppresses policy from descendants created by an
+older `mixed` result. The descendant rows remain immutable history and can
+reactivate if the parent later returns to `mixed`.
+
+Classifications are immutable durable policy metadata, not graph facts. Their
+freshness covers ordered subject membership, manifests/configs, and the bounded
+representative evidence actually shown to the model; the global structural
+snapshot is audit metadata only. An unrelated reindex does not stale them, an
+evidence or membership change in the subject restores neutral fallback, and a
+return to an identical branch fingerprint reuses the prior run without another
+model call. Only fresh `likely` classifications affect defaults:
+
+- search retains every hit but penalizes auxiliary scopes unless an explicit
+  `--file-role` filter is supplied;
+- workflow/card automatic planning excludes auxiliary scopes and permits a
+  fresh runtime decision to override an ambiguous deterministic path role;
+- `embed --product` embeds fresh runtime scopes plus unclassified deterministic
+  production/unknown files, while excluding fresh auxiliary scopes;
+- checker project scheduling follows fresh project purpose but retains an
+  auxiliary project when it is a file's sole owner.
+
+`possible`, `mixed`, `unknown`, stale, and missing classifications are neutral.
+Each classification stores the exact cited evidence objects, including the
+bounded content shown to the model, so historical citations remain auditable
+after the source or deterministic pack changes.
+If policy reconciliation cannot read or validate its optional inputs during
+`index`, jscout warns, clears the disposable policy projection, and keeps the
+new L1 snapshot available with neutral defaults.
+Diagnostic search JSON retains `file_role` and adds `repository_role` only when
+an active reconnaissance policy exists; compact output presents the effective
+role without adding a second metadata field.
 
 ## TypeScript checker enrichment
 
@@ -173,11 +242,13 @@ files within each priority tier. `--dry-run` reports discovered, eligible,
 selected, omitted, project, and configuration counts after a configuration-only
 ownership pass and does not construct a TypeScript Program.
 
-Configured projects carry a deterministic purpose classification. Explicit
+Configured projects start with a deterministic purpose classification. Explicit
 lint configurations such as `tsconfig.eslint.json` are removed from a file's
 ownership set when a non-tooling project still owns that file; they remain as
 fallback owners for otherwise-unowned files. This avoids re-querying an
 aggregate lint program without silently dropping its unique coverage.
+Fresh likely repository reconnaissance can override that bootstrap purpose;
+membership/config fingerprint drift restores the deterministic fallback.
 `--dry-run` reports selected, excluded, and fallback occurrence counts per
 affected project. `jscout checker doctor` prints each project's purpose and the
 evidence used to classify it. Generic `noEmit` configurations are not treated
@@ -238,7 +309,7 @@ churn; plain `watch` never starts Node.
 
 ## Semantic scouting
 
-`jscout scout workflows`, `cards`, `summaries`, and `concepts` make
+`jscout scout repository`, `workflows`, `cards`, `summaries`, and `concepts` make
 schema-constrained model calls through the bundled pi-ai gateway. Workflow and
 concept runs additionally require exhaustive candidate classification.
 Generative calls default to
@@ -570,15 +641,16 @@ complete response-byte limit includes semantic artifacts.
 
 `jscout index` reparses the current checkout instead of carrying cheap
 structural rows across snapshots. It preserves content-hash embedding cache
-rows and semantic memory, then rematerializes current vector occurrences from
-the cache. Checker enrichment is snapshot-bound and is removed by a full index;
+rows, semantic memory, and immutable repository-reconnaissance history, then
+rematerializes current vector occurrences and exact fresh reconnaissance policy
+from those durable planes. Checker enrichment is snapshot-bound and is removed by a full index;
 run `jscout enrich` again when occurrence-specific checker edges are required.
 `jscout watch` remains hash-incremental and is a separate coordination mode.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.
 The old per-version migration ladder has been removed. Writer commands accept
-the v16+ durable format by preserving embedding/semantic-memory tables and
+the v16+ durable format by preserving embedding/semantic-memory/reconnaissance tables and
 recreating all disposable snapshot tables once. Older durable formats are
 rejected; preserve such a file before creating a fresh current database.
 

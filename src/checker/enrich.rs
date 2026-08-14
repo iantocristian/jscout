@@ -175,7 +175,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let ownership = planner.plan_members(
+    let mut ownership = planner.plan_members(
         selected
             .iter()
             .map(|occurrence| occurrence.file.clone())
@@ -186,6 +186,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     )?;
     let protocol = planner.versions.protocol;
     drop(planner);
+    apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
     let ProjectPlanning {
         projects: project_plan,
         decisions: project_decisions,
@@ -615,6 +616,69 @@ fn build_project_plan(
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
     })
+}
+
+fn apply_repository_project_policy(
+    conn: &Connection,
+    ownership: &mut [FileOwnership],
+    projects: &mut [ProjectSummary],
+) -> Result<()> {
+    let mut policies = HashMap::<String, String>::new();
+    for project in projects.iter_mut() {
+        let Some(policy) = crate::recon::project_policy(
+            conn,
+            &project.project_id,
+            &project.membership_fingerprint,
+            &project.config_fingerprint,
+        )?
+        else {
+            continue;
+        };
+        project.purpose = policy.role.clone();
+        project
+            .purpose_reasons
+            .push(format!("repository-recon:{}", policy.classification_id));
+        policies.insert(project.project_id.clone(), policy.role);
+    }
+    for file in ownership {
+        let all = file
+            .project_ids
+            .iter()
+            .chain(&file.excluded_project_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if all.is_empty() {
+            continue;
+        }
+        let mut selected = BTreeSet::new();
+        let mut excluded = BTreeSet::new();
+        for project in &all {
+            match policies.get(project).map(String::as_str) {
+                Some("runtime") => {
+                    selected.insert(project.clone());
+                }
+                Some(role) if crate::recon::is_auxiliary(role) => {
+                    excluded.insert(project.clone());
+                }
+                _ if file.project_ids.contains(project) => {
+                    selected.insert(project.clone());
+                }
+                _ => {
+                    excluded.insert(project.clone());
+                }
+            }
+        }
+        if selected.is_empty() {
+            selected = all;
+            excluded.clear();
+            file.tooling_fallback = true;
+        } else {
+            file.tooling_fallback = false;
+        }
+        file.project_ids = selected.into_iter().collect();
+        file.excluded_project_ids = excluded.into_iter().collect();
+    }
+    Ok(())
 }
 
 fn project_decision<'a>(
@@ -1953,12 +2017,16 @@ mod tests {
                 file_count: 2,
                 purpose: "tooling".into(),
                 purpose_reasons: vec!["tooling-filename".into()],
+                membership_fingerprint: String::new(),
+                config_fingerprint: String::new(),
             },
             ProjectSummary {
                 project_id: "tsconfig.json".into(),
                 file_count: 1,
                 purpose: "general".into(),
                 purpose_reasons: Vec::new(),
+                membership_fingerprint: String::new(),
+                config_fingerprint: String::new(),
             },
         ];
 
@@ -1978,6 +2046,138 @@ mod tests {
         assert_eq!(tooling.selected_occurrences, 1);
         assert_eq!(tooling.excluded_occurrences, 1);
         assert_eq!(tooling.fallback_occurrences, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_project_policy_overrides_heuristics_but_preserves_sole_owner_fallback()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let conn = crate::store::open(directory.path())?;
+        for (project_id, role, suffix) in [
+            ("tsconfig.runtime.json", "runtime", "runtime"),
+            ("tsconfig.tool.json", "tooling", "tooling"),
+        ] {
+            conn.execute(
+                "INSERT INTO scout_runs(
+                   scout_kind,status,gateway_protocol,provider,model,billing_path,
+                   prompt_version,source_snapshot,input_fingerprint,request_hash,
+                   config_json,started_at,completed_at
+                 ) VALUES('repository','completed',1,'test','test','custom','test',
+                          'snapshot',?1,?1,'{}','now','now')",
+                [format!("project-policy-{suffix}")],
+            )?;
+            let selector = serde_json::to_string(&crate::recon::SubjectSelector::Project {
+                config: project_id.into(),
+                membership_fingerprint: format!("members-{suffix}"),
+                config_fingerprint: format!("config-{suffix}"),
+            })?;
+            conn.execute(
+                "INSERT INTO repository_classifications(
+                   run_id,subject_key,subject_kind,selector_json,depth,role,confidence,
+                   explanation,citations_json,evidence_fingerprint,
+                   classification_fingerprint,source_snapshot,created_at
+                 ) VALUES(?1,?2,'project',?3,0,?4,'likely','test','[\"E001\"]',
+                          ?2,?2,'snapshot','now')",
+                rusqlite::params![
+                    conn.last_insert_rowid(),
+                    format!("project:{project_id}"),
+                    selector,
+                    role,
+                ],
+            )?;
+        }
+        let mut projects = vec![
+            ProjectSummary {
+                project_id: "tsconfig.runtime.json".into(),
+                file_count: 1,
+                purpose: "tooling".into(),
+                purpose_reasons: vec!["filename".into()],
+                membership_fingerprint: "members-runtime".into(),
+                config_fingerprint: "config-runtime".into(),
+            },
+            ProjectSummary {
+                project_id: "tsconfig.tool.json".into(),
+                file_count: 2,
+                purpose: "general".into(),
+                purpose_reasons: Vec::new(),
+                membership_fingerprint: "members-tooling".into(),
+                config_fingerprint: "config-tooling".into(),
+            },
+        ];
+        let mut ownership = vec![
+            FileOwnership {
+                file: "shared.ts".into(),
+                project_ids: vec!["tsconfig.tool.json".into()],
+                excluded_project_ids: vec!["tsconfig.runtime.json".into()],
+                tooling_fallback: false,
+            },
+            FileOwnership {
+                file: "tool-only.ts".into(),
+                project_ids: vec!["tsconfig.tool.json".into()],
+                excluded_project_ids: Vec::new(),
+                tooling_fallback: false,
+            },
+        ];
+
+        apply_repository_project_policy(&conn, &mut ownership, &mut projects)?;
+
+        assert_eq!(ownership[0].project_ids, ["tsconfig.runtime.json"]);
+        assert_eq!(ownership[0].excluded_project_ids, ["tsconfig.tool.json"]);
+        assert!(!ownership[0].tooling_fallback);
+        assert_eq!(ownership[1].project_ids, ["tsconfig.tool.json"]);
+        assert!(ownership[1].excluded_project_ids.is_empty());
+        assert!(ownership[1].tooling_fallback);
+        assert_eq!(projects[0].purpose, "runtime");
+        assert_eq!(projects[1].purpose, "tooling");
+        assert!(projects.iter().all(|project| {
+            project
+                .purpose_reasons
+                .iter()
+                .any(|reason| reason.starts_with("repository-recon:"))
+        }));
+
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'test','test','custom','test',
+                      'snapshot','project-policy-neutral','neutral','{}','now','now')",
+            [],
+        )?;
+        let selector = serde_json::to_string(&crate::recon::SubjectSelector::Project {
+            config: "tsconfig.runtime.json".into(),
+            membership_fingerprint: "members-runtime".into(),
+            config_fingerprint: "config-runtime".into(),
+        })?;
+        conn.execute(
+            "INSERT INTO repository_classifications(
+               run_id,subject_key,subject_kind,selector_json,depth,role,confidence,
+               explanation,citations_json,evidence_fingerprint,
+               classification_fingerprint,source_snapshot,created_at
+             ) VALUES(?1,'project:tsconfig.runtime.json','project',?2,0,'unknown',
+                      'possible','insufficient','[\"E001\"]','neutral','neutral',
+                      'snapshot','now')",
+            rusqlite::params![conn.last_insert_rowid(), selector],
+        )?;
+        let mut neutral_projects = vec![ProjectSummary {
+            project_id: "tsconfig.runtime.json".into(),
+            file_count: 1,
+            purpose: "tooling".into(),
+            purpose_reasons: vec!["filename".into()],
+            membership_fingerprint: "members-runtime".into(),
+            config_fingerprint: "config-runtime".into(),
+        }];
+        let mut neutral_ownership = vec![FileOwnership {
+            file: "only.ts".into(),
+            project_ids: Vec::new(),
+            excluded_project_ids: vec!["tsconfig.runtime.json".into()],
+            tooling_fallback: false,
+        }];
+        apply_repository_project_policy(&conn, &mut neutral_ownership, &mut neutral_projects)?;
+        assert_eq!(neutral_projects[0].purpose, "tooling");
+        assert_eq!(neutral_projects[0].purpose_reasons, ["filename"]);
         Ok(())
     }
 

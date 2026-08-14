@@ -228,7 +228,13 @@ pub fn workflow_candidates(
         )?;
         traversal_truncated |= neighborhood.truncated;
         for node in neighborhood.nodes {
-            if node.kind != "symbol" || node.file_role.as_deref() != Some("production") {
+            if node.kind != "symbol"
+                || !crate::recon::effective_runtime(
+                    conn,
+                    node.file.as_deref(),
+                    node.file_role.as_deref(),
+                )?
+            {
                 continue;
             }
             let is_seed = resolved_seeds.contains(&node.key);

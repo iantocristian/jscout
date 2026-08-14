@@ -130,8 +130,9 @@ fn compact_hit(hit: &search::Hit) -> Value {
     if !hit.used_by.is_empty() {
         value.insert("used_by".into(), json!(hit.used_by));
     }
-    if hit.file_role != "production" {
-        value.insert("role".into(), json!(hit.file_role));
+    let effective_role = hit.repository_role.as_deref().unwrap_or(&hit.file_role);
+    if effective_role != "production" {
+        value.insert("role".into(), json!(effective_role));
     }
     if hit.file_origin == "dependency" {
         value.insert("origin".into(), json!(hit.file_origin));
@@ -503,6 +504,7 @@ mod tests {
                 chunk_id: 41,
                 file: "src/workflow.ts".into(),
                 file_role: "production".into(),
+                repository_role: None,
                 file_origin: "repository".into(),
                 kind: "method".into(),
                 name: Some("start".into()),
@@ -562,6 +564,7 @@ mod tests {
                 chunk_id: index,
                 file: format!("src/services/service-{index}.ts"),
                 file_role: "production".into(),
+                repository_role: None,
                 file_origin: "repository".into(),
                 kind: "function".into(),
                 name: Some(format!("handleStep{index}")),

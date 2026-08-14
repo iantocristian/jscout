@@ -369,6 +369,7 @@ fn index_repo_impl(
         if std::env::var_os("JSCOUT_TIMING").is_some() {
             eprintln!("timing structural-projection=skipped (unchanged)");
         }
+        crate::recon::reconcile_file_policy_after_index(&root, conn);
         return Ok(outcome);
     }
     crate::structural::rebuild_projection(conn, &snapshot)?;
@@ -383,6 +384,7 @@ fn index_repo_impl(
             projection_started.elapsed()
         );
     }
+    crate::recon::reconcile_file_policy_after_index(&root, conn);
     Ok(outcome)
 }
 
