@@ -507,6 +507,12 @@ reconciliation?” without replacing the source evidence used to answer them.
   content hash. The document-text format is versioned in the profile
   fingerprint, and embedding selection groups missing work by hash so duplicate
   chunk occurrences cause one provider request and one cached vector.
+- Every search response reports lexical/vector retrieval status. A configured
+  vector stage that cannot use its requested profile is `degraded`, not
+  indistinguishable from an active hybrid search. The `content-v2` document
+  format intentionally requires existing embedded repositories to create one
+  new profile with `jscout embed`; prior profiles remain stored and are never
+  mixed into the new vector space.
 - Release packaging places the installed gateway and pinned dependencies beside
   the Rust binary. Startup and doctor enforce the supported Node version and
   produce controlled missing-runtime/dependency/auth diagnostics; deterministic
@@ -1249,6 +1255,71 @@ delete semantic memory or content-hash embedding rows.
 - blanket `node_modules` watching or dependency indexing;
 - hidden scouting, summarization, or other generative work.
 
+## Planned G13 — repository reconnaissance scout
+
+Path nouns and configuration filenames are not structural truth. `doc`,
+`docs`, and a broadly owning `tsconfig` can each describe either production
+behavior or auxiliary material depending on the repository. G13 replaces
+accumulating path-specific exceptions with an evidence-backed semantic policy
+overlay immediately after the neutral L1 index.
+
+Reconnaissance is an explicit generative command, never an implicit part of
+`index` or plain `watch`:
+
+```text
+jscout index
+  -> jscout scout repository
+  -> optional embedding selection
+  -> optional checker enrichment
+  -> workflow/card/summary/concept scouting
+```
+
+The deterministic planner discovers subjects without consulting current file
+roles:
+
+- workspace packages and bounded directory areas, recursively subdividing an
+  area only when it is classified as mixed;
+- TypeScript/JavaScript project configurations discovered by the checker
+  configuration-only pass;
+- repository-owned files outside a workspace package, grouped by stable path
+  boundaries rather than one model call per file.
+
+Each bounded evidence pack includes manifests and scripts, config
+`extends`/`references`/`include`/`exclude`, file-kind and language counts,
+representative outlines, imports/exports, and deterministic entity/relation
+summaries. Current `production`/`documentation` labels are excluded from the
+prompt so the scout cannot merely repeat the heuristic under review.
+
+The scout publishes immutable, fingerprinted scope/project classifications:
+
+- role: `runtime`, `tooling`, `documentation`, `test`, `generated`, `mixed`, or
+  `unknown`;
+- exact scope or config identity;
+- `likely`/`possible` confidence, model provenance, and cited evidence spans or
+  config fields;
+- a fingerprint over membership, evidence, prompt/schema/model policy, and the
+  structural snapshot.
+
+Classifications are policy metadata, not graph facts. Files are never deleted
+from L1. Only current, fresh classifications affect downstream defaults:
+
+- primary search applies a penalty to auxiliary scopes but retains recall and
+  supports explicit inclusion;
+- workflow candidates exclude fresh, likely auxiliary scopes by default;
+- embedding can explicitly select the product corpus before expensive vector
+  generation;
+- checker ownership remains deterministic, while project purpose controls
+  scheduling. A tooling project is skipped for a file only when a non-tooling
+  owning project remains; a sole owner is retained as a fallback;
+- stale, possible, mixed, or missing classifications fall back to neutral
+  inclusion rather than silently hiding code.
+
+The first implementation must add a dry-run showing every planned subject,
+classification input, and downstream inclusion decision. Acceptance requires
+fixtures where the same `doc`/`docs` and `tsconfig` names receive different
+roles from different repository evidence, plus a stale-overlay test proving
+that source/config drift restores neutral inclusion.
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -1259,7 +1330,7 @@ consequences that still govern implementation.
 | Unassisted Codex sessions made zero jscout calls; MCP metadata alone did not create adoption | Ship explicit project-local agent guidance; do not generalize the adoption result to every client/model |
 | Grep, baseline, and structural arms reached the same correctness ceiling while structural retrieval initially read more irrelevant files | L1 retrieval investment is closed; expansion stays opt-in and file-role/origin policy applies before budgets |
 | Whole search responses grew materially when structural context was attached | Complete rendered-response byte budgets are a permanent contract |
-| The preregistered file-role revision reduced structural irrelevant inspection to an interval including zero without creating a correctness win | Keep deterministic role classification/filtering; do not claim graph value from the result |
+| The preregistered file-role revision reduced structural irrelevant inspection to an interval including zero without creating a correctness win | Keep high-precision deterministic roles as bootstrap signals; move ambiguous directory and project purpose into the G13 reconnaissance overlay rather than adding repository-specific path rules |
 | Full versus elided source retained answer quality but did not reduce selected-artifact bytes/calls | Full source remains the default; custom behavioral IR is not earned |
 | Fixed-snapshot workflow memory replay delivered artifacts in every correct warm token win and reduced median session-2 tokens | Keep evidence-backed workflow memory opt-in and proceed with the shared semantic engine |
 | Free-form workflow participant synthesis omitted deterministic continuations | Candidate closure and exhaustive classification are mandatory |

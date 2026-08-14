@@ -68,6 +68,10 @@ pub fn classify(path: &Path, source: &str) -> &'static str {
         ],
     ) {
         "test"
+    // Singular `doc` is deliberately not a documentation marker: document-
+    // domain production code commonly uses that directory name. `docs` and
+    // `documentation` remain coarse bootstrap signals until evidence-backed
+    // repository reconnaissance can supply a semantic scope-role overlay.
     } else if has_component(
         &components,
         &["docs", "documentation", ".storybook", "stories"],
