@@ -412,11 +412,13 @@ fn missing_embedding_documents(
     profile_fingerprint: &str,
     profile_id: Option<i64>,
     file_origins: &[String],
+    product_only: bool,
 ) -> Result<Vec<MissingEmbeddingDocument>> {
     let flags = origin_flags(file_origins);
     let mut statement = conn.prepare(
         "SELECT c.hash, MIN(c.content), COUNT(DISTINCT c.content)
          FROM chunks c JOIN files f ON c.file_id=f.id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
          WHERE NOT EXISTS (
            SELECT 1 FROM embeddings e
            WHERE e.chunk_hash=c.hash
@@ -428,11 +430,20 @@ fn missing_embedding_documents(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
+           AND (NOT ?6 OR policy.role='runtime'
+             OR (policy.file_id IS NULL AND f.role IN ('production','unknown')))
          GROUP BY c.hash
          ORDER BY c.hash",
     )?;
     let rows = statement.query_map(
-        params![profile_fingerprint, flags.0, flags.1, flags.2, profile_id],
+        params![
+            profile_fingerprint,
+            flags.0,
+            flags.1,
+            flags.2,
+            profile_id,
+            product_only,
+        ],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -468,6 +479,16 @@ pub fn embed_missing_for_origins(
     batch_size: usize,
     file_origins: &[String],
 ) -> Result<(usize, usize)> {
+    embed_missing_for_selection(conn, provider, batch_size, file_origins, false)
+}
+
+pub fn embed_missing_for_selection(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+    file_origins: &[String],
+    product_only: bool,
+) -> Result<(usize, usize)> {
     if batch_size == 0 {
         bail!("embedding batch size must be positive");
     }
@@ -480,6 +501,7 @@ pub fn embed_missing_for_origins(
         &profile.fingerprint,
         resolved_profile_id,
         file_origins,
+        product_only,
     )?;
 
     let total = rows.len();
@@ -997,12 +1019,49 @@ fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
+
     use super::{
         DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, embed_text, ensure_profile,
         exact_vector_search, existing_profile, materialize_cached_embeddings,
         missing_embedding_documents, profile_fingerprint, ready_search_profile, sync_vector_index,
         validate_endpoint, vec_to_blob, vector_index_needs_sync, vector_table,
     };
+
+    fn insert_policy(
+        conn: &Connection,
+        file_id: i64,
+        role: &str,
+        suffix: &str,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'test','test','custom',
+                      'test','snapshot',?1,?1,'{}','now','now')",
+            [format!("policy-{suffix}")],
+        )?;
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repository_classifications(
+               run_id,subject_key,subject_kind,selector_json,depth,role,confidence,
+               explanation,citations_json,evidence_fingerprint,
+               classification_fingerprint,source_snapshot,created_at
+             ) VALUES(?1,?2,'area','{}',0,?3,'likely','test','[\"E001\"]',
+                      ?2,?2,'snapshot','now')",
+            rusqlite::params![run_id, format!("area:{suffix}"), role],
+        )?;
+        let classification_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repository_file_policy(
+               file_id,classification_id,subject_key,role,source_hash,depth
+             ) VALUES(?1,?2,?3,?4,'hash',0)",
+            rusqlite::params![file_id, classification_id, format!("area:{suffix}"), role],
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn profile_fingerprint_changes_with_configuration() {
@@ -1135,6 +1194,7 @@ mod tests {
             "missing-profile",
             None,
             &["repository".into()],
+            false,
         )?;
         assert_eq!(documents.len(), 2);
         assert_eq!(
@@ -1143,6 +1203,51 @@ mod tests {
                 .map(|document| document.hash.as_str())
                 .collect::<Vec<_>>(),
             ["other", "same"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn product_embedding_selection_uses_fresh_repository_policy_with_neutral_fallback()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        let mut file_ids = std::collections::BTreeMap::new();
+        for (path, hash, deterministic_role) in [
+            ("docs/runtime.ts", "runtime", "documentation"),
+            ("src/tool.ts", "tooling", "production"),
+            ("src/default.ts", "default", "production"),
+            ("docs/default.ts", "docs-default", "documentation"),
+        ] {
+            connection.execute(
+                "INSERT INTO files(path,hash,role,origin) VALUES(?1,?2,?3,'repository')",
+                rusqlite::params![path, format!("file-{hash}"), deterministic_role],
+            )?;
+            let file_id = connection.last_insert_rowid();
+            file_ids.insert(hash, file_id);
+            connection.execute(
+                "INSERT INTO chunks(
+                   file_id,kind,scope_chain,symbols,start,end,start_line,end_line,hash,content
+                 ) VALUES(?1,'module','','',0,1,1,1,?2,?3)",
+                rusqlite::params![file_id, hash, format!("content-{hash}")],
+            )?;
+        }
+        insert_policy(&connection, file_ids["runtime"], "runtime", "runtime")?;
+        insert_policy(&connection, file_ids["tooling"], "tooling", "tooling")?;
+
+        let documents = missing_embedding_documents(
+            &connection,
+            "missing-profile",
+            None,
+            &["repository".into()],
+            true,
+        )?;
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.hash.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "runtime"]
         );
         Ok(())
     }

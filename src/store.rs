@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "19";
+pub const SCHEMA_VERSION: &str = "20";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -181,6 +181,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS checker_input_files;
              DROP TABLE IF EXISTS checker_enrichments;
              DROP TABLE IF EXISTS checker_enrichment_batches;
+             DROP TABLE IF EXISTS repository_file_policy;
              DROP TABLE IF EXISTS entity_edges;
              DROP TABLE IF EXISTS entity_occurrences;
              DROP TABLE IF EXISTS entities;
@@ -205,7 +206,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%';
-             UPDATE meta SET value='19' WHERE key='schema_version';",
+             UPDATE meta SET value='20' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -223,7 +224,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '19')
+INSERT INTO meta(key, value) VALUES('schema_version', '20')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -625,6 +626,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_scout_runs_active
   WHERE status IN ('running', 'completed');
 CREATE INDEX IF NOT EXISTS idx_scout_runs_status ON scout_runs(status, scout_kind);
 
+-- G13 repository reconnaissance is policy metadata, not semantic graph
+-- memory. Classifications are immutable and durable across disposable source
+-- snapshots. `evidence_fingerprint` is deliberately snapshot-free: it covers
+-- the exact subject membership/content and deterministic disk evidence.
+CREATE TABLE IF NOT EXISTS repository_classifications(
+  id INTEGER PRIMARY KEY,
+  run_id INTEGER UNIQUE NOT NULL REFERENCES scout_runs(id) ON DELETE CASCADE,
+  subject_key TEXT NOT NULL,
+  subject_kind TEXT NOT NULL CHECK(subject_kind IN ('package', 'area', 'project')),
+  selector_json TEXT NOT NULL,
+  parent_subject_key TEXT,
+  depth INTEGER NOT NULL CHECK(depth >= 0),
+  role TEXT NOT NULL CHECK(role IN (
+    'runtime', 'tooling', 'documentation', 'test', 'generated',
+    'mixed', 'unknown'
+  )),
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  explanation TEXT NOT NULL,
+  citations_json TEXT NOT NULL,
+  evidence_fingerprint TEXT NOT NULL,
+  classification_fingerprint TEXT NOT NULL,
+  source_snapshot TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_classifications_subject
+  ON repository_classifications(subject_key, id DESC);
+CREATE INDEX IF NOT EXISTS idx_repository_classifications_evidence
+  ON repository_classifications(subject_key, evidence_fingerprint, id DESC);
+
+-- Snapshot-local acceleration plane. It is rebuilt deterministically from
+-- fresh, likely scope classifications after indexing/scouting; stale,
+-- possible, mixed, and unknown results never hide or penalize a file.
+CREATE TABLE IF NOT EXISTS repository_file_policy(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  classification_id INTEGER NOT NULL REFERENCES repository_classifications(id),
+  subject_key TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN (
+    'runtime', 'tooling', 'documentation', 'test', 'generated'
+  )),
+  source_hash TEXT NOT NULL,
+  depth INTEGER NOT NULL CHECK(depth >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_repository_file_policy_classification
+  ON repository_file_policy(classification_id);
+
 -- Every deterministic candidate's decision for a run, including exclusions
 -- (which never become semantic supports).
 CREATE TABLE IF NOT EXISTS scout_classifications(
@@ -788,7 +834,8 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     // already-emptied referencing tables. `entities` and the graph tables are
     // disposable projection state rebuilt by the next projection pass.
     conn.execute_batch(
-        "DELETE FROM embedding_index_entries;
+        "DELETE FROM repository_file_policy;
+         DELETE FROM embedding_index_entries;
          DELETE FROM entity_edges;
          DELETE FROM entity_occurrences;
          DELETE FROM entities;
@@ -922,7 +969,7 @@ mod tests {
         let database = directory.path().join("floor.db");
         let conn = open_path(&database)?;
         conn.execute_batch(
-            "INSERT INTO files(path, hash, role) VALUES('old.ts', 'source', 'production');
+            r#"INSERT INTO files(path, hash, role) VALUES('old.ts', 'source', 'production');
              INSERT INTO chunks(
                file_id, kind, start, end, start_line, end_line, hash, content
              ) VALUES(1, 'module', 0, 1, 1, 1, 'chunk', 'x');
@@ -937,22 +984,43 @@ mod tests {
                input_fingerprint, artifact_fingerprint
              ) VALUES(1, 'annotation', 'memory', '{}', 'agent', 'v1',
                       'likely', 'old', '2026-01-01T00:00:00Z', 'input', 'artifact');
+             INSERT INTO scout_runs(
+               id, scout_kind, status, gateway_protocol, provider, model,
+               billing_path, prompt_version, source_snapshot, input_fingerprint,
+               request_hash, started_at, completed_at
+             ) VALUES(1, 'repository', 'completed', 1, 'test', 'model', 'custom',
+                      'repository-recon/v1', 'old', 'recon-input', 'request',
+                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z');
+             INSERT INTO repository_classifications(
+               id, run_id, subject_key, subject_kind, selector_json, depth,
+               role, confidence, explanation, citations_json,
+               evidence_fingerprint, classification_fingerprint,
+               source_snapshot, created_at
+             ) VALUES(1, 1, 'area:repository:src', 'area',
+                      '{"kind":"repository_area","scope":"src","direct_only":false}',
+                      0, 'runtime', 'likely', 'runtime source', '["E001"]',
+                      'evidence', 'classification', 'old', '2026-01-01T00:00:01Z');
+             INSERT INTO repository_file_policy(
+               file_id, classification_id, subject_key, role, source_hash, depth
+             ) VALUES(1, 1, 'area:repository:src', 'runtime', 'source', 0);
              INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,
                checker_input_fingerprint, sidecar_protocol, created_at, active
              ) VALUES('old', '5.9.3', 'test', 'checker', 1,
                       '2026-01-01T00:00:00Z', 1);
-             UPDATE meta SET value='16' WHERE key='schema_version';",
+             UPDATE meta SET value='16' WHERE key='schema_version';"#,
         )?;
         crate::embed::materialize_cached_embeddings(&conn)?;
         drop(conn);
 
         let upgraded = open_path(&database)?;
-        let counts: (i64, i64, i64, i64, i64) = upgraded.query_row(
+        let counts: (i64, i64, i64, i64, i64, i64, i64) = upgraded.query_row(
             "SELECT
                (SELECT count(*) FROM embedding_profiles),
                (SELECT count(*) FROM embeddings),
                (SELECT count(*) FROM semantic_artifacts),
+               (SELECT count(*) FROM repository_classifications),
+               (SELECT count(*) FROM repository_file_policy),
                (SELECT count(*) FROM files),
                (SELECT count(*) FROM checker_enrichment_batches)",
             [],
@@ -963,10 +1031,12 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
-        assert_eq!(counts, (1, 1, 1, 0, 0));
+        assert_eq!(counts, (1, 1, 1, 1, 0, 0, 0));
         let materialized: (i64, i64) = upgraded.query_row(
             "SELECT
                (SELECT count(*) FROM embedding_index_entries),

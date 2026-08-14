@@ -223,11 +223,20 @@ function projectPurpose(config, rawConfig, parsed) {
 }
 
 function projectSummary(project) {
+  project.membershipFingerprint ??= digestText(
+    [...project.fileNames].map((file) => relativeIdentity(file)).sort().join("\0"),
+  );
+  project.configFingerprint ??= digestText(JSON.stringify(
+    (project.config ? configInputs(project.config) : [])
+      .map(({ identity, source_hash }) => ({ identity, source_hash })),
+  ));
   return {
     project_id: project.id,
     file_count: project.fileNames.length,
     purpose: project.purpose ?? "general",
     purpose_reasons: project.purposeReasons ?? [],
+    membership_fingerprint: project.membershipFingerprint,
+    config_fingerprint: project.configFingerprint,
   };
 }
 

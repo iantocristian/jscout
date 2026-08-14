@@ -141,6 +141,10 @@ pub struct ProjectSummary {
     pub purpose: String,
     #[serde(default)]
     pub purpose_reasons: Vec<String>,
+    #[serde(default)]
+    pub membership_fingerprint: String,
+    #[serde(default)]
+    pub config_fingerprint: String,
 }
 
 fn default_project_purpose() -> String {

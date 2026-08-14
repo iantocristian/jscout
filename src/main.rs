@@ -17,6 +17,7 @@ mod origin;
 mod package_exports;
 mod parse;
 mod query;
+mod recon;
 mod scout;
 mod scouting;
 mod search;
@@ -82,6 +83,9 @@ enum Command {
         /// Restrict embeddings to file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
+        /// Embed only the effective product corpus after fresh reconnaissance policy
+        #[arg(long)]
+        product: bool,
     },
     /// Hybrid search over the indexed repository
     Search {
@@ -474,6 +478,53 @@ enum CheckerCommand {
 
 #[derive(Subcommand)]
 enum ScoutCommand {
+    /// Evidence-backed repository scope and TypeScript-project classification
+    Repository {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Hard command-level model-call budget, shared with mixed subdivision
+        #[arg(long)]
+        max_calls: usize,
+        /// Maximum serialized evidence bytes sent to the model per subject
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Maximum initial plus subdivided subjects
+        #[arg(long, default_value_t = scouting::repository::DEFAULT_MAX_SUBJECTS)]
+        max_subjects: usize,
+        /// Maximum directory levels below an initial mixed subject
+        #[arg(long, default_value_t = scouting::repository::DEFAULT_MAX_DEPTH)]
+        max_depth: usize,
+        /// Supersede completed identical runs instead of reusing them
+        #[arg(long)]
+        rebuild: bool,
+        /// Print exact subjects, evidence, freshness, and bounds; make no model calls
+        #[arg(long)]
+        dry_run: bool,
+        /// Hard deadline for each checker inventory request in seconds
+        #[arg(long, default_value_t = 30)]
+        checker_timeout: u64,
+        /// Checker sidecar entry file for development and diagnostics
+        #[arg(long)]
+        sidecar_path: Option<PathBuf>,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
     /// Candidate-closed workflow classification from explicit or automatic seeds
     Workflows {
         /// Repository root (must be indexed)
@@ -706,7 +757,8 @@ fn main() -> Result<()> {
             root,
             batch,
             file_origins,
-        } => cmd_embed(&root, batch, &file_origins),
+            product,
+        } => cmd_embed(&root, batch, &file_origins, product),
         Command::Search {
             root,
             query,
@@ -1029,6 +1081,43 @@ fn main() -> Result<()> {
             InferenceCommand::Doctor { url } => inference::doctor(url.as_deref()),
         },
         Command::Scout { command } => match command {
+            ScoutCommand::Repository {
+                root,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                max_calls,
+                context_bytes,
+                max_subjects,
+                max_depth,
+                rebuild,
+                dry_run,
+                checker_timeout,
+                sidecar_path,
+                database,
+                gateway_path,
+            } => cmd_scout_repository(
+                &root,
+                database.as_deref(),
+                gateway_path.as_deref(),
+                dry_run,
+                scouting::repository::RepositoryPlanningOptions {
+                    max_subjects,
+                    max_depth,
+                    checker_timeout: std::time::Duration::from_secs(checker_timeout),
+                    checker_sidecar: sidecar_path.as_deref(),
+                },
+                scouting::repository::RepositoryScoutOptions {
+                    model: llm::config::resolve_model(model.as_deref())?,
+                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                    service_tier,
+                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                    rebuild,
+                    max_subjects,
+                    max_depth,
+                },
+            ),
             ScoutCommand::Workflows {
                 root,
                 seeds,
@@ -1232,7 +1321,7 @@ fn cmd_neighborhood(
     Ok(())
 }
 
-fn cmd_embed(root: &Path, batch: usize, file_origins: &[String]) -> Result<()> {
+fn cmd_embed(root: &Path, batch: usize, file_origins: &[String], product: bool) -> Result<()> {
     let conn = store::open(root)?;
     let Some(provider) = embed::Provider::from_env()? else {
         anyhow::bail!(
@@ -1240,7 +1329,8 @@ fn cmd_embed(root: &Path, batch: usize, file_origins: &[String]) -> Result<()> {
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
-    let (done, total) = embed::embed_missing_for_origins(&conn, &provider, batch, file_origins)?;
+    let (done, total) =
+        embed::embed_missing_for_selection(&conn, &provider, batch, file_origins, product)?;
     println!("embedded {done}/{total} chunks");
     Ok(())
 }
@@ -1654,6 +1744,29 @@ fn cmd_scout_workflows(
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
+    print_scout_batch(&batch);
+    scout_batch_exit(&batch)
+}
+
+fn cmd_scout_repository(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    dry_run: bool,
+    planning: scouting::repository::RepositoryPlanningOptions<'_>,
+    options: scouting::repository::RepositoryScoutOptions,
+) -> Result<()> {
+    let conn = open_database_for_write(root, database)?;
+    let plan = scouting::repository::plan(root, &conn, &planning)?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scouting::repository::dry_run_report(&plan, &options,)?)?
+        );
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let batch = scouting::repository::execute(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
 }

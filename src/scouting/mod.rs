@@ -11,6 +11,7 @@ pub mod evidence;
 pub mod ledger;
 pub mod plan;
 pub mod refresh;
+pub mod repository;
 pub mod summary;
 pub mod workflow;
 
@@ -3274,6 +3275,140 @@ mod tests {
             attempts: 1,
             response_model: Some("faux-model".into()),
         }
+    }
+
+    fn repository_outcome(role: &str) -> CompletionOutcome {
+        let mut result = outcome(json!({
+            "role": role,
+            "confidence": "likely",
+            "explanation": format!("the evidence classifies this scope as {role}"),
+            "evidence": ["E001"],
+        }));
+        result.tool_call.name = super::repository::SUBMIT_TOOL_NAME.into();
+        result
+    }
+
+    #[test]
+    fn repository_scout_subdivides_mixed_scopes_and_reuses_every_exact_run() -> Result<()> {
+        use super::repository::{
+            CurrentClassification, EvidenceItem, RepositoryEvidencePack, RepositoryPlan,
+            RepositoryPlanItem, RepositoryScoutOptions,
+        };
+        use crate::recon::{self, SubjectSelector};
+
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("mixed/docs"))?;
+        std::fs::write(
+            repo.path().join("mixed/runtime.ts"),
+            "export const run = 1;\n",
+        )?;
+        std::fs::write(
+            repo.path().join("mixed/docs/guide.ts"),
+            "export const guide = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let selector = SubjectSelector::RepositoryArea {
+            scope: "mixed".into(),
+            direct_only: false,
+        };
+        let state = recon::build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:mixed".into(),
+            selector.clone(),
+        )?;
+        let evidence = RepositoryEvidencePack {
+            algorithm: recon::EVIDENCE_ALGORITHM,
+            subject_key: state.subject_key.clone(),
+            subject_kind: "area".into(),
+            member_count: state.members.len(),
+            language_counts: Default::default(),
+            chunk_kind_counts: Default::default(),
+            items: vec![EvidenceItem {
+                id: "E001".into(),
+                kind: "aggregate".into(),
+                source: None,
+                start_line: None,
+                end_line: None,
+                content: "runtime and documentation files coexist".into(),
+            }],
+            rendered: "deterministic mixed-scope evidence".into(),
+        };
+        let make_plan = || RepositoryPlan {
+            snapshot: snapshot.clone(),
+            max_subjects: 3,
+            max_depth: 1,
+            subject_limit_reached: false,
+            configured_projects: 0,
+            configuration_problems: Vec::new(),
+            items: vec![RepositoryPlanItem {
+                subject_key: state.subject_key.clone(),
+                subject_kind: "area".into(),
+                display_name: "mixed".into(),
+                parent_subject_key: None,
+                depth: 0,
+                selector: selector.clone(),
+                evidence_fingerprint: state.evidence_fingerprint.clone(),
+                member_count: state.members.len(),
+                evidence: evidence.clone(),
+                current_classification: None::<CurrentClassification>,
+                downstream_policy: "neutral inclusion".into(),
+                potential_children: vec![
+                    "area:repository:mixed:direct".into(),
+                    "area:repository:mixed/docs".into(),
+                ],
+                state: state.clone(),
+            }],
+            omitted_subjects: Vec::new(),
+        };
+        let options = RepositoryScoutOptions {
+            model: ModelSpec::parse("faux:faux-model")?,
+            reasoning: None,
+            service_tier: None,
+            policy: RequestPolicy::new(30, 3, 240_000)?,
+            rebuild: false,
+            max_subjects: 3,
+            max_depth: 1,
+        };
+
+        let mut first = FakeGateway::new(vec![
+            Ok(repository_outcome("mixed")),
+            Ok(repository_outcome("runtime")),
+            Ok(repository_outcome("documentation")),
+        ]);
+        let report =
+            super::repository::execute(repo.path(), &conn, &mut first, &options, make_plan())?;
+        assert_eq!(report.model_calls, 3);
+        assert_eq!(report.reports.len(), 3);
+        assert_eq!(first.calls, 3);
+        assert_eq!(
+            recon::file_policy_by_path(&conn, "mixed/runtime.ts")?
+                .unwrap()
+                .role,
+            "runtime"
+        );
+        assert_eq!(
+            recon::file_policy_by_path(&conn, "mixed/docs/guide.ts")?
+                .unwrap()
+                .role,
+            "documentation"
+        );
+
+        let mut reused = FakeGateway::new(Vec::new());
+        let report =
+            super::repository::execute(repo.path(), &conn, &mut reused, &options, make_plan())?;
+        assert_eq!(report.model_calls, 0);
+        assert_eq!(report.reports.len(), 3);
+        assert!(
+            report
+                .reports
+                .iter()
+                .all(|report| report.status == "reused")
+        );
+        assert_eq!(reused.calls, 0);
+        Ok(())
     }
 
     fn scout_options() -> WorkflowScoutOptions {

@@ -843,8 +843,10 @@ fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>
          FROM graph_nodes node
          JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
          JOIN files file ON file.id=node.file_id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
-           AND file.role='production' AND file.origin IN ('repository','workspace')
+           AND (policy.role='runtime' OR (policy.file_id IS NULL AND file.role='production'))
+           AND file.origin IN ('repository','workspace')
          ORDER BY node.node_key",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -913,8 +915,10 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
          FROM graph_nodes node
          JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
          JOIN files file ON file.id=node.file_id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE node.node_kind='symbol' AND symbol.exported=1 AND symbol.scope_chain=''
-           AND file.role='production' AND file.origin IN ('repository','workspace')
+           AND (policy.role='runtime' OR (policy.file_id IS NULL AND file.role='production'))
+           AND file.origin IN ('repository','workspace')
          ORDER BY node.node_key",
     )?;
     let rows = statement.query_map([], |row| {
@@ -969,12 +973,15 @@ fn runtime_boundary_endpoints(conn: &Connection) -> Result<BTreeMap<String, Vec<
         "SELECT edge.src_key, edge.dst_key, edge.kind,
                 src.node_kind, dst.node_kind,
                 COALESCE(src_file.role, ''), COALESCE(src_file.origin, ''),
-                COALESCE(dst_file.role, ''), COALESCE(dst_file.origin, '')
+                COALESCE(dst_file.role, ''), COALESCE(dst_file.origin, ''),
+                COALESCE(src_policy.role, ''), COALESCE(dst_policy.role, '')
          FROM resolved_edges edge
          JOIN graph_nodes src ON src.node_key=edge.src_key
          JOIN graph_nodes dst ON dst.node_key=edge.dst_key
          LEFT JOIN files src_file ON src_file.id=src.file_id
          LEFT JOIN files dst_file ON dst_file.id=dst.file_id
+         LEFT JOIN repository_file_policy src_policy ON src_policy.file_id=src_file.id
+         LEFT JOIN repository_file_policy dst_policy ON dst_policy.file_id=dst_file.id
          WHERE edge.kind IN (
            'handles_route','handles_graphql','registered_handler','lifecycle_listener',
            'job_handler','provides','dispatches','produces_lifecycle',
@@ -994,19 +1001,38 @@ fn runtime_boundary_endpoints(conn: &Connection) -> Result<BTreeMap<String, Vec<
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
             row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     for row in rows {
-        let (src, dst, kind, src_kind, dst_kind, src_role, src_origin, dst_role, dst_origin) = row?;
+        let (
+            src,
+            dst,
+            kind,
+            src_kind,
+            dst_kind,
+            src_role,
+            src_origin,
+            dst_role,
+            dst_origin,
+            src_policy,
+            dst_policy,
+        ) = row?;
         let endpoint = if inbound.contains(&kind.as_str()) {
-            (dst, dst_kind, dst_role, dst_origin)
+            (dst, dst_kind, dst_role, dst_origin, dst_policy)
         } else if outbound.contains(&kind.as_str()) {
-            (src, src_kind, src_role, src_origin)
+            (src, src_kind, src_role, src_origin, src_policy)
         } else {
             continue;
         };
+        let runtime = if endpoint.4.is_empty() {
+            endpoint.2 == "production"
+        } else {
+            endpoint.4 == "runtime"
+        };
         if endpoint.1 != "symbol"
-            || endpoint.2 != "production"
+            || !runtime
             || !matches!(endpoint.3.as_str(), "repository" | "workspace")
         {
             continue;

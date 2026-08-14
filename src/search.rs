@@ -171,7 +171,11 @@ pub struct SearchExpansion {
 pub struct Hit {
     pub chunk_id: i64,
     pub file: String,
+    /// Deterministic path/content classification from the indexer.
     pub file_role: String,
+    /// Fresh, likely repository-scout override, when one is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_role: Option<String>,
     pub file_origin: String,
     pub kind: String,
     pub name: Option<String>,
@@ -415,6 +419,9 @@ fn ranked_hits(
     for ranking in &mut rankings {
         prefilter_ranking_by_role(conn, ranking, file_roles)?;
         ranking.truncate(pool);
+        if file_roles.is_empty() {
+            apply_repository_policy_penalty(conn, ranking)?;
+        }
     }
     let mut fused = rrf(&rankings, 60.0);
 
@@ -457,6 +464,9 @@ fn ranked_hits(
             }
         }
     }
+    if file_roles.is_empty() {
+        apply_repository_policy_penalty(conn, &mut fused)?;
+    }
 
     let mut hits = Vec::new();
     let allowed_roles: HashSet<&str> = file_roles.iter().map(String::as_str).collect();
@@ -472,6 +482,32 @@ fn ranked_hits(
         }
     }
     Ok((hits, retrieval))
+}
+
+fn apply_repository_policy_penalty(conn: &Connection, ranking: &mut Vec<(i64, f64)>) -> Result<()> {
+    let mut weighted = ranking
+        .iter()
+        .enumerate()
+        .map(|(rank, &(chunk_id, score))| {
+            Ok((
+                chunk_id,
+                score,
+                crate::recon::chunk_policy_penalty(conn, chunk_id)? / (rank as f64 + 1.0),
+                rank,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    weighted.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    *ranking = weighted
+        .into_iter()
+        .map(|(chunk_id, score, _, _)| (chunk_id, score))
+        .collect();
+    Ok(())
 }
 
 fn candidate_pool_limits(limit: usize, role_filtered: bool) -> (usize, usize) {
@@ -536,10 +572,12 @@ fn reranker_document(
 ) -> Result<Option<(i64, String)>> {
     let row = conn.query_row(
         "SELECT file.path, file.role, file.origin, chunk.kind, chunk.name,
-                chunk.start_line, chunk.end_line, chunk.content, package.name
+                chunk.start_line, chunk.end_line, chunk.content, package.name,
+                policy.role
          FROM chunks chunk
          JOIN files file ON file.id=chunk.file_id
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE chunk.id=?1",
         [chunk_id],
         |row| {
@@ -553,10 +591,22 @@ fn reranker_document(
                 row.get::<_, i64>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         },
     );
-    let (file, role, origin, kind, name, start_line, end_line, content, package) = match row {
+    let (
+        file,
+        deterministic_role,
+        origin,
+        kind,
+        name,
+        start_line,
+        end_line,
+        content,
+        package,
+        repository_role,
+    ) = match row {
         Ok(row) => row,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -566,8 +616,12 @@ fn reranker_document(
             .map_or_else(|| "(root)".to_string(), |(scope, _)| scope.to_string())
     });
     let symbol = name.as_deref().unwrap_or("(anonymous)");
+    let role = repository_role.as_deref().unwrap_or(&deterministic_role);
+    let role_context = repository_role.as_ref().map_or_else(String::new, |_| {
+        format!("\ndeterministic_role: {deterministic_role}")
+    });
     let mut document = format!(
-        "path: {file}\nscope: {scope}\nsymbol: {symbol}\nkind: {kind}\nrole: {role}\norigin: {origin}\nlines: {start_line}-{end_line}\n\n{content}"
+        "path: {file}\nscope: {scope}\nsymbol: {symbol}\nkind: {kind}\nrole: {role}{role_context}\norigin: {origin}\nlines: {start_line}-{end_line}\n\n{content}"
     );
     truncate_utf8(&mut document, max_chars);
     Ok(Some((chunk_id, document)))
@@ -593,8 +647,11 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
-                    c.content, c.symbols, c.file_id
-             FROM chunks c JOIN files f ON c.file_id = f.id WHERE c.id = ?1",
+                    c.content, c.symbols, c.file_id, policy.role
+             FROM chunks c
+             JOIN files f ON c.file_id = f.id
+             LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
+             WHERE c.id = ?1",
             [chunk_id],
             |r| {
                 Ok((
@@ -608,6 +665,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -623,6 +681,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         content,
         symbols,
         _file_id,
+        repository_role,
     )) = row
     else {
         return Ok(None);
@@ -659,6 +718,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         chunk_id,
         file,
         file_role: role,
+        repository_role,
         file_origin,
         kind,
         name,
@@ -1197,9 +1257,9 @@ mod tests {
 
     use super::{
         DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
-        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, candidate_pool_limits,
-        merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-        search,
+        SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
+        apply_response_budget, candidate_pool_limits, merge_reranked_prefix,
+        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1207,6 +1267,41 @@ mod tests {
         store,
         structural::{GraphEdge, GraphNode},
     };
+
+    fn insert_repository_policy(
+        conn: &rusqlite::Connection,
+        file_id: i64,
+        role: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'test','test','custom','test',
+                      'snapshot',?1,?1,'{}','now','now')",
+            [format!("search-policy-{suffix}")],
+        )?;
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repository_classifications(
+               run_id,subject_key,subject_kind,selector_json,depth,role,confidence,
+               explanation,citations_json,evidence_fingerprint,
+               classification_fingerprint,source_snapshot,created_at
+             ) VALUES(?1,?2,'area','{}',0,?3,'likely','test','[\"E001\"]',
+                      ?2,?2,'snapshot','now')",
+            rusqlite::params![run_id, format!("area:{suffix}"), role],
+        )?;
+        let classification_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO repository_file_policy(
+               file_id,classification_id,subject_key,role,source_hash,depth
+             ) VALUES(?1,?2,?3,?4,'hash',0)",
+            rusqlite::params![file_id, classification_id, format!("area:{suffix}"), role],
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn vector_retrieval_status_distinguishes_active_disabled_and_degraded() {
@@ -1471,6 +1566,7 @@ mod tests {
                 chunk_id: 1,
                 file: "src/large.ts".into(),
                 file_role: "production".into(),
+                repository_role: None,
                 file_origin: "repository".into(),
                 kind: "function".into(),
                 name: Some("largeHit".into()),
@@ -1683,6 +1779,62 @@ mod tests {
                 .iter()
                 .any(|node| node.file_role.as_deref() == Some("test"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_repository_policy_ranks_and_describes_effective_roles() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("docs"))?;
+        fs::create_dir_all(repo.path().join("src"))?;
+        fs::write(
+            repo.path().join("docs/runtime.ts"),
+            "export function sharedReconNeedle() { return 'runtime'; }\n",
+        )?;
+        fs::write(
+            repo.path().join("src/tool.ts"),
+            "export function sharedReconNeedle() { return 'tooling'; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let (runtime_file, runtime_chunk): (i64, i64) = conn.query_row(
+            "SELECT file.id, chunk.id FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             WHERE file.path='docs/runtime.ts' ORDER BY chunk.id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (tool_file, tool_chunk): (i64, i64) = conn.query_row(
+            "SELECT file.id, chunk.id FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             WHERE file.path='src/tool.ts' ORDER BY chunk.id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        insert_repository_policy(&conn, runtime_file, "runtime", "runtime")?;
+        insert_repository_policy(&conn, tool_file, "tooling", "tooling")?;
+
+        let mut ranking = vec![(tool_chunk, 1.0), (runtime_chunk, 0.9)];
+        apply_repository_policy_penalty(&conn, &mut ranking)?;
+        assert_eq!(ranking[0].0, runtime_chunk);
+
+        let (_, document) =
+            reranker_document(&conn, runtime_chunk, 4_000)?.expect("runtime recon candidate");
+        assert!(document.contains("role: runtime"));
+        assert!(document.contains("deterministic_role: documentation"));
+
+        let result = search(
+            &conn,
+            None,
+            "sharedReconNeedle",
+            &SearchOptions {
+                limit: 2,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(result.hits[0].file, "docs/runtime.ts");
+        assert_eq!(result.hits[0].repository_role.as_deref(), Some("runtime"));
+        assert!(result.hits.iter().any(|hit| {
+            hit.file == "src/tool.ts" && hit.repository_role.as_deref() == Some("tooling")
+        }));
         Ok(())
     }
 }
