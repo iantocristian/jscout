@@ -299,6 +299,34 @@ test("uses an explicit lint script to corroborate a noEmit tooling config", asyn
   await checker.close();
 });
 
+test("does not borrow a lint signal from a neighboring compound command", async (context) => {
+  const root = fixture({
+    "package.json": JSON.stringify({
+      scripts: { check: "eslint . && tsc -p tsconfig.app.json" },
+    }),
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.app.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      files: ["main.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.deepEqual(plan.result.files[0], {
+    file: "main.ts",
+    project_ids: ["tsconfig.app.json", "tsconfig.json"],
+    excluded_project_ids: [],
+    tooling_fallback: false,
+  });
+  assert.ok(plan.result.projects.every((project) => project.purpose === "general"));
+  await checker.close();
+});
+
 // The program must be built from the EFFECTIVE compiler options. Normalizing
 // absolute paths before `ts.createProgram` (normalization belongs to the
 // fingerprint) silently degraded every receiver reached through a `paths`

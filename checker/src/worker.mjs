@@ -199,7 +199,7 @@ function projectPurpose(config, rawConfig, parsed) {
     .filter(([name, command]) => {
       if (
         typeof command !== "string"
-        || !/(?:eslint|lint)/iu.test(`${name} ${command}`)
+        || !/(?:^|[:._-])(?:eslint|lint)(?:$|[:._-])/iu.test(name)
       ) {
         return false;
       }

@@ -395,7 +395,7 @@ fn ranked_hits(
     rerank: bool,
 ) -> Result<(Vec<Hit>, RetrievalStatus)> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
-    let pool = limit.max(10) * 5;
+    let (pool, vector_pool) = candidate_pool_limits(limit, !file_roles.is_empty());
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(conn, q, pool, file_roles, file_origins)?];
     let mut retrieval = RetrievalStatus::vector_disabled();
@@ -406,7 +406,7 @@ fn ranked_hits(
         let t = std::time::Instant::now();
         retrieval = record_vector_ranking(
             &mut rankings,
-            vector_ranking(conn, p, q, pool, file_origins),
+            vector_ranking(conn, p, q, vector_pool, file_origins),
         );
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
@@ -414,6 +414,7 @@ fn ranked_hits(
     }
     for ranking in &mut rankings {
         prefilter_ranking_by_role(conn, ranking, file_roles)?;
+        ranking.truncate(pool);
     }
     let mut fused = rrf(&rankings, 60.0);
 
@@ -471,6 +472,19 @@ fn ranked_hits(
         }
     }
     Ok((hits, retrieval))
+}
+
+fn candidate_pool_limits(limit: usize, role_filtered: bool) -> (usize, usize) {
+    let pool = limit.max(10).saturating_mul(5);
+    // sqlite-vec applies KNN's k before jscout can inspect the joined file role.
+    // Fetch a bounded surplus so selective role filters do not starve the vector
+    // ranking and accidentally tilt RRF toward BM25.
+    let vector_pool = if role_filtered {
+        pool.saturating_mul(4)
+    } else {
+        pool
+    };
+    (pool, vector_pool)
 }
 
 fn merge_reranked_prefix(fused: &[(i64, f64)], mut reranked: Vec<(i64, f64)>) -> Vec<(i64, f64)> {
@@ -1183,8 +1197,9 @@ mod tests {
 
     use super::{
         DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
-        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, merge_reranked_prefix,
-        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
+        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, candidate_pool_limits,
+        merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
+        search,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1217,6 +1232,12 @@ mod tests {
         assert_eq!(reranked.reranker, "active");
         reranked.reranker_degraded();
         assert_eq!(reranked.reranker, "degraded");
+    }
+
+    #[test]
+    fn vector_candidates_are_overfetched_before_role_filtering() {
+        assert_eq!(candidate_pool_limits(8, false), (50, 50));
+        assert_eq!(candidate_pool_limits(8, true), (50, 200));
     }
 
     #[test]
