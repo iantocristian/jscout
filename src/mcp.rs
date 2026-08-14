@@ -203,7 +203,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Returns ranked code chunks with call-graph context.",
+            "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Reports lexical/vector stage status, compact ranked code chunks, and optional graph context; set debug for the full diagnostic representation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -215,6 +215,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "memory_limit": { "type": "integer", "default": 4 },
                     "vector": { "type": "boolean", "default": true, "description": "Use the configured embedding profile when it is already materialized" },
                     "rerank": { "type": "boolean", "default": true, "description": "Apply the configured cross-encoder to the candidate pool; independent of vector retrieval" },
+                    "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered result, including hits, expansion, metadata, and JSON overhead" },
                     "expand": { "type": "boolean", "default": false, "description": "Attach a separately labelled structural context pack; off by default" },
                     "expand_depth": { "type": "integer", "default": 1 },
@@ -449,7 +450,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
         },
         {
             "name": "neighborhood",
-            "description": "Bounded traversal of the snapshot-safe structural graph around a file or symbol. Returns the current snapshot and reports when a stale saved anchor was re-resolved.",
+            "description": "Bounded traversal of the snapshot-safe structural graph around a file or symbol. Returns compact graph JSON by default; set debug for the full diagnostic representation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -463,7 +464,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Backing-file origin allowlist. Dependency nodes are excluded unless explicitly included" },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1 }
+                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1 },
+                    "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
                 "required": ["anchor"]
             }
@@ -524,6 +526,7 @@ fn call_tool(
             let q = args["query"].as_str().unwrap_or("");
             let limit = args["limit"].as_u64().unwrap_or(8) as usize;
             let expand = args["expand"].as_bool().unwrap_or(false);
+            let debug = args["debug"].as_bool().unwrap_or(false);
             if expand && profile == ToolProfile::Baseline {
                 anyhow::bail!("structural expansion is unavailable in the baseline MCP profile");
             }
@@ -544,6 +547,7 @@ fn call_tool(
                         && args["include_memory"].as_bool().unwrap_or(true),
                     memory_limit: args["memory_limit"].as_u64().unwrap_or(4) as usize,
                     rerank: args["rerank"].as_bool().unwrap_or(true),
+                    compact: !debug,
                     response_byte_limit: args["response_bytes"]
                         .as_u64()
                         .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
@@ -574,7 +578,11 @@ fn call_tool(
                     },
                 },
             )?;
-            Ok(serde_json::to_string_pretty(&result)?)
+            if debug {
+                Ok(serde_json::to_string_pretty(&result)?)
+            } else {
+                crate::compact::search_string(&result)
+            }
         }
         "who_uses" => {
             let spec = args["symbol"].as_str().unwrap_or("");
@@ -894,11 +902,16 @@ fn call_tool(
                     .is_some_and(|roles| !roles.is_empty()),
             };
             let result = structural::neighborhood(conn, anchor, &options)?;
-            render_bounded_object_arrays(
-                serde_json::to_value(result)?,
-                &["edges", "nodes"],
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
-            )
+            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
+            if args["debug"].as_bool().unwrap_or(false) {
+                render_bounded_object_arrays(
+                    serde_json::to_value(result)?,
+                    &["edges", "nodes"],
+                    response_bytes,
+                )
+            } else {
+                crate::compact::render_neighborhood(&result, response_bytes)
+            }
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
@@ -1065,6 +1078,11 @@ fn log_tool_call(
         .ok()
         .map(|text| semantic_artifact_metrics(text))
         .unwrap_or_default();
+    let retrieval_vector = result
+        .as_ref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value["retrieval"]["vector"].as_str().map(str::to_string));
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let record = json!({
@@ -1091,6 +1109,7 @@ fn log_tool_call(
         "semantic_artifacts_degraded": semantic_metrics.degraded,
         "semantic_artifacts_stale": semantic_metrics.stale,
         "semantic_artifacts_written": usize::from(tool == "annotate" && ok),
+        "retrieval_vector": retrieval_vector,
         "snapshot": snapshot,
     });
     if serde_json::to_writer(&mut *file, &record).is_err()
@@ -1113,6 +1132,24 @@ fn expansion_role_metrics(text: &str) -> ExpansionRoleMetrics {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return ExpansionRoleMetrics::default();
     };
+    if let Some(nodes) = value["graph"]["nodes"].as_object() {
+        let mut metrics = ExpansionRoleMetrics {
+            nodes: nodes.len(),
+            ..Default::default()
+        };
+        for node in nodes.values() {
+            if node["at"].as_str().is_none() {
+                continue;
+            }
+            let role = node["role"].as_str().unwrap_or("production");
+            metrics.file_nodes += 1;
+            *metrics.role_counts.entry(role.to_string()).or_default() += 1;
+            if matches!(role, "test" | "fixture" | "generated") {
+                metrics.test_fixture_generated += 1;
+            }
+        }
+        return metrics;
+    }
     let Some(nodes) = value["expansion"]["nodes"].as_array() else {
         return ExpansionRoleMetrics::default();
     };
@@ -1147,6 +1184,7 @@ fn semantic_artifact_metrics(text: &str) -> SemanticArtifactMetrics {
     };
     let artifacts = value["semantic_artifacts"]
         .as_array()
+        .or_else(|| value["semantic_memory"]["artifacts"].as_array())
         .or_else(|| value["semantic_overlay"]["artifacts"].as_array());
     let Some(artifacts) = artifacts else {
         return SemanticArtifactMetrics::default();
@@ -1226,6 +1264,20 @@ mod tests {
         assert_eq!(
             neighborhood["inputSchema"]["properties"]["response_bytes"]["default"],
             24_000
+        );
+        assert_eq!(
+            neighborhood["inputSchema"]["properties"]["debug"]["default"],
+            false
+        );
+        let search = structural
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == "semantic_search")
+            .expect("search definition");
+        assert_eq!(
+            search["inputSchema"]["properties"]["debug"]["default"],
+            false
         );
     }
 
@@ -1561,7 +1613,22 @@ mod tests {
         )?;
         let structural_search: serde_json::Value = serde_json::from_str(&structural_search)?;
         assert_eq!(
-            structural_search["semantic_artifacts"][0]["name"],
+            structural_search["semantic_memory"]["artifacts"][0]["name"],
+            "handoff workflow"
+        );
+
+        let diagnostic_search = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "semantic_search",
+            &json!({ "query": "handoff", "debug": true }),
+        )?;
+        let diagnostic_search: serde_json::Value = serde_json::from_str(&diagnostic_search)?;
+        assert_eq!(
+            diagnostic_search["semantic_artifacts"][0]["name"],
             "handoff workflow"
         );
 
@@ -1661,6 +1728,23 @@ mod tests {
         assert_eq!(metrics.file_nodes, 2);
         assert_eq!(metrics.role_counts["production"], 1);
         assert_eq!(metrics.test_fixture_generated, 1);
+
+        let compact = expansion_role_metrics(
+            &json!({
+                "graph": {
+                    "nodes": {
+                        "n1": { "at": "src/a.ts:1" },
+                        "n2": { "at": "tests/a.test.ts:1", "role": "test" },
+                        "n3": { "kind": "event", "name": "ready" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(compact.nodes, 3);
+        assert_eq!(compact.file_nodes, 2);
+        assert_eq!(compact.role_counts["production"], 1);
+        assert_eq!(compact.test_fixture_generated, 1);
     }
 
     #[test]
@@ -1679,6 +1763,21 @@ mod tests {
         assert_eq!(metrics.fresh, 1);
         assert_eq!(metrics.degraded, 1);
         assert_eq!(metrics.stale, 1);
+
+        let compact = semantic_artifact_metrics(
+            &json!({
+                "semantic_memory": {
+                    "artifacts": [
+                        { "freshness": "fresh" },
+                        { "freshness": "degraded" }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(compact.returned, 2);
+        assert_eq!(compact.fresh, 1);
+        assert_eq!(compact.degraded, 1);
 
         let overlay = semantic_artifact_metrics(
             &json!({

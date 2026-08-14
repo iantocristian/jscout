@@ -2,6 +2,7 @@ mod agent;
 mod calls;
 mod checker;
 mod chunk;
+mod compact;
 mod dependency;
 mod embed;
 mod entity;
@@ -115,9 +116,12 @@ enum Command {
         /// Use BM25 only (equivalent to --no-vector --no-rerank)
         #[arg(long)]
         lexical_only: bool,
-        /// Output JSON
-        #[arg(long)]
+        /// Output compact agent JSON
+        #[arg(long, conflicts_with = "debug_json")]
         json: bool,
+        /// Output the full diagnostic JSON representation
+        #[arg(long, conflicts_with = "json")]
+        debug_json: bool,
         /// Attach a separately labelled structural context pack (off by default)
         #[arg(long)]
         expand: bool,
@@ -386,6 +390,9 @@ enum Command {
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = 24_000)]
         response_bytes: usize,
+        /// Output the full diagnostic JSON representation
+        #[arg(long)]
+        debug_json: bool,
     },
     /// Print or install the jscout agent-integration skill
     AgentGuide {
@@ -713,6 +720,7 @@ fn main() -> Result<()> {
             no_rerank,
             lexical_only,
             json,
+            debug_json,
             expand,
             expand_depth,
             expand_seeds,
@@ -726,6 +734,7 @@ fn main() -> Result<()> {
             &query,
             no_vector || lexical_only,
             json,
+            debug_json,
             search::SearchOptions {
                 limit,
                 expand,
@@ -734,6 +743,7 @@ fn main() -> Result<()> {
                 include_memory: !no_memory,
                 memory_limit,
                 rerank: !(no_rerank || lexical_only),
+                compact: json,
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -938,10 +948,12 @@ fn main() -> Result<()> {
             file_roles,
             file_origins,
             response_bytes,
+            debug_json,
         } => cmd_neighborhood(
             &root,
             &anchor,
             response_bytes,
+            debug_json,
             structural::NeighborhoodOptions {
                 expected_snapshot: snapshot,
                 depth,
@@ -1202,18 +1214,21 @@ fn cmd_neighborhood(
     root: &Path,
     anchor: &str,
     response_bytes: usize,
+    debug_json: bool,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
     let conn = store::open_read_only(root)?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
-    println!(
-        "{}",
+    let rendered = if debug_json {
         mcp::render_bounded_object_arrays(
             serde_json::to_value(neighborhood)?,
             &["edges", "nodes"],
             response_bytes,
         )?
-    );
+    } else {
+        compact::render_neighborhood(&neighborhood, response_bytes)?
+    };
+    println!("{rendered}");
     Ok(())
 }
 
@@ -1235,6 +1250,7 @@ fn cmd_search(
     query: &str,
     no_vector: bool,
     json: bool,
+    debug_json: bool,
     options: search::SearchOptions,
 ) -> Result<()> {
     let conn = store::open_read_only(root)?;
@@ -1245,10 +1261,21 @@ fn cmd_search(
     };
     let result = search::search(&conn, provider.as_ref(), query, &options)?;
     if json {
+        println!("{}", compact::search_string(&result)?);
+        return Ok(());
+    }
+    if debug_json {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
     println!("snapshot: {}", result.snapshot);
+    println!(
+        "retrieval: lexical={} vector={}",
+        result.retrieval.lexical, result.retrieval.vector
+    );
+    if let Some(action) = result.retrieval.vector_action {
+        println!("vector action: {action}");
+    }
     if result.hits.is_empty() && result.semantic_artifacts.is_empty() {
         println!("no results");
         return Ok(());
@@ -1891,6 +1918,33 @@ mod main_tests {
             panic!("expected search")
         };
         assert!(lexical_only);
+    }
+
+    #[test]
+    fn compact_and_debug_json_modes_parse_without_ambiguity() {
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--debug-json"])
+                .expect("debug search output parses");
+        let Command::Search {
+            json, debug_json, ..
+        } = command
+        else {
+            panic!("expected search")
+        };
+        assert!(!json);
+        assert!(debug_json);
+        assert!(
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--json", "--debug-json"])
+                .is_err()
+        );
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "neighborhood", ".", "root", "--debug-json"])
+                .expect("debug neighborhood output parses");
+        let Command::Neighborhood { debug_json, .. } = command else {
+            panic!("expected neighborhood")
+        };
+        assert!(debug_json);
     }
 
     #[test]

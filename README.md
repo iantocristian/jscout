@@ -70,8 +70,10 @@ jscout index <root>            # rebuild disposable structural state in .jscout.
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   add --expand for a bounded structural context pack
                                #   --no-vector, --no-rerank, or --lexical-only control stages
+                               #   --json is compact; --debug-json retains diagnostics
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
+                               #   compact JSON by default; --debug-json for diagnostics
 jscout workflow-candidates R S # experimental fingerprinted candidate-set diagnostic
 jscout events <root> [name]    # string-keyed event wiring (emit/listen sites)
 jscout calls <root> METHOD     # exact member-call sites matched on the AST
@@ -505,7 +507,11 @@ is exposed as the `calls` MCP tool.
 
 ## Search anchors and expansion
 
-Search returns a repository snapshot plus ranked hits. Every hit includes a
+Search returns a repository snapshot, retrieval-stage status, and ranked hits.
+`retrieval.vector` is `active`, `disabled`, or `degraded`; degraded means the
+requested vector stage failed and the returned ranking is lexical-only. This
+status is present in compact CLI/MCP and full diagnostic JSON, so an agent does
+not have to infer vector availability from stderr. Every hit includes a
 `file_role`, a `file_anchor`, and one or more snapshot-scoped `anchors`
 projected from the chunk's overlapping declarations. Roles are deterministic:
 `production`, `test`, `fixture`, `generated`, `documentation`, or `unknown`.
@@ -528,11 +534,23 @@ tests, fixtures, generated files, or documentation back in. Explicitly
 included non-production nodes receive deterministic ranking penalties before
 the traversal and global node/byte budgets are consumed.
 
-`--response-bytes` caps the complete pretty-printed JSON envelope: hits,
-expansion, budget metadata, and serialization overhead. The result reports its
-actual `rendered_bytes`, original `unbudgeted_bytes`, and any omitted content.
-The expansion node, edge, and payload limits are subordinate budgets shared
-across all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
+`--json` and the MCP tools use compact, minified agent transport. It retains
+source locations, symbols, snippets, anchors, graph direction, confidence,
+provenance, and checker receiver types while omitting occurrence IDs, raw
+diagnostic metadata, empty fields, and repeated defaults. Search
+`--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
+full diagnostic representation.
+
+`--response-bytes` caps whichever complete JSON representation was requested:
+hits, expansion, budget metadata, and serialization overhead. The result
+reports its actual `rendered_bytes`, original `unbudgeted_bytes`, and omitted
+content. Search semantic-memory previews share a global eight-support cap.
+When the budget binds, optional memory is shed first, then low-ranked graph
+relations and their unused nodes, then lower-ranked code hits; the top code hit
+is never silently removed. Expansion admits an edge together with both endpoint
+nodes so a node-only context pack cannot consume the relation budget. The
+expansion node, edge, and payload limits are subordinate budgets shared across
+all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
 use `possible` only when explicit unresolved candidates are useful.
 
 Matching semantic memory is attached to CLI and structural-profile search by
@@ -663,10 +681,22 @@ jscout embed /path/to/repo
 ```
 
 Embeddings are keyed by chunk content hash and a fingerprint of provider,
-model, endpoint/protocol, revision, pooling, normalization, and other
-output-affecting configuration. The profile also records and enforces vector
-dimensions. Unchanged code is not re-embedded, and incompatible configurations
-can coexist without silently sharing vectors.
+model, endpoint/protocol, revision, pooling, normalization, document-text
+format, and other output-affecting configuration. Documents embed bounded chunk
+content only. Path, scope, symbol, and imports are occurrence metadata and are
+deliberately excluded from text stored under a content-only key; including them
+would make duplicate content reuse a vector from an arbitrary path. Each
+distinct missing hash is sent to the provider once. The profile records and
+enforces vector dimensions, and changing the document representation creates a
+new profile instead of silently reusing incompatible vectors. Unchanged code is
+not re-embedded, and compatible duplicate chunks share one cached vector.
+
+Upgrade note for `content-v2`: profiles created before the content-only
+document format remain intact but are intentionally incompatible. Existing
+embedded repositories therefore report `retrieval.vector=degraded` and use
+BM25 until `jscout embed <root>` creates the new profile. This is a one-time
+full re-embed per provider/model configuration; old vectors are not mixed into
+the new space or deleted automatically.
 
 Vector retrieval uses the statically linked `sqlite-vec` extension. jscout
 creates one cosine `vec0` virtual table per embedding dimension, partitioned by

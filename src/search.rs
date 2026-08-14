@@ -8,7 +8,7 @@ use crate::{embed, file_role, origin, semantic, store, structural};
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
-const DEFAULT_RENDERED_SUPPORT_LIMIT: usize = 8;
+const DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ExpansionOptions {
@@ -58,6 +58,9 @@ pub struct SearchOptions {
     /// Apply the separately configured cross-encoder to the fused candidate
     /// pool. This is independent of whether vector retrieval is enabled.
     pub rerank: bool,
+    /// Budget and render the agent-facing compact transport rather than the
+    /// diagnostic representation.
+    pub compact: bool,
     pub expansion: ExpansionOptions,
 }
 
@@ -72,6 +75,7 @@ impl Default for SearchOptions {
             include_memory: true,
             memory_limit: 4,
             rerank: true,
+            compact: false,
             expansion: ExpansionOptions::default(),
         }
     }
@@ -80,12 +84,47 @@ impl Default for SearchOptions {
 #[derive(Debug, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
+    pub retrieval: RetrievalStatus,
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RetrievalStatus {
+    pub lexical: &'static str,
+    pub vector: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_action: Option<&'static str>,
+}
+
+impl RetrievalStatus {
+    pub(crate) fn vector_disabled() -> Self {
+        Self {
+            lexical: "active",
+            vector: "disabled",
+            vector_action: None,
+        }
+    }
+
+    fn vector_active() -> Self {
+        Self {
+            lexical: "active",
+            vector: "active",
+            vector_action: None,
+        }
+    }
+
+    fn vector_degraded() -> Self {
+        Self {
+            lexical: "active",
+            vector: "degraded",
+            vector_action: Some("run jscout embed <root>; inspect stderr if it fails"),
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -289,7 +328,7 @@ pub fn search(
     origin::validate_all(&options.expansion.file_origins)?;
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let hits = ranked_hits(
+        let (hits, retrieval) = ranked_hits(
             conn,
             provider,
             q,
@@ -305,10 +344,11 @@ pub fn search(
         };
         let expansion = options
             .expand
-            .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion))
+            .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
             .transpose()?;
         let mut result = SearchResult {
             snapshot,
+            retrieval,
             hits,
             semantic_artifacts,
             expansion,
@@ -317,7 +357,7 @@ pub fn search(
                 ..Default::default()
             },
         };
-        apply_response_budget(&mut result)?;
+        apply_response_budget(&mut result, options.compact)?;
         Ok(result)
     })
 }
@@ -330,20 +370,21 @@ fn ranked_hits(
     file_roles: &[String],
     file_origins: &[String],
     rerank: bool,
-) -> Result<Vec<Hit>> {
+) -> Result<(Vec<Hit>, RetrievalStatus)> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(conn, q, pool, file_origins)?];
+    let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
     }
     if let Some(p) = provider {
         let t = std::time::Instant::now();
-        match vector_ranking(conn, p, q, pool, file_origins) {
-            Ok(r) => rankings.push(r),
-            Err(e) => eprintln!("vector search unavailable: {e}"),
-        }
+        retrieval = record_vector_ranking(
+            &mut rankings,
+            vector_ranking(conn, p, q, pool, file_origins),
+        );
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
         }
@@ -409,7 +450,23 @@ fn ranked_hits(
             }
         }
     }
-    Ok(hits)
+    Ok((hits, retrieval))
+}
+
+fn record_vector_ranking(
+    rankings: &mut Vec<Vec<(i64, f64)>>,
+    result: Result<Vec<(i64, f64)>>,
+) -> RetrievalStatus {
+    match result {
+        Ok(ranking) => {
+            rankings.push(ranking);
+            RetrievalStatus::vector_active()
+        }
+        Err(error) => {
+            eprintln!("vector search unavailable: {error}");
+            RetrievalStatus::vector_degraded()
+        }
+    }
 }
 
 fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>> {
@@ -497,35 +554,23 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
     }))
 }
 
-fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
+fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()> {
     let byte_limit = result.response_budget.byte_limit;
     if byte_limit == 0 {
         anyhow::bail!("response byte limit must be greater than zero");
     }
 
-    let unbudgeted = settle_rendered_bytes(result)?;
-    result.response_budget.unbudgeted_bytes = unbudgeted;
-    let unbudgeted = settle_rendered_bytes(result)?;
-    result.response_budget.unbudgeted_bytes = unbudgeted;
+    capture_unbudgeted_bytes(result, compact)?;
 
     // Search attaches semantic memory as secondary context. A stored artifact
     // can carry up to 160 evidence rows, but rendering all of them here can
     // consume the whole response before primary code or explicitly requested
     // structural context appears. The dedicated semantic-memory surface owns
-    // deeper evidence retrieval; search keeps a bounded preview.
-    for artifact in &mut result.semantic_artifacts {
-        let omitted = artifact
-            .supports
-            .len()
-            .saturating_sub(DEFAULT_RENDERED_SUPPORT_LIMIT);
-        if omitted > 0 {
-            artifact.supports.truncate(DEFAULT_RENDERED_SUPPORT_LIMIT);
-            result.response_budget.omitted_semantic_supports += omitted;
-            result.response_budget.truncated = true;
-        }
-    }
+    // deeper evidence retrieval; search keeps one global, fairly distributed
+    // preview rather than multiplying the cap by the number of artifacts.
+    cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
 
-    while settle_rendered_bytes(result)? > byte_limit {
+    while settle_rendered_bytes(result, compact)? > byte_limit {
         result.response_budget.truncated = true;
 
         // Semantic memory is an untrusted, optional attachment to search. Shed
@@ -552,47 +597,34 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
         }
 
         if let Some(expansion) = result.expansion.as_mut() {
-            if !expansion.nodes.is_empty() {
-                let removable = expansion
-                    .nodes
-                    .iter()
-                    .rposition(|node| !expansion.seeds.contains(&node.key))
-                    .unwrap_or(expansion.nodes.len() - 1);
-                let removed = expansion.nodes.remove(removable);
-                let edge_count = expansion.edges.len();
-                expansion
-                    .edges
-                    .retain(|edge| edge.source != removed.key && edge.target != removed.key);
-                expansion.truncated = true;
-                result.response_budget.omitted_nodes += 1;
-                result.response_budget.omitted_edges += edge_count - expansion.edges.len();
-                expansion.payload_bytes = expansion_payload_bytes(expansion)?;
-                continue;
-            }
+            // Edges are relevance-sorted, so the tail is the least useful
+            // relationship. Remove it before its now-unreferenced endpoint;
+            // node-first shedding produced relationship-free context packs.
             if expansion.edges.pop().is_some() {
                 expansion.truncated = true;
                 result.response_budget.omitted_edges += 1;
-                expansion.payload_bytes = expansion_payload_bytes(expansion)?;
+                result.response_budget.omitted_nodes += prune_expansion_nodes(expansion);
+                expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
+                continue;
+            }
+            if let Some(index) = expansion
+                .nodes
+                .iter()
+                .rposition(|node| !expansion.seeds.contains(&node.key))
+            {
+                expansion.nodes.remove(index);
+                expansion.truncated = true;
+                result.response_budget.omitted_nodes += 1;
+                expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
                 continue;
             }
         }
 
-        let rendered = result.response_budget.rendered_bytes;
-        if let Some((index, _)) = result
-            .hits
-            .iter()
-            .enumerate()
-            .filter(|(_, hit)| !hit.snippet.is_empty())
-            .max_by_key(|(_, hit)| hit.snippet.len())
-        {
-            let overshoot = rendered.saturating_sub(byte_limit);
-            let hit = &mut result.hits[index];
-            let target = hit.snippet.len().saturating_sub(overshoot.max(128));
-            truncate_utf8(&mut hit.snippet, target);
-            if !hit.snippet_truncated {
-                hit.snippet_truncated = true;
-                result.response_budget.truncated_snippets += 1;
-            }
+        // Ranked hits are the primary product. Shed only lower-ranked hits;
+        // the top hit remains even when the requested byte limit is too small.
+        if result.hits.len() > 1 {
+            result.hits.pop();
+            result.response_budget.omitted_hits += 1;
             continue;
         }
 
@@ -623,40 +655,140 @@ fn apply_response_budget(result: &mut SearchResult) -> Result<()> {
             hit.anchors.pop();
             continue;
         }
-        if result.hits.pop().is_some() {
-            result.response_budget.omitted_hits += 1;
+
+        let rendered = result.response_budget.rendered_bytes;
+        if let Some((index, _)) = result
+            .hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| !hit.snippet.is_empty())
+            .max_by_key(|(_, hit)| hit.snippet.len())
+        {
+            let overshoot = rendered.saturating_sub(byte_limit);
+            let hit = &mut result.hits[index];
+            let target = hit.snippet.len().saturating_sub(overshoot.max(128));
+            truncate_utf8(&mut hit.snippet, target);
+            if !hit.snippet_truncated {
+                hit.snippet_truncated = true;
+                result.response_budget.truncated_snippets += 1;
+            }
             continue;
         }
 
-        let minimum = settle_rendered_bytes(result)?;
+        let minimum = settle_rendered_bytes(result, compact)?;
         anyhow::bail!(
             "response byte limit {byte_limit} is below the minimum search envelope ({minimum} bytes)"
         );
     }
 
-    settle_rendered_bytes(result)?;
+    settle_rendered_bytes(result, compact)?;
     Ok(())
 }
 
-fn settle_rendered_bytes(result: &mut SearchResult) -> Result<usize> {
+fn cap_semantic_supports(result: &mut SearchResult, limit: usize) {
+    let original = result
+        .semantic_artifacts
+        .iter()
+        .map(|artifact| artifact.supports.len())
+        .sum::<usize>();
+    if original <= limit {
+        return;
+    }
+
+    let mut keep = vec![0_usize; result.semantic_artifacts.len()];
+    let mut remaining = limit;
+    // Preserve one evidence row per returned artifact before allocating a
+    // second row. Artifact and support order are already deterministic rank
+    // order, so this is stable while avoiding first-artifact monopolization.
+    while remaining > 0 {
+        let mut allocated = false;
+        for (index, artifact) in result.semantic_artifacts.iter().enumerate() {
+            if keep[index] < artifact.supports.len() {
+                keep[index] += 1;
+                remaining -= 1;
+                allocated = true;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if !allocated {
+            break;
+        }
+    }
+    for (artifact, count) in result.semantic_artifacts.iter_mut().zip(keep) {
+        artifact.supports.truncate(count);
+    }
+    result.response_budget.omitted_semantic_supports += original - limit;
+    result.response_budget.truncated = true;
+}
+
+fn prune_expansion_nodes(expansion: &mut SearchExpansion) -> usize {
+    let referenced = expansion
+        .edges
+        .iter()
+        .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
+        .collect::<HashSet<_>>();
+    let original = expansion.nodes.len();
+    expansion.nodes.retain(|node| {
+        expansion.seeds.contains(&node.key) || referenced.contains(node.key.as_str())
+    });
+    original - expansion.nodes.len()
+}
+
+fn settle_rendered_bytes(result: &mut SearchResult, compact: bool) -> Result<usize> {
     for _ in 0..8 {
-        let rendered = serde_json::to_string_pretty(result)?.len();
+        let rendered = rendered_bytes(result, compact)?;
         if result.response_budget.rendered_bytes == rendered {
             return Ok(rendered);
         }
         result.response_budget.rendered_bytes = rendered;
     }
-    Ok(serde_json::to_string_pretty(result)?.len())
+    rendered_bytes(result, compact)
 }
 
-fn expansion_payload_bytes(expansion: &SearchExpansion) -> Result<usize> {
-    let node_bytes = expansion
-        .nodes
+fn capture_unbudgeted_bytes(result: &mut SearchResult, compact: bool) -> Result<usize> {
+    for _ in 0..8 {
+        let rendered = settle_rendered_bytes(result, compact)?;
+        if result.response_budget.unbudgeted_bytes == rendered {
+            return Ok(rendered);
+        }
+        result.response_budget.unbudgeted_bytes = rendered;
+    }
+    settle_rendered_bytes(result, compact)
+}
+
+fn rendered_bytes(result: &SearchResult, compact: bool) -> Result<usize> {
+    if compact {
+        crate::compact::search_rendered_bytes(result)
+    } else {
+        Ok(serde_json::to_string_pretty(result)?.len())
+    }
+}
+
+fn expansion_payload_bytes(expansion: &SearchExpansion, compact: bool) -> Result<usize> {
+    expansion_parts_bytes(
+        &expansion.nodes,
+        &expansion.edges,
+        &expansion.seeds,
+        compact,
+    )
+}
+
+fn expansion_parts_bytes(
+    nodes: &[structural::GraphNode],
+    edges: &[structural::GraphEdge],
+    seeds: &[String],
+    compact: bool,
+) -> Result<usize> {
+    if compact {
+        return crate::compact::expansion_payload_bytes(nodes, edges, seeds);
+    }
+    let node_bytes = nodes
         .iter()
         .map(|node| serde_json::to_vec(node).map(|bytes| bytes.len()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let edge_bytes = expansion
-        .edges
+    let edge_bytes = edges
         .iter()
         .map(|edge| serde_json::to_vec(edge).map(|bytes| bytes.len()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -735,6 +867,7 @@ fn expand_hits(
     snapshot: &str,
     hits: &[Hit],
     options: &ExpansionOptions,
+    compact: bool,
 ) -> Result<SearchExpansion> {
     if options.seed_limit == 0
         || options.node_limit == 0
@@ -839,35 +972,89 @@ fn expand_hits(
         })
     });
 
+    let nodes_by_key = ranked_nodes
+        .iter()
+        .map(|node| (node.key.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
     let mut nodes = Vec::new();
     let mut selected_node_keys = HashSet::new();
-    let mut payload_bytes = 0_usize;
-    for node in ranked_nodes {
-        let bytes = serde_json::to_vec(&node)?.len() + usize::from(!nodes.is_empty());
-        if nodes.len() >= options.node_limit || payload_bytes + bytes > options.byte_limit {
+    let mut edges = Vec::new();
+
+    // Seeds are the required definitions for interpreting an expansion. Add
+    // them first, then admit relations atomically with both endpoints. The old
+    // nodes-first loop could exhaust the byte budget before a single edge.
+    for seed in &seeds {
+        let Some(node) = nodes_by_key.get(seed) else {
+            continue;
+        };
+        let mut candidate_nodes = nodes.clone();
+        candidate_nodes.push(node.clone());
+        if candidate_nodes.len() <= options.node_limit
+            && expansion_parts_bytes(&candidate_nodes, &edges, &seeds, compact)?
+                <= options.byte_limit
+        {
+            selected_node_keys.insert(seed.clone());
+            nodes = candidate_nodes;
+        } else {
+            truncated = true;
+        }
+    }
+
+    for edge in ranked_edges {
+        if edges.len() >= options.edge_limit {
             truncated = true;
             continue;
         }
-        payload_bytes += bytes;
-        selected_node_keys.insert(node.key.clone());
-        nodes.push(node);
-    }
-
-    let mut edges = Vec::new();
-    for edge in ranked_edges {
-        if !selected_node_keys.contains(&edge.source) || !selected_node_keys.contains(&edge.target)
+        let mut candidate_nodes = nodes.clone();
+        let mut candidate_keys = selected_node_keys.clone();
+        let mut endpoints_available = true;
+        for key in [&edge.source, &edge.target] {
+            if candidate_keys.contains(key) {
+                continue;
+            }
+            let Some(node) = nodes_by_key.get(key) else {
+                endpoints_available = false;
+                break;
+            };
+            candidate_keys.insert(key.clone());
+            candidate_nodes.push(node.clone());
+        }
+        if !endpoints_available || candidate_nodes.len() > options.node_limit {
+            truncated = true;
+            continue;
+        }
+        let mut candidate_edges = edges.clone();
+        candidate_edges.push(edge);
+        if expansion_parts_bytes(&candidate_nodes, &candidate_edges, &seeds, compact)?
+            > options.byte_limit
         {
             truncated = true;
             continue;
         }
-        let bytes = serde_json::to_vec(&edge)?.len() + usize::from(!edges.is_empty());
-        if edges.len() >= options.edge_limit || payload_bytes + bytes > options.byte_limit {
-            truncated = true;
+        nodes = candidate_nodes;
+        selected_node_keys = candidate_keys;
+        edges = candidate_edges;
+    }
+
+    // Use remaining space for high-relevance standalone definitions without
+    // sacrificing any already-admitted relation.
+    for node in ranked_nodes {
+        if selected_node_keys.contains(&node.key) {
             continue;
         }
-        payload_bytes += bytes;
-        edges.push(edge);
+        let mut candidate_nodes = nodes.clone();
+        candidate_nodes.push(node.clone());
+        if candidate_nodes.len() <= options.node_limit
+            && expansion_parts_bytes(&candidate_nodes, &edges, &seeds, compact)?
+                <= options.byte_limit
+        {
+            selected_node_keys.insert(node.key.clone());
+            nodes = candidate_nodes;
+        } else {
+            truncated = true;
+        }
     }
+    let payload_bytes = expansion_parts_bytes(&nodes, &edges, &seeds, compact)?;
     Ok(SearchExpansion {
         seeds,
         nodes,
@@ -889,8 +1076,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, SearchExpansion,
-        SearchOptions, SearchResult, apply_response_budget, search,
+        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
+        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, record_vector_ranking,
+        search,
     };
     use crate::{
         file_role, indexer, origin,
@@ -898,6 +1086,25 @@ mod tests {
         store,
         structural::{GraphEdge, GraphNode},
     };
+
+    #[test]
+    fn vector_retrieval_status_distinguishes_active_disabled_and_degraded() {
+        let disabled = RetrievalStatus::vector_disabled();
+        assert_eq!(disabled.vector, "disabled");
+        assert!(disabled.vector_action.is_none());
+
+        let mut rankings = Vec::new();
+        let active = record_vector_ranking(&mut rankings, Ok(vec![(7, 0.9)]));
+        assert_eq!(active.vector, "active");
+        assert_eq!(rankings, vec![vec![(7, 0.9)]]);
+
+        let degraded = record_vector_ranking(
+            &mut rankings,
+            Err(anyhow::anyhow!("profile is not materialized")),
+        );
+        assert_eq!(degraded.vector, "degraded");
+        assert!(degraded.vector_action.is_some());
+    }
 
     #[test]
     fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
@@ -960,6 +1167,7 @@ mod tests {
                 include_memory: true,
                 memory_limit: 4,
                 rerank: true,
+                compact: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
@@ -978,7 +1186,11 @@ mod tests {
         )?;
         let expansion = result.expansion.expect("expansion context pack");
         assert!(expansion.nodes.len() <= 2);
-        assert!(expansion.edges.len() <= 1);
+        assert_eq!(expansion.edges.len(), 1);
+        assert!(expansion.edges.iter().all(|edge| {
+            expansion.nodes.iter().any(|node| node.key == edge.source)
+                && expansion.nodes.iter().any(|node| node.key == edge.target)
+        }));
         assert!(expansion.payload_bytes <= 1_500);
         assert!(expansion.truncated);
 
@@ -994,6 +1206,7 @@ mod tests {
                 include_memory: true,
                 memory_limit: 4,
                 rerank: true,
+                compact: false,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     byte_limit: 1,
@@ -1064,6 +1277,7 @@ mod tests {
         };
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
             expansion: Some(SearchExpansion {
@@ -1084,7 +1298,7 @@ mod tests {
             },
         };
 
-        apply_response_budget(&mut result)?;
+        apply_response_budget(&mut result, false)?;
         let expansion = result.expansion.expect("expansion");
         assert!(expansion.nodes.iter().any(|node| node.key == "high"));
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
@@ -1098,6 +1312,7 @@ mod tests {
     fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: vec![Hit {
                 chunk_id: 1,
                 file: "src/large.ts".into(),
@@ -1144,7 +1359,7 @@ mod tests {
             },
         };
 
-        apply_response_budget(&mut result)?;
+        apply_response_budget(&mut result, false)?;
         assert!(result.semantic_artifacts.is_empty());
         assert_eq!(result.response_budget.omitted_semantic_artifacts, 1);
         assert_eq!(result.hits.len(), 1);
@@ -1171,25 +1386,30 @@ mod tests {
                 freshness: "fresh".into(),
             })
             .collect();
+        let artifact = SemanticArtifact {
+            id: 1,
+            supersedes: None,
+            artifact_type: "workflow".into(),
+            name: Some("large workflow".into()),
+            trust: "untrusted-semantic-memory".into(),
+            body: serde_json::json!({ "purpose": "exercise bounded rendering" }),
+            model: "agent-reported".into(),
+            prompt_version: "annotate/v2".into(),
+            confidence: "likely".into(),
+            source_snapshot: "s".repeat(64),
+            created_at: "2026-08-13T00:00:00Z".into(),
+            freshness: "fresh".into(),
+            supports,
+            relevance: 1.0,
+        };
+        let mut second_artifact = artifact.clone();
+        second_artifact.id = 2;
+        second_artifact.name = Some("second workflow".into());
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
-            semantic_artifacts: vec![SemanticArtifact {
-                id: 1,
-                supersedes: None,
-                artifact_type: "workflow".into(),
-                name: Some("large workflow".into()),
-                trust: "untrusted-semantic-memory".into(),
-                body: serde_json::json!({ "purpose": "exercise bounded rendering" }),
-                model: "agent-reported".into(),
-                prompt_version: "annotate/v2".into(),
-                confidence: "likely".into(),
-                source_snapshot: "s".repeat(64),
-                created_at: "2026-08-13T00:00:00Z".into(),
-                freshness: "fresh".into(),
-                supports,
-                relevance: 1.0,
-            }],
+            semantic_artifacts: vec![artifact, second_artifact],
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 100_000,
@@ -1197,9 +1417,18 @@ mod tests {
             },
         };
 
-        apply_response_budget(&mut result)?;
-        assert_eq!(result.semantic_artifacts[0].supports.len(), 8);
-        assert_eq!(result.response_budget.omitted_semantic_supports, 12);
+        apply_response_budget(&mut result, false)?;
+        assert_eq!(
+            result
+                .semantic_artifacts
+                .iter()
+                .map(|artifact| artifact.supports.len())
+                .sum::<usize>(),
+            8
+        );
+        assert_eq!(result.semantic_artifacts[0].supports.len(), 4);
+        assert_eq!(result.semantic_artifacts[1].supports.len(), 4);
+        assert_eq!(result.response_budget.omitted_semantic_supports, 32);
         assert!(result.response_budget.truncated);
         assert!(result.response_budget.unbudgeted_bytes > result.response_budget.rendered_bytes);
         Ok(())
