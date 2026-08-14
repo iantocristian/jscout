@@ -163,7 +163,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v18; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v20; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -1271,7 +1271,7 @@ delete semantic memory or content-hash embedding rows.
 - blanket `node_modules` watching or dependency indexing;
 - hidden scouting, summarization, or other generative work.
 
-## Planned G13 — repository reconnaissance scout
+## Implemented G13 — repository reconnaissance scout
 
 Path nouns and configuration filenames are not structural truth. `doc`,
 `docs`, and a broadly owning `tsconfig` can each describe either production
@@ -1299,7 +1299,9 @@ roles:
   command-wide `--max-calls` limit, and each serialized evidence pack must fit
   `--context-bytes`. Reaching any bound leaves the unresolved area `mixed`,
   which has neutral downstream policy, rather than silently guessing a child
-  role;
+  role. Subdivision includes a direct-file residual when a mixed scope contains
+  both direct files and child directories, so root-level implementation files
+  are not stranded under the mixed parent;
 - TypeScript/JavaScript project configurations discovered by the checker
   configuration-only pass;
 - repository-owned files outside a workspace package, grouped by stable path
@@ -1348,7 +1350,7 @@ from L1. Only current, fresh classifications affect downstream defaults:
 - stale, possible, mixed, or missing classifications fall back to neutral
   inclusion rather than silently hiding code.
 
-The first implementation must add a dry-run showing every planned subject,
+The implementation includes a dry-run showing every planned subject,
 classification input, subdivision depth/budget decision, reuse/freshness
 decision, and downstream inclusion decision. Acceptance requires fixtures
 where the same `doc`/`docs` and `tsconfig` names receive different roles from

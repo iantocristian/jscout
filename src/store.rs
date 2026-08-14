@@ -629,7 +629,8 @@ CREATE INDEX IF NOT EXISTS idx_scout_runs_status ON scout_runs(status, scout_kin
 -- G13 repository reconnaissance is policy metadata, not semantic graph
 -- memory. Classifications are immutable and durable across disposable source
 -- snapshots. `evidence_fingerprint` is deliberately snapshot-free: it covers
--- the exact subject membership/content and deterministic disk evidence.
+-- exact subject membership, selected representative content, and deterministic
+-- disk evidence.
 CREATE TABLE IF NOT EXISTS repository_classifications(
   id INTEGER PRIMARY KEY,
   run_id INTEGER UNIQUE NOT NULL REFERENCES scout_runs(id) ON DELETE CASCADE,

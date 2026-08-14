@@ -757,9 +757,70 @@ mod tests {
     }
 
     #[test]
+    fn scope_freshness_tracks_membership_and_only_bounded_representative_content() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("src"))?;
+        for index in 0..10 {
+            std::fs::write(
+                repo.path().join(format!("src/{index:02}.ts")),
+                format!("export const value{index} = {index};\n"),
+            )?;
+        }
+        let conn = store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let selector = SubjectSelector::RepositoryArea {
+            scope: "src".into(),
+            direct_only: false,
+        };
+        let initial = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:src".into(),
+            selector.clone(),
+        )?;
+
+        // With ten members and an eight-file spread, 04.ts is not in the
+        // bounded evidence sample and therefore must not create recurring
+        // model cost for evidence the model never saw.
+        std::fs::write(
+            repo.path().join("src/04.ts"),
+            "export const value4 = 400;\n",
+        )?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let unselected_edit = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:src".into(),
+            selector.clone(),
+        )?;
+        assert_eq!(
+            unselected_edit.evidence_fingerprint,
+            initial.evidence_fingerprint
+        );
+
+        std::fs::write(
+            repo.path().join("src/05.ts"),
+            "export const value5 = 500;\n",
+        )?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let selected_edit =
+            build_scope_state(repo.path(), &conn, "area:repository:src".into(), selector)?;
+        assert_ne!(
+            selected_edit.evidence_fingerprint,
+            initial.evidence_fingerprint
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fresh_scope_policy_overrides_ambiguous_doc_path_heuristics_for_workflows() -> Result<()> {
         let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("doc"))?;
         std::fs::create_dir_all(repo.path().join("docs"))?;
+        std::fs::write(
+            repo.path().join("doc/guide.ts"),
+            "export function renderGuide() { return 'guide'; }\n",
+        )?;
         std::fs::write(
             repo.path().join("docs/runtime.ts"),
             "export function finish() { return 1; }\n\
@@ -804,7 +865,46 @@ mod tests {
             },
         )?;
         ledger::finish_run(&conn, run_id, RunOutcome::Completed, None, None)?;
+
+        let doc_selector = SubjectSelector::RepositoryArea {
+            scope: "doc".into(),
+            direct_only: false,
+        };
+        let doc_state = build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:doc".into(),
+            doc_selector.clone(),
+        )?;
+        let doc_run_id = run(&conn, "documentation-doc")?;
+        persist_classification(
+            &conn,
+            &NewClassification {
+                run_id: doc_run_id,
+                subject_key: &doc_state.subject_key,
+                subject_kind: "area",
+                selector: &doc_selector,
+                parent_subject_key: None,
+                depth: 0,
+                role: "documentation",
+                confidence: "likely",
+                explanation: "reader-facing guide implementation",
+                citations_json: "[\"E001\"]",
+                evidence_fingerprint: &doc_state.evidence_fingerprint,
+                classification_fingerprint: "documentation-doc",
+                source_snapshot: "snapshot",
+            },
+        )?;
+        ledger::finish_run(&conn, doc_run_id, RunOutcome::Completed, None, None)?;
         reconcile_file_policy(repo.path(), &conn)?;
+        assert_eq!(
+            file_policy_by_path(&conn, "docs/runtime.ts")?.unwrap().role,
+            "runtime"
+        );
+        assert_eq!(
+            file_policy_by_path(&conn, "doc/guide.ts")?.unwrap().role,
+            "documentation"
+        );
 
         let candidates = crate::semantic::workflow_candidates(
             repo.path(),
