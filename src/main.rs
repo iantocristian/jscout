@@ -1269,6 +1269,13 @@ fn cmd_search(
         return Ok(());
     }
     println!("snapshot: {}", result.snapshot);
+    println!(
+        "retrieval: lexical={} vector={}",
+        result.retrieval.lexical, result.retrieval.vector
+    );
+    if let Some(action) = result.retrieval.vector_action {
+        println!("vector action: {action}");
+    }
     if result.hits.is_empty() && result.semantic_artifacts.is_empty() {
         println!("no results");
         return Ok(());

@@ -507,7 +507,11 @@ is exposed as the `calls` MCP tool.
 
 ## Search anchors and expansion
 
-Search returns a repository snapshot plus ranked hits. Every hit includes a
+Search returns a repository snapshot, retrieval-stage status, and ranked hits.
+`retrieval.vector` is `active`, `disabled`, or `degraded`; degraded means the
+requested vector stage failed and the returned ranking is lexical-only. This
+status is present in compact CLI/MCP and full diagnostic JSON, so an agent does
+not have to infer vector availability from stderr. Every hit includes a
 `file_role`, a `file_anchor`, and one or more snapshot-scoped `anchors`
 projected from the chunk's overlapping declarations. Roles are deterministic:
 `production`, `test`, `fixture`, `generated`, `documentation`, or `unknown`.
@@ -686,6 +690,13 @@ distinct missing hash is sent to the provider once. The profile records and
 enforces vector dimensions, and changing the document representation creates a
 new profile instead of silently reusing incompatible vectors. Unchanged code is
 not re-embedded, and compatible duplicate chunks share one cached vector.
+
+Upgrade note for `content-v2`: profiles created before the content-only
+document format remain intact but are intentionally incompatible. Existing
+embedded repositories therefore report `retrieval.vector=degraded` and use
+BM25 until `jscout embed <root>` creates the new profile. This is a one-time
+full re-embed per provider/model configuration; old vectors are not mixed into
+the new space or deleted automatically.
 
 Vector retrieval uses the statically linked `sqlite-vec` extension. jscout
 creates one cosine `vec0` virtual table per embedding dimension, partitioned by

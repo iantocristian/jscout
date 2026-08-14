@@ -24,6 +24,7 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     let hits = result.hits.iter().map(compact_hit).collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
+    response.insert("retrieval".into(), json!(result.retrieval));
     response.insert("hits".into(), Value::Array(hits));
 
     if !result.semantic_artifacts.is_empty() {
@@ -455,7 +456,7 @@ mod tests {
     use super::{render_neighborhood, search_string};
     use crate::{
         origin,
-        search::{Hit, ResponseBudget, SearchExpansion, SearchResult},
+        search::{Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchResult},
         structural::{GraphEdge, GraphNode, Neighborhood},
     };
 
@@ -497,6 +498,7 @@ mod tests {
         let target = "sym:src/workflow.ts#::finish@20";
         let result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: vec![Hit {
                 chunk_id: 41,
                 file: "src/workflow.ts".into(),
@@ -537,6 +539,8 @@ mod tests {
         let diagnostic = serde_json::to_string_pretty(&result)?;
         assert!(compact.len() * 2 < diagnostic.len());
         let value: serde_json::Value = serde_json::from_str(&compact)?;
+        assert_eq!(value["retrieval"]["lexical"], "active");
+        assert_eq!(value["retrieval"]["vector"], "disabled");
         assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
         assert_eq!(value["hits"][0]["symbol"], "start");
         assert_eq!(value["hits"][0]["anchor"], root);
@@ -576,6 +580,7 @@ mod tests {
             .collect();
         let result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits,
             semantic_artifacts: Vec::new(),
             expansion: None,

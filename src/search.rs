@@ -84,12 +84,47 @@ impl Default for SearchOptions {
 #[derive(Debug, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
+    pub retrieval: RetrievalStatus,
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RetrievalStatus {
+    pub lexical: &'static str,
+    pub vector: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_action: Option<&'static str>,
+}
+
+impl RetrievalStatus {
+    pub(crate) fn vector_disabled() -> Self {
+        Self {
+            lexical: "active",
+            vector: "disabled",
+            vector_action: None,
+        }
+    }
+
+    fn vector_active() -> Self {
+        Self {
+            lexical: "active",
+            vector: "active",
+            vector_action: None,
+        }
+    }
+
+    fn vector_degraded() -> Self {
+        Self {
+            lexical: "active",
+            vector: "degraded",
+            vector_action: Some("run jscout embed <root>; inspect stderr if it fails"),
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -293,7 +328,7 @@ pub fn search(
     origin::validate_all(&options.expansion.file_origins)?;
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let hits = ranked_hits(
+        let (hits, retrieval) = ranked_hits(
             conn,
             provider,
             q,
@@ -313,6 +348,7 @@ pub fn search(
             .transpose()?;
         let mut result = SearchResult {
             snapshot,
+            retrieval,
             hits,
             semantic_artifacts,
             expansion,
@@ -334,20 +370,21 @@ fn ranked_hits(
     file_roles: &[String],
     file_origins: &[String],
     rerank: bool,
-) -> Result<Vec<Hit>> {
+) -> Result<(Vec<Hit>, RetrievalStatus)> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let pool = limit.max(10) * 5;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(conn, q, pool, file_origins)?];
+    let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
     }
     if let Some(p) = provider {
         let t = std::time::Instant::now();
-        match vector_ranking(conn, p, q, pool, file_origins) {
-            Ok(r) => rankings.push(r),
-            Err(e) => eprintln!("vector search unavailable: {e}"),
-        }
+        retrieval = record_vector_ranking(
+            &mut rankings,
+            vector_ranking(conn, p, q, pool, file_origins),
+        );
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
         }
@@ -413,7 +450,23 @@ fn ranked_hits(
             }
         }
     }
-    Ok(hits)
+    Ok((hits, retrieval))
+}
+
+fn record_vector_ranking(
+    rankings: &mut Vec<Vec<(i64, f64)>>,
+    result: Result<Vec<(i64, f64)>>,
+) -> RetrievalStatus {
+    match result {
+        Ok(ranking) => {
+            rankings.push(ranking);
+            RetrievalStatus::vector_active()
+        }
+        Err(error) => {
+            eprintln!("vector search unavailable: {error}");
+            RetrievalStatus::vector_degraded()
+        }
+    }
 }
 
 fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>> {
@@ -1023,8 +1076,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, SearchExpansion,
-        SearchOptions, SearchResult, apply_response_budget, search,
+        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
+        SearchExpansion, SearchOptions, SearchResult, apply_response_budget, record_vector_ranking,
+        search,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1032,6 +1086,25 @@ mod tests {
         store,
         structural::{GraphEdge, GraphNode},
     };
+
+    #[test]
+    fn vector_retrieval_status_distinguishes_active_disabled_and_degraded() {
+        let disabled = RetrievalStatus::vector_disabled();
+        assert_eq!(disabled.vector, "disabled");
+        assert!(disabled.vector_action.is_none());
+
+        let mut rankings = Vec::new();
+        let active = record_vector_ranking(&mut rankings, Ok(vec![(7, 0.9)]));
+        assert_eq!(active.vector, "active");
+        assert_eq!(rankings, vec![vec![(7, 0.9)]]);
+
+        let degraded = record_vector_ranking(
+            &mut rankings,
+            Err(anyhow::anyhow!("profile is not materialized")),
+        );
+        assert_eq!(degraded.vector, "degraded");
+        assert!(degraded.vector_action.is_some());
+    }
 
     #[test]
     fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
@@ -1204,6 +1277,7 @@ mod tests {
         };
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
             expansion: Some(SearchExpansion {
@@ -1238,6 +1312,7 @@ mod tests {
     fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: vec![Hit {
                 chunk_id: 1,
                 file: "src/large.ts".into(),
@@ -1332,6 +1407,7 @@ mod tests {
         second_artifact.name = Some("second workflow".into());
         let mut result = SearchResult {
             snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
             expansion: None,
