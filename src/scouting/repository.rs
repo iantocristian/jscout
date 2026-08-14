@@ -862,23 +862,50 @@ fn input_fingerprint(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn dry_run_report(plan: &RepositoryPlan, options: &RepositoryScoutOptions) -> Result<Value> {
+pub fn dry_run_report(
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    plan: &RepositoryPlan,
+    options: &RepositoryScoutOptions,
+) -> Result<Value> {
     let mut rendered = serde_json::to_value(plan)?;
-    let mut eligible = 0;
+    let mut calls_planned = 0;
     let mut over_budget = 0;
+    let mut reusable_items = 0;
+    let mut cache = PreparationCache::default();
     if let Some(items) = rendered.get_mut("items").and_then(Value::as_array_mut) {
         for (output, item) in items.iter_mut().zip(&plan.items) {
             let mut request = build_request(item, options);
             let (_, request_bytes) = reserve_output_and_measure(&mut request, 1, None)?;
-            let over = request_bytes > options.policy.context_bytes;
-            let would_call = !over && eligible < options.policy.max_calls;
+            let mut over = request_bytes > options.policy.context_bytes;
+            let mut reusable = false;
+            if !over {
+                match prepare(gateway, &mut cache, item.clone(), options, &plan.snapshot) {
+                    Ok(prepared) => {
+                        reusable = !options.rebuild
+                            && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<super::ContextBudgetExceeded>()
+                            .is_some() =>
+                    {
+                        over = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let would_call = !over && !reusable && calls_planned < options.policy.max_calls;
             if over {
                 over_budget += 1;
-            } else {
-                eligible += 1;
+            } else if reusable {
+                reusable_items += 1;
+            } else if would_call {
+                calls_planned += 1;
             }
             output["request_bytes"] = request_bytes.into();
             output["over_context_bytes"] = over.into();
+            output["reusable"] = reusable.into();
             output["would_call"] = would_call.into();
             output["subdivision"] = match item.subject_kind.as_str() {
                 "package" | "area" if item.depth < options.max_depth => {
@@ -896,11 +923,12 @@ pub fn dry_run_report(plan: &RepositoryPlan, options: &RepositoryScoutOptions) -
         "max_subjects": options.max_subjects,
         "max_depth": options.max_depth,
         "context_bytes": options.policy.context_bytes,
-        "calls_planned": eligible.min(options.policy.max_calls),
+        "calls_planned": calls_planned,
+        "reusable_items": reusable_items,
         "over_context_bytes_items": over_budget,
         "notes": [
             "current_classification reports subject-local freshness independent of the structural snapshot",
-            "completed matching model-policy runs reuse at execution time without consuming --max-calls",
+            "reusable and would_call use the resolved gateway/model-policy fingerprint; dry-run makes no provider generation calls",
             "mixed subdivision shares both --max-subjects and --max-calls and is visible only after a result exists",
         ],
         "plan": rendered,

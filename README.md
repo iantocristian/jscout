@@ -68,6 +68,7 @@ jscout index <root>            # rebuild disposable structural state in .jscout.
                                #   --database PATH isolates index/memory state
                                #   --deps pkg,@scope/pkg indexes named dependency internals
 jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
+                               #   --database PATH reads an isolated index
                                #   add --expand for a bounded structural context pack
                                #   --no-vector, --no-rerank, or --lexical-only control stages
                                #   --json is compact; --debug-json retains diagnostics
@@ -90,6 +91,7 @@ jscout watch <root> [--embed] [--enrich]
                                # hash-incremental parse plus optional vector/checker refresh
                                #   repeat --deps from index to retain that corpus
 jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
+                               #   --database PATH writes an isolated index
   --product                    #   fresh runtime recon + neutral production fallback only
 jscout inference serve         # run the optional local embedding/reranking service
 jscout inference doctor        # verify its endpoint, device, models, and dimensions
@@ -178,9 +180,11 @@ jscout enrich /path/to/repo
 ```
 
 The dry run prints every initial subject, the exact evidence pack and request
-size, current/reusable classification, downstream decision, possible children,
-and depth/subject/context bounds. It starts the checker inventory but does not
-start the LLM gateway and makes no model calls.
+size, exact model-policy reuse status, downstream decision, possible children,
+and depth/subject/context bounds. It starts the checker inventory and the local
+LLM gateway to resolve the same endpoint/model fingerprint execution will use,
+but makes no provider generation calls. `reusable: true` items have
+`would_call: false` and do not consume the reported `calls_planned` budget.
 
 `mixed` package/area results subdivide deterministically into immediate child
 directories plus a direct-file residual. One command shares `--max-calls`,

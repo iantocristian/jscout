@@ -77,6 +77,9 @@ enum Command {
     Embed {
         /// Repository root (must be indexed)
         root: PathBuf,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
         /// Batch size per API call
         #[arg(long, default_value_t = 64)]
         batch: usize,
@@ -93,6 +96,9 @@ enum Command {
         root: PathBuf,
         /// Query: natural language and/or identifiers
         query: String,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
         /// Max results
         #[arg(short = 'k', long, default_value_t = 8)]
         limit: usize,
@@ -755,13 +761,15 @@ fn main() -> Result<()> {
         } => cmd_index(&root, database.as_deref(), &dependencies),
         Command::Embed {
             root,
+            database,
             batch,
             file_origins,
             product,
-        } => cmd_embed(&root, batch, &file_origins, product),
+        } => cmd_embed(&root, database.as_deref(), batch, &file_origins, product),
         Command::Search {
             root,
             query,
+            database,
             limit,
             file_roles,
             file_origins,
@@ -783,6 +791,7 @@ fn main() -> Result<()> {
             expand_file_roles,
         } => cmd_search(
             &root,
+            database.as_deref(),
             &query,
             no_vector || lexical_only,
             json,
@@ -1321,8 +1330,14 @@ fn cmd_neighborhood(
     Ok(())
 }
 
-fn cmd_embed(root: &Path, batch: usize, file_origins: &[String], product: bool) -> Result<()> {
-    let conn = store::open(root)?;
+fn cmd_embed(
+    root: &Path,
+    database: Option<&Path>,
+    batch: usize,
+    file_origins: &[String],
+    product: bool,
+) -> Result<()> {
+    let conn = open_database_for_write(root, database)?;
     let Some(provider) = embed::Provider::from_env()? else {
         anyhow::bail!(
             "no embedding provider configured — set JSCOUT_EMBED_PROVIDER to local, voyage, or openai"
@@ -1337,13 +1352,14 @@ fn cmd_embed(root: &Path, batch: usize, file_origins: &[String], product: bool) 
 
 fn cmd_search(
     root: &Path,
+    database: Option<&Path>,
     query: &str,
     no_vector: bool,
     json: bool,
     debug_json: bool,
     options: search::SearchOptions,
 ) -> Result<()> {
-    let conn = store::open_read_only(root)?;
+    let conn = open_database_read_only(root, database)?;
     let provider = if no_vector {
         None
     } else {
@@ -1761,9 +1777,15 @@ fn cmd_scout_repository(
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::repository::plan(root, &conn, &planning)?;
     if dry_run {
+        let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::repository::dry_run_report(&plan, &options,)?)?
+            serde_json::to_string_pretty(&scouting::repository::dry_run_report(
+                &conn,
+                &mut gateway,
+                &plan,
+                &options,
+            )?)?
         );
         return Ok(());
     }
@@ -2033,6 +2055,31 @@ mod main_tests {
             panic!("expected search")
         };
         assert!(lexical_only);
+    }
+
+    #[test]
+    fn search_and_embed_accept_external_database_paths() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "search",
+            ".",
+            "query",
+            "--database",
+            "/tmp/search.db",
+        ])
+        .expect("external search database parses");
+        let Command::Search { database, .. } = command else {
+            panic!("expected search")
+        };
+        assert_eq!(database, Some(PathBuf::from("/tmp/search.db")));
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "embed", ".", "--database", "/tmp/embed.db"])
+                .expect("external embed database parses");
+        let Command::Embed { database, .. } = command else {
+            panic!("expected embed")
+        };
+        assert_eq!(database, Some(PathBuf::from("/tmp/embed.db")));
     }
 
     #[test]
