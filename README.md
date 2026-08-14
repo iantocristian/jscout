@@ -173,6 +173,16 @@ files within each priority tier. `--dry-run` reports discovered, eligible,
 selected, omitted, project, and configuration counts after a configuration-only
 ownership pass and does not construct a TypeScript Program.
 
+Configured projects carry a deterministic purpose classification. Explicit
+lint configurations such as `tsconfig.eslint.json` are removed from a file's
+ownership set when a non-tooling project still owns that file; they remain as
+fallback owners for otherwise-unowned files. This avoids re-querying an
+aggregate lint program without silently dropping its unique coverage.
+`--dry-run` reports selected, excluded, and fallback occurrence counts per
+affected project. `jscout checker doctor` prints each project's purpose and the
+evidence used to classify it. Generic `noEmit` configurations are not treated
+as tooling without an independent lint signal.
+
 The sidecar prefers the repository's installed `typescript`; otherwise it uses
 the pinned bundled fallback. `jscout checker doctor <root>` reports that choice,
 every discovered owning `tsconfig`, and configuration-read problems. Query
@@ -721,10 +731,19 @@ candidates to the same service's BGE reranker. To use a separate service, set
 `JSCOUT_RERANK_URL` to an endpoint speaking
 `POST {model,query,candidates:[{id,text}]}` → `{scores:[{id,score}]}`. A malformed
 or incomplete score set is rejected and search falls back to RRF ordering.
+File-role allowlists are applied before fusion and reranker pool construction,
+so excluded tests or documentation cannot consume the cross-encoder budget.
+Each reranker candidate includes an occurrence-specific header with path,
+scope, symbol, chunk kind, role, origin, and line range before the source body.
+Successful reranking preserves the unreranked RRF tail rather than discarding
+it. Search reports `retrieval.reranker` as `active`, `disabled`, or `degraded`.
 Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
 (per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`. `--no-vector`
 keeps BM25 plus reranking, `--no-rerank` disables only the cross-encoder, and
 `--lexical-only` disables both optional stages.
+These changes do not alter the current reranking default. Re-measure real
+queries with the contextual input before changing that default in either
+direction.
 Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (BM25 / embed-query +
 sqlite-vec / rerank) to stderr on search and structural-projection stage
 timings during indexing.

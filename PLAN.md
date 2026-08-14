@@ -507,12 +507,17 @@ reconciliation?” without replacing the source evidence used to answer them.
   content hash. The document-text format is versioned in the profile
   fingerprint, and embedding selection groups missing work by hash so duplicate
   chunk occurrences cause one provider request and one cached vector.
-- Every search response reports lexical/vector retrieval status. A configured
-  vector stage that cannot use its requested profile is `degraded`, not
+- Every search response reports lexical/vector/reranker retrieval status. A
+  configured vector stage that cannot use its requested profile is `degraded`, not
   indistinguishable from an active hybrid search. The `content-v2` document
   format intentionally requires existing embedded repositories to create one
   new profile with `jscout embed`; prior profiles remain stored and are never
   mixed into the new vector space.
+- File-role filters apply before fusion and reranker pool construction.
+  Cross-encoder inputs carry occurrence-specific path, scope, symbol, kind,
+  role, origin, and span context, and reranking preserves the untouched RRF
+  tail. This repairs the context-starved input without changing the reranker
+  default; a real-query remeasurement must precede any default flip.
 - Release packaging places the installed gateway and pinned dependencies beside
   the Rust binary. Startup and doctor enforce the supported Node version and
   produce controlled missing-runtime/dependency/auth diagnostics; deterministic
@@ -594,6 +599,17 @@ This falsifies the current implementation's claim to be bounded at repository
 scale. Raising the V8 heap only postpones the failure; exhaustive `enrich` and
 `watch --enrich` are not considered operational on large repositories until
 the scale correction below passes its acceptance checks.
+
+**Amendment — tooling-project ownership (2026-08-14).** Configuration-only
+planning now classifies only high-confidence lint projects as `tooling` from
+explicit filename/extends evidence or a lint script corroborated by `noEmit`.
+For each file, tooling owners are excluded only when at least one non-tooling
+owner remains; otherwise they remain fallback owners. Doctor output records
+project purpose/evidence, while enrichment dry runs record selected, excluded,
+and fallback occurrence counts per affected project. Generic `noEmit` and broad
+include patterns never classify a project by themselves. G13 remains
+responsible for ambiguous project purpose rather than extending this bootstrap
+with repository-specific exceptions.
 
 ### Shape
 
@@ -1350,6 +1366,7 @@ Relevant result summaries include:
 - [agent surfaces](eval/results/agent-surfaces-2026-08-10.md)
 - [logical workflow routing](eval/results/workflow-logical-routing-2026-08-10.md)
 - [dependency indexing](eval/results/dependency-indexing-2026-08-10.md)
+- [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
 
 ## Positioning versus tsserver/LSP
 
