@@ -570,7 +570,7 @@ fn reranker_document(
     let row = conn.query_row(
         "SELECT file.path, file.role, file.origin, chunk.kind, chunk.name,
                 chunk.start_line, chunk.end_line, chunk.content, package.name,
-                policy.role
+                policy.scope_role, policy.effective_role
          FROM chunks chunk
          JOIN files file ON file.id=chunk.file_id
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
@@ -589,6 +589,7 @@ fn reranker_document(
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         },
     );
@@ -602,7 +603,8 @@ fn reranker_document(
         end_line,
         content,
         package,
-        repository_role,
+        scope_role,
+        effective_role,
     ) = match row {
         Ok(row) => row,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -613,9 +615,9 @@ fn reranker_document(
             .map_or_else(|| "(root)".to_string(), |(scope, _)| scope.to_string())
     });
     let symbol = name.as_deref().unwrap_or("(anonymous)");
-    let role = repository_role.as_deref().unwrap_or(&deterministic_role);
-    let role_context = repository_role.as_ref().map_or_else(String::new, |_| {
-        format!("\ndeterministic_role: {deterministic_role}")
+    let role = effective_role.as_deref().unwrap_or(&deterministic_role);
+    let role_context = scope_role.as_ref().map_or_else(String::new, |scope_role| {
+        format!("\ndeterministic_role: {deterministic_role}\nscouted_scope_role: {scope_role}")
     });
     let mut document = format!(
         "path: {file}\nscope: {scope}\nsymbol: {symbol}\nkind: {kind}\nrole: {role}{role_context}\norigin: {origin}\nlines: {start_line}-{end_line}\n\n{content}"
@@ -644,7 +646,7 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
-                    c.content, c.symbols, c.file_id, policy.role
+                    c.content, c.symbols, c.file_id, policy.effective_role
              FROM chunks c
              JOIN files f ON c.file_id = f.id
              LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
@@ -1293,8 +1295,9 @@ mod tests {
         let classification_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO repository_file_policy(
-               file_id,classification_id,subject_key,role,source_hash,depth
-             ) VALUES(?1,?2,?3,?4,'hash',0)",
+               file_id,classification_id,subject_key,scope_role,effective_role,
+               source_hash,depth
+             ) VALUES(?1,?2,?3,?4,?4,'hash',0)",
             rusqlite::params![file_id, classification_id, format!("area:{suffix}"), role],
         )?;
         Ok(())

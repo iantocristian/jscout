@@ -430,7 +430,7 @@ fn missing_embedding_documents(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
-           AND (NOT ?6 OR policy.role='runtime'
+           AND (NOT ?6 OR policy.effective_role='runtime'
              OR (policy.file_id IS NULL AND f.role IN ('production','unknown')))
          GROUP BY c.hash
          ORDER BY c.hash",
@@ -1056,8 +1056,9 @@ mod tests {
         let classification_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO repository_file_policy(
-               file_id,classification_id,subject_key,role,source_hash,depth
-             ) VALUES(?1,?2,?3,?4,'hash',0)",
+               file_id,classification_id,subject_key,scope_role,effective_role,
+               source_hash,depth
+             ) VALUES(?1,?2,?3,?4,?4,'hash',0)",
             rusqlite::params![file_id, classification_id, format!("area:{suffix}"), role],
         )?;
         Ok(())
@@ -1218,6 +1219,7 @@ mod tests {
             ("src/tool.ts", "tooling", "production"),
             ("src/default.ts", "default", "production"),
             ("docs/default.ts", "docs-default", "documentation"),
+            ("src/runtime.test.ts", "runtime-test", "test"),
         ] {
             connection.execute(
                 "INSERT INTO files(path,hash,role,origin) VALUES(?1,?2,?3,'repository')",
@@ -1234,6 +1236,17 @@ mod tests {
         }
         insert_policy(&connection, file_ids["runtime"], "runtime", "runtime")?;
         insert_policy(&connection, file_ids["tooling"], "tooling", "tooling")?;
+        insert_policy(
+            &connection,
+            file_ids["runtime-test"],
+            "runtime",
+            "runtime-test",
+        )?;
+        connection.execute(
+            "UPDATE repository_file_policy SET effective_role='test'
+             WHERE file_id=?1",
+            [file_ids["runtime-test"]],
+        )?;
 
         let documents = missing_embedding_documents(
             &connection,

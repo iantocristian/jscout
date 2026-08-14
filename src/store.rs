@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "20";
+pub const SCHEMA_VERSION: &str = "21";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -182,6 +182,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS checker_enrichments;
              DROP TABLE IF EXISTS checker_enrichment_batches;
              DROP TABLE IF EXISTS repository_file_policy;
+             DROP TABLE IF EXISTS repository_current_classifications;
              DROP TABLE IF EXISTS entity_edges;
              DROP TABLE IF EXISTS entity_occurrences;
              DROP TABLE IF EXISTS entities;
@@ -206,7 +207,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%';
-             UPDATE meta SET value='20' WHERE key='schema_version';",
+             UPDATE meta SET value='21' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -224,7 +225,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '20')
+INSERT INTO meta(key, value) VALUES('schema_version', '21')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -664,14 +665,43 @@ CREATE TABLE IF NOT EXISTS repository_file_policy(
   file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
   classification_id INTEGER NOT NULL REFERENCES repository_classifications(id),
   subject_key TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN (
+  scope_role TEXT NOT NULL CHECK(scope_role IN (
     'runtime', 'tooling', 'documentation', 'test', 'generated'
+  )),
+  effective_role TEXT NOT NULL CHECK(effective_role IN (
+    'runtime', 'tooling', 'documentation', 'test', 'fixture', 'generated'
   )),
   source_hash TEXT NOT NULL,
   depth INTEGER NOT NULL CHECK(depth >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_repository_file_policy_classification
   ON repository_file_policy(classification_id);
+
+-- Current, exact-fingerprint scope classifications, including neutral
+-- possible/mixed/unknown results. This disposable projection lets read-only
+-- overview calls explain the active semantic policy without pretending that
+-- immutable historical rows are current after a branch or membership change.
+CREATE TABLE IF NOT EXISTS repository_current_classifications(
+  classification_id INTEGER PRIMARY KEY REFERENCES repository_classifications(id) ON DELETE CASCADE,
+  subject_key TEXT UNIQUE NOT NULL,
+  subject_kind TEXT NOT NULL CHECK(subject_kind IN ('package', 'area')),
+  role TEXT NOT NULL CHECK(role IN (
+    'runtime', 'tooling', 'documentation', 'test', 'generated',
+    'mixed', 'unknown'
+  )),
+  confidence TEXT NOT NULL CHECK(confidence IN ('likely', 'possible')),
+  explanation TEXT NOT NULL,
+  citations_json TEXT NOT NULL,
+  cited_evidence_json TEXT NOT NULL,
+  member_count INTEGER NOT NULL CHECK(member_count >= 0),
+  deterministic_roles_json TEXT NOT NULL,
+  effective_roles_json TEXT NOT NULL,
+  conflict_files INTEGER NOT NULL CHECK(conflict_files >= 0),
+  depth INTEGER NOT NULL CHECK(depth >= 0),
+  prompt_version TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_current_role
+  ON repository_current_classifications(role, confidence, subject_key);
 
 -- Every deterministic candidate's decision for a run, including exclusions
 -- (which never become semantic supports).
@@ -855,6 +885,7 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     // disposable projection state rebuilt by the next projection pass.
     conn.execute_batch(
         "DELETE FROM repository_file_policy;
+         DELETE FROM repository_current_classifications;
          DELETE FROM embedding_index_entries;
          DELETE FROM entity_edges;
          DELETE FROM entity_occurrences;
@@ -1021,8 +1052,10 @@ mod tests {
                       0, 'runtime', 'likely', 'runtime source', '["E001"]',
                       'evidence', 'classification', 'old', '2026-01-01T00:00:01Z');
              INSERT INTO repository_file_policy(
-               file_id, classification_id, subject_key, role, source_hash, depth
-             ) VALUES(1, 1, 'area:repository:src', 'runtime', 'source', 0);
+               file_id, classification_id, subject_key, scope_role,
+               effective_role, source_hash, depth
+             ) VALUES(1, 1, 'area:repository:src', 'runtime', 'runtime',
+                      'source', 0);
              INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,
                checker_input_fingerprint, sidecar_protocol, created_at, active
