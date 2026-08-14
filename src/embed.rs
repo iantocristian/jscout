@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 
 const LOCAL_EMBED_MODEL: &str = "BAAI/bge-m3";
 const DEFAULT_LOCAL_DEADLINE_MS: u64 = 120_000;
+/// The document representation is part of cache identity. Versioning it keeps
+/// vectors produced from an older representation from being silently reused.
+const DOCUMENT_TEXT_FORMAT: &str = "content-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Protocol {
@@ -169,6 +172,7 @@ impl Provider {
                 (
                     json!({
                         "protocol": "jscout-local-v1",
+                        "document_text": DOCUMENT_TEXT_FORMAT,
                         "embedding": embedding,
                     }),
                     Some(dimensions),
@@ -177,6 +181,7 @@ impl Provider {
             Protocol::Voyage => (
                 json!({
                     "protocol": "voyage-v1",
+                    "document_text": DOCUMENT_TEXT_FORMAT,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                 }),
@@ -185,6 +190,7 @@ impl Provider {
             Protocol::OpenAi => (
                 json!({
                     "protocol": "openai-embeddings-v1",
+                    "document_text": DOCUMENT_TEXT_FORMAT,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                 }),
@@ -291,6 +297,7 @@ impl Provider {
             }
             let configuration = json!({
                 "protocol": "jscout-local-v1",
+                "document_text": DOCUMENT_TEXT_FORMAT,
                 "embedding": {
                     "model": response["model"],
                     "dimensions": response["dimensions"],
@@ -378,25 +385,12 @@ pub fn vec_to_blob(vector: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// The text actually embedded: a small contextual header + the chunk body.
-pub fn embed_text(
-    path: &str,
-    scope: &str,
-    name: Option<&str>,
-    imports: &str,
-    content: &str,
-) -> String {
-    let mut header = format!("// file: {path}\n");
-    if !scope.is_empty() {
-        header.push_str(&format!("// scope: {scope}\n"));
-    }
-    if let Some(name) = name {
-        header.push_str(&format!("// symbol: {name}\n"));
-    }
-    if !imports.is_empty() {
-        header.push_str(&format!("// imports: {imports}\n"));
-    }
-    let mut text = header + content;
+/// The content-addressed cache embeds content only. Path, scope, and symbol
+/// metadata are occurrence-specific and therefore cannot be part of text keyed
+/// solely by `(chunk_hash, profile_id)` without making duplicate occurrences
+/// depend on an arbitrary representative path.
+pub fn embed_text(content: &str) -> String {
+    let mut text = content.to_string();
     if text.len() > 24_000 {
         let mut cut = 24_000;
         while !text.is_char_boundary(cut) {
@@ -405,6 +399,59 @@ pub fn embed_text(
         text.truncate(cut);
     }
     text
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MissingEmbeddingDocument {
+    hash: String,
+    content: String,
+}
+
+fn missing_embedding_documents(
+    conn: &Connection,
+    profile_fingerprint: &str,
+    profile_id: Option<i64>,
+    file_origins: &[String],
+) -> Result<Vec<MissingEmbeddingDocument>> {
+    let flags = origin_flags(file_origins);
+    let mut statement = conn.prepare(
+        "SELECT c.hash, MIN(c.content), COUNT(DISTINCT c.content)
+         FROM chunks c JOIN files f ON c.file_id=f.id
+         WHERE NOT EXISTS (
+           SELECT 1 FROM embeddings e
+           WHERE e.chunk_hash=c.hash
+             AND e.profile_id=COALESCE(
+               ?5,
+               (SELECT id FROM embedding_profiles WHERE config_fingerprint=?1)
+             )
+         )
+           AND ((?2 AND f.origin='repository')
+             OR (?3 AND f.origin='workspace')
+             OR (?4 AND f.origin='dependency'))
+         GROUP BY c.hash
+         ORDER BY c.hash",
+    )?;
+    let rows = statement.query_map(
+        params![profile_fingerprint, flags.0, flags.1, flags.2, profile_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let mut documents = Vec::new();
+    for row in rows {
+        let (hash, content, distinct_contents) = row?;
+        if distinct_contents != 1 {
+            bail!(
+                "chunk hash `{hash}` maps to {distinct_contents} different contents; refusing to cache an ambiguous embedding"
+            );
+        }
+        documents.push(MissingEmbeddingDocument { hash, content });
+    }
+    Ok(documents)
 }
 
 pub fn embed_missing(
@@ -428,43 +475,12 @@ pub fn embed_missing_for_origins(
     let profile = provider.profile()?;
     let mut resolved = existing_profile(conn, &profile)?;
     let resolved_profile_id = resolved.as_ref().map(|profile| profile.id);
-    let flags = origin_flags(file_origins);
-    let rows: Vec<(String, String, String, Option<String>, String)> = {
-        let mut statement = conn.prepare(
-            "SELECT DISTINCT c.hash, f.path, c.scope_chain, c.name, c.content
-             FROM chunks c JOIN files f ON c.file_id=f.id
-             WHERE NOT EXISTS (
-               SELECT 1 FROM embeddings e
-               WHERE e.chunk_hash=c.hash
-                 AND e.profile_id=COALESCE(
-                   ?5,
-                   (SELECT id FROM embedding_profiles WHERE config_fingerprint=?1)
-                 )
-             )
-               AND ((?2 AND f.origin='repository')
-                 OR (?3 AND f.origin='workspace')
-                 OR (?4 AND f.origin='dependency'))",
-        )?;
-        let found = statement.query_map(
-            params![
-                profile.fingerprint,
-                flags.0,
-                flags.1,
-                flags.2,
-                resolved_profile_id
-            ],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        found.collect::<std::result::Result<_, _>>()?
-    };
+    let rows = missing_embedding_documents(
+        conn,
+        &profile.fingerprint,
+        resolved_profile_id,
+        file_origins,
+    )?;
 
     let total = rows.len();
     let mut done = 0usize;
@@ -479,9 +495,7 @@ pub fn embed_missing_for_origins(
     for batch in rows.chunks(request_batch_size) {
         let texts = batch
             .iter()
-            .map(|(_, path, scope, name, content)| {
-                embed_text(path, scope, name.as_deref(), "", content)
-            })
+            .map(|document| embed_text(&document.content))
             .collect::<Vec<_>>();
         let response = provider.embed_documents(&texts)?;
         validate_response_profile(&profile, &response)?;
@@ -495,14 +509,14 @@ pub fn embed_missing_for_origins(
         resolved = Some(current.clone());
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let write_result = (|| -> Result<()> {
-            for ((hash, ..), vector) in batch.iter().zip(&response.vectors) {
+            for (document, vector) in batch.iter().zip(&response.vectors) {
                 if vector.len() != current.dimensions {
                     bail!("embedding dimensions changed during one response");
                 }
                 conn.execute(
                     "INSERT OR IGNORE INTO embeddings(chunk_hash, profile_id, vec)
                      VALUES(?1, ?2, ?3)",
-                    params![hash, current.id, vec_to_blob(vector)],
+                    params![document.hash, current.id, vec_to_blob(vector)],
                 )?;
             }
             Ok(())
@@ -984,9 +998,10 @@ fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse
 #[cfg(test)]
 mod tests {
     use super::{
-        ProfileSpec, ensure_profile, exact_vector_search, existing_profile,
-        materialize_cached_embeddings, profile_fingerprint, ready_search_profile,
-        sync_vector_index, validate_endpoint, vec_to_blob, vector_index_needs_sync, vector_table,
+        DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, embed_text, ensure_profile,
+        exact_vector_search, existing_profile, materialize_cached_embeddings,
+        missing_embedding_documents, profile_fingerprint, ready_search_profile, sync_vector_index,
+        validate_endpoint, vec_to_blob, vector_index_needs_sync, vector_table,
     };
 
     #[test]
@@ -1014,6 +1029,7 @@ mod tests {
         let legacy_config = serde_json::json!({
             "protocol": "jscout-local-v1",
             "device": "mps",
+            "document_text": DOCUMENT_TEXT_FORMAT,
             "embedding": embedding
         })
         .to_string();
@@ -1029,6 +1045,7 @@ mod tests {
         let legacy_id = connection.last_insert_rowid();
         let config_json = serde_json::json!({
             "protocol": "jscout-local-v1",
+            "document_text": DOCUMENT_TEXT_FORMAT,
             "embedding": embedding
         })
         .to_string();
@@ -1047,6 +1064,86 @@ mod tests {
                 row.get(0)
             })?;
         assert_eq!(profiles, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn document_embedding_text_is_content_addressed_and_utf8_bounded() {
+        assert_eq!(
+            embed_text("export const answer = 42;"),
+            "export const answer = 42;"
+        );
+        let long = "é".repeat(20_000);
+        let embedded = embed_text(&long);
+        assert!(embedded.len() <= 24_000);
+        assert!(embedded.is_char_boundary(embedded.len()));
+        assert!(!embedded.contains("// file:"));
+    }
+
+    #[test]
+    fn embedding_profile_versions_the_document_text_format() -> anyhow::Result<()> {
+        let provider = Provider {
+            name: "openai-compatible".into(),
+            model: "tiny".into(),
+            url: "https://example.test/v1/embeddings".into(),
+            key: None,
+            protocol: Protocol::OpenAi,
+            query_prefix: String::new(),
+        };
+        let profile = provider.profile()?;
+        let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
+        assert_eq!(config["document_text"], DOCUMENT_TEXT_FORMAT);
+
+        let old_config = serde_json::json!({
+            "protocol": "openai-embeddings-v1",
+            "url": "https://example.test/v1/embeddings",
+            "query_prefix": ""
+        })
+        .to_string();
+        assert_ne!(
+            profile.fingerprint,
+            profile_fingerprint("openai-compatible", "tiny", &old_config)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_embeddings_are_selected_once_per_content_hash() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        for (path, hash, content) in [
+            ("a.ts", "same", "export const x = 1;"),
+            ("nested/a.ts", "same", "export const x = 1;"),
+            ("b.ts", "other", "export const y = 2;"),
+        ] {
+            connection.execute(
+                "INSERT INTO files(path, hash, role, origin) VALUES(?1, ?2, 'production', 'repository')",
+                rusqlite::params![path, format!("file-{path}")],
+            )?;
+            let file_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO chunks(
+                   file_id, kind, scope_chain, symbols, start, end,
+                   start_line, end_line, hash, content
+                 ) VALUES(?1, 'module', '', '', 0, 1, 1, 1, ?2, ?3)",
+                rusqlite::params![file_id, hash, content],
+            )?;
+        }
+
+        let documents = missing_embedding_documents(
+            &connection,
+            "missing-profile",
+            None,
+            &["repository".into()],
+        )?;
+        assert_eq!(documents.len(), 2);
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.hash.as_str())
+                .collect::<Vec<_>>(),
+            ["other", "same"]
+        );
         Ok(())
     }
 
