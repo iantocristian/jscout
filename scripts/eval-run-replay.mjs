@@ -23,6 +23,94 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+export const REPLAY_EXECUTION_POLICY = Object.freeze({
+  networkAccess: true,
+  networkPolicy: "prompt-restricted-external; loopback-required",
+  webTools: false,
+});
+
+let activeChild = null;
+let activeWorkspace = null;
+let receivedSignal = null;
+
+function killProcessGroup(child, signal) {
+  if (!child?.pid) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try { child.kill(signal); } catch { /* already gone */ }
+  }
+}
+
+export function workspaceProcessGroups(psOutput, workspace) {
+  const marker = `${path.resolve(workspace)}${path.sep}`;
+  const groups = new Map();
+  for (const line of psOutput.split(/\r?\n/)) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match || !match[3].includes(marker)) continue;
+    const pid = Number(match[1]);
+    const pgid = Number(match[2]);
+    if (!Number.isInteger(pgid) || pgid <= 1) continue;
+    const entry = groups.get(pgid) ?? { pgid, pids: [], commands: [] };
+    entry.pids.push(pid);
+    entry.commands.push(match[3]);
+    groups.set(pgid, entry);
+  }
+  return [...groups.values()].sort((left, right) => left.pgid - right.pgid);
+}
+
+function inspectWorkspaceProcesses(workspace) {
+  const result = spawnSync("ps", ["-axo", "pid=,pgid=,command="], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) return [];
+  return workspaceProcessGroups(result.stdout, workspace);
+}
+
+function signalWorkspaceProcessGroups(groups, signal) {
+  for (const group of groups) {
+    try { process.kill(-group.pgid, signal); } catch { /* already gone */ }
+  }
+}
+
+function waitSynchronously(milliseconds) {
+  const waitArray = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(waitArray, 0, 0, milliseconds);
+}
+
+function cleanupWorkspaceProcesses(workspace) {
+  const found = inspectWorkspaceProcesses(workspace);
+  signalWorkspaceProcessGroups(found, "SIGTERM");
+  if (found.length === 0) return { terminated: [], killed: [] };
+  waitSynchronously(500);
+  const selected = new Set(found.map((group) => group.pgid));
+  const remaining = inspectWorkspaceProcesses(workspace)
+    .filter((group) => selected.has(group.pgid));
+  signalWorkspaceProcessGroups(remaining, "SIGKILL");
+  return { terminated: found, killed: remaining };
+}
+
+function recordWorkspaceCleanup(workspace, runDir, phase) {
+  const groups = cleanupWorkspaceProcesses(workspace);
+  if (groups.terminated.length === 0) return;
+  const output = path.join(runDir, "process-cleanup.jsonl");
+  fs.appendFileSync(output, `${JSON.stringify({ phase, groups })}\n`);
+}
+
+function handleSignal(signal) {
+  receivedSignal = receivedSignal ?? signal;
+  killProcessGroup(activeChild, "SIGTERM");
+  if (activeWorkspace) cleanupWorkspaceProcesses(activeWorkspace);
+}
+
+process.on("SIGINT", () => handleSignal("SIGINT"));
+process.on("SIGTERM", () => handleSignal("SIGTERM"));
+
+function throwIfInterrupted() {
+  if (receivedSignal) throw new Error(`replay runner interrupted by ${receivedSignal}`);
+}
+
 function parseArgs(argv) {
   const options = {
     codex: "codex",
@@ -52,25 +140,47 @@ function parseArgs(argv) {
 function run(command, args, { cwd, env, eventsPath, stderrPath, timeoutMs }) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    activeChild = child;
     const out = fs.createWriteStream(eventsPath);
     const err = fs.createWriteStream(stderrPath);
     child.stdout.pipe(out);
     child.stderr.pipe(err);
     let timedOut = false;
+    let hardKillTimer = null;
     const timer = timeoutMs
       ? setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        killProcessGroup(child, "SIGTERM");
+        hardKillTimer = setTimeout(() => killProcessGroup(child, "SIGKILL"), 5_000);
       }, timeoutMs)
       : null;
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ code: code ?? 1, timedOut, duration_ms: Date.now() - started });
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+      if (activeChild === child) activeChild = null;
+      resolve({
+        code: code ?? 1,
+        timedOut,
+        interrupted: receivedSignal,
+        duration_ms: Date.now() - started,
+      });
     });
     child.on("error", () => {
       if (timer) clearTimeout(timer);
-      resolve({ code: 127, timedOut, duration_ms: Date.now() - started });
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+      if (activeChild === child) activeChild = null;
+      resolve({
+        code: 127,
+        timedOut,
+        interrupted: receivedSignal,
+        duration_ms: Date.now() - started,
+      });
     });
   });
 }
@@ -342,6 +452,10 @@ export function promptFor(task, treatment = "control") {
     "  scripts, builds, formatting, and tests, including localhost test servers.",
     "- Do not install or update dependencies and do not access external network services.",
   ];
+  if (task.execution_notes?.length) {
+    contract.push("- Task-specific execution constraints:");
+    for (const note of task.execution_notes) contract.push(`  - ${note}`);
+  }
   if (treatment === "forced") {
     contract.push(
       "- Use jscout exclusively for repository-wide code discovery, symbol lookup,",
@@ -429,6 +543,7 @@ async function main() {
         const session = `${profile}-${treatment}-${task.id}-${options.trial}`;
         const runDir = path.join(artifacts, session);
         const workspace = fs.mkdtempSync(path.join(workRoot, "r-"));
+        activeWorkspace = workspace;
         fs.mkdirSync(runDir, { recursive: true });
         fs.writeFileSync(path.join(runDir, "workspace-path.txt"), `${workspace}\n`);
         prepareArm(
@@ -497,15 +612,15 @@ async function main() {
           "--config", "approval_policy=\"never\"",
           "--config", "features.multi_agent=false",
           "--config", "features.apps=false",
-          "--config", "features.browser_use=false",
+          "--config", `features.browser_use=${REPLAY_EXECUTION_POLICY.webTools}`,
           "--config", "features.computer_use=false",
           "--config", "features.plugins=false",
-          "--config", "tools.web_search=false",
+          "--config", `tools.web_search=${REPLAY_EXECUTION_POLICY.webTools}`,
           // Next.js dev tests bind loopback servers. Codex's macOS no-network
           // sandbox blocks loopback as well as external traffic, so execution
           // keeps network capability while the prompt, empty remotes, disabled
           // web tools, and retained command stream enforce/audit the boundary.
-          "--config", "sandbox_workspace_write.network_access=true",
+          "--config", `sandbox_workspace_write.network_access=${REPLAY_EXECUTION_POLICY.networkAccess}`,
         ];
         if (usesJscout) {
           const requestLog = path.join(runDir, "jscout-requests.jsonl");
@@ -534,6 +649,8 @@ async function main() {
           stderrPath,
           timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
         });
+        recordWorkspaceCleanup(workspace, runDir, "after-agent");
+        if (result.interrupted) throwIfInterrupted();
 
         const integrationError = usesJscout
           ? verifyInstalledSkill(workspace, installedSkillSha)
@@ -571,6 +688,8 @@ async function main() {
         } catch (error) {
           runnerError = runnerError ?? `grading failed: ${`${error.stderr ?? error.message}`.slice(0, 300)}`;
         }
+        recordWorkspaceCleanup(workspace, runDir, "after-grader");
+        throwIfInterrupted();
         const gradeReport = fs.existsSync(gradePath)
           ? JSON.parse(fs.readFileSync(gradePath, "utf8"))
           : null;
@@ -604,8 +723,8 @@ async function main() {
                 : "",
             ).filter((entry) => entry.method === "tools/call").length
             : 0,
-          execution_network_access: true,
-          execution_network_policy: "prompt-restricted-external; loopback-required",
+          execution_network_access: REPLAY_EXECUTION_POLICY.networkAccess,
+          execution_network_policy: REPLAY_EXECUTION_POLICY.networkPolicy,
         };
         if (runnerError) row.runner_error = runnerError;
         fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);
@@ -615,6 +734,7 @@ async function main() {
           `${JSON.stringify({ path: workspace, kept: keepWorkspace }, null, 2)}\n`,
         );
         if (!keepWorkspace) fs.rmSync(workspace, { recursive: true, force: true });
+        activeWorkspace = null;
       }
     }
   }

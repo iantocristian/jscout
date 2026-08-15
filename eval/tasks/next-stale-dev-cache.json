@@ -41,6 +41,10 @@
       "parent": "70f8b678877ba69f266e1522fcfacb95cfd3c76e",
       "story_source": "stale-development-cache-behavior",
       "story": "In development, cached server computations update after an edit for an existing browser tab, but remain stale for curl, fresh clients, and route handlers. Fix this for both bundlers without invalidating when no source content changed.",
+      "execution_notes": [
+        "Do not run the persistent `pnpm --filter=next dev` compiler/watch process. The prepared snapshot is already built; use the one-shot `pnpm --filter=next build` command if your edits require rebuilding.",
+        "Bounded `test-dev-webpack` and `test-dev-turbo` test commands are allowed; do not leave background watch or development-server processes running."
+      ],
       "contamination_prompt": "where would you fix development cached server computations that update after an edit for an existing browser tab but remain stale for curl, fresh clients, and route handlers, across both development bundlers, without invalidating when source content did not change?",
       "gold": {
         "files": [

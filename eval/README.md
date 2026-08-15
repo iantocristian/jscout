@@ -471,6 +471,13 @@ history-free snapshot; grading compares against the real implementation.
    Direct network capability remains enabled because Next.js dev tests require
    loopback and Codex's macOS no-network sandbox blocks loopback too. External
    access remains prompt-restricted and auditable, not technically isolated.
+   This is the fixed replay policy, not a per-run choice. Task-specific
+   execution notes may prohibit persistent compiler/watch commands while still
+   allowing bounded development-test servers. After agent execution and
+   grading, the runner terminates any process groups whose commands are rooted
+   in that arm's temporary workspace and records non-empty cleanup actions in
+   `process-cleanup.jsonl`; interruption and timeout also target the complete
+   child process group rather than only the direct Codex process.
 
    Response rows preserve input, cached input, derived non-cached input,
    output, reasoning-output, and total token counts alongside wall time. Raw

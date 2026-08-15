@@ -6,7 +6,12 @@ import path from "node:path";
 import test from "node:test";
 
 import { buildSnapshot } from "./eval-pr-snapshot.mjs";
-import { profilePlan, promptFor } from "./eval-run-replay.mjs";
+import {
+  REPLAY_EXECUTION_POLICY,
+  profilePlan,
+  promptFor,
+  workspaceProcessGroups,
+} from "./eval-run-replay.mjs";
 
 function git(repo, args) {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
@@ -41,6 +46,32 @@ test("replay profiles and forced-search contract are explicit", () => {
   assert.ok(natural.includes("do not access external network services"));
   assert.ok(forced.includes("Use jscout exclusively"));
   assert.ok(forced.includes("directly read files and line ranges identified by jscout"));
+
+  const constrained = promptFor({
+    story: "Fix it.",
+    execution_notes: ["Do not start the persistent package watcher."],
+  }, "skill");
+  assert.ok(constrained.includes("Task-specific execution constraints"));
+  assert.ok(constrained.includes("Do not start the persistent package watcher"));
+  assert.deepEqual(REPLAY_EXECUTION_POLICY, {
+    networkAccess: true,
+    networkPolicy: "prompt-restricted-external; loopback-required",
+    webTools: false,
+  });
+});
+
+test("workspace process cleanup selects only exact workspace-rooted groups", () => {
+  const rows = [
+    "  101   90 node /private/tmp/jr/r-one/node_modules/jest/bin/jest.js",
+    "  102   90 next-server",
+    "  201  200 node /private/tmp/jr/r-two/node_modules/jest/bin/jest.js",
+    "  301  300 node /private/tmp/jr/r-one-other/tool.js",
+  ].join("\n");
+  assert.deepEqual(workspaceProcessGroups(rows, "/private/tmp/jr/r-one"), [{
+    pgid: 90,
+    pids: [101],
+    commands: ["node /private/tmp/jr/r-one/node_modules/jest/bin/jest.js"],
+  }]);
 });
 
 // End-to-end: fixture repo -> snapshot -> stubbed agent edits one gold file
