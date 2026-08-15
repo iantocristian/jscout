@@ -922,6 +922,12 @@ and `expansion_role_counts`; no paths or source are added to telemetry.
 Semantic calls add only aggregate artifact returned/written counts and
 fresh/degraded/stale totals.
 
+For controlled evaluations that require a complete audit trail, additionally
+pass `--request-log PATH`. This separate JSONL records every incoming MCP
+method in order and includes exact `tools/call` arguments. It can therefore
+contain repository queries, anchors, annotation text, and other sensitive
+inputs; keep it with restricted raw eval artifacts, not in the repository.
+
 ## Storage
 
 Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to

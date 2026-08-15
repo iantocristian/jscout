@@ -41,6 +41,7 @@ pub fn serve(
     root: &Path,
     database_path: Option<&Path>,
     telemetry_path: Option<&Path>,
+    request_log_path: Option<&Path>,
     profile: ToolProfile,
     source_view: scout::SourceView,
 ) -> Result<()> {
@@ -63,6 +64,17 @@ pub fn serve(
         ),
         None => None,
     };
+    let mut request_log = match request_log_path {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open MCP request log {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let mut request_sequence = 0_u64;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -86,6 +98,8 @@ pub fn serve(
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
+        request_sequence += 1;
+        log_request(&mut request_log, profile, request_sequence, method, &params);
 
         // Notifications get no response.
         if id.is_null() && method.starts_with("notifications/") {
@@ -171,6 +185,41 @@ pub fn serve(
         write_msg(&mut out, &response)?;
     }
     Ok(())
+}
+
+fn log_request(
+    request_log: &mut Option<File>,
+    profile: ToolProfile,
+    sequence: u64,
+    method: &str,
+    params: &Value,
+) {
+    let Some(file) = request_log else { return };
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let session = std::env::var("JSCOUT_SESSION_ID")
+        .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let task = std::env::var("JSCOUT_TASK_ID").ok();
+    let profile_label =
+        std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
+    let record = json!({
+        "timestamp_ms": timestamp_ms,
+        "sequence": sequence,
+        "session": session,
+        "task": task,
+        "profile": profile_label,
+        "method": method,
+        "tool": params.get("name").and_then(Value::as_str),
+        "arguments": params.get("arguments"),
+    });
+    if serde_json::to_writer(&mut *file, &record).is_err()
+        || file.write_all(b"\n").is_err()
+        || file.flush().is_err()
+    {
+        eprintln!("warning: failed to write jscout MCP request log");
+    }
 }
 
 fn write_msg(out: &mut impl Write, msg: &Value) -> Result<()> {
@@ -1254,7 +1303,7 @@ fn semantic_artifact_metrics(text: &str) -> SemanticArtifactMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::path::Path;
 
     use anyhow::Result;
@@ -1262,7 +1311,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ToolProfile, call_tool, definition_source_metrics, expansion_role_metrics,
+        ToolProfile, call_tool, definition_source_metrics, expansion_role_metrics, log_request,
         render_bounded_items, semantic_artifact_metrics, server_instructions, tool_defs,
     };
     use crate::{indexer, scout::SourceView, store, structural};
@@ -1284,6 +1333,32 @@ mod tests {
         assert!(structural.contains("direct participants field"));
         assert!(structural.contains("as defining"));
         assert!(structural.contains("as supporting"));
+    }
+
+    #[test]
+    fn request_log_records_order_and_exact_tool_arguments() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("requests.jsonl");
+        let mut file = Some(OpenOptions::new().create(true).append(true).open(&path)?);
+        log_request(
+            &mut file,
+            ToolProfile::Structural,
+            7,
+            "tools/call",
+            &json!({
+                "name": "semantic_search",
+                "arguments": { "query": "live request headers", "expand": true }
+            }),
+        );
+        drop(file);
+
+        let row: serde_json::Value = serde_json::from_str(fs::read_to_string(path)?.trim())?;
+        assert_eq!(row["sequence"], 7);
+        assert_eq!(row["method"], "tools/call");
+        assert_eq!(row["tool"], "semantic_search");
+        assert_eq!(row["arguments"]["query"], "live request headers");
+        assert_eq!(row["arguments"]["expand"], true);
+        Ok(())
     }
 
     #[test]

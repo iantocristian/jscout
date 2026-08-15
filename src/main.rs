@@ -206,6 +206,9 @@ enum Command {
         /// Append privacy-minimal tool-call metrics as JSONL (no queries or results)
         #[arg(long)]
         telemetry: Option<PathBuf>,
+        /// Append every incoming MCP request as JSONL, including tool arguments
+        #[arg(long)]
+        request_log: Option<PathBuf>,
         /// Evaluation tool surface: baseline or structural
         #[arg(long, default_value = "structural")]
         profile: String,
@@ -859,12 +862,14 @@ fn main() -> Result<()> {
             root,
             database,
             telemetry,
+            request_log,
             profile,
             source_view,
         } => mcp::serve(
             &root,
             database.as_deref(),
             telemetry.as_deref(),
+            request_log.as_deref(),
             mcp::ToolProfile::parse(&profile)?,
             scout::SourceView::parse(&source_view)?,
         ),
