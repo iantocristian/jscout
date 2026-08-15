@@ -19,13 +19,16 @@ questions, then verify decisive claims in source.
   overlap, not separate model claims; increase
   `concept_tag_limit` only when the omitted count shows the default bound was
   reached.
-- Start code localization with `semantic_search`. Keep expansion off for exact
-  lookups.
+- Start code localization with `semantic_search`. Keep the initial result
+  limit at 10 or below and keep expansion off for exact lookups. Widen only
+  after inspecting the first result set and finding that it lacks enough
+  candidates.
 - For blast-radius, multi-hop, or workflow questions, use
   `semantic_search` with `expand=true` and a small depth/budget.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
-- Use `file_outline` after localizing a file and `events` for string-keyed
-  emit/listener wiring.
+- Use `file_outline` after localizing a file when the relevant symbol is still
+  unclear; go directly to `definition` when the exact symbol is already known.
+  Use `events` for string-keyed emit/listener wiring.
 - Use `calls` for exact member-method and object-option questions, such as
   finding every `insert` call passed `merge=replace`.
 - Use `neighborhood` for targeted drill-down when an exact anchor is already

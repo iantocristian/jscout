@@ -5,12 +5,12 @@
 //! locations, relation identity, confidence, and provenance while removing
 //! byte offsets, repeated defaults, occurrence IDs, and empty fields.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::{search, structural};
+use crate::{query, scout, search, structural};
 
 pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
     Ok(serde_json::to_string(&search_value(result))?)
@@ -165,6 +165,422 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
         }
     }
     Value::Object(value)
+}
+
+pub(crate) fn who_uses_string(
+    results: &[(&query::SymbolTarget, Vec<query::Usage>)],
+    byte_limit: usize,
+) -> Result<String> {
+    if byte_limit < 256 {
+        anyhow::bail!("response byte limit must be at least 256 bytes");
+    }
+    let mut sites = results
+        .iter()
+        .enumerate()
+        .flat_map(|(target_index, (_, usages))| {
+            usages.iter().map(move |usage| (target_index, usage))
+        })
+        .collect::<Vec<_>>();
+    sites.sort_by(|(left_target, left), (right_target, right)| {
+        confidence_rank(&left.confidence)
+            .cmp(&confidence_rank(&right.confidence))
+            .then_with(|| left_target.cmp(right_target))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.chunk_name.cmp(&right.chunk_name))
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+
+    let matched_targets = results.len();
+    let matched_usages = sites.len();
+    let (full, full_bytes) = settle_who_uses(
+        results,
+        matched_targets,
+        &sites,
+        byte_limit,
+        matched_targets,
+        matched_usages,
+        None,
+    )?;
+    if full_bytes <= byte_limit {
+        return Ok(serde_json::to_string(&full)?);
+    }
+
+    let mut returned_targets = matched_targets;
+    loop {
+        let (_, base_bytes) = settle_who_uses(
+            results,
+            returned_targets,
+            &[],
+            byte_limit,
+            matched_targets,
+            matched_usages,
+            Some(full_bytes),
+        )?;
+        if base_bytes <= byte_limit {
+            break;
+        }
+        if returned_targets == 0 {
+            anyhow::bail!(
+                "response byte limit {byte_limit} is below the minimum compact who_uses envelope ({base_bytes} bytes)"
+            );
+        }
+        returned_targets -= 1;
+    }
+
+    let eligible = sites
+        .into_iter()
+        .filter(|(target_index, _)| *target_index < returned_targets)
+        .collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = eligible.len() + 1;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let (_, rendered) = settle_who_uses(
+            results,
+            returned_targets,
+            &eligible[..middle],
+            byte_limit,
+            matched_targets,
+            matched_usages,
+            Some(full_bytes),
+        )?;
+        if rendered <= byte_limit {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let retained = low.saturating_sub(1);
+    let (value, rendered) = settle_who_uses(
+        results,
+        returned_targets,
+        &eligible[..retained],
+        byte_limit,
+        matched_targets,
+        matched_usages,
+        Some(full_bytes),
+    )?;
+    if rendered > byte_limit {
+        anyhow::bail!("failed to fit compact who_uses response into {byte_limit} bytes");
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_who_uses(
+    results: &[(&query::SymbolTarget, Vec<query::Usage>)],
+    returned_targets: usize,
+    sites: &[(usize, &query::Usage)],
+    byte_limit: usize,
+    matched_targets: usize,
+    matched_usages: usize,
+    unbudgeted_bytes: Option<usize>,
+) -> Result<(Value, usize)> {
+    let mut rendered_bytes = 0usize;
+    for _ in 0..8 {
+        let value = who_uses_value(
+            results,
+            returned_targets,
+            sites,
+            byte_limit,
+            rendered_bytes,
+            matched_targets,
+            matched_usages,
+            unbudgeted_bytes,
+        );
+        let rendered = serde_json::to_string(&value)?.len();
+        if rendered == rendered_bytes {
+            return Ok((value, rendered));
+        }
+        rendered_bytes = rendered;
+    }
+    let value = who_uses_value(
+        results,
+        returned_targets,
+        sites,
+        byte_limit,
+        rendered_bytes,
+        matched_targets,
+        matched_usages,
+        unbudgeted_bytes,
+    );
+    let rendered = serde_json::to_string(&value)?.len();
+    Ok((value, rendered))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn who_uses_value(
+    results: &[(&query::SymbolTarget, Vec<query::Usage>)],
+    returned_targets: usize,
+    sites: &[(usize, &query::Usage)],
+    byte_limit: usize,
+    rendered_bytes: usize,
+    matched_targets: usize,
+    matched_usages: usize,
+    unbudgeted_bytes: Option<usize>,
+) -> Value {
+    let mut groups = (0..returned_targets)
+        .map(|_| BTreeMap::<&'static str, BTreeMap<String, Vec<Value>>>::new())
+        .collect::<Vec<_>>();
+    let mut dependency_files = (0..returned_targets)
+        .map(|_| BTreeSet::<String>::new())
+        .collect::<Vec<_>>();
+    for (target_index, usage) in sites {
+        let confidence = normalized_confidence(&usage.confidence);
+        let mut site = vec![json!(usage.line), json!(usage.kind)];
+        match (usage.chunk_name.as_deref(), usage.detail.as_deref()) {
+            (Some(chunk), Some(detail)) => {
+                site.push(json!(chunk));
+                site.push(json!(detail));
+            }
+            (Some(chunk), None) => site.push(json!(chunk)),
+            (None, Some(detail)) => {
+                site.push(Value::Null);
+                site.push(json!(detail));
+            }
+            (None, None) => {}
+        }
+        groups[*target_index]
+            .entry(confidence)
+            .or_default()
+            .entry(usage.file.clone())
+            .or_default()
+            .push(Value::Array(site));
+        if usage.file_origin == "dependency" {
+            dependency_files[*target_index].insert(usage.file.clone());
+        }
+    }
+
+    let targets = results
+        .iter()
+        .take(returned_targets)
+        .enumerate()
+        .map(|(index, (target, _))| {
+            let mut value = Map::new();
+            value.insert("target".into(), compact_target(target));
+            if !groups[index].is_empty() {
+                value.insert("usages".into(), json!(groups[index]));
+            }
+            if !dependency_files[index].is_empty() {
+                value.insert("dependency_files".into(), json!(dependency_files[index]));
+            }
+            Value::Object(value)
+        })
+        .collect::<Vec<_>>();
+
+    let returned_usages = sites.len();
+    let omitted_targets = matched_targets.saturating_sub(returned_targets);
+    let omitted_usages = matched_usages.saturating_sub(returned_usages);
+    let truncated = omitted_targets > 0 || omitted_usages > 0;
+    let mut response = Map::new();
+    response.insert("byte_limit".into(), json!(byte_limit));
+    response.insert("rendered_bytes".into(), json!(rendered_bytes));
+    response.insert("matched_targets".into(), json!(matched_targets));
+    response.insert("returned_targets".into(), json!(returned_targets));
+    response.insert("matched_usages".into(), json!(matched_usages));
+    response.insert("returned_usages".into(), json!(returned_usages));
+    if truncated {
+        response.insert("truncated".into(), json!(true));
+        if let Some(unbudgeted_bytes) = unbudgeted_bytes {
+            response.insert("unbudgeted_bytes".into(), json!(unbudgeted_bytes));
+        }
+        let mut omitted = Map::new();
+        if omitted_targets > 0 {
+            omitted.insert("targets".into(), json!(omitted_targets));
+        }
+        if omitted_usages > 0 {
+            omitted.insert("usages".into(), json!(omitted_usages));
+        }
+        response.insert("omitted".into(), Value::Object(omitted));
+    }
+    json!({
+        "usage_fields": ["line", "kind", "enclosing?", "detail?"],
+        "targets": targets,
+        "response": response,
+    })
+}
+
+pub(crate) fn definition_string(
+    results: &[(query::SymbolTarget, Option<scout::RenderedSource>)],
+    matched_targets: usize,
+    byte_limit: usize,
+) -> Result<String> {
+    if byte_limit < 256 {
+        anyhow::bail!("response byte limit must be at least 256 bytes");
+    }
+    let mut definitions = results
+        .iter()
+        .map(|(target, source)| compact_definition(target, source.as_ref()))
+        .collect::<Vec<_>>();
+    let mut omitted_source_bytes = 0usize;
+
+    loop {
+        let (value, rendered) = settle_definitions(
+            &definitions,
+            matched_targets,
+            byte_limit,
+            omitted_source_bytes,
+        )?;
+        if rendered <= byte_limit {
+            return Ok(serde_json::to_string(&value)?);
+        }
+        if definitions.len() > 1 {
+            definitions.pop();
+            continue;
+        }
+        let Some(definition) = definitions.first_mut() else {
+            anyhow::bail!(
+                "response byte limit {byte_limit} is below the minimum compact definition envelope ({rendered} bytes)"
+            );
+        };
+        let Some(source) = definition.get("source").and_then(Value::as_str) else {
+            anyhow::bail!(
+                "response byte limit {byte_limit} is below the minimum compact definition envelope ({rendered} bytes)"
+            );
+        };
+        if source.is_empty() {
+            anyhow::bail!(
+                "response byte limit {byte_limit} is below the minimum compact definition envelope ({rendered} bytes)"
+            );
+        }
+        let excess = rendered.saturating_sub(byte_limit).max(1);
+        let keep = source.len().saturating_sub(excess);
+        let shortened = truncate_utf8(source, keep).to_string();
+        omitted_source_bytes += source.len().saturating_sub(shortened.len());
+        definition["source"] = json!(shortened);
+        definition["source_meta"]["rendered_bytes"] =
+            json!(definition["source"].as_str().map_or(0, str::len));
+        definition["source_meta"]["budget_truncated"] = json!(true);
+    }
+}
+
+fn settle_definitions(
+    definitions: &[Value],
+    matched_targets: usize,
+    byte_limit: usize,
+    omitted_source_bytes: usize,
+) -> Result<(Value, usize)> {
+    let mut rendered_bytes = 0usize;
+    for _ in 0..8 {
+        let value = definitions_value(
+            definitions,
+            matched_targets,
+            byte_limit,
+            rendered_bytes,
+            omitted_source_bytes,
+        );
+        let rendered = serde_json::to_string(&value)?.len();
+        if rendered == rendered_bytes {
+            return Ok((value, rendered));
+        }
+        rendered_bytes = rendered;
+    }
+    let value = definitions_value(
+        definitions,
+        matched_targets,
+        byte_limit,
+        rendered_bytes,
+        omitted_source_bytes,
+    );
+    let rendered = serde_json::to_string(&value)?.len();
+    Ok((value, rendered))
+}
+
+fn definitions_value(
+    definitions: &[Value],
+    matched_targets: usize,
+    byte_limit: usize,
+    rendered_bytes: usize,
+    omitted_source_bytes: usize,
+) -> Value {
+    let returned_targets = definitions.len();
+    let omitted_targets = matched_targets.saturating_sub(returned_targets);
+    let truncated = omitted_targets > 0 || omitted_source_bytes > 0;
+    let mut response = Map::new();
+    response.insert("byte_limit".into(), json!(byte_limit));
+    response.insert("rendered_bytes".into(), json!(rendered_bytes));
+    response.insert("matched_targets".into(), json!(matched_targets));
+    response.insert("returned_targets".into(), json!(returned_targets));
+    if truncated {
+        response.insert("truncated".into(), json!(true));
+        let mut omitted = Map::new();
+        if omitted_targets > 0 {
+            omitted.insert("targets".into(), json!(omitted_targets));
+        }
+        if omitted_source_bytes > 0 {
+            omitted.insert("source_bytes".into(), json!(omitted_source_bytes));
+        }
+        response.insert("omitted".into(), Value::Object(omitted));
+    }
+    json!({ "definitions": definitions, "response": response })
+}
+
+fn compact_definition(
+    target: &query::SymbolTarget,
+    source: Option<&scout::RenderedSource>,
+) -> Value {
+    let mut value = Map::new();
+    value.insert("target".into(), compact_target(target));
+    if let Some(source) = source {
+        value.insert("source".into(), json!(source.text));
+        let mut meta = Map::new();
+        meta.insert("representation".into(), json!(source.representation));
+        meta.insert("original_bytes".into(), json!(source.original_bytes));
+        meta.insert("rendered_bytes".into(), json!(source.rendered_bytes));
+        if !source.elisions.is_empty() {
+            meta.insert("elisions".into(), json!(source.elisions));
+        }
+        if source.budget_truncated {
+            meta.insert("budget_truncated".into(), json!(true));
+        }
+        value.insert("source_meta".into(), Value::Object(meta));
+    }
+    Value::Object(value)
+}
+
+fn compact_target(target: &query::SymbolTarget) -> Value {
+    let mut value = Map::new();
+    value.insert(
+        "at".into(),
+        json!(format!("{}:{}", target.file, target.line)),
+    );
+    value.insert("symbol".into(), json!(target.name));
+    value.insert("kind".into(), json!(target.kind));
+    if target.exported {
+        value.insert("exported".into(), json!(true));
+    }
+    if target.file_origin == "dependency" {
+        value.insert("origin".into(), json!("dependency"));
+    }
+    Value::Object(value)
+}
+
+fn confidence_rank(confidence: &str) -> usize {
+    match confidence {
+        "certain" => 0,
+        "likely" => 1,
+        "possible" => 2,
+        _ => 3,
+    }
+}
+
+fn normalized_confidence(confidence: &str) -> &'static str {
+    match confidence {
+        "certain" => "certain",
+        "likely" => "likely",
+        "possible" => "possible",
+        _ => "unknown",
+    }
+}
+
+fn truncate_utf8(text: &str, maximum: usize) -> &str {
+    let mut end = maximum.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 pub(crate) fn expansion_payload_bytes(
@@ -454,9 +870,11 @@ fn source_at_option(file: Option<&str>, start: Option<i64>, end: Option<i64>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{render_neighborhood, search_string};
+    use super::{definition_string, render_neighborhood, search_string, who_uses_string};
     use crate::{
         origin,
+        query::{SymbolTarget, Usage},
+        scout::RenderedSource,
         search::{Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchResult},
         structural::{GraphEdge, GraphNode, Neighborhood},
     };
@@ -490,6 +908,18 @@ mod tests {
                 "occurrenceSpecific": true,
             }),
             relevance: 1.0,
+        }
+    }
+
+    fn symbol_target() -> SymbolTarget {
+        SymbolTarget {
+            file: "src/adapter.ts".into(),
+            file_origin: "workspace".into(),
+            file_id: 41,
+            name: "Adapter".into(),
+            kind: "class".into(),
+            line: 8,
+            exported: true,
         }
     }
 
@@ -624,6 +1054,110 @@ mod tests {
         assert!(compact.len() < 8_000);
         let value: serde_json::Value = serde_json::from_str(&compact)?;
         assert_eq!(value["graph"]["edges"].as_array().map(Vec::len), Some(10));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_who_uses_groups_sites_without_losing_candidate_evidence() -> anyhow::Result<()> {
+        let target = symbol_target();
+        let results = vec![(
+            &target,
+            vec![
+                Usage {
+                    file: "src/caller.ts".into(),
+                    file_origin: "workspace".into(),
+                    line: 12,
+                    kind: "call".into(),
+                    confidence: "certain".into(),
+                    detail: None,
+                    chunk_name: Some("run".into()),
+                },
+                Usage {
+                    file: "src/dynamic.ts".into(),
+                    file_origin: "repository".into(),
+                    line: 30,
+                    kind: "call".into(),
+                    confidence: "possible".into(),
+                    detail: Some("candidate.Adapter()".into()),
+                    chunk_name: None,
+                },
+            ],
+        )];
+
+        let rendered = who_uses_string(&results, 4_000)?;
+        let value: serde_json::Value = serde_json::from_str(&rendered)?;
+
+        assert!(rendered.len() < 1_000);
+        assert_eq!(value["targets"][0]["target"]["at"], "src/adapter.ts:8");
+        assert!(value["targets"][0]["target"].get("file_id").is_none());
+        assert_eq!(
+            value["targets"][0]["usages"]["certain"]["src/caller.ts"][0],
+            serde_json::json!([12, "call", "run"])
+        );
+        assert_eq!(
+            value["targets"][0]["usages"]["possible"]["src/dynamic.ts"][0],
+            serde_json::json!([30, "call", null, "candidate.Adapter()"])
+        );
+        assert_eq!(value["response"]["matched_usages"], 2);
+        assert_eq!(value["response"]["returned_usages"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_who_uses_truncates_to_the_complete_response_budget() -> anyhow::Result<()> {
+        let target = symbol_target();
+        let usages = (0..100)
+            .map(|line| Usage {
+                file: format!("src/caller-{line:03}.ts"),
+                file_origin: "workspace".into(),
+                line,
+                kind: "call".into(),
+                confidence: if line < 50 { "certain" } else { "possible" }.into(),
+                detail: Some(format!("receiver-{line}.Adapter()")),
+                chunk_name: Some(format!("caller{line}")),
+            })
+            .collect();
+        let results = vec![(&target, usages)];
+
+        let rendered = who_uses_string(&results, 1_200)?;
+        let value: serde_json::Value = serde_json::from_str(&rendered)?;
+
+        assert!(rendered.len() <= 1_200);
+        assert_eq!(value["response"]["rendered_bytes"], rendered.len());
+        assert_eq!(value["response"]["truncated"], true);
+        assert!(value["response"]["returned_usages"].as_u64().unwrap() < 100);
+        assert!(value["targets"][0]["usages"].get("certain").is_some());
+        assert!(value["targets"][0]["usages"].get("possible").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compact_definition_serializes_source_once_and_obeys_the_whole_budget() -> anyhow::Result<()>
+    {
+        let target = symbol_target();
+        let source = RenderedSource {
+            representation: "full",
+            text: format!("UNIQUE_SOURCE_MARKER\n{}", "const value = 1;\n".repeat(200)),
+            byte_limit: 8_000,
+            original_bytes: 3_500,
+            rendered_bytes: 3_500,
+            compression_ratio: 1.0,
+            elisions: Vec::new(),
+            budget_truncated: false,
+        };
+
+        let rendered = definition_string(&[(target, Some(source))], 1, 1_000)?;
+        let value: serde_json::Value = serde_json::from_str(&rendered)?;
+
+        assert!(rendered.len() <= 1_000);
+        assert_eq!(rendered.matches("UNIQUE_SOURCE_MARKER").count(), 1);
+        assert!(value["definitions"][0]["source_meta"].get("text").is_none());
+        assert!(value["definitions"][0]["target"].get("file_id").is_none());
+        assert_eq!(
+            value["definitions"][0]["source_meta"]["budget_truncated"],
+            true
+        );
+        assert_eq!(value["response"]["rendered_bytes"], rendered.len());
         Ok(())
     }
 }

@@ -231,12 +231,14 @@ fn tool_defs(profile: ToolProfile) -> Value {
         },
         {
             "name": "who_uses",
-            "description": "All usage sites of a symbol (function, class, component, method), grouped by confidence: certain (resolved imports/renders/calls), possible (name-match member calls).",
+            "description": "Bounded usage sites of a symbol (function, class, component, method), grouped by confidence and file: certain (resolved imports/renders/calls), possible (name-match member calls).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "symbol": { "type": "string", "description": "NAME or path-substring:NAME, e.g. 'getUser' or 'services/user:getUser'" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Target origin allowlist. Dependency symbols are excluded unless explicitly included" }
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Target origin allowlist. Dependency symbols are excluded unless explicitly included" },
+                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
+                    "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
                 "required": ["symbol"]
             }
@@ -250,7 +252,9 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "symbol": { "type": "string", "description": "NAME or path-substring:NAME" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Definition origin allowlist. Dependency definitions are excluded unless explicitly included" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
-                    "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" }
+                    "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" },
+                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
+                    "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
                 "required": ["symbol"]
             }
@@ -587,6 +591,11 @@ fn call_tool(
         }
         "who_uses" => {
             let spec = args["symbol"].as_str().unwrap_or("");
+            let debug = args["debug"].as_bool().unwrap_or(false);
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
+                as usize;
             let graph = query::ModuleGraph::load(conn)?;
             let origins = json_string_array_or(args, "origins", crate::origin::defaults);
             let targets = query::find_symbols_in_origins(conn, spec, &origins)?;
@@ -594,12 +603,25 @@ fn call_tool(
             for t in &targets {
                 let usages =
                     query::who_uses_in_origins(conn, &graph, t.file_id, &t.name, &origins)?;
-                results.push(json!({ "target": t, "usages": usages }));
+                results.push((t, usages));
             }
-            Ok(serde_json::to_string_pretty(&results)?)
+            if debug {
+                let diagnostic = results
+                    .iter()
+                    .map(|(target, usages)| json!({ "target": target, "usages": usages }))
+                    .collect::<Vec<_>>();
+                Ok(serde_json::to_string_pretty(&diagnostic)?)
+            } else {
+                crate::compact::who_uses_string(&results, response_bytes)
+            }
         }
         "definition" => {
             let spec = args["symbol"].as_str().unwrap_or("");
+            let debug = args["debug"].as_bool().unwrap_or(false);
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
+                as usize;
             let source_view = args["view"]
                 .as_str()
                 .map(scout::SourceView::parse)
@@ -614,8 +636,9 @@ fn call_tool(
                 spec,
                 &json_string_array_or(args, "origins", crate::origin::defaults),
             )?;
+            let matched_targets = targets.len();
             let mut results = Vec::new();
-            for t in targets.iter().take(5) {
+            for t in targets.into_iter().take(5) {
                 let chunk: Option<(String, i64, i64, String)> = conn
                     .query_row(
                         "SELECT c.content, c.start, c.end, f.hash
@@ -656,14 +679,23 @@ fn call_tool(
                         }
                     })
                     .transpose()?;
-                let source = rendered.as_ref().map(|artifact| artifact.text.clone());
-                results.push(json!({
-                    "target": t,
-                    "source": source,
-                    "source_meta": rendered,
-                }));
+                results.push((t, rendered));
             }
-            Ok(serde_json::to_string_pretty(&results)?)
+            if debug {
+                let diagnostic = results
+                    .iter()
+                    .map(|(target, rendered)| {
+                        json!({
+                            "target": target,
+                            "source": rendered.as_ref().map(|artifact| &artifact.text),
+                            "source_meta": rendered,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::to_string_pretty(&diagnostic)?)
+            } else {
+                crate::compact::definition_string(&results, matched_targets, response_bytes)
+            }
         }
         "file_outline" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -1045,32 +1077,7 @@ fn log_tool_call(
     let source_metrics = result
         .as_ref()
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|value| value.as_array().cloned())
-        .map(|artifacts| {
-            let source_artifacts = artifacts
-                .iter()
-                .filter(|artifact| artifact.get("source_meta").is_some_and(Value::is_object))
-                .count();
-            let source_rendered_bytes = artifacts
-                .iter()
-                .filter_map(|artifact| artifact["source_meta"]["rendered_bytes"].as_u64())
-                .sum::<u64>();
-            let source_original_bytes = artifacts
-                .iter()
-                .filter_map(|artifact| artifact["source_meta"]["original_bytes"].as_u64())
-                .sum::<u64>();
-            let source_budget_truncations = artifacts
-                .iter()
-                .filter(|artifact| artifact["source_meta"]["budget_truncated"] == true)
-                .count();
-            (
-                source_artifacts,
-                source_rendered_bytes,
-                source_original_bytes,
-                source_budget_truncations,
-            )
-        })
+        .map(|text| definition_source_metrics(text))
         .unwrap_or_default();
     let expansion_metrics = result
         .as_ref()
@@ -1128,6 +1135,37 @@ fn log_tool_call(
     {
         eprintln!("warning: failed to write jscout MCP telemetry");
     }
+}
+
+fn definition_source_metrics(text: &str) -> (usize, u64, u64, usize) {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Default::default();
+    };
+    let Some(artifacts) = value.as_array().or_else(|| value["definitions"].as_array()) else {
+        return Default::default();
+    };
+    let source_artifacts = artifacts
+        .iter()
+        .filter(|artifact| artifact.get("source_meta").is_some_and(Value::is_object))
+        .count();
+    let source_rendered_bytes = artifacts
+        .iter()
+        .filter_map(|artifact| artifact["source_meta"]["rendered_bytes"].as_u64())
+        .sum::<u64>();
+    let source_original_bytes = artifacts
+        .iter()
+        .filter_map(|artifact| artifact["source_meta"]["original_bytes"].as_u64())
+        .sum::<u64>();
+    let source_budget_truncations = artifacts
+        .iter()
+        .filter(|artifact| artifact["source_meta"]["budget_truncated"] == true)
+        .count();
+    (
+        source_artifacts,
+        source_rendered_bytes,
+        source_original_bytes,
+        source_budget_truncations,
+    )
 }
 
 #[derive(Default)]
@@ -1224,8 +1262,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ToolProfile, call_tool, expansion_role_metrics, render_bounded_items,
-        semantic_artifact_metrics, server_instructions, tool_defs,
+        ToolProfile, call_tool, definition_source_metrics, expansion_role_metrics,
+        render_bounded_items, semantic_artifact_metrics, server_instructions, tool_defs,
     };
     use crate::{indexer, scout::SourceView, store, structural};
 
@@ -1374,6 +1412,25 @@ mod tests {
         assert!(
             definition["inputSchema"]["properties"]
                 .get("source_bytes")
+                .is_some()
+        );
+        assert!(
+            definition["inputSchema"]["properties"]
+                .get("response_bytes")
+                .is_some()
+        );
+        assert!(
+            definition["inputSchema"]["properties"]
+                .get("debug")
+                .is_some()
+        );
+        let who_uses = tools
+            .iter()
+            .find(|tool| tool["name"] == "who_uses")
+            .expect("who_uses tool");
+        assert!(
+            who_uses["inputSchema"]["properties"]
+                .get("response_bytes")
                 .is_some()
         );
         let calls = tools
@@ -1676,10 +1733,18 @@ mod tests {
             &json!({ "symbol": "run", "source_bytes": 512 }),
         )?;
         let elided: serde_json::Value = serde_json::from_str(&elided)?;
-        assert_eq!(elided[0]["source_meta"]["representation"], "elided");
-        assert!(elided[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
+        assert_eq!(
+            elided["definitions"][0]["source_meta"]["representation"],
+            "elided"
+        );
         assert!(
-            !elided[0]["source"]
+            elided["definitions"][0]["source_meta"]["rendered_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 512
+        );
+        assert!(
+            !elided["definitions"][0]["source"]
                 .as_str()
                 .unwrap()
                 .contains("localPlumbingWithALongName")
@@ -1695,14 +1760,35 @@ mod tests {
             &json!({ "symbol": "run", "view": "full", "source_bytes": 512 }),
         )?;
         let full: serde_json::Value = serde_json::from_str(&full)?;
-        assert_eq!(full[0]["source_meta"]["representation"], "full");
-        assert!(full[0]["source_meta"]["rendered_bytes"].as_u64().unwrap() <= 512);
+        assert_eq!(
+            full["definitions"][0]["source_meta"]["representation"],
+            "full"
+        );
         assert!(
-            full[0]["source"]
+            full["definitions"][0]["source_meta"]["rendered_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 512
+        );
+        assert!(
+            full["definitions"][0]["source"]
                 .as_str()
                 .unwrap()
                 .contains("localPlumbingWithALongName")
         );
+
+        let debug = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            "definition",
+            &json!({ "symbol": "run", "source_bytes": 512, "debug": true }),
+        )?;
+        let debug: serde_json::Value = serde_json::from_str(&debug)?;
+        assert!(debug.is_array());
+        assert_eq!(debug[0]["source"], debug[0]["source_meta"]["text"]);
         Ok(())
     }
 
@@ -1755,6 +1841,27 @@ mod tests {
         assert_eq!(compact.file_nodes, 2);
         assert_eq!(compact.role_counts["production"], 1);
         assert_eq!(compact.test_fixture_generated, 1);
+    }
+
+    #[test]
+    fn telemetry_reads_compact_definition_source_metrics() {
+        let metrics = definition_source_metrics(
+            &json!({
+                "definitions": [{
+                    "target": { "at": "src/a.ts:1", "symbol": "run", "kind": "function" },
+                    "source": "run() {}",
+                    "source_meta": {
+                        "representation": "full",
+                        "original_bytes": 20,
+                        "rendered_bytes": 8,
+                        "budget_truncated": true
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(metrics, (1, 8, 20, 1));
     }
 
     #[test]
