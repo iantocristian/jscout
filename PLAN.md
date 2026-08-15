@@ -611,6 +611,28 @@ include patterns never classify a project by themselves. G13 remains
 responsible for ambiguous project purpose rather than extending this bootstrap
 with repository-specific exceptions.
 
+**Amendment — builtin-receiver and runtime-namesake selection (2026-08-15).**
+A Next.js diagnostic showed ~93% of returned declarations failing to anchor:
+62.8% in the TypeScript standard library, 30.2% in `node_modules/@types`, and
+receiver classes told the story (`this` receivers mapped at 88%, ECMAScript
+globals at 0.05%, Node core namespaces at 0%). Discovery now computes two
+per-occurrence facts: a builtin-looking receiver (a file-local unbound
+ECMAScript/host global name or a receiver sharing a file-level Node-core import
+name) and a runtime namesake (some indexed symbol with the member's name in an
+effective-runtime file). Runtime namesakes remain a necessary default
+eligibility gate and `--all` bypasses it. Builtin detection is advisory only:
+project-wide ambient declarations, lexical import shadows, and tsconfig path
+aliases make file-local classification insufficient for hard exclusion.
+Builtin-looking occurrences are scheduled after ordinary receivers within the
+same structural tier, reported separately, and still all consumed by an
+uncapped run. An empty post-filter plan is a successful no-op that does not
+launch the checker. The sidecar labels every declaration's provenance (`repo`,
+`types`, `lib`, `vendored`, `outside`); non-`repo` declarations skip the
+anchoring lookup but still count as unmapped, so the per-occurrence ambiguity rule
+(`unmapped == 0`) and every published confidence are byte-identical — the
+change avoids runtime-unanchorable names and attributes refusals without
+relaxing fail-closed anchoring.
+
 ### Shape
 
 A companion Node sidecar hosting the TypeScript checker (LanguageService or

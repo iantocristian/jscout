@@ -543,6 +543,18 @@ function symbolDeclarations(checker, receiverType, member) {
   return symbols.flatMap((symbol) => symbol.getDeclarations() ?? []);
 }
 
+// Provenance of a declaration file relative to the indexed corpus. The Rust
+// side can only anchor `repo` declarations; the other contexts let it skip
+// hopeless symbol lookups and attribute unmapped declarations in reports
+// instead of conflating "vendored type" with "index gap".
+function declarationContext(relative) {
+  if (relative === null) return "outside";
+  if (!relative.includes("node_modules/")) return "repo";
+  if (relative.includes("node_modules/@types/")) return "types";
+  if (/\/typescript\/lib\/lib\.[^/]+\.d\.ts$/u.test(relative)) return "lib";
+  return "vendored";
+}
+
 function declarationResult(declaration) {
   const source = declaration.getSourceFile();
   let canonical;
@@ -552,12 +564,16 @@ function declarationResult(declaration) {
     return undefined;
   }
   const named = declaration.name ?? declaration;
+  const relative = insideRoot(canonical)
+    ? path.relative(root, canonical).split(path.sep).join("/")
+    : null;
   return {
-    file: insideRoot(canonical) ? path.relative(root, canonical).split(path.sep).join("/") : null,
-    outside_root: !insideRoot(canonical),
+    file: relative,
+    outside_root: relative === null,
     start: utf16ToByte(source.text, named.getStart(source)),
     end: utf16ToByte(source.text, named.end),
     source_hash: sourceHash(source.text),
+    context: declarationContext(relative),
   };
 }
 

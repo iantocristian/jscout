@@ -230,6 +230,12 @@ pub struct DeclarationSite {
     pub start: i64,
     pub end: i64,
     pub source_hash: String,
+    /// Sidecar-computed provenance of the declaration file: `repo`, `types`
+    /// (`node_modules/@types`), `lib` (the TypeScript standard library),
+    /// `vendored` (other `node_modules`), or `outside`. Absent from older
+    /// sidecars, which is treated as `repo` so mapping behavior is unchanged.
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

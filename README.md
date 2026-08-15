@@ -271,6 +271,21 @@ files within each priority tier. `--dry-run` reports discovered, eligible,
 selected, omitted, project, and configuration counts after a configuration-only
 ownership pass and does not construct a TypeScript Program.
 
+The default plan excludes calls whose member name has indexed namesakes only
+outside effective-runtime files; `--all` bypasses that necessary anchorability
+gate. Builtin-looking receivers (`console`, `JSON`, `path`, `fs`, …) are only
+scheduled after ordinary receivers within the same structural tier and are
+reported in `occurrences_deprioritized_builtin_receiver`. They are never
+excluded: file-local scope and import spelling cannot account for project-wide
+ambient declarations, lexical import shadows, or tsconfig path aliases. An
+uncapped run therefore remains complete. A plan with no eligible occurrences
+is a successful no-op and does not launch the checker sidecar. The sidecar
+labels every returned declaration's provenance (`repo`, `types`, `lib`,
+`vendored`, `outside`); non-repository
+declarations skip the anchoring lookup but still count as unmapped, so
+confidences are unchanged and the report attributes refusals by provenance in
+`unmapped_declaration_contexts`.
+
 Configured projects start with a deterministic purpose classification. Explicit
 lint configurations such as `tsconfig.eslint.json` are removed from a file's
 ownership set when a non-tooling project still owns that file; they remain as
