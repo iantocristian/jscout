@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "suite": "next-pr-replay-calibration",
+  "status": "pilot",
+  "profiles": [
+    "grep",
+    "structural",
+    "checker",
+    "checker-embed",
+    "checker-scout",
+    "checker-scout-embed"
+  ],
+  "treatments": ["skill", "forced"],
+  "repository": {
+    "name": "next.js",
+    "source": "https://github.com/vercel/next.js"
+  },
+  "setup_command": "corepack pnpm install --frozen-lockfile && corepack pnpm build",
+  "test_command": "corepack pnpm build && corepack pnpm test-start test/e2e/app-dir/proxy-headers-live-view/proxy-headers-live-view.test.ts",
+  "notes": [
+    "The agent receives a history-free archive of the parent commit. The source clone, issue, PR, gold patches, and hidden tests remain outside the agent workspace.",
+    "Every execution arm independently archives, installs, and builds the historical parent before the agent starts.",
+    "The story is behavioral and deliberately omits PR numbers, filenames, symbols, and regression-test names."
+  ],
+  "tasks": [
+    {
+      "id": "next-live-request-headers",
+      "sha": "3c97df56ead9d1df81b36f891ba5ac0724c4eec0",
+      "parent": "ac65c6b27c53df92c814b95326e2cfba7bc57a82",
+      "story_source": "issue-97049",
+      "story": "A request hook obtains a read-only header view, mutates the incoming request, and reads the headers again. The request itself reflects the mutation, but both the previously obtained view and a newly obtained view remain stale. Make the read-only API remain a live view of the underlying request while preserving its mutation guard and keeping framework-internal headers hidden from every read operation. Existing cookie snapshot behavior must not change.",
+      "contamination_prompt": "where in the repository would you fix a request-hook bug where read-only header views remain stale after the underlying incoming request is mutated, while internal framework headers must stay hidden and cookie snapshot behavior must remain unchanged?",
+      "gold": {
+        "files": [
+          "packages/next/src/server/async-storage/request-store.ts",
+          "packages/next/src/server/web/spec-extension/adapters/headers.ts"
+        ],
+        "symbols": [
+          "getHeaders",
+          "HeadersAdapter.seal"
+        ]
+      }
+    }
+  ]
+}

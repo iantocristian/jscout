@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { admitCandidate, classifyFiles, isTestPath, mineCandidates } from "./eval-pr-mine.mjs";
 import { buildSnapshot } from "./eval-pr-snapshot.mjs";
+import { prepareSuite } from "./eval-pr-prepare.mjs";
 import { diffTrees, scoreCoverage } from "./eval-pr-grade.mjs";
 
 function git(repo, args) {
@@ -86,6 +87,45 @@ test("snapshot exports history-free workspace and out-of-sandbox gold", () => {
     () => buildSnapshot({ repository: repo, sha, workspace: path.join(base, "ws2"), gold: path.join(base, "ws2", "gold") }),
     /must not be inside the workspace/,
   );
+  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("preparation freezes setup outputs and admits fail-to-pass hidden tests", () => {
+  const { repo, sha } = makeFixtureRepo();
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-prepare-out-"));
+  const tasksFile = path.join(base, "tasks.json");
+  const runsRoot = path.join(base, "runs");
+  fs.writeFileSync(
+    tasksFile,
+    JSON.stringify({
+      setup_command:
+        "node -e \"require('fs').writeFileSync('prepared.txt', 'yes')\"",
+      test_command:
+        "node -e \"const fs=require('fs'); if(fs.readFileSync('prepared.txt','utf8')!=='yes'||!fs.readFileSync('src/a.js','utf8').includes('x + 1')) process.exit(1)\"",
+      tasks: [{
+        id: "prepared-fixture",
+        sha,
+        story: "Increment inputs.",
+        story_source: "fixture",
+      }],
+    }),
+  );
+
+  const [result] = prepareSuite({ tasksFile, repository: repo, runsRoot });
+  assert.equal(result.setup, "pass");
+  assert.equal(result.hidden_tests, "fail-to-pass");
+  assert.equal(result.layer1_eligible, true);
+  assert.equal(
+    fs.readFileSync(path.join(runsRoot, "prepared-fixture", "pristine", "prepared.txt"), "utf8"),
+    "yes",
+  );
+  const task = JSON.parse(
+    fs.readFileSync(path.join(runsRoot, "prepared-fixture", "gold", "task.json"), "utf8"),
+  );
+  assert.equal(task.story, "Increment inputs.");
+  assert.equal(task.story_source, "fixture");
+
   fs.rmSync(base, { recursive: true, force: true });
   fs.rmSync(repo, { recursive: true, force: true });
 });

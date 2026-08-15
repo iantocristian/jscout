@@ -23,12 +23,20 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 import { classifyFiles } from "./eval-pr-mine.mjs";
+import { overlayHiddenTests } from "./eval-hidden-tests.mjs";
+import { cloneTree } from "./eval-tree-clone.mjs";
 
 function git(repository, args, opts = {}) {
   return execFileSync("git", ["-C", repository, ...args], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     ...opts,
+  });
+}
+
+function gitBytes(repository, args) {
+  return execFileSync("git", ["-C", repository, ...args], {
+    maxBuffer: 256 * 1024 * 1024,
   });
 }
 
@@ -80,6 +88,8 @@ export function buildSnapshot(options) {
   const workspace = path.resolve(options.workspace);
   const gold = path.resolve(options.gold);
   assertDisjoint(workspace, gold);
+  const workRoot = path.resolve(options.workRoot ?? "/tmp/jr");
+  fs.mkdirSync(workRoot, { recursive: true });
   for (const target of [workspace, gold]) {
     if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
       throw new Error(`refusing to write into non-empty directory: ${target}`);
@@ -120,6 +130,28 @@ export function buildSnapshot(options) {
     throw new Error("workspace export unexpectedly contains .git");
   }
 
+  // Preparation is part of the frozen base, not part of an agent run. This is
+  // where repository-specific dependency installation and builds happen.
+  // The resulting node_modules/build outputs are cloned into every arm.
+  let setupVerification = { status: "skipped" };
+  if (options.setupCommand) {
+    const setupRun = run("sh", ["-c", options.setupCommand], workspace);
+    setupVerification = {
+      status: setupRun.code === 0 ? "pass" : "failed",
+      exit_code: setupRun.code,
+      command: options.setupCommand,
+      output_tail: setupRun.output.split("\n").slice(-25).join("\n"),
+    };
+    if (setupRun.code !== 0) {
+      throw new Error(
+        `setup command failed (${setupRun.code}):\n${setupVerification.output_tail}`,
+      );
+    }
+    if (fs.existsSync(path.join(workspace, ".git"))) {
+      throw new Error("setup command introduced .git into the history-free workspace");
+    }
+  }
+
   const changes = changedFiles(repository, parent, sha).filter(
     (change) => members.length === 0 || arcScope.has(change.file),
   );
@@ -144,6 +176,14 @@ export function buildSnapshot(options) {
       path.join(gold, "gold-tests.patch"),
       git(repository, ["diff", parent, sha, "--", ...classes.tests]),
     );
+    const oracleRoot = path.join(gold, "gold-tests");
+    for (const file of classes.tests) {
+      const change = changes.find((entry) => entry.file === file);
+      if (change?.status === "D") continue;
+      const destination = path.join(oracleRoot, file);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination, gitBytes(repository, ["show", `${sha}:${file}`]));
+    }
   }
   const nonTest = [...classes.code, ...classes.other];
   if (nonTest.length > 0) {
@@ -158,31 +198,50 @@ export function buildSnapshot(options) {
   if (classes.tests.length === 0) {
     testsVerification = { status: "no-tests" };
   } else if (options.testCommand) {
-    const probe = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-replay-verify-"));
+    const probeRoot = fs.mkdtempSync(path.join(workRoot, "v-"));
+    const parentProbe = path.join(probeRoot, "parent");
+    const referenceProbe = path.join(probeRoot, "reference");
     try {
-      fs.cpSync(workspace, probe, { recursive: true });
-      const testsPatch = path.join(gold, "gold-tests.patch");
-      const applyCheck = run("git", ["apply", "--check", testsPatch], probe);
-      if (applyCheck.code !== 0) {
+      cloneTree(workspace, parentProbe);
+      overlayHiddenTests(gold, parentProbe);
+      const parentRun = run("sh", ["-c", options.testCommand], parentProbe);
+      if (parentRun.code === 0) {
         testsVerification = {
           status: "rejected",
-          reason: "test-only patch does not apply independently",
+          reason: "reference tests pass on the parent; they do not encode the new behavior",
+          parent_exit_code: parentRun.code,
+          parent_output_tail: parentRun.output.split("\n").slice(-15).join("\n"),
         };
       } else {
-        run("git", ["apply", testsPatch], probe);
-        const testRun = run("sh", ["-c", options.testCommand], probe);
-        testsVerification = {
-          status: testRun.code === 0 ? "rejected" : "fail-to-pass",
-          reason:
-            testRun.code === 0
-              ? "reference tests pass on the parent; they do not encode the new behavior"
-              : null,
-          exit_code: testRun.code,
-          output_tail: testRun.output.split("\n").slice(-15).join("\n"),
-        };
+        cloneTree(workspace, referenceProbe);
+        const codePatch = path.join(gold, "gold-code.patch");
+        const applyCode = fs.existsSync(codePatch)
+          ? run("git", ["apply", codePatch], referenceProbe)
+          : { code: 0, output: "" };
+        overlayHiddenTests(gold, referenceProbe);
+        const referenceRun = applyCode.code === 0
+          ? run("sh", ["-c", options.testCommand], referenceProbe)
+          : applyCode;
+        testsVerification = referenceRun.code === 0
+          ? {
+              status: "fail-to-pass",
+              reason: null,
+              parent_exit_code: parentRun.code,
+              parent_output_tail: parentRun.output.split("\n").slice(-15).join("\n"),
+              reference_exit_code: referenceRun.code,
+              reference_output_tail: referenceRun.output.split("\n").slice(-15).join("\n"),
+            }
+          : {
+              status: "rejected",
+              reason: "reference tests do not pass with the reference production patch",
+              parent_exit_code: parentRun.code,
+              parent_output_tail: parentRun.output.split("\n").slice(-15).join("\n"),
+              reference_exit_code: referenceRun.code,
+              reference_output_tail: referenceRun.output.split("\n").slice(-15).join("\n"),
+            };
       }
     } finally {
-      fs.rmSync(probe, { recursive: true, force: true });
+      fs.rmSync(probeRoot, { recursive: true, force: true });
     }
   }
 
@@ -193,11 +252,11 @@ export function buildSnapshot(options) {
     arc_members: members,
     files: classes,
     changes,
+    setup_verification: setupVerification,
     tests_verification: testsVerification,
     layer1_eligible: testsVerification.status === "fail-to-pass",
-    // Filled by the story author from symptom/issue text — never the diff.
-    story: null,
-    story_source: null,
+    story: options.story ?? null,
+    story_source: options.storySource ?? null,
   };
   fs.writeFileSync(path.join(gold, "task.json"), `${JSON.stringify(task, null, 2)}\n`);
   return task;
@@ -228,7 +287,11 @@ function main() {
     members: options.members,
     workspace: options.workspace,
     gold: options.gold,
+    setupCommand: options["setup-command"],
     testCommand: options["test-command"],
+    story: options.story,
+    storySource: options["story-source"],
+    workRoot: options["work-root"],
   });
   process.stdout.write(`${JSON.stringify(task, null, 2)}\n`);
 }

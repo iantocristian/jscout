@@ -73,6 +73,11 @@ const DELTA_METRICS = [
   "mean_source_rendered_bytes",
   "mean_source_original_bytes",
   "mean_source_budget_truncations",
+  "mean_jscout_requests",
+  "mean_command_calls",
+  "mean_failed_command_calls",
+  "mean_command_output_bytes",
+  "mean_max_command_output_bytes",
   "mean_inspected_files",
   "mean_irrelevant_files",
   "mean_total_tokens",
@@ -96,6 +101,7 @@ export function buildReport(taskSet, responses, telemetry = []) {
   }
   const taskById = new Map(taskSet.tasks.map((task) => [task.id, task]));
   const profiles = {};
+  const profileTreatments = {};
   const taskResults = [];
 
   for (const response of responses) {
@@ -120,12 +126,17 @@ export function buildReport(taskSet, responses, telemetry = []) {
       task_id: response.task_id,
       category: task.category,
       profile: response.profile,
+      treatment: response.treatment ?? "unspecified",
       session: response.session,
       file_precision: fileScore.precision,
       file_recall: fileScore.recall,
       symbol_precision: symbolScore.precision,
       symbol_recall: symbolScore.recall,
-      correct: typeof response.correct === "boolean" ? response.correct : null,
+      correct: typeof response.correct === "boolean"
+        ? response.correct
+        : typeof response.layer1 === "string"
+          ? response.layer1 === "pass"
+          : null,
       tool_calls: calls.length,
       failed_tool_calls: calls.filter((call) => call.ok === false).length,
       tool_latency_ms: calls.reduce((sum, call) => sum + Number(call.elapsed_ms || 0), 0),
@@ -142,6 +153,19 @@ export function buildReport(taskSet, responses, telemetry = []) {
         (sum, call) => sum + Number(call.source_budget_truncations || 0),
         0,
       ),
+      jscout_requests: Number.isFinite(response.jscout_requests)
+        ? response.jscout_requests
+        : null,
+      command_calls: Number.isFinite(response.command_calls) ? response.command_calls : null,
+      failed_command_calls: Number.isFinite(response.failed_command_calls)
+        ? response.failed_command_calls
+        : null,
+      command_output_bytes: Number.isFinite(response.command_output_bytes)
+        ? response.command_output_bytes
+        : null,
+      max_command_output_bytes: Number.isFinite(response.max_command_output_bytes)
+        ? response.max_command_output_bytes
+        : null,
       inspected_files: inspectedFiles?.size ?? null,
       irrelevant_files: inspectedFiles
         ? [...inspectedFiles].filter((file) => !goldFiles.has(file)).length
@@ -151,12 +175,12 @@ export function buildReport(taskSet, responses, telemetry = []) {
     };
     taskResults.push(result);
     (profiles[response.profile] ??= []).push(result);
+    (profileTreatments[`${response.profile}/${result.treatment}`] ??= []).push(result);
   }
 
-  const summaries = {};
-  for (const [profile, results] of Object.entries(profiles)) {
+  const summarize = (results) => {
     const judged = results.filter((result) => result.correct !== null);
-    summaries[profile] = {
+    return {
       runs: results.length,
       file_precision: mean(results.map((result) => result.file_precision)),
       file_recall: mean(results.map((result) => result.file_recall)),
@@ -172,11 +196,31 @@ export function buildReport(taskSet, responses, telemetry = []) {
       mean_source_budget_truncations: mean(
         results.map((result) => result.source_budget_truncations),
       ),
+      mean_jscout_requests: meanPresent(results.map((result) => result.jscout_requests)),
+      mean_command_calls: meanPresent(results.map((result) => result.command_calls)),
+      mean_failed_command_calls: meanPresent(
+        results.map((result) => result.failed_command_calls),
+      ),
+      mean_command_output_bytes: meanPresent(
+        results.map((result) => result.command_output_bytes),
+      ),
+      mean_max_command_output_bytes: meanPresent(
+        results.map((result) => result.max_command_output_bytes),
+      ),
       mean_inspected_files: meanPresent(results.map((result) => result.inspected_files)),
       mean_irrelevant_files: meanPresent(results.map((result) => result.irrelevant_files)),
       mean_total_tokens: meanPresent(results.map((result) => result.total_tokens)),
       mean_run_duration_ms: meanPresent(results.map((result) => result.run_duration_ms)),
     };
+  };
+
+  const summaries = {};
+  for (const [profile, results] of Object.entries(profiles)) {
+    summaries[profile] = summarize(results);
+  }
+  const treatmentSummaries = {};
+  for (const [profileTreatment, results] of Object.entries(profileTreatments)) {
+    treatmentSummaries[profileTreatment] = summarize(results);
   }
 
   const expectedProfiles = taskSet.profiles ?? ["baseline", "structural"];
@@ -212,6 +256,7 @@ export function buildReport(taskSet, responses, telemetry = []) {
     schema_version: 1,
     repository: taskSet.repository,
     profiles: summaries,
+    profile_treatments: treatmentSummaries,
     structural_minus_baseline: structuralMinusBaseline,
     profile_deltas: profileDeltas,
     missing,

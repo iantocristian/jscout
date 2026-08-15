@@ -19,6 +19,7 @@ test("evaluation report joins task outcomes to profile/session telemetry", () =>
     {
       task_id: "path",
       profile: "baseline",
+      treatment: "skill",
       session: "base-1",
       files: ["a.ts"],
       symbols: ["a"],
@@ -29,6 +30,7 @@ test("evaluation report joins task outcomes to profile/session telemetry", () =>
     {
       task_id: "path",
       profile: "structural",
+      treatment: "forced",
       session: "graph-1",
       files: ["a.ts", "b.ts"],
       symbols: ["a", "b"],
@@ -64,6 +66,8 @@ test("evaluation report joins task outcomes to profile/session telemetry", () =>
   assert.equal(report.structural_minus_baseline.file_recall, 0.5);
   assert.equal(report.profiles.structural.mean_tool_calls, 1);
   assert.equal(report.profiles.baseline.mean_irrelevant_files, 1);
+  assert.equal(report.profile_treatments["baseline/skill"].runs, 1);
+  assert.equal(report.profile_treatments["structural/forced"].correctness_rate, 1);
   assert.equal(report.structural_minus_baseline.mean_total_tokens, -300);
   assert.deepEqual(report.missing, []);
 });

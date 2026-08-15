@@ -18,10 +18,12 @@
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+
+import { overlayHiddenTests } from "./eval-hidden-tests.mjs";
+import { cloneTree } from "./eval-tree-clone.mjs";
 
 const IGNORED = new Set(["node_modules", ".git", ".jscout.db", ".jscout.db-wal", ".jscout.db-shm"]);
 
@@ -52,6 +54,22 @@ export function diffTrees(pristineDir, workspaceDir) {
     if (!workspace.has(file)) changed.push({ file, status: "deleted" });
   }
   return changed.sort((a, b) => a.file.localeCompare(b.file));
+}
+
+export function diffGit(workspaceDir) {
+  const rows = execFileSync("git", ["diff", "--name-status", "HEAD"], {
+    cwd: workspaceDir,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  }).split(/\r?\n/).filter(Boolean);
+  return rows.map((row) => {
+    const parts = row.split("\t");
+    const status = parts[0][0];
+    return {
+      file: parts[parts.length - 1],
+      status: status === "A" ? "added" : status === "D" ? "deleted" : "modified",
+    };
+  }).sort((left, right) => left.file.localeCompare(right.file));
 }
 
 export function scoreCoverage({ goldFiles, patchedFiles, planMentioned, adjudications }) {
@@ -97,20 +115,24 @@ export function scoreCoverage({ goldFiles, patchedFiles, planMentioned, adjudica
   };
 }
 
-function runLayer1(workspaceDir, goldDir, testCommand) {
+function runLayer1(workspaceDir, goldDir, testCommand, inPlace = false, workRoot = "/tmp/jr") {
   const testsPatch = path.join(goldDir, "gold-tests.patch");
   if (!fs.existsSync(testsPatch)) return { status: "no-tests" };
   if (!testCommand) return { status: "skipped" };
-  const probe = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-replay-grade-"));
+  if (!inPlace) fs.mkdirSync(workRoot, { recursive: true });
+  const probeRoot = inPlace ? null : fs.mkdtempSync(path.join(workRoot, "g-"));
+  const probe = inPlace ? workspaceDir : path.join(probeRoot, "workspace");
   try {
-    fs.cpSync(workspaceDir, probe, { recursive: true });
-    try {
-      execFileSync("git", ["apply", testsPatch], { cwd: probe, encoding: "utf8" });
-    } catch (error) {
-      return {
-        status: "tests-did-not-apply",
-        detail: `${error.stderr ?? error.message}`.trim().split("\n").slice(-3).join("\n"),
-      };
+    if (!inPlace) cloneTree(workspaceDir, probe);
+    if (!overlayHiddenTests(goldDir, probe)) {
+      try {
+        execFileSync("git", ["apply", testsPatch], { cwd: probe, encoding: "utf8" });
+      } catch (error) {
+        return {
+          status: "tests-did-not-apply",
+          detail: `${error.stderr ?? error.message}`.trim().split("\n").slice(-3).join("\n"),
+        };
+      }
     }
     try {
       execFileSync("sh", ["-c", testCommand], {
@@ -121,10 +143,15 @@ function runLayer1(workspaceDir, goldDir, testCommand) {
       });
       return { status: "pass", exit_code: 0 };
     } catch (error) {
-      return { status: "fail", exit_code: error.status ?? 1 };
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      return {
+        status: "fail",
+        exit_code: error.status ?? 1,
+        output_tail: output.split("\n").slice(-40).join("\n"),
+      };
     }
   } finally {
-    fs.rmSync(probe, { recursive: true, force: true });
+    if (probeRoot) fs.rmSync(probeRoot, { recursive: true, force: true });
   }
 }
 
@@ -138,7 +165,7 @@ function parseArgs(argv) {
     }
     options[flag.slice(2)] = value;
   }
-  for (const required of ["pristine", "workspace", "gold"]) {
+  for (const required of ["workspace", "gold"]) {
     if (!options[required]) throw new Error(`--${required} is required`);
   }
   return options;
@@ -150,7 +177,10 @@ function main() {
   const task = JSON.parse(fs.readFileSync(path.join(goldDir, "task.json"), "utf8"));
   const goldFiles = task.files.code;
 
-  const changes = diffTrees(path.resolve(options.pristine), path.resolve(options.workspace));
+  const workspaceDir = path.resolve(options.workspace);
+  const changes = options.pristine
+    ? diffTrees(path.resolve(options.pristine), workspaceDir)
+    : diffGit(workspaceDir);
   const response = options.response
     ? JSON.parse(fs.readFileSync(options.response, "utf8"))
     : {};
@@ -166,7 +196,13 @@ function main() {
   });
 
   const layer1 = task.layer1_eligible
-    ? runLayer1(path.resolve(options.workspace), goldDir, options["test-command"])
+    ? runLayer1(
+        workspaceDir,
+        goldDir,
+        options["test-command"],
+        options["in-place"] === "true",
+        path.resolve(options["work-root"] ?? "/tmp/jr"),
+      )
     : { status: "not-eligible" };
 
   const report = {

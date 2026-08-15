@@ -395,20 +395,29 @@ history-free snapshot; grading compares against the real implementation.
    certify each story against the gold patch files with
    `eval-anchor-certify.mjs` (must not be `anchored`).
 
-3. **Snapshot** each admitted task. The workspace is a `git archive` export
+3. **Prepare** each admitted task. The workspace is a `git archive` export
    with **no `.git`** (a parent checkout still contains the real commit in
    its object store); the gold bundle lives outside the agent sandbox and
-   must never be mounted into it. `--test-command` runs the fail-to-pass
-   admission gate: the test-only patch must apply independently and FAIL on
-   the parent, else the task is layer-1 ineligible:
+   must never be mounted into it. Repository-specific `setup_command` and
+   `test_command` values live in the task set. Setup installs dependencies and
+   builds the historical parent once; then the test-only patch must apply
+   independently and FAIL, else the task is layer-1 ineligible:
 
    ```bash
-   node scripts/eval-pr-snapshot.mjs --repository /path/to/repo \
-     --sha <merged-sha> --workspace /runs/<task>/workspace \
-     --gold /runs/<task>/gold --test-command "npm test"
+   node scripts/eval-pr-prepare.mjs \
+     --tasks eval/tasks/next-calibration.json \
+     --repository /path/to/next.js \
+     --runs-root /runs/next-calibration \
+     --work-root /tmp/jr
    ```
 
-   Keep a pristine copy of the workspace before the agent touches it.
+   The prepared `pristine/` tree includes `node_modules` and build outputs.
+   Preparation and grading use copy-on-write clones when supported so those
+   gigabytes are not recopied for every admission probe and execution arm.
+   Admission overlays exact post-change test files onto two throwaway clones:
+   they must fail on the parent and pass after the reference production patch.
+   Exact overlays are used instead of `git apply` during grading because an
+   agent may legitimately edit the same public test file.
 
 4. **Run** the agent in the workspace (± jscout arms, counterbalanced,
    ≥2 trials), then **grade**:
@@ -432,12 +441,17 @@ history-free snapshot; grading compares against the real implementation.
    registered claims).
 
 5. **Batch runs** use the dedicated runner (write-sandbox, per-run workspace
-   copies, per-arm indexing, automatic grading; `--codex` is overridable for
-   stubbed tests):
+   workspaces, per-arm indexing, automatic grading; `--codex` is overridable
+   for stubbed tests). Each jscout arm installs the shipped project-local skill
+   into the synthetic baseline and verifies that the agent did not alter it.
+   It also retains a per-session
+   `jscout-requests.jsonl` containing every MCP request and exact tool
+   arguments; the shared privacy-minimal telemetry remains the metrics input:
 
    ```bash
    node scripts/eval-run-replay.mjs \
      --tasks eval/tasks/ai-pipe-replay-pilot.json \
+     --repository /path/to/source-clone \
      --runs-root /Users/cristian/git/jscout-replay-runs/ai-pipe \
      --jscout "$PWD/target/release/jscout" \
      --responses /tmp/replay-responses.jsonl \
@@ -445,6 +459,61 @@ history-free snapshot; grading compares against the real implementation.
      --artifacts /tmp/replay-artifacts \
      --profiles grep,structural --trial 001
    ```
+
+   Every arm independently exports the parent into a short-path workspace,
+   installs dependencies, and builds. The short path avoids package-manager
+   filename-limit failures in large monorepos. The runner then creates a
+   synthetic one-commit repository, with no
+   remote or upstream history, for exact patch capture. Agents may run local
+   package-manager/build/test commands. Their prompt forbids the source clone,
+   other filesystem paths, GitHub/remotes, and web search; package-registry
+   access for declared dependencies is the only allowed network use.
+
+   Response rows preserve input, cached input, derived non-cached input,
+   output, reasoning-output, and total token counts alongside wall time. Raw
+   Codex JSONL remains authoritative if accounting fields change in a later
+   CLI version. They also record command counts, failures, total command-output
+   bytes, and the largest single command output. `eval-report.mjs` keeps
+   `profile/treatment` summaries separate instead of silently pooling
+   skill-only and forced-search runs.
+
+   PR-replay calibration supports these cumulative jscout profiles:
+
+   - `structural`: parser-derived index and graph;
+   - `checker`: structural plus `jscout enrich`;
+   - `checker-embed`: checker plus local embeddings/reranking;
+   - `checker-scout`: checker plus repository LLM reconnaissance;
+   - `checker-scout-embed`: checker, reconnaissance, and product embeddings.
+
+   Each jscout profile runs twice by default. `skill` installs the shipped
+   skill without a prompt instruction; `forced` requires jscout exclusively
+   for repository-wide code discovery while still permitting direct reads of
+   localized files, edits, builds, and tests. Pass `--treatments skill` or
+   `--treatments forced` to run only one. The two treatments reuse a
+   copy-on-write clone of the same prepared database so embeddings and scout
+   generations are not repeated or allowed to vary between them. Grep remains
+   a single `control` treatment.
+
+   ```bash
+   node scripts/eval-run-replay.mjs \
+     --tasks eval/tasks/next-calibration.json \
+     --repository /path/to/next.js \
+     --runs-root /runs/next-calibration \
+     --jscout "$PWD/target/release/jscout" \
+     --responses /runs/next-matrix/responses.jsonl \
+     --telemetry /runs/next-matrix/telemetry.jsonl \
+     --artifacts /runs/next-matrix/artifacts \
+     --profiles structural,checker,checker-embed,checker-scout,checker-scout-embed \
+     --treatments skill,forced --work-root /tmp/jr --trial calibration-001
+   ```
+
+   Embedding profiles require the local inference service. Repository-scout
+   profiles use the configured pi-ai gateway and share the command-level
+   `--scout-max-calls` budget (default 64) per prepared profile. The separate
+   `--scout-max-subjects` inventory bound defaults to 512 so large repositories
+   retain room for bounded subdivision without increasing model calls. Short-path
+   workspaces are deleted after patch capture and grading by default; use
+   `--keep-workspaces true` only for a debugging run.
 
 The task unit is a **change arc**, not a single PR/commit: seed + every
 semantically related follow-up until the feature stabilized (see
@@ -469,5 +538,6 @@ All stories certify `weak` or better; snapshots under
 **Harness-validation corpus only**:
 [`tasks/ai-pipe-replay-pilot.json`](tasks/ai-pipe-replay-pilot.json) — ai-pipe
 is mostly AI-generated code, so it validates the pipeline, not product value.
-Layer 1 is deferred for all pilots (test commands need installed
-dependencies); a future `--setup-command` unlocks it.
+Layer 1 is deferred for the older pilots whose task files do not declare setup
+commands. `tasks/next-calibration.json` exercises the complete prepared-base
+and fail-to-pass path on a real monorepo.

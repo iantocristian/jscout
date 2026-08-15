@@ -6,10 +6,35 @@ import path from "node:path";
 import test from "node:test";
 
 import { buildSnapshot } from "./eval-pr-snapshot.mjs";
+import { profilePlan, promptFor } from "./eval-run-replay.mjs";
 
 function git(repo, args) {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
 }
+
+test("replay profiles and forced-search contract are explicit", () => {
+  assert.deepEqual(profilePlan("structural"), { usesJscout: true, stages: [] });
+  assert.deepEqual(profilePlan("checker"), { usesJscout: true, stages: ["enrich"] });
+  assert.deepEqual(profilePlan("checker-embed"), {
+    usesJscout: true,
+    stages: ["enrich", "embed"],
+  });
+  assert.deepEqual(profilePlan("checker-scout"), {
+    usesJscout: true,
+    stages: ["enrich", "scout"],
+  });
+  assert.deepEqual(profilePlan("checker-scout-embed"), {
+    usesJscout: true,
+    stages: ["enrich", "scout", "embed-product"],
+  });
+  assert.throws(() => profilePlan("invented"), /unknown profile/);
+
+  const natural = promptFor({ story: "Fix it." }, "skill");
+  const forced = promptFor({ story: "Fix it." }, "forced");
+  assert.ok(!natural.includes("Do not use grep"));
+  assert.ok(forced.includes("Use jscout exclusively"));
+  assert.ok(forced.includes("directly read files and line ranges identified by jscout"));
+});
 
 // End-to-end: fixture repo -> snapshot -> stubbed agent edits one gold file
 // -> runner grades the workspace and records patched vs pending adjudication.
@@ -72,6 +97,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   execFileSync(process.execPath, [
     runner,
     "--tasks", tasksFile,
+    "--repository", repo,
     "--runs-root", runsRoot,
     "--jscout", "/bin/true",
     "--responses", responses,
@@ -86,15 +112,24 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   assert.equal(rows.length, 1);
   const row = rows[0];
   assert.equal(row.task_id, "replay-fixture");
+  assert.equal(row.treatment, "control");
   assert.equal(row.model, "gpt-5.6-terra");
   assert.deepEqual(row.patched_files, ["src/a.js"]);
   assert.equal(row.gold_matched, 1);
   assert.equal(row.gold_pending_adjudication, 1, "src/b.js must be pending adjudication");
   assert.equal(row.total_tokens, 15);
+  assert.equal(row.input_tokens, 10);
+  assert.equal(row.cached_input_tokens, 0);
+  assert.equal(row.noncached_input_tokens, 10);
+  assert.equal(row.output_tokens, 5);
+  assert.equal(row.command_calls, 0);
+  assert.equal(row.failed_command_calls, 0);
+  assert.equal(row.command_output_bytes, 0);
+  assert.equal(row.max_command_output_bytes, 0);
   assert.equal(row.runner_error, undefined);
 
   const grade = JSON.parse(
-    fs.readFileSync(path.join(base, "artifacts", "grep-replay-fixture-t1", "grade.json"), "utf8"),
+    fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "grade.json"), "utf8"),
   );
   // Plan mentioned both files; patched metrics must not be inflated by that.
   assert.deepEqual(grade.coverage.patched.matched, ["src/a.js"]);
