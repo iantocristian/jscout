@@ -267,7 +267,7 @@ function gitCommitWithoutHooks(workspace, args) {
   });
 }
 
-function prepareArm(repository, parent, workspace, setupCommand, runDir) {
+function prepareArm(repository, parent, workspace, setupCommand, runDir, env) {
   fs.mkdirSync(workspace, { recursive: true });
   const tar = path.join(os.tmpdir(), `jscout-arm-${parent.slice(0, 12)}-${process.pid}.tar`);
   execFileSync("git", ["-C", repository, "archive", "--format=tar", "-o", tar, parent]);
@@ -286,6 +286,7 @@ function prepareArm(repository, parent, workspace, setupCommand, runDir) {
     runLogged("sh", ["-c", setupCommand], {
       cwd: workspace,
       log: path.join(runDir, "setup.log"),
+      env,
     });
     // If setup changed an archived/tracked file, make that prepared state the
     // baseline. Generated and dependency files remain ignored.
@@ -347,10 +348,12 @@ function prepareJscoutProfile({
   scoutMaxSubjects,
   scoutWarnSubjects,
   baseDatabase,
+  executionEnvironment,
 }) {
   const plan = profilePlan(profile);
   const env = {
     ...process.env,
+    ...executionEnvironment,
     ...(plan.stages.some((stage) => stage.startsWith("embed"))
       ? { JSCOUT_EMBED_PROVIDER: "local" }
       : {}),
@@ -409,6 +412,22 @@ function prepareJscoutProfile({
       );
     }
   }
+}
+
+function resolveExecutionEnvironment(taskSet, task) {
+  const merged = {
+    ...(taskSet.execution_environment ?? {}),
+    ...(task.execution_environment ?? {}),
+  };
+  for (const [name, value] of Object.entries(merged)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`invalid execution-environment variable name: ${name}`);
+    }
+    if (typeof value !== "string") {
+      throw new Error(`execution-environment value for ${name} must be a string`);
+    }
+  }
+  return merged;
 }
 
 function saveAgentPatch(workspace, output) {
@@ -575,6 +594,8 @@ async function main() {
       if (!fs.existsSync(required)) throw new Error(`missing snapshot directory: ${required}`);
     }
     if (!task.story) throw new Error(`task ${task.id} has no story`);
+    const executionEnvironment = resolveExecutionEnvironment(taskSet, task);
+    const childEnvironment = { ...process.env, ...executionEnvironment };
     const goldTask = JSON.parse(fs.readFileSync(path.join(gold, "task.json"), "utf8"));
     const parent = task.parent ?? goldTask.parent;
     if (!parent) throw new Error(`task ${task.id} has no parent revision`);
@@ -612,6 +633,7 @@ async function main() {
           workspace,
           task.setup_command ?? taskSet.setup_command,
           runDir,
+          childEnvironment,
         );
 
         let installedSkillSha = null;
@@ -652,6 +674,7 @@ async function main() {
                 scoutMaxSubjects,
                 scoutWarnSubjects,
                 baseDatabase,
+                executionEnvironment,
               });
               fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
               copyDatabase(database, profileDatabase);
@@ -714,6 +737,7 @@ async function main() {
         process.stderr.write(`[${task.id}] ${profile}/${treatment} — live events: ${eventsPath}\n`);
         const result = await run(options.codex, args, {
           cwd: workspace,
+          env: childEnvironment,
           eventsPath,
           stderrPath,
           timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
@@ -753,7 +777,7 @@ async function main() {
               ? ["--test-command", task.test_command ?? taskSet.test_command]
               : []),
             "--output", gradePath,
-          ], { encoding: "utf8" });
+          ], { encoding: "utf8", env: childEnvironment });
         } catch (error) {
           runnerError = runnerError ?? `grading failed: ${`${error.stderr ?? error.message}`.slice(0, 300)}`;
         }
@@ -794,6 +818,7 @@ async function main() {
             : 0,
           execution_network_access: REPLAY_EXECUTION_POLICY.networkAccess,
           execution_network_policy: REPLAY_EXECUTION_POLICY.networkPolicy,
+          execution_environment: executionEnvironment,
         };
         if (runnerError) row.runner_error = runnerError;
         fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);

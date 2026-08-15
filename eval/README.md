@@ -535,6 +535,13 @@ history-free snapshot; grading compares against the real implementation.
    copied into the replacement arm instead of repeating indexing, enrichment,
    scouting, or embedding.
 
+   A suite or task may declare an `execution_environment` object of string
+   environment variables. The runner validates and records it, then passes the
+   same values to setup, the agent, jscout preparation, and grading. The Next.js
+   cache replay uses `WATCHPACK_POLLING=250` because native Watchpack watchers
+   exhaust the Codex sandbox's descriptor allowance even when no orphaned test
+   process exists.
+
 The task unit is a **change arc**, not a single PR/commit: seed + every
 semantically related follow-up until the feature stabilized (see
 [`value-hypotheses-2026-08-09.md`](value-hypotheses-2026-08-09.md)). Arc

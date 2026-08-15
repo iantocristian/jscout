@@ -105,6 +105,7 @@ test("replay runner drives workspace, stub agent, and grading end to end", () =>
   fs.writeFileSync(
     tasksFile,
     JSON.stringify({
+      execution_environment: { JSCOUT_REPLAY_TEST_ENV: "enabled" },
       tasks: [{ id: "replay-fixture", sha, story: "Inputs should be incremented." }],
     }),
   );
@@ -120,6 +121,7 @@ import path from "node:path";
 const argv = process.argv.slice(2);
 const value = (flag) => argv[argv.indexOf(flag) + 1];
 const workspace = value("--cd");
+if (process.env.JSCOUT_REPLAY_TEST_ENV !== "enabled") throw new Error("execution environment missing");
 fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
 if (fs.existsSync(path.join(workspace, "gold"))) throw new Error("gold leaked into workspace");
 fs.appendFileSync(path.join(workspace, "src/a.js"), "// stub edit\\n");
@@ -170,6 +172,7 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     row.execution_network_policy,
     "prompt-restricted-external; loopback-required",
   );
+  assert.deepEqual(row.execution_environment, { JSCOUT_REPLAY_TEST_ENV: "enabled" });
   assert.equal(row.runner_error, undefined);
 
   const agentArgv = JSON.parse(
