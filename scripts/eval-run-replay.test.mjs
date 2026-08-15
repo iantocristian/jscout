@@ -27,11 +27,18 @@ test("replay profiles and forced-search contract are explicit", () => {
     usesJscout: true,
     stages: ["enrich", "scout", "embed-product"],
   });
+  assert.deepEqual(profilePlan("production-order"), {
+    usesJscout: true,
+    stages: ["scout", "enrich", "embed-product"],
+  });
   assert.throws(() => profilePlan("invented"), /unknown profile/);
 
   const natural = promptFor({ story: "Fix it." }, "skill");
   const forced = promptFor({ story: "Fix it." }, "forced");
   assert.ok(!natural.includes("Do not use grep"));
+  assert.ok(natural.includes("Dependencies are already installed"));
+  assert.ok(natural.includes("localhost test servers"));
+  assert.ok(natural.includes("do not access external network services"));
   assert.ok(forced.includes("Use jscout exclusively"));
   assert.ok(forced.includes("directly read files and line ranges identified by jscout"));
 });
@@ -82,6 +89,7 @@ import path from "node:path";
 const argv = process.argv.slice(2);
 const value = (flag) => argv[argv.indexOf(flag) + 1];
 const workspace = value("--cd");
+fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
 if (fs.existsSync(path.join(workspace, "gold"))) throw new Error("gold leaked into workspace");
 fs.appendFileSync(path.join(workspace, "src/a.js"), "// stub edit\\n");
 fs.writeFileSync(value("--output-last-message"), JSON.stringify({
@@ -126,7 +134,17 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   assert.equal(row.failed_command_calls, 0);
   assert.equal(row.command_output_bytes, 0);
   assert.equal(row.max_command_output_bytes, 0);
+  assert.equal(row.execution_network_access, true);
+  assert.equal(
+    row.execution_network_policy,
+    "prompt-restricted-external; loopback-required",
+  );
   assert.equal(row.runner_error, undefined);
+
+  const agentArgv = JSON.parse(
+    fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "agent-argv.json"), "utf8"),
+  );
+  assert.ok(agentArgv.includes("sandbox_workspace_write.network_access=true"));
 
   const grade = JSON.parse(
     fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "grade.json"), "utf8"),

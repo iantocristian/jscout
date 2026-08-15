@@ -465,9 +465,12 @@ history-free snapshot; grading compares against the real implementation.
    filename-limit failures in large monorepos. The runner then creates a
    synthetic one-commit repository, with no
    remote or upstream history, for exact patch capture. Agents may run local
-   package-manager/build/test commands. Their prompt forbids the source clone,
-   other filesystem paths, GitHub/remotes, and web search; package-registry
-   access for declared dependencies is the only allowed network use.
+   existing package-manager scripts, builds, and tests. Their prompt forbids
+   the source clone, other filesystem paths, GitHub/remotes, and web search;
+   web/browser tools are disabled and the complete command stream is retained.
+   Direct network capability remains enabled because Next.js dev tests require
+   loopback and Codex's macOS no-network sandbox blocks loopback too. External
+   access remains prompt-restricted and auditable, not technically isolated.
 
    Response rows preserve input, cached input, derived non-cached input,
    output, reasoning-output, and total token counts alongside wall time. Raw
@@ -484,6 +487,8 @@ history-free snapshot; grading compares against the real implementation.
    - `checker-embed`: checker plus local embeddings/reranking;
    - `checker-scout`: checker plus repository LLM reconnaissance;
    - `checker-scout-embed`: checker, reconnaissance, and product embeddings.
+   - `production-order`: reconnaissance before checker enrichment, followed by
+     product-only embeddings.
 
    Each jscout profile runs twice by default. `skill` installs the shipped
    skill without a prompt instruction; `forced` requires jscout exclusively

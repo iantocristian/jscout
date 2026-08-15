@@ -158,6 +158,7 @@ const PROFILE_PLANS = Object.freeze({
   "checker-embed": ["enrich", "embed"],
   "checker-scout": ["enrich", "scout"],
   "checker-scout-embed": ["enrich", "scout", "embed-product"],
+  "production-order": ["scout", "enrich", "embed-product"],
 });
 
 const PROFILE_BASES = Object.freeze({
@@ -337,7 +338,9 @@ export function promptFor(task, treatment = "control") {
     "## Contract",
     "- Implement the change directly in the working directory; edit files as needed.",
     "- Investigate enough to cover every place the change genuinely affects.",
-    "- You may run package-manager install, build, formatting, and test commands.",
+    "- Dependencies are already installed. You may run existing package-manager",
+    "  scripts, builds, formatting, and tests, including localhost test servers.",
+    "- Do not install or update dependencies and do not access external network services.",
   ];
   if (treatment === "forced") {
     contract.push(
@@ -351,8 +354,7 @@ export function promptFor(task, treatment = "control") {
   contract.push(
     "- Work only inside this synthetic one-commit snapshot. Do not inspect other",
     "  filesystem locations, GitHub, upstream Git history/remotes, or web/search",
-    "  services. Do not fetch or clone repositories. Network use is limited to",
-    "  package-manager access required for declared dependencies.",
+    "  services. Do not fetch or clone repositories.",
     "- Finish with a JSON object matching the output schema: `answer` is a short",
     "  summary of what you changed and why; `files` lists every file you judged",
     "  relevant to the change (changed or deliberately left alone); `symbols`",
@@ -499,6 +501,10 @@ async function main() {
           "--config", "features.computer_use=false",
           "--config", "features.plugins=false",
           "--config", "tools.web_search=false",
+          // Next.js dev tests bind loopback servers. Codex's macOS no-network
+          // sandbox blocks loopback as well as external traffic, so execution
+          // keeps network capability while the prompt, empty remotes, disabled
+          // web tools, and retained command stream enforce/audit the boundary.
           "--config", "sandbox_workspace_write.network_access=true",
         ];
         if (usesJscout) {
@@ -598,6 +604,8 @@ async function main() {
                 : "",
             ).filter((entry) => entry.method === "tools/call").length
             : 0,
+          execution_network_access: true,
+          execution_network_policy: "prompt-restricted-external; loopback-required",
         };
         if (runnerError) row.runner_error = runnerError;
         fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "suite": "next-pr-replay-stale-development-cache",
+  "status": "admitted",
+  "profiles": [
+    "grep",
+    "structural",
+    "checker",
+    "checker-embed",
+    "checker-scout",
+    "checker-scout-embed",
+    "production-order"
+  ],
+  "treatments": ["skill", "forced"],
+  "repository": {
+    "name": "next.js",
+    "source": "https://github.com/vercel/next.js"
+  },
+  "setup_command": "corepack pnpm install --frozen-lockfile && corepack pnpm build",
+  "test_command": "corepack pnpm build && corepack pnpm test-dev-webpack test/e2e/app-dir/use-cache-dev/use-cache-dev.test.ts && corepack pnpm test-dev-turbo test/e2e/app-dir/use-cache-dev/use-cache-dev.test.ts",
+  "notes": [
+    "The agent receives a history-free archive of the parent commit and a synthetic one-commit baseline.",
+    "The source clone, upstream history, pull requests, gold patch, and hidden tests remain outside the agent workspace.",
+    "Webpack and Turbopack development-mode behavior are independently required by the hidden oracle.",
+    "Every profile is prepared from a fresh source snapshot and database for this task; no headers-calibration artifacts are reused."
+  ],
+  "admission": {
+    "anchor_certificate": "weak",
+    "identifier_anchors": 0,
+    "contamination_probe": "clean",
+    "contamination_model": "gpt-5.6-terra",
+    "contamination_reasoning": "high",
+    "setup": "pass",
+    "hidden_tests": "fail-to-pass",
+    "oracle_bundlers": ["webpack", "turbopack"]
+  },
+  "tasks": [
+    {
+      "id": "next-stale-development-cache",
+      "sha": "286862e35bbc4fa7c023077cf794d5852063463a",
+      "parent": "70f8b678877ba69f266e1522fcfacb95cfd3c76e",
+      "story_source": "stale-development-cache-behavior",
+      "story": "In development, cached server computations update after an edit for an existing browser tab, but remain stale for curl, fresh clients, and route handlers. Fix this for both bundlers without invalidating when no source content changed.",
+      "contamination_prompt": "where would you fix development cached server computations that update after an edit for an existing browser tab but remain stale for curl, fresh clients, and route handlers, across both development bundlers, without invalidating when source content did not change?",
+      "gold": {
+        "files": [
+          "packages/next/src/build/templates/app-route.ts",
+          "packages/next/src/client/components/app-router-headers.ts",
+          "packages/next/src/client/dev/hot-reloader/app/hot-reloader-app.tsx",
+          "packages/next/src/server/app-render/app-render.tsx",
+          "packages/next/src/server/app-render/work-unit-async-storage.external.ts",
+          "packages/next/src/server/async-storage/request-store.ts",
+          "packages/next/src/server/async-storage/work-store.ts",
+          "packages/next/src/server/base-server.ts",
+          "packages/next/src/server/dev/hot-reloader-turbopack.ts",
+          "packages/next/src/server/dev/hot-reloader-types.ts",
+          "packages/next/src/server/dev/hot-reloader-webpack.ts",
+          "packages/next/src/server/dev/next-dev-server.ts",
+          "packages/next/src/server/dev/turbopack-utils.ts",
+          "packages/next/src/server/dev/use-cache-probe-worker.ts",
+          "packages/next/src/server/lib/dev-bundler-service.ts",
+          "packages/next/src/server/request-meta.ts",
+          "packages/next/src/server/route-modules/app-route/module.ts",
+          "packages/next/src/server/use-cache/use-cache-probe-globals.ts",
+          "packages/next/src/server/use-cache/use-cache-probe-scheduler.ts",
+          "packages/next/src/server/use-cache/use-cache-wrapper.ts",
+          "packages/next/src/server/web/adapter.ts"
+        ],
+        "symbols": [
+          "getServerComponentsHmrRefreshHash",
+          "getHmrRefreshHash",
+          "refreshServerComponents",
+          "createRequestStoreForRender",
+          "createRequestStoreForAPI",
+          "handleRouteType"
+        ]
+      }
+    }
+  ]
+}

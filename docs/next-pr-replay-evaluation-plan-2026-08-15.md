@@ -92,7 +92,7 @@ recommends building first and then using targeted modes such as
 
 During the agent turn:
 
-- disable network access entirely; dependency installation belongs to
+- prohibit external network use; dependency installation belongs to
   preparation, not execution;
 - provide only the synthetic repository and the tools declared by the arm;
 - install the shipped jscout skill in every jscout arm and verify its hash
@@ -103,9 +103,12 @@ During the agent turn:
 - retain the complete Codex event stream, command log, token accounting, and
   patch.
 
-The current replay runner still permits package-registry network access during
-the agent turn. Removing that access after preparation is a required harness
-change, not an already-enforced property.
+Codex's macOS no-network sandbox also blocks loopback binds, which makes the
+Next.js development oracle impossible to exercise. The runner therefore keeps
+direct network capability enabled, disables web/browser tools, removes Git
+remotes and history, prohibits external access in the prompt, and retains the
+complete command stream for audit. This is prompt-restricted rather than hard
+network isolation; localhost test servers remain part of the bounded contract.
 
 ### 4. Source and database independence
 
@@ -177,7 +180,7 @@ never be pooled.
 | `checker-embed` | checker + full local embeddings/reranking | `skill`, `forced` | Marginal value of vector retrieval without scout filtering. |
 | `checker-scout` | checker + repository scout overlay | `skill`, `forced` | Controlled additive scout comparison using the same checker facts. |
 | `checker-scout-embed` | checker + scout + product-only embeddings | `skill`, `forced` | Controlled additive combined profile used in calibration. |
-| `production-order` | structural + scout + checker + product-only embeddings | `skill`, `forced` | Operational ordering in which scouting can exclude tooling before checker and embedding work. Runner support is pending. |
+| `production-order` | structural + scout + checker + product-only embeddings | `skill`, `forced` | Operational ordering in which scouting can exclude tooling before checker and embedding work. |
 
 The controlled additive profiles continue to enrich before scouting so they
 can reuse the same checker fact set and isolate the scout overlay. The new
@@ -213,9 +216,9 @@ design, not calibration results.
    default.
 8. **Include the JSX-in-`.js` parser correction.** The coverage fix is part of
    the common jscout baseline for future Next.js runs, not a treatment.
-9. **Disable execution-time network access.** Installation and the initial
-   build happen before the agent starts. This runner hardening is still
-   pending.
+9. **Restrict execution-time network use.** Installation and the initial build
+   happen before the agent starts. External access is prohibited and audited,
+   while loopback remains available for framework tests.
 10. **Use harder tasks and multiple trials.** The headers task calibrates the
     harness; it does not replace discriminating implementation tasks.
 
@@ -244,7 +247,7 @@ them into one score.
 | Priority | Candidate | Base | Reference | Scope | Status |
 |---:|---|---|---|---|---|
 | Calibration | `headers()` live sealed view | `ac65c6b` | `3c97df5` | 8 files | Already run as the initial 11-arm calibration. |
-| 1 | Stale development cache for curl and route handlers | `70f8b67` | `286862e` | 26 files, roughly 700 changed lines | Recommended first hard implementation task. |
+| 1 | Stale development cache for curl and route handlers | `70f8b67` | `286862e` | 26 files, roughly 700 changed lines | Admitted; matrix pending. |
 | 2 | Optimistic routing infinite prefetch loop | `7cb68c1` | `5942b37` | 26 files, roughly 900 additions | Hardest implementation task in this slate. |
 | 3 | Server Actions on dynamic PPR fallback routes | `5e8f31f` | `1ab0f1a` | 13 files | Architecture and workflow-localization task. |
 | 4 | Middleware Node request-stream hang | `a37068f` | `3bb780e` | 6 files | Small fix with a symptom remote from its cause. |
@@ -261,6 +264,9 @@ them into one score.
 - Size: 26 files, roughly 700 changed lines
 - Surfaces: browser HMR state, Webpack stats, Turbopack updates, request
   metadata, request/work stores, route handlers, and the cache wrapper
+- Admission: weak lexical certificate with no identifier anchors; clean
+  Terra/high no-tools contamination probe; fresh install/build passed; the
+  dual Webpack/Turbopack oracle fails on the parent and passes on the reference
 
 Anchor-free story:
 
@@ -398,10 +404,7 @@ Do not mix architecture-answer scoring with implementation-task pass/fail.
 
 ## Next execution sequence
 
-1. Enforce no network during the agent turn.
-2. Add the separate production-order preparation profile.
-3. Prepare and admit the stale-development-cache task, including its bounded
-   Webpack and Turbopack oracles.
-4. Run the complete matrix with at least two counterbalanced trials.
-5. Select the next task based on uncovered subsystem diversity, not on which
+1. Run the admitted stale-development-cache matrix with the separate
+   production-order profile and at least two counterbalanced trials.
+2. Select the next task based on uncovered subsystem diversity, not on which
    arm performed best in the first hard task.
