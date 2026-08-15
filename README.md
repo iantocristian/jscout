@@ -271,6 +271,17 @@ files within each priority tier. `--dry-run` reports discovered, eligible,
 selected, omitted, project, and configuration counts after a configuration-only
 ownership pass and does not construct a TypeScript Program.
 
+Two default exclusions remove occurrences whose declarations cannot anchor to
+the index: calls on an unshadowed ECMAScript/host global (`console`, `JSON`,
+`Object`, …) or on a receiver whose import binding resolves a Node core module
+(`path`, `fs`, `node:*`), and calls whose member name has indexed namesakes
+only outside effective-runtime files. Both are `--all`-bypassable and reported
+as separate skip counts. The sidecar labels every returned declaration's
+provenance (`repo`, `types`, `lib`, `vendored`, `outside`); non-repository
+declarations skip the anchoring lookup but still count as unmapped, so
+confidences are unchanged and the report attributes refusals by provenance in
+`unmapped_declaration_contexts`.
+
 Configured projects start with a deterministic purpose classification. Explicit
 lint configurations such as `tsconfig.eslint.json` are removed from a file's
 ownership set when a non-tooling project still owns that file; they remain as

@@ -35,11 +35,15 @@ pub struct EnrichReport {
     pub occurrences_eligible: usize,
     pub occurrences_selected: usize,
     pub occurrences_omitted: usize,
+    pub occurrences_skipped_builtin_receiver: usize,
+    pub occurrences_skipped_foreign_namesake: usize,
     pub occurrences_resumed: usize,
     pub request_batches: usize,
     pub unknown_answers: usize,
     pub unknown_projects: Vec<String>,
     pub unmapped_declarations: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub unmapped_declaration_contexts: BTreeMap<String, usize>,
     pub facts_published: usize,
     pub checker_version: String,
     pub checker_source: String,
@@ -89,6 +93,8 @@ struct Occurrence {
     package: String,
     boundary_rank: i64,
     deterministically_resolved: bool,
+    builtin_receiver: bool,
+    runtime_namesake: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +135,7 @@ struct OccurrenceOutcome {
     projects: Vec<PendingProjectAnswer>,
     unknown_answers: usize,
     unmapped_declarations: usize,
+    unmapped_declaration_contexts: BTreeMap<String, usize>,
 }
 
 #[cfg(test)]
@@ -159,7 +166,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let snapshot = crate::structural::current_snapshot(&conn)?;
     let discovered = load_occurrences(&conn)?;
     let occurrences_discovered = discovered.len();
-    let eligible = select_eligible(discovered, options);
+    let (eligible, selection_skips) = select_eligible(discovered, options);
     let occurrences_eligible = eligible.len();
     let ordered = spread_occurrences(eligible);
     let selected = match options.max_occurrences {
@@ -211,11 +218,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_eligible,
             occurrences_selected: selected.len(),
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+            occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
             occurrences_resumed: 0,
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects: Vec::new(),
             unmapped_declarations: 0,
+            unmapped_declaration_contexts: BTreeMap::new(),
             facts_published: 0,
             checker_version: ownership.typescript.version,
             checker_source: ownership.typescript.source,
@@ -252,11 +262,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_eligible,
             occurrences_selected: selected.len(),
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+            occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
             occurrences_resumed: selected.len(),
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects,
             unmapped_declarations: 0,
+            unmapped_declaration_contexts: BTreeMap::new(),
             facts_published,
             checker_version: ownership.typescript.version,
             checker_source: ownership.typescript.source,
@@ -289,6 +302,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut request_batches = 0;
     let mut unknown_answers = 0;
     let mut unmapped_declarations = 0;
+    let mut unmapped_declaration_contexts = BTreeMap::<String, usize>::new();
     let mut peak_rss_bytes = 0;
     let mut peak_heap_bytes = 0;
     let mut failed_projects = Vec::new();
@@ -333,6 +347,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut occurrences_queried,
             &mut unknown_answers,
             &mut unmapped_declarations,
+            &mut unmapped_declaration_contexts,
             &mut peak_rss_bytes,
             &mut peak_heap_bytes,
         );
@@ -375,11 +390,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         occurrences_eligible,
         occurrences_selected: selected.len(),
         occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
+        occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
+        occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
         occurrences_resumed,
         request_batches,
         unknown_answers,
         unknown_projects: load_unknown_projects(&conn, batch_id)?,
         unmapped_declarations,
+        unmapped_declaration_contexts,
         facts_published,
         checker_version: ownership.typescript.version,
         checker_source: ownership.typescript.source,
@@ -404,6 +422,139 @@ fn canceled_checker_error(error: &anyhow::Error) -> bool {
         .downcast_ref::<super::process::CheckerError>()
         .is_some_and(|error| matches!(error, super::process::CheckerError::Canceled(_)))
 }
+
+/// ECMAScript / host globals whose members resolve into the TypeScript
+/// standard library or `@types` — never into an indexed repository symbol.
+/// A same-file symbol or import binding with the same name (a deliberate
+/// shadow) keeps the occurrence eligible.
+const BUILTIN_RECEIVER_GLOBALS: &[&str] = &[
+    "console",
+    "JSON",
+    "Math",
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Symbol",
+    "Reflect",
+    "Proxy",
+    "Promise",
+    "Date",
+    "RegExp",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "WeakRef",
+    "FinalizationRegistry",
+    "ArrayBuffer",
+    "SharedArrayBuffer",
+    "DataView",
+    "Atomics",
+    "Intl",
+    "BigInt",
+    "globalThis",
+    "window",
+    "document",
+    "navigator",
+    "performance",
+    "process",
+    "Buffer",
+    "require",
+    "module",
+    "exports",
+    "URL",
+    "URLSearchParams",
+    "TextEncoder",
+    "TextDecoder",
+    "AbortController",
+    "AbortSignal",
+    "Headers",
+    "Response",
+    "Request",
+    "FormData",
+    "Blob",
+    "Event",
+    "EventTarget",
+    "crypto",
+    "fetch",
+    "Int8Array",
+    "Int16Array",
+    "Int32Array",
+    "Uint8Array",
+    "Uint16Array",
+    "Uint32Array",
+    "Uint8ClampedArray",
+    "Float32Array",
+    "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
+];
+
+/// Node core module specifiers. A receiver whose import binding resolves one
+/// of these (or any `node:`-prefixed request) has its member declarations in
+/// `@types/node`, outside the indexed corpus.
+const NODE_CORE_MODULES: &[&str] = &[
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
 
 fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
     let deterministically_resolved = conn
@@ -431,7 +582,31 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
                   SELECT 1 FROM entity_occurrences entity
                   WHERE entity.file_id=file.id
                     AND entity.start<=call.start AND entity.end>=call.start
-                ) THEN 0 ELSE 1 END
+                ) THEN 0 ELSE 1 END,
+                CASE WHEN (
+                  call.object IN (SELECT value FROM json_each(?1))
+                  AND NOT EXISTS(
+                    SELECT 1 FROM symbols shadow
+                    WHERE shadow.file_id=file.id AND shadow.name=call.object)
+                  AND NOT EXISTS(
+                    SELECT 1 FROM imports binding
+                    WHERE binding.file_id=file.id AND binding.local_name=call.object)
+                ) OR EXISTS(
+                  SELECT 1 FROM imports binding
+                  WHERE binding.file_id=file.id AND binding.local_name=call.object
+                    AND (binding.request IN (SELECT value FROM json_each(?2))
+                      OR binding.request LIKE 'node:%')
+                ) THEN 1 ELSE 0 END,
+                CASE WHEN EXISTS(
+                  SELECT 1 FROM symbols target
+                  JOIN files target_file ON target_file.id=target.file_id
+                  LEFT JOIN repository_file_policy target_policy
+                    ON target_policy.file_id=target_file.id
+                  WHERE target.name=call.prop
+                    AND (target_policy.effective_role='runtime'
+                      OR (target_policy.file_id IS NULL
+                        AND target_file.role IN ('production', 'unknown')))
+                ) THEN 1 ELSE 0 END
          FROM member_calls call
          JOIN files file ON file.id=call.file_id
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
@@ -442,7 +617,9 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
            AND EXISTS(SELECT 1 FROM symbols target WHERE target.name=call.prop)
          ORDER BY file.path, call.start, call.rowid",
     )?;
-    let rows = statement.query_map([], |row| {
+    let globals = serde_json::to_string(BUILTIN_RECEIVER_GLOBALS)?;
+    let core_modules = serde_json::to_string(NODE_CORE_MODULES)?;
+    let rows = statement.query_map(params![globals, core_modules], |row| {
         Ok(Occurrence {
             id: row.get(0)?,
             file_id: row.get(1)?,
@@ -459,16 +636,28 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
             package: row.get(12)?,
             boundary_rank: row.get(13)?,
             deterministically_resolved: deterministically_resolved.contains(&row.get(0)?),
+            builtin_receiver: row.get::<_, i64>(14)? != 0,
+            runtime_namesake: row.get::<_, i64>(15)? != 0,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-fn select_eligible(occurrences: Vec<Occurrence>, options: &EnrichOptions<'_>) -> Vec<Occurrence> {
-    occurrences
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SelectionSkips {
+    builtin_receiver: usize,
+    foreign_namesake: usize,
+}
+
+fn select_eligible(
+    occurrences: Vec<Occurrence>,
+    options: &EnrichOptions<'_>,
+) -> (Vec<Occurrence>, SelectionSkips) {
+    let mut skips = SelectionSkips::default();
+    let eligible = occurrences
         .into_iter()
         .filter(|occurrence| {
-            (!occurrence.deterministically_resolved || options.include_all)
+            let in_scope = (!occurrence.deterministically_resolved || options.include_all)
                 && (if options.roles.is_empty() {
                     options.include_all
                         || matches!(occurrence.role.as_str(), "production" | "unknown")
@@ -484,9 +673,29 @@ fn select_eligible(occurrences: Vec<Occurrence>, options: &EnrichOptions<'_>) ->
                                 .is_some_and(|suffix| suffix.starts_with('/'))
                     }))
                 && (options.packages.is_empty() || options.packages.contains(&occurrence.package))
-                && (options.members.is_empty() || options.members.contains(&occurrence.member))
+                && (options.members.is_empty() || options.members.contains(&occurrence.member));
+            if !in_scope {
+                return false;
+            }
+            if options.include_all {
+                return true;
+            }
+            // Hopelessness gates, `--all`-bypassable like every other default
+            // exclusion. A builtin/global receiver resolves into lib/@types;
+            // a member whose only indexed namesakes live outside runtime
+            // files cannot anchor a fact either way.
+            if occurrence.builtin_receiver {
+                skips.builtin_receiver += 1;
+                return false;
+            }
+            if !occurrence.runtime_namesake {
+                skips.foreign_namesake += 1;
+                return false;
+            }
+            true
         })
-        .collect()
+        .collect();
+    (eligible, skips)
 }
 
 /// Stable rank-tier spreading. This ordering matters for visible progress and
@@ -1079,6 +1288,7 @@ fn execute_project(
     occurrences_queried: &mut usize,
     unknown_answers: &mut usize,
     unmapped_declarations: &mut usize,
+    unmapped_declaration_contexts: &mut BTreeMap<String, usize>,
     peak_rss_bytes: &mut u64,
     peak_heap_bytes: &mut u64,
 ) -> Result<()> {
@@ -1166,6 +1376,9 @@ fn execute_project(
             let outcome = map_occurrence(conn, occurrence, std::slice::from_ref(&item.answer))?;
             *unknown_answers += outcome.unknown_answers;
             *unmapped_declarations += outcome.unmapped_declarations;
+            for (context, count) in outcome.unmapped_declaration_contexts {
+                *unmapped_declaration_contexts.entry(context).or_default() += count;
+            }
             facts.extend(outcome.facts);
             projects.extend(outcome.projects);
         }
@@ -1609,6 +1822,20 @@ fn map_occurrence(
             continue;
         }
         for declaration in &answer.declarations {
+            // A declaration the sidecar attributes to lib/@types/vendored/
+            // outside files can never anchor to an indexed symbol; skip the
+            // lookup but keep counting it as unmapped so the per-occurrence
+            // ambiguity predicate (`unmapped == 0`) is unchanged.
+            if let Some(context) = declaration.context.as_deref()
+                && context != "repo"
+            {
+                outcome.unmapped_declarations += 1;
+                *outcome
+                    .unmapped_declaration_contexts
+                    .entry(context.to_string())
+                    .or_default() += 1;
+                continue;
+            }
             match map_declaration(conn, &occurrence.member, declaration)? {
                 Some(target) => outcome.facts.push(PendingFact {
                     occurrence: occurrence.clone(),
@@ -1618,7 +1845,18 @@ fn map_occurrence(
                     confidence: String::new(),
                     input_fingerprint: answer.checker_input_fingerprint.clone(),
                 }),
-                None => outcome.unmapped_declarations += 1,
+                None => {
+                    outcome.unmapped_declarations += 1;
+                    let key = if declaration.file.is_none() {
+                        "outside"
+                    } else {
+                        "repo_unanchored"
+                    };
+                    *outcome
+                        .unmapped_declaration_contexts
+                        .entry(key.to_string())
+                        .or_default() += 1;
+                }
             }
         }
     }
@@ -1934,6 +2172,8 @@ mod tests {
             package: package.into(),
             boundary_rank,
             deterministically_resolved: false,
+            builtin_receiver: false,
+            runtime_namesake: true,
         }
     }
 
@@ -1980,6 +2220,7 @@ mod tests {
         ];
         assert_eq!(
             select_eligible(candidates.clone(), &options())
+                .0
                 .iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
@@ -1987,7 +2228,31 @@ mod tests {
         );
         let mut all = options();
         all.include_all = true;
-        assert_eq!(select_eligible(candidates, &all).len(), 3);
+        assert_eq!(select_eligible(candidates, &all).0.len(), 3);
+    }
+
+    #[test]
+    fn builtin_receivers_and_foreign_namesakes_are_default_exclusions_with_all_bypass() {
+        let mut builtin = planned_occurrence(1, "alpha", "alpha/a.ts", "production", 0);
+        builtin.builtin_receiver = true;
+        let mut foreign = planned_occurrence(2, "alpha", "alpha/b.ts", "production", 0);
+        foreign.runtime_namesake = false;
+        let keep = planned_occurrence(3, "alpha", "alpha/c.ts", "production", 0);
+        let candidates = vec![builtin, foreign, keep];
+
+        let (eligible, skips) = select_eligible(candidates.clone(), &options());
+        assert_eq!(
+            eligible.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(skips.builtin_receiver, 1);
+        assert_eq!(skips.foreign_namesake, 1);
+
+        let mut all = options();
+        all.include_all = true;
+        let (eligible, skips) = select_eligible(candidates, &all);
+        assert_eq!(eligible.len(), 3);
+        assert_eq!(skips, SelectionSkips::default());
     }
 
     #[test]
@@ -2196,6 +2461,146 @@ mod tests {
     }
 
     #[test]
+    fn builtin_receiver_and_runtime_namesake_flags_come_from_the_index() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src"))?;
+        fs::create_dir_all(repo.path().join("tests"))?;
+        fs::write(
+            repo.path().join("src/app.ts"),
+            "import path from \"path\";\n\
+             import { helper } from \"./helper\";\n\
+             export class Service { run(): void {} }\n\
+             export function work(service: Service): void {\n\
+               console.log(\"x\");\n\
+               path.join(\"a\", \"b\");\n\
+               service.run();\n\
+               helper.probe();\n\
+             }\n",
+        )?;
+        fs::write(
+            repo.path().join("src/shadow.ts"),
+            "export const console = { log(_message: string): void {} };\n\
+             export function shadowed(): void { console.log(\"y\"); }\n",
+        )?;
+        fs::write(
+            repo.path().join("src/helper.ts"),
+            "export const helper = { probe(): void {} };\n",
+        )?;
+        // Test-role namesakes satisfy the raw same-name floor for every
+        // member below without making any of them runtime-anchorable.
+        fs::write(
+            repo.path().join("tests/namesakes.test.ts"),
+            "export function log(): void {}\n\
+             export function join(): void {}\n\
+             export function probe(): void {}\n",
+        )?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+
+        let calls = load_occurrences(&conn)?;
+        let flags = |file: &str, member: &str| {
+            let occurrence = calls
+                .iter()
+                .find(|occurrence| occurrence.file == file && occurrence.member == member)
+                .unwrap_or_else(|| panic!("occurrence {file}:{member} discovered"));
+            (occurrence.builtin_receiver, occurrence.runtime_namesake)
+        };
+        // Bare global receiver, no shadow in the file.
+        assert_eq!(flags("src/app.ts", "log"), (true, false));
+        // Receiver bound by a Node core-module import.
+        assert_eq!(flags("src/app.ts", "join"), (true, false));
+        // Ordinary local receiver with a production-class namesake.
+        assert_eq!(flags("src/app.ts", "run"), (false, true));
+        // Namesake exists only in a test file.
+        assert_eq!(flags("src/app.ts", "probe"), (false, false));
+        // A same-file symbol named after the global keeps the occurrence.
+        assert!(!flags("src/shadow.ts", "log").0);
+
+        let (eligible, skips) = select_eligible(calls, &options());
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|occurrence| occurrence.member.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run"]
+        );
+        assert_eq!(skips.builtin_receiver, 2);
+        assert_eq!(skips.foreign_namesake, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn non_repo_declaration_contexts_skip_mapping_but_stay_unmapped() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "export class CardTable { insert(): void {} }\n",
+        )?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let calls = load_occurrences(&conn)?;
+        assert!(calls.is_empty(), "fixture has no member calls");
+        let occurrence = planned_occurrence(1, "(root)", "main.ts", "production", 0);
+
+        let answer = ProjectAnswer {
+            project_id: "tsconfig.json".into(),
+            status: "resolved".into(),
+            receiver_type: None,
+            declarations: vec![
+                DeclarationSite {
+                    file: None,
+                    outside_root: true,
+                    start: 0,
+                    end: 4,
+                    source_hash: "lib".into(),
+                    context: Some("lib".into()),
+                },
+                DeclarationSite {
+                    file: Some("node_modules/@types/thing/index.d.ts".into()),
+                    outside_root: false,
+                    start: 0,
+                    end: 4,
+                    source_hash: "types".into(),
+                    context: Some("types".into()),
+                },
+            ],
+            checker_input_fingerprint: "inputs".into(),
+        };
+        let outcome = map_occurrence(&conn, &occurrence, std::slice::from_ref(&answer))?;
+        assert!(outcome.facts.is_empty());
+        assert_eq!(outcome.unmapped_declarations, 2);
+        assert_eq!(
+            outcome.unmapped_declaration_contexts,
+            BTreeMap::from([("lib".to_string(), 1), ("types".to_string(), 1)])
+        );
+
+        // An old sidecar sends no context; an outside declaration is still
+        // attributed rather than mislabelled as a repository anchoring gap.
+        let legacy = ProjectAnswer {
+            project_id: "tsconfig.json".into(),
+            status: "resolved".into(),
+            receiver_type: None,
+            declarations: vec![DeclarationSite {
+                file: None,
+                outside_root: true,
+                start: 0,
+                end: 4,
+                source_hash: "lib".into(),
+                context: None,
+            }],
+            checker_input_fingerprint: "inputs".into(),
+        };
+        let outcome = map_occurrence(&conn, &occurrence, std::slice::from_ref(&legacy))?;
+        assert!(outcome.facts.is_empty());
+        assert_eq!(outcome.unmapped_declarations, 1);
+        assert_eq!(
+            outcome.unmapped_declaration_contexts,
+            BTreeMap::from([("outside".to_string(), 1)])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn namespace_member_resolved_by_the_structural_graph_is_not_requeried() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
@@ -2216,11 +2621,11 @@ mod tests {
             .expect("namespace member call");
         assert!(call.deterministically_resolved);
         let call_id = call.id;
-        assert!(select_eligible(calls.clone(), &options()).is_empty());
+        assert!(select_eligible(calls.clone(), &options()).0.is_empty());
 
         let mut all = options();
         all.include_all = true;
-        assert_eq!(select_eligible(calls, &all).len(), 1);
+        assert_eq!(select_eligible(calls, &all).0.len(), 1);
         let bound_edges: i64 = conn.query_row(
             "SELECT count(*) FROM resolved_edges
              WHERE confidence IN ('certain', 'likely')
@@ -2245,7 +2650,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let eligible = select_eligible(occurrences, &options());
+        let (eligible, _) = select_eligible(occurrences, &options());
         assert_eq!(eligible.len(), 150_000);
         assert_eq!(spread_occurrences(eligible).len(), 150_000);
     }
@@ -2484,6 +2889,7 @@ mod tests {
             start,
             end: start + name.len() as i64,
             source_hash: hash.to_string(),
+            context: Some("repo".into()),
         }
     }
 
@@ -2534,6 +2940,7 @@ mod tests {
             start: literal_method_start,
             end: literal_method_start + "insert".len() as i64,
             source_hash: hash,
+            context: Some("repo".into()),
         };
 
         // The containment trap is live: indexed symbols really do enclose this

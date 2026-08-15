@@ -167,6 +167,8 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   assert.equal(resolved.kind, "resolve_members_result");
   assert.equal(resolved.result.results.length, 2);
   assert.ok(resolved.result.results.every((item) => item.answer.status === "resolved"));
+  assert.ok(resolved.result.results.every((item) =>
+    item.answer.declarations.every((declaration) => declaration.context === "repo")));
   assert.ok(resolved.result.resources.rss_bytes > 0);
 
   const validation = await checker.request("validate_project", {
@@ -482,6 +484,41 @@ test("keeps receiver identity, inheritance, overrides, and overload declarations
   );
   assert.equal(answers["overloaded.execute('x')"].declarations.length, 2);
   assert.ok(!("diagnostics" in answers["alpha.save()"]));
+  await checker.close();
+});
+
+test("labels declaration provenance for vendored types and outside libraries", async (context) => {
+  const source = 'import { helper } from "thing";\nhelper.go();\nconst list = [1];\nlist.push(2);\n';
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { moduleResolution: "node" }, files: ["main.ts"] }),
+    "node_modules/@types/thing/package.json": JSON.stringify({ name: "@types/thing", types: "index.d.ts" }),
+    "node_modules/@types/thing/index.d.ts":
+      "export declare const helper: { go(): void };\n",
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const vendored = await checker.request("resolve_member", {
+    query: queryFor(source, "helper.go()", "helper", "go"),
+  });
+  assert.equal(vendored.result.projects[0].status, "resolved");
+  assert.deepEqual(
+    vendored.result.projects[0].declarations.map((declaration) => declaration.context),
+    ["types"],
+  );
+
+  // Array.prototype.push lives in the TypeScript lib, which sits outside a
+  // fixture root; the context still attributes it instead of a bare null file.
+  const builtin = await checker.request("resolve_member", {
+    query: queryFor(source, "list.push(2)", "list", "push"),
+  });
+  assert.equal(builtin.result.projects[0].status, "resolved");
+  const contexts = builtin.result.projects[0].declarations.map((declaration) => declaration.context);
+  assert.ok(contexts.length > 0);
+  assert.ok(contexts.every((value) => value === "outside" || value === "lib"), JSON.stringify(contexts));
   await checker.close();
 });
 
