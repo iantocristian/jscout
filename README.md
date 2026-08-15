@@ -272,10 +272,12 @@ selected, omitted, project, and configuration counts after a configuration-only
 ownership pass and does not construct a TypeScript Program.
 
 Two default exclusions remove occurrences whose declarations cannot anchor to
-the index: calls on an unshadowed ECMAScript/host global (`console`, `JSON`,
-`Object`, …) or on a receiver whose import binding resolves a Node core module
-(`path`, `fs`, `node:*`), and calls whose member name has indexed namesakes
-only outside effective-runtime files. Both are `--all`-bypassable and reported
+the index: calls on an ECMAScript/host global (`console`, `JSON`, `Object`, …)
+whose receiver identifier has no binding in the file's scope tree — a
+parameter, import, or local with the same name keeps the occurrence — or on a
+receiver whose import binding resolves a Node core module (`path`, `fs`,
+`node:*`), and calls whose member name has indexed namesakes only outside
+effective-runtime files. Both are `--all`-bypassable and reported
 as separate skip counts. The sidecar labels every returned declaration's
 provenance (`repo`, `types`, `lib`, `vendored`, `outside`); non-repository
 declarations skip the anchoring lookup but still count as unmapped, so

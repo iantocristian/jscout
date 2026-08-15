@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "21";
+pub const SCHEMA_VERSION: &str = "22";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -207,7 +207,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%';
-             UPDATE meta SET value='21' WHERE key='schema_version';",
+             UPDATE meta SET value='22' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -225,7 +225,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '21')
+INSERT INTO meta(key, value) VALUES('schema_version', '22')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -375,7 +375,8 @@ CREATE TABLE IF NOT EXISTS member_calls(
   receiver_start INTEGER NOT NULL DEFAULT 0,
   receiver_end INTEGER NOT NULL DEFAULT 0,
   property_start INTEGER NOT NULL DEFAULT 0,
-  property_end INTEGER NOT NULL DEFAULT 0
+  property_end INTEGER NOT NULL DEFAULT 0,
+  receiver_unbound INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);

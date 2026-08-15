@@ -67,7 +67,7 @@ pub struct FileGraph {
 pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
     let mut g = FileGraph::default();
     let record = &ret.module_record;
-    let heur = crate::heur::extract(&ret.program);
+    let heur = crate::heur::extract(&ret.program, semantic);
 
     // ---- imports ----
     for entry in &record.import_entries {

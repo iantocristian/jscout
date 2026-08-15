@@ -619,7 +619,10 @@ globals at 0.05%, Node core namespaces at 0%). Discovery now computes two
 per-occurrence facts: a builtin receiver (an unshadowed ECMAScript/host global
 identifier, or a receiver whose import binding resolves a Node core module)
 and a runtime namesake (some indexed symbol with the member's name in an
-effective-runtime file). Default eligibility requires a non-builtin receiver
+effective-runtime file). The builtin decision uses the scope tree recorded at
+extraction (`member_calls.receiver_unbound`): only an identifier with no
+binding at all is a global, so a parameter or local named `module` never
+trips the gate. Default eligibility requires a non-builtin receiver
 and a runtime namesake; `--all` bypasses both, and reports count each skip
 class. The sidecar labels every declaration's provenance (`repo`, `types`,
 `lib`, `vendored`, `outside`); non-`repo` declarations skip the anchoring

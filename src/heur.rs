@@ -32,6 +32,11 @@ pub struct EventSite {
 pub struct MemberCall {
     pub prop: String,
     pub object: Option<String>,
+    /// True when the receiver base is a bare identifier with no binding in
+    /// the file's scope tree — a genuine global reference (`console`, a
+    /// CommonJS `module`), never a parameter, import, or local that happens
+    /// to share the name.
+    pub receiver_unbound: bool,
     /// Full static receiver chain (`dbs.wave.card`, `this.db`); None when any
     /// link is computed or a call result.
     pub receiver: Option<String>,
@@ -89,8 +94,9 @@ const LISTEN_METHODS: &[&str] = &[
     "handle",
 ];
 
-struct HeurVisitor {
+struct HeurVisitor<'s> {
     out: Heuristics,
+    scoping: &'s oxc_semantic::Scoping,
 }
 
 fn string_arg(args: &[Argument<'_>]) -> Option<String> {
@@ -116,7 +122,7 @@ fn require_request(expr: &Expression<'_>) -> Option<String> {
     string_arg(&call.arguments)
 }
 
-impl<'a> Visit<'a> for HeurVisitor {
+impl<'a> Visit<'a> for HeurVisitor<'_> {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
         if let Some(init) = &decl.init
             && let Some(request) = require_request(init)
@@ -192,8 +198,16 @@ impl<'a> Visit<'a> for HeurVisitor {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if let Expression::StaticMemberExpression(m) = &call.callee {
             let prop = m.property.name.to_string();
+            let mut receiver_unbound = false;
             let object = match &m.object {
-                Expression::Identifier(id) => Some(id.name.to_string()),
+                Expression::Identifier(id) => {
+                    receiver_unbound = self
+                        .scoping
+                        .get_reference(id.reference_id())
+                        .symbol_id()
+                        .is_none();
+                    Some(id.name.to_string())
+                }
                 Expression::ThisExpression(_) => Some("this".into()),
                 _ => None,
             };
@@ -218,6 +232,7 @@ impl<'a> Visit<'a> for HeurVisitor {
             self.out.member_calls.push(MemberCall {
                 prop,
                 object,
+                receiver_unbound,
                 receiver: member_path(&m.object),
                 span_start: call.span.start,
                 span_end: call.span.end,
@@ -267,9 +282,10 @@ impl<'a> Visit<'a> for HeurVisitor {
     }
 }
 
-pub fn extract(program: &Program<'_>) -> Heuristics {
+pub fn extract(program: &Program<'_>, semantic: &oxc_semantic::Semantic<'_>) -> Heuristics {
     let mut v = HeurVisitor {
         out: Heuristics::default(),
+        scoping: semantic.scoping(),
     };
     v.visit_program(program);
     v.out

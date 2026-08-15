@@ -585,12 +585,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
                 ) THEN 0 ELSE 1 END,
                 CASE WHEN (
                   call.object IN (SELECT value FROM json_each(?1))
-                  AND NOT EXISTS(
-                    SELECT 1 FROM symbols shadow
-                    WHERE shadow.file_id=file.id AND shadow.name=call.object)
-                  AND NOT EXISTS(
-                    SELECT 1 FROM imports binding
-                    WHERE binding.file_id=file.id AND binding.local_name=call.object)
+                  AND call.receiver_unbound=1
                 ) OR EXISTS(
                   SELECT 1 FROM imports binding
                   WHERE binding.file_id=file.id AND binding.local_name=call.object
@@ -2470,11 +2465,18 @@ mod tests {
             "import path from \"path\";\n\
              import { helper } from \"./helper\";\n\
              export class Service { run(): void {} }\n\
+             export class Loader { ensureUserland(): void {} }\n\
              export function work(service: Service): void {\n\
                console.log(\"x\");\n\
                path.join(\"a\", \"b\");\n\
                service.run();\n\
                helper.probe();\n\
+             }\n\
+             export function route(module: Loader): void {\n\
+               module.ensureUserland();\n\
+             }\n\
+             export function hot(): void {\n\
+               module.reload();\n\
              }\n",
         )?;
         fs::write(
@@ -2492,7 +2494,8 @@ mod tests {
             repo.path().join("tests/namesakes.test.ts"),
             "export function log(): void {}\n\
              export function join(): void {}\n\
-             export function probe(): void {}\n",
+             export function probe(): void {}\n\
+             export function reload(): void {}\n",
         )?;
         let conn = crate::store::open(repo.path())?;
         crate::indexer::index_repo(repo.path(), &conn)?;
@@ -2505,7 +2508,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("occurrence {file}:{member} discovered"));
             (occurrence.builtin_receiver, occurrence.runtime_namesake)
         };
-        // Bare global receiver, no shadow in the file.
+        // Bare global receiver, unbound in the scope tree.
         assert_eq!(flags("src/app.ts", "log"), (true, false));
         // Receiver bound by a Node core-module import.
         assert_eq!(flags("src/app.ts", "join"), (true, false));
@@ -2513,18 +2516,22 @@ mod tests {
         assert_eq!(flags("src/app.ts", "run"), (false, true));
         // Namesake exists only in a test file.
         assert_eq!(flags("src/app.ts", "probe"), (false, false));
+        // `module` as a function parameter is a binding, not the CommonJS
+        // global: the gate must not fire (the Next.js app-route.ts case).
+        assert_eq!(flags("src/app.ts", "ensureUserland"), (false, true));
+        // `module` with no binding anywhere is the real global.
+        assert_eq!(flags("src/app.ts", "reload"), (true, false));
         // A same-file symbol named after the global keeps the occurrence.
         assert!(!flags("src/shadow.ts", "log").0);
 
         let (eligible, skips) = select_eligible(calls, &options());
-        assert_eq!(
-            eligible
-                .iter()
-                .map(|occurrence| occurrence.member.as_str())
-                .collect::<Vec<_>>(),
-            vec!["run"]
-        );
-        assert_eq!(skips.builtin_receiver, 2);
+        let mut eligible_members = eligible
+            .iter()
+            .map(|occurrence| occurrence.member.as_str())
+            .collect::<Vec<_>>();
+        eligible_members.sort_unstable();
+        assert_eq!(eligible_members, vec!["ensureUserland", "run"]);
+        assert_eq!(skips.builtin_receiver, 3);
         assert_eq!(skips.foreign_namesake, 2);
         Ok(())
     }
