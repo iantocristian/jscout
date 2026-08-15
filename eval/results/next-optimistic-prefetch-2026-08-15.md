@@ -134,11 +134,49 @@ its plan), and forced arms with scout policy were the most role-filtered.
    inheritance into agent shells; the packed-tarball build dependency now
    encoded in the task's test command.
 
+## Trial sol-001: same matrix, execution model gpt-5.6-sol
+
+Run immediately after trial 001 with every prepared profile database cloned
+byte-identically from it (sha256-verified) via a `--prepared-root` runner
+flag — a deliberate, recorded deviation from the no-cross-trial-sharing rule
+so that the execution model is the only variable. One arm ran at a time. Sol
+admission: contamination probe clean (confident wrong guesses, zero gold
+overlap), model id verified.
+
+**Bottom line: 13/13 fail, identical to terra.** The rewrite-misprediction
+case fails in all 26 arms of both trials at the same assertion — a property
+of the task, not the model. What moves cross-model, on retrieval- and
+oracle-side evidence unaffected by the confound below:
+
+- **Livelock: sol fixes it in 11/13 arms vs terra's 7/13.** The embed-skill
+  regression reproduced exactly (checker-embed/skill is the only arm to lose
+  the livelock under both models on the same database); terra's other embed
+  regressions did not reproduce.
+- **Patched gold overlap stays 1/7 everywhere** except sol checker/forced,
+  which reached 3/7 (`cache.ts`, `navigation.ts`, `optimistic-routes.ts`,
+  1 extraneous) before hitting the 30-minute timeout — the best gold
+  targeting of either trial, cut off mid-convergence.
+- Sol names more gold files/symbols in its answers (10 of 13 paired arms)
+  and produced zero extraneous patches on every scout/embed-bearing profile.
+- **Adoption is ~2x terra at both treatment levels** (skill median 9 calls
+  vs 4; forced 50 vs 23; maximum 98). `canonicaliz*`/`diverg*` markers:
+  still zero in all 26 arms.
+
+**Confound — do not read sol's costs as model differences.** Chromium could
+not launch inside the sol arms' sandbox (Mach-port rendezvous denial): 24
+blocked launches across 11 of 13 arms versus 3 across 2 terra arms. Sol
+iterated blind against the oracle, which inflates its totals (101.9M tokens
+vs terra's 46.1M, +60% wall clock, 2.5x failed commands, and the single
+timeout). Layer1 grading ran outside the sandbox and is sound. The
+environment must be fixed (or the denial equalized) before sol-vs-terra cost
+comparisons mean anything.
+
 ## Artifacts
 
 `~/git/jscout-replay-runs/next-optimistic-prefetch-2026-08-15/`: `task-set.json`,
 `prepared/next-optimistic-prefetch/{pristine,gold}`, `contamination/`
 (admission records), `trial-001/{responses.jsonl,telemetry.jsonl,artifacts/}`
 with per-arm event streams, MCP request logs, patches, grades, and prepared
-profile databases. Scripts are local copies of js-rag `scripts/eval-*` at
+profile databases; `trial-sol-001/` mirrors the layout for the sol trial,
+with `contamination/responses-sol.jsonl` recording sol's admission probe. Scripts are local copies of js-rag `scripts/eval-*` at
 `d138de4` with two recorded changes (production-order profile, `--resume`).
