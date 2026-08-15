@@ -520,12 +520,20 @@ history-free snapshot; grading compares against the real implementation.
    ```
 
    Embedding profiles require the local inference service. Repository-scout
-   profiles use the configured pi-ai gateway and share the command-level
-   `--scout-max-calls` budget (default 64) per prepared profile. The separate
-   `--scout-max-subjects` inventory bound defaults to 512 so large repositories
-   retain room for bounded subdivision without increasing model calls. Short-path
+   profiles use the configured pi-ai gateway. Replay runs default both
+   `--scout-max-calls` and `--scout-max-subjects` to `all`, so every discovered
+   subject is classified; numeric values remain available for explicitly
+   budgeted runs. `--scout-warn-subjects` defaults to 512 and warns without
+   truncating when a repository plus bounded mixed subdivision crosses that
+   size. Short-path
    workspaces are deleted after patch capture and grading by default; use
    `--keep-workspaces true` only for a debugging run.
+
+   An interrupted campaign can be resumed with `--resume true`. Completed
+   session rows are skipped, an incomplete session directory is retained with
+   an `.interrupted-NNN` suffix, and an already prepared profile database is
+   copied into the replacement arm instead of repeating indexing, enrichment,
+   scouting, or embedding.
 
 The task unit is a **change arc**, not a single PR/commit: seed + every
 semantically related follow-up until the feature stabilized (see

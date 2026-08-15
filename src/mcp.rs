@@ -257,7 +257,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
-                    "limit": { "type": "integer", "default": 8 },
+                    "limit": { "type": "integer", "default": search::DEFAULT_RESULT_LIMIT },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional primary-hit role allowlist; omitted means all roles" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Hit and expansion origin allowlist. Dependency internals are excluded unless explicitly included" },
                     "include_memory": { "type": "boolean", "default": true, "description": "Attach matching persistent semantic artifacts with freshness and evidence" },
@@ -328,7 +328,8 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Optional event name filter" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Event-site origin allowlist. Dependency sites are excluded unless explicitly included" }
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Event-site origin allowlist. Dependency sites are excluded unless explicitly included" },
+                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1, "description": "Maximum bytes in the complete rendered event response; callers may widen it" }
                 }
             }
         },
@@ -578,7 +579,9 @@ fn call_tool(
     match name {
         "semantic_search" => {
             let q = args["query"].as_str().unwrap_or("");
-            let limit = args["limit"].as_u64().unwrap_or(8) as usize;
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(search::DEFAULT_RESULT_LIMIT as u64) as usize;
             let expand = args["expand"].as_bool().unwrap_or(false);
             let debug = args["debug"].as_bool().unwrap_or(false);
             if expand && profile == ToolProfile::Baseline {
@@ -787,7 +790,15 @@ fn call_tool(
             let filter = args["name"].as_str();
             let origins = json_string_array_or(args, "origins", crate::origin::defaults);
             let sites = query::events_in_origins(conn, filter, &origins)?;
-            Ok(serde_json::to_string_pretty(&sites)?)
+            let sites = sites
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            render_bounded_items(
+                "events",
+                sites,
+                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+            )
         }
         "calls" => {
             let method = args["method"].as_str().unwrap_or("").to_string();
@@ -1402,6 +1413,20 @@ mod tests {
             search["inputSchema"]["properties"]["debug"]["default"],
             false
         );
+        assert_eq!(
+            search["inputSchema"]["properties"]["limit"]["default"],
+            crate::search::DEFAULT_RESULT_LIMIT
+        );
+        let events = structural
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == "events")
+            .expect("events definition");
+        assert_eq!(
+            events["inputSchema"]["properties"]["response_bytes"]["default"],
+            24_000
+        );
     }
 
     #[test]
@@ -1668,6 +1693,24 @@ mod tests {
                 .as_u64()
                 .unwrap()
                 <= 4000
+        );
+
+        let events = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "events",
+            &json!({ "response_bytes": 1_000 }),
+        )?;
+        let events: serde_json::Value = serde_json::from_str(&events)?;
+        assert!(events["events"].is_array());
+        assert!(
+            events["response_budget"]["rendered_bytes"]
+                .as_u64()
+                .unwrap()
+                <= 1_000
         );
         Ok(())
     }

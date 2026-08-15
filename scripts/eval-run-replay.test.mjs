@@ -186,5 +186,25 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   assert.equal(grade.coverage.plan_mentioned.matched.length, 2);
   assert.equal(grade.coverage.patched.confirmed_omission_rate, null);
 
+  execFileSync(process.execPath, [
+    runner,
+    "--tasks", tasksFile,
+    "--repository", repo,
+    "--runs-root", runsRoot,
+    "--jscout", "/bin/true",
+    "--responses", responses,
+    "--telemetry", path.join(base, "telemetry.jsonl"),
+    "--artifacts", path.join(base, "artifacts"),
+    "--codex", stub,
+    "--profiles", "grep",
+    "--trial", "t1",
+    "--resume", "true",
+  ], { encoding: "utf8" });
+  assert.equal(
+    fs.readFileSync(responses, "utf8").split("\n").filter(Boolean).length,
+    1,
+    "resume must skip a session with a completed response row",
+  );
+
   fs.rmSync(base, { recursive: true, force: true });
 });

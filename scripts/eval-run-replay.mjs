@@ -191,6 +191,42 @@ function jsonLines(text) {
   });
 }
 
+function completedReplaySessions(responses) {
+  if (!fs.existsSync(responses)) return new Set();
+  return new Set(
+    jsonLines(fs.readFileSync(responses, "utf8"))
+      .map((row) => row.session)
+      .filter(Boolean),
+  );
+}
+
+function isStrictChild(candidate, parent) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+function nextInterruptedRunPath(runDir) {
+  for (let attempt = 1; ; attempt += 1) {
+    const candidate = `${runDir}.interrupted-${String(attempt).padStart(3, "0")}`;
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+}
+
+function archiveInterruptedRun(runDir, workRoot) {
+  if (!fs.existsSync(runDir) || fs.readdirSync(runDir).length === 0) return null;
+  const archived = nextInterruptedRunPath(runDir);
+  fs.renameSync(runDir, archived);
+  const workspacePathFile = path.join(archived, "workspace-path.txt");
+  if (fs.existsSync(workspacePathFile)) {
+    const workspace = fs.readFileSync(workspacePathFile, "utf8").trim();
+    if (workspace && isStrictChild(workspace, workRoot)) {
+      recordWorkspaceCleanup(workspace, archived, "resume-before-restart");
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  }
+  return archived;
+}
+
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
@@ -309,6 +345,7 @@ function prepareJscoutProfile({
   runDir,
   scoutMaxCalls,
   scoutMaxSubjects,
+  scoutWarnSubjects,
   baseDatabase,
 }) {
   const plan = profilePlan(profile);
@@ -348,6 +385,7 @@ function prepareJscoutProfile({
           "--database", database,
           "--max-calls", String(scoutMaxCalls),
           "--max-subjects", String(scoutMaxSubjects),
+          "--warn-subjects", String(scoutWarnSubjects),
         ],
         {
           cwd: workspace,
@@ -502,23 +540,33 @@ async function main() {
   }
   const workRoot = path.resolve(options["work-root"] ?? "/tmp/jr");
   fs.mkdirSync(workRoot, { recursive: true });
-  const scoutMaxCalls = Number(options["scout-max-calls"] ?? 64);
-  if (!Number.isInteger(scoutMaxCalls) || scoutMaxCalls < 1) {
-    throw new Error("--scout-max-calls must be a positive integer");
-  }
-  const scoutMaxSubjects = Number(options["scout-max-subjects"] ?? 512);
-  if (!Number.isInteger(scoutMaxSubjects) || scoutMaxSubjects < 1) {
-    throw new Error("--scout-max-subjects must be a positive integer");
-  }
-  for (const outputPath of [responses, telemetry]) {
-    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-      throw new Error(`refusing to append to non-empty output: ${outputPath}`);
+  const resume = options.resume === "true";
+  const scoutMaxCalls = String(options["scout-max-calls"] ?? "all").toLowerCase();
+  const scoutMaxSubjects = String(options["scout-max-subjects"] ?? "all").toLowerCase();
+  for (const [name, value] of [
+    ["--scout-max-calls", scoutMaxCalls],
+    ["--scout-max-subjects", scoutMaxSubjects],
+  ]) {
+    if (value !== "all" && (!Number.isInteger(Number(value)) || Number(value) < 1)) {
+      throw new Error(`${name} must be a positive integer or all`);
     }
   }
-  if (fs.existsSync(artifacts) && fs.readdirSync(artifacts).length > 0) {
-    throw new Error(`refusing to overwrite non-empty artifacts directory: ${artifacts}`);
+  const scoutWarnSubjects = Number(options["scout-warn-subjects"] ?? 512);
+  if (!Number.isInteger(scoutWarnSubjects) || scoutWarnSubjects < 1) {
+    throw new Error("--scout-warn-subjects must be a positive integer");
+  }
+  if (!resume) {
+    for (const outputPath of [responses, telemetry]) {
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+        throw new Error(`refusing to append to non-empty output: ${outputPath}`);
+      }
+    }
+    if (fs.existsSync(artifacts) && fs.readdirSync(artifacts).length > 0) {
+      throw new Error(`refusing to overwrite non-empty artifacts directory: ${artifacts}`);
+    }
   }
   fs.mkdirSync(artifacts, { recursive: true });
+  const completedSessions = resume ? completedReplaySessions(responses) : new Set();
 
   for (let taskIndex = 0; taskIndex < taskSet.tasks.length; taskIndex += 1) {
     const task = taskSet.tasks[taskIndex];
@@ -542,6 +590,18 @@ async function main() {
         const treatment = treatments[treatmentIndex];
         const session = `${profile}-${treatment}-${task.id}-${options.trial}`;
         const runDir = path.join(artifacts, session);
+        if (completedSessions.has(session)) {
+          process.stderr.write(`[${task.id}] ${profile}/${treatment} — already complete; skipping\n`);
+          continue;
+        }
+        if (resume) {
+          const archived = archiveInterruptedRun(runDir, workRoot);
+          if (archived) {
+            process.stderr.write(
+              `[${task.id}] ${profile}/${treatment} — archived interrupted artifacts at ${archived}\n`,
+            );
+          }
+        }
         const workspace = fs.mkdtempSync(path.join(workRoot, "r-"));
         activeWorkspace = workspace;
         fs.mkdirSync(runDir, { recursive: true });
@@ -571,22 +631,31 @@ async function main() {
           }
           const database = path.join(runDir, "jscout.db");
           if (treatmentIndex === 0) {
-            const baseProfile = PROFILE_BASES[profile];
-            const baseDatabase = baseProfile
-              ? path.join(artifacts, "prepared-databases", task.id, `${baseProfile}.db`)
-              : null;
-            prepareJscoutProfile({
-              jscout,
-              workspace,
-              database,
-              profile,
-              runDir,
-              scoutMaxCalls,
-              scoutMaxSubjects,
-              baseDatabase,
-            });
-            fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
-            copyDatabase(database, profileDatabase);
+            if (resume && fs.existsSync(profileDatabase)) {
+              copyDatabase(profileDatabase, database);
+              fs.writeFileSync(
+                path.join(runDir, "jscout-profile-reuse.json"),
+                `${JSON.stringify({ source: profileDatabase, resumed: true }, null, 2)}\n`,
+              );
+            } else {
+              const baseProfile = PROFILE_BASES[profile];
+              const baseDatabase = baseProfile
+                ? path.join(artifacts, "prepared-databases", task.id, `${baseProfile}.db`)
+                : null;
+              prepareJscoutProfile({
+                jscout,
+                workspace,
+                database,
+                profile,
+                runDir,
+                scoutMaxCalls,
+                scoutMaxSubjects,
+                scoutWarnSubjects,
+                baseDatabase,
+              });
+              fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
+              copyDatabase(database, profileDatabase);
+            }
           } else {
             copyDatabase(profileDatabase, database);
             fs.writeFileSync(

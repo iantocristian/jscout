@@ -138,6 +138,9 @@ pub struct ScoutBatchReport {
     pub auto_limit_reached: bool,
     pub skipped_over_budget: Vec<BatchSkip>,
     pub skipped_unresolvable: Vec<BatchSkip>,
+    /// Repository reconnaissance records its complete initial-plus-subdivided
+    /// subject count here. Other scout families leave it absent.
+    pub subjects_considered: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +366,7 @@ pub fn scout_workflow_plan(
         auto_limit_reached: auto_seed_limit_reached,
         skipped_over_budget,
         skipped_unresolvable: Vec::new(),
+        subjects_considered: None,
     })
 }
 

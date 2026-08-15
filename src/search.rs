@@ -8,6 +8,7 @@ use crate::{embed, file_role, origin, semantic, store, structural};
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
+pub const DEFAULT_RESULT_LIMIT: usize = 10;
 const DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -67,7 +68,7 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
-            limit: 8,
+            limit: DEFAULT_RESULT_LIMIT,
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),

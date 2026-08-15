@@ -29,7 +29,6 @@ use crate::{scouting::ledger, structural};
 
 pub const PROMPT_VERSION: &str = "repository-recon/v2";
 pub const SUBMIT_TOOL_NAME: &str = "submit_repository_classification";
-pub const DEFAULT_MAX_SUBJECTS: usize = 256;
 pub const DEFAULT_MAX_DEPTH: usize = 3;
 
 const MAX_EXPLANATION_CHARS: usize = 600;
@@ -927,6 +926,7 @@ pub fn dry_run_report(
     options: &RepositoryScoutOptions,
 ) -> Result<Value> {
     let mut rendered = serde_json::to_value(plan)?;
+    rendered["max_subjects"] = rendered_limit(options.max_subjects);
     let mut calls_planned = 0;
     let mut over_budget = 0;
     let mut reusable_items = 0;
@@ -977,8 +977,8 @@ pub fn dry_run_report(
     }
     Ok(json!({
         "dry_run": true,
-        "max_calls": options.policy.max_calls,
-        "max_subjects": options.max_subjects,
+        "max_calls": rendered_limit(options.policy.max_calls),
+        "max_subjects": rendered_limit(options.max_subjects),
         "max_depth": options.max_depth,
         "context_bytes": options.policy.context_bytes,
         "calls_planned": calls_planned,
@@ -992,6 +992,14 @@ pub fn dry_run_report(
         ],
         "plan": rendered,
     }))
+}
+
+fn rendered_limit(limit: usize) -> Value {
+    if limit == usize::MAX {
+        Value::String("all".into())
+    } else {
+        Value::from(limit)
+    }
 }
 
 pub fn execute(
@@ -1087,6 +1095,7 @@ pub fn execute(
         }
     }
     recon::reconcile_file_policy(root, conn)?;
+    report.subjects_considered = Some(subject_count);
     Ok(report)
 }
 
@@ -1517,7 +1526,7 @@ mod tests {
 
     use super::{
         DiscoveredSubject, EvidenceItem, RepositoryEvidencePack, Submission, build_evidence,
-        validate,
+        rendered_limit, validate,
     };
     use crate::{indexer, recon, store};
 
@@ -1540,6 +1549,12 @@ mod tests {
             }],
             rendered: String::new(),
         }
+    }
+
+    #[test]
+    fn unbounded_limits_render_as_all_instead_of_machine_integers() {
+        assert_eq!(rendered_limit(usize::MAX), json!("all"));
+        assert_eq!(rendered_limit(512), json!(512));
     }
 
     #[test]

@@ -100,7 +100,7 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
         /// Max results
-        #[arg(short = 'k', long, default_value_t = 8)]
+        #[arg(short = 'k', long, default_value_t = search::DEFAULT_RESULT_LIMIT)]
         limit: usize,
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
@@ -506,15 +506,22 @@ enum ScoutCommand {
         /// Per-request wall-clock limit in seconds
         #[arg(long, default_value_t = 300)]
         timeout: u64,
-        /// Hard command-level model-call budget, shared with mixed subdivision
-        #[arg(long)]
+        /// Hard command-level model-call budget, shared with mixed subdivision; accepts `all`
+        #[arg(long, value_parser = parse_positive_count_or_all)]
         max_calls: usize,
         /// Maximum serialized evidence bytes sent to the model per subject
         #[arg(long, default_value_t = 240_000)]
         context_bytes: usize,
-        /// Maximum initial plus subdivided subjects
-        #[arg(long, default_value_t = scouting::repository::DEFAULT_MAX_SUBJECTS)]
+        /// Maximum initial plus subdivided subjects; accepts `all`
+        #[arg(
+            long,
+            default_value = "all",
+            value_parser = parse_positive_count_or_all
+        )]
         max_subjects: usize,
+        /// Warn without truncating when the final subject count exceeds this value
+        #[arg(long, default_value_t = 512)]
+        warn_subjects: usize,
         /// Maximum directory levels below an initial mixed subject
         #[arg(long, default_value_t = scouting::repository::DEFAULT_MAX_DEPTH)]
         max_depth: usize,
@@ -1109,6 +1116,7 @@ fn main() -> Result<()> {
                 max_calls,
                 context_bytes,
                 max_subjects,
+                warn_subjects,
                 max_depth,
                 rebuild,
                 dry_run,
@@ -1121,6 +1129,7 @@ fn main() -> Result<()> {
                 database.as_deref(),
                 gateway_path.as_deref(),
                 dry_run,
+                warn_subjects,
                 scouting::repository::RepositoryPlanningOptions {
                     max_subjects,
                     max_depth,
@@ -1781,11 +1790,18 @@ fn cmd_scout_repository(
     database: Option<&Path>,
     gateway_path: Option<&Path>,
     dry_run: bool,
+    warn_subjects: usize,
     planning: scouting::repository::RepositoryPlanningOptions<'_>,
     options: scouting::repository::RepositoryScoutOptions,
 ) -> Result<()> {
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::repository::plan(root, &conn, &planning)?;
+    let initial_subjects = plan.items.len();
+    if initial_subjects > warn_subjects {
+        eprintln!(
+            "warning: repository scout discovered {initial_subjects} initial subjects (warning threshold {warn_subjects}); no subjects will be truncated"
+        );
+    }
     if dry_run {
         let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
         println!(
@@ -1801,8 +1817,29 @@ fn cmd_scout_repository(
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
     let batch = scouting::repository::execute(root, &conn, &mut gateway, &options, plan)?;
+    if let Some(subjects) = batch.subjects_considered
+        && initial_subjects <= warn_subjects
+        && subjects > warn_subjects
+    {
+        eprintln!(
+            "warning: mixed-scope subdivision increased repository scouting to {subjects} subjects (warning threshold {warn_subjects}); no subjects were truncated"
+        );
+    }
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
+}
+
+fn parse_positive_count_or_all(value: &str) -> std::result::Result<usize, String> {
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(usize::MAX);
+    }
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer or `all`, received `{value}`"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero or `all`".into());
+    }
+    Ok(parsed)
 }
 
 fn cmd_scout_summaries(
@@ -1937,6 +1974,9 @@ fn scout_batch_exit(batch: &scouting::ScoutBatchReport) -> Result<()> {
 }
 
 fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
+    if let Some(subjects) = batch.subjects_considered {
+        println!("subjects considered: {subjects}");
+    }
     for report in &batch.reports {
         println!(
             "run {} [{}]: {} ({} candidates, billing path {})",
@@ -2007,7 +2047,7 @@ mod main_tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{Cli, Command, render_semantic_memory_text};
+    use super::{Cli, Command, ScoutCommand, render_semantic_memory_text};
     use crate::semantic::SemanticArtifact;
     use clap::Parser;
 
@@ -2065,6 +2105,42 @@ mod main_tests {
             panic!("expected search")
         };
         assert!(lexical_only);
+    }
+
+    #[test]
+    fn repository_scout_accepts_explicit_all_without_hiding_the_warning_threshold() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "scout",
+            "repository",
+            ".",
+            "--max-calls",
+            "all",
+            "--max-subjects",
+            "all",
+            "--warn-subjects",
+            "512",
+        ])
+        .expect("unbounded repository scout parses");
+        let Command::Scout {
+            command:
+                ScoutCommand::Repository {
+                    max_calls,
+                    max_subjects,
+                    warn_subjects,
+                    ..
+                },
+        } = command
+        else {
+            panic!("expected repository scout")
+        };
+        assert_eq!(max_calls, usize::MAX);
+        assert_eq!(max_subjects, usize::MAX);
+        assert_eq!(warn_subjects, 512);
+        assert!(
+            Cli::try_parse_from(["jscout", "scout", "repository", ".", "--max-calls", "0",])
+                .is_err()
+        );
     }
 
     #[test]

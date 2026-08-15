@@ -160,7 +160,7 @@ callers without materializing every call-site × symbol pair.
 
 ## Repository reconnaissance
 
-`jscout scout repository <root> --max-calls N` is the explicit G13 pass between
+`jscout scout repository <root> --max-calls N|all` is the explicit G13 pass between
 the neutral structural index and optional expensive work. It classifies exact
 workspace packages, unowned directory areas, and configured TypeScript/JavaScript
 projects as `runtime`, `tooling`, `documentation`, `test`, `generated`, `mixed`,
@@ -174,8 +174,8 @@ sample without treating a directory name as semantic truth.
 Run the deterministic inspection first:
 
 ```bash
-jscout scout repository /path/to/repo --max-calls 64 --dry-run
-jscout scout repository /path/to/repo --max-calls 64
+jscout scout repository /path/to/repo --max-calls all --max-subjects all --warn-subjects 512 --dry-run
+jscout scout repository /path/to/repo --max-calls all --max-subjects all --warn-subjects 512
 JSCOUT_EMBED_PROVIDER=local jscout embed /path/to/repo --product
 jscout enrich /path/to/repo
 ```
@@ -189,9 +189,12 @@ but makes no provider generation calls. `reusable: true` items have
 
 `mixed` package/area results subdivide deterministically into immediate child
 directories plus a direct-file residual. One command shares `--max-calls`,
-`--max-subjects` (default 256), `--max-depth` (default 3), and
+`--max-subjects` (default `all`; both limits accept `all`), `--max-depth`
+(default 3), and
 `--context-bytes` across the entire recursive plan. Reaching a bound leaves the
 unresolved subject neutral; it never invents a narrower role.
+`--warn-subjects N` (default 512) reports when the initial or subdivided subject
+count exceeds `N` without truncating it.
 Whole-scope artifact counts guide classification but do not constrain the
 answer: `unknown`/`possible` is always legal, and co-located tests, fixtures, or
 generated output do not by themselves make a runtime package `mixed`.
