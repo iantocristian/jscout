@@ -263,7 +263,7 @@ pub fn find_symbols_in_origins(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
-         ORDER BY s.exported DESC",
+         ORDER BY s.exported DESC, f.path, s.line, s.kind",
     )?;
     let rows = stmt.query_map(
         rusqlite::params![&name, repository, workspace, dependency],
@@ -293,7 +293,8 @@ pub fn find_symbols_in_origins(
              WHERE c.name = ?1 AND c.kind = 'method'
                AND ((?2 AND f.origin='repository')
                  OR (?3 AND f.origin='workspace')
-                 OR (?4 AND f.origin='dependency'))",
+                 OR (?4 AND f.origin='dependency'))
+             ORDER BY f.path, c.start_line, c.scope_chain",
         )?;
         let rows = stmt.query_map(
             rusqlite::params![&name, repository, workspace, dependency],

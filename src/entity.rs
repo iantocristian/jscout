@@ -11,7 +11,7 @@ use serde_json::json;
 
 /// Bump whenever deterministic extraction semantics change in a way that
 /// requires unchanged files to be parsed again.
-pub const EXTRACTION_VERSION: &str = "4";
+pub const EXTRACTION_VERSION: &str = "5";
 
 #[derive(Debug, Clone)]
 pub struct EntitySite {

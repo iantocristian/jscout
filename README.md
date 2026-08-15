@@ -896,6 +896,11 @@ See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
 enables the experimental deterministic renderer, and each call can override it
 with `view: "full"` or `view: "elided"`. Both representations obey the same
 per-definition `source_bytes` ceiling and report original/rendered byte counts.
+MCP `definition` and `who_uses` use compact agent transport with a complete
+`response_bytes` ceiling; set `debug: true` for their full diagnostic JSON.
+Compact definitions serialize source once, while compact usages group sites by
+confidence and file without dropping enclosing-symbol or candidate-detail
+evidence.
 The first SC-1 agent run found no compression on the artifacts selected by the
 elided arm, so elision remains experimental rather than becoming the default.
 The first discriminating three-arm run found no outcome gain over grep: both

@@ -1102,6 +1102,23 @@ mod tests {
     }
 
     #[test]
+    fn indexes_js_files_containing_jsx() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("page.js"),
+            "export default function Page() { return <main>Hello</main>; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+
+        let outcome = index_repo(repo.path(), &conn)?;
+
+        assert_eq!((outcome.indexed, outcome.failed), (1, 0));
+        let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
+        assert!(chunks > 0);
+        Ok(())
+    }
+
+    #[test]
     fn extraction_version_change_forces_unchanged_files_through_extraction() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
