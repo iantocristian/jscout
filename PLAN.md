@@ -616,20 +616,22 @@ A Next.js diagnostic showed ~93% of returned declarations failing to anchor:
 62.8% in the TypeScript standard library, 30.2% in `node_modules/@types`, and
 receiver classes told the story (`this` receivers mapped at 88%, ECMAScript
 globals at 0.05%, Node core namespaces at 0%). Discovery now computes two
-per-occurrence facts: a builtin receiver (an unshadowed ECMAScript/host global
-identifier, or a receiver whose import binding resolves a Node core module)
-and a runtime namesake (some indexed symbol with the member's name in an
-effective-runtime file). The builtin decision uses the scope tree recorded at
-extraction (`member_calls.receiver_unbound`): only an identifier with no
-binding at all is a global, so a parameter or local named `module` never
-trips the gate. Default eligibility requires a non-builtin receiver
-and a runtime namesake; `--all` bypasses both, and reports count each skip
-class. The sidecar labels every declaration's provenance (`repo`, `types`,
-`lib`, `vendored`, `outside`); non-`repo` declarations skip the anchoring
-lookup but still count as unmapped, so the per-occurrence ambiguity rule
+per-occurrence facts: a builtin-looking receiver (a file-local unbound
+ECMAScript/host global name or a receiver sharing a file-level Node-core import
+name) and a runtime namesake (some indexed symbol with the member's name in an
+effective-runtime file). Runtime namesakes remain a necessary default
+eligibility gate and `--all` bypasses it. Builtin detection is advisory only:
+project-wide ambient declarations, lexical import shadows, and tsconfig path
+aliases make file-local classification insufficient for hard exclusion.
+Builtin-looking occurrences are scheduled after ordinary receivers within the
+same structural tier, reported separately, and still all consumed by an
+uncapped run. An empty post-filter plan is a successful no-op that does not
+launch the checker. The sidecar labels every declaration's provenance (`repo`,
+`types`, `lib`, `vendored`, `outside`); non-`repo` declarations skip the
+anchoring lookup but still count as unmapped, so the per-occurrence ambiguity rule
 (`unmapped == 0`) and every published confidence are byte-identical — the
-change removes hopeless questions and attributes refusals, it does not relax
-fail-closed anchoring.
+change avoids runtime-unanchorable names and attributes refusals without
+relaxing fail-closed anchoring.
 
 ### Shape
 

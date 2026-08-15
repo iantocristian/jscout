@@ -35,7 +35,7 @@ pub struct EnrichReport {
     pub occurrences_eligible: usize,
     pub occurrences_selected: usize,
     pub occurrences_omitted: usize,
-    pub occurrences_skipped_builtin_receiver: usize,
+    pub occurrences_deprioritized_builtin_receiver: usize,
     pub occurrences_skipped_foreign_namesake: usize,
     pub occurrences_resumed: usize,
     pub request_batches: usize,
@@ -156,7 +156,6 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if options.max_occurrences == Some(0) {
         bail!("--max-occurrences must be greater than zero");
     }
-    super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
     let canonical_root = fs::canonicalize(root)
         .with_context(|| format!("repository root does not exist: {}", root.display()))?;
     let conn = match options.database {
@@ -166,7 +165,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let snapshot = crate::structural::current_snapshot(&conn)?;
     let discovered = load_occurrences(&conn)?;
     let occurrences_discovered = discovered.len();
-    let (eligible, selection_skips) = select_eligible(discovered, options);
+    let (eligible, selection) = select_eligible(discovered, options);
     let occurrences_eligible = eligible.len();
     let ordered = spread_occurrences(eligible);
     let selected = match options.max_occurrences {
@@ -174,8 +173,37 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         None => ordered,
     };
     if selected.is_empty() {
-        bail!("no eligible member-call occurrences matched the enrichment plan");
+        return Ok(EnrichReport {
+            snapshot,
+            batch_id: 0,
+            occurrences_queried: 0,
+            occurrences_discovered,
+            occurrences_eligible,
+            occurrences_selected: 0,
+            occurrences_omitted: 0,
+            occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+            occurrences_resumed: 0,
+            request_batches: 0,
+            unknown_answers: 0,
+            unknown_projects: Vec::new(),
+            unmapped_declarations: 0,
+            unmapped_declaration_contexts: BTreeMap::new(),
+            facts_published: 0,
+            checker_version: "not-invoked".into(),
+            checker_source: "not-invoked".into(),
+            projects: 0,
+            configured_projects: 0,
+            configuration_problems: 0,
+            occurrences_avoided_by_tooling_filter: 0,
+            occurrences_using_tooling_fallback: 0,
+            project_decisions: Vec::new(),
+            dry_run: options.dry_run,
+            peak_rss_bytes: 0,
+            peak_heap_bytes: 0,
+        });
     }
+    super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
     verify_selected_sources(&canonical_root, &conn, &selected)?;
 
     let mut planner = super::launch(&canonical_root, options.sidecar)?;
@@ -218,8 +246,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_eligible,
             occurrences_selected: selected.len(),
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
-            occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
-            occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
+            occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection.foreign_namesake,
             occurrences_resumed: 0,
             request_batches: 0,
             unknown_answers: 0,
@@ -262,8 +290,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_eligible,
             occurrences_selected: selected.len(),
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
-            occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
-            occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
+            occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection.foreign_namesake,
             occurrences_resumed: selected.len(),
             request_batches: 0,
             unknown_answers: 0,
@@ -390,8 +418,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         occurrences_eligible,
         occurrences_selected: selected.len(),
         occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
-        occurrences_skipped_builtin_receiver: selection_skips.builtin_receiver,
-        occurrences_skipped_foreign_namesake: selection_skips.foreign_namesake,
+        occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
+        occurrences_skipped_foreign_namesake: selection.foreign_namesake,
         occurrences_resumed,
         request_batches,
         unknown_answers,
@@ -423,10 +451,10 @@ fn canceled_checker_error(error: &anyhow::Error) -> bool {
         .is_some_and(|error| matches!(error, super::process::CheckerError::Canceled(_)))
 }
 
-/// ECMAScript / host globals whose members resolve into the TypeScript
-/// standard library or `@types` — never into an indexed repository symbol.
-/// A same-file symbol or import binding with the same name (a deliberate
-/// shadow) keeps the occurrence eligible.
+/// ECMAScript / host names that usually resolve into the TypeScript standard
+/// library or `@types`. This is an ordering hint only: project-wide ambient
+/// declarations can make a file-local unbound name resolve into repository
+/// code.
 const BUILTIN_RECEIVER_GLOBALS: &[&str] = &[
     "console",
     "JSON",
@@ -499,9 +527,9 @@ const BUILTIN_RECEIVER_GLOBALS: &[&str] = &[
     "BigUint64Array",
 ];
 
-/// Node core module specifiers. A receiver whose import binding resolves one
-/// of these (or any `node:`-prefixed request) has its member declarations in
-/// `@types/node`, outside the indexed corpus.
+/// Node core module spellings used by the advisory ordering hint. Bare
+/// specifiers can be shadowed by tsconfig paths and file-level import names can
+/// be shadowed lexically, so this list must never drive hard exclusion.
 const NODE_CORE_MODULES: &[&str] = &[
     "assert",
     "assert/strict",
@@ -639,7 +667,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct SelectionSkips {
+struct SelectionStats {
     builtin_receiver: usize,
     foreign_namesake: usize,
 }
@@ -647,8 +675,8 @@ struct SelectionSkips {
 fn select_eligible(
     occurrences: Vec<Occurrence>,
     options: &EnrichOptions<'_>,
-) -> (Vec<Occurrence>, SelectionSkips) {
-    let mut skips = SelectionSkips::default();
+) -> (Vec<Occurrence>, SelectionStats) {
+    let mut stats = SelectionStats::default();
     let eligible = occurrences
         .into_iter()
         .filter(|occurrence| {
@@ -672,25 +700,22 @@ fn select_eligible(
             if !in_scope {
                 return false;
             }
-            if options.include_all {
-                return true;
+            // A runtime namesake is a necessary precondition for the default
+            // runtime graph to anchor a fact. Builtin-looking receivers are
+            // only an ordering hint: file-local scope and import spelling
+            // cannot prove that project-wide TypeScript resolution lands in
+            // lib/@types, so they must never remove an occurrence.
+            if !options.include_all && !occurrence.runtime_namesake {
+                stats.foreign_namesake += 1;
+                return false;
             }
-            // Hopelessness gates, `--all`-bypassable like every other default
-            // exclusion. A builtin/global receiver resolves into lib/@types;
-            // a member whose only indexed namesakes live outside runtime
-            // files cannot anchor a fact either way.
             if occurrence.builtin_receiver {
-                skips.builtin_receiver += 1;
-                return false;
-            }
-            if !occurrence.runtime_namesake {
-                skips.foreign_namesake += 1;
-                return false;
+                stats.builtin_receiver += 1;
             }
             true
         })
         .collect();
-    (eligible, skips)
+    (eligible, stats)
 }
 
 /// Stable rank-tier spreading. This ordering matters for visible progress and
@@ -698,10 +723,12 @@ fn select_eligible(
 /// still consumes every eligible occurrence.
 fn spread_occurrences(occurrences: Vec<Occurrence>) -> Vec<Occurrence> {
     let mut tiers =
-        BTreeMap::<i64, BTreeMap<String, BTreeMap<String, VecDeque<Occurrence>>>>::new();
+        BTreeMap::<(i64, bool), BTreeMap<String, BTreeMap<String, VecDeque<Occurrence>>>>::new();
     for occurrence in occurrences {
         tiers
-            .entry(occurrence.boundary_rank)
+            // Within the structural boundary tier, process ordinary receivers
+            // before builtin-looking ones. An uncapped run still consumes both.
+            .entry((occurrence.boundary_rank, occurrence.builtin_receiver))
             .or_default()
             .entry(occurrence.package.clone())
             .or_default()
@@ -2227,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_receivers_and_foreign_namesakes_are_default_exclusions_with_all_bypass() {
+    fn builtin_receivers_are_deprioritized_while_foreign_namesakes_are_excluded() {
         let mut builtin = planned_occurrence(1, "alpha", "alpha/a.ts", "production", 0);
         builtin.builtin_receiver = true;
         let mut foreign = planned_occurrence(2, "alpha", "alpha/b.ts", "production", 0);
@@ -2238,16 +2265,24 @@ mod tests {
         let (eligible, skips) = select_eligible(candidates.clone(), &options());
         assert_eq!(
             eligible.iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![3]
+            vec![1, 3]
         );
         assert_eq!(skips.builtin_receiver, 1);
         assert_eq!(skips.foreign_namesake, 1);
+        assert_eq!(
+            spread_occurrences(eligible)
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
 
         let mut all = options();
         all.include_all = true;
         let (eligible, skips) = select_eligible(candidates, &all);
         assert_eq!(eligible.len(), 3);
-        assert_eq!(skips, SelectionSkips::default());
+        assert_eq!(skips.builtin_receiver, 1);
+        assert_eq!(skips.foreign_namesake, 0);
     }
 
     #[test]
@@ -2463,6 +2498,7 @@ mod tests {
         fs::write(
             repo.path().join("src/app.ts"),
             "import path from \"path\";\n\
+             import { PathShim } from \"./path-shim\";\n\
              import { helper } from \"./helper\";\n\
              export class Service { run(): void {} }\n\
              export class Loader { ensureUserland(): void {} }\n\
@@ -2472,12 +2508,28 @@ mod tests {
                service.run();\n\
                helper.probe();\n\
              }\n\
+             export function ambient(): void { console.send(); }\n\
+             export function shadowedImport(path: PathShim): void { path.join(); }\n\
              export function route(module: Loader): void {\n\
                module.ensureUserland();\n\
              }\n\
              export function hot(): void {\n\
                module.reload();\n\
              }\n",
+        )?;
+        fs::write(
+            repo.path().join("src/globals.ts"),
+            "class RepoConsole { send(): void {} }\n\
+             declare const console: RepoConsole;\n",
+        )?;
+        fs::write(
+            repo.path().join("src/path-shim.ts"),
+            "export class PathShim { join(): void {} }\n\
+             export default new PathShim();\n",
+        )?;
+        fs::write(
+            repo.path().join("tsconfig.json"),
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"path\":[\"./src/path-shim.ts\"]}},\"include\":[\"src/**/*.ts\"]}",
         )?;
         fs::write(
             repo.path().join("src/shadow.ts"),
@@ -2510,8 +2562,19 @@ mod tests {
         };
         // Bare global receiver, unbound in the scope tree.
         assert_eq!(flags("src/app.ts", "log"), (true, false));
-        // Receiver bound by a Node core-module import.
-        assert_eq!(flags("src/app.ts", "join"), (true, false));
+        // Request spelling alone labels a paths-mapped import and a lexically
+        // shadowed import as builtin-looking. This is advisory only: both have
+        // an indexed runtime namesake and must remain eligible.
+        let joins = calls
+            .iter()
+            .filter(|occurrence| occurrence.file == "src/app.ts" && occurrence.member == "join")
+            .collect::<Vec<_>>();
+        assert_eq!(joins.len(), 2);
+        assert!(joins.iter().all(|occurrence| occurrence.builtin_receiver));
+        assert!(joins.iter().all(|occurrence| occurrence.runtime_namesake));
+        // A project-wide ambient global is also unbound in the per-file Oxc
+        // scope even though TypeScript can resolve its repository declaration.
+        assert_eq!(flags("src/app.ts", "send"), (true, true));
         // Ordinary local receiver with a production-class namesake.
         assert_eq!(flags("src/app.ts", "run"), (false, true));
         // Namesake exists only in a test file.
@@ -2530,9 +2593,39 @@ mod tests {
             .map(|occurrence| occurrence.member.as_str())
             .collect::<Vec<_>>();
         eligible_members.sort_unstable();
-        assert_eq!(eligible_members, vec!["ensureUserland", "run"]);
+        assert_eq!(
+            eligible_members,
+            vec!["ensureUserland", "join", "join", "run", "send"]
+        );
         assert_eq!(skips.builtin_receiver, 3);
-        assert_eq!(skips.foreign_namesake, 2);
+        assert_eq!(skips.foreign_namesake, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_filtered_plan_is_a_successful_noop_without_launching_the_checker() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join("src"))?;
+        fs::create_dir_all(repo.path().join("tests"))?;
+        fs::write(
+            repo.path().join("src/app.ts"),
+            "export function run(): void { console.log('x'); }\n",
+        )?;
+        fs::write(
+            repo.path().join("tests/log.test.ts"),
+            "export function log(): void {}\n",
+        )?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        drop(conn);
+
+        let report = enrich(repo.path(), &options())?;
+        assert_eq!(report.occurrences_discovered, 1);
+        assert_eq!(report.occurrences_eligible, 0);
+        assert_eq!(report.occurrences_selected, 0);
+        assert_eq!(report.occurrences_skipped_foreign_namesake, 1);
+        assert_eq!(report.checker_source, "not-invoked");
+        assert_eq!(report.batch_id, 0);
         Ok(())
     }
 
