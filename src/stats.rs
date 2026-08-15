@@ -64,10 +64,9 @@ impl<'a> Visit<'a> for StatsVisitor {
 
 pub fn file_stats(path: &Path, source: &str) -> anyhow::Result<FileStats> {
     crate::parse::with_parsed(source, path, |ret, _semantic| {
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let mut v = StatsVisitor {
             stats: FileStats::default(),
-            is_jsx_file: matches!(ext, "jsx" | "tsx"),
+            is_jsx_file: ret.program.source_type.is_jsx(),
         };
         v.visit_program(&ret.program);
         v.stats.imports = ret.module_record.import_entries.len();
@@ -76,4 +75,25 @@ pub fn file_stats(path: &Path, source: &str) -> anyhow::Result<FileStats> {
             + ret.module_record.star_export_entries.len();
         v.stats
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use anyhow::Result;
+
+    use super::file_stats;
+
+    #[test]
+    fn counts_components_written_as_js_with_jsx() -> Result<()> {
+        let stats = file_stats(
+            Path::new("component.js"),
+            "export function Card() { return <article />; }",
+        )?;
+
+        assert_eq!(stats.functions, 1);
+        assert_eq!(stats.jsx_components_defined, 1);
+        Ok(())
+    }
 }
