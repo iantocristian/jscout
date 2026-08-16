@@ -181,7 +181,7 @@ never be pooled.
 | `checker-scout` | checker + repository scout overlay | `skill`, `forced` | Controlled additive scout comparison using the same checker facts. |
 | `checker-scout-embed` | checker + scout + product-only embeddings | `skill`, `forced` | Controlled additive combined profile used in calibration. |
 | `production-order` | structural + scout + checker + product-only embeddings | `skill`, `forced` | Operational ordering in which scouting can exclude tooling before checker and embedding work. |
-| `memory` | checker-scout + workflow/card/summary scouting into the semantic tables | `skill`, `forced` | Whether persisted causal artifacts change implementation outcomes where retrieval alone did not. |
+| `memory` | checker-scout-embed + workflow/card/summary scouting into the semantic tables | `skill`, `forced` | Whether persisted causal artifacts change implementation outcomes where retrieval alone did not. |
 
 The controlled additive profiles continue to enrich before scouting so they
 can reuse the same checker fact set and isolate the scout overlay. The new

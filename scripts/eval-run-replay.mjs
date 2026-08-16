@@ -348,9 +348,15 @@ const PROFILE_PLANS = Object.freeze({
   // corpus this order produces must not inherit additive-profile state.
   "production-order": ["scout", "enrich", "embed-product"],
   // The memory plane: generative workflow/card/summary artifacts persisted
-  // into the semantic tables before any arm runs. Base checker-scout so the
-  // artifacts form over checker facts and reconnaissance policy.
-  memory: ["enrich", "scout", "workflows", "cards", "summaries"],
+  // into the semantic tables before any arm runs. Memory artifacts attach to
+  // search hits, so the base must carry product embeddings or the plane is
+  // lexically stranded (measured: sol-mem-003 delivered 0-1 segment-cache
+  // artifacts despite 8 existing). Base checker-scout-embed so the artifacts
+  // form over checker facts and reconnaissance policy AND stay retrievable.
+  // This list is also what gates JSCOUT_EMBED_PROVIDER on the arm's MCP
+  // server below, so a memory plan without an embed stage disabled vector
+  // retrieval outright: every sol-mem-003 search reported vector "disabled".
+  memory: ["enrich", "scout", "embed-product", "workflows", "cards", "summaries"],
 });
 
 const PROFILE_BASES = Object.freeze({
@@ -358,7 +364,7 @@ const PROFILE_BASES = Object.freeze({
   "checker-embed": "checker",
   "checker-scout": "checker",
   "checker-scout-embed": "checker-scout",
-  memory: "checker-scout",
+  memory: "checker-scout-embed",
 });
 
 const PROFILE_INCREMENT = Object.freeze({

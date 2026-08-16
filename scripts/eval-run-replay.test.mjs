@@ -41,6 +41,13 @@ test("replay profiles and forced-search contract are explicit", () => {
     usesJscout: true,
     stages: ["scout", "enrich", "embed-product"],
   });
+  // Memory artifacts attach to search hits, so the plane only reaches an agent
+  // when the base carries product embeddings: embed-product must precede the
+  // generative stages.
+  assert.deepEqual(profilePlan("memory"), {
+    usesJscout: true,
+    stages: ["enrich", "scout", "embed-product", "workflows", "cards", "summaries"],
+  });
   assert.throws(() => profilePlan("invented"), /unknown profile/);
 
   const natural = promptFor({ story: "Fix it." }, "skill");
