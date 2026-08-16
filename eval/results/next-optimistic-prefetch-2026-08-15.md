@@ -258,3 +258,34 @@ independently named the same missing mechanism the oracle test detects.
 Records: `adjudication/` in the experiment folder (per-arm JSONL, grader-
 compatible verdicts, prompts and event streams). Cost: 39 sequential calls,
 16.15M in / 208K out, 84 minutes.
+
+## Architecture probe: design instead of implement (one sol call)
+
+One read-only gpt-5.6-sol call (11.2 min, 26.6k output tokens) given the
+same anchor-free story but asked to design the fix. Verdict: split, and the
+split is the finding.
+
+Retrieval-reachable: the design reached the correct residual mechanism (the
+synthetic prediction never fetches the tree that discovery would validate,
+survives segment-level rejection, and is re-derived on retry), the correct
+detection signal (server tree vs request tree, compared on segment identity
+and parallel-slot structure — gold's two axes), the correct site
+(`fetchSegmentPrefetchesUsingDynamicRequest`, before writing under predicted
+keys), gold's exact cure semantics (immediate expiration, `-1`, not
+backoff), named `cache.ts`, and independently rediscovered the parallel-slot
+dynamic-child collision. The concept is not beyond the model: 39
+implementation arms missing it reads as search/attention collapse under
+implementation pressure, not a capability ceiling.
+
+Conceptual gap: the canonicalization sub-fix (`canonicalizeURLPart` vs param
+cache keys in `route-params.ts`) is absent in any form — the design believes
+downstream response comparison covers that class, so no retrieval steering
+would land it. The design also argues, by name, against the two pieces of
+existing machinery gold reuses (`markRouteEntryAsDynamicRewrite`,
+`invalidateRouteCacheEntries`), leaving sibling entries derived from a bad
+template un-invalidated.
+
+Implication for the product: the leverage on hard tasks may be a
+design-before-edit workflow surface rather than more retrieval — the model
+produces the mechanism when asked to design and loses it while implementing.
+Artifacts: `trial-sol-003-arch-probe/` in the experiment folder.
