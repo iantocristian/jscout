@@ -171,6 +171,64 @@ timeout). Layer1 grading ran outside the sandbox and is sound. The
 environment must be fixed (or the denial equalized) before sol-vs-terra cost
 comparisons mean anything.
 
+## Trial 002: terra on the fixed harness, counterbalanced order
+
+Run 2026-08-16 with the repaired harness (out-of-sandbox browser server +
+`NEXT_TEST_BROWSER_WS_ENDPOINT`, fd-limit wrapper, dev-watcher and
+run-tests.js prompt guards), profiles in reversed order, one arm at a time,
+databases cloned from trial-001 (same recorded deviation).
+
+| Profile | Treatment | Grade | jscout | Tool bytes | Fresh in | Cached in | Output | Time |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| production-order | skill | fail | 9 | 20,356 | 124,944 | 3,249,664 | 17,107 | 9.7m |
+| production-order | forced | fail | 18 | 103,639 | 137,846 | 4,310,272 | 17,844 | 13.5m |
+| checker-scout-embed | skill | fail | 2 | 16,215 | 110,626 | 2,194,432 | 18,548 | 8.6m |
+| checker-scout-embed | forced | fail | 17 | 93,809 | 115,739 | 2,342,912 | 13,575 | 7.0m |
+| checker-scout | skill | fail | 5 | 28,856 | 137,597 | 4,816,896 | 24,254 | 15.8m |
+| checker-scout | forced | fail | 26 | 165,125 | 129,397 | 3,701,504 | 15,626 | 10.4m |
+| checker-embed | skill | fail | 5 | 25,573 | 125,929 | 2,872,320 | 19,078 | 11.4m |
+| checker-embed | forced | fail | 31 | 87,348 | 136,957 | 4,840,192 | 23,104 | 14.0m |
+| checker | skill | fail | 0 | 0 | 103,909 | 1,578,496 | 17,849 | 7.9m |
+| checker | forced | fail | 25 | 104,865 | 171,658 | 5,207,808 | 19,844 | 17.7m |
+| structural | skill | fail | 4 | 18,012 | 276,855 | 4,758,784 | 21,850 | 22.3m |
+| structural | forced | fail | 51 | 200,790 | 228,751 | 8,429,824 | 26,098 | 19.9m |
+| grep | control | fail | 0 | 0 | 119,745 | 2,444,288 | 20,307 | 9.1m |
+
+Totals: 0/13 pass; 193 jscout calls; 52.9M tokens (1.92M fresh in, 255k out);
+167.5 agent-minutes.
+
+What moved, and why it matters:
+
+- **The rewrite-misprediction case is now 39/39 unfixed** across three trials
+  and two models, always at the same assertion. It is the defining property
+  of this task and a better future target than any profile in this matrix.
+- **Livelock fixed 12/13, up from terra-001's 7/13, with adoption flat**
+  (skill mean 4.2 vs 3.7 calls; forced mean identical at 28.0). The gain
+  tracks the harness — a reachable browser and zero EMFILE (45,645
+  occurrences in trial-001, 0 here) — not retrieval or feedback iteration.
+- **The embed-skill livelock regression is retired**: on its third
+  same-substrate run (identical cloned `checker-embed.db`), the arm won the
+  case it lost under terra-001 and sol-001. Execution variance, not an
+  embed effect.
+- **Gold overlap broke its floor once**: structural/skill patched 3/7 gold
+  files (`cache.ts`, `navigation.ts`, `optimistic-routes.ts`) — the only
+  non-timeout arm across three trials to exceed 1/7. Markers remain zero in
+  all 13 patches and answers.
+- **Self-verification stayed hollow despite the fix**: real assertion
+  results reached 7/13 arms (6/13 before). The blocker moved — 21 of 43
+  in-arm e2e attempts hung in `pnpm test-start-turbo` teardown (120s
+  `afterAll` in `next.destroy()`, 18 timeouts trial-wide) while the graded
+  oracle path stayed clean at ~33s. And structurally: the hidden suites are
+  vacuous green in-workspace and the pre-existing suites are green at the
+  parent, so no in-arm run can discriminate the fix. One integrity note:
+  checker/skill claimed e2e verification its own logs do not contain;
+  grep/control described the same situation honestly.
+
+Residual harness item for the next task: steer agents to the `pnpm
+testonly` invocation (teardown-clean under connect) instead of
+`test-start-turbo`, and check whether that teardown hang is connect-induced
+or pre-existing.
+
 ## Artifacts
 
 `~/git/jscout-replay-runs/next-optimistic-prefetch-2026-08-15/`: `task-set.json`,
@@ -178,5 +236,7 @@ comparisons mean anything.
 (admission records), `trial-001/{responses.jsonl,telemetry.jsonl,artifacts/}`
 with per-arm event streams, MCP request logs, patches, grades, and prepared
 profile databases; `trial-sol-001/` mirrors the layout for the sol trial,
-with `contamination/responses-sol.jsonl` recording sol's admission probe. Scripts are local copies of js-rag `scripts/eval-*` at
+with `contamination/responses-sol.jsonl` recording sol's admission probe;
+`trial-002/` holds the fixed-harness terra trial and `trial-sol-002-probe/`
+the browser-fix validation arm. Scripts are local copies of js-rag `scripts/eval-*` at
 `d138de4` with two recorded changes (production-order profile, `--resume`).
