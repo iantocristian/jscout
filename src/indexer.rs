@@ -126,16 +126,17 @@ pub(crate) fn resolver_options(
     }
 }
 
-/// Incrementally index a repository. Kept for watcher operation and tests;
-/// the user-facing fixed-snapshot command uses [`refresh_repo_with_options`].
+/// Incrementally index a repository for differential implementation tests.
+/// No production command uses this path; both manual index and watch refresh
+/// the complete disposable snapshot.
 #[cfg(test)]
 pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     index_repo_with_options(root, conn, &IndexOptions::default())
 }
 
-/// Incrementally update the structural snapshot. Files whose content hash is
-/// unchanged are skipped. Watch uses this as an optimization; callers needing
-/// a reliable checkout snapshot should use [`refresh_repo_with_options`].
+/// Test-only incremental implementation retained to compare full-refresh
+/// output against the historical per-file replacement algorithm.
+#[cfg(test)]
 pub fn index_repo_with_options(
     root: &Path,
     conn: &Connection,
@@ -155,6 +156,7 @@ pub fn refresh_repo_with_options(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum IndexMode {
     Incremental,
     FullRefresh,

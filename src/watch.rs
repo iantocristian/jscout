@@ -1,22 +1,909 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use notify::{RecursiveMode, Watcher};
+use rusqlite::Connection;
 
-use crate::{checker, embed, indexer, store, walk};
+use crate::{checker, embed, indexer, store, structural, walk};
+
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(30);
+const OPTIONAL_PHASE_POLL: Duration = Duration::from_millis(100);
+const STABLE_FAILURE_THRESHOLD: u8 = 3;
 
 pub struct WatchOptions<'a> {
+    pub database: Option<&'a Path>,
     pub embed_on_change: bool,
     pub dependencies: &'a [String],
     pub enrich_on_change: bool,
     pub enrich_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
+    pub debounce: Duration,
+    pub reconcile_interval: Duration,
 }
 
-/// Paths that should trigger re-indexing even though they aren't source files:
-/// resolution config changes alter the module graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+    Refresh,
+    Embed,
+    Enrich,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Refresh => "refresh",
+            Self::Embed => "embed",
+            Self::Enrich => "enrich",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Work {
+    generation: u64,
+    phase: Phase,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    work: Work,
+    due: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FinishState {
+    Continue,
+    Complete { degraded: bool },
+    Retry { after: Duration },
+    Superseded,
+}
+
+/// Pure generation state. The driver supplies monotonic time and executes the
+/// returned work, so debounce/retry/supersession tests do not sleep or touch
+/// the filesystem.
+struct Coordinator {
+    desired_generation: u64,
+    completed_generation: u64,
+    last_dirty_at: Duration,
+    startup_immediate: bool,
+    active: Option<Work>,
+    ready: Option<Work>,
+    retry: Option<Retry>,
+    retry_attempts: BTreeMap<Phase, u32>,
+    stable_failure: Option<(String, u8)>,
+    cycle_snapshot: Option<String>,
+    cycle_degraded: bool,
+    dirty_reasons: BTreeSet<String>,
+    debounce: Duration,
+    retry_initial: Duration,
+    retry_max: Duration,
+    embed: bool,
+    enrich: bool,
+}
+
+impl Coordinator {
+    fn new(debounce: Duration, embed: bool, enrich: bool) -> Self {
+        let mut coordinator = Self {
+            desired_generation: 0,
+            completed_generation: 0,
+            last_dirty_at: Duration::ZERO,
+            startup_immediate: true,
+            active: None,
+            ready: None,
+            retry: None,
+            retry_attempts: BTreeMap::new(),
+            stable_failure: None,
+            cycle_snapshot: None,
+            cycle_degraded: false,
+            dirty_reasons: BTreeSet::new(),
+            debounce,
+            retry_initial: DEFAULT_RETRY_INITIAL,
+            retry_max: DEFAULT_RETRY_MAX,
+            embed,
+            enrich,
+        };
+        coordinator.mark_dirty(Duration::ZERO, "startup");
+        coordinator.startup_immediate = true;
+        coordinator
+    }
+
+    fn mark_dirty(&mut self, now: Duration, reason: impl Into<String>) {
+        self.desired_generation += 1;
+        self.last_dirty_at = now;
+        self.dirty_reasons.insert(reason.into());
+        self.ready = None;
+        self.retry = None;
+        self.retry_attempts.clear();
+        self.stable_failure = None;
+        self.cycle_snapshot = None;
+        self.cycle_degraded = false;
+    }
+
+    fn next_work(&mut self, now: Duration) -> Option<Work> {
+        if self.active.is_some() {
+            return None;
+        }
+        if self
+            .ready
+            .is_some_and(|work| work.generation != self.desired_generation)
+        {
+            self.ready = None;
+        }
+        if self
+            .retry
+            .is_some_and(|retry| retry.work.generation != self.desired_generation)
+        {
+            self.retry = None;
+        }
+        if let Some(work) = self.ready.take() {
+            self.active = Some(work);
+            return Some(work);
+        }
+        if let Some(retry) = self.retry
+            && now >= retry.due
+        {
+            self.retry = None;
+            self.active = Some(retry.work);
+            return Some(retry.work);
+        }
+        if self.desired_generation <= self.completed_generation {
+            return None;
+        }
+        if !self.startup_immediate && now < self.last_dirty_at.saturating_add(self.debounce) {
+            return None;
+        }
+        self.startup_immediate = false;
+        let work = Work {
+            generation: self.desired_generation,
+            phase: Phase::Refresh,
+        };
+        self.active = Some(work);
+        Some(work)
+    }
+
+    fn next_deadline(&self) -> Option<Duration> {
+        if self.active.is_some() || self.ready.is_some() {
+            return Some(Duration::ZERO);
+        }
+        if let Some(retry) = self.retry {
+            return Some(retry.due);
+        }
+        (self.desired_generation > self.completed_generation).then(|| {
+            if self.startup_immediate {
+                Duration::ZERO
+            } else {
+                self.last_dirty_at.saturating_add(self.debounce)
+            }
+        })
+    }
+
+    fn finish_refresh(
+        &mut self,
+        now: Duration,
+        work: Work,
+        snapshot: String,
+        failure_fingerprint: Option<String>,
+    ) -> FinishState {
+        self.clear_active(work);
+        if work.generation != self.desired_generation {
+            return FinishState::Superseded;
+        }
+        self.retry_attempts.remove(&Phase::Refresh);
+        if let Some(fingerprint) = failure_fingerprint {
+            let repeats = match &self.stable_failure {
+                Some((previous, repeats)) if previous == &fingerprint => repeats + 1,
+                _ => 1,
+            };
+            self.stable_failure = Some((fingerprint, repeats));
+            if repeats < STABLE_FAILURE_THRESHOLD {
+                return self.schedule_retry(now, work);
+            }
+            self.cycle_degraded = true;
+        } else {
+            self.stable_failure = None;
+            self.cycle_degraded = false;
+        }
+        self.cycle_snapshot = Some(snapshot);
+        self.advance(work)
+    }
+
+    fn finish_optional(&mut self, work: Work) -> FinishState {
+        self.clear_active(work);
+        if work.generation != self.desired_generation {
+            return FinishState::Superseded;
+        }
+        self.retry_attempts.remove(&work.phase);
+        self.advance(work)
+    }
+
+    fn finish_error(&mut self, now: Duration, work: Work) -> FinishState {
+        self.clear_active(work);
+        if work.generation != self.desired_generation {
+            return FinishState::Superseded;
+        }
+        self.schedule_retry(now, work)
+    }
+
+    fn clear_active(&mut self, work: Work) {
+        debug_assert_eq!(self.active, Some(work));
+        self.active = None;
+    }
+
+    fn schedule_retry(&mut self, now: Duration, work: Work) -> FinishState {
+        let attempts = self.retry_attempts.entry(work.phase).or_default();
+        *attempts += 1;
+        let multiplier = 1u32
+            .checked_shl((*attempts - 1).min(16))
+            .unwrap_or(u32::MAX);
+        let after = self
+            .retry_initial
+            .saturating_mul(multiplier)
+            .min(self.retry_max);
+        self.retry = Some(Retry {
+            work,
+            due: now.saturating_add(after),
+        });
+        FinishState::Retry { after }
+    }
+
+    fn advance(&mut self, work: Work) -> FinishState {
+        let next = match work.phase {
+            Phase::Refresh if self.embed => Some(Phase::Embed),
+            Phase::Refresh if self.enrich => Some(Phase::Enrich),
+            Phase::Embed if self.enrich => Some(Phase::Enrich),
+            _ => None,
+        };
+        if let Some(phase) = next {
+            self.ready = Some(Work {
+                generation: work.generation,
+                phase,
+            });
+            FinishState::Continue
+        } else {
+            self.completed_generation = work.generation;
+            self.dirty_reasons.clear();
+            self.cycle_snapshot = None;
+            let degraded = self.cycle_degraded;
+            self.cycle_degraded = false;
+            FinishState::Complete { degraded }
+        }
+    }
+
+    fn is_superseded(&self, work: Work) -> bool {
+        self.desired_generation != work.generation
+    }
+}
+
+#[derive(Default)]
+struct EventClassifier {
+    root: PathBuf,
+    excluded: BTreeSet<PathBuf>,
+    git_controls: BTreeSet<PathBuf>,
+    external_exact: BTreeSet<PathBuf>,
+    external_prefixes: BTreeSet<PathBuf>,
+}
+
+impl EventClassifier {
+    fn new(root: &Path, database: &Path) -> Self {
+        let mut excluded = BTreeSet::new();
+        excluded.insert(database.to_path_buf());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            excluded.insert(PathBuf::from(format!("{}{suffix}", database.display())));
+        }
+        Self {
+            root: root.to_path_buf(),
+            excluded,
+            git_controls: git_control_paths(root),
+            external_exact: BTreeSet::new(),
+            external_prefixes: BTreeSet::new(),
+        }
+    }
+
+    fn set_external(&mut self, exact: BTreeSet<PathBuf>, prefixes: BTreeSet<PathBuf>) {
+        self.external_exact = exact;
+        self.external_prefixes = prefixes;
+    }
+
+    fn classify(&self, paths: &[PathBuf]) -> Option<String> {
+        if paths.is_empty() {
+            return Some("unknown-event".into());
+        }
+        let mut saw_non_noise = false;
+        for path in paths {
+            let path = self.absolute(path);
+            if self.excluded.contains(&path) {
+                continue;
+            }
+            if self.git_controls.contains(&path) {
+                return Some(format!("git:{}", display_path(&self.root, &path)));
+            }
+            if self.external_exact.contains(&path)
+                || self
+                    .external_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            {
+                return Some(format!("external:{}", path.display()));
+            }
+            if is_noise(&path) {
+                continue;
+            }
+            saw_non_noise = true;
+            if is_relevant(&path) {
+                return Some(format!("source:{}", display_path(&self.root, &path)));
+            }
+        }
+        saw_non_noise.then(|| "unknown-event".into())
+    }
+
+    fn absolute(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetKind {
+    Exact,
+    Prefix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetSource {
+    Git,
+    Dependency,
+    Checker,
+}
+
+#[derive(Clone, Debug)]
+struct WatchTarget {
+    watch_path: PathBuf,
+    path: PathBuf,
+    mode: RecursiveMode,
+    kind: TargetKind,
+    source: TargetSource,
+}
+
+#[derive(Default)]
+struct WatchRegistry {
+    active: BTreeMap<PathBuf, RecursiveMode>,
+    failures: BTreeMap<PathBuf, u8>,
+}
+
+impl WatchRegistry {
+    fn reconcile<W: Watcher>(&mut self, watcher: &mut W, root: &Path, targets: &[WatchTarget]) {
+        let mut desired = BTreeMap::new();
+        for target in targets
+            .iter()
+            .filter(|target| !target.watch_path.starts_with(root))
+        {
+            desired
+                .entry(target.watch_path.clone())
+                .and_modify(|mode| {
+                    if target.mode == RecursiveMode::Recursive {
+                        *mode = RecursiveMode::Recursive;
+                    }
+                })
+                .or_insert(target.mode);
+        }
+        let removed = self
+            .active
+            .keys()
+            .filter(|path| !desired.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in removed {
+            if let Err(error) = watcher.unwatch(&path) {
+                eprintln!(
+                    "watch coverage path={} status=unwatch-failed error={error}",
+                    path.display()
+                );
+            }
+            self.active.remove(&path);
+            self.failures.remove(&path);
+        }
+        for (path, mode) in desired {
+            if self.active.get(&path) == Some(&mode) {
+                continue;
+            }
+            if self.active.contains_key(&path) {
+                let _ = watcher.unwatch(&path);
+                self.active.remove(&path);
+            }
+            match watcher.watch(&path, mode) {
+                Ok(()) => {
+                    self.active.insert(path.clone(), mode);
+                    self.failures.remove(&path);
+                }
+                Err(error) => {
+                    let failures = self.failures.entry(path.clone()).or_default();
+                    *failures = failures.saturating_add(1);
+                    eprintln!(
+                        "watch coverage path={} status={} attempt={} error={error}",
+                        path.display(),
+                        if *failures >= 3 {
+                            "degraded"
+                        } else {
+                            "retrying"
+                        },
+                        failures
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct RefreshResult {
+    snapshot: String,
+    outcome: indexer::IndexOutcome,
+    failure_fingerprint: Option<String>,
+}
+
+pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
+    if options.enrich_on_change && options.enrich_timeout.is_zero() {
+        bail!("--enrich-timeout must be greater than zero seconds");
+    }
+    if options.debounce.is_zero() {
+        bail!("--debounce-ms must be greater than zero");
+    }
+    let root = root.canonicalize()?;
+    let database = absolute_database_path(&root, options.database);
+    let provider = if options.embed_on_change {
+        Some(Arc::new(embed::Provider::from_env()?.context(
+            "--embed requires JSCOUT_EMBED_PROVIDER=local, voyage, or openai",
+        )?))
+    } else {
+        None
+    };
+    let (sender, receiver) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })?;
+    // Subscribe before startup refresh so changes during a long first pass are
+    // queued and force a later generation.
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
+    let started = Instant::now();
+    let mut coordinator = Coordinator::new(
+        options.debounce,
+        options.embed_on_change,
+        options.enrich_on_change,
+    );
+    let mut classifier = EventClassifier::new(&root, &database);
+    let mut registry = WatchRegistry::default();
+    let mut targets =
+        collect_watch_targets(&root, &database).unwrap_or_else(|_| git_watch_targets(&root));
+    targets.extend(selector_watch_targets(&root, options.dependencies));
+    normalize_targets(&mut targets);
+    update_classifier_targets(&mut classifier, &targets);
+    registry.reconcile(&mut watcher, &root, &targets);
+    let mut next_reconcile = (!options.reconcile_interval.is_zero())
+        .then(|| started.elapsed().saturating_add(options.reconcile_interval));
+
+    eprintln!(
+        "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} enrich={}",
+        root.display(),
+        database.display(),
+        options.debounce.as_millis(),
+        options.reconcile_interval.as_secs(),
+        options.embed_on_change,
+        options.enrich_on_change
+    );
+    if options.reconcile_interval.is_zero() {
+        eprintln!(
+            "warning: periodic reconciliation is disabled; missed notifications and degraded external coverage may remain stale until another event"
+        );
+    }
+
+    loop {
+        let now = started.elapsed();
+        if next_reconcile.is_some_and(|deadline| now >= deadline) {
+            coordinator.mark_dirty(now, "periodic-reconciliation");
+            next_reconcile = Some(now.saturating_add(options.reconcile_interval));
+        }
+        drain_events(&receiver, &classifier, &mut coordinator, started.elapsed());
+
+        if let Some(work) = coordinator.next_work(started.elapsed()) {
+            let phase_started = Instant::now();
+            eprintln!(
+                "watch generation={} phase={} status=started reasons={}",
+                work.generation,
+                work.phase,
+                coordinator
+                    .dirty_reasons
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            match work.phase {
+                Phase::Refresh => match run_refresh(&root, &database, options.dependencies) {
+                    Ok(result) => {
+                        indexer::report_failures(&result.outcome);
+                        eprintln!(
+                            "watch generation={} phase=refresh status={} snapshot={} indexed={} failed={} chunks={} refs={} elapsed_ms={}",
+                            work.generation,
+                            if result.outcome.failed == 0 {
+                                "succeeded"
+                            } else {
+                                "partial"
+                            },
+                            result.snapshot,
+                            result.outcome.indexed,
+                            result.outcome.failed,
+                            result.outcome.chunks,
+                            result.outcome.refs,
+                            phase_started.elapsed().as_millis()
+                        );
+                        let previous_targets = targets.clone();
+                        targets = collect_watch_targets(&root, &database).unwrap_or_else(|error| {
+                            eprintln!("watch coverage status=read-failed error={error:#}");
+                            git_watch_targets(&root)
+                        });
+                        if options.enrich_on_change {
+                            targets.extend(
+                                previous_targets
+                                    .into_iter()
+                                    .filter(|target| target.source == TargetSource::Checker),
+                            );
+                            normalize_targets(&mut targets);
+                        }
+                        targets.extend(selector_watch_targets(&root, options.dependencies));
+                        normalize_targets(&mut targets);
+                        update_classifier_targets(&mut classifier, &targets);
+                        registry.reconcile(&mut watcher, &root, &targets);
+                        drain_events(&receiver, &classifier, &mut coordinator, started.elapsed());
+                        report_finish(
+                            work,
+                            coordinator.finish_refresh(
+                                started.elapsed(),
+                                work,
+                                result.snapshot,
+                                result.failure_fingerprint,
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "watch generation={} phase=refresh status=failed elapsed_ms={} error={error:#}",
+                            work.generation,
+                            phase_started.elapsed().as_millis()
+                        );
+                        report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                    }
+                },
+                Phase::Embed => {
+                    let provider = Arc::clone(provider.as_ref().expect("provider validated"));
+                    let result = {
+                        let mut monitor = PhaseMonitor {
+                            receiver: &receiver,
+                            classifier: &classifier,
+                            coordinator: &mut coordinator,
+                            work,
+                            started,
+                        };
+                        run_embedding_interruptible(&root, &database, provider, &mut monitor)
+                    };
+                    match result {
+                        Ok((done, total, canceled)) => {
+                            eprintln!(
+                                "watch generation={} phase=embed status={} embedded={done}/{total} elapsed_ms={}",
+                                work.generation,
+                                if canceled { "canceled" } else { "succeeded" },
+                                phase_started.elapsed().as_millis()
+                            );
+                            let state = if canceled && !coordinator.is_superseded(work) {
+                                coordinator.finish_error(started.elapsed(), work)
+                            } else {
+                                coordinator.finish_optional(work)
+                            };
+                            report_finish(work, state);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "watch generation={} phase=embed status=failed elapsed_ms={} error={error:#}",
+                                work.generation,
+                                phase_started.elapsed().as_millis()
+                            );
+                            report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                        }
+                    }
+                }
+                Phase::Enrich => {
+                    let result = {
+                        let mut monitor = PhaseMonitor {
+                            receiver: &receiver,
+                            classifier: &classifier,
+                            coordinator: &mut coordinator,
+                            work,
+                            started,
+                        };
+                        run_enrichment_interruptible(&root, &database, options, &mut monitor)
+                    };
+                    match result {
+                        Ok(report) => {
+                            eprintln!(
+                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} elapsed_ms={}",
+                                work.generation,
+                                report.snapshot,
+                                report.facts_published,
+                                report.occurrences_queried,
+                                report.projects,
+                                phase_started.elapsed().as_millis()
+                            );
+                            targets =
+                                collect_watch_targets(&root, &database).unwrap_or_else(|error| {
+                                    eprintln!("watch coverage status=read-failed error={error:#}");
+                                    targets.clone()
+                                });
+                            targets.extend(selector_watch_targets(&root, options.dependencies));
+                            normalize_targets(&mut targets);
+                            update_classifier_targets(&mut classifier, &targets);
+                            registry.reconcile(&mut watcher, &root, &targets);
+                            report_finish(work, coordinator.finish_optional(work));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "watch generation={} phase=enrich status=failed elapsed_ms={} error={error:#}",
+                                work.generation,
+                                phase_started.elapsed().as_millis()
+                            );
+                            report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let now = started.elapsed();
+        let phase_deadline = coordinator.next_deadline();
+        let deadline = match (phase_deadline, next_reconcile) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
+        let received = match deadline {
+            Some(deadline) => {
+                receiver.recv_timeout(deadline.saturating_sub(now).max(Duration::from_millis(1)))
+            }
+            None => match receiver.recv() {
+                Ok(event) => Ok(event),
+                Err(_) => return Ok(()),
+            },
+        };
+        match received {
+            Ok(event) => ingest_event(event, &classifier, &mut coordinator, started.elapsed()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn run_refresh(root: &Path, database: &Path, dependencies: &[String]) -> Result<RefreshResult> {
+    let conn = open_phase_database(root, database)?;
+    let outcome = indexer::refresh_repo_with_options(
+        root,
+        &conn,
+        &indexer::IndexOptions {
+            dependencies: dependencies.to_vec(),
+            ..Default::default()
+        },
+    )?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let failure_fingerprint = failure_fingerprint(&outcome);
+    Ok(RefreshResult {
+        snapshot,
+        outcome,
+        failure_fingerprint,
+    })
+}
+
+fn run_embedding_interruptible(
+    root: &Path,
+    database: &Path,
+    provider: Arc<embed::Provider>,
+    monitor: &mut PhaseMonitor<'_>,
+) -> Result<(usize, usize, bool)> {
+    let root = root.to_path_buf();
+    let database = database.to_path_buf();
+    let canceled = Arc::new(AtomicBool::new(false));
+    let worker_canceled = Arc::clone(&canceled);
+    let worker = thread::spawn(move || -> Result<(usize, usize, bool)> {
+        let conn = open_phase_database(&root, &database)?;
+        embed::embed_missing_interruptible(&conn, &provider, 64, || {
+            worker_canceled.load(Ordering::SeqCst)
+        })
+    });
+    while !worker.is_finished() {
+        monitor.poll();
+        if monitor.is_superseded() {
+            canceled.store(true, Ordering::SeqCst);
+        }
+        thread::sleep(OPTIONAL_PHASE_POLL);
+    }
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("embedding worker panicked"))?
+}
+
+fn run_enrichment_interruptible(
+    root: &Path,
+    database: &Path,
+    options: &WatchOptions<'_>,
+    monitor: &mut PhaseMonitor<'_>,
+) -> Result<checker::EnrichReport> {
+    let root = root.to_path_buf();
+    let database = database.to_path_buf();
+    let sidecar = options.checker_sidecar.map(Path::to_path_buf);
+    let timeout = options.enrich_timeout;
+    let worker = thread::spawn(move || {
+        checker::enrich(
+            &root,
+            &checker::EnrichOptions {
+                database: Some(&database),
+                sidecar: sidecar.as_deref(),
+                timeout,
+                files: Vec::new(),
+                packages: Vec::new(),
+                members: Vec::new(),
+                roles: Vec::new(),
+                max_occurrences: None,
+                include_all: false,
+                dry_run: false,
+            },
+        )
+    });
+    while !worker.is_finished() {
+        monitor.poll();
+        if monitor.is_superseded() {
+            let _ = checker::process::cancel_active_operation();
+        }
+        thread::sleep(OPTIONAL_PHASE_POLL);
+    }
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("checker enrichment worker panicked"))?
+}
+
+struct PhaseMonitor<'a> {
+    receiver: &'a mpsc::Receiver<notify::Result<notify::Event>>,
+    classifier: &'a EventClassifier,
+    coordinator: &'a mut Coordinator,
+    work: Work,
+    started: Instant,
+}
+
+impl PhaseMonitor<'_> {
+    fn poll(&mut self) {
+        match self.receiver.recv_timeout(OPTIONAL_PHASE_POLL) {
+            Ok(event) => ingest_event(
+                event,
+                self.classifier,
+                self.coordinator,
+                self.started.elapsed(),
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        drain_events(
+            self.receiver,
+            self.classifier,
+            self.coordinator,
+            self.started.elapsed(),
+        );
+    }
+
+    fn is_superseded(&self) -> bool {
+        self.coordinator.is_superseded(self.work)
+    }
+}
+
+fn ingest_event(
+    event: notify::Result<notify::Event>,
+    classifier: &EventClassifier,
+    coordinator: &mut Coordinator,
+    now: Duration,
+) {
+    let reason = match event {
+        Ok(event) => classifier.classify(&event.paths),
+        Err(error) => Some(format!("watch-error:{error}")),
+    };
+    if let Some(reason) = reason {
+        coordinator.mark_dirty(now, reason);
+    }
+}
+
+fn drain_events(
+    receiver: &mpsc::Receiver<notify::Result<notify::Event>>,
+    classifier: &EventClassifier,
+    coordinator: &mut Coordinator,
+    now: Duration,
+) {
+    while let Ok(event) = receiver.try_recv() {
+        ingest_event(event, classifier, coordinator, now);
+    }
+}
+
+fn report_finish(work: Work, state: FinishState) {
+    match state {
+        FinishState::Continue => {}
+        FinishState::Complete { degraded } => eprintln!(
+            "watch generation={} status={}",
+            work.generation,
+            if degraded { "degraded" } else { "clean" }
+        ),
+        FinishState::Retry { after } => eprintln!(
+            "watch generation={} phase={} status=retry-wait retry_ms={}",
+            work.generation,
+            work.phase,
+            after.as_millis()
+        ),
+        FinishState::Superseded => eprintln!(
+            "watch generation={} phase={} status=superseded",
+            work.generation, work.phase
+        ),
+    }
+}
+
+fn open_phase_database(root: &Path, database: &Path) -> Result<Connection> {
+    let conn = if database == store::db_path(root) {
+        store::open(root)?
+    } else {
+        store::open_path(database)?
+    };
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    Ok(conn)
+}
+
+fn absolute_database_path(root: &Path, selected: Option<&Path>) -> PathBuf {
+    let path = match selected {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => root.join(path),
+        None => store::db_path(root),
+    };
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or(path),
+        _ => path,
+    }
+}
+
+fn failure_fingerprint(outcome: &indexer::IndexOutcome) -> Option<String> {
+    if outcome.failures.is_empty() {
+        return None;
+    }
+    let mut failures = outcome
+        .failures
+        .iter()
+        .map(|failure| format!("{}\0{}\0{}", failure.path, failure.stage, failure.error))
+        .collect::<Vec<_>>();
+    failures.sort();
+    Some(
+        blake3::hash(failures.join("\n").as_bytes())
+            .to_hex()
+            .to_string(),
+    )
+}
+
+/// Paths that change extraction, module resolution, or checker ownership.
 fn is_relevant(path: &Path) -> bool {
     if walk::is_indexable(path) {
         return true;
@@ -30,172 +917,309 @@ fn is_relevant(path: &Path) -> bool {
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
             | "tsconfig.json"
             | "jsconfig.json"
+            | ".gitmodules"
     ) || (name.starts_with("tsconfig.") && name.ends_with(".json"))
+        || (name.starts_with("jsconfig.") && name.ends_with(".json"))
         || name.ends_with(".d.ts")
         || name.ends_with(".d.mts")
         || name.ends_with(".d.cts")
 }
 
 fn is_noise(path: &Path) -> bool {
-    path.components().any(|c| {
+    path.components().any(|component| {
         matches!(
-            c.as_os_str().to_str(),
-            Some("node_modules") | Some(".git") | Some("dist") | Some("build") | Some(".next")
+            component.as_os_str().to_str(),
+            Some("node_modules")
+                | Some(".git")
+                | Some("dist")
+                | Some("build")
+                | Some(".next")
+                | Some("coverage")
+                | Some("out")
         )
-    }) || path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(store::DB_FILE))
+    })
 }
 
-pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
-    if options.enrich_on_change && options.enrich_timeout.is_zero() {
-        bail!("--enrich-timeout must be greater than zero seconds");
-    }
-    let root = root.canonicalize()?;
-    // Subscribe before the initial index/enrichment. Those passes can be long;
-    // events that arrive while they run must remain queued for the first loop
-    // iteration instead of falling into an unobserved startup window.
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })?;
-    watcher.watch(&root, RecursiveMode::Recursive)?;
-
-    let conn = store::open(&root)?;
-    let index_options = indexer::IndexOptions {
-        dependencies: options.dependencies.to_vec(),
-        ..Default::default()
-    };
-    let outcome = indexer::index_repo_with_options(&root, &conn, &index_options)?;
-    eprintln!(
-        "initial: {} indexed, {} unchanged, {} failed — watching {} for changes (ctrl-c to stop)",
-        outcome.indexed,
-        outcome.unchanged,
-        outcome.failed,
-        root.display()
-    );
-    indexer::report_failures(&outcome);
-    let provider = if options.embed_on_change {
-        embed::Provider::from_env()?
+fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::from([root.join(".gitmodules")]);
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        Some(dot_git)
     } else {
-        None
-    };
-    if options.embed_on_change && provider.is_none() {
-        eprintln!("warning: --embed set but no provider configured; skipping embeddings");
-    }
-    if options.enrich_on_change {
-        if outcome.failed > 0 {
-            eprintln!(
-                "checker enrichment deferred because initial indexing failed; watch will retry"
-            );
-        } else {
-            run_checker_enrichment(&root, options);
-        }
-    }
-
-    while let Ok(first) = rx.recv() {
-        // The outer receive blocks until something happens; then debounce
-        // until 300ms of quiet.
-        let mut pending: Vec<PathBuf> = Vec::new();
-        if let Ok(ev) = first {
-            pending.extend(ev.paths);
-        }
-        loop {
-            match rx.recv_timeout(Duration::from_millis(300)) {
-                Ok(Ok(ev)) => pending.extend(ev.paths),
-                Ok(Err(_)) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        }
-        if !pending
-            .iter()
-            .any(|path| !is_noise(path) && is_relevant(path))
-        {
-            continue;
-        }
-        let started = std::time::Instant::now();
-        match indexer::index_repo_with_options(&root, &conn, &index_options) {
-            Ok(o) => {
-                let changed = o.indexed > 0 || o.projection_rebuilt;
-                if o.indexed > 0 || o.failed > 0 {
-                    eprintln!(
-                        "re-indexed {} files ({} failed) in {:?}",
-                        o.indexed,
-                        o.failed,
-                        started.elapsed()
-                    );
-                    indexer::report_failures(&o);
-                }
-                if options.enrich_on_change {
-                    if o.failed > 0 {
-                        eprintln!(
-                            "checker enrichment deferred because indexing failed; checker edges remain absent"
-                        );
+        fs::read_to_string(&dot_git).ok().and_then(|contents| {
+            contents
+                .trim()
+                .strip_prefix("gitdir:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
                     } else {
-                        run_checker_enrichment(&root, options);
+                        root.join(path)
                     }
-                }
-                if changed && let Some(p) = &provider {
-                    match embed::embed_missing(&conn, p, 64) {
-                        Ok((done, _)) if done > 0 => eprintln!("embedded {done} new chunks"),
-                        Ok(_) => {}
-                        Err(e) => eprintln!("embed failed: {e}"),
-                    }
-                }
-            }
-            Err(e) => eprintln!("re-index failed: {e}"),
-        }
+                })
+        })
+    };
+    if let Some(git_dir) = git_dir {
+        let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+        paths.insert(git_dir.join("HEAD"));
+        paths.insert(git_dir.join("index"));
     }
-    Ok(())
+    paths
 }
 
-/// Replenish the checker plane for the structural snapshot just published.
-/// Failed project work stays in inactive staging for an exact-plan retry.
-/// Structural indexing owns invalidation when it publishes a new snapshot.
-fn run_checker_enrichment(root: &Path, options: &WatchOptions<'_>) -> bool {
-    match checker::enrich(
-        root,
-        &checker::EnrichOptions {
-            database: None,
-            sidecar: options.checker_sidecar,
-            timeout: options.enrich_timeout,
-            files: Vec::new(),
-            packages: Vec::new(),
-            members: Vec::new(),
-            roles: Vec::new(),
-            max_occurrences: None,
-            include_all: false,
-            dry_run: false,
-        },
-    ) {
-        Ok(report) => {
-            eprintln!(
-                "checker enriched {} facts from {} occurrence(s) across {} configured project(s)",
-                report.facts_published, report.occurrences_queried, report.projects
-            );
-            true
-        }
-        Err(error) => {
-            eprintln!(
-                "checker enrichment failed; completed work remains staged for an exact-snapshot retry: {error}"
-            );
-            false
+fn git_watch_targets(root: &Path) -> Vec<WatchTarget> {
+    git_control_paths(root)
+        .into_iter()
+        .map(|path| exact_watch_target(path, TargetSource::Git))
+        .collect()
+}
+
+fn selector_watch_targets(root: &Path, dependencies: &[String]) -> Vec<WatchTarget> {
+    dependencies
+        .iter()
+        .map(|name| {
+            exact_watch_target(
+                root.join("node_modules").join(name),
+                TargetSource::Dependency,
+            )
+        })
+        .collect()
+}
+
+fn collect_watch_targets(root: &Path, database: &Path) -> Result<Vec<WatchTarget>> {
+    let conn = store::open_path_read_only(database)?;
+    let mut targets = git_watch_targets(root);
+    let mut packages = conn.prepare(
+        "SELECT canonical_root, locator FROM package_instances WHERE origin='dependency'",
+    )?;
+    let rows = packages.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (canonical_root, locator) = row?;
+        let canonical_root = PathBuf::from(canonical_root);
+        targets.push(WatchTarget {
+            watch_path: canonical_root.clone(),
+            path: canonical_root,
+            mode: RecursiveMode::Recursive,
+            kind: TargetKind::Prefix,
+            source: TargetSource::Dependency,
+        });
+        targets.push(exact_watch_target(
+            root.join(locator),
+            TargetSource::Dependency,
+        ));
+    }
+    let mut checker_inputs = conn.prepare(
+        "SELECT input.input_kind, input.input_path
+         FROM checker_project_inputs input
+         JOIN checker_enrichment_batches batch ON batch.id=input.batch_id
+         WHERE batch.active=1",
+    )?;
+    let rows = checker_inputs.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (kind, input) = row?;
+        let path = if kind == "absolute" {
+            PathBuf::from(input)
+        } else {
+            root.join(input)
+        };
+        if !path.starts_with(root) {
+            targets.push(exact_watch_target(path, TargetSource::Checker));
         }
     }
+    normalize_targets(&mut targets);
+    Ok(targets)
+}
+
+fn normalize_targets(targets: &mut Vec<WatchTarget>) {
+    targets.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.watch_path.cmp(&right.watch_path))
+    });
+    targets.dedup_by(|left, right| {
+        left.path == right.path && left.watch_path == right.watch_path && left.mode == right.mode
+    });
+}
+
+fn exact_watch_target(path: PathBuf, source: TargetSource) -> WatchTarget {
+    let watch_path = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.clone());
+    WatchTarget {
+        watch_path,
+        path,
+        mode: RecursiveMode::NonRecursive,
+        kind: TargetKind::Exact,
+        source,
+    }
+}
+
+fn update_classifier_targets(classifier: &mut EventClassifier, targets: &[WatchTarget]) {
+    let mut exact = BTreeSet::new();
+    let mut prefixes = BTreeSet::new();
+    for target in targets {
+        match target.kind {
+            TargetKind::Exact => {
+                exact.insert(target.path.clone());
+            }
+            TargetKind::Prefix => {
+                prefixes.insert(target.path.clone());
+            }
+        }
+    }
+    classifier.set_external(exact, prefixes);
+}
+
+fn display_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-    use super::{is_noise, is_relevant};
+    use anyhow::Result;
+
+    use super::{
+        Coordinator, EventClassifier, FinishState, Phase, is_noise, is_relevant, run_refresh,
+    };
+
+    fn seconds(value: u64) -> Duration {
+        Duration::from_secs(value)
+    }
 
     #[test]
-    fn lockfiles_trigger_reconciliation_without_watching_node_modules() {
+    fn startup_refresh_is_immediate_and_optional_phases_are_ordered() {
+        let mut coordinator = Coordinator::new(seconds(2), true, true);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        assert_eq!(refresh.phase, Phase::Refresh);
+        assert_eq!(
+            coordinator.finish_refresh(Duration::ZERO, refresh, "s1".into(), None),
+            FinishState::Continue
+        );
+        let embed = coordinator.next_work(Duration::ZERO).expect("embed");
+        assert_eq!(embed.phase, Phase::Embed);
+        assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
+        let enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+        assert_eq!(enrich.phase, Phase::Enrich);
+        assert_eq!(
+            coordinator.finish_optional(enrich),
+            FinishState::Complete { degraded: false }
+        );
+    }
+
+    #[test]
+    fn an_event_during_refresh_supersedes_optional_work_and_debounces_again() {
+        let mut coordinator = Coordinator::new(seconds(2), true, true);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        coordinator.mark_dirty(seconds(1), "source:a.ts");
+        assert_eq!(
+            coordinator.finish_refresh(seconds(1), refresh, "s1".into(), None),
+            FinishState::Superseded
+        );
+        assert!(coordinator.next_work(seconds(2)).is_none());
+        let next = coordinator.next_work(seconds(3)).expect("next refresh");
+        assert_eq!(next.generation, 2);
+        assert_eq!(next.phase, Phase::Refresh);
+    }
+
+    #[test]
+    fn failed_work_retries_without_a_new_event_with_bounded_backoff() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        assert_eq!(
+            coordinator.finish_error(Duration::ZERO, refresh),
+            FinishState::Retry {
+                after: Duration::from_millis(500)
+            }
+        );
+        assert!(coordinator.next_work(Duration::from_millis(499)).is_none());
+        assert_eq!(
+            coordinator
+                .next_work(Duration::from_millis(500))
+                .expect("retry"),
+            refresh
+        );
+    }
+
+    #[test]
+    fn three_identical_partial_refreshes_publish_a_degraded_generation() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let mut now = Duration::ZERO;
+        for attempt in 0..3 {
+            let work = coordinator.next_work(now).expect("refresh attempt");
+            let state = coordinator.finish_refresh(
+                now,
+                work,
+                format!("s{attempt}"),
+                Some("same-failure".into()),
+            );
+            if attempt < 2 {
+                let FinishState::Retry { after } = state else {
+                    panic!("expected retry")
+                };
+                now = now.saturating_add(after);
+            } else {
+                assert_eq!(state, FinishState::Complete { degraded: true });
+            }
+        }
+    }
+
+    #[test]
+    fn event_classifier_excludes_only_the_exact_database_family() {
+        let root = PathBuf::from("/repo");
+        let database = root.join(".jscout.db");
+        let classifier = EventClassifier::new(&root, &database);
+        assert!(classifier.classify(&[database]).is_none());
+        assert!(
+            classifier
+                .classify(&[root.join(".jscout.db-wal")])
+                .is_none()
+        );
+        assert!(
+            classifier
+                .classify(&[root.join(".jscout-notes.ts")])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn selected_external_prefix_overrides_node_modules_noise() {
+        let root = PathBuf::from("/repo");
+        let dependency = root.join("node_modules/pkg");
+        let mut classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+        classifier.set_external(Default::default(), [dependency.clone()].into());
+        assert!(
+            classifier
+                .classify(&[dependency.join("index.js")])
+                .is_some()
+        );
+        assert!(
+            classifier
+                .classify(&[root.join("node_modules/other/index.js")])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lockfiles_configs_and_declarations_trigger_reconciliation() {
         assert!(is_relevant(Path::new("pnpm-lock.yaml")));
         assert!(is_relevant(Path::new("package-lock.json")));
         assert!(is_relevant(Path::new("yarn.lock")));
@@ -203,5 +1227,25 @@ mod tests {
         assert!(is_relevant(Path::new("types/ambient.d.ts")));
         assert!(is_noise(Path::new("node_modules/dep/index.js")));
         assert!(!is_noise(Path::new("pnpm-lock.yaml")));
+    }
+
+    #[test]
+    fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
+        let database = directory.path().join("watch.db");
+        let first = run_refresh(directory.path(), &database, &[])?;
+        assert_eq!(first.outcome.indexed, 1);
+        fs::remove_file(directory.path().join("a.ts"))?;
+        fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
+        let second = run_refresh(directory.path(), &database, &[])?;
+        assert_eq!(second.outcome.indexed, 1);
+        let conn = crate::store::open_path_read_only(&database)?;
+        let paths = conn
+            .prepare("SELECT path FROM files ORDER BY path")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(paths, vec!["b.ts"]);
+        Ok(())
     }
 }

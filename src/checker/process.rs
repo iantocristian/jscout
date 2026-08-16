@@ -126,6 +126,13 @@ fn request_interrupt_cancellation() -> bool {
         .unwrap_or(false)
 }
 
+/// Cancel the active request for an in-process watcher generation. Setting the
+/// pending bit also stops enrichment at its next project boundary when the
+/// sidecar has not yet registered an active request.
+pub fn cancel_active_operation() -> bool {
+    request_interrupt_cancellation()
+}
+
 /// Start one top-level checker operation. Per-project sidecars may replace the
 /// active cancel target, but they must not clear an interrupt that already
 /// canceled an earlier project in the same operation.
