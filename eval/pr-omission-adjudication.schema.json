@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["gold_files", "overall_verdict", "overall_reason"],
+  "properties": {
+    "gold_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gold_file", "verdict", "reason"],
+        "properties": {
+          "gold_file": { "type": "string" },
+          "verdict": {
+            "type": "string",
+            "enum": ["omission", "alternative_covered", "not_required"]
+          },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "overall_verdict": {
+      "type": "string",
+      "enum": ["genuine_alternative", "partial_alternative", "not_alternative"]
+    },
+    "overall_reason": { "type": "string" }
+  }
+}
