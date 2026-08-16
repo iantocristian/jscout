@@ -181,6 +181,7 @@ never be pooled.
 | `checker-scout` | checker + repository scout overlay | `skill`, `forced` | Controlled additive scout comparison using the same checker facts. |
 | `checker-scout-embed` | checker + scout + product-only embeddings | `skill`, `forced` | Controlled additive combined profile used in calibration. |
 | `production-order` | structural + scout + checker + product-only embeddings | `skill`, `forced` | Operational ordering in which scouting can exclude tooling before checker and embedding work. |
+| `memory` | checker-scout + workflow/card/summary scouting into the semantic tables | `skill`, `forced` | Whether persisted causal artifacts change implementation outcomes where retrieval alone did not. |
 
 The controlled additive profiles continue to enrich before scouting so they
 can reuse the same checker fact set and isolate the scout overlay. The new
@@ -221,6 +222,43 @@ design, not calibration results.
    while loopback remains available for framework tests.
 10. **Use harder tasks and multiple trials.** The headers task calibrates the
     harness; it does not replace discriminating implementation tasks.
+
+## Memory profile
+
+Motivated by the optimistic-prefetch result: 39 implementation arms across
+two models never produced the fix's second mechanism, while the same model
+produced it in one call when asked to design instead of implement, and the
+retrieval profiles all ran with empty semantic tables. The memory profile
+tests the plane built for exactly that gap.
+
+- **Preparation**: clone the `checker-scout` database, then run
+  `scout workflows`, `scout cards`, and `scout summaries` with bounded
+  `--max-calls` budgets recorded per stage. Prepare once; clone byte-identical
+  copies for both treatments, as with every other profile.
+- **Leakage rule (hard)**: scouting uses automatic seeding only, over the
+  whole repository, with subject-weight ordering. Never target scouting at a
+  subsystem chosen because the task's fix lives there — aiming the artifacts
+  is answer-key leakage. The artifacts must be what a production user would
+  have had before the bug report existed.
+- **Snapshot safety**: artifacts are generated from the parent snapshot by a
+  model that has already passed this task's contamination probe, so they can
+  describe existing causal structure but cannot describe the fix.
+- **Agent surface**: no new tools; `semantic_memory`, search-attached
+  artifacts, and `overview --semantic` already exist. Record per arm how many
+  artifacts were returned, cited, and (from the event stream) visibly used.
+- **Runner support**: `PROFILE_PLANS` gains `memory` with stages
+  `["workflows", "cards", "summaries"]` on base `checker-scout`; stage
+  invocations mirror the existing scout stage with per-stage call budgets.
+- **First execution**: add a sol `skill`/`forced` memory pair to the
+  completed optimistic-prefetch task, reusing its substrate — the 39-arm
+  baseline makes any movement on the rewrite-misprediction case, gold-file
+  coverage, or the divergence markers directly attributable. Then include
+  the profile in the next task's matrix from the start.
+- **Reporting**: alongside the standard metrics, record scouting prep cost
+  per stage, artifact counts by type, refusal rates, and — decisive for
+  interpretation — whether any artifact describes the causal chain the task
+  requires (judged blind, after the arms complete, the way omission
+  adjudication is done).
 
 ## Recorded metrics and artifacts
 
