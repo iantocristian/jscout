@@ -1055,7 +1055,17 @@ Acceptance checks:
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
 
-## Planned G12 — watcher coordinator
+## G12 — watcher coordinator
+
+**Implementation complete (2026-08-16); sustained-churn validation on a large
+real repository remains pending.** The production watcher now has no reachable
+incremental-indexing path. It uses a pure generation coordinator, full
+disposable-snapshot refreshes, fresh per-phase connections, explicit optional
+embedding/checker phases, supersession and cancellation, bounded retry and
+stable-failure degradation, exact self-output exclusions, dynamic external
+coverage, and periodic reconciliation. Unit/fixture coverage passes; the next
+operational step is to run it through branch switches and ordinary edits on the
+user's target repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
