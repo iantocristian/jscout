@@ -245,6 +245,11 @@ function runLogged(command, args, {
   log,
   env = process.env,
   maxBuffer = 256 * 1024 * 1024,
+  // Generative scout stages exit nonzero to report subject-local failures
+  // while still publishing every successful artifact (scout_batch_exit).
+  // Callers that can proceed on partial output pass tolerateExit with a
+  // predicate over the log text; a nonzero exit is then recorded, not fatal.
+  tolerateExit = null,
 }) {
   const result = spawnSync(command, args, {
     cwd,
@@ -253,12 +258,26 @@ function runLogged(command, args, {
     maxBuffer,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  fs.writeFileSync(log, `${result.stdout ?? ""}${result.stderr ?? ""}`);
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  fs.writeFileSync(log, output);
   if (result.error || result.status !== 0) {
+    if (!result.error && tolerateExit && tolerateExit(output)) {
+      process.stderr.write(
+        `tolerated partial failure: ${command} ${args.join(" ")} exited ${result.status}; see ${log}\n`,
+      );
+      return;
+    }
     throw new Error(
       `${command} ${args.join(" ")} failed (${result.status ?? result.error?.message ?? "unknown"}); see ${log}`,
     );
   }
+}
+
+// A generative scout run is usable when it published at least one artifact;
+// subject-local failures are reported in the log and by the batch exit code.
+function scoutPublishedArtifacts(output) {
+  const match = output.match(/reports: (\d+)/);
+  return match !== null && Number(match[1]) > 0;
 }
 
 function gitCommitWithoutHooks(workspace, args) {
@@ -470,6 +489,7 @@ function prepareJscoutProfile({
           cwd: workspace,
           env,
           log: path.join(runDir, `jscout-${stage}.log`),
+          tolerateExit: scoutPublishedArtifacts,
         },
       );
     } else if (stage === "embed" || stage === "embed-product") {
