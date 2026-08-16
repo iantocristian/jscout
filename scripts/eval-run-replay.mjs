@@ -347,10 +347,16 @@ const PROFILE_PLANS = Object.freeze({
   // shape checker scheduling and product embedding. No base profile: the
   // corpus this order produces must not inherit additive-profile state.
   "production-order": ["scout", "enrich", "embed-product"],
-  // The memory plane: generative workflow/card/summary artifacts persisted
-  // into the semantic tables before any arm runs. Base checker-scout so the
-  // artifacts form over checker facts and reconnaissance policy.
+  // The memory-only plane: generative workflow/card/summary artifacts persisted
+  // over checker facts and reconnaissance policy. Keep this free of embeddings
+  // so it remains an isolatable treatment.
   memory: ["enrich", "scout", "workflows", "cards", "summaries"],
+  // Full semantic-memory treatment: the same persisted artifacts plus
+  // product-scoped vectors and the local query embedder/reranker at runtime.
+  // Keep this separate from `memory` so memory-only trials remain comparable.
+  "memory-embed": [
+    "enrich", "scout", "embed-product", "workflows", "cards", "summaries",
+  ],
 });
 
 const PROFILE_BASES = Object.freeze({
@@ -359,6 +365,7 @@ const PROFILE_BASES = Object.freeze({
   "checker-scout": "checker",
   "checker-scout-embed": "checker-scout",
   memory: "checker-scout",
+  "memory-embed": "checker-scout-embed",
 });
 
 const PROFILE_INCREMENT = Object.freeze({
@@ -367,6 +374,7 @@ const PROFILE_INCREMENT = Object.freeze({
   "checker-scout": "scout",
   "checker-scout-embed": "embed-product",
   memory: ["workflows", "cards", "summaries"],
+  "memory-embed": ["workflows", "cards", "summaries"],
 });
 
 export function profilePlan(profile) {
@@ -374,6 +382,13 @@ export function profilePlan(profile) {
   const stages = PROFILE_PLANS[profile];
   if (!stages) throw new Error(`unknown profile: ${profile}`);
   return { usesJscout: true, stages };
+}
+
+export function embeddingEnvironmentForProfile(profile) {
+  const plan = profilePlan(profile);
+  return plan.stages.some((stage) => stage.startsWith("embed"))
+    ? { JSCOUT_EMBED_PROVIDER: "local" }
+    : {};
 }
 
 function copyDatabase(source, destination) {
@@ -452,9 +467,7 @@ function prepareJscoutProfile({
   const env = {
     ...process.env,
     ...executionEnvironment,
-    ...(plan.stages.some((stage) => stage.startsWith("embed"))
-      ? { JSCOUT_EMBED_PROVIDER: "local" }
-      : {}),
+    ...embeddingEnvironmentForProfile(profile),
   };
   let stages = plan.stages;
   if (baseDatabase && fs.existsSync(baseDatabase)) {
@@ -981,7 +994,7 @@ async function main() {
             "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
             "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
           );
-          if (stages.some((stage) => stage.startsWith("embed"))) {
+          if (embeddingEnvironmentForProfile(profile).JSCOUT_EMBED_PROVIDER) {
             args.push(
               "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
             );

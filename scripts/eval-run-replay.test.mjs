@@ -9,6 +9,7 @@ import { buildSnapshot } from "./eval-pr-snapshot.mjs";
 import {
   preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
+  embeddingEnvironmentForProfile,
   profilePlan,
   promptFor,
   startBrowserServer,
@@ -40,6 +41,18 @@ test("replay profiles and forced-search contract are explicit", () => {
   assert.deepEqual(profilePlan("production-order"), {
     usesJscout: true,
     stages: ["scout", "enrich", "embed-product"],
+  });
+  assert.deepEqual(profilePlan("memory"), {
+    usesJscout: true,
+    stages: ["enrich", "scout", "workflows", "cards", "summaries"],
+  });
+  assert.deepEqual(profilePlan("memory-embed"), {
+    usesJscout: true,
+    stages: ["enrich", "scout", "embed-product", "workflows", "cards", "summaries"],
+  });
+  assert.deepEqual(embeddingEnvironmentForProfile("memory"), {});
+  assert.deepEqual(embeddingEnvironmentForProfile("memory-embed"), {
+    JSCOUT_EMBED_PROVIDER: "local",
   });
   assert.throws(() => profilePlan("invented"), /unknown profile/);
 
