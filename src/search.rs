@@ -89,6 +89,11 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
+    /// Number of artifacts matched before the whole-response budget. Compact
+    /// transport uses this to retain an actionable memory envelope even when
+    /// every preview is shed.
+    #[serde(skip)]
+    pub semantic_matched: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
@@ -370,6 +375,7 @@ pub fn search(
         } else {
             Vec::new()
         };
+        let semantic_matched = semantic_artifacts.len();
         let expansion = options
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
@@ -379,6 +385,7 @@ pub fn search(
             retrieval,
             hits,
             semantic_artifacts,
+            semantic_matched,
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
@@ -748,7 +755,9 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
     // structural context appears. The dedicated semantic-memory surface owns
     // deeper evidence retrieval; search keeps one global, fairly distributed
     // preview rather than multiplying the cap by the number of artifacts.
-    cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
+    if !compact {
+        cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
+    }
 
     while settle_rendered_bytes(result, compact)? > byte_limit {
         result.response_budget.truncated = true;
@@ -1530,6 +1539,7 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
+            semantic_matched: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec!["root".into()],
                 nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],
@@ -1603,6 +1613,7 @@ mod tests {
                 supports: Vec::new(),
                 relevance: 1.0,
             }],
+            semantic_matched: 1,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 2_000,
@@ -1661,6 +1672,7 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
+            semantic_matched: 2,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 100_000,
