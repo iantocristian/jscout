@@ -13,16 +13,23 @@ questions, then verify decisive claims in source.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
   `semantic_memory`. Use its `anchor` or `related_to` filters for code-to-memory
   joins and `include_source=true` for hash-verified evidence drill-down.
+- For causal questions, regressions with multiple mechanisms, or behavior that
+  crosses files, call `semantic_memory` directly. The memory attached to
+  `semantic_search` is only a compact preview; when its matched count exceeds
+  its returned count, retrieve the relevant artifacts with `semantic_memory`
+  instead of widening the combined search response.
 - For selected current, fresh concepts, use the returned `concept_tags` as
   deterministic file/chunk localization hints. They follow fingerprinted
   concept-to-child claims and derive from the child's exact support-span
   overlap, not separate model claims; increase
   `concept_tag_limit` only when the omitted count shows the default bound was
   reached.
-- Start code localization with `semantic_search`. Keep the initial result
-  limit at 10 or below and keep expansion off for exact lookups. Widen only
-  after inspecting the first result set and finding that it lacks enough
-  candidates.
+- Start code localization with `semantic_search`. Split a multi-clause task
+  into one small query per distinct behavior. Keep the initial result limit at
+  10 or below and keep expansion off for exact lookups. After learning a
+  concrete symbol, state transition, or subsystem term, issue a follow-up
+  search with those terms before editing; do not treat one broad query as the
+  complete repository investigation.
 - For blast-radius, multi-hop, or workflow questions, use
   `semantic_search` with `expand=true` and a small depth/budget.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
@@ -35,8 +42,10 @@ questions, then verify decisive claims in source.
   known. Expanded search is the normal discovery surface.
 - Treat `possible` confidence as a candidate, not a fact. It includes
   unresolved receiver/member-call and event relationships.
-- Refine the query or drill into exact definitions before increasing result
-  budgets. Graph context can contain irrelevant structural neighbors.
+- Leave `response_bytes` unset on initial calls so the 24 KB tool default
+  applies. Refine the query or drill into exact definitions before increasing
+  result budgets. Lower the byte budget only when omissions are acceptable;
+  graph context can contain irrelevant structural neighbors.
 - If jscout returns no relevant evidence, fall back to repository-local search.
 
 `semantic_search` can also attach a small persistent-memory section, but it

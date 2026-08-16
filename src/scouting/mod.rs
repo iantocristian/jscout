@@ -4523,6 +4523,7 @@ mod tests {
         let queried = crate::semantic_query::query(
             repo.path(),
             &conn,
+            None,
             &crate::semantic_query::QueryOptions {
                 artifact_id: Some(concept_id),
                 artifact_types: vec!["concept".into()],

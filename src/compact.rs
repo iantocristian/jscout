@@ -64,6 +64,7 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
             "semantic_memory".into(),
             json!({
                 "trust": "untrusted",
+                "retrieval": result.semantic_retrieval,
                 "matched": result.semantic_matched,
                 "returned": artifacts.len(),
                 "omitted": result.semantic_matched.saturating_sub(artifacts.len()),
@@ -959,6 +960,7 @@ mod tests {
                 used_by: Vec::new(),
             }],
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
             semantic_matched: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec![root.into()],
@@ -1028,6 +1030,7 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits,
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
             semantic_matched: 0,
             expansion: None,
             response_budget: ResponseBudget {
@@ -1078,6 +1081,11 @@ mod tests {
                 }],
                 relevance: 0.75,
             }],
+            semantic_retrieval: Some(crate::semantic::ArtifactRetrievalStatus {
+                lexical: "active",
+                vector: "disabled",
+                vector_action: None,
+            }),
             semantic_matched: 1,
             expansion: None,
             response_budget: ResponseBudget {
@@ -1108,6 +1116,11 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: Some(crate::semantic::ArtifactRetrievalStatus {
+                lexical: "active",
+                vector: "degraded",
+                vector_action: Some("run jscout embed <root> --semantic"),
+            }),
             semantic_matched: 3,
             expansion: None,
             response_budget: ResponseBudget {

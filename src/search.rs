@@ -89,6 +89,8 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_retrieval: Option<semantic::ArtifactRetrievalStatus>,
     /// Number of artifacts matched before the whole-response budget. Compact
     /// transport uses this to retain an actionable memory envelope even when
     /// every preview is shed.
@@ -370,10 +372,12 @@ pub fn search(
             &options.file_origins,
             options.rerank,
         )?;
-        let semantic_artifacts = if options.include_memory {
-            semantic::search(conn, q, options.memory_limit)?
+        let (semantic_artifacts, semantic_retrieval) = if options.include_memory {
+            let (artifacts, retrieval) =
+                semantic::search_with_provider(conn, provider, q, options.memory_limit)?;
+            (artifacts, Some(retrieval))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let semantic_matched = semantic_artifacts.len();
         let expansion = options
@@ -385,6 +389,7 @@ pub fn search(
             retrieval,
             hits,
             semantic_artifacts,
+            semantic_retrieval,
             semantic_matched,
             expansion,
             response_budget: ResponseBudget {
@@ -1539,6 +1544,7 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
             semantic_matched: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec!["root".into()],
@@ -1613,6 +1619,7 @@ mod tests {
                 supports: Vec::new(),
                 relevance: 1.0,
             }],
+            semantic_retrieval: None,
             semantic_matched: 1,
             expansion: None,
             response_budget: ResponseBudget {
@@ -1672,6 +1679,7 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
+            semantic_retrieval: None,
             semantic_matched: 2,
             expansion: None,
             response_budget: ResponseBudget {
