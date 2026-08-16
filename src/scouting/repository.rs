@@ -261,11 +261,7 @@ pub fn plan(
     let (projects, configuration_problems, configured_projects) =
         discover_project_subjects(root, conn, options)?;
     subjects.extend(projects);
-    subjects.sort_by(|left, right| {
-        subject_priority(&left.subject_kind)
-            .cmp(&subject_priority(&right.subject_kind))
-            .then(left.subject_key.cmp(&right.subject_key))
-    });
+    order_subjects(&mut subjects);
 
     let subject_limit_reached = subjects.len() > options.max_subjects;
     let mut omitted_subjects = Vec::new();
@@ -792,6 +788,21 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     } else {
         value.chars().take(limit).collect::<String>() + "\n[truncated]"
     }
+}
+
+// Within each tier, larger subjects first: a bounded --max-calls budget
+// must reach the corpus's weight centers before its periphery. On the
+// Next.js evaluation snapshot, alphabetical ordering spent 64 calls on
+// apps/bench/crates/evals and skipped 308 subjects including the main
+// package. Member count is a neutral structural fact — no path nouns —
+// and the key comparison keeps equal-sized subjects deterministic.
+fn order_subjects(subjects: &mut [DiscoveredSubject]) {
+    subjects.sort_by(|left, right| {
+        subject_priority(&left.subject_kind)
+            .cmp(&subject_priority(&right.subject_kind))
+            .then(right.state.members.len().cmp(&left.state.members.len()))
+            .then(left.subject_key.cmp(&right.subject_key))
+    });
 }
 
 fn subject_priority(kind: &str) -> usize {
@@ -1555,6 +1566,57 @@ mod tests {
     fn unbounded_limits_render_as_all_instead_of_machine_integers() {
         assert_eq!(rendered_limit(usize::MAX), json!("all"));
         assert_eq!(rendered_limit(512), json!(512));
+    }
+
+    fn discovered(key: &str, kind: &str, member_count: usize) -> super::DiscoveredSubject {
+        super::DiscoveredSubject {
+            subject_key: key.into(),
+            subject_kind: kind.into(),
+            display_name: key.into(),
+            parent_subject_key: None,
+            depth: 0,
+            state: crate::recon::SubjectState {
+                subject_key: key.into(),
+                selector: crate::recon::SubjectSelector::RepositoryArea {
+                    scope: key.into(),
+                    direct_only: false,
+                },
+                members: (0..member_count)
+                    .map(|index| crate::recon::MemberFile {
+                        id: index as i64,
+                        path: format!("{key}/file-{index}.ts"),
+                        hash: "hash".into(),
+                    })
+                    .collect(),
+                disk_inputs: Vec::new(),
+                evidence_fingerprint: format!("fp-{key}"),
+            },
+        }
+    }
+
+    #[test]
+    fn planning_orders_each_tier_by_member_count_before_key() {
+        let mut subjects = vec![
+            discovered("packages/aaa-tiny", "package", 2),
+            discovered("area:repository:zz-big", "area", 500),
+            discovered("packages/next", "package", 400),
+            discovered("area:repository:aa-small", "area", 3),
+            discovered("packages/bbb-tiny", "package", 2),
+        ];
+        super::order_subjects(&mut subjects);
+        assert_eq!(
+            subjects
+                .iter()
+                .map(|subject| subject.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "packages/next",
+                "packages/aaa-tiny",
+                "packages/bbb-tiny",
+                "area:repository:zz-big",
+                "area:repository:aa-small",
+            ],
+        );
     }
 
     #[test]
