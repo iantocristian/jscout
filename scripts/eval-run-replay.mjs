@@ -273,11 +273,27 @@ function runLogged(command, args, {
   }
 }
 
-// A generative scout run is usable when it published at least one artifact;
-// subject-local failures are reported in the log and by the batch exit code.
+// A generative scout run is usable when it published at least one artifact.
+// The summary line is only printed on orderly exits, so a hard abort (e.g. a
+// fatal gateway error mid-batch) must be judged by the database itself: a
+// stage that grew the artifact count did real work worth keeping.
 function scoutPublishedArtifacts(output) {
   const match = output.match(/reports: (\d+)/);
   return match !== null && Number(match[1]) > 0;
+}
+
+function countSemanticArtifacts(database) {
+  try {
+    const result = spawnSync("sqlite3", [
+      `file:${database}?immutable=1`,
+      "SELECT count(*) FROM semantic_artifacts",
+    ], { encoding: "utf8" });
+    if (result.status !== 0) return null;
+    const count = Number(result.stdout.trim());
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
 }
 
 function gitCommitWithoutHooks(workspace, args) {
@@ -478,6 +494,7 @@ function prepareJscoutProfile({
         },
       );
     } else if (stage === "workflows" || stage === "cards" || stage === "summaries") {
+      const artifactsBefore = countSemanticArtifacts(database);
       runLogged(
         jscout,
         [
@@ -489,7 +506,11 @@ function prepareJscoutProfile({
           cwd: workspace,
           env,
           log: path.join(runDir, `jscout-${stage}.log`),
-          tolerateExit: scoutPublishedArtifacts,
+          tolerateExit: (output) => {
+            if (scoutPublishedArtifacts(output)) return true;
+            const after = countSemanticArtifacts(database);
+            return after !== null && artifactsBefore !== null && after > artifactsBefore;
+          },
         },
       );
     } else if (stage === "embed" || stage === "embed-product") {

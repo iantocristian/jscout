@@ -1121,6 +1121,14 @@ fn execute_prepared_workflow(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
+            // A per-request timeout is a property of one subject's request,
+            // not of the gateway: the batch continues with a failed report,
+            // exactly as contract failures do. A second memory-prep abort
+            // came from one slow card killing 98 published artifacts.
+            // Spawn/protocol/auth/cancel errors keep aborting the batch.
+            if let GatewayError::Timeout(_) = &error {
+                return Ok(gateway_timeout_report(run_id, &spec, error));
+            }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
     };
@@ -1419,6 +1427,14 @@ fn execute_prepared_card(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
+            // A per-request timeout is a property of one subject's request,
+            // not of the gateway: the batch continues with a failed report,
+            // exactly as contract failures do. A second memory-prep abort
+            // came from one slow card killing 98 published artifacts.
+            // Spawn/protocol/auth/cancel errors keep aborting the batch.
+            if let GatewayError::Timeout(_) = &error {
+                return Ok(gateway_timeout_report(run_id, &spec, error));
+            }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
     };
@@ -1760,6 +1776,14 @@ fn execute_prepared_concept(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
+            // A per-request timeout is a property of one subject's request,
+            // not of the gateway: the batch continues with a failed report,
+            // exactly as contract failures do. A second memory-prep abort
+            // came from one slow card killing 98 published artifacts.
+            // Spawn/protocol/auth/cancel errors keep aborting the batch.
+            if let GatewayError::Timeout(_) = &error {
+                return Ok(gateway_timeout_report(run_id, &spec, error));
+            }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
     };
@@ -2300,6 +2324,14 @@ fn execute_prepared_summary(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
+            // A per-request timeout is a property of one subject's request,
+            // not of the gateway: the batch continues with a failed report,
+            // exactly as contract failures do. A second memory-prep abort
+            // came from one slow card killing 98 published artifacts.
+            // Spawn/protocol/auth/cancel errors keep aborting the batch.
+            if let GatewayError::Timeout(_) = &error {
+                return Ok(gateway_timeout_report(run_id, &spec, error));
+            }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
     };
@@ -3141,6 +3173,26 @@ fn scout_report(
 /// failed run, the model call counts against the budget, and later subjects
 /// still get their turn. Gateway/infrastructure errors and invalidated
 /// publication state keep aborting via `Err`.
+/// A gateway timeout finishes the run as failed and yields a subject-local
+/// failed report with no usage or provider identity (the request never
+/// completed). The subject is recoverable from the run spec's config.
+fn gateway_timeout_report(run_id: i64, spec: &RunSpec, error: GatewayError) -> ScoutReport {
+    ScoutReport {
+        kind: spec.scout_kind.clone(),
+        subject: spec.input_fingerprint.clone(),
+        run_id,
+        status: "failed".into(),
+        artifact_id: None,
+        candidate_count: 0,
+        decisions: BTreeMap::new(),
+        usage: None,
+        billing_path: spec.billing_path.clone(),
+        started: None,
+        incomplete_reason: None,
+        failure: Some(format!("gateway timeout: {error}")),
+    }
+}
+
 fn failed_report(
     run_id: i64,
     kind: &str,
