@@ -311,6 +311,10 @@ const PROFILE_PLANS = Object.freeze({
   // shape checker scheduling and product embedding. No base profile: the
   // corpus this order produces must not inherit additive-profile state.
   "production-order": ["scout", "enrich", "embed-product"],
+  // The memory plane: generative workflow/card/summary artifacts persisted
+  // into the semantic tables before any arm runs. Base checker-scout so the
+  // artifacts form over checker facts and reconnaissance policy.
+  memory: ["enrich", "scout", "workflows", "cards", "summaries"],
 });
 
 const PROFILE_BASES = Object.freeze({
@@ -318,6 +322,7 @@ const PROFILE_BASES = Object.freeze({
   "checker-embed": "checker",
   "checker-scout": "checker",
   "checker-scout-embed": "checker-scout",
+  memory: "checker-scout",
 });
 
 const PROFILE_INCREMENT = Object.freeze({
@@ -325,6 +330,7 @@ const PROFILE_INCREMENT = Object.freeze({
   "checker-embed": "embed",
   "checker-scout": "scout",
   "checker-scout-embed": "embed-product",
+  memory: ["workflows", "cards", "summaries"],
 });
 
 export function profilePlan(profile) {
@@ -402,6 +408,7 @@ function prepareJscoutProfile({
   scoutMaxCalls,
   scoutMaxSubjects,
   scoutWarnSubjects,
+  memoryBudgets,
   baseDatabase,
   executionEnvironment,
 }) {
@@ -416,7 +423,7 @@ function prepareJscoutProfile({
   let stages = plan.stages;
   if (baseDatabase && fs.existsSync(baseDatabase)) {
     copyDatabase(baseDatabase, database);
-    stages = [PROFILE_INCREMENT[profile]];
+    stages = [].concat(PROFILE_INCREMENT[profile]);
     fs.writeFileSync(
       path.join(runDir, "jscout-profile-base.json"),
       `${JSON.stringify({ profile: PROFILE_BASES[profile], database: baseDatabase }, null, 2)}\n`,
@@ -449,6 +456,20 @@ function prepareJscoutProfile({
           cwd: workspace,
           env,
           log: path.join(runDir, "jscout-scout.log"),
+        },
+      );
+    } else if (stage === "workflows" || stage === "cards" || stage === "summaries") {
+      runLogged(
+        jscout,
+        [
+          "scout", stage, workspace,
+          "--database", database,
+          "--max-calls", String(memoryBudgets[stage]),
+        ],
+        {
+          cwd: workspace,
+          env,
+          log: path.join(runDir, `jscout-${stage}.log`),
         },
       );
     } else if (stage === "embed" || stage === "embed-product") {
@@ -725,6 +746,16 @@ async function main() {
       throw new Error(`${name} must be a positive integer or all`);
     }
   }
+  const memoryBudgets = {
+    workflows: Number(options["memory-workflow-calls"] ?? 32),
+    cards: Number(options["memory-card-calls"] ?? 64),
+    summaries: Number(options["memory-summary-calls"] ?? 32),
+  };
+  for (const [stage, budget] of Object.entries(memoryBudgets)) {
+    if (!Number.isInteger(budget) || budget < 1) {
+      throw new Error(`--memory-${stage.replace(/s$/, "")}-calls must be a positive integer`);
+    }
+  }
   const scoutWarnSubjects = Number(options["scout-warn-subjects"] ?? 512);
   if (!Number.isInteger(scoutWarnSubjects) || scoutWarnSubjects < 1) {
     throw new Error("--scout-warn-subjects must be a positive integer");
@@ -850,6 +881,7 @@ async function main() {
               scoutMaxCalls,
               scoutMaxSubjects,
               scoutWarnSubjects,
+              memoryBudgets,
               baseDatabase,
               executionEnvironment,
             });
