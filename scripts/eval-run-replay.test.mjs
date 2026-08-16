@@ -14,6 +14,8 @@ import {
   startBrowserServer,
   validatePreparedDatabaseManifest,
   workspaceProcessGroups,
+  scoutPublishedArtifacts,
+  countSemanticArtifacts,
 } from "./eval-run-replay.mjs";
 
 function git(repo, args) {
@@ -282,4 +284,34 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   );
 
   fs.rmSync(base, { recursive: true, force: true });
+});
+
+
+test("failed-only scout output is not mistaken for published artifacts", () => {
+  const allFailed = [
+    "  failed: submission failed claim-level card validation",
+    "model calls: 64; reports: 64; failed subjects: 64; skipped by call budget: 0",
+    "Error: 64 of 64 scouting subject(s) failed; see the report above",
+  ].join("\n");
+  assert.equal(scoutPublishedArtifacts(allFailed), false);
+
+  const published = [
+    "  defining: 1",
+    "  artifact: 24",
+    "model calls: 64; reports: 64; failed subjects: 1",
+  ].join("\n");
+  assert.equal(scoutPublishedArtifacts(published), true);
+});
+
+test("database artifact count detects hard-abort publication growth", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jr-tolerance-"));
+  const database = path.join(dir, "stage.db");
+  execFileSync("sqlite3", [database,
+    "CREATE TABLE semantic_artifacts(id INTEGER PRIMARY KEY, artifact_type TEXT);"]);
+  assert.equal(countSemanticArtifacts(database), 0);
+  execFileSync("sqlite3", [database,
+    "INSERT INTO semantic_artifacts(artifact_type) VALUES('card'),('workflow');"]);
+  assert.equal(countSemanticArtifacts(database), 2);
+  assert.equal(countSemanticArtifacts(path.join(dir, "missing.db")), null);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

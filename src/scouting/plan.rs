@@ -910,14 +910,20 @@ fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>
     }
     let weights = incoming_reference_weights(conn)?;
     let mut subjects = subjects.into_iter().collect::<Vec<_>>();
+    // Weight primary, tier as tiebreak. Tier-first drowned the weight list
+    // on the Next.js evaluation snapshot: boundary endpoints from examples/
+    // and dev infrastructure filled the entire card cap while the corpus's
+    // most-referenced production symbols (weight rank 134 and up) were never
+    // selected. Cards document symbols, and incoming degree is the importance
+    // signal for that; boundary-ness still breaks ties. Workflow seeds keep
+    // tier-primary ordering because entry points have low in-degree by
+    // nature — that is what makes them entries.
     subjects.sort_by(|left, right| {
-        card_priority(&left.1)
-            .cmp(&card_priority(&right.1))
-            .then_with(|| {
-                let left_weight = weights.get(&left.0).copied().unwrap_or(0.0);
-                let right_weight = weights.get(&right.0).copied().unwrap_or(0.0);
-                right_weight.total_cmp(&left_weight)
-            })
+        let left_weight = weights.get(&left.0).copied().unwrap_or(0.0);
+        let right_weight = weights.get(&right.0).copied().unwrap_or(0.0);
+        right_weight
+            .total_cmp(&left_weight)
+            .then_with(|| card_priority(&left.1).cmp(&card_priority(&right.1)))
             .then_with(|| left.0.cmp(&right.0))
     });
     Ok(subjects)

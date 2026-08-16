@@ -273,11 +273,28 @@ function runLogged(command, args, {
   }
 }
 
-// A generative scout run is usable when it published at least one artifact;
-// subject-local failures are reported in the log and by the batch exit code.
-function scoutPublishedArtifacts(output) {
-  const match = output.match(/reports: (\d+)/);
-  return match !== null && Number(match[1]) > 0;
+// A generative scout run is usable when it PUBLISHED at least one artifact.
+// The `reports:` summary counts failed subjects too, so it proves nothing —
+// an all-timeout batch reports nonzero. Evidence of publication is either a
+// per-subject `artifact: <id>` line in the output or, decisively (hard
+// aborts print no summary at all), growth of the stage database's
+// semantic_artifacts count.
+export function scoutPublishedArtifacts(output) {
+  return /^\s*artifact: \d+/m.test(output);
+}
+
+export function countSemanticArtifacts(database) {
+  try {
+    const result = spawnSync("sqlite3", [
+      `file:${database}?immutable=1`,
+      "SELECT count(*) FROM semantic_artifacts",
+    ], { encoding: "utf8" });
+    if (result.status !== 0) return null;
+    const count = Number(result.stdout.trim());
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
+  }
 }
 
 function gitCommitWithoutHooks(workspace, args) {
@@ -478,6 +495,7 @@ function prepareJscoutProfile({
         },
       );
     } else if (stage === "workflows" || stage === "cards" || stage === "summaries") {
+      const artifactsBefore = countSemanticArtifacts(database);
       runLogged(
         jscout,
         [
@@ -489,7 +507,11 @@ function prepareJscoutProfile({
           cwd: workspace,
           env,
           log: path.join(runDir, `jscout-${stage}.log`),
-          tolerateExit: scoutPublishedArtifacts,
+          tolerateExit: (output) => {
+            if (scoutPublishedArtifacts(output)) return true;
+            const after = countSemanticArtifacts(database);
+            return after !== null && artifactsBefore !== null && after > artifactsBefore;
+          },
         },
       );
     } else if (stage === "embed" || stage === "embed-product") {
