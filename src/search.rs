@@ -91,11 +91,13 @@ pub struct SearchResult {
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_retrieval: Option<semantic::ArtifactRetrievalStatus>,
-    /// Number of artifacts matched before the whole-response budget. Compact
-    /// transport uses this to retain an actionable memory envelope even when
-    /// every preview is shed.
+    /// Ranked retrieval pool before the memory result limit. This is a
+    /// candidate count, not a calibrated relevant-match count.
     #[serde(skip)]
-    pub semantic_matched: usize,
+    pub semantic_candidates: usize,
+    /// Memory previews selected before the whole-response byte budget.
+    #[serde(skip)]
+    pub semantic_selected: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
@@ -129,12 +131,12 @@ impl RetrievalStatus {
         }
     }
 
-    fn vector_degraded() -> Self {
+    fn vector_degraded(action: &'static str) -> Self {
         Self {
             lexical: "active",
             vector: "degraded",
             reranker: "disabled",
-            vector_action: Some("run jscout embed <root>; inspect stderr if it fails"),
+            vector_action: Some(action),
         }
     }
 
@@ -372,14 +374,15 @@ pub fn search(
             &options.file_origins,
             options.rerank,
         )?;
-        let (semantic_artifacts, semantic_retrieval) = if options.include_memory {
-            let (artifacts, retrieval) =
-                semantic::search_with_provider(conn, provider, q, options.memory_limit)?;
-            (artifacts, Some(retrieval))
-        } else {
-            (Vec::new(), None)
-        };
-        let semantic_matched = semantic_artifacts.len();
+        let (semantic_artifacts, semantic_retrieval, semantic_candidates) =
+            if options.include_memory {
+                let (artifacts, retrieval, candidates) =
+                    semantic::search_with_provider(conn, provider, q, options.memory_limit)?;
+                (artifacts, Some(retrieval), candidates)
+            } else {
+                (Vec::new(), None, 0)
+            };
+        let semantic_selected = semantic_artifacts.len();
         let expansion = options
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
@@ -390,7 +393,8 @@ pub fn search(
             hits,
             semantic_artifacts,
             semantic_retrieval,
-            semantic_matched,
+            semantic_candidates,
+            semantic_selected,
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
@@ -650,7 +654,7 @@ fn record_vector_ranking(
         }
         Err(error) => {
             eprintln!("vector search unavailable: {error}");
-            RetrievalStatus::vector_degraded()
+            RetrievalStatus::vector_degraded(embed::code_vector_failure_action(&error))
         }
     }
 }
@@ -1277,7 +1281,7 @@ mod tests {
     };
     use crate::{
         file_role, indexer, origin,
-        semantic::{SemanticArtifact, SemanticSupport},
+        semantic::{ArtifactRetrievalScore, SemanticArtifact, SemanticSupport},
         store,
         structural::{GraphEdge, GraphNode},
     };
@@ -1545,7 +1549,8 @@ mod tests {
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
             semantic_retrieval: None,
-            semantic_matched: 0,
+            semantic_candidates: 0,
+            semantic_selected: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec!["root".into()],
                 nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],
@@ -1617,10 +1622,15 @@ mod tests {
                 created_at: "2026-08-09T00:00:00Z".into(),
                 freshness: "fresh".into(),
                 supports: Vec::new(),
-                relevance: 1.0,
+                retrieval_score: Some(ArtifactRetrievalScore {
+                    rank_score: 1.0,
+                    lexical_score: Some(1.0),
+                    vector_cosine: None,
+                }),
             }],
             semantic_retrieval: None,
-            semantic_matched: 1,
+            semantic_candidates: 1,
+            semantic_selected: 1,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 2_000,
@@ -1669,7 +1679,11 @@ mod tests {
             created_at: "2026-08-13T00:00:00Z".into(),
             freshness: "fresh".into(),
             supports,
-            relevance: 1.0,
+            retrieval_score: Some(ArtifactRetrievalScore {
+                rank_score: 1.0,
+                lexical_score: Some(1.0),
+                vector_cosine: None,
+            }),
         };
         let mut second_artifact = artifact.clone();
         second_artifact.id = 2;
@@ -1680,7 +1694,8 @@ mod tests {
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
             semantic_retrieval: None,
-            semantic_matched: 2,
+            semantic_candidates: 2,
+            semantic_selected: 2,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 100_000,

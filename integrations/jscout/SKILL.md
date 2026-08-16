@@ -15,9 +15,11 @@ questions, then verify decisive claims in source.
   joins and `include_source=true` for hash-verified evidence drill-down.
 - For causal questions, regressions with multiple mechanisms, or behavior that
   crosses files, call `semantic_memory` directly. The memory attached to
-  `semantic_search` is only a compact preview; when its matched count exceeds
-  its returned count, retrieve the relevant artifacts with `semantic_memory`
-  instead of widening the combined search response.
+  `semantic_search` is only a compact preview. If a preview is relevant, or
+  `budget_omitted` is positive, retrieve it with `semantic_memory` instead of
+  widening the combined search response. `candidate_pool` is the bounded
+  lexical/vector retrieval pool, not a count of relevant matches; its lexical
+  and vector-cosine score signals are diagnostics, not probabilities.
 - For selected current, fresh concepts, use the returned `concept_tags` as
   deterministic file/chunk localization hints. They follow fingerprinted
   concept-to-child claims and derive from the child's exact support-span

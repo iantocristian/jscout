@@ -42,6 +42,83 @@ pub struct ResolvedProfile {
     pub dimensions: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum VectorFailureKind {
+    Inference,
+    Index,
+}
+
+#[derive(Debug)]
+struct VectorFailure {
+    plane: &'static str,
+    kind: VectorFailureKind,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for VectorFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            VectorFailureKind::Inference => {
+                write!(
+                    formatter,
+                    "{} embedding service unavailable: {}",
+                    self.plane, self.source
+                )
+            }
+            VectorFailureKind::Index => {
+                write!(
+                    formatter,
+                    "{} vector index unavailable: {}",
+                    self.plane, self.source
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VectorFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn vector_failure(
+    plane: &'static str,
+    kind: VectorFailureKind,
+    source: anyhow::Error,
+) -> anyhow::Error {
+    VectorFailure {
+        plane,
+        kind,
+        source,
+    }
+    .into()
+}
+
+fn vector_failure_action(error: &anyhow::Error, index_action: &'static str) -> &'static str {
+    match error
+        .downcast_ref::<VectorFailure>()
+        .map(|failure| failure.kind)
+    {
+        Some(VectorFailureKind::Inference) => {
+            "start or repair the configured embedding service, then retry"
+        }
+        _ => index_action,
+    }
+}
+
+fn semantic_vector_failure(kind: VectorFailureKind, source: anyhow::Error) -> anyhow::Error {
+    vector_failure("semantic", kind, source)
+}
+
+pub(crate) fn semantic_vector_failure_action(error: &anyhow::Error) -> &'static str {
+    vector_failure_action(error, "run jscout embed <root> --semantic-only")
+}
+
+pub(crate) fn code_vector_failure_action(error: &anyhow::Error) -> &'static str {
+    vector_failure_action(error, "run jscout embed <root>")
+}
+
 struct EmbeddingResponse {
     vectors: Vec<Vec<f32>>,
     profile_fingerprint: Option<String>,
@@ -1219,6 +1296,38 @@ fn ready_semantic_search_profile(conn: &Connection, spec: &ProfileSpec) -> Resul
     Ok(profile)
 }
 
+/// Check whether one configured profile can be topped up after an interactive
+/// annotation. This does not create tables or repair rows; callers use it
+/// before the write so a repository without semantic vectors does not trigger
+/// an unexpected full-corpus embed.
+pub fn semantic_vector_index_ready(conn: &Connection, provider: &Provider) -> Result<bool> {
+    let spec = provider
+        .profile()
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let Some(profile) = existing_profile(conn, &spec)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?
+    else {
+        return Ok(false);
+    };
+    if semantic_vector_index_needs_sync(conn, profile.id)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?
+    {
+        return Ok(false);
+    }
+    let table = semantic_vector_table(profile.dimensions)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [&table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    let has_gaps = semantic_vector_index_has_gaps(conn, profile.id, &table)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    Ok(table_exists && !has_gaps)
+}
+
 fn semantic_vector_index_has_gaps(conn: &Connection, profile_id: i64, table: &str) -> Result<bool> {
     conn.query_row(
         &format!(
@@ -1248,15 +1357,25 @@ pub fn semantic_vector_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<(i64, f64)>> {
-    let spec = provider.profile()?;
-    let profile = ready_semantic_search_profile(conn, &spec)?;
-    let response = provider.embed_query(query)?;
-    validate_response_profile(&spec, &response)?;
+    let spec = provider
+        .profile()
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let profile = ready_semantic_search_profile(conn, &spec)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    let response = provider
+        .embed_query(query)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    validate_response_profile(&spec, &response)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
     if vector.len() != profile.dimensions {
-        bail!("stored embedding profile has incompatible dimensions");
+        return Err(semantic_vector_failure(
+            VectorFailureKind::Index,
+            anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
+        ));
     }
     exact_semantic_vector_search(conn, &profile, vector, limit)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))
 }
 
 fn exact_semantic_vector_search(
@@ -1302,26 +1421,37 @@ pub fn vector_search(
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let total_started = std::time::Instant::now();
     let started = std::time::Instant::now();
-    let spec = provider.profile()?;
+    let spec = provider
+        .profile()
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     if timing {
         eprintln!("timing:     vector profile {:?}", started.elapsed());
     }
     let started = std::time::Instant::now();
-    let profile = ready_search_profile(conn, &spec)?;
+    let profile = ready_search_profile(conn, &spec)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     if timing {
         eprintln!("timing:     vector index readiness {:?}", started.elapsed());
     }
     let started = std::time::Instant::now();
-    let response = provider.embed_query(query)?;
+    let response = provider
+        .embed_query(query)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     if timing {
         eprintln!("timing:     vector query embedding {:?}", started.elapsed());
     }
-    validate_response_profile(&spec, &response)?;
+    validate_response_profile(&spec, &response)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
     if vector.len() != profile.dimensions {
-        bail!("stored embedding profile has incompatible dimensions");
+        return Err(vector_failure(
+            "code",
+            VectorFailureKind::Index,
+            anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
+        ));
     }
-    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)?;
+    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     if timing {
         eprintln!("timing:     vector total {:?}", total_started.elapsed());
     }
@@ -1425,12 +1555,14 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile, embed_text,
-        ensure_profile, exact_semantic_vector_search, exact_vector_search, existing_profile,
-        materialize_cached_embeddings, missing_embedding_documents, profile_fingerprint,
-        ready_search_profile, semantic_embedding_documents, semantic_vector_index_has_gaps,
-        semantic_vector_table, sync_semantic_vector_index, sync_vector_index, validate_endpoint,
-        vec_to_blob, vector_index_needs_sync, vector_table,
+        DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile, VectorFailureKind,
+        code_vector_failure_action, embed_text, ensure_profile, exact_semantic_vector_search,
+        exact_vector_search, existing_profile, materialize_cached_embeddings,
+        missing_embedding_documents, profile_fingerprint, ready_search_profile,
+        semantic_embedding_documents, semantic_vector_failure, semantic_vector_failure_action,
+        semantic_vector_index_has_gaps, semantic_vector_table, sync_semantic_vector_index,
+        sync_vector_index, validate_endpoint, vec_to_blob, vector_failure, vector_index_needs_sync,
+        vector_table,
     };
 
     fn insert_policy(
@@ -1474,6 +1606,33 @@ mod tests {
         let first = profile_fingerprint("local", "m", r#"{"dtype":"float16"}"#);
         let second = profile_fingerprint("local", "m", r#"{"dtype":"float32"}"#);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn semantic_vector_failure_actions_distinguish_service_from_index() {
+        let inference = semantic_vector_failure(
+            VectorFailureKind::Inference,
+            anyhow::anyhow!("connection refused"),
+        );
+        assert_eq!(
+            semantic_vector_failure_action(&inference),
+            "start or repair the configured embedding service, then retry"
+        );
+        let index =
+            semantic_vector_failure(VectorFailureKind::Index, anyhow::anyhow!("profile missing"));
+        assert_eq!(
+            semantic_vector_failure_action(&index),
+            "run jscout embed <root> --semantic-only"
+        );
+        let code_index = vector_failure(
+            "code",
+            VectorFailureKind::Index,
+            anyhow::anyhow!("profile missing"),
+        );
+        assert_eq!(
+            code_vector_failure_action(&code_index),
+            "run jscout embed <root>"
+        );
     }
 
     #[test]

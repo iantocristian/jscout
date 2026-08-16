@@ -906,8 +906,10 @@ fn main() -> Result<()> {
         } => {
             let conn = open_database_for_write(&root, database.as_deref())?;
             let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
-            let artifact = semantic::annotate_request(&root, &conn, input)?;
-            println!("{}", serde_json::to_string_pretty(&artifact)?);
+            let provider = embed::Provider::from_env()?;
+            let publication =
+                semantic::annotate_request_with_provider(&root, &conn, provider.as_ref(), input)?;
+            println!("{}", serde_json::to_string_pretty(&publication)?);
             Ok(())
         }
         Command::Memory {
@@ -2101,7 +2103,7 @@ mod main_tests {
             created_at: "now".into(),
             freshness: "fresh".into(),
             supports: Vec::new(),
-            relevance: 1.0,
+            retrieval_score: None,
         }])?;
         assert!(rendered.contains("semantic memory (untrusted; verify in source)"));
         assert!(rendered.contains("invoice settlement [fresh]"));

@@ -88,7 +88,8 @@ pub struct ArtifactView {
     pub source_snapshot: String,
     pub created_at: String,
     pub freshness: String,
-    pub relevance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_score: Option<semantic::ArtifactRetrievalScore>,
     pub support_count: usize,
     pub supports: Vec<semantic::SemanticSupport>,
     pub supports_truncated: bool,
@@ -185,7 +186,10 @@ pub struct ResponseBudget {
 pub struct QueryResult {
     pub snapshot: String,
     pub retrieval: semantic::ArtifactRetrievalStatus,
-    pub matched_artifacts: usize,
+    /// Ranked candidates after exact type/anchor/relation/freshness filters,
+    /// before the caller's result and byte budgets. This is not a calibrated
+    /// count of semantically relevant artifacts.
+    pub candidate_artifacts: usize,
     pub matched_concept_tags: usize,
     pub semantic_artifacts: Vec<ArtifactView>,
     pub related_artifacts: Vec<RelatedArtifact>,
@@ -200,7 +204,7 @@ struct Candidate {
     artifact_type: String,
     current: bool,
     superseded_by: Option<i64>,
-    relevance: f64,
+    retrieval_score: Option<semantic::ArtifactRetrievalScore>,
 }
 
 pub fn query(
@@ -225,9 +229,14 @@ pub fn query(
             .iter()
             .map(|candidate| candidate.id)
             .collect::<Vec<_>>();
-        let relevance = candidates
+        let retrieval_scores = candidates
             .iter()
-            .map(|candidate| (candidate.id, candidate.relevance))
+            .filter_map(|candidate| {
+                candidate
+                    .retrieval_score
+                    .clone()
+                    .map(|score| (candidate.id, score))
+            })
             .collect::<HashMap<_, _>>();
         let current = candidates
             .iter()
@@ -246,11 +255,11 @@ pub fn query(
                     .iter()
                     .any(|value| value == &artifact.freshness)
         });
-        let matched_artifacts = loaded.len();
+        let candidate_artifacts = loaded.len();
         loaded.truncate(options.limit);
-        let omitted_artifacts = matched_artifacts.saturating_sub(loaded.len());
+        let omitted_artifacts = candidate_artifacts.saturating_sub(loaded.len());
         for artifact in &mut loaded {
-            artifact.relevance = relevance.get(&artifact.id).copied().unwrap_or_default();
+            artifact.retrieval_score = retrieval_scores.get(&artifact.id).cloned();
         }
 
         let selected_ids = loaded
@@ -312,7 +321,7 @@ pub fn query(
         let mut result = QueryResult {
             snapshot,
             retrieval,
-            matched_artifacts,
+            candidate_artifacts,
             matched_concept_tags,
             semantic_artifacts,
             related_artifacts,
@@ -414,7 +423,7 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
                 artifact_type: row.get(1)?,
                 current: row.get(2)?,
                 superseded_by: row.get(3)?,
-                relevance: 0.0,
+                retrieval_score: None,
             })
         },
     )?;
@@ -453,13 +462,13 @@ fn apply_ranking(
     let ranks = ranking
         .iter()
         .enumerate()
-        .map(|(rank, artifact)| (artifact.id, (rank, artifact.relevance)))
+        .map(|(rank, artifact)| (artifact.id, (rank, artifact.retrieval_score.clone())))
         .collect::<HashMap<_, _>>();
     candidates.retain_mut(|candidate| {
-        let Some((_, relevance)) = ranks.get(&candidate.id) else {
+        let Some((_, retrieval_score)) = ranks.get(&candidate.id) else {
             return false;
         };
-        candidate.relevance = *relevance;
+        candidate.retrieval_score = Some(retrieval_score.clone());
         true
     });
     candidates.sort_by_key(|candidate| {
@@ -493,7 +502,7 @@ fn artifact_view(
         source_snapshot: artifact.source_snapshot,
         created_at: artifact.created_at,
         freshness: artifact.freshness,
-        relevance: artifact.relevance,
+        retrieval_score: artifact.retrieval_score,
         support_count,
         supports_truncated: support_count > artifact.supports.len(),
         supports: artifact.supports,
@@ -1273,7 +1282,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 1);
+        assert_eq!(result.candidate_artifacts, 1);
         assert_eq!(result.semantic_artifacts[0].id, card.id);
         assert!(result.semantic_artifacts[0].current);
         assert_eq!(result.semantic_artifacts[0].freshness, "fresh");
@@ -1703,7 +1712,14 @@ mod tests {
         )?;
         assert_eq!(result.semantic_artifacts.len(), 1);
         assert_eq!(result.semantic_artifacts[0].id, concept.id);
-        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        assert_eq!(
+            result.semantic_artifacts[0]
+                .retrieval_score
+                .as_ref()
+                .expect("retrieval score")
+                .rank_score,
+            1.0
+        );
         Ok(())
     }
 
@@ -1739,9 +1755,16 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 1);
+        assert_eq!(result.candidate_artifacts, 1);
         assert_eq!(result.semantic_artifacts[0].id, expected.id);
-        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        assert_eq!(
+            result.semantic_artifacts[0]
+                .retrieval_score
+                .as_ref()
+                .expect("retrieval score")
+                .rank_score,
+            1.0
+        );
         Ok(())
     }
 
@@ -1828,7 +1851,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 2);
+        assert_eq!(result.candidate_artifacts, 2);
         assert!(!result.concept_tags.is_empty());
         assert!(
             result
