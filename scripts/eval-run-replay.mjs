@@ -305,6 +305,9 @@ const PROFILE_PLANS = Object.freeze({
   "checker-embed": ["enrich", "embed"],
   "checker-scout": ["enrich", "scout"],
   "checker-scout-embed": ["enrich", "scout", "embed-product"],
+  // Operational ordering: scout before checker so reconnaissance policy can
+  // shape checker scheduling and product embedding. No base profile: the
+  // corpus this order produces must not inherit additive-profile state.
   "production-order": ["scout", "enrich", "embed-product"],
 });
 
@@ -430,6 +433,30 @@ function resolveExecutionEnvironment(taskSet, task) {
   return merged;
 }
 
+// Chromium cannot launch inside Codex's seatbelt (no mach-register), so a
+// browser server runs OUTSIDE the sandbox and the workspace's own e2e
+// harness connects to it via NEXT_TEST_BROWSER_WS_ENDPOINT (native support
+// in test/lib/browsers/playwright.ts). Loopback sockets are sandbox-allowed.
+function startBrowserServer(workspace) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["-e", `
+      const { chromium } = require('playwright');
+      chromium.launchServer({ host: '127.0.0.1', headless: true }).then((server) => {
+        console.log('WS_ENDPOINT=' + server.wsEndpoint());
+        process.on('SIGTERM', () => server.close().then(() => process.exit(0)));
+      }).catch((error) => { console.error(error); process.exit(1); });
+    `], { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const timer = setTimeout(() => resolve({ child, endpoint: null }), 60_000);
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      const match = out.match(/WS_ENDPOINT=(ws:[^\s]+)/);
+      if (match) { clearTimeout(timer); resolve({ child, endpoint: match[1] }); }
+    });
+    child.on("close", () => { clearTimeout(timer); resolve({ child: null, endpoint: null }); });
+  });
+}
+
 function saveAgentPatch(workspace, output) {
   const untracked = execFileSync(
     "git",
@@ -523,6 +550,13 @@ export function promptFor(task, treatment = "control") {
     );
   }
   contract.push(
+    "- Browser e2e tests work through a pre-connected browser endpoint: run",
+    "  them with the repository's pnpm test scripts (e.g. HEADLESS=true",
+    "  pnpm test-start-turbo <path>). Do not invoke node run-tests.js",
+    "  directly; it replaces the browser endpoint and will fail.",
+    "- Do not start long-running dev watchers (pnpm dev, next dev, watch",
+    "  builds); they exhaust file watchers on this tree and the e2e harness",
+    "  manages its own servers.",
     "- Work only inside this synthetic one-commit snapshot. Do not inspect other",
     "  filesystem locations, GitHub, upstream Git history/remotes, or web/search",
     "  services. Do not fetch or clone repositories.",
@@ -558,6 +592,9 @@ async function main() {
     }
   }
   const workRoot = path.resolve(options["work-root"] ?? "/tmp/jr");
+  const preparedRoot = options["prepared-root"]
+    ? path.resolve(options["prepared-root"])
+    : path.join(artifacts, "prepared-databases");
   fs.mkdirSync(workRoot, { recursive: true });
   const resume = options.resume === "true";
   const scoutMaxCalls = String(options["scout-max-calls"] ?? "all").toLowerCase();
@@ -605,7 +642,7 @@ async function main() {
       const { usesJscout, stages } = profilePlan(profile);
       const treatments = usesJscout ? requestedTreatments : ["control"];
       const profileDatabase = usesJscout
-        ? path.join(artifacts, "prepared-databases", task.id, `${profile}.db`)
+        ? path.join(preparedRoot, task.id, `${profile}.db`)
         : null;
       for (let treatmentIndex = 0; treatmentIndex < treatments.length; treatmentIndex += 1) {
         const treatment = treatments[treatmentIndex];
@@ -652,33 +689,35 @@ async function main() {
             throw new Error("synthetic baseline preparation changed the installed jscout skill");
           }
           const database = path.join(runDir, "jscout.db");
-          if (treatmentIndex === 0) {
-            if (resume && fs.existsSync(profileDatabase)) {
-              copyDatabase(profileDatabase, database);
-              fs.writeFileSync(
-                path.join(runDir, "jscout-profile-reuse.json"),
-                `${JSON.stringify({ source: profileDatabase, resumed: true }, null, 2)}\n`,
-              );
-            } else {
-              const baseProfile = PROFILE_BASES[profile];
-              const baseDatabase = baseProfile
-                ? path.join(artifacts, "prepared-databases", task.id, `${baseProfile}.db`)
-                : null;
-              prepareJscoutProfile({
-                jscout,
-                workspace,
-                database,
-                profile,
-                runDir,
-                scoutMaxCalls,
-                scoutMaxSubjects,
-                scoutWarnSubjects,
-                baseDatabase,
-                executionEnvironment,
-              });
-              fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
-              copyDatabase(database, profileDatabase);
-            }
+          if (treatmentIndex === 0 && fs.existsSync(profileDatabase)) {
+            // Cross-model reuse: an already-prepared profile database (e.g.
+            // from a prior trial) is cloned byte-identically instead of being
+            // rebuilt, holding the retrieval substrate constant across
+            // execution models. Recorded per-arm for provenance.
+            copyDatabase(profileDatabase, database);
+            fs.writeFileSync(
+              path.join(runDir, "jscout-profile-reuse.json"),
+              `${JSON.stringify({ source: profileDatabase, stages, reused_prepared: true }, null, 2)}\n`,
+            );
+          } else if (treatmentIndex === 0) {
+            const baseProfile = PROFILE_BASES[profile];
+            const baseDatabase = baseProfile
+              ? path.join(preparedRoot, task.id, `${baseProfile}.db`)
+              : null;
+            prepareJscoutProfile({
+              jscout,
+              workspace,
+              database,
+              profile,
+              runDir,
+              scoutMaxCalls,
+              scoutMaxSubjects,
+              scoutWarnSubjects,
+              baseDatabase,
+              executionEnvironment,
+            });
+            fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
+            copyDatabase(database, profileDatabase);
           } else {
             copyDatabase(profileDatabase, database);
             fs.writeFileSync(
@@ -734,14 +773,33 @@ async function main() {
 
         const eventsPath = path.join(runDir, "events.jsonl");
         const stderrPath = path.join(runDir, "stderr.log");
+        const browser = await startBrowserServer(workspace);
+        if (browser.endpoint) {
+          fs.writeFileSync(
+            path.join(runDir, "browser-server.json"),
+            `${JSON.stringify({ endpoint: browser.endpoint }, null, 2)}\n`,
+          );
+        } else {
+          process.stderr.write(`[${task.id}] ${profile}/${treatment} — browser server FAILED to start; arm runs without an e2e endpoint\n`);
+        }
         process.stderr.write(`[${task.id}] ${profile}/${treatment} — live events: ${eventsPath}\n`);
-        const result = await run(options.codex, args, {
+        // sh wrapper raises the fd limit for codex and every inner agent
+        // shell (bug-1 EMFILE); "$@" passes args through without re-quoting.
+        const result = await run("/bin/sh", ["-c", 'ulimit -n 65536; exec "$@"', "sh", options.codex, ...args], {
           cwd: workspace,
-          env: childEnvironment,
+          env: {
+            ...childEnvironment,
+            ...(browser.endpoint
+              ? { NEXT_TEST_BROWSER_WS_ENDPOINT: browser.endpoint, HEADLESS: "true" }
+              : {}),
+          },
           eventsPath,
           stderrPath,
           timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
         });
+        if (browser.child) {
+          try { browser.child.kill("SIGTERM"); } catch {}
+        }
         recordWorkspaceCleanup(workspace, runDir, "after-agent");
         if (result.interrupted) throwIfInterrupted();
 
