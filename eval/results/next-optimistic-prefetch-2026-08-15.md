@@ -240,3 +240,21 @@ with `contamination/responses-sol.jsonl` recording sol's admission probe;
 `trial-002/` holds the fixed-harness terra trial and `trial-sol-002-probe/`
 the browser-fix validation arm. Scripts are local copies of js-rag `scripts/eval-*` at
 `d138de4` with two recorded changes (production-order profile, `--resume`).
+
+## Blind omission adjudication (all 39 arms)
+
+One blind gpt-5.6-sol judgment per arm (story + patch + untouched reference
+diffs; no profile/treatment/trial/model identity). Unanimous across 230 file
+judgments: `decode-server-response.ts` confirmed defect 39/39 and `cache.ts`
+37/37 (the two arms that patched it still drew the decode omission); the
+other four gold files — `create-initial-router-state.ts`,
+`ppr-navigations.ts`, `navigation.ts`, `route-params.ts` — scored
+`not_required` in every arm, and no file ever scored `alternative_covered`.
+No arm was a genuine alternative implementation; 38 were partial (the
+parallel-slot half only). The honest per-arm miss is therefore the two-file
+divergence core (confirmed-omission 2/3), not "6 of 7 gold files": four of
+seven were reference-design plumbing nobody needed. The blind judge
+independently named the same missing mechanism the oracle test detects.
+Records: `adjudication/` in the experiment folder (per-arm JSONL, grader-
+compatible verdicts, prompts and event streams). Cost: 39 sequential calls,
+16.15M in / 208K out, 84 minutes.
