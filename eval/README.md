@@ -493,9 +493,13 @@ history-free snapshot; grading compares against the real implementation.
    - `checker`: structural plus `jscout enrich`;
    - `checker-embed`: checker plus local embeddings/reranking;
    - `checker-scout`: checker plus repository LLM reconnaissance;
-   - `checker-scout-embed`: checker, reconnaissance, and product embeddings.
+   - `checker-scout-embed`: checker, reconnaissance, and product embeddings;
    - `production-order`: reconnaissance before checker enrichment, followed by
-     product-only embeddings.
+     product-only embeddings;
+   - `memory`: checker, reconnaissance, and generated workflow/card/summary
+     memory without code or artifact vectors;
+   - `memory-embed`: the full memory profile with product vectors plus a final
+     semantic-artifact embedding stage after generation.
 
    Each jscout profile runs twice by default. `skill` installs the shipped
    skill without a prompt instruction; `forced` requires jscout exclusively

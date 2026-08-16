@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "22";
+pub const SCHEMA_VERSION: &str = "23";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -157,8 +157,13 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
     let vector_tables = {
         let mut statement = conn.prepare(
             "SELECT name FROM sqlite_master
-             WHERE type='table' AND name GLOB 'vec_embeddings_[0-9]*'
-               AND substr(name, length('vec_embeddings_') + 1) NOT GLOB '*[^0-9]*'
+             WHERE type='table' AND (
+               (name GLOB 'vec_embeddings_[0-9]*'
+                AND substr(name, length('vec_embeddings_') + 1) NOT GLOB '*[^0-9]*')
+               OR
+               (name GLOB 'vec_semantic_embeddings_[0-9]*'
+                AND substr(name, length('vec_semantic_embeddings_') + 1) NOT GLOB '*[^0-9]*')
+             )
              ORDER BY name",
         )?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -167,7 +172,10 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
         for table in vector_tables {
-            let dimensions = table.trim_start_matches("vec_embeddings_");
+            let dimensions = table
+                .strip_prefix("vec_semantic_embeddings_")
+                .or_else(|| table.strip_prefix("vec_embeddings_"))
+                .unwrap_or_default();
             if dimensions.is_empty() || !dimensions.bytes().all(|byte| byte.is_ascii_digit()) {
                 bail!("invalid sqlite-vec table name `{table}`");
             }
@@ -175,6 +183,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch(
             "DROP TABLE IF EXISTS embedding_index_entries;
+             DROP TABLE IF EXISTS semantic_embedding_index_entries;
              DROP TABLE IF EXISTS checker_occurrence_projects;
              DROP TABLE IF EXISTS checker_project_inputs;
              DROP TABLE IF EXISTS checker_project_runs;
@@ -206,8 +215,9 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              WHERE key IN (
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version'
-             ) OR key LIKE 'embedding_index_synced_v1:%';
-             UPDATE meta SET value='22' WHERE key='schema_version';",
+             ) OR key LIKE 'embedding_index_synced_v1:%'
+               OR key LIKE 'semantic_embedding_index_synced_v1:%';
+             UPDATE meta SET value='23' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -225,7 +235,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '22')
+INSERT INTO meta(key, value) VALUES('schema_version', '23')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -470,6 +480,16 @@ CREATE TABLE IF NOT EXISTS embeddings(
   profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
   vec BLOB NOT NULL,
   PRIMARY KEY (chunk_hash, profile_id)
+);
+
+-- Generated semantic artifacts use their own document namespace. Their
+-- compact descriptive text is content-addressed independently of code chunks,
+-- so unchanged cards/workflows/summaries reuse vectors across snapshots.
+CREATE TABLE IF NOT EXISTS semantic_embeddings(
+  document_hash TEXT NOT NULL,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  vec BLOB NOT NULL,
+  PRIMARY KEY (document_hash, profile_id)
 );
 
 CREATE TABLE IF NOT EXISTS embedding_index_entries(
@@ -774,6 +794,19 @@ CREATE INDEX IF NOT EXISTS idx_semantic_supports_artifact
   ON semantic_supports(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_supports_anchor
   ON semantic_supports(anchor_key);
+
+-- Snapshot-independent materialization identity for semantic-vector KNN.
+-- The virtual sqlite-vec table has no foreign keys, so this regular table is
+-- authoritative and its rows are repaired by `jscout embed --semantic`.
+CREATE TABLE IF NOT EXISTS semantic_embedding_index_entries(
+  id INTEGER PRIMARY KEY,
+  artifact_id INTEGER NOT NULL REFERENCES semantic_artifacts(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  document_hash TEXT NOT NULL,
+  UNIQUE (artifact_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_embedding_entries_profile
+  ON semantic_embedding_index_entries(profile_id, artifact_id);
 "#,
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;

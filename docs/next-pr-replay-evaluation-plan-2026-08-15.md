@@ -182,7 +182,7 @@ never be pooled.
 | `checker-scout-embed` | checker + scout + product-only embeddings | `skill`, `forced` | Controlled additive combined profile used in calibration. |
 | `production-order` | structural + scout + checker + product-only embeddings | `skill`, `forced` | Operational ordering in which scouting can exclude tooling before checker and embedding work. |
 | `memory` | checker-scout + workflow/card/summary scouting into the semantic tables | `skill`, `forced` | Isolated value of persisted causal artifacts where retrieval alone did not. |
-| `memory-embed` | checker-scout-embed + workflow/card/summary scouting into the semantic tables | `skill`, `forced` | Full operational substrate with product vectors and persisted causal artifacts. |
+| `memory-embed` | checker-scout-embed + workflow/card/summary scouting + semantic-artifact embeddings | `skill`, `forced` | Full operational substrate with product vectors and hybrid retrieval over persisted causal artifacts. |
 
 The controlled additive profiles continue to enrich before scouting so they
 can reuse the same checker fact set and isolate the scout overlay. The new
@@ -251,7 +251,8 @@ tests the plane built for exactly that gap.
   `["workflows", "cards", "summaries"]` on base `checker-scout`; stage
   invocations mirror the existing scout stage with per-stage call budgets.
 - **Full-stack variant**: `memory-embed` adds the same generative stages on
-  base `checker-scout-embed`. It is a separate treatment and must not be pooled
+  base `checker-scout-embed`, then embeds the generated semantic artifacts in
+  a separate final stage. It is a separate treatment and must not be pooled
   with `memory`; code-vector retrieval and memory value are otherwise
   confounded.
 - **First execution**: add a sol `skill`/`forced` memory pair to the

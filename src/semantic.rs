@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::structural;
+use crate::{embed, structural};
 
 const MAX_BODY_BYTES: usize = 12_000;
 // Generated workflows may carry four evidence spans for each of 31
@@ -126,7 +126,79 @@ pub struct SemanticArtifact {
     pub created_at: String,
     pub freshness: String,
     pub supports: Vec<SemanticSupport>,
-    pub relevance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_score: Option<ArtifactRetrievalScore>,
+}
+
+/// Retrieval signals are deliberately exposed instead of being collapsed
+/// into a calibrated-looking relevance value. `rank_score` is only the
+/// normalized reciprocal-rank fusion score; lexical and vector
+/// cosine remain model/query-specific diagnostic signals.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactRetrievalScore {
+    pub rank_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_cosine: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnotationPublication {
+    #[serde(flatten)]
+    pub artifact: SemanticArtifact,
+    pub vector_memory: AnnotationVectorStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnnotationVectorStatus {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactRetrievalStatus {
+    pub lexical: &'static str,
+    pub vector: &'static str,
+    pub corpus_artifacts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_action: Option<&'static str>,
+}
+
+impl ArtifactRetrievalStatus {
+    fn vector_disabled(corpus_artifacts: usize) -> Self {
+        Self {
+            lexical: "active",
+            vector: "disabled",
+            corpus_artifacts,
+            vector_action: None,
+        }
+    }
+
+    fn vector_active(corpus_artifacts: usize) -> Self {
+        Self {
+            lexical: "active",
+            vector: "active",
+            corpus_artifacts,
+            vector_action: None,
+        }
+    }
+
+    fn vector_degraded(corpus_artifacts: usize, action: &'static str) -> Self {
+        Self {
+            lexical: "active",
+            vector: "degraded",
+            corpus_artifacts,
+            vector_action: Some(action),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RankedArtifact {
+    pub id: i64,
+    pub retrieval_score: ArtifactRetrievalScore,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +485,62 @@ pub fn annotate_request(
         },
     };
     annotate(root, conn, &input)
+}
+
+/// Publish one interactive agent write and, only when this provider's
+/// semantic vector index was healthy before the write, top it up immediately.
+/// The annotation itself remains successful if inference later fails: retrying
+/// the write would create duplicate memory, while the returned status and the
+/// next retrieval both expose the degraded vector plane.
+pub fn annotate_request_with_provider(
+    root: &Path,
+    conn: &Connection,
+    provider: Option<&embed::Provider>,
+    request: AnnotateRequest,
+) -> Result<AnnotationPublication> {
+    let ready_before_write = provider.map(|provider| {
+        embed::semantic_vector_index_ready(conn, provider).map_err(|error| {
+            eprintln!("semantic vector preflight unavailable: {error}");
+            error
+        })
+    });
+    let artifact = annotate_request(root, conn, request)?;
+    let vector_memory = match (provider, ready_before_write) {
+        (None, _) => AnnotationVectorStatus {
+            status: "disabled",
+            action: None,
+        },
+        (Some(_), Some(Ok(false))) => AnnotationVectorStatus {
+            status: "degraded",
+            action: Some("run jscout embed <root> --semantic-only"),
+        },
+        (Some(_), Some(Err(ref error))) => AnnotationVectorStatus {
+            status: "degraded",
+            action: Some(embed::semantic_vector_failure_action(error)),
+        },
+        (Some(provider), Some(Ok(true))) => {
+            match embed::embed_semantic_missing(conn, provider, 16) {
+                Ok(_) => AnnotationVectorStatus {
+                    status: "active",
+                    action: None,
+                },
+                Err(error) => {
+                    eprintln!("semantic vector refresh after annotation failed: {error}");
+                    AnnotationVectorStatus {
+                        status: "degraded",
+                        action: Some(
+                            "repair the configured embedding service, then run jscout embed <root> --semantic-only",
+                        ),
+                    }
+                }
+            }
+        }
+        (Some(_), None) => unreachable!("provider presence determines preflight presence"),
+    };
+    Ok(AnnotationPublication {
+        artifact,
+        vector_memory,
+    })
 }
 
 pub(crate) fn workflow_request(
@@ -724,6 +852,7 @@ pub(crate) fn persist_validated_artifact(
             ],
         )?;
         let artifact_id = conn.last_insert_rowid();
+        crate::embed::mark_semantic_vector_index_stale(conn)?;
         let mut statement = conn.prepare_cached(
             "INSERT INTO semantic_supports(
                artifact_id, claim_path, anchor_key, role, evidence_file,
@@ -834,62 +963,245 @@ fn validate_relation_contract(
     Ok(())
 }
 
-pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SemanticArtifact>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
+#[derive(Debug)]
+struct ArtifactRankingCandidate {
+    id: i64,
+    artifact_type: String,
+    name: Option<String>,
+    body_json: String,
+}
+
+pub(crate) fn rank_artifacts(
+    conn: &Connection,
+    provider: Option<&embed::Provider>,
+    query: &str,
+    include_superseded: bool,
+    vector_limit: usize,
+) -> Result<(Vec<RankedArtifact>, ArtifactRetrievalStatus)> {
     let mut statement = conn.prepare(
-        "SELECT a.id, a.canonical_name, a.body_json FROM semantic_artifacts a
-         WHERE NOT EXISTS(
-           SELECT 1 FROM semantic_artifacts newer WHERE newer.supersedes_artifact_id=a.id
+        "SELECT artifact.id, artifact.artifact_type, artifact.canonical_name,
+                artifact.body_json
+         FROM semantic_artifacts artifact
+         WHERE ?1 OR NOT EXISTS(
+           SELECT 1 FROM semantic_artifacts successor
+           WHERE successor.supersedes_artifact_id=artifact.id
          )
-         ORDER BY a.id DESC",
+         ORDER BY artifact.id DESC",
     )?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+        .query_map([include_superseded], |row| {
+            Ok(ArtifactRankingCandidate {
+                id: row.get(0)?,
+                artifact_type: row.get(1)?,
+                name: row.get(2)?,
+                body_json: row.get(3)?,
+            })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let tokens: Vec<String> = query
-        .split(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
-        .filter(|token| token.len() > 1)
-        .map(str::to_lowercase)
-        .collect();
-    let mut ranked = Vec::new();
-    for (id, name, body_json) in rows {
-        let name = name.as_deref().unwrap_or_default().to_lowercase();
-        let body = body_json.to_lowercase();
-        let matches = tokens
-            .iter()
-            .filter(|token| name.contains(token.as_str()) || body.contains(token.as_str()))
-            .count();
-        if !tokens.is_empty() && matches == 0 {
-            continue;
-        }
-        let name_bonus = usize::from(!name.is_empty() && query.eq_ignore_ascii_case(&name));
-        let relevance = ((matches + name_bonus * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
-        ranked.push((id, relevance));
+    let corpus_artifacts = rows.len();
+    if query.trim().is_empty() {
+        return Ok((
+            rows.into_iter()
+                .map(|candidate| RankedArtifact {
+                    id: candidate.id,
+                    retrieval_score: ArtifactRetrievalScore {
+                        rank_score: 0.0,
+                        lexical_score: None,
+                        vector_cosine: None,
+                    },
+                })
+                .collect(),
+            ArtifactRetrievalStatus::vector_disabled(corpus_artifacts),
+        ));
     }
-    ranked.sort_by(|left, right| {
+
+    let raw_tokens = semantic_tokens(&query.to_lowercase());
+    let normalized_concept_query = crate::scouting::concept::normalize(query);
+    let concept_tokens = semantic_tokens(&normalized_concept_query);
+    let mut lexical = rows
+        .iter()
+        .filter_map(|candidate| {
+            lexical_artifact_relevance(
+                candidate,
+                query,
+                &raw_tokens,
+                &normalized_concept_query,
+                &concept_tokens,
+            )
+            .map(|score| (candidate.id, score))
+        })
+        .collect::<Vec<_>>();
+    lexical.sort_by(|left, right| {
         right
             .1
             .total_cmp(&left.1)
             .then_with(|| right.0.cmp(&left.0))
     });
+
+    let lexical_scores = lexical.iter().copied().collect::<HashMap<_, _>>();
+    let mut retrieval = ArtifactRetrievalStatus::vector_disabled(corpus_artifacts);
+    let vector = if let Some(provider) = provider {
+        match embed::semantic_vector_search(conn, provider, query, vector_limit.clamp(100, 1_000)) {
+            Ok(ranking) => {
+                retrieval = ArtifactRetrievalStatus::vector_active(corpus_artifacts);
+                ranking
+            }
+            Err(error) => {
+                retrieval = ArtifactRetrievalStatus::vector_degraded(
+                    corpus_artifacts,
+                    embed::semantic_vector_failure_action(&error),
+                );
+                eprintln!("semantic vector retrieval unavailable, using lexical order: {error}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let vector_scores = vector.iter().copied().collect::<HashMap<_, _>>();
+
+    let allowed = rows
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<HashSet<_>>();
+    let rankings = [lexical, vector]
+        .into_iter()
+        .map(|ranking| {
+            ranking
+                .into_iter()
+                .filter(|(id, _)| allowed.contains(id))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut fused = HashMap::<i64, f64>::new();
+    for ranking in rankings {
+        for (rank, (id, _)) in ranking.into_iter().enumerate() {
+            *fused.entry(id).or_default() += 1.0 / (60.0 + rank as f64 + 1.0);
+        }
+    }
+    let maximum = fused.values().copied().fold(0.0_f64, f64::max);
+    let mut ranked = fused
+        .into_iter()
+        .map(|(id, score)| RankedArtifact {
+            id,
+            retrieval_score: ArtifactRetrievalScore {
+                rank_score: if maximum > 0.0 { score / maximum } else { 0.0 },
+                lexical_score: lexical_scores.get(&id).copied(),
+                vector_cosine: vector_scores.get(&id).copied(),
+            },
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .retrieval_score
+            .rank_score
+            .total_cmp(&left.retrieval_score.rank_score)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok((ranked, retrieval))
+}
+
+fn lexical_artifact_relevance(
+    candidate: &ArtifactRankingCandidate,
+    query: &str,
+    raw_tokens: &[String],
+    normalized_concept_query: &str,
+    concept_tokens: &[String],
+) -> Option<f64> {
+    let (name, body, exact_name, tokens) = if candidate.artifact_type == "concept" {
+        let name =
+            crate::scouting::concept::normalize(candidate.name.as_deref().unwrap_or_default());
+        let body = serde_json::from_str::<Value>(&candidate.body_json)
+            .ok()
+            .map(|body| {
+                let definition = body
+                    .get("definition")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let aliases = body
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
+            })
+            .unwrap_or_else(|| crate::scouting::concept::normalize(&candidate.body_json));
+        let exact = !name.is_empty() && normalized_concept_query == name;
+        (name, body, exact, concept_tokens)
+    } else {
+        let name = candidate.name.as_deref().unwrap_or_default().to_lowercase();
+        let exact = !name.is_empty() && query.eq_ignore_ascii_case(&name);
+        (name, candidate.body_json.to_lowercase(), exact, raw_tokens)
+    };
+    if tokens.is_empty() {
+        return exact_name.then_some(1.0);
+    }
+    let matches = tokens
+        .iter()
+        .filter(|token| name.contains(token.as_str()) || body.contains(token.as_str()))
+        .count();
+    if matches == 0 {
+        return None;
+    }
+    Some(((matches + usize::from(exact_name) * 4) as f64 / tokens.len() as f64).min(1.0))
+}
+
+fn semantic_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '$'
+        })
+        .filter(|token| token.len() > 1)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+pub fn search_with_provider(
+    conn: &Connection,
+    provider: Option<&embed::Provider>,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<SemanticArtifact>, ArtifactRetrievalStatus, usize)> {
+    if limit == 0 {
+        let corpus_artifacts = conn.query_row(
+            "SELECT count(*) FROM semantic_artifacts artifact
+             WHERE NOT EXISTS(
+               SELECT 1 FROM semantic_artifacts successor
+               WHERE successor.supersedes_artifact_id=artifact.id
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        return Ok((
+            Vec::new(),
+            ArtifactRetrievalStatus::vector_disabled(corpus_artifacts),
+            0,
+        ));
+    }
+    let (mut ranked, retrieval) = rank_artifacts(conn, provider, query, false, limit * 5)?;
+    let candidate_pool = ranked.len();
     ranked.truncate(limit);
-    let ids = ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-    let relevance = ranked.into_iter().collect::<HashMap<_, _>>();
+    let ids = ranked
+        .iter()
+        .map(|artifact| artifact.id)
+        .collect::<Vec<_>>();
+    let retrieval_scores = ranked
+        .into_iter()
+        .map(|artifact| (artifact.id, artifact.retrieval_score))
+        .collect::<HashMap<_, _>>();
     let mut artifacts = load_artifacts(conn, &ids)?;
     for artifact in &mut artifacts {
-        artifact.relevance = relevance.get(&artifact.id).copied().unwrap_or_default();
+        artifact.retrieval_score = retrieval_scores.get(&artifact.id).cloned();
     }
-    Ok(artifacts)
+    Ok((artifacts, retrieval, candidate_pool))
+}
+
+#[cfg(test)]
+pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SemanticArtifact>> {
+    search_with_provider(conn, None, query, limit).map(|(artifacts, _, _)| artifacts)
 }
 
 pub(crate) fn load_artifact(conn: &Connection, id: i64) -> Result<Option<SemanticArtifact>> {
@@ -1319,7 +1631,7 @@ fn load_artifact_at_depth(
         created_at,
         freshness,
         supports,
-        relevance: 0.0,
+        retrieval_score: None,
     }))
 }
 

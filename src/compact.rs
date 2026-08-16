@@ -27,7 +27,10 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     response.insert("retrieval".into(), json!(result.retrieval));
     response.insert("hits".into(), Value::Array(hits));
 
-    if !result.semantic_artifacts.is_empty() {
+    if result.semantic_retrieval.as_ref().is_some_and(|retrieval| {
+        retrieval.corpus_artifacts > 0
+            && (result.semantic_candidates > 0 || retrieval.vector == "degraded")
+    }) {
         let artifacts = result
             .semantic_artifacts
             .iter()
@@ -38,33 +41,25 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 if let Some(name) = &artifact.name {
                     value.insert("name".into(), json!(name));
                 }
-                value.insert("body".into(), artifact.body.clone());
+                if let Some(summary) = semantic_preview(&artifact.body) {
+                    value.insert("summary".into(), json!(summary));
+                }
                 value.insert("confidence".into(), json!(artifact.confidence));
                 value.insert("freshness".into(), json!(artifact.freshness));
-                if !artifact.supports.is_empty() {
+                if let Some(score) = &artifact.retrieval_score {
+                    value.insert("score".into(), json!(score));
+                }
+                if let Some(support) = artifact.supports.first() {
                     value.insert(
-                        "supports".into(),
-                        Value::Array(
-                            artifact
-                                .supports
-                                .iter()
-                                .map(|support| {
-                                    json!([
-                                        support.claim_path,
-                                        support.relationship,
-                                        support.anchor,
-                                        source_at(
-                                            Some(&support.evidence_file),
-                                            Some(support.evidence_start_line),
-                                            Some(support.evidence_end_line),
-                                        ),
-                                        support.role,
-                                        support.confidence,
-                                        support.freshness,
-                                    ])
-                                })
-                                .collect(),
-                        ),
+                        "evidence".into(),
+                        json!({
+                            "anchor": support.anchor,
+                            "at": source_at(
+                                Some(&support.evidence_file),
+                                Some(support.evidence_start_line),
+                                Some(support.evidence_end_line),
+                            ),
+                        }),
                     );
                 }
                 Value::Object(value)
@@ -74,10 +69,13 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
             "semantic_memory".into(),
             json!({
                 "trust": "untrusted",
-                "support_fields": [
-                    "claim", "relationship", "anchor", "at", "role",
-                    "confidence", "freshness"
-                ],
+                "retrieval": result.semantic_retrieval,
+                "candidate_pool": result.semantic_candidates,
+                "selected": result.semantic_selected,
+                "returned": artifacts.len(),
+                "budget_omitted": result.semantic_selected.saturating_sub(artifacts.len()),
+                "next_tool": "semantic_memory",
+                "detail": "preview only; candidate_pool and scores are not calibrated relevance; use semantic_memory for full bodies and evidence",
                 "artifacts": artifacts,
             }),
         );
@@ -95,6 +93,24 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         search_budget_value(&result.response_budget),
     );
     Value::Object(response)
+}
+
+fn semantic_preview(body: &Value) -> Option<String> {
+    let object = body.as_object()?;
+    let value = ["claim", "purpose", "overview", "description", "definition"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))?;
+    let mut preview = value.trim().to_string();
+    const MAX_PREVIEW_BYTES: usize = 360;
+    if preview.len() > MAX_PREVIEW_BYTES {
+        let mut cut = MAX_PREVIEW_BYTES;
+        while !preview.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        preview.truncate(cut);
+        preview.push('…');
+    }
+    (!preview.is_empty()).then_some(preview)
 }
 
 fn compact_hit(hit: &search::Hit) -> Value {
@@ -870,12 +886,15 @@ fn source_at_option(file: Option<&str>, start: Option<i64>, end: Option<i64>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{definition_string, render_neighborhood, search_string, who_uses_string};
+    use super::{
+        definition_string, render_neighborhood, search_string, semantic_preview, who_uses_string,
+    };
     use crate::{
         origin,
         query::{SymbolTarget, Usage},
         scout::RenderedSource,
         search::{Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchResult},
+        semantic::{ArtifactRetrievalScore, SemanticArtifact, SemanticSupport},
         structural::{GraphEdge, GraphNode, Neighborhood},
     };
 
@@ -949,6 +968,9 @@ mod tests {
                 used_by: Vec::new(),
             }],
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
+            semantic_candidates: 0,
+            semantic_selected: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec![root.into()],
                 nodes: vec![node(root, 1), node(target, 20)],
@@ -1017,6 +1039,9 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits,
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
+            semantic_candidates: 0,
+            semantic_selected: 0,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 24_000,
@@ -1026,6 +1051,148 @@ mod tests {
             },
         };
         assert!(search_string(&result)?.len() < 4_000);
+        Ok(())
+    }
+
+    #[test]
+    fn search_memory_is_a_small_actionable_preview() -> anyhow::Result<()> {
+        let result = SearchResult {
+            snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
+            hits: Vec::new(),
+            semantic_artifacts: vec![SemanticArtifact {
+                id: 7,
+                supersedes: None,
+                artifact_type: "card".into(),
+                name: Some("sym:src/cache.ts#::resolveRoute@1".into()),
+                trust: "untrusted-semantic-memory".into(),
+                body: serde_json::json!({
+                    "purpose": "Resolves a cached route while preserving rewrite state.",
+                    "invariants": ["The rewrite marker survives fallback."]
+                }),
+                model: "test".into(),
+                prompt_version: "card/v1".into(),
+                confidence: "likely".into(),
+                source_snapshot: "s".repeat(64),
+                created_at: "2026-08-16T00:00:00Z".into(),
+                freshness: "fresh".into(),
+                supports: vec![SemanticSupport {
+                    claim_path: "/purpose".into(),
+                    anchor: "sym:src/cache.ts#::resolveRoute@1".into(),
+                    relationship: "defining-evidence".into(),
+                    role: None,
+                    evidence_file: "src/cache.ts".into(),
+                    evidence_start_line: 10,
+                    evidence_end_line: 20,
+                    source_hash: "h".repeat(64),
+                    context_hash: "c".repeat(64),
+                    confidence: "likely".into(),
+                    freshness: "fresh".into(),
+                }],
+                retrieval_score: Some(ArtifactRetrievalScore {
+                    rank_score: 0.75,
+                    lexical_score: Some(0.5),
+                    vector_cosine: Some(0.8),
+                }),
+            }],
+            semantic_retrieval: Some(crate::semantic::ArtifactRetrievalStatus {
+                lexical: "active",
+                vector: "disabled",
+                corpus_artifacts: 8,
+                vector_action: None,
+            }),
+            semantic_candidates: 8,
+            semantic_selected: 1,
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 24_000,
+                ..Default::default()
+            },
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
+        let memory = &value["semantic_memory"];
+        assert_eq!(memory["candidate_pool"], 8);
+        assert_eq!(memory["selected"], 1);
+        assert_eq!(memory["returned"], 1);
+        assert_eq!(memory["next_tool"], "semantic_memory");
+        assert_eq!(
+            memory["artifacts"][0]["summary"],
+            "Resolves a cached route while preserving rewrite state."
+        );
+        assert!(memory["artifacts"][0].get("body").is_none());
+        assert!(memory["artifacts"][0].get("supports").is_none());
+        assert!(search_string(&result)?.len() < 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn annotation_claim_is_visible_in_memory_preview() {
+        assert_eq!(
+            semantic_preview(&serde_json::json!({
+                "claim": "The route cache preserves the previous tree during refresh."
+            })),
+            Some("The route cache preserves the previous tree during refresh.".into())
+        );
+    }
+
+    #[test]
+    fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Result<()> {
+        let result = SearchResult {
+            snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
+            hits: Vec::new(),
+            semantic_artifacts: Vec::new(),
+            semantic_retrieval: Some(crate::semantic::ArtifactRetrievalStatus {
+                lexical: "active",
+                vector: "degraded",
+                corpus_artifacts: 20,
+                vector_action: Some("start or repair the configured embedding service, then retry"),
+            }),
+            semantic_candidates: 0,
+            semantic_selected: 0,
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 24_000,
+                ..Default::default()
+            },
+        };
+        let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
+        assert_eq!(value["semantic_memory"]["candidate_pool"], 0);
+        assert_eq!(value["semantic_memory"]["returned"], 0);
+        assert_eq!(value["semantic_memory"]["retrieval"]["vector"], "degraded");
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_memory_keeps_the_follow_up_envelope() -> anyhow::Result<()> {
+        let result = SearchResult {
+            snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
+            hits: Vec::new(),
+            semantic_artifacts: Vec::new(),
+            semantic_retrieval: Some(crate::semantic::ArtifactRetrievalStatus {
+                lexical: "active",
+                vector: "degraded",
+                corpus_artifacts: 20,
+                vector_action: Some("run jscout embed <root> --semantic-only"),
+            }),
+            semantic_candidates: 12,
+            semantic_selected: 3,
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 512,
+                omitted_semantic_artifacts: 3,
+                truncated: true,
+                ..Default::default()
+            },
+        };
+        let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
+        assert_eq!(value["semantic_memory"]["candidate_pool"], 12);
+        assert_eq!(value["semantic_memory"]["selected"], 3);
+        assert_eq!(value["semantic_memory"]["returned"], 0);
+        assert_eq!(value["semantic_memory"]["budget_omitted"], 3);
+        assert_eq!(value["semantic_memory"]["next_tool"], "semantic_memory");
         Ok(())
     }
 

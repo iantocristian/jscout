@@ -356,6 +356,7 @@ const PROFILE_PLANS = Object.freeze({
   // Keep this separate from `memory` so memory-only trials remain comparable.
   "memory-embed": [
     "enrich", "scout", "embed-product", "workflows", "cards", "summaries",
+    "embed-semantic",
   ],
 });
 
@@ -374,7 +375,7 @@ const PROFILE_INCREMENT = Object.freeze({
   "checker-scout": "scout",
   "checker-scout-embed": "embed-product",
   memory: ["workflows", "cards", "summaries"],
-  "memory-embed": ["workflows", "cards", "summaries"],
+  "memory-embed": ["workflows", "cards", "summaries", "embed-semantic"],
 });
 
 export function profilePlan(profile) {
@@ -527,13 +528,14 @@ function prepareJscoutProfile({
           },
         },
       );
-    } else if (stage === "embed" || stage === "embed-product") {
+    } else if (stage === "embed" || stage === "embed-product" || stage === "embed-semantic") {
       runLogged(
         jscout,
         [
           "embed", workspace,
           "--database", database,
           ...(stage === "embed-product" ? ["--product"] : []),
+          ...(stage === "embed-semantic" ? ["--semantic-only"] : []),
         ],
         {
           cwd: workspace,

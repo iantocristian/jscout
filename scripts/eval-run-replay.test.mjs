@@ -48,7 +48,10 @@ test("replay profiles and forced-search contract are explicit", () => {
   });
   assert.deepEqual(profilePlan("memory-embed"), {
     usesJscout: true,
-    stages: ["enrich", "scout", "embed-product", "workflows", "cards", "summaries"],
+    stages: [
+      "enrich", "scout", "embed-product", "workflows", "cards", "summaries",
+      "embed-semantic",
+    ],
   });
   assert.deepEqual(embeddingEnvironmentForProfile("memory"), {});
   assert.deepEqual(embeddingEnvironmentForProfile("memory-embed"), {

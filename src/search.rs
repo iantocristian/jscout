@@ -90,6 +90,15 @@ pub struct SearchResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_retrieval: Option<semantic::ArtifactRetrievalStatus>,
+    /// Ranked retrieval pool before the memory result limit. This is a
+    /// candidate count, not a calibrated relevant-match count.
+    #[serde(skip)]
+    pub semantic_candidates: usize,
+    /// Memory previews selected before the whole-response byte budget.
+    #[serde(skip)]
+    pub semantic_selected: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
     pub response_budget: ResponseBudget,
 }
@@ -122,12 +131,12 @@ impl RetrievalStatus {
         }
     }
 
-    fn vector_degraded() -> Self {
+    fn vector_degraded(action: &'static str) -> Self {
         Self {
             lexical: "active",
             vector: "degraded",
             reranker: "disabled",
-            vector_action: Some("run jscout embed <root>; inspect stderr if it fails"),
+            vector_action: Some(action),
         }
     }
 
@@ -365,11 +374,15 @@ pub fn search(
             &options.file_origins,
             options.rerank,
         )?;
-        let semantic_artifacts = if options.include_memory {
-            semantic::search(conn, q, options.memory_limit)?
-        } else {
-            Vec::new()
-        };
+        let (semantic_artifacts, semantic_retrieval, semantic_candidates) =
+            if options.include_memory {
+                let (artifacts, retrieval, candidates) =
+                    semantic::search_with_provider(conn, provider, q, options.memory_limit)?;
+                (artifacts, Some(retrieval), candidates)
+            } else {
+                (Vec::new(), None, 0)
+            };
+        let semantic_selected = semantic_artifacts.len();
         let expansion = options
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
@@ -379,6 +392,9 @@ pub fn search(
             retrieval,
             hits,
             semantic_artifacts,
+            semantic_retrieval,
+            semantic_candidates,
+            semantic_selected,
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
@@ -638,7 +654,7 @@ fn record_vector_ranking(
         }
         Err(error) => {
             eprintln!("vector search unavailable: {error}");
-            RetrievalStatus::vector_degraded()
+            RetrievalStatus::vector_degraded(embed::code_vector_failure_action(&error))
         }
     }
 }
@@ -748,7 +764,9 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
     // structural context appears. The dedicated semantic-memory surface owns
     // deeper evidence retrieval; search keeps one global, fairly distributed
     // preview rather than multiplying the cap by the number of artifacts.
-    cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
+    if !compact {
+        cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
+    }
 
     while settle_rendered_bytes(result, compact)? > byte_limit {
         result.response_budget.truncated = true;
@@ -1263,7 +1281,7 @@ mod tests {
     };
     use crate::{
         file_role, indexer, origin,
-        semantic::{SemanticArtifact, SemanticSupport},
+        semantic::{ArtifactRetrievalScore, SemanticArtifact, SemanticSupport},
         store,
         structural::{GraphEdge, GraphNode},
     };
@@ -1530,6 +1548,9 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
+            semantic_candidates: 0,
+            semantic_selected: 0,
             expansion: Some(SearchExpansion {
                 seeds: vec!["root".into()],
                 nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],
@@ -1601,8 +1622,15 @@ mod tests {
                 created_at: "2026-08-09T00:00:00Z".into(),
                 freshness: "fresh".into(),
                 supports: Vec::new(),
-                relevance: 1.0,
+                retrieval_score: Some(ArtifactRetrievalScore {
+                    rank_score: 1.0,
+                    lexical_score: Some(1.0),
+                    vector_cosine: None,
+                }),
             }],
+            semantic_retrieval: None,
+            semantic_candidates: 1,
+            semantic_selected: 1,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 2_000,
@@ -1651,7 +1679,11 @@ mod tests {
             created_at: "2026-08-13T00:00:00Z".into(),
             freshness: "fresh".into(),
             supports,
-            relevance: 1.0,
+            retrieval_score: Some(ArtifactRetrievalScore {
+                rank_score: 1.0,
+                lexical_score: Some(1.0),
+                vector_cosine: None,
+            }),
         };
         let mut second_artifact = artifact.clone();
         second_artifact.id = 2;
@@ -1661,6 +1693,9 @@ mod tests {
             retrieval: RetrievalStatus::vector_disabled(),
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
+            semantic_retrieval: None,
+            semantic_candidates: 2,
+            semantic_selected: 2,
             expansion: None,
             response_budget: ResponseBudget {
                 byte_limit: 100_000,

@@ -73,7 +73,7 @@ enum Command {
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
     },
-    /// Embed chunks missing from the explicitly configured provider profile
+    /// Embed code and/or semantic documents missing from the configured profile
     Embed {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -89,6 +89,12 @@ enum Command {
         /// Embed only the effective product corpus after fresh reconnaissance policy
         #[arg(long)]
         product: bool,
+        /// Also embed current workflows, cards, summaries, concepts, and annotations
+        #[arg(long)]
+        semantic: bool,
+        /// Embed only current semantic artifacts, without scanning code chunks
+        #[arg(long, conflicts_with_all = ["product", "semantic"])]
+        semantic_only: bool,
     },
     /// Hybrid search over the indexed repository
     Search {
@@ -230,9 +236,12 @@ enum Command {
     Memory {
         /// Repository root used to locate the default index
         root: PathBuf,
-        /// Optional lexical query; empty lists the newest records
+        /// Optional conceptual or identifier query; empty lists newest records
         #[arg(default_value = "")]
         query: String,
+        /// Disable semantic-artifact vector retrieval even when configured
+        #[arg(long)]
+        no_vector: bool,
         /// Maximum returned artifacts
         #[arg(short = 'k', long, default_value_t = 20)]
         limit: usize,
@@ -778,7 +787,17 @@ fn main() -> Result<()> {
             batch,
             file_origins,
             product,
-        } => cmd_embed(&root, database.as_deref(), batch, &file_origins, product),
+            semantic,
+            semantic_only,
+        } => cmd_embed(
+            &root,
+            database.as_deref(),
+            batch,
+            &file_origins,
+            product,
+            semantic,
+            semantic_only,
+        ),
         Command::Search {
             root,
             query,
@@ -887,13 +906,16 @@ fn main() -> Result<()> {
         } => {
             let conn = open_database_for_write(&root, database.as_deref())?;
             let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
-            let artifact = semantic::annotate_request(&root, &conn, input)?;
-            println!("{}", serde_json::to_string_pretty(&artifact)?);
+            let provider = embed::Provider::from_env()?;
+            let publication =
+                semantic::annotate_request_with_provider(&root, &conn, provider.as_ref(), input)?;
+            println!("{}", serde_json::to_string_pretty(&publication)?);
             Ok(())
         }
         Command::Memory {
             root,
             query,
+            no_vector,
             limit,
             artifact_types,
             freshness,
@@ -913,9 +935,15 @@ fn main() -> Result<()> {
             database,
         } => {
             let conn = open_database_read_only(&root, database.as_deref())?;
+            let provider = if no_vector {
+                None
+            } else {
+                embed::Provider::from_env()?
+            };
             let result = semantic_query::query(
                 &root,
                 &conn,
+                provider.as_ref(),
                 &semantic_query::QueryOptions {
                     query,
                     artifact_id: artifact,
@@ -1355,6 +1383,8 @@ fn cmd_embed(
     batch: usize,
     file_origins: &[String],
     product: bool,
+    semantic: bool,
+    semantic_only: bool,
 ) -> Result<()> {
     let conn = open_database_for_write(root, database)?;
     let Some(provider) = embed::Provider::from_env()? else {
@@ -1363,9 +1393,15 @@ fn cmd_embed(
         );
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
-    let (done, total) =
-        embed::embed_missing_for_selection(&conn, &provider, batch, file_origins, product)?;
-    println!("embedded {done}/{total} chunks");
+    if !semantic_only {
+        let (done, total) =
+            embed::embed_missing_for_selection(&conn, &provider, batch, file_origins, product)?;
+        println!("embedded {done}/{total} chunks");
+    }
+    if semantic || semantic_only {
+        let (done, total) = embed::embed_semantic_missing(&conn, &provider, batch)?;
+        println!("embedded {done}/{total} semantic artifacts");
+    }
     Ok(())
 }
 
@@ -2067,7 +2103,7 @@ mod main_tests {
             created_at: "now".into(),
             freshness: "fresh".into(),
             supports: Vec::new(),
-            relevance: 1.0,
+            retrieval_score: None,
         }])?;
         assert!(rendered.contains("semantic memory (untrusted; verify in source)"));
         assert!(rendered.contains("invoice settlement [fresh]"));
@@ -2166,6 +2202,30 @@ mod main_tests {
             panic!("expected embed")
         };
         assert_eq!(database, Some(PathBuf::from("/tmp/embed.db")));
+
+        let Cli { command } = Cli::try_parse_from(["jscout", "embed", ".", "--semantic-only"])
+            .expect("semantic-only embedding parses");
+        let Command::Embed {
+            semantic,
+            semantic_only,
+            ..
+        } = command
+        else {
+            panic!("expected embed")
+        };
+        assert!(!semantic);
+        assert!(semantic_only);
+        assert!(
+            Cli::try_parse_from(["jscout", "embed", ".", "--product", "--semantic-only"]).is_err()
+        );
+
+        let Cli { command } =
+            Cli::try_parse_from(["jscout", "memory", ".", "rewrite behavior", "--no-vector"])
+                .expect("lexical semantic-memory query parses");
+        let Command::Memory { no_vector, .. } = command else {
+            panic!("expected memory")
+        };
+        assert!(no_vector);
     }
 
     #[test]
