@@ -22,6 +22,7 @@ const MAX_TERM_CHARS: usize = 80;
 const MAX_CLAIM_CHARS: usize = 240;
 const MAX_LIST_ITEMS: usize = 6;
 const MAX_RANGES_PER_CLAIM: usize = 4;
+const MAX_RANGE_REPAIR_INPUT: usize = 12;
 const MAX_REASON_CHARS: usize = 300;
 /// Body budget below `semantic::MAX_BODY_BYTES`, checked here so an oversized
 /// card fails as a validation error instead of surfacing as a publication
@@ -300,6 +301,7 @@ pub fn validate(
         "purpose",
     )?;
     check(&purpose, "purpose")?;
+    let purpose = repair_claim(purpose);
 
     let architectural_role = submission
         .architectural_role
@@ -316,6 +318,7 @@ pub fn validate(
     if let Some(role) = &architectural_role {
         check(role, "architectural_role")?;
     }
+    let architectural_role = architectural_role.map(repair_claim);
 
     let domain_terms = submission.domain_terms.as_deref().unwrap_or_default();
     let domain_terms: Vec<ValidatedClaim> = domain_terms
@@ -337,7 +340,7 @@ pub fn validate(
         );
     }
     let mut lists = lists.into_iter();
-    let card = ValidatedCard {
+    let mut card = ValidatedCard {
         anchor: subject.anchor.clone(),
         file: subject.file.clone(),
         purpose: Some(purpose.clone()),
@@ -378,11 +381,24 @@ pub fn validate(
         }
     }
 
+    // Every submitted range has now been validated; apply the bounded repair.
+    card.domain_terms = card.domain_terms.into_iter().map(repair_claim).collect();
+    card.side_effects = card.side_effects.into_iter().map(repair_claim).collect();
+    card.invariants = card.invariants.into_iter().map(repair_claim).collect();
+    card.failure_modes = card.failure_modes.into_iter().map(repair_claim).collect();
+
     let body_bytes = serde_json::to_vec(&body(&card))?.len();
     if body_bytes > MAX_CARD_BODY_BYTES {
         bail!("card body is {body_bytes} bytes, over the {MAX_CARD_BODY_BYTES} byte limit");
     }
     Ok(card)
+}
+
+/// Applied only after every submitted range has passed the source-file
+/// check: retain the first MAX_RANGES_PER_CLAIM valid ranges.
+fn repair_claim(mut claim: ValidatedClaim) -> ValidatedClaim {
+    claim.evidence.truncate(MAX_RANGES_PER_CLAIM);
+    claim
 }
 
 fn claim(
@@ -401,15 +417,26 @@ fn claim(
     if evidence.is_empty() {
         bail!("`{label}` claim requires at least one evidence range");
     }
-    if evidence.len() > MAX_RANGES_PER_CLAIM {
+    if evidence.len() > MAX_RANGE_REPAIR_INPUT {
         bail!(
-            "`{label}` claim cites {} evidence ranges; at most {MAX_RANGES_PER_CLAIM}",
+            "`{label}` claim cites {} evidence ranges; over the {MAX_RANGE_REPAIR_INPUT}-range repair bound",
             evidence.len()
         );
     }
+    // Deduplicate in model order; the full deduplicated list is validated
+    // against the source file before any repair. Truncation to
+    // MAX_RANGES_PER_CLAIM happens in `repair_claim` only after that check,
+    // so an invalid over-cap range still fails the card rather than being
+    // silently dropped — the repository scout's repair boundary.
+    let mut seen = std::collections::BTreeSet::new();
+    let evidence = evidence
+        .iter()
+        .filter(|range| seen.insert((range.start_line, range.end_line)))
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(ValidatedClaim {
         text: text.to_string(),
-        evidence: evidence.to_vec(),
+        evidence,
     })
 }
 
@@ -520,6 +547,75 @@ mod tests {
 
     fn submission(value: serde_json::Value) -> Submission {
         serde_json::from_value(value).expect("submission shape")
+    }
+
+    #[test]
+    fn valid_excess_citations_are_repaired_to_the_claim_cap() -> Result<()> {
+        let card = validate(
+            &submission(json!({
+                "purpose": {
+                    "text": "charges the customer for a settled order",
+                    "evidence": [
+                        {"start_line": 1, "end_line": 2},
+                        {"start_line": 3, "end_line": 4},
+                        {"start_line": 5, "end_line": 6},
+                        {"start_line": 7, "end_line": 8},
+                        {"start_line": 9, "end_line": 10},
+                    ],
+                },
+                "incomplete_reason": null,
+            })),
+            &subject(),
+            &pack(),
+        )?;
+        let purpose = card.purpose.expect("purpose claim");
+        assert_eq!(purpose.evidence.len(), 4);
+        assert_eq!(purpose.evidence[0].start_line, 1);
+        assert_eq!(purpose.evidence[3].end_line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_excess_citation_still_fails_the_card() {
+        let error = validate(
+            &submission(json!({
+                "purpose": {
+                    "text": "charges the customer for a settled order",
+                    "evidence": [
+                        {"start_line": 1, "end_line": 2},
+                        {"start_line": 3, "end_line": 4},
+                        {"start_line": 5, "end_line": 6},
+                        {"start_line": 7, "end_line": 8},
+                        {"start_line": 19, "end_line": 99},
+                    ],
+                },
+                "incomplete_reason": null,
+            })),
+            &subject(),
+            &pack(),
+        )
+        .expect_err("out-of-file fifth range must fail, not be dropped");
+        assert!(error.to_string().contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn citations_beyond_the_repair_bound_fail() {
+        let ranges = (1..=13)
+            .map(|line| json!({"start_line": line, "end_line": line}))
+            .collect::<Vec<_>>();
+        let error = validate(
+            &submission(json!({
+                "purpose": {
+                    "text": "charges the customer for a settled order",
+                    "evidence": ranges,
+                },
+                "incomplete_reason": null,
+            })),
+            &subject(),
+            &pack(),
+        )
+        .expect_err("13 ranges exceed the repair bound");
+        assert!(error.to_string().contains("repair bound"), "{error}");
     }
 
     #[test]
