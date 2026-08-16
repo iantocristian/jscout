@@ -7,9 +7,12 @@ import test from "node:test";
 
 import { buildSnapshot } from "./eval-pr-snapshot.mjs";
 import {
+  preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
   profilePlan,
   promptFor,
+  startBrowserServer,
+  validatePreparedDatabaseManifest,
   workspaceProcessGroups,
 } from "./eval-run-replay.mjs";
 
@@ -74,6 +77,31 @@ test("replay profiles and forced-search contract are explicit", () => {
   });
 });
 
+test("prepared database manifests reject a different source snapshot", () => {
+  const expected = preparedDatabaseManifest({
+    taskId: "task-one",
+    parent: "parent-one",
+    profile: "checker-embed",
+    stages: ["enrich", "embed"],
+  });
+  assert.doesNotThrow(() => validatePreparedDatabaseManifest(expected, expected));
+  assert.throws(
+    () => validatePreparedDatabaseManifest({ ...expected, parent: "parent-two" }, expected),
+    /manifest mismatch for parent/,
+  );
+});
+
+test("browser server startup fails instead of dispatching a blind arm", async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-browser-missing-"));
+  const log = path.join(workspace, "browser-server.log");
+  await assert.rejects(
+    startBrowserServer(workspace, log, 2_000),
+    /browser server exited before publishing an endpoint/,
+  );
+  assert.ok(fs.existsSync(log));
+  fs.rmSync(workspace, { recursive: true, force: true });
+});
+
 test("workspace process cleanup selects only exact workspace-rooted groups", () => {
   const rows = [
     "  101   90 node /private/tmp/jr/r-one/node_modules/jest/bin/jest.js",
@@ -94,12 +122,30 @@ test("replay runner drives workspace, stub agent, and grading end to end", () =>
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-replay-runner-"));
   const repo = path.join(base, "repo");
   fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "node_modules/playwright"), { recursive: true });
   git(base, ["init", "-q", "-b", "main", repo]);
   git(repo, ["config", "user.email", "eval@test"]);
   git(repo, ["config", "user.name", "eval"]);
   fs.writeFileSync(path.join(repo, "src/a.js"), "export const a = () => 1;\n");
   fs.writeFileSync(path.join(repo, "src/b.js"), "export const b = () => 2;\n");
+  fs.writeFileSync(
+    path.join(repo, "node_modules/playwright/index.js"),
+    `exports.chromium = {
+  async launchServer() {
+    const keepAlive = setInterval(() => {}, 1_000);
+    return {
+      wsEndpoint() { return "ws://127.0.0.1:43210/fake-browser"; },
+      async close() {
+        clearInterval(keepAlive);
+        console.log("FAKE_BROWSER_SERVER_CLOSED");
+      },
+    };
+  },
+};
+`,
+  );
   git(repo, ["add", "."]);
+  git(repo, ["add", "-f", "node_modules/playwright/index.js"]);
   git(repo, ["commit", "-qm", "base"]);
   fs.writeFileSync(path.join(repo, "src/a.js"), "export const a = (x) => x + 1;\n");
   fs.writeFileSync(path.join(repo, "src/b.js"), "export const b = (x) => x + 2;\n");
@@ -132,10 +178,15 @@ test("replay runner drives workspace, stub agent, and grading end to end", () =>
     `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 const argv = process.argv.slice(2);
 const value = (flag) => argv[argv.indexOf(flag) + 1];
 const workspace = value("--cd");
 if (process.env.JSCOUT_REPLAY_TEST_ENV !== "enabled") throw new Error("execution environment missing");
+if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
+if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+const fdLimit = Number(execFileSync("/bin/sh", ["-c", "ulimit -n"], { encoding: "utf8" }).trim());
+if (fdLimit < 65536) throw new Error("file descriptor limit was not inherited");
 fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
 if (fs.existsSync(path.join(workspace, "gold"))) throw new Error("gold leaked into workspace");
 fs.appendFileSync(path.join(workspace, "src/a.js"), "// stub edit\\n");
@@ -193,6 +244,13 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "agent-argv.json"), "utf8"),
   );
   assert.ok(agentArgv.includes("sandbox_workspace_write.network_access=true"));
+
+  const runDir = path.join(base, "artifacts", "grep-control-replay-fixture-t1");
+  const browser = JSON.parse(
+    fs.readFileSync(path.join(runDir, "browser-server.json"), "utf8"),
+  );
+  assert.equal(browser.endpoint, "ws://127.0.0.1:43210/fake-browser");
+  assert.match(fs.readFileSync(browser.log, "utf8"), /FAKE_BROWSER_SERVER_CLOSED/);
 
   const grade = JSON.parse(
     fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "grade.json"), "utf8"),

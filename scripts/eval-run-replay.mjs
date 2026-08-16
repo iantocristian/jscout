@@ -30,6 +30,7 @@ export const REPLAY_EXECUTION_POLICY = Object.freeze({
 });
 
 let activeChild = null;
+let activeBrowserChild = null;
 let activeWorkspace = null;
 let receivedSignal = null;
 
@@ -101,6 +102,7 @@ function recordWorkspaceCleanup(workspace, runDir, phase) {
 function handleSignal(signal) {
   receivedSignal = receivedSignal ?? signal;
   killProcessGroup(activeChild, "SIGTERM");
+  try { activeBrowserChild?.kill("SIGTERM"); } catch { /* already gone */ }
   if (activeWorkspace) cleanupWorkspaceProcesses(activeWorkspace);
 }
 
@@ -341,6 +343,56 @@ function copyDatabase(source, destination) {
   }
 }
 
+export function preparedDatabaseManifest({ taskId, parent, profile, stages }) {
+  return {
+    schema_version: 1,
+    task_id: taskId,
+    parent,
+    profile,
+    stages: [...stages],
+  };
+}
+
+function manifestPath(database) {
+  return `${database}.manifest.json`;
+}
+
+function writePreparedDatabaseManifest(database, manifest) {
+  fs.writeFileSync(manifestPath(database), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+export function validatePreparedDatabaseManifest(actual, expected) {
+  for (const field of ["schema_version", "task_id", "parent", "profile"]) {
+    if (actual?.[field] !== expected[field]) {
+      throw new Error(
+        `prepared database manifest mismatch for ${field}: expected ${JSON.stringify(expected[field])}, got ${JSON.stringify(actual?.[field])}`,
+      );
+    }
+  }
+  if (JSON.stringify(actual.stages) !== JSON.stringify(expected.stages)) {
+    throw new Error(
+      `prepared database manifest mismatch for stages: expected ${JSON.stringify(expected.stages)}, got ${JSON.stringify(actual.stages)}`,
+    );
+  }
+}
+
+function requirePreparedDatabaseManifest(database, expected) {
+  const file = manifestPath(database);
+  if (!fs.existsSync(file)) {
+    throw new Error(
+      `prepared database has no provenance manifest: ${database}; rebuild it before reuse`,
+    );
+  }
+  let actual;
+  try {
+    actual = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`unable to read prepared database manifest ${file}: ${error.message}`);
+  }
+  validatePreparedDatabaseManifest(actual, expected);
+  return actual;
+}
+
 function prepareJscoutProfile({
   jscout,
   workspace,
@@ -433,12 +485,36 @@ function resolveExecutionEnvironment(taskSet, task) {
   return merged;
 }
 
+function stopBrowserServer(child, graceMs = 5_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    if (activeBrowserChild === child) activeBrowserChild = null;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activeBrowserChild === child) activeBrowserChild = null;
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      finish();
+    }, graceMs);
+    child.once("close", finish);
+    try { child.kill("SIGTERM"); } catch { finish(); }
+  });
+}
+
 // Chromium cannot launch inside Codex's seatbelt (no mach-register), so a
 // browser server runs OUTSIDE the sandbox and the workspace's own e2e
 // harness connects to it via NEXT_TEST_BROWSER_WS_ENDPOINT (native support
 // in test/lib/browsers/playwright.ts). Loopback sockets are sandbox-allowed.
-function startBrowserServer(workspace) {
-  return new Promise((resolve) => {
+export function startBrowserServer(workspace, logPath, timeoutMs = 60_000) {
+  return new Promise((resolve, reject) => {
+    const log = fs.createWriteStream(logPath, { flags: "a" });
     const child = spawn(process.execPath, ["-e", `
       const { chromium } = require('playwright');
       chromium.launchServer({ host: '127.0.0.1', headless: true }).then((server) => {
@@ -446,14 +522,44 @@ function startBrowserServer(workspace) {
         process.on('SIGTERM', () => server.close().then(() => process.exit(0)));
       }).catch((error) => { console.error(error); process.exit(1); });
     `], { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] });
+    activeBrowserChild = child;
     let out = "";
-    const timer = setTimeout(() => resolve({ child, endpoint: null }), 60_000);
+    let settled = false;
+    const fail = async (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      await stopBrowserServer(child);
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      void fail(new Error(`browser server did not start within ${timeoutMs}ms; see ${logPath}`));
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => {
+      log.write(chunk);
       out += chunk;
       const match = out.match(/WS_ENDPOINT=(ws:[^\s]+)/);
-      if (match) { clearTimeout(timer); resolve({ child, endpoint: match[1] }); }
+      if (match && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ child, endpoint: match[1] });
+      }
     });
-    child.on("close", () => { clearTimeout(timer); resolve({ child: null, endpoint: null }); });
+    child.stderr.pipe(log, { end: false });
+    child.on("error", (error) => {
+      void fail(new Error(`browser server failed to spawn: ${error.message}; see ${logPath}`));
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (activeBrowserChild === child) activeBrowserChild = null;
+      log.end();
+      if (!settled) {
+        settled = true;
+        reject(new Error(
+          `browser server exited before publishing an endpoint (code=${code}, signal=${signal}); see ${logPath}`,
+        ));
+      }
+    });
   });
 }
 
@@ -656,6 +762,9 @@ async function main() {
       const profileDatabase = usesJscout
         ? path.join(preparedRoot, task.id, `${profile}.db`)
         : null;
+      const expectedProfileManifest = usesJscout
+        ? preparedDatabaseManifest({ taskId: task.id, parent, profile, stages })
+        : null;
       for (let treatmentIndex = 0; treatmentIndex < treatments.length; treatmentIndex += 1) {
         const treatment = treatments[treatmentIndex];
         const session = `${profile}-${treatment}-${task.id}-${options.trial}`;
@@ -706,16 +815,32 @@ async function main() {
             // from a prior trial) is cloned byte-identically instead of being
             // rebuilt, holding the retrieval substrate constant across
             // execution models. Recorded per-arm for provenance.
+            const preparedManifest = requirePreparedDatabaseManifest(
+              profileDatabase,
+              expectedProfileManifest,
+            );
             copyDatabase(profileDatabase, database);
+            writePreparedDatabaseManifest(database, preparedManifest);
             fs.writeFileSync(
               path.join(runDir, "jscout-profile-reuse.json"),
-              `${JSON.stringify({ source: profileDatabase, stages, reused_prepared: true }, null, 2)}\n`,
+              `${JSON.stringify({ source: profileDatabase, manifest: preparedManifest, reused_prepared: true }, null, 2)}\n`,
             );
           } else if (treatmentIndex === 0) {
             const baseProfile = PROFILE_BASES[profile];
             const baseDatabase = baseProfile
               ? path.join(preparedRoot, task.id, `${baseProfile}.db`)
               : null;
+            if (baseDatabase && fs.existsSync(baseDatabase)) {
+              requirePreparedDatabaseManifest(
+                baseDatabase,
+                preparedDatabaseManifest({
+                  taskId: task.id,
+                  parent,
+                  profile: baseProfile,
+                  stages: profilePlan(baseProfile).stages,
+                }),
+              );
+            }
             prepareJscoutProfile({
               jscout,
               workspace,
@@ -728,13 +853,20 @@ async function main() {
               baseDatabase,
               executionEnvironment,
             });
+            writePreparedDatabaseManifest(database, expectedProfileManifest);
             fs.mkdirSync(path.dirname(profileDatabase), { recursive: true });
             copyDatabase(database, profileDatabase);
+            writePreparedDatabaseManifest(profileDatabase, expectedProfileManifest);
           } else {
+            const preparedManifest = requirePreparedDatabaseManifest(
+              profileDatabase,
+              expectedProfileManifest,
+            );
             copyDatabase(profileDatabase, database);
+            writePreparedDatabaseManifest(database, preparedManifest);
             fs.writeFileSync(
               path.join(runDir, "jscout-profile-reuse.json"),
-              `${JSON.stringify({ source: profileDatabase, stages }, null, 2)}\n`,
+              `${JSON.stringify({ source: profileDatabase, manifest: preparedManifest }, null, 2)}\n`,
             );
           }
         }
@@ -783,35 +915,41 @@ async function main() {
         }
         const eventsPath = path.join(runDir, "events.jsonl");
         const stderrPath = path.join(runDir, "stderr.log");
-        // The browser server starts before the prompt is built: whether an
-        // endpoint exists decides which e2e paragraph the agent is given.
-        const browser = await startBrowserServer(workspace);
+        const browserLog = path.join(runDir, "browser-server.log");
+        const browser = await startBrowserServer(workspace, browserLog);
         args.push(promptFor(task, treatment, { browserEndpoint: browser.endpoint }));
-        if (browser.endpoint) {
-          fs.writeFileSync(
-            path.join(runDir, "browser-server.json"),
-            `${JSON.stringify({ endpoint: browser.endpoint }, null, 2)}\n`,
-          );
-        } else {
-          process.stderr.write(`[${task.id}] ${profile}/${treatment} — browser server FAILED to start; arm runs without an e2e endpoint\n`);
-        }
+        fs.writeFileSync(
+          path.join(runDir, "browser-server.json"),
+          `${JSON.stringify({ endpoint: browser.endpoint, log: browserLog }, null, 2)}\n`,
+        );
         process.stderr.write(`[${task.id}] ${profile}/${treatment} — live events: ${eventsPath}\n`);
         // sh wrapper raises the fd limit for codex and every inner agent
         // shell (bug-1 EMFILE); "$@" passes args through without re-quoting.
-        const result = await run("/bin/sh", ["-c", 'ulimit -n 65536; exec "$@"', "sh", options.codex, ...args], {
-          cwd: workspace,
-          env: {
-            ...childEnvironment,
-            ...(browser.endpoint
-              ? { NEXT_TEST_BROWSER_WS_ENDPOINT: browser.endpoint, HEADLESS: "true" }
-              : {}),
-          },
-          eventsPath,
-          stderrPath,
-          timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
-        });
-        if (browser.child) {
-          try { browser.child.kill("SIGTERM"); } catch {}
+        let result;
+        try {
+          result = await run(
+            "/bin/sh",
+            [
+              "-c",
+              'ulimit -n 65536 || { echo "failed to raise file-descriptor limit to 65536" >&2; exit 72; }; exec "$@"',
+              "sh",
+              options.codex,
+              ...args,
+            ],
+            {
+              cwd: workspace,
+              env: {
+                ...childEnvironment,
+                NEXT_TEST_BROWSER_WS_ENDPOINT: browser.endpoint,
+                HEADLESS: "true",
+              },
+              eventsPath,
+              stderrPath,
+              timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
+            },
+          );
+        } finally {
+          await stopBrowserServer(browser.child);
         }
         recordWorkspaceCleanup(workspace, runDir, "after-agent");
         if (result.interrupted) throwIfInterrupted();
