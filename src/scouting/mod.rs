@@ -3380,14 +3380,26 @@ mod tests {
 
         let mut first = FakeGateway::new(vec![
             Ok(repository_outcome("mixed")),
-            Ok(repository_outcome("runtime")),
             Ok(repository_outcome("documentation")),
+            Ok(repository_outcome("runtime")),
         ]);
         let report =
             super::repository::execute(repo.path(), &conn, &mut first, &options, make_plan())?;
         assert_eq!(report.model_calls, 3);
         assert_eq!(report.reports.len(), 3);
         assert_eq!(first.calls, 3);
+        assert_eq!(
+            report
+                .reports
+                .iter()
+                .map(|report| report.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "area:repository:mixed",
+                "area:repository:mixed/docs",
+                "area:repository:mixed:direct",
+            ],
+        );
         assert_eq!(
             recon::file_policy_by_path(&conn, "mixed/runtime.ts")?
                 .unwrap()
