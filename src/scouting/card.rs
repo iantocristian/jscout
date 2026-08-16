@@ -401,15 +401,17 @@ fn claim(
     if evidence.is_empty() {
         bail!("`{label}` claim requires at least one evidence range");
     }
+    // Excess valid citations are repaired by truncation in model order, the
+    // same local repair the repository scout applies: a billed submission
+    // whose only defect is over-citing must not fail the subject. Every
+    // retained range is still validated; empty evidence still fails closed.
+    let mut evidence = evidence.to_vec();
     if evidence.len() > MAX_RANGES_PER_CLAIM {
-        bail!(
-            "`{label}` claim cites {} evidence ranges; at most {MAX_RANGES_PER_CLAIM}",
-            evidence.len()
-        );
+        evidence.truncate(MAX_RANGES_PER_CLAIM);
     }
     Ok(ValidatedClaim {
         text: text.to_string(),
-        evidence: evidence.to_vec(),
+        evidence,
     })
 }
 

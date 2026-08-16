@@ -836,6 +836,13 @@ fn render_concept_pack(
 /// Union of the three deterministic card sources, deduped by anchor. Runtime
 /// boundary endpoints rank first, then workflow participants, so a capped
 /// plan keeps the symbols with the most established meaning.
+// Automatic selection orders subjects by incoming resolved-edge count —
+// most-referenced symbols first — so a bounded --max-calls budget reaches
+// the corpus's load-bearing surfaces before its periphery. On the Next.js
+// evaluation snapshot, key-ordered selection spent full budgets on
+// telemetry/dev-infrastructure/examples and produced zero artifacts about
+// the subsystem the repository revolves around. Usage degree is a neutral
+// graph fact; the key tiebreak keeps equal-weight subjects deterministic.
 fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
     let mut subjects = runtime_boundary_endpoints(conn)?;
     let mut statement = conn.prepare(
@@ -848,7 +855,10 @@ fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>
            AND (policy.effective_role='runtime'
              OR (policy.file_id IS NULL AND file.role='production'))
            AND file.origin IN ('repository','workspace')
-         ORDER BY node.node_key",
+         ORDER BY (
+           SELECT count(*) FROM resolved_edges edge
+           WHERE edge.dst_key=node.node_key
+         ) DESC, node.node_key",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
@@ -921,7 +931,10 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
            AND (policy.effective_role='runtime'
              OR (policy.file_id IS NULL AND file.role='production'))
            AND file.origin IN ('repository','workspace')
-         ORDER BY node.node_key",
+         ORDER BY (
+           SELECT count(*) FROM resolved_edges edge
+           WHERE edge.dst_key=node.node_key
+         ) DESC, node.node_key",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
