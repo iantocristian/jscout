@@ -53,6 +53,20 @@ test("replay profiles and forced-search contract are explicit", () => {
   }, "skill");
   assert.ok(constrained.includes("Task-specific execution constraints"));
   assert.ok(constrained.includes("Do not start the persistent package watcher"));
+
+  // The e2e paragraph follows the browser server: promise an endpoint only
+  // when one exists, otherwise steer the agent away from browser tests.
+  const withBrowser = promptFor({ story: "Fix it." }, "skill", {
+    browserEndpoint: "ws://127.0.0.1:1/token",
+  });
+  assert.ok(withBrowser.includes("pre-connected browser endpoint"));
+  assert.ok(withBrowser.includes("NEXT_TEST_MODE=start pnpm testonly <path>"));
+  assert.ok(withBrowser.includes("test-start-turbo / test-dev-* wrappers"));
+  assert.ok(!withBrowser.includes("No browser endpoint is available"));
+  assert.ok(!natural.includes("pre-connected browser endpoint"));
+  assert.ok(natural.includes(
+    "No browser endpoint is available in this environment; do not attempt browser e2e tests.",
+  ));
   assert.deepEqual(REPLAY_EXECUTION_POLICY, {
     networkAccess: true,
     networkPolicy: "prompt-restricted-external; loopback-required",

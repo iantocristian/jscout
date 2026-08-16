@@ -522,7 +522,7 @@ function commandUsage(events) {
   };
 }
 
-export function promptFor(task, treatment = "control") {
+export function promptFor(task, treatment = "control", options = {}) {
   const contract = [
     "You are implementing a real change in this repository.",
     "",
@@ -549,11 +549,23 @@ export function promptFor(task, treatment = "control") {
       "  files, inspect test/build output, and run tests or builds.",
     );
   }
+  // Only promise a browser when one is actually there: an arm whose server
+  // failed to start would otherwise be told to run e2e tests that cannot pass.
+  if (options.browserEndpoint) {
+    contract.push(
+      "- Browser e2e tests work through a pre-connected browser endpoint: run",
+      "  them with the repository's pnpm test scripts, e.g. HEADLESS=true",
+      "  NEXT_TEST_MODE=start pnpm testonly <path>. Avoid the pnpm",
+      "  test-start-turbo / test-dev-* wrappers; their teardown can hang for",
+      "  120s per run. Do not invoke node run-tests.js directly; it replaces",
+      "  the browser endpoint and will fail.",
+    );
+  } else {
+    contract.push(
+      "- No browser endpoint is available in this environment; do not attempt browser e2e tests.",
+    );
+  }
   contract.push(
-    "- Browser e2e tests work through a pre-connected browser endpoint: run",
-    "  them with the repository's pnpm test scripts (e.g. HEADLESS=true",
-    "  pnpm test-start-turbo <path>). Do not invoke node run-tests.js",
-    "  directly; it replaces the browser endpoint and will fail.",
     "- Do not start long-running dev watchers (pnpm dev, next dev, watch",
     "  builds); they exhaust file watchers on this tree and the e2e harness",
     "  manages its own servers.",
@@ -769,11 +781,12 @@ async function main() {
             );
           }
         }
-        args.push(promptFor(task, treatment));
-
         const eventsPath = path.join(runDir, "events.jsonl");
         const stderrPath = path.join(runDir, "stderr.log");
+        // The browser server starts before the prompt is built: whether an
+        // endpoint exists decides which e2e paragraph the agent is given.
         const browser = await startBrowserServer(workspace);
+        args.push(promptFor(task, treatment, { browserEndpoint: browser.endpoint }));
         if (browser.endpoint) {
           fs.writeFileSync(
             path.join(runDir, "browser-server.json"),
