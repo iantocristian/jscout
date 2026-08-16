@@ -1121,13 +1121,23 @@ fn execute_prepared_workflow(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A per-request timeout is a property of one subject's request,
-            // not of the gateway: the batch continues with a failed report,
-            // exactly as contract failures do. A second memory-prep abort
-            // came from one slow card killing 98 published artifacts.
-            // Spawn/protocol/auth/cancel errors keep aborting the batch.
-            if let GatewayError::Timeout(_) = &error {
-                return Ok(gateway_timeout_report(run_id, &spec, error));
+            // A REMOTE per-request timeout is subject-local: the gateway
+            // aborted that one request, sent a correlated terminal frame,
+            // and the connection is synchronized for the next subject —
+            // the batch continues with a failed report, exactly as contract
+            // failures do (a second memory-prep abort came from one slow
+            // card killing 98 published artifacts). The LOCAL frame-deadline
+            // `GatewayError::Timeout` poisons the connection (request
+            // correlation is lost), so it stays batch-fatal, as do
+            // spawn/protocol/io/cancel errors.
+            if remote_timeout(&error) {
+                return Ok(gateway_timeout_report(
+                    run_id,
+                    &spec,
+                    candidate_set.seeds.join(", "),
+                    candidate_set.candidates.len(),
+                    error,
+                ));
             }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
@@ -1427,13 +1437,23 @@ fn execute_prepared_card(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A per-request timeout is a property of one subject's request,
-            // not of the gateway: the batch continues with a failed report,
-            // exactly as contract failures do. A second memory-prep abort
-            // came from one slow card killing 98 published artifacts.
-            // Spawn/protocol/auth/cancel errors keep aborting the batch.
-            if let GatewayError::Timeout(_) = &error {
-                return Ok(gateway_timeout_report(run_id, &spec, error));
+            // A REMOTE per-request timeout is subject-local: the gateway
+            // aborted that one request, sent a correlated terminal frame,
+            // and the connection is synchronized for the next subject —
+            // the batch continues with a failed report, exactly as contract
+            // failures do (a second memory-prep abort came from one slow
+            // card killing 98 published artifacts). The LOCAL frame-deadline
+            // `GatewayError::Timeout` poisons the connection (request
+            // correlation is lost), so it stays batch-fatal, as do
+            // spawn/protocol/io/cancel errors.
+            if remote_timeout(&error) {
+                return Ok(gateway_timeout_report(
+                    run_id,
+                    &spec,
+                    subject.anchor.clone(),
+                    1,
+                    error,
+                ));
             }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
@@ -1776,13 +1796,23 @@ fn execute_prepared_concept(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A per-request timeout is a property of one subject's request,
-            // not of the gateway: the batch continues with a failed report,
-            // exactly as contract failures do. A second memory-prep abort
-            // came from one slow card killing 98 published artifacts.
-            // Spawn/protocol/auth/cancel errors keep aborting the batch.
-            if let GatewayError::Timeout(_) = &error {
-                return Ok(gateway_timeout_report(run_id, &spec, error));
+            // A REMOTE per-request timeout is subject-local: the gateway
+            // aborted that one request, sent a correlated terminal frame,
+            // and the connection is synchronized for the next subject —
+            // the batch continues with a failed report, exactly as contract
+            // failures do (a second memory-prep abort came from one slow
+            // card killing 98 published artifacts). The LOCAL frame-deadline
+            // `GatewayError::Timeout` poisons the connection (request
+            // correlation is lost), so it stays batch-fatal, as do
+            // spawn/protocol/io/cancel errors.
+            if remote_timeout(&error) {
+                return Ok(gateway_timeout_report(
+                    run_id,
+                    &spec,
+                    canonical_name.clone(),
+                    sources.len(),
+                    error,
+                ));
             }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
@@ -2324,13 +2354,23 @@ fn execute_prepared_summary(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A per-request timeout is a property of one subject's request,
-            // not of the gateway: the batch continues with a failed report,
-            // exactly as contract failures do. A second memory-prep abort
-            // came from one slow card killing 98 published artifacts.
-            // Spawn/protocol/auth/cancel errors keep aborting the batch.
-            if let GatewayError::Timeout(_) = &error {
-                return Ok(gateway_timeout_report(run_id, &spec, error));
+            // A REMOTE per-request timeout is subject-local: the gateway
+            // aborted that one request, sent a correlated terminal frame,
+            // and the connection is synchronized for the next subject —
+            // the batch continues with a failed report, exactly as contract
+            // failures do (a second memory-prep abort came from one slow
+            // card killing 98 published artifacts). The LOCAL frame-deadline
+            // `GatewayError::Timeout` poisons the connection (request
+            // correlation is lost), so it stays batch-fatal, as do
+            // spawn/protocol/io/cancel errors.
+            if remote_timeout(&error) {
+                return Ok(gateway_timeout_report(
+                    run_id,
+                    &spec,
+                    scope.scope_key.clone(),
+                    children.len(),
+                    error,
+                ));
             }
             return Err(anyhow::Error::from(error)).context("gateway completion failed");
         }
@@ -3173,17 +3213,32 @@ fn scout_report(
 /// failed run, the model call counts against the budget, and later subjects
 /// still get their turn. Gateway/infrastructure errors and invalidated
 /// publication state keep aborting via `Err`.
+/// True only for the gateway-reported per-request timeout: the remote side
+/// aborted the request and remains synchronized. The local frame-deadline
+/// `GatewayError::Timeout` is deliberately excluded — it poisons the
+/// connection and must abort the batch.
+pub(crate) fn remote_timeout(error: &GatewayError) -> bool {
+    matches!(error, GatewayError::Remote(remote) if remote.code == "timeout")
+}
+
 /// A gateway timeout finishes the run as failed and yields a subject-local
 /// failed report with no usage or provider identity (the request never
-/// completed). The subject is recoverable from the run spec's config.
-fn gateway_timeout_report(run_id: i64, spec: &RunSpec, error: GatewayError) -> ScoutReport {
+/// completed). The caller passes its real subject identity so the slow
+/// subject is visible in command output without a database investigation.
+fn gateway_timeout_report(
+    run_id: i64,
+    spec: &RunSpec,
+    subject: String,
+    candidate_count: usize,
+    error: GatewayError,
+) -> ScoutReport {
     ScoutReport {
         kind: spec.scout_kind.clone(),
-        subject: spec.input_fingerprint.clone(),
+        subject,
         run_id,
         status: "failed".into(),
         artifact_id: None,
-        candidate_count: 0,
+        candidate_count,
         decisions: BTreeMap::new(),
         usage: None,
         billing_path: spec.billing_path.clone(),
@@ -4341,6 +4396,68 @@ mod tests {
             "candidates": candidates,
             "incomplete_reason": null,
         })
+    }
+
+    #[test]
+    fn remote_timeout_fails_one_subject_and_the_batch_continues() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let conn = fixture(dir.path())?;
+        let mut options = card_options();
+        options.anchors = vec!["flow.ts:start".into(), "flow.ts:finish".into()];
+        options.policy = RequestPolicy::new(30, 2, 240_000).expect("policy");
+        let plan = super::plan::cards(dir.path(), &conn, &options.anchors)?;
+        assert_eq!(plan.items.len(), 2);
+        let mut gateway = FakeGateway::new(vec![
+            Err(GatewayError::Remote(crate::llm::protocol::RemoteError {
+                code: "timeout".into(),
+                message: "completion exceeded 300000 ms".into(),
+                retryable: true,
+                capacity: false,
+            })),
+            Ok(card_outcome(card_submission())),
+        ]);
+        let batch = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)?;
+        assert_eq!(batch.reports.len(), 2);
+        let failed = batch
+            .reports
+            .iter()
+            .find(|report| report.status == "failed")
+            .expect("timed-out subject records a failed report");
+        assert!(
+            failed
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("gateway timeout")),
+            "{failed:?}"
+        );
+        assert!(
+            failed.subject.contains("flow.ts"),
+            "the slow subject must be identifiable: {}",
+            failed.subject
+        );
+        assert!(
+            batch
+                .reports
+                .iter()
+                .any(|report| report.status == "completed"),
+            "the batch continues past a remote timeout"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_frame_timeout_remains_batch_fatal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let conn = fixture(dir.path())?;
+        let options = card_options();
+        let plan = super::plan::cards(dir.path(), &conn, &options.anchors)?;
+        let mut gateway = FakeGateway::new(vec![Err(GatewayError::Timeout(
+            std::time::Duration::from_secs(30),
+        ))]);
+        let error = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)
+            .expect_err("a poisoned connection must abort the batch");
+        assert!(error.to_string().contains("gateway completion failed"));
+        Ok(())
     }
 
     fn scout_one_card(

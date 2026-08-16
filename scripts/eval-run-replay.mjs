@@ -273,16 +273,17 @@ function runLogged(command, args, {
   }
 }
 
-// A generative scout run is usable when it published at least one artifact.
-// The summary line is only printed on orderly exits, so a hard abort (e.g. a
-// fatal gateway error mid-batch) must be judged by the database itself: a
-// stage that grew the artifact count did real work worth keeping.
-function scoutPublishedArtifacts(output) {
-  const match = output.match(/reports: (\d+)/);
-  return match !== null && Number(match[1]) > 0;
+// A generative scout run is usable when it PUBLISHED at least one artifact.
+// The `reports:` summary counts failed subjects too, so it proves nothing —
+// an all-timeout batch reports nonzero. Evidence of publication is either a
+// per-subject `artifact: <id>` line in the output or, decisively (hard
+// aborts print no summary at all), growth of the stage database's
+// semantic_artifacts count.
+export function scoutPublishedArtifacts(output) {
+  return /^\s*artifact: \d+/m.test(output);
 }
 
-function countSemanticArtifacts(database) {
+export function countSemanticArtifacts(database) {
   try {
     const result = spawnSync("sqlite3", [
       `file:${database}?immutable=1`,
