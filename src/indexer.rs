@@ -20,6 +20,9 @@ pub struct IndexOptions {
 pub struct IndexOutcome {
     pub indexed: usize,
     pub unchanged: usize,
+    /// Previously indexed first-party files omitted from the resulting
+    /// snapshot because they disappeared or failed read/extraction.
+    pub removed: usize,
     pub failed: usize,
     pub failures: Vec<IndexFailure>,
     pub chunks: usize,
@@ -196,6 +199,7 @@ fn index_repo_impl(
     let mut outcome = IndexOutcome {
         indexed: 0,
         unchanged: 0,
+        removed: 0,
         failed: 0,
         failures: Vec::new(),
         chunks: 0,
@@ -210,9 +214,7 @@ fn index_repo_impl(
         extraction_reset: false,
     };
 
-    let mut existing: HashMap<String, (i64, String, String)> = if mode == IndexMode::FullRefresh {
-        HashMap::new()
-    } else {
+    let stored: HashMap<String, (i64, String, String)> = {
         let mut stmt =
             conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
         let rows = stmt.query_map([], |r| {
@@ -226,6 +228,15 @@ fn index_repo_impl(
             ))
         })?;
         rows.collect::<std::result::Result<_, _>>()?
+    };
+    let previous_paths = stored
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut existing = if mode == IndexMode::FullRefresh {
+        HashMap::new()
+    } else {
+        stored
     };
 
     // Extractor-version changes force re-extraction by clearing file hashes, and the
@@ -243,6 +254,7 @@ fn index_repo_impl(
         || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
 
     let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut published: std::collections::HashSet<String> = Default::default();
     conn.execute_batch("BEGIN")?;
     if extraction_reset {
         if mode == IndexMode::FullRefresh {
@@ -279,6 +291,7 @@ fn index_repo_impl(
                 conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
             }
             outcome.unchanged += 1;
+            published.insert(rel);
             continue;
         }
         if std::env::var_os("JSCOUT_DEBUG").is_some() {
@@ -301,6 +314,7 @@ fn index_repo_impl(
                 outcome.indexed += 1;
                 outcome.chunks += nchunks;
                 outcome.refs += nrefs;
+                published.insert(rel);
             }
             Err(e) => {
                 if let Some((old_id, _, _)) = existing.get(&rel) {
@@ -316,6 +330,7 @@ fn index_repo_impl(
             store::delete_file(conn, *id)?;
         }
     }
+    outcome.removed = previous_paths.difference(&published).count();
 
     // Remember the published projection identity before invalidating it: if
     // this run reproduces the exact same snapshot and module resolution, the
@@ -1943,9 +1958,7 @@ mod tests {
     }
 
     /// Every canonical and projected table, keyed by paths/keys/spans instead
-    /// of rowids. `snapshot` and `resolution_hash` are excluded: the
-    /// resolution hash digests file ids, which every full re-index reassigns
-    /// — on the per-file path and the wholesale-reset path alike.
+    /// of rowids, including the stable published snapshot identity.
     fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, String)>> {
         const SECTIONS: &[(&str, &str)] = &[
             (
@@ -2093,10 +2106,7 @@ mod tests {
                 "SELECT e.chunk_hash, p.provider, p.model, p.config_fingerprint, p.dimensions
                  FROM embeddings e JOIN embedding_profiles p ON p.id=e.profile_id",
             ),
-            (
-                "meta",
-                "SELECT key, value FROM meta WHERE key NOT IN ('snapshot', 'resolution_hash')",
-            ),
+            ("meta", "SELECT key, value FROM meta"),
         ];
         SECTIONS
             .iter()
@@ -2275,6 +2285,7 @@ mod tests {
             incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
         assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.removed, 1);
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM files WHERE path='main.ts'",
@@ -2282,6 +2293,95 @@ mod tests {
                 |row| { row.get::<_, i64>(0) }
             )?,
             0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { stable } from './stable';\n\
+             import { edited } from './edited';\n\
+             import { removed } from './removed';\n\
+             import { renamed } from './old-name';\n\
+             export const total = stable + edited + removed + renamed;\n",
+        )?;
+        fs::write(repo.path().join("stable.ts"), "export const stable = 1;\n")?;
+        fs::write(repo.path().join("edited.ts"), "export const edited = 2;\n")?;
+        fs::write(
+            repo.path().join("removed.ts"),
+            "export const removed = 3;\n",
+        )?;
+        fs::write(
+            repo.path().join("old-name.ts"),
+            "export const renamed = 4;\n",
+        )?;
+
+        let incremental = store::open_path(&repo.path().join("incremental.db"))?;
+        let full = store::open_path(&repo.path().join("full.db"))?;
+        refresh_repo_with_options(repo.path(), &incremental, &IndexOptions::default())?;
+        refresh_repo_with_options(repo.path(), &full, &IndexOptions::default())?;
+
+        fs::write(repo.path().join("edited.ts"), "export const edited = 20;\n")?;
+        fs::remove_file(repo.path().join("removed.ts"))?;
+        fs::rename(
+            repo.path().join("old-name.ts"),
+            repo.path().join("renamed.ts"),
+        )?;
+        fs::write(repo.path().join("added.ts"), "export const added = 5;\n")?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import { stable } from './stable';\n\
+             import { edited } from './edited';\n\
+             import { added } from './added';\n\
+             import { renamed } from './renamed';\n\
+             export const total = stable + edited + added + renamed;\n",
+        )?;
+
+        let incremental_outcome = incremental_refresh_repo_with_options(
+            repo.path(),
+            &incremental,
+            &IndexOptions::default(),
+        )?;
+        let full_outcome = refresh_repo_with_options(repo.path(), &full, &IndexOptions::default())?;
+        assert_eq!(
+            (
+                incremental_outcome.indexed,
+                incremental_outcome.unchanged,
+                incremental_outcome.removed,
+            ),
+            (4, 1, 2)
+        );
+        assert_eq!((full_outcome.indexed, full_outcome.unchanged), (5, 0));
+
+        let incremental_resolution = structural::compute_resolution_hash(&incremental)?;
+        let full_resolution = structural::compute_resolution_hash(&full)?;
+        let incremental_snapshot = structural::current_snapshot(&incremental)?;
+        let full_snapshot = structural::current_snapshot(&full)?;
+        assert_eq!(incremental_resolution, full_resolution);
+        assert_eq!(incremental_snapshot, full_snapshot);
+        assert_eq!(canonical_dump(&incremental)?, canonical_dump(&full)?);
+
+        incremental.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(?1, '5.9.3', 'test', 'checker-fp', 1,
+                      '2026-01-01T00:00:00Z', 1)",
+            [&incremental_snapshot],
+        )?;
+        refresh_repo_with_options(repo.path(), &incremental, &IndexOptions::default())?;
+        assert_eq!(structural::current_snapshot(&incremental)?, full_snapshot);
+        assert_eq!(
+            incremental.query_row(
+                "SELECT count(*) FROM checker_enrichment_batches",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1,
+            "an unchanged full reconciliation must retain the exact checker batch"
         );
         Ok(())
     }

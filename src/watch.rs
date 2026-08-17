@@ -185,25 +185,28 @@ impl Coordinator {
             self.refresh_scope = RefreshScope::Incremental;
         }
         self.last_dirty_at = now;
-        let signal_scope = signal.scope;
-        self.refresh_scope = self.refresh_scope.max(signal_scope);
-        if self.refresh_scope == RefreshScope::Incremental {
-            self.dirty_reasons.extend(signal.reasons);
-            self.dirty_source_paths.extend(signal.source_paths);
-            if self.dirty_source_paths.len() > MAX_INCREMENTAL_SOURCE_PATHS {
-                self.refresh_scope = RefreshScope::Full;
-                self.dirty_source_paths.clear();
-                self.dirty_reasons
-                    .retain(|reason| !reason.starts_with("source:"));
-                self.dirty_reasons.insert("mass-source-change".to_string());
+        self.refresh_scope = self.refresh_scope.max(signal.scope);
+        self.dirty_reasons.extend(
+            signal
+                .reasons
+                .into_iter()
+                .filter(|reason| !reason.starts_with("source:")),
+        );
+        let mut source_overflow = false;
+        for path in signal.source_paths {
+            if self.dirty_source_paths.contains(&path) {
+                continue;
             }
-        } else {
-            self.dirty_source_paths.clear();
-            self.dirty_reasons
-                .retain(|reason| !reason.starts_with("source:"));
-            if signal_scope == RefreshScope::Full {
-                self.dirty_reasons.extend(signal.reasons);
+            if self.dirty_source_paths.len() == MAX_INCREMENTAL_SOURCE_PATHS {
+                source_overflow = true;
+                continue;
             }
+            self.dirty_reasons.insert(format!("source:{path}"));
+            self.dirty_source_paths.insert(path);
+        }
+        if source_overflow {
+            self.refresh_scope = RefreshScope::Full;
+            self.dirty_reasons.insert("mass-source-change".to_string());
         }
         self.refresh_immediate = false;
         self.ready = None;
@@ -675,7 +678,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         Ok(result) => {
                             indexer::report_failures(&result.outcome);
                             eprintln!(
-                                "watch generation={} phase=refresh refresh_scope={} status={} snapshot={} indexed={} unchanged={} failed={} chunks={} refs={} projection_rebuilt={} elapsed_ms={}",
+                                "watch generation={} phase=refresh refresh_scope={} status={} snapshot={} indexed={} unchanged={} removed={} failed={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
                                 work.generation,
                                 work.refresh_scope,
                                 if result.outcome.failed == 0 {
@@ -686,10 +689,15 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 result.snapshot,
                                 result.outcome.indexed,
                                 result.outcome.unchanged,
+                                result.outcome.removed,
                                 result.outcome.failed,
                                 result.outcome.chunks,
                                 result.outcome.refs,
-                                result.outcome.projection_rebuilt,
+                                if result.outcome.projection_rebuilt {
+                                    "rebuilt"
+                                } else {
+                                    "reused"
+                                },
                                 phase_started.elapsed().as_millis()
                             );
                             let previous_targets = targets.clone();
@@ -1520,7 +1528,13 @@ mod tests {
 
         let work = coordinator.next_work(seconds(5)).expect("refresh");
         assert_eq!(work.refresh_scope, RefreshScope::Full);
-        assert!(coordinator.dirty_source_paths.is_empty());
+        assert_eq!(
+            coordinator.dirty_source_paths,
+            ["a.ts".to_string(), "b.ts".to_string()].into()
+        );
+        assert!(coordinator.dirty_reasons.contains("source:a.ts"));
+        assert!(coordinator.dirty_reasons.contains("source:b.ts"));
+        assert!(coordinator.dirty_reasons.contains("boundary:package.json"));
     }
 
     #[test]
@@ -1540,6 +1554,10 @@ mod tests {
         let work = coordinator.next_work(seconds(3)).expect("refresh");
         assert_eq!(work.refresh_scope, RefreshScope::Full);
         assert!(coordinator.dirty_reasons.contains("mass-source-change"));
+        assert_eq!(
+            coordinator.dirty_source_paths.len(),
+            MAX_INCREMENTAL_SOURCE_PATHS
+        );
     }
 
     #[test]
@@ -1666,6 +1684,7 @@ mod tests {
         fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
         let second = run_refresh(directory.path(), &database, &[], RefreshScope::Incremental)?;
         assert_eq!(second.outcome.indexed, 1);
+        assert_eq!(second.outcome.removed, 1);
         let conn = crate::store::open_path_read_only(&database)?;
         let paths = conn
             .prepare("SELECT path FROM files ORDER BY path")?
@@ -1690,6 +1709,7 @@ mod tests {
             (refreshed.outcome.indexed, refreshed.outcome.unchanged),
             (1, 1)
         );
+        assert_eq!(refreshed.outcome.removed, 0);
         assert!(refreshed.outcome.projection_rebuilt);
         Ok(())
     }
