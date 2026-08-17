@@ -22,6 +22,7 @@ permissions:
 env:
   RUST_TOOLCHAIN: 1.97.1
   NODE_VERSION: 22.19.0
+  NPM_VERSION: 11.19.0
 
 jobs:
   macos-binaries:
@@ -129,9 +130,12 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Upgrade npm for trusted publishing
-        # Node 22.19.0 ships npm 10.x; OIDC needs >= 11.5.1.
+        # Node 22.19.0 ships npm 10.x; OIDC needs >= 11.5.1. Pinned rather
+        # than @latest: npm 12 requires node ^22.22.2 || ^24.15.0 || >=26,
+        # so @latest silently stops matching NODE_VERSION. npm 11.19.0
+        # declares ^20.17.0 || >=22.9.0.
         run: |
-          npm install -g npm@latest
+          npm install -g npm@${{ env.NPM_VERSION }}
           npm --version
 
       - name: Check the tag matches Cargo.toml
