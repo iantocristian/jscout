@@ -5004,7 +5004,7 @@ mod tests {
     /// project fragments. A structural snapshot change suppresses the entire
     /// old batch until enrichment publishes a batch for the new snapshot.
     #[test]
-    fn checker_batch_is_inert_after_snapshot_changes() -> Result<()> {
+    fn checker_batch_is_removed_after_snapshot_changes() -> Result<()> {
         let repo = tempfile::tempdir()?;
         write(
             repo.path(),
@@ -5153,8 +5153,8 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(
-            retained, 2,
-            "incremental watch may retain inert facts until the next full refresh"
+            retained, 0,
+            "every refresh mode retires checker facts from an older snapshot"
         );
         Ok(())
     }
