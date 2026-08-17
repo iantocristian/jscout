@@ -1144,6 +1144,7 @@ fn is_refresh_boundary(path: &Path) -> bool {
     matches!(
         name,
         "package.json"
+            | "pnpm-workspace.yaml"
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
@@ -1151,6 +1152,8 @@ fn is_refresh_boundary(path: &Path) -> bool {
             | "bun.lockb"
             | "tsconfig.json"
             | "jsconfig.json"
+            | ".gitignore"
+            | ".ignore"
             | ".gitmodules"
     ) || (name.starts_with("tsconfig.") && name.ends_with(".json"))
         || (name.starts_with("jsconfig.") && name.ends_with(".json"))
@@ -1613,12 +1616,26 @@ mod tests {
     #[test]
     fn lockfiles_and_configs_are_full_refresh_boundaries() {
         assert!(is_refresh_boundary(Path::new("pnpm-lock.yaml")));
+        assert!(is_refresh_boundary(Path::new("pnpm-workspace.yaml")));
         assert!(is_refresh_boundary(Path::new("package-lock.json")));
         assert!(is_refresh_boundary(Path::new("yarn.lock")));
         assert!(is_refresh_boundary(Path::new("tsconfig.server.json")));
         assert!(is_refresh_boundary(Path::new("types/ambient.d.ts")));
+        assert!(is_refresh_boundary(Path::new(".gitignore")));
+        assert!(is_refresh_boundary(Path::new(".ignore")));
         assert!(is_noise(Path::new("node_modules/dep/index.js")));
         assert!(!is_noise(Path::new("pnpm-lock.yaml")));
+
+        let root = PathBuf::from("/repo");
+        let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+        for boundary in [".gitignore", ".ignore", "pnpm-workspace.yaml"] {
+            assert!(
+                classifier
+                    .classify(&[root.join(boundary)])
+                    .is_some_and(|signal| signal.scope == RefreshScope::Full),
+                "{boundary} must force a full refresh"
+            );
+        }
     }
 
     #[test]

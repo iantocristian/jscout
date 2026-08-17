@@ -1100,13 +1100,14 @@ resulting snapshot. `jscout index` remains a full rebuild; the incremental path
 is a watcher latency optimization, not a second correctness model.
 
 A source batch is promoted to full refresh when it contains more than 256
-distinct paths. Git HEAD or submodule controls, package manifests, lockfiles,
-tsconfig/jsconfig and declaration inputs, selected dependency roots, external
-checker inputs, directories, backend errors, and unclassifiable missing paths
-also require full refresh. Full scope is sticky within a generation, so a
-mixed event cannot be downgraded by later source notifications. A changed file
-that cannot be read or extracted is removed from the published partial
-snapshot rather than leaving its previous structural row live.
+distinct paths. Git HEAD or submodule controls, source-inventory ignore files,
+package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
+inputs, selected dependency roots, external checker inputs, directories,
+backend errors, and unclassifiable missing paths also require full refresh.
+Full scope is sticky within a generation, so a mixed event cannot be downgraded
+by later source notifications. A changed file that cannot be read or extracted
+is removed from the published partial snapshot rather than leaving its
+previous structural row live.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1202,8 +1203,9 @@ database locking remains a separate concern handled below.
 Triggers include:
 
 - indexed source create, update, delete, and rename events;
-- `package.json`, supported lockfiles, tsconfig/jsconfig files, declaration
-  files, and other resolver configuration;
+- `package.json`, `pnpm-workspace.yaml`, source-inventory ignore files,
+  supported lockfiles, tsconfig/jsconfig files, declaration files, and other
+  resolver configuration;
 - resolved Git worktree `HEAD` control paths, including branch switches and
   worktree-specific Git directories; source notifications cover checkout
   changes without treating routine `.git/index` writes as rebuild triggers;

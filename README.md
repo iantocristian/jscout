@@ -374,10 +374,11 @@ disposable-snapshot refresh as `jscout index`. A bounded batch containing only
 indexed JavaScript/TypeScript source paths then uses incremental extraction: it
 walks and hashes the complete source tree, but parses and replaces only changed
 or missing files. Startup, periodic reconciliation, more than 256 changed
-source paths, Git/submodule controls, package manifests, lockfiles,
-tsconfig/jsconfig or declaration inputs, selected dependency/checker inputs,
-directories, backend errors, and uncertain missing paths use full refresh.
-Full scope is sticky within a coalesced generation.
+source paths, Git/submodule controls, source-inventory ignore files,
+package/workspace manifests, lockfiles, tsconfig/jsconfig or declaration
+inputs, selected dependency/checker inputs, directories, backend errors, and
+uncertain missing paths use full refresh. Full scope is sticky within a
+coalesced generation.
 
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
@@ -802,8 +803,10 @@ or `stale` label. The complete response-byte limit includes semantic artifacts.
 structural rows across snapshots. It preserves content-hash embedding cache
 rows, semantic memory, and immutable repository-reconnaissance history, then
 rematerializes current vector occurrences and exact fresh reconnaissance policy
-from those durable planes. Checker enrichment is snapshot-bound and is removed by a full index;
-run `jscout enrich` again when occurrence-specific checker edges are required.
+from those durable planes. Checker enrichment is snapshot-bound: an exact
+batch survives either refresh mode when the snapshot is unchanged, while a
+changed snapshot removes it. Run `jscout enrich` again when those
+occurrence-specific edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
 periodic full reconciliation. Manual `jscout index` always remains a full
