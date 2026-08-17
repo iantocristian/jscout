@@ -4,12 +4,12 @@
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
-> snapshot simplification, G13 repository reconnaissance, and G14 retrieval
-> handoff are implemented; G12 watcher coordination remains planned. G15
-> design-before-edit task memory is parked as product-surface expansion while
-> the same hypothesis is tested entirely in the evaluation harness. G16 is
-> also parked; it remains a conditional memory-delivery correction, not a
-> committed rewrite.
+> snapshot simplification, G12 watcher coordination and incremental source
+> refresh, G13 repository reconnaissance, and G14 retrieval handoff are
+> implemented. G15 design-before-edit task memory is parked as
+> product-surface expansion while the same hypothesis is tested entirely in
+> the evaluation harness. G16 is also parked; it remains a conditional
+> memory-delivery correction, not a committed rewrite.
 
 ## Document policy
 
@@ -1064,15 +1064,14 @@ Acceptance checks:
 
 ## G12 — watcher coordinator
 
-**Implementation complete (2026-08-16); sustained-churn validation on a large
-real repository remains pending.** The production watcher now has no reachable
-incremental-indexing path. It uses a pure generation coordinator, full
-disposable-snapshot refreshes, fresh per-phase connections, explicit optional
-embedding/checker phases, supersession and cancellation, bounded retry and
-stable-failure degradation, exact self-output exclusions, dynamic external
-coverage, and periodic reconciliation. Unit/fixture coverage passes; the next
-operational step is to run it through branch switches and ordinary edits on the
-user's target repository.
+**Implementation complete (2026-08-17); sustained-churn validation on a large
+real repository remains pending.** The production watcher uses a pure
+generation coordinator, a typed full/incremental refresh scope, fresh per-phase
+connections, explicit optional embedding/checker phases, supersession and
+cancellation, bounded retry and stable-failure degradation, exact self-output
+exclusions, dynamic external coverage, and periodic reconciliation. Unit and
+fixture coverage passes; the next operational step is to run it through branch
+switches and ordinary edits on the user's target repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
@@ -1085,17 +1084,31 @@ The watcher guarantees eventual convergence to the current checkout while it
 is running. A successful generation executes:
 
 ```text
-full structural refresh
+full or incremental structural refresh
   -> rematerialize vectors already present in the content cache
   -> optionally embed unseen content (`--embed`)
   -> optionally enrich the exact published snapshot (`--enrich`)
 ```
 
-The first implementation runs a full disposable-plane refresh at startup and
-after every accepted change generation. Source-derived state is cheap and
-disposable; content-hash embeddings and semantic memory survive. Per-file
-incremental extraction is an optimization that may return only after measured
-watch latency justifies its additional invalidation rules.
+Startup and reconciliation generations run a full disposable-plane refresh.
+An ordinary bounded batch of JavaScript/TypeScript source paths uses
+incremental extraction: it still walks and hashes the complete current source
+tree, but preserves unchanged first-party rows and parses/replaces only changed
+or missing files. Dependency discovery, module resolution, snapshot
+calculation, stale checker-batch retirement, vector occurrence
+rematerialization, and projection publication still run against the complete
+resulting snapshot. `jscout index` remains a full rebuild; the incremental path
+is a watcher latency optimization, not a second correctness model.
+
+A source batch is promoted to full refresh when it contains more than 256
+distinct paths. Git HEAD or submodule controls, source-inventory ignore files,
+package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
+inputs, selected dependency roots, external checker inputs, directories,
+backend errors, and unclassifiable missing paths also require full refresh.
+Full scope is sticky within a generation, so a mixed event cannot be downgraded
+by later source notifications. A changed file that cannot be read or extracted
+is removed from the published partial snapshot rather than leaving its
+previous structural row live.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1109,8 +1122,9 @@ durations.
 `--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
 does not start the TypeScript checker, and never serves checker facts from a
 different structural snapshot. It may reuse an active exact-snapshot batch
-when a full rebuild proves the snapshot unchanged. Dependency selectors remain
-authoritative and must be supplied to watch exactly as they are to index.
+when either refresh mode proves the snapshot unchanged. Dependency selectors
+remain authoritative and must be supplied to watch exactly as they are to
+index.
 
 ### Generation state machine
 
@@ -1128,7 +1142,7 @@ finished:
 
 ```text
 clean
-  -> dirty(generation, reasons)
+  -> dirty(generation, reasons, full|incremental)
   -> refreshing(generation)
   -> embedding(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
@@ -1168,9 +1182,14 @@ watcher journal or recovery schema is required.
 
 ### Trigger and reconciliation policy
 
-Every relevant event initially selects the same full-refresh path; event
-classification exists to explain and broaden observation, not to choose a
-less-correct update algorithm.
+Relevant events carry a typed refresh scope. Indexed source-file create,
+update, delete, and rename paths select incremental extraction while all
+resolution, ownership, checkout, dependency, and uncertain boundaries select
+full refresh. Scopes coalesce during debounce, full scope dominates and remains
+sticky for the generation, and more than 256 distinct source paths promotes
+the generation to full refresh. The incremental executor still scans the
+complete source tree and runs complete resolution and publication, so event
+paths are optimization hints rather than the correctness inventory.
 
 Jscout-owned output paths are excluded before relevance classification and
 before the unknown-event escalation rule. The exclusion set is exact, not a
@@ -1185,8 +1204,9 @@ database locking remains a separate concern handled below.
 Triggers include:
 
 - indexed source create, update, delete, and rename events;
-- `package.json`, supported lockfiles, tsconfig/jsconfig files, declaration
-  files, and other resolver configuration;
+- `package.json`, `pnpm-workspace.yaml`, source-inventory ignore files,
+  supported lockfiles, tsconfig/jsconfig files, declaration files, and other
+  resolver configuration;
 - resolved Git worktree `HEAD` control paths, including branch switches and
   worktree-specific Git directories; source notifications cover checkout
   changes without treating routine `.git/index` writes as rebuild triggers;
@@ -1264,10 +1284,10 @@ delete semantic memory or content-hash embedding rows.
    executor. Track desired/completed generations, dirty reasons, per-phase
    retry state, debounce, degraded snapshots/coverage, and structured cycle
    telemetry without timing-dependent tests.
-2. Replace watch's incremental indexing call with the normal full-refresh
-   operation. Open a fresh connection per phase, configure `busy_timeout`,
-   audit rollback paths, implement bounded stable-file-failure degradation,
-   and make fatal failures retry automatically.
+2. Replace the pre-G12 watch loop with the normal full-refresh operation. Open
+   a fresh connection per phase, configure `busy_timeout`, audit rollback
+   paths, implement bounded stable-file-failure degradation, and make fatal
+   failures retry automatically.
 3. Invalidate cross-snapshot checker state through the structural refresh while
    retaining a reusable exact-snapshot batch; sequence optional embedding and
    exact-snapshot enrichment, and add generation checks plus cancellation
@@ -1279,9 +1299,13 @@ delete semantic memory or content-hash embedding rows.
 5. Add periodic reconciliation, bounded retry/backoff, concise generation and
    phase logging, then remove assumptions that another repository event is
    required to recover from failure.
-6. Update README operational guidance only after the coordinator behavior is
-   implemented. Do not describe the current incremental watcher as satisfying
-   G12 before the acceptance suite passes.
+6. Update README operational guidance after the coordinator acceptance suite
+   passes.
+7. **G12.1 amendment (2026-08-17):** promote the already parity-tested
+   incremental extractor to a production watcher operation. Add typed event
+   scope, sticky full fallbacks, a 256-path promotion bound, fail-closed stale
+   row removal, exact-snapshot checker retention, and refresh-scope telemetry.
+   Keep manual `index` full-refresh-only.
 
 ### Acceptance checks
 
@@ -1304,8 +1328,10 @@ delete semantic memory or content-hash embedding rows.
   TypeScript runtime, and ambient declaration changes converge;
 - edit -> enrich -> revert cannot reactivate a checker batch created before
   intervening external checker-input changes;
-- no reachable G12 code path invokes incremental indexing or can project a
-  checker batch from a different snapshot;
+- bounded source-only generations parse only changed files and report
+  unchanged-file reuse, while startup, reconciliation, branch/config/package,
+  large-batch, and uncertain generations use full refresh;
+- no refresh mode can project a checker batch from a different snapshot;
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;

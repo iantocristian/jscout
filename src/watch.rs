@@ -18,6 +18,7 @@ const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(30);
 const OPTIONAL_PHASE_POLL: Duration = Duration::from_millis(100);
 const STABLE_FAILURE_THRESHOLD: u8 = 3;
+const MAX_INCREMENTAL_SOURCE_PATHS: usize = 256;
 
 pub struct WatchOptions<'a> {
     pub database: Option<&'a Path>,
@@ -47,10 +48,57 @@ impl fmt::Display for Phase {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RefreshScope {
+    Incremental,
+    Full,
+}
+
+impl fmt::Display for RefreshScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Incremental => "incremental",
+            Self::Full => "full",
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirtySignal {
+    scope: RefreshScope,
+    reasons: BTreeSet<String>,
+    source_paths: BTreeSet<String>,
+}
+
+impl DirtySignal {
+    fn full(reason: impl Into<String>) -> Self {
+        Self {
+            scope: RefreshScope::Full,
+            reasons: [reason.into()].into(),
+            source_paths: BTreeSet::new(),
+        }
+    }
+
+    fn source(reason: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            scope: RefreshScope::Incremental,
+            reasons: [reason.into()].into(),
+            source_paths: [path.into()].into(),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.scope = self.scope.max(other.scope);
+        self.reasons.extend(other.reasons);
+        self.source_paths.extend(other.source_paths);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Work {
     generation: u64,
     phase: Phase,
+    refresh_scope: RefreshScope,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +131,8 @@ struct Coordinator {
     cycle_snapshot: Option<String>,
     cycle_degraded: bool,
     dirty_reasons: BTreeSet<String>,
+    dirty_source_paths: BTreeSet<String>,
+    refresh_scope: RefreshScope,
     debounce: Duration,
     retry_initial: Duration,
     retry_max: Duration,
@@ -105,18 +155,20 @@ impl Coordinator {
             cycle_snapshot: None,
             cycle_degraded: false,
             dirty_reasons: BTreeSet::new(),
+            dirty_source_paths: BTreeSet::new(),
+            refresh_scope: RefreshScope::Full,
             debounce,
             retry_initial: DEFAULT_RETRY_INITIAL,
             retry_max: DEFAULT_RETRY_MAX,
             embed,
             enrich,
         };
-        coordinator.mark_dirty(Duration::ZERO, "startup");
+        coordinator.mark_dirty(Duration::ZERO, DirtySignal::full("startup"));
         coordinator.refresh_immediate = true;
         coordinator
     }
 
-    fn mark_dirty(&mut self, now: Duration, reason: impl Into<String>) {
+    fn mark_dirty(&mut self, now: Duration, signal: DirtySignal) {
         let current_generation_has_work = self
             .active
             .is_some_and(|work| work.generation == self.desired_generation)
@@ -129,9 +181,33 @@ impl Coordinator {
         if self.desired_generation == self.completed_generation || current_generation_has_work {
             self.desired_generation += 1;
             self.dirty_reasons.clear();
+            self.dirty_source_paths.clear();
+            self.refresh_scope = RefreshScope::Incremental;
         }
         self.last_dirty_at = now;
-        self.dirty_reasons.insert(reason.into());
+        self.refresh_scope = self.refresh_scope.max(signal.scope);
+        self.dirty_reasons.extend(
+            signal
+                .reasons
+                .into_iter()
+                .filter(|reason| !reason.starts_with("source:")),
+        );
+        let mut source_overflow = false;
+        for path in signal.source_paths {
+            if self.dirty_source_paths.contains(&path) {
+                continue;
+            }
+            if self.dirty_source_paths.len() == MAX_INCREMENTAL_SOURCE_PATHS {
+                source_overflow = true;
+                continue;
+            }
+            self.dirty_reasons.insert(format!("source:{path}"));
+            self.dirty_source_paths.insert(path);
+        }
+        if source_overflow {
+            self.refresh_scope = RefreshScope::Full;
+            self.dirty_reasons.insert("mass-source-change".to_string());
+        }
         self.refresh_immediate = false;
         self.ready = None;
         self.retry = None;
@@ -142,7 +218,7 @@ impl Coordinator {
 
     fn mark_reconciliation(&mut self, now: Duration) {
         debug_assert!(self.is_clean());
-        self.mark_dirty(now, "periodic-reconciliation");
+        self.mark_dirty(now, DirtySignal::full("periodic-reconciliation"));
         self.refresh_immediate = true;
     }
 
@@ -184,6 +260,7 @@ impl Coordinator {
         let work = Work {
             generation: self.desired_generation,
             phase: Phase::Refresh,
+            refresh_scope: self.refresh_scope,
         };
         self.active = Some(work);
         Some(work)
@@ -286,11 +363,13 @@ impl Coordinator {
             self.ready = Some(Work {
                 generation: work.generation,
                 phase,
+                refresh_scope: work.refresh_scope,
             });
             FinishState::Continue
         } else {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
+            self.dirty_source_paths.clear();
             self.cycle_snapshot = None;
             let degraded = self.cycle_degraded;
             self.cycle_degraded = false;
@@ -340,18 +419,22 @@ impl EventClassifier {
         self.external_prefixes = prefixes;
     }
 
-    fn classify(&self, paths: &[PathBuf]) -> Option<String> {
+    fn classify(&self, paths: &[PathBuf]) -> Option<DirtySignal> {
         if paths.is_empty() {
-            return Some("unknown-event".into());
+            return Some(DirtySignal::full("unknown-event"));
         }
-        let mut saw_uncertain = false;
+        let mut signal = None;
         for path in paths {
             let path = self.absolute(path);
             if self.excluded.contains(&path) {
                 continue;
             }
             if self.git_controls.contains(&path) {
-                return Some(format!("git:{}", display_path(&self.root, &path)));
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::full(format!("git:{}", display_path(&self.root, &path))),
+                );
+                continue;
             }
             if self.external_exact.contains(&path)
                 || self
@@ -359,13 +442,33 @@ impl EventClassifier {
                     .iter()
                     .any(|prefix| path.starts_with(prefix))
             {
-                return Some(format!("external:{}", path.display()));
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::full(format!("external:{}", path.display())),
+                );
+                continue;
             }
             if is_noise(&path) {
                 continue;
             }
-            if is_relevant(&path) {
-                return Some(format!("source:{}", display_path(&self.root, &path)));
+            if is_refresh_boundary(&path) {
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::full(format!("boundary:{}", display_path(&self.root, &path))),
+                );
+                continue;
+            }
+            if path.is_dir() {
+                merge_signal(&mut signal, DirtySignal::full("unknown-directory-event"));
+                continue;
+            }
+            if walk::is_indexable(&path) {
+                let relative = display_path(&self.root, &path);
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::source(format!("source:{relative}"), relative),
+                );
+                continue;
             }
             // Existing regular files with irrelevant extensions are ordinary
             // repository noise (README edits, Finder metadata, and similar).
@@ -373,10 +476,10 @@ impl EventClassifier {
             // backend may be reporting a delete, rename, or rescan without
             // enough type information to classify it safely.
             if !path.is_file() {
-                saw_uncertain = true;
+                merge_signal(&mut signal, DirtySignal::full("unknown-event"));
             }
         }
-        saw_uncertain.then(|| "unknown-event".into())
+        signal
     }
 
     fn absolute(&self, path: &Path) -> PathBuf {
@@ -385,6 +488,13 @@ impl EventClassifier {
         } else {
             self.root.join(path)
         }
+    }
+}
+
+fn merge_signal(target: &mut Option<DirtySignal>, signal: DirtySignal) {
+    match target {
+        Some(target) => target.merge(signal),
+        None => *target = Some(signal),
     }
 }
 
@@ -551,9 +661,10 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         if let Some(work) = coordinator.next_work(started.elapsed()) {
             let phase_started = Instant::now();
             eprintln!(
-                "watch generation={} phase={} status=started reasons={}",
+                "watch generation={} phase={} refresh_scope={} status=started reasons={}",
                 work.generation,
                 work.phase,
+                work.refresh_scope,
                 coordinator
                     .dirty_reasons
                     .iter()
@@ -562,70 +673,86 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     .join(",")
             );
             match work.phase {
-                Phase::Refresh => match run_refresh(&root, &database, options.dependencies) {
-                    Ok(result) => {
-                        indexer::report_failures(&result.outcome);
-                        eprintln!(
-                            "watch generation={} phase=refresh status={} snapshot={} indexed={} failed={} chunks={} refs={} elapsed_ms={}",
-                            work.generation,
-                            if result.outcome.failed == 0 {
-                                "succeeded"
-                            } else {
-                                "partial"
-                            },
-                            result.snapshot,
-                            result.outcome.indexed,
-                            result.outcome.failed,
-                            result.outcome.chunks,
-                            result.outcome.refs,
-                            phase_started.elapsed().as_millis()
-                        );
-                        let previous_targets = targets.clone();
-                        targets = collect_watch_targets(&root, &database).unwrap_or_else(|error| {
-                            eprintln!("watch coverage status=read-failed error={error:#}");
-                            git_watch_targets(&root)
-                        });
-                        if options.enrich_on_change {
-                            targets.extend(
-                                previous_targets
-                                    .into_iter()
-                                    .filter(|target| target.source == TargetSource::Checker),
-                            );
-                            normalize_targets(&mut targets);
-                        }
-                        targets.extend(selector_watch_targets(&root, options.dependencies));
-                        normalize_targets(&mut targets);
-                        update_classifier_targets(&mut classifier, &targets);
-                        registry.reconcile(&mut watcher, &root, &targets);
-                        drain_events(&receiver, &classifier, &mut coordinator, started.elapsed());
-                        report_finish(
-                            work,
-                            coordinator.finish_refresh(
-                                started.elapsed(),
-                                work,
+                Phase::Refresh => {
+                    match run_refresh(&root, &database, options.dependencies, work.refresh_scope) {
+                        Ok(result) => {
+                            indexer::report_failures(&result.outcome);
+                            eprintln!(
+                                "watch generation={} phase=refresh refresh_scope={} status={} snapshot={} indexed={} unchanged={} removed={} failed={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
+                                work.generation,
+                                work.refresh_scope,
+                                if result.outcome.failed == 0 {
+                                    "succeeded"
+                                } else {
+                                    "partial"
+                                },
                                 result.snapshot,
-                                result.failure_fingerprint,
-                            ),
-                            started.elapsed(),
-                            options.reconcile_interval,
-                            &mut next_reconcile,
-                        );
+                                result.outcome.indexed,
+                                result.outcome.unchanged,
+                                result.outcome.removed,
+                                result.outcome.failed,
+                                result.outcome.chunks,
+                                result.outcome.refs,
+                                if result.outcome.projection_rebuilt {
+                                    "rebuilt"
+                                } else {
+                                    "reused"
+                                },
+                                phase_started.elapsed().as_millis()
+                            );
+                            let previous_targets = targets.clone();
+                            targets =
+                                collect_watch_targets(&root, &database).unwrap_or_else(|error| {
+                                    eprintln!("watch coverage status=read-failed error={error:#}");
+                                    git_watch_targets(&root)
+                                });
+                            if options.enrich_on_change {
+                                targets.extend(
+                                    previous_targets
+                                        .into_iter()
+                                        .filter(|target| target.source == TargetSource::Checker),
+                                );
+                                normalize_targets(&mut targets);
+                            }
+                            targets.extend(selector_watch_targets(&root, options.dependencies));
+                            normalize_targets(&mut targets);
+                            update_classifier_targets(&mut classifier, &targets);
+                            registry.reconcile(&mut watcher, &root, &targets);
+                            drain_events(
+                                &receiver,
+                                &classifier,
+                                &mut coordinator,
+                                started.elapsed(),
+                            );
+                            report_finish(
+                                work,
+                                coordinator.finish_refresh(
+                                    started.elapsed(),
+                                    work,
+                                    result.snapshot,
+                                    result.failure_fingerprint,
+                                ),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "watch generation={} phase=refresh status=failed elapsed_ms={} error={error:#}",
+                                work.generation,
+                                phase_started.elapsed().as_millis()
+                            );
+                            report_finish(
+                                work,
+                                coordinator.finish_error(started.elapsed(), work),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
+                        }
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "watch generation={} phase=refresh status=failed elapsed_ms={} error={error:#}",
-                            work.generation,
-                            phase_started.elapsed().as_millis()
-                        );
-                        report_finish(
-                            work,
-                            coordinator.finish_error(started.elapsed(), work),
-                            started.elapsed(),
-                            options.reconcile_interval,
-                            &mut next_reconcile,
-                        );
-                    }
-                },
+                }
                 Phase::Embed => {
                     let provider = Arc::clone(provider.as_ref().expect("provider validated"));
                     let result = {
@@ -781,16 +908,23 @@ fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
     Ok(())
 }
 
-fn run_refresh(root: &Path, database: &Path, dependencies: &[String]) -> Result<RefreshResult> {
+fn run_refresh(
+    root: &Path,
+    database: &Path,
+    dependencies: &[String],
+    scope: RefreshScope,
+) -> Result<RefreshResult> {
     let conn = open_phase_database(root, database)?;
-    let outcome = indexer::refresh_repo_with_options(
-        root,
-        &conn,
-        &indexer::IndexOptions {
-            dependencies: dependencies.to_vec(),
-            ..Default::default()
-        },
-    )?;
+    let options = indexer::IndexOptions {
+        dependencies: dependencies.to_vec(),
+        ..Default::default()
+    };
+    let outcome = match scope {
+        RefreshScope::Incremental => {
+            indexer::incremental_refresh_repo_with_options(root, &conn, &options)?
+        }
+        RefreshScope::Full => indexer::refresh_repo_with_options(root, &conn, &options)?,
+    };
     let snapshot = structural::current_snapshot(&conn)?;
     let failure_fingerprint = failure_fingerprint(&outcome);
     Ok(RefreshResult {
@@ -905,12 +1039,12 @@ fn ingest_event(
     coordinator: &mut Coordinator,
     now: Duration,
 ) {
-    let reason = match event {
+    let signal = match event {
         Ok(event) => classifier.classify(&event.paths),
-        Err(error) => Some(format!("watch-error:{error}")),
+        Err(error) => Some(DirtySignal::full(format!("watch-error:{error}"))),
     };
-    if let Some(reason) = reason {
-        coordinator.mark_dirty(now, reason);
+    if let Some(signal) = signal {
+        coordinator.mark_dirty(now, signal);
     }
 }
 
@@ -1001,17 +1135,16 @@ fn failure_fingerprint(outcome: &indexer::IndexOutcome) -> Option<String> {
     )
 }
 
-/// Paths that change extraction, module resolution, or checker ownership.
-fn is_relevant(path: &Path) -> bool {
-    if walk::is_indexable(path) {
-        return true;
-    }
+/// Paths whose changes can alter source discovery, package ownership, module
+/// resolution, dependency selection, or checker project ownership.
+fn is_refresh_boundary(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     matches!(
         name,
         "package.json"
+            | "pnpm-workspace.yaml"
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
@@ -1019,6 +1152,8 @@ fn is_relevant(path: &Path) -> bool {
             | "bun.lockb"
             | "tsconfig.json"
             | "jsconfig.json"
+            | ".gitignore"
+            | ".ignore"
             | ".gitmodules"
     ) || (name.starts_with("tsconfig.") && name.ends_with(".json"))
         || (name.starts_with("jsconfig.") && name.ends_with(".json"))
@@ -1195,12 +1330,17 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        Coordinator, EventClassifier, FinishState, Phase, WatchOptions, is_noise, is_relevant,
-        run_refresh, validate_options,
+        Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS,
+        Phase, RefreshScope, WatchOptions, is_noise, is_refresh_boundary, run_refresh,
+        validate_options,
     };
 
     fn seconds(value: u64) -> Duration {
         Duration::from_secs(value)
+    }
+
+    fn source_signal(path: &str) -> DirtySignal {
+        DirtySignal::source(format!("source:{path}"), path)
     }
 
     #[test]
@@ -1208,6 +1348,7 @@ mod tests {
         let mut coordinator = Coordinator::new(seconds(2), true, true);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(refresh.phase, Phase::Refresh);
+        assert_eq!(refresh.refresh_scope, RefreshScope::Full);
         assert_eq!(
             coordinator.finish_refresh(Duration::ZERO, refresh, "s1".into(), None),
             FinishState::Continue
@@ -1227,7 +1368,7 @@ mod tests {
     fn an_event_during_refresh_supersedes_optional_work_and_debounces_again() {
         let mut coordinator = Coordinator::new(seconds(2), true, true);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
-        coordinator.mark_dirty(seconds(1), "source:a.ts");
+        coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
         assert_eq!(
             coordinator.finish_refresh(seconds(1), refresh, "s1".into(), None),
             FinishState::Superseded
@@ -1236,6 +1377,7 @@ mod tests {
         let next = coordinator.next_work(seconds(3)).expect("next refresh");
         assert_eq!(next.generation, 2);
         assert_eq!(next.phase, Phase::Refresh);
+        assert_eq!(next.refresh_scope, RefreshScope::Incremental);
     }
 
     #[test]
@@ -1324,7 +1466,7 @@ mod tests {
             }
         }
 
-        coordinator.mark_dirty(now, "source:still-unreadable.ts");
+        coordinator.mark_dirty(now, source_signal("still-unreadable.ts"));
         now = now.saturating_add(Duration::from_millis(100));
         let work = coordinator.next_work(now).expect("next generation");
         assert_eq!(
@@ -1353,22 +1495,71 @@ mod tests {
             .next_work(seconds(10))
             .expect("immediate reconciliation");
         assert_eq!(refresh.generation, 2);
+        assert_eq!(refresh.refresh_scope, RefreshScope::Full);
     }
 
     #[test]
     fn events_coalesce_into_one_successor_generation_and_drop_old_reasons() {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
-        coordinator.mark_dirty(seconds(1), "source:a.ts");
-        coordinator.mark_dirty(seconds(2), "source:b.ts");
+        coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
+        coordinator.mark_dirty(seconds(2), source_signal("b.ts"));
         assert_eq!(coordinator.desired_generation, 2);
         assert_eq!(
             coordinator.dirty_reasons,
             ["source:a.ts".to_string(), "source:b.ts".to_string()].into()
         );
+        assert_eq!(coordinator.refresh_scope, RefreshScope::Incremental);
         assert_eq!(
             coordinator.finish_refresh(seconds(2), startup, "old".into(), None),
             FinishState::Superseded
+        );
+    }
+
+    #[test]
+    fn a_full_refresh_signal_is_sticky_within_the_generation() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(
+            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            FinishState::Complete { degraded: false }
+        );
+
+        coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
+        coordinator.mark_dirty(seconds(2), DirtySignal::full("boundary:package.json"));
+        coordinator.mark_dirty(seconds(3), source_signal("b.ts"));
+
+        let work = coordinator.next_work(seconds(5)).expect("refresh");
+        assert_eq!(work.refresh_scope, RefreshScope::Full);
+        assert_eq!(
+            coordinator.dirty_source_paths,
+            ["a.ts".to_string(), "b.ts".to_string()].into()
+        );
+        assert!(coordinator.dirty_reasons.contains("source:a.ts"));
+        assert!(coordinator.dirty_reasons.contains("source:b.ts"));
+        assert!(coordinator.dirty_reasons.contains("boundary:package.json"));
+    }
+
+    #[test]
+    fn a_large_source_batch_promotes_to_full_refresh() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(
+            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            FinishState::Complete { degraded: false }
+        );
+
+        for index in 0..=MAX_INCREMENTAL_SOURCE_PATHS {
+            let path = format!("src/file-{index}.ts");
+            coordinator.mark_dirty(seconds(1), source_signal(&path));
+        }
+
+        let work = coordinator.next_work(seconds(3)).expect("refresh");
+        assert_eq!(work.refresh_scope, RefreshScope::Full);
+        assert!(coordinator.dirty_reasons.contains("mass-source-change"));
+        assert_eq!(
+            coordinator.dirty_source_paths.len(),
+            MAX_INCREMENTAL_SOURCE_PATHS
         );
     }
 
@@ -1386,7 +1577,7 @@ mod tests {
         assert!(
             classifier
                 .classify(&[root.join(".jscout-notes.ts")])
-                .is_some()
+                .is_some_and(|signal| signal.scope == RefreshScope::Incremental)
         );
     }
 
@@ -1399,7 +1590,7 @@ mod tests {
         assert!(
             classifier
                 .classify(&[dependency.join("index.js")])
-                .is_some()
+                .is_some_and(|signal| signal.scope == RefreshScope::Full)
         );
         assert!(
             classifier
@@ -1409,14 +1600,42 @@ mod tests {
     }
 
     #[test]
-    fn lockfiles_configs_and_declarations_trigger_reconciliation() {
-        assert!(is_relevant(Path::new("pnpm-lock.yaml")));
-        assert!(is_relevant(Path::new("package-lock.json")));
-        assert!(is_relevant(Path::new("yarn.lock")));
-        assert!(is_relevant(Path::new("tsconfig.server.json")));
-        assert!(is_relevant(Path::new("types/ambient.d.ts")));
+    fn a_refresh_boundary_dominates_source_paths_in_one_event() {
+        let root = PathBuf::from("/repo");
+        let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+
+        let signal = classifier
+            .classify(&[root.join("src/main.ts"), root.join("package.json")])
+            .expect("relevant event");
+
+        assert_eq!(signal.scope, RefreshScope::Full);
+        assert!(signal.reasons.contains("source:src/main.ts"));
+        assert!(signal.reasons.contains("boundary:package.json"));
+    }
+
+    #[test]
+    fn lockfiles_and_configs_are_full_refresh_boundaries() {
+        assert!(is_refresh_boundary(Path::new("pnpm-lock.yaml")));
+        assert!(is_refresh_boundary(Path::new("pnpm-workspace.yaml")));
+        assert!(is_refresh_boundary(Path::new("package-lock.json")));
+        assert!(is_refresh_boundary(Path::new("yarn.lock")));
+        assert!(is_refresh_boundary(Path::new("tsconfig.server.json")));
+        assert!(is_refresh_boundary(Path::new("types/ambient.d.ts")));
+        assert!(is_refresh_boundary(Path::new(".gitignore")));
+        assert!(is_refresh_boundary(Path::new(".ignore")));
         assert!(is_noise(Path::new("node_modules/dep/index.js")));
         assert!(!is_noise(Path::new("pnpm-lock.yaml")));
+
+        let root = PathBuf::from("/repo");
+        let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+        for boundary in [".gitignore", ".ignore", "pnpm-workspace.yaml"] {
+            assert!(
+                classifier
+                    .classify(&[root.join(boundary)])
+                    .is_some_and(|signal| signal.scope == RefreshScope::Full),
+                "{boundary} must force a full refresh"
+            );
+        }
     }
 
     #[test]
@@ -1446,11 +1665,11 @@ mod tests {
         );
         assert_eq!(
             classifier.classify(&[root.path().join("renamed-directory")]),
-            Some("unknown-event".into())
+            Some(DirtySignal::full("unknown-directory-event"))
         );
         assert_eq!(
             classifier.classify(&[root.path().join("deleted-unknown-file")]),
-            Some("unknown-event".into())
+            Some(DirtySignal::full("unknown-event"))
         );
         Ok(())
     }
@@ -1476,18 +1695,39 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
         let database = directory.path().join("watch.db");
-        let first = run_refresh(directory.path(), &database, &[])?;
+        let first = run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
         assert_eq!(first.outcome.indexed, 1);
         fs::remove_file(directory.path().join("a.ts"))?;
         fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
-        let second = run_refresh(directory.path(), &database, &[])?;
+        let second = run_refresh(directory.path(), &database, &[], RefreshScope::Incremental)?;
         assert_eq!(second.outcome.indexed, 1);
+        assert_eq!(second.outcome.removed, 1);
         let conn = crate::store::open_path_read_only(&database)?;
         let paths = conn
             .prepare("SELECT path FROM files ORDER BY path")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(paths, vec!["b.ts"]);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_refresh_reuses_unchanged_source_rows() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
+        fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
+        let database = directory.path().join("watch.db");
+        run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
+
+        fs::write(directory.path().join("a.ts"), "export const a = 3;\n")?;
+        let refreshed = run_refresh(directory.path(), &database, &[], RefreshScope::Incremental)?;
+
+        assert_eq!(
+            (refreshed.outcome.indexed, refreshed.outcome.unchanged),
+            (1, 1)
+        );
+        assert_eq!(refreshed.outcome.removed, 0);
+        assert!(refreshed.outcome.projection_rebuilt);
         Ok(())
     }
 }

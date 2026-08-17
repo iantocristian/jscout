@@ -961,9 +961,9 @@ pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Keep checker facts only when a full extraction rebuild reproduced their
-/// exact structural snapshot. The snapshot marker is still absent here, so a
-/// failed projection cannot expose either retained or stale checker edges.
+/// Keep checker facts only when extraction reproduced their exact structural
+/// snapshot. The snapshot marker is still absent here, so a failed projection
+/// cannot expose either retained or stale checker edges.
 pub(crate) fn retain_checker_batches_for_snapshot(conn: &Connection, snapshot: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM checker_enrichment_batches WHERE source_snapshot != ?1",
