@@ -1577,9 +1577,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
             ..Default::default()
         },
     )?;
-    // `jscout index` and every watcher generation are full snapshot refreshes,
-    // so an "unchanged" count would always read 0 and misreport the rebuild as
-    // failed change detection.
+    // Manual `jscout index` is always a full snapshot refresh, so an
+    // "unchanged" count would always read 0 and misreport the rebuild as failed
+    // change detection. Watch reports reuse for its incremental generations.
     println!(
         "indexed {} files ({} failed) — {} chunks, {} refs in {:?}",
         o.indexed,

@@ -351,35 +351,43 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 /// projection identity.
 pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-resolution-hash-v1\0");
+    hasher.update(b"jscout-resolution-hash-v2\0");
     let mut stmt = conn.prepare(
-        "SELECT from_file, request, COALESCE(to_file, -1),
-                COALESCE(package, ''), COALESCE(resolution, ''),
-                COALESCE(package_instance_id, -1), type_only
-         FROM module_edges ORDER BY from_file, request",
+        "SELECT source.path, edge.request, COALESCE(target.path, ''),
+                COALESCE(edge.package, ''), COALESCE(edge.resolution, ''),
+                COALESCE(package.canonical_root, ''), edge.type_only
+         FROM module_edges edge
+         JOIN files source ON source.id=edge.from_file
+         LEFT JOIN files target ON target.id=edge.to_file
+         LEFT JOIN package_instances package ON package.id=edge.package_instance_id
+         ORDER BY source.path, edge.request, COALESCE(target.path, ''),
+                  COALESCE(edge.package, ''), COALESCE(edge.resolution, ''),
+                  COALESCE(package.canonical_root, ''), edge.type_only",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i64>(0)?,
+            row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
+            row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)?,
+            row.get::<_, String>(5)?,
             row.get::<_, i64>(6)?,
         ))
     })?;
     for row in rows {
-        let (from_file, request, to_file, package, resolution, package_instance, type_only) = row?;
-        hasher.update(b"\0");
-        hasher.update(from_file.to_le_bytes().as_slice());
-        hasher.update(request.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(to_file.to_le_bytes().as_slice());
-        hasher.update(package.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(resolution.as_bytes());
-        hasher.update(package_instance.to_le_bytes().as_slice());
+        let (source, request, target, package, resolution, package_root, type_only) = row?;
+        for value in [
+            source.as_str(),
+            request.as_str(),
+            target.as_str(),
+            package.as_str(),
+            resolution.as_str(),
+            package_root.as_str(),
+        ] {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
         hasher.update(type_only.to_le_bytes().as_slice());
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -5004,7 +5012,7 @@ mod tests {
     /// project fragments. A structural snapshot change suppresses the entire
     /// old batch until enrichment publishes a batch for the new snapshot.
     #[test]
-    fn checker_batch_is_inert_after_snapshot_changes() -> Result<()> {
+    fn checker_batch_is_removed_after_snapshot_changes() -> Result<()> {
         let repo = tempfile::tempdir()?;
         write(
             repo.path(),
@@ -5153,8 +5161,8 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(
-            retained, 2,
-            "incremental watch may retain inert facts until the next full refresh"
+            retained, 0,
+            "every refresh mode retires checker facts from an older snapshot"
         );
         Ok(())
     }
