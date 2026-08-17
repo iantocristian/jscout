@@ -93,9 +93,11 @@ jscout watch <root> [--embed] [--enrich]
                                #   --database PATH isolates index/memory state
                                #   --debounce-ms 2000 waits for a trailing quiet point
                                #   --reconcile-seconds 600 recovers missed notifications
-jscout embed <root>            # embed chunks missing embeddings (cached by content hash)
+jscout embed <root>            # embed code chunks missing embeddings (cached by content hash)
                                #   --database PATH writes an isolated index
   --product                    #   fresh runtime recon + neutral production fallback only
+  --semantic                   #   also embed current generated/agent semantic artifacts
+  --semantic-only              #   update only the semantic-artifact vector index
 jscout inference serve         # run the optional local embedding/reranking service
 jscout inference doctor        # verify its endpoint, device, models, and dimensions
 jscout entities <root> [query] # runtime, contract, route, config, data, flag, host entities
@@ -505,10 +507,38 @@ longer resolves is reported and skipped without blocking other refreshes.
 ## Semantic retrieval
 
 `jscout memory` and the structural-profile MCP `semantic_memory` tool query
-persistent memory independently of BM25/vector code ranking. They filter by
-artifact type, computed freshness, exact evidence anchor, direct relation, or
-historical artifact id. Current artifacts are the default; an exact historical
-id reports `current: false` and its `superseded_by` successor.
+persistent memory through a vector-plus-lexical ranking plane separate from
+code-chunk ranking. Semantic vectors are content-addressed by the bounded
+artifact description and exact support anchors; create or refresh them after
+workflow/card/summary/concept generation with
+`JSCOUT_EMBED_PROVIDER=local jscout embed <root> --semantic-only`. Without a
+materialized semantic index, retrieval reports `vector: degraded` and falls
+back to lexical matching. `--no-vector` (MCP: `vector=false`) requests lexical
+matching explicitly.
+
+Memory retrieval filters by artifact type, computed freshness, exact evidence
+anchor, direct relation, or historical artifact id. Current artifacts are the
+default; an exact historical id reports `current: false` and its
+`superseded_by` successor.
+
+`semantic_search` attaches only compact memory previews: artifact identity, a
+short purpose/overview/description/claim, freshness, retrieval signals, and one
+evidence locator. Full bodies, relations, and evidence belong to
+`semantic_memory`.
+Annotations preview their required `claim` field. The envelope reports the
+bounded `candidate_pool`, previews `selected` before the response budget,
+actual `returned`, and `budget_omitted`; the pool is not a count of relevant
+matches. Per-artifact rank, lexical-score, and vector-cosine values are
+diagnostic signals, not calibrated probabilities. A degraded vector status and
+the follow-up tool remain visible when memory exists even if the query has no
+lexical matches; the envelope also survives when the byte budget removes every
+selected preview.
+
+When an interactive `annotate` call starts with a healthy semantic vector
+index, jscout embeds the new document and incrementally synchronizes that
+profile after committing the artifact. A failed refresh does not roll back or
+duplicate the durable annotation; the response reports the degraded vector
+plane and its repair action. Batch scouts still embed once after publication.
 
 When the selected results include current, fresh concepts, the response also
 contains deterministic `concept_tags`: deduplicated file-level associations

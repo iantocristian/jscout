@@ -7,6 +7,7 @@ const DEFAULT_LOCAL_DEADLINE_MS: u64 = 120_000;
 /// The document representation is part of cache identity. Versioning it keeps
 /// vectors produced from an older representation from being silently reused.
 const DOCUMENT_TEXT_FORMAT: &str = "content-v2";
+const SEMANTIC_DOCUMENT_TEXT_FORMAT: &str = "semantic-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Protocol {
@@ -39,6 +40,83 @@ struct ProfileSpec {
 pub struct ResolvedProfile {
     pub id: i64,
     pub dimensions: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VectorFailureKind {
+    Inference,
+    Index,
+}
+
+#[derive(Debug)]
+struct VectorFailure {
+    plane: &'static str,
+    kind: VectorFailureKind,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for VectorFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            VectorFailureKind::Inference => {
+                write!(
+                    formatter,
+                    "{} embedding service unavailable: {}",
+                    self.plane, self.source
+                )
+            }
+            VectorFailureKind::Index => {
+                write!(
+                    formatter,
+                    "{} vector index unavailable: {}",
+                    self.plane, self.source
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VectorFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn vector_failure(
+    plane: &'static str,
+    kind: VectorFailureKind,
+    source: anyhow::Error,
+) -> anyhow::Error {
+    VectorFailure {
+        plane,
+        kind,
+        source,
+    }
+    .into()
+}
+
+fn vector_failure_action(error: &anyhow::Error, index_action: &'static str) -> &'static str {
+    match error
+        .downcast_ref::<VectorFailure>()
+        .map(|failure| failure.kind)
+    {
+        Some(VectorFailureKind::Inference) => {
+            "start or repair the configured embedding service, then retry"
+        }
+        _ => index_action,
+    }
+}
+
+fn semantic_vector_failure(kind: VectorFailureKind, source: anyhow::Error) -> anyhow::Error {
+    vector_failure("semantic", kind, source)
+}
+
+pub(crate) fn semantic_vector_failure_action(error: &anyhow::Error) -> &'static str {
+    vector_failure_action(error, "run jscout embed <root> --semantic-only")
+}
+
+pub(crate) fn code_vector_failure_action(error: &anyhow::Error) -> &'static str {
+    vector_failure_action(error, "run jscout embed <root>")
 }
 
 struct EmbeddingResponse {
@@ -407,6 +485,88 @@ struct MissingEmbeddingDocument {
     content: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SemanticEmbeddingDocument {
+    artifact_id: i64,
+    document_hash: String,
+    content: String,
+}
+
+fn semantic_embedding_documents(conn: &Connection) -> Result<Vec<SemanticEmbeddingDocument>> {
+    let mut statement = conn.prepare(
+        "SELECT artifact.id, artifact.artifact_type, artifact.canonical_name,
+                artifact.body_json,
+                COALESCE((
+                  SELECT group_concat(anchor_key, char(10)) FROM (
+                    SELECT DISTINCT support.anchor_key AS anchor_key
+                    FROM semantic_supports support
+                    WHERE support.artifact_id=artifact.id
+                    ORDER BY support.anchor_key
+                  )
+                ), '')
+         FROM semantic_artifacts artifact
+         WHERE NOT EXISTS(
+           SELECT 1 FROM semantic_artifacts successor
+           WHERE successor.supersedes_artifact_id=artifact.id
+         )
+         ORDER BY artifact.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut documents = Vec::new();
+    for row in rows {
+        let (artifact_id, artifact_type, name, body_json, anchors) = row?;
+        // Put the stable identity and evidence vocabulary before generated
+        // prose. Large workflow bodies are bounded below, so placing anchors
+        // last would systematically truncate the most useful bridge back to
+        // code.
+        let content = embed_text(&format!(
+            "semantic artifact\ntype: {artifact_type}\nname: {}\nanchors:\n{anchors}\nbody: {body_json}",
+            name.as_deref().unwrap_or_default()
+        ));
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SEMANTIC_DOCUMENT_TEXT_FORMAT.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(content.as_bytes());
+        documents.push(SemanticEmbeddingDocument {
+            artifact_id,
+            document_hash: hasher.finalize().to_hex().to_string(),
+            content,
+        });
+    }
+    Ok(documents)
+}
+
+fn missing_semantic_documents(
+    conn: &Connection,
+    profile_id: Option<i64>,
+    documents: &[SemanticEmbeddingDocument],
+) -> Result<Vec<SemanticEmbeddingDocument>> {
+    let cached = if let Some(profile_id) = profile_id {
+        let mut statement =
+            conn.prepare("SELECT document_hash FROM semantic_embeddings WHERE profile_id=?1")?;
+        let rows = statement.query_map([profile_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()?
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut seen = std::collections::HashSet::new();
+    Ok(documents
+        .iter()
+        .filter(|document| {
+            !cached.contains(&document.document_hash) && seen.insert(document.document_hash.clone())
+        })
+        .cloned()
+        .collect())
+}
+
 fn missing_embedding_documents(
     conn: &Connection,
     profile_fingerprint: &str,
@@ -590,6 +750,78 @@ fn embed_missing_for_selection_interruptible(
     Ok((done, total, false))
 }
 
+/// Embed current, non-superseded semantic artifacts and materialize their
+/// sqlite-vec occurrence index. The durable cache is keyed by the exact
+/// bounded semantic document, not by artifact id, so an unchanged generated
+/// explanation can reuse its vector after a disposable source reindex.
+pub fn embed_semantic_missing(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+) -> Result<(usize, usize)> {
+    if batch_size == 0 {
+        bail!("embedding batch size must be positive");
+    }
+    let profile = provider.profile()?;
+    let mut resolved = existing_profile(conn, &profile)?;
+    let documents = semantic_embedding_documents(conn)?;
+    let rows = missing_semantic_documents(
+        conn,
+        resolved.as_ref().map(|profile| profile.id),
+        &documents,
+    )?;
+    let total = rows.len();
+    let mut done = 0usize;
+    let request_batch_size = if provider.protocol == Protocol::Local {
+        batch_size.min(16)
+    } else {
+        batch_size
+    };
+    for batch in rows.chunks(request_batch_size) {
+        let texts = batch
+            .iter()
+            .map(|document| document.content.clone())
+            .collect::<Vec<_>>();
+        let response = provider.embed_documents(&texts)?;
+        validate_response_profile(&profile, &response)?;
+        let dimensions = response.vectors[0].len();
+        let current = ensure_profile(conn, &profile, dimensions)?;
+        if let Some(previous) = &resolved
+            && previous.id != current.id
+        {
+            bail!("embedding profile changed during one semantic embed operation");
+        }
+        resolved = Some(current.clone());
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let write_result = (|| -> Result<()> {
+            for (document, vector) in batch.iter().zip(&response.vectors) {
+                if vector.len() != current.dimensions {
+                    bail!("embedding dimensions changed during one response");
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO semantic_embeddings(document_hash, profile_id, vec)
+                     VALUES(?1, ?2, ?3)",
+                    params![document.document_hash, current.id, vec_to_blob(vector)],
+                )?;
+            }
+            Ok(())
+        })();
+        match write_result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        done += batch.len();
+        eprintln!("embedded semantic memory {done}/{total}");
+    }
+    if let Some(profile) = resolved {
+        sync_semantic_vector_index(conn, &profile, &documents)?;
+    }
+    Ok((done, total))
+}
+
 fn existing_profile(conn: &Connection, profile: &ProfileSpec) -> Result<Option<ResolvedProfile>> {
     let exact = conn
         .query_row(
@@ -706,6 +938,145 @@ fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
          );"
     ))?;
     Ok(table)
+}
+
+fn semantic_vector_table(dimensions: usize) -> Result<String> {
+    if dimensions == 0 || dimensions > 8_192 {
+        bail!("unsupported embedding dimensions: {dimensions}");
+    }
+    Ok(format!("vec_semantic_embeddings_{dimensions}"))
+}
+
+fn ensure_semantic_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
+    let table = semantic_vector_table(dimensions)?;
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
+           embedding FLOAT[{dimensions}] distance_metric=cosine,
+           profile_id INTEGER PARTITION KEY
+         );"
+    ))?;
+    Ok(table)
+}
+
+fn semantic_vector_sync_key(profile_id: i64) -> String {
+    format!("semantic_embedding_index_synced_v1:{profile_id}")
+}
+
+pub(crate) fn mark_semantic_vector_index_stale(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE 'semantic_embedding_index_synced_v1:%'",
+        [],
+    )?;
+    Ok(())
+}
+
+fn sync_semantic_vector_index(
+    conn: &Connection,
+    profile: &ResolvedProfile,
+    documents: &[SemanticEmbeddingDocument],
+) -> Result<()> {
+    let table = ensure_semantic_vector_table(conn, profile.dimensions)?;
+    let current = documents
+        .iter()
+        .map(|document| (document.artifact_id, document.document_hash.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    conn.execute_batch("SAVEPOINT jscout_semantic_vector_sync")?;
+    let result = (|| -> Result<()> {
+        let indexed = {
+            let mut statement = conn.prepare(
+                "SELECT id, artifact_id, document_hash
+                 FROM semantic_embedding_index_entries
+                 WHERE profile_id=?1",
+            )?;
+            let rows = statement.query_map([profile.id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (row_id, artifact_id, document_hash) in indexed {
+            if current.get(&artifact_id).copied() != Some(document_hash.as_str()) {
+                conn.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [row_id])?;
+                conn.execute(
+                    "DELETE FROM semantic_embedding_index_entries WHERE id=?1",
+                    [row_id],
+                )?;
+            }
+        }
+
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE profile_id=?1
+                   AND rowid NOT IN (
+                     SELECT id FROM semantic_embedding_index_entries WHERE profile_id=?1
+                   )"
+            ),
+            [profile.id],
+        )?;
+
+        for document in documents {
+            let vector: Vec<u8> = conn.query_row(
+                "SELECT vec FROM semantic_embeddings
+                 WHERE document_hash=?1 AND profile_id=?2",
+                params![document.document_hash, profile.id],
+                |row| row.get(0),
+            )?;
+            let row_id = match conn
+                .query_row(
+                    "SELECT id FROM semantic_embedding_index_entries
+                     WHERE artifact_id=?1 AND profile_id=?2",
+                    params![document.artifact_id, profile.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                Some(row_id) => row_id,
+                None => {
+                    conn.execute(
+                        "INSERT INTO semantic_embedding_index_entries(
+                           artifact_id, profile_id, document_hash
+                         ) VALUES(?1, ?2, ?3)",
+                        params![document.artifact_id, profile.id, document.document_hash],
+                    )?;
+                    conn.last_insert_rowid()
+                }
+            };
+            let virtual_exists = conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE rowid=?1)"),
+                [row_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !virtual_exists {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table}(rowid, embedding, profile_id)
+                         VALUES(?1, ?2, ?3)"
+                    ),
+                    params![row_id, vector, profile.id],
+                )?;
+            }
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [semantic_vector_sync_key(profile.id)],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_semantic_vector_sync")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_semantic_vector_sync; RELEASE jscout_semantic_vector_sync",
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result<()> {
@@ -920,6 +1291,157 @@ fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<Resolve
     Ok(profile)
 }
 
+fn semantic_vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+        [semantic_vector_sync_key(profile_id)],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
+fn ready_semantic_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<ResolvedProfile> {
+    let profile = existing_profile(conn, spec)?.with_context(|| {
+        format!(
+            "embedding profile `{}` is not materialized; run `jscout embed <root> --semantic`",
+            spec.model
+        )
+    })?;
+    if semantic_vector_index_needs_sync(conn, profile.id)? {
+        bail!("semantic vector index is not ready; run `jscout embed <root> --semantic`")
+    }
+    let table = semantic_vector_table(profile.dimensions)?;
+    let table_exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [&table],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !table_exists {
+        bail!("semantic vector index table is missing; run `jscout embed <root> --semantic`")
+    }
+    if semantic_vector_index_has_gaps(conn, profile.id, &table)? {
+        bail!(
+            "semantic vector index is incomplete; run `jscout embed <root> --semantic` to repair it"
+        )
+    }
+    Ok(profile)
+}
+
+/// Check whether one configured profile can be topped up after an interactive
+/// annotation. This does not create tables or repair rows; callers use it
+/// before the write so a repository without semantic vectors does not trigger
+/// an unexpected full-corpus embed.
+pub fn semantic_vector_index_ready(conn: &Connection, provider: &Provider) -> Result<bool> {
+    let spec = provider
+        .profile()
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let Some(profile) = existing_profile(conn, &spec)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?
+    else {
+        return Ok(false);
+    };
+    if semantic_vector_index_needs_sync(conn, profile.id)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?
+    {
+        return Ok(false);
+    }
+    let table = semantic_vector_table(profile.dimensions)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [&table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    let has_gaps = semantic_vector_index_has_gaps(conn, profile.id, &table)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    Ok(table_exists && !has_gaps)
+}
+
+fn semantic_vector_index_has_gaps(conn: &Connection, profile_id: i64, table: &str) -> Result<bool> {
+    conn.query_row(
+        &format!(
+            "SELECT
+               EXISTS(
+                 SELECT 1
+                 FROM semantic_embedding_index_entries entry
+                 LEFT JOIN {table} vector ON vector.rowid=entry.id
+                 WHERE entry.profile_id=?1 AND vector.rowid IS NULL
+               )
+               OR EXISTS(
+                 SELECT 1
+                 FROM {table} vector
+                 LEFT JOIN semantic_embedding_index_entries entry ON entry.id=vector.rowid
+                 WHERE vector.profile_id=?1 AND entry.id IS NULL
+               )"
+        ),
+        [profile_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
+pub fn semantic_vector_search(
+    conn: &Connection,
+    provider: &Provider,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let spec = provider
+        .profile()
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let profile = ready_semantic_search_profile(conn, &spec)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    let response = provider
+        .embed_query(query)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    validate_response_profile(&spec, &response)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let vector = &response.vectors[0];
+    if vector.len() != profile.dimensions {
+        return Err(semantic_vector_failure(
+            VectorFailureKind::Index,
+            anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
+        ));
+    }
+    exact_semantic_vector_search(conn, &profile, vector, limit)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))
+}
+
+fn exact_semantic_vector_search(
+    conn: &Connection,
+    profile: &ResolvedProfile,
+    vector: &[f32],
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let table = semantic_vector_table(profile.dimensions)?;
+    let candidate_limit = limit.max(1).saturating_mul(4).min(4_096);
+    let mut statement = conn.prepare(&format!(
+        "SELECT entry.artifact_id, vector.distance
+         FROM {table} vector
+         JOIN semantic_embedding_index_entries entry ON entry.id=vector.rowid
+         WHERE vector.embedding MATCH ?1
+           AND vector.k=?2
+           AND vector.profile_id=?3
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=entry.artifact_id
+           )
+         ORDER BY vector.distance"
+    ))?;
+    let rows = statement.query_map(
+        params![vec_to_blob(vector), candidate_limit as i64, profile.id],
+        |row| {
+            let distance = row.get::<_, f64>(1)?;
+            Ok((row.get::<_, i64>(0)?, 1.0 - distance))
+        },
+    )?;
+    let mut scores = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    scores.truncate(limit);
+    Ok(scores)
+}
+
 pub fn vector_search(
     conn: &Connection,
     provider: &Provider,
@@ -930,26 +1452,37 @@ pub fn vector_search(
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let total_started = std::time::Instant::now();
     let started = std::time::Instant::now();
-    let spec = provider.profile()?;
+    let spec = provider
+        .profile()
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     if timing {
         eprintln!("timing:     vector profile {:?}", started.elapsed());
     }
     let started = std::time::Instant::now();
-    let profile = ready_search_profile(conn, &spec)?;
+    let profile = ready_search_profile(conn, &spec)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     if timing {
         eprintln!("timing:     vector index readiness {:?}", started.elapsed());
     }
     let started = std::time::Instant::now();
-    let response = provider.embed_query(query)?;
+    let response = provider
+        .embed_query(query)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     if timing {
         eprintln!("timing:     vector query embedding {:?}", started.elapsed());
     }
-    validate_response_profile(&spec, &response)?;
+    validate_response_profile(&spec, &response)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
     if vector.len() != profile.dimensions {
-        bail!("stored embedding profile has incompatible dimensions");
+        return Err(vector_failure(
+            "code",
+            VectorFailureKind::Index,
+            anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
+        ));
     }
-    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)?;
+    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)
+        .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     if timing {
         eprintln!("timing:     vector total {:?}", total_started.elapsed());
     }
@@ -1053,10 +1586,14 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, embed_text, ensure_profile,
+        DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile, VectorFailureKind,
+        code_vector_failure_action, embed_text, ensure_profile, exact_semantic_vector_search,
         exact_vector_search, existing_profile, materialize_cached_embeddings,
-        missing_embedding_documents, profile_fingerprint, ready_search_profile, sync_vector_index,
-        validate_endpoint, vec_to_blob, vector_index_needs_sync, vector_table,
+        missing_embedding_documents, profile_fingerprint, ready_search_profile,
+        semantic_embedding_documents, semantic_vector_failure, semantic_vector_failure_action,
+        semantic_vector_index_has_gaps, semantic_vector_table, sync_semantic_vector_index,
+        sync_vector_index, validate_endpoint, vec_to_blob, vector_failure, vector_index_needs_sync,
+        vector_table,
     };
 
     fn insert_policy(
@@ -1100,6 +1637,33 @@ mod tests {
         let first = profile_fingerprint("local", "m", r#"{"dtype":"float16"}"#);
         let second = profile_fingerprint("local", "m", r#"{"dtype":"float32"}"#);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn semantic_vector_failure_actions_distinguish_service_from_index() {
+        let inference = semantic_vector_failure(
+            VectorFailureKind::Inference,
+            anyhow::anyhow!("connection refused"),
+        );
+        assert_eq!(
+            semantic_vector_failure_action(&inference),
+            "start or repair the configured embedding service, then retry"
+        );
+        let index =
+            semantic_vector_failure(VectorFailureKind::Index, anyhow::anyhow!("profile missing"));
+        assert_eq!(
+            semantic_vector_failure_action(&index),
+            "run jscout embed <root> --semantic-only"
+        );
+        let code_index = vector_failure(
+            "code",
+            VectorFailureKind::Index,
+            anyhow::anyhow!("profile missing"),
+        );
+        assert_eq!(
+            code_vector_failure_action(&code_index),
+            "run jscout embed <root>"
+        );
     }
 
     #[test]
@@ -1169,6 +1733,121 @@ mod tests {
         assert!(embedded.len() <= 24_000);
         assert!(embedded.is_char_boundary(embedded.len()));
         assert!(!embedded.contains("// file:"));
+    }
+
+    #[test]
+    fn semantic_embedding_documents_include_meaning_and_current_anchors() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        connection.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type,canonical_name,body_json,model,prompt_version,
+               confidence,source_snapshot,created_at,artifact_fingerprint
+             ) VALUES('card','old','{\"purpose\":\"old route\"}','test','card/v1',
+                      'likely','snapshot','now','old')",
+            [],
+        )?;
+        let old_id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO semantic_artifacts(
+               supersedes_artifact_id,artifact_type,canonical_name,body_json,
+               model,prompt_version,confidence,source_snapshot,created_at,
+               artifact_fingerprint
+             ) VALUES(?1,'card','resolveRoute',
+                      '{\"purpose\":\"Preserves rewrite state during fallback.\"}',
+                      'test','card/v1','likely','snapshot','now','current')",
+            [old_id],
+        )?;
+        let current_id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO semantic_supports(
+               artifact_id,claim_path,anchor_key,evidence_file,
+               evidence_start_line,evidence_end_line,source_hash,context_hash,confidence
+             ) VALUES(?1,'/purpose','sym:src/cache.ts#::resolveRoute@1',
+                      'src/cache.ts',10,20,'source','context','likely')",
+            [current_id],
+        )?;
+
+        let documents = semantic_embedding_documents(&connection)?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].artifact_id, current_id);
+        assert!(documents[0].content.contains("Preserves rewrite state"));
+        assert!(
+            documents[0]
+                .content
+                .contains("sym:src/cache.ts#::resolveRoute@1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_vectors_materialize_and_rank_independently_of_code_chunks() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        for (name, body, fingerprint) in [
+            ("rewrite", r#"{"purpose":"rewrite fallback"}"#, "rewrite-fp"),
+            ("headers", r#"{"purpose":"request headers"}"#, "headers-fp"),
+        ] {
+            connection.execute(
+                "INSERT INTO semantic_artifacts(
+                   artifact_type,canonical_name,body_json,model,prompt_version,
+                   confidence,source_snapshot,created_at,artifact_fingerprint
+                 ) VALUES('card',?1,?2,'test','card/v1','likely','snapshot','now',?3)",
+                rusqlite::params![name, body, fingerprint],
+            )?;
+        }
+        connection.execute(
+            "INSERT INTO embedding_profiles(
+               provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES('test','test','profile',2,'{}')",
+            [],
+        )?;
+        let profile = ResolvedProfile {
+            id: connection.last_insert_rowid(),
+            dimensions: 2,
+        };
+        let documents = semantic_embedding_documents(&connection)?;
+        for (document, vector) in documents
+            .iter()
+            .zip([vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+        {
+            connection.execute(
+                "INSERT INTO semantic_embeddings(document_hash,profile_id,vec)
+                 VALUES(?1,?2,?3)",
+                rusqlite::params![document.document_hash, profile.id, vec_to_blob(&vector)],
+            )?;
+        }
+        sync_semantic_vector_index(&connection, &profile, &documents)?;
+
+        let scores = exact_semantic_vector_search(&connection, &profile, &[1.0_f32, 0.0], 2)?;
+        assert_eq!(scores[0].0, documents[0].artifact_id);
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM semantic_embedding_index_entries",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            2
+        );
+        let table = semantic_vector_table(2)?;
+        assert_eq!(
+            connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            2
+        );
+        assert!(!semantic_vector_index_has_gaps(
+            &connection,
+            profile.id,
+            &table
+        )?);
+        connection.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [1])?;
+        assert!(semantic_vector_index_has_gaps(
+            &connection,
+            profile.id,
+            &table
+        )?);
+        Ok(())
     }
 
     #[test]

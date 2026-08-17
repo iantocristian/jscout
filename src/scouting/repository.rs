@@ -261,11 +261,7 @@ pub fn plan(
     let (projects, configuration_problems, configured_projects) =
         discover_project_subjects(root, conn, options)?;
     subjects.extend(projects);
-    subjects.sort_by(|left, right| {
-        subject_priority(&left.subject_kind)
-            .cmp(&subject_priority(&right.subject_kind))
-            .then(left.subject_key.cmp(&right.subject_key))
-    });
+    order_subjects(&mut subjects);
 
     let subject_limit_reached = subjects.len() > options.max_subjects;
     let mut omitted_subjects = Vec::new();
@@ -794,6 +790,21 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     }
 }
 
+// Within each tier, larger subjects first: a bounded --max-calls budget
+// must reach the corpus's weight centers before its periphery. On the
+// Next.js evaluation snapshot, alphabetical ordering spent 64 calls on
+// apps/bench/crates/evals and skipped 308 subjects including the main
+// package. Member count is a neutral structural fact — no path nouns —
+// and the key comparison keeps equal-sized subjects deterministic.
+fn order_subjects(subjects: &mut [DiscoveredSubject]) {
+    subjects.sort_by(|left, right| {
+        subject_priority(&left.subject_kind)
+            .cmp(&subject_priority(&right.subject_kind))
+            .then(right.state.members.len().cmp(&left.state.members.len()))
+            .then(left.subject_key.cmp(&right.subject_key))
+    });
+}
+
 fn subject_priority(kind: &str) -> usize {
     match kind {
         "package" => 0,
@@ -1038,21 +1049,14 @@ pub fn execute(
                     reason: error.to_string(),
                 });
                 if item.depth < options.max_depth {
-                    for child in subdivide(root, conn, &item)? {
-                        if !seen.insert(child.subject_key.clone()) {
-                            continue;
-                        }
-                        if subject_count >= options.max_subjects {
-                            report.auto_limit_reached = true;
-                            report.skipped_unresolvable.push(BatchSkip {
-                                subject: child.subject_key,
-                                reason: format!("--max-subjects {} reached", options.max_subjects),
-                            });
-                            continue;
-                        }
-                        subject_count += 1;
-                        queue.push_back(child);
-                    }
+                    enqueue_subdivisions(
+                        &mut queue,
+                        &mut seen,
+                        &mut subject_count,
+                        &mut report,
+                        options.max_subjects,
+                        subdivide(root, conn, &item)?,
+                    );
                 } else {
                     report.auto_limit_reached = true;
                 }
@@ -1077,26 +1081,59 @@ pub fn execute(
                 report.auto_limit_reached = true;
                 continue;
             }
-            for child in subdivide(root, conn, &subdivision_parent)? {
-                if !seen.insert(child.subject_key.clone()) {
-                    continue;
-                }
-                if subject_count >= options.max_subjects {
-                    report.auto_limit_reached = true;
-                    report.skipped_unresolvable.push(BatchSkip {
-                        subject: child.subject_key,
-                        reason: format!("--max-subjects {} reached", options.max_subjects),
-                    });
-                    continue;
-                }
-                subject_count += 1;
-                queue.push_back(child);
-            }
+            enqueue_subdivisions(
+                &mut queue,
+                &mut seen,
+                &mut subject_count,
+                &mut report,
+                options.max_subjects,
+                subdivide(root, conn, &subdivision_parent)?,
+            );
         }
     }
     recon::reconcile_file_policy(root, conn)?;
     report.subjects_considered = Some(subject_count);
     Ok(report)
+}
+
+fn enqueue_subdivisions(
+    queue: &mut VecDeque<RepositoryPlanItem>,
+    seen: &mut BTreeSet<String>,
+    subject_count: &mut usize,
+    report: &mut ScoutBatchReport,
+    max_subjects: usize,
+    mut children: Vec<RepositoryPlanItem>,
+) {
+    children.sort_by(|left, right| {
+        right
+            .state
+            .members
+            .len()
+            .cmp(&left.state.members.len())
+            .then(left.subject_key.cmp(&right.subject_key))
+    });
+    let mut admitted = Vec::new();
+    for child in children {
+        if !seen.insert(child.subject_key.clone()) {
+            continue;
+        }
+        if *subject_count >= max_subjects {
+            report.auto_limit_reached = true;
+            report.skipped_unresolvable.push(BatchSkip {
+                subject: child.subject_key,
+                reason: format!("--max-subjects {max_subjects} reached"),
+            });
+            continue;
+        }
+        *subject_count += 1;
+        admitted.push(child);
+    }
+    // The parent has already established that its coarse classification is
+    // insufficient. Refine it before unrelated pending subjects consume the
+    // remaining call budget, while preserving descending weight order.
+    for child in admitted.into_iter().rev() {
+        queue.push_front(child);
+    }
 }
 
 fn execute_one(
@@ -1128,6 +1165,29 @@ fn execute_one(
                 RunOutcome::Failed
             };
             ledger::finish_run(conn, run_id, status, None, Some(&error.code()))?;
+            // Remote per-request timeouts are subject-local here exactly as
+            // in the four semantic executors; the batch continues and the
+            // subject stays classifiable on a later run. Local frame
+            // timeouts poison the connection and remain fatal.
+            if super::remote_timeout(&error) {
+                return Ok((
+                    ScoutReport {
+                        kind: "repository".into(),
+                        subject: item.subject_key,
+                        run_id,
+                        status: "failed".into(),
+                        started: None,
+                        artifact_id: None,
+                        candidate_count: 1,
+                        decisions: BTreeMap::new(),
+                        usage: None,
+                        billing_path: spec.billing_path.clone(),
+                        incomplete_reason: None,
+                        failure: Some(format!("gateway timeout: {error}")),
+                    },
+                    None,
+                ));
+            }
             return Err(anyhow::Error::from(error)).context("repository scout completion failed");
         }
     };
@@ -1519,7 +1579,10 @@ fn child_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        fs,
+    };
 
     use anyhow::Result;
     use serde_json::json;
@@ -1555,6 +1618,114 @@ mod tests {
     fn unbounded_limits_render_as_all_instead_of_machine_integers() {
         assert_eq!(rendered_limit(usize::MAX), json!("all"));
         assert_eq!(rendered_limit(512), json!(512));
+    }
+
+    fn discovered(key: &str, kind: &str, member_count: usize) -> super::DiscoveredSubject {
+        super::DiscoveredSubject {
+            subject_key: key.into(),
+            subject_kind: kind.into(),
+            display_name: key.into(),
+            parent_subject_key: None,
+            depth: 0,
+            state: crate::recon::SubjectState {
+                subject_key: key.into(),
+                selector: crate::recon::SubjectSelector::RepositoryArea {
+                    scope: key.into(),
+                    direct_only: false,
+                },
+                members: (0..member_count)
+                    .map(|index| crate::recon::MemberFile {
+                        id: index as i64,
+                        path: format!("{key}/file-{index}.ts"),
+                        hash: "hash".into(),
+                    })
+                    .collect(),
+                disk_inputs: Vec::new(),
+                evidence_fingerprint: format!("fp-{key}"),
+            },
+        }
+    }
+
+    fn planned(key: &str, member_count: usize) -> super::RepositoryPlanItem {
+        let subject = discovered(key, "area", member_count);
+        let selector = subject.state.selector.clone();
+        let mut evidence = evidence();
+        evidence.subject_key = key.into();
+        evidence.member_count = member_count;
+        super::RepositoryPlanItem {
+            subject_key: subject.subject_key,
+            subject_kind: subject.subject_kind,
+            display_name: subject.display_name,
+            parent_subject_key: subject.parent_subject_key,
+            depth: subject.depth,
+            selector,
+            evidence_fingerprint: subject.state.evidence_fingerprint.clone(),
+            member_count,
+            evidence,
+            current_classification: None,
+            downstream_policy: "neutral inclusion".into(),
+            potential_children: Vec::new(),
+            state: subject.state,
+        }
+    }
+
+    #[test]
+    fn planning_orders_each_tier_by_member_count_before_key() {
+        let mut subjects = vec![
+            discovered("packages/aaa-tiny", "package", 2),
+            discovered("area:repository:zz-big", "area", 500),
+            discovered("packages/next", "package", 400),
+            discovered("area:repository:aa-small", "area", 3),
+            discovered("packages/bbb-tiny", "package", 2),
+        ];
+        super::order_subjects(&mut subjects);
+        assert_eq!(
+            subjects
+                .iter()
+                .map(|subject| subject.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "packages/next",
+                "packages/aaa-tiny",
+                "packages/bbb-tiny",
+                "area:repository:zz-big",
+                "area:repository:aa-small",
+            ],
+        );
+    }
+
+    #[test]
+    fn subdivisions_preempt_pending_subjects_in_descending_weight_order() {
+        let mut queue = VecDeque::from([planned("area:repository:pending", 10)]);
+        let mut seen = BTreeSet::from(["area:repository:pending".to_string()]);
+        let mut subject_count = 1;
+        let mut report = super::ScoutBatchReport::default();
+
+        super::enqueue_subdivisions(
+            &mut queue,
+            &mut seen,
+            &mut subject_count,
+            &mut report,
+            3,
+            vec![
+                planned("area:repository:parent/small", 2),
+                planned("area:repository:parent/big", 20),
+            ],
+        );
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "area:repository:parent/big",
+                "area:repository:parent/small",
+                "area:repository:pending",
+            ],
+        );
+        assert_eq!(subject_count, 3);
+        assert!(!report.auto_limit_reached);
     }
 
     #[test]

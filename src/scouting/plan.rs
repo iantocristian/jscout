@@ -836,6 +836,30 @@ fn render_concept_pack(
 /// Union of the three deterministic card sources, deduped by anchor. Runtime
 /// boundary endpoints rank first, then workflow participants, so a capped
 /// plan keeps the symbols with the most established meaning.
+// Automatic selection orders subjects by confidence-weighted incoming
+// degree — most-referenced symbols first, with speculative edges discounted
+// (certain 1.0 / likely 0.6 / possible 0.3, matching graph ranking) — so a
+// bounded --max-calls budget reaches the corpus's load-bearing surfaces
+// before its periphery. On the Next.js evaluation snapshot, key-ordered
+// selection spent full budgets on telemetry/dev-infrastructure/examples and
+// produced zero artifacts about the subsystem the repository revolves
+// around. The weight covers every subject source (boundary endpoints,
+// exported symbols, workflow participants); the key tiebreak keeps
+// equal-weight subjects deterministic.
+fn incoming_reference_weights(conn: &Connection) -> Result<std::collections::HashMap<String, f64>> {
+    let mut statement = conn.prepare(
+        "SELECT dst_key, SUM(CASE confidence
+             WHEN 'certain' THEN 1.0
+             WHEN 'likely' THEN 0.6
+             ELSE 0.3 END)
+         FROM resolved_edges GROUP BY dst_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
     let mut subjects = runtime_boundary_endpoints(conn)?;
     let mut statement = conn.prepare(
@@ -884,10 +908,22 @@ fn automatic_card_subjects(conn: &Connection) -> Result<Vec<(String, Vec<String>
         sources.sort();
         sources.dedup();
     }
+    let weights = incoming_reference_weights(conn)?;
     let mut subjects = subjects.into_iter().collect::<Vec<_>>();
+    // Weight primary, tier as tiebreak. Tier-first drowned the weight list
+    // on the Next.js evaluation snapshot: boundary endpoints from examples/
+    // and dev infrastructure filled the entire card cap while the corpus's
+    // most-referenced production symbols (weight rank 134 and up) were never
+    // selected. Cards document symbols, and incoming degree is the importance
+    // signal for that; boundary-ness still breaks ties. Workflow seeds keep
+    // tier-primary ordering because entry points have low in-degree by
+    // nature — that is what makes them entries.
     subjects.sort_by(|left, right| {
-        card_priority(&left.1)
-            .cmp(&card_priority(&right.1))
+        let left_weight = weights.get(&left.0).copied().unwrap_or(0.0);
+        let right_weight = weights.get(&right.0).copied().unwrap_or(0.0);
+        right_weight
+            .total_cmp(&left_weight)
+            .then_with(|| card_priority(&left.1).cmp(&card_priority(&right.1)))
             .then_with(|| left.0.cmp(&right.0))
     });
     Ok(subjects)
@@ -941,10 +977,16 @@ fn automatic_seeds(root: &Path, conn: &Connection) -> Result<Vec<(String, Vec<St
         sources.sort();
         sources.dedup();
     }
+    let weights = incoming_reference_weights(conn)?;
     let mut seeds = seeds.into_iter().collect::<Vec<_>>();
     seeds.sort_by(|left, right| {
         seed_priority(&left.1)
             .cmp(&seed_priority(&right.1))
+            .then_with(|| {
+                let left_weight = weights.get(&left.0).copied().unwrap_or(0.0);
+                let right_weight = weights.get(&right.0).copied().unwrap_or(0.0);
+                right_weight.total_cmp(&left_weight)
+            })
             .then_with(|| left.0.cmp(&right.0))
     });
     Ok(seeds)
@@ -1661,6 +1703,75 @@ mod tests {
             )?;
         }
         Ok(artifact_id)
+    }
+
+    #[test]
+    fn heavier_referenced_subjects_lead_their_tier() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        // `aardvark` sorts first by key; `zebra` carries the references. The
+        // weighted order must beat the key order within the same tier, so a
+        // bounded selection cap keeps the load-bearing symbol.
+        std::fs::create_dir_all(repo.path().join("aardvark"))?;
+        std::fs::create_dir_all(repo.path().join("zebra"))?;
+        std::fs::write(
+            repo.path().join("aardvark/index.ts"),
+            "export function aardvark() { return 1; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("zebra/index.ts"),
+            "export function zebra() { return 2; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("caller-one.ts"),
+            "import { zebra } from './zebra';\nexport function one() { return zebra(); }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("caller-two.ts"),
+            "import { zebra } from './zebra';\nexport function two() { return zebra(); }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("caller-three.ts"),
+            "import { zebra } from './zebra';\nexport function three() { return zebra(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let cards = super::automatic_card_subjects(&conn)?;
+        let card_keys = cards
+            .iter()
+            .map(|(anchor, _)| anchor.as_str())
+            .collect::<Vec<_>>();
+        let zebra_card = card_keys
+            .iter()
+            .position(|key| key.contains("::zebra@"))
+            .expect("zebra card subject");
+        let aardvark_card = card_keys
+            .iter()
+            .position(|key| key.contains("::aardvark@"))
+            .expect("aardvark card subject");
+        assert!(
+            zebra_card < aardvark_card,
+            "weighted order must beat key order: {card_keys:?}"
+        );
+
+        let seeds = super::automatic_seeds(repo.path(), &conn)?;
+        let seed_keys = seeds
+            .iter()
+            .map(|(anchor, _)| anchor.as_str())
+            .collect::<Vec<_>>();
+        let zebra_seed = seed_keys
+            .iter()
+            .position(|key| key.contains("::zebra@"))
+            .expect("zebra seed");
+        let aardvark_seed = seed_keys
+            .iter()
+            .position(|key| key.contains("::aardvark@"))
+            .expect("aardvark seed");
+        assert!(
+            zebra_seed < aardvark_seed,
+            "weighted order must beat key order: {seed_keys:?}"
+        );
+        Ok(())
     }
 
     fn vocabulary_fixture() -> Result<(tempfile::TempDir, rusqlite::Connection)> {

@@ -238,8 +238,13 @@ with per-arm event streams, MCP request logs, patches, grades, and prepared
 profile databases; `trial-sol-001/` mirrors the layout for the sol trial,
 with `contamination/responses-sol.jsonl` recording sol's admission probe;
 `trial-002/` holds the fixed-harness terra trial and `trial-sol-002-probe/`
-the browser-fix validation arm. Scripts are local copies of js-rag `scripts/eval-*` at
-`d138de4` with two recorded changes (production-order profile, `--resume`).
+the browser-fix validation arm; `trial-sol-mem-001/` … `trial-sol-mem-004/`
+the memory trials (the two aborted preps kept for their logs). Scripts are
+local copies of js-rag `scripts/eval-*` at `d138de4` with two recorded
+changes (production-order profile, `--resume`); the memory trials instead
+ran the runner from js-rag origin/main worktrees, recorded per trial in the
+folder README. `trial-codex-*` folders are Codex's own runs, not covered by
+this document.
 
 ## Blind omission adjudication (all 39 arms)
 
@@ -289,3 +294,117 @@ Implication for the product: the leverage on hard tasks may be a
 design-before-edit workflow surface rather than more retrieval — the model
 produces the mechanism when asked to design and loses it while implementing.
 Artifacts: `trial-sol-003-arch-probe/` in the experiment folder.
+
+## Memory trials: the semantic plane as a treatment (sol-mem-001 … 004)
+
+Four trials asked whether a scouted semantic memory — workflows, cards, and
+summaries written by jscout's own scouting over the workspace, never aimed
+at the fix's subsystem — changes agent behavior on this task. All ran on
+gpt-5.6-sol, one arm at a time. Two preps aborted and became upstream
+fixes; the third ran vector-disabled and became another; the fourth is the
+measurement.
+
+- **sol-mem-001** (prep abort): one card of its 64-card batch failed claim
+  validation (5 evidence ranges, cap 4) and the stage exit killed the whole
+  prep — 96 billed calls discarded. Upstreamed: card citation repair and
+  runner partial-failure tolerance (#39, #40).
+- **sol-mem-002** (prep abort): a single gateway timeout at ~100 of 256
+  cards poisoned the batch, and tier-first card ordering had spent the
+  budget on examples/dev-infra endpoints. Upstreamed: remote timeouts are
+  subject-local failed reports; card selection is weight-primary (#40).
+- **sol-mem-003** (ran; invalid as a memory measurement): both arms
+  completed on a 425-artifact plane, but the profile's stage plan carried
+  no embed stage and the runner gates the arm's embedding provider on that
+  same list, so every search reported `vector: disabled` — the plane
+  existed and was mostly unreachable (skill arm: 0 segment-cache artifacts
+  delivered). Upstreamed: #41 split the profiles (`memory` embed-free by
+  design, `memory-embed` retrievable).
+
+**sol-mem-004** re-ran the pair on a retrievable substrate with the corpus
+held constant. The prepared database was grafted, not re-scouted:
+`checker-scout-embed.db` as the base, sol-mem-003's semantic plane inserted
+byte-identically (hash-verified; 425 artifacts = 314 cards / 63 workflows /
+48 summaries), then migrated across the v23 boundary (post-#42 binary;
+425/425 semantic embeddings; freshness verified per-support).
+Retrievability is the treatment, not literally the only difference against
+mem-003 — it arrives together with the #42 binary, tool surface, and skill,
+and the grafted base carries trial-001's checker facts and product
+embeddings. What the graft holds constant is artifact content, so delivery
+differences are not corpus differences. Two unbilled gates ran before
+any agent turn: the search preview envelope attaching fresh segment-cache
+cards (pass) and the #42 `semantic_memory` drill-down returning 13 fresh
+artifacts at the default budget (pass). Arms ran as profile `memory-embed`;
+sol-mem-003's `memory-*` rows are the same artifacts, unretrievable.
+
+Oracle is failed/total hidden tests; ✓ = livelock suite fixed.
+
+| | mem-003 skill | mem-003 forced | mem-004 skill | mem-004 forced |
+|---|---:|---:|---:|---:|
+| Oracle | 1/11 | 1/11 | 1/11 | 1/11 |
+| Livelock | ✓ | ✓ | ✓ | ✓ |
+| Vector status | disabled | disabled | active 6/6 | active 24/24 |
+| Gold matched | 1/7 | 1/7 | 1/7 | 1/7 |
+| jscout calls | 7 | 53 | 8 | 36 |
+| Distinct artifacts delivered | 10 | 30 | 21 | 42 |
+| Segment-cache cards delivered | 0 | 1 | 3 | 2 |
+| Total tokens | 14.91M | 28.56M | 13.78M | 18.96M |
+| Time | 24.0m | 34.6m | 26.1m | 32.0m |
+
+What the treatment changed — delivery, verifiably. Vector retrieval was
+active on every call in both mem-004 arms, and the reranker on every search
+(reranking is a search-pipeline stage; direct memory retrieval is
+lexical+vector fusion without it). The `semantic_memory`
+drill-down was called exactly once per arm, both times as the *first*
+retrieval action (the #42 skill guidance fires; neither agent returned to
+it once previews arrived); and segment-cache cards reached the agents
+(`cache.ts#segmentCacheMap`, `cache.ts#upgradeToPendingSegment`,
+`types.ts#PrefetchPriority`) where mem-003's skill arm got none.
+
+What it did not change — the outcome, at all. Same single failing case
+(rewrite misprediction, same assertion), same 1/7 gold overlap, and no
+memory arm edited any source file but `optimistic-routes.ts` — every wider
+patch is a self-authored e2e regression fixture. `canonicaliz*`/`diverg*`
+markers: zero in all four arms, across events, patches, and answers. The
+cross-trial constants now stand at 44 graded arms (three matrix trials, the
+harness probe, four memory arms): oracle pass 0/44, the rewrite-
+misprediction case unfixed 44/44, `optimistic-routes.ts` patched 44/44,
+gold overlap 1/7 in 42 of 44. The four memory arms are not in the 39-arm
+blind adjudication; given identical patch shape there is no reason to
+expect different verdicts.
+
+Plumbing is now eliminated as the retrieval-side limitation; the one that
+remains is corpus power — a limitation, not the exclusive cause of the
+failures. The plane holds no artifact naming `optimistic-routes.ts` —
+automatic scouting never aimed at the fix's subsystem, and the file's low
+incoming-reference weight (rank 2,353) keeps it outside any bounded card
+budget — and only 3 of the 7 gold files carry any artifact. Of those, only `segment-cache/cache.ts` ever
+surfaced to an agent; `navigation.ts` and `ppr-navigations.ts` never did.
+The retrieval machinery is now demonstrably live end-to-end; what it
+retrieves over is adjacent context. Read with the architecture probe, the
+leverage question shifts from "can the agent reach memory" (yes) to what
+the scout writes into it — mechanism-level artifacts on the production
+surface — and whether any retrieved context competes with implementation
+pressure once editing begins.
+
+Corroboration (`trial-codex-memory-vector-006/RESULTS.md`): Codex ran
+skill-only memory-embed arms on terra and sol with an independently
+prepared workspace, checker, and structural plane but the byte-identical
+425-artifact semantic plane (verified here: artifact row sets hash equal
+across the two databases; its trial-005 was invalidated by the same
+v22→v23 snapshot trap recorded above). Both its models adopted jscout
+naturally (7–8 calls, no forcing), vector active throughout — and both
+landed at 1/7 gold, `optimistic-routes.ts` only, rewrite misprediction
+unfixed; its terra arm also dropped the livelock, within terra's
+documented variance on that case. The cross-experiment constants are now
+46/46 on the same corpus, and its conclusion matches this section's
+independently: memory was "non-empty but generic," and neither budgets
+nor embedding coverage are the lever. Its new finding, bounded by this
+trial's data: both its models invented shorthand drill-down arguments
+(`optimistic-routes:matchKnownRoute`, zero targets) where this trial's
+sol arms copied full `path:symbol` anchors and resolved 8 of 9
+definition calls to source — the failure is real but non-deterministic,
+and its proposed fix (emit copy-ready tool arguments beside each hit)
+would also cover this trial's one miss, an unqualified class-member
+anchor. Its second recommendation — `repository_overview` is now the
+largest automatic response — reproduces here (21.5KB and 17.4KB in the
+two mem-004 arms).

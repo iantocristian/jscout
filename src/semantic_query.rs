@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{origin, semantic, store, structural};
+use crate::{embed, origin, semantic, store, structural};
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_SOURCE_BYTE_LIMIT: usize = 2_000;
@@ -88,7 +88,8 @@ pub struct ArtifactView {
     pub source_snapshot: String,
     pub created_at: String,
     pub freshness: String,
-    pub relevance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_score: Option<semantic::ArtifactRetrievalScore>,
     pub support_count: usize,
     pub supports: Vec<semantic::SemanticSupport>,
     pub supports_truncated: bool,
@@ -184,7 +185,11 @@ pub struct ResponseBudget {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub snapshot: String,
-    pub matched_artifacts: usize,
+    pub retrieval: semantic::ArtifactRetrievalStatus,
+    /// Ranked candidates after exact type/anchor/relation/freshness filters,
+    /// before the caller's result and byte budgets. This is not a calibrated
+    /// count of semantically relevant artifacts.
+    pub candidate_artifacts: usize,
     pub matched_concept_tags: usize,
     pub semantic_artifacts: Vec<ArtifactView>,
     pub related_artifacts: Vec<RelatedArtifact>,
@@ -197,26 +202,41 @@ pub struct QueryResult {
 struct Candidate {
     id: i64,
     artifact_type: String,
-    name: Option<String>,
-    body_json: String,
     current: bool,
     superseded_by: Option<i64>,
-    relevance: f64,
+    retrieval_score: Option<semantic::ArtifactRetrievalScore>,
 }
 
-pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<QueryResult> {
+pub fn query(
+    root: &Path,
+    conn: &Connection,
+    provider: Option<&embed::Provider>,
+    options: &QueryOptions,
+) -> Result<QueryResult> {
     validate_options(options)?;
     store::with_read_snapshot(conn, "jscout_semantic_query", || {
         let snapshot = structural::current_snapshot(conn)?;
         let mut candidates = candidates(conn, options)?;
-        rank_candidates(&mut candidates, &options.query);
+        let (ranking, retrieval) = semantic::rank_artifacts(
+            conn,
+            provider,
+            &options.query,
+            options.include_superseded,
+            options.limit.saturating_mul(5),
+        )?;
+        apply_ranking(&mut candidates, &ranking, &options.query);
         let candidate_ids = candidates
             .iter()
             .map(|candidate| candidate.id)
             .collect::<Vec<_>>();
-        let relevance = candidates
+        let retrieval_scores = candidates
             .iter()
-            .map(|candidate| (candidate.id, candidate.relevance))
+            .filter_map(|candidate| {
+                candidate
+                    .retrieval_score
+                    .clone()
+                    .map(|score| (candidate.id, score))
+            })
             .collect::<HashMap<_, _>>();
         let current = candidates
             .iter()
@@ -235,11 +255,11 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
                     .iter()
                     .any(|value| value == &artifact.freshness)
         });
-        let matched_artifacts = loaded.len();
+        let candidate_artifacts = loaded.len();
         loaded.truncate(options.limit);
-        let omitted_artifacts = matched_artifacts.saturating_sub(loaded.len());
+        let omitted_artifacts = candidate_artifacts.saturating_sub(loaded.len());
         for artifact in &mut loaded {
-            artifact.relevance = relevance.get(&artifact.id).copied().unwrap_or_default();
+            artifact.retrieval_score = retrieval_scores.get(&artifact.id).cloned();
         }
 
         let selected_ids = loaded
@@ -300,7 +320,8 @@ pub fn query(root: &Path, conn: &Connection, options: &QueryOptions) -> Result<Q
             || relation_paths_truncated;
         let mut result = QueryResult {
             snapshot,
-            matched_artifacts,
+            retrieval,
+            candidate_artifacts,
             matched_concept_tags,
             semantic_artifacts,
             related_artifacts,
@@ -374,8 +395,7 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
 
 fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate>> {
     let mut statement = conn.prepare(
-        "SELECT artifact.id, artifact.artifact_type, artifact.canonical_name,
-                artifact.body_json,
+        "SELECT artifact.id, artifact.artifact_type,
                 NOT EXISTS(
                   SELECT 1 FROM semantic_artifacts successor
                   WHERE successor.supersedes_artifact_id=artifact.id
@@ -401,11 +421,9 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
             Ok(Candidate {
                 id: row.get(0)?,
                 artifact_type: row.get(1)?,
-                name: row.get(2)?,
-                body_json: row.get(3)?,
-                current: row.get(4)?,
-                superseded_by: row.get(5)?,
-                relevance: 0.0,
+                current: row.get(2)?,
+                superseded_by: row.get(3)?,
+                retrieval_score: None,
             })
         },
     )?;
@@ -433,90 +451,32 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
     Ok(candidates)
 }
 
-fn rank_candidates(candidates: &mut Vec<Candidate>, query: &str) {
-    let raw_tokens = raw_tokens(query);
-    let concept_tokens = concept_tokens(query);
-    let normalized_concept_query = crate::scouting::concept::normalize(query);
+fn apply_ranking(
+    candidates: &mut Vec<Candidate>,
+    ranking: &[semantic::RankedArtifact],
+    query: &str,
+) {
+    if query.trim().is_empty() {
+        return;
+    }
+    let ranks = ranking
+        .iter()
+        .enumerate()
+        .map(|(rank, artifact)| (artifact.id, (rank, artifact.retrieval_score.clone())))
+        .collect::<HashMap<_, _>>();
     candidates.retain_mut(|candidate| {
-        let (name, body, exact_name) = if candidate.artifact_type == "concept" {
-            let name =
-                crate::scouting::concept::normalize(candidate.name.as_deref().unwrap_or_default());
-            let body = serde_json::from_str::<Value>(&candidate.body_json)
-                .ok()
-                .map(|body| {
-                    let definition = body
-                        .get("definition")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let aliases = body
-                        .get("aliases")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
-                })
-                .unwrap_or_else(|| crate::scouting::concept::normalize(&candidate.body_json));
-            let exact = !name.is_empty() && normalized_concept_query == name;
-            (name, body, exact)
-        } else {
-            let name = candidate.name.as_deref().unwrap_or_default().to_lowercase();
-            let exact = !name.is_empty() && query.eq_ignore_ascii_case(&name);
-            (name, candidate.body_json.to_lowercase(), exact)
-        };
-        let tokens = if candidate.artifact_type == "concept" {
-            &concept_tokens
-        } else {
-            &raw_tokens
-        };
-        // Valid identities can consist only of punctuation and one-character
-        // tokens (`C++`, `R`). Exact normalized identity still has to localize
-        // them instead of admitting arbitrary recent artifacts.
-        if tokens.is_empty() {
-            if exact_name {
-                candidate.relevance = 1.0;
-                return true;
-            }
-            return query.trim().is_empty();
-        }
-        let matches = tokens
-            .iter()
-            .filter(|token| name.contains(token.as_str()) || body.contains(token.as_str()))
-            .count();
-        if matches == 0 {
+        let Some((_, retrieval_score)) = ranks.get(&candidate.id) else {
             return false;
-        }
-        let exact_name = usize::from(exact_name);
-        candidate.relevance =
-            ((matches + exact_name * 4) as f64 / tokens.len().max(1) as f64).min(1.0);
+        };
+        candidate.retrieval_score = Some(retrieval_score.clone());
         true
     });
-    candidates.sort_by(|left, right| {
-        right
-            .relevance
-            .total_cmp(&left.relevance)
-            .then_with(|| right.id.cmp(&left.id))
+    candidates.sort_by_key(|candidate| {
+        ranks
+            .get(&candidate.id)
+            .map(|(rank, _)| *rank)
+            .unwrap_or(usize::MAX)
     });
-}
-
-fn raw_tokens(query: &str) -> Vec<String> {
-    split_tokens(&query.to_lowercase())
-}
-
-fn concept_tokens(query: &str) -> Vec<String> {
-    split_tokens(&crate::scouting::concept::normalize(query))
-}
-
-fn split_tokens(query: &str) -> Vec<String> {
-    query
-        .split(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
-        .filter(|token| token.len() > 1)
-        .map(str::to_lowercase)
-        .collect()
 }
 
 fn artifact_view(
@@ -542,7 +502,7 @@ fn artifact_view(
         source_snapshot: artifact.source_snapshot,
         created_at: artifact.created_at,
         freshness: artifact.freshness,
-        relevance: artifact.relevance,
+        retrieval_score: artifact.retrieval_score,
         support_count,
         supports_truncated: support_count > artifact.supports.len(),
         supports: artifact.supports,
@@ -1314,6 +1274,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 query: "settlement".into(),
                 artifact_types: vec!["card".into()],
@@ -1321,7 +1282,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 1);
+        assert_eq!(result.candidate_artifacts, 1);
         assert_eq!(result.semantic_artifacts[0].id, card.id);
         assert!(result.semantic_artifacts[0].current);
         assert_eq!(result.semantic_artifacts[0].freshness, "fresh");
@@ -1349,6 +1310,7 @@ mod tests {
         let stale = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(card.id),
                 include_source: true,
@@ -1467,6 +1429,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(summary_id),
                 include_source: true,
@@ -1521,6 +1484,7 @@ mod tests {
         let capped = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(root_id),
                 include_source: true,
@@ -1558,6 +1522,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(overlapping.id),
                 ..Default::default()
@@ -1580,6 +1545,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(file_only.id),
                 ..Default::default()
@@ -1698,6 +1664,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(concept_id),
                 ..Default::default()
@@ -1736,6 +1703,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 query: "ＩＮＶＯＩＣＥ　ＳＥＴＴＬＥＭＥＮＴ".into(),
                 artifact_types: vec!["concept".into()],
@@ -1744,7 +1712,14 @@ mod tests {
         )?;
         assert_eq!(result.semantic_artifacts.len(), 1);
         assert_eq!(result.semantic_artifacts[0].id, concept.id);
-        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        assert_eq!(
+            result.semantic_artifacts[0]
+                .retrieval_score
+                .as_ref()
+                .expect("retrieval score")
+                .rank_score,
+            1.0
+        );
         Ok(())
     }
 
@@ -1772,6 +1747,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 query: "C++".into(),
                 artifact_types: vec!["concept".into()],
@@ -1779,9 +1755,16 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 1);
+        assert_eq!(result.candidate_artifacts, 1);
         assert_eq!(result.semantic_artifacts[0].id, expected.id);
-        assert_eq!(result.semantic_artifacts[0].relevance, 1.0);
+        assert_eq!(
+            result.semantic_artifacts[0]
+                .retrieval_score
+                .as_ref()
+                .expect("retrieval score")
+                .rank_score,
+            1.0
+        );
         Ok(())
     }
 
@@ -1804,6 +1787,7 @@ mod tests {
         let excluded = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(artifact.id),
                 ..Default::default()
@@ -1816,6 +1800,7 @@ mod tests {
         let included = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(artifact.id),
                 file_origins: vec!["dependency".into()],
@@ -1858,6 +1843,7 @@ mod tests {
         let result = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 query: "history concept".into(),
                 artifact_types: vec!["concept".into()],
@@ -1865,7 +1851,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.matched_artifacts, 2);
+        assert_eq!(result.candidate_artifacts, 2);
         assert!(!result.concept_tags.is_empty());
         assert!(
             result
@@ -1894,6 +1880,7 @@ mod tests {
         let stale = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(current.id),
                 ..Default::default()
@@ -1921,6 +1908,7 @@ mod tests {
         let limited = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(artifact.id),
                 concept_tag_limit: 2,
@@ -1934,6 +1922,7 @@ mod tests {
         let full = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(artifact.id),
                 include_source: true,
@@ -1943,6 +1932,7 @@ mod tests {
         let budgeted = query(
             repo.path(),
             &conn,
+            None,
             &QueryOptions {
                 artifact_id: Some(artifact.id),
                 include_source: true,
@@ -1974,6 +1964,7 @@ mod tests {
             query(
                 repo.path(),
                 &conn,
+                None,
                 &QueryOptions {
                     artifact_id: Some(artifact.id),
                     concept_tag_limit: MAX_CONCEPT_TAG_LIMIT + 1,

@@ -245,6 +245,11 @@ function runLogged(command, args, {
   log,
   env = process.env,
   maxBuffer = 256 * 1024 * 1024,
+  // Generative scout stages exit nonzero to report subject-local failures
+  // while still publishing every successful artifact (scout_batch_exit).
+  // Callers that can proceed on partial output pass tolerateExit with a
+  // predicate over the log text; a nonzero exit is then recorded, not fatal.
+  tolerateExit = null,
 }) {
   const result = spawnSync(command, args, {
     cwd,
@@ -253,11 +258,42 @@ function runLogged(command, args, {
     maxBuffer,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  fs.writeFileSync(log, `${result.stdout ?? ""}${result.stderr ?? ""}`);
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  fs.writeFileSync(log, output);
   if (result.error || result.status !== 0) {
+    if (!result.error && tolerateExit && tolerateExit(output)) {
+      process.stderr.write(
+        `tolerated partial failure: ${command} ${args.join(" ")} exited ${result.status}; see ${log}\n`,
+      );
+      return;
+    }
     throw new Error(
       `${command} ${args.join(" ")} failed (${result.status ?? result.error?.message ?? "unknown"}); see ${log}`,
     );
+  }
+}
+
+// A generative scout run is usable when it PUBLISHED at least one artifact.
+// The `reports:` summary counts failed subjects too, so it proves nothing —
+// an all-timeout batch reports nonzero. Evidence of publication is either a
+// per-subject `artifact: <id>` line in the output or, decisively (hard
+// aborts print no summary at all), growth of the stage database's
+// semantic_artifacts count.
+export function scoutPublishedArtifacts(output) {
+  return /^\s*artifact: \d+/m.test(output);
+}
+
+export function countSemanticArtifacts(database) {
+  try {
+    const result = spawnSync("sqlite3", [
+      `file:${database}?immutable=1`,
+      "SELECT count(*) FROM semantic_artifacts",
+    ], { encoding: "utf8" });
+    if (result.status !== 0) return null;
+    const count = Number(result.stdout.trim());
+    return Number.isFinite(count) ? count : null;
+  } catch {
+    return null;
   }
 }
 
@@ -311,6 +347,17 @@ const PROFILE_PLANS = Object.freeze({
   // shape checker scheduling and product embedding. No base profile: the
   // corpus this order produces must not inherit additive-profile state.
   "production-order": ["scout", "enrich", "embed-product"],
+  // The memory-only plane: generative workflow/card/summary artifacts persisted
+  // over checker facts and reconnaissance policy. Keep this free of embeddings
+  // so it remains an isolatable treatment.
+  memory: ["enrich", "scout", "workflows", "cards", "summaries"],
+  // Full semantic-memory treatment: the same persisted artifacts plus
+  // product-scoped vectors and the local query embedder/reranker at runtime.
+  // Keep this separate from `memory` so memory-only trials remain comparable.
+  "memory-embed": [
+    "enrich", "scout", "embed-product", "workflows", "cards", "summaries",
+    "embed-semantic",
+  ],
 });
 
 const PROFILE_BASES = Object.freeze({
@@ -318,6 +365,8 @@ const PROFILE_BASES = Object.freeze({
   "checker-embed": "checker",
   "checker-scout": "checker",
   "checker-scout-embed": "checker-scout",
+  memory: "checker-scout",
+  "memory-embed": "checker-scout-embed",
 });
 
 const PROFILE_INCREMENT = Object.freeze({
@@ -325,6 +374,8 @@ const PROFILE_INCREMENT = Object.freeze({
   "checker-embed": "embed",
   "checker-scout": "scout",
   "checker-scout-embed": "embed-product",
+  memory: ["workflows", "cards", "summaries"],
+  "memory-embed": ["workflows", "cards", "summaries", "embed-semantic"],
 });
 
 export function profilePlan(profile) {
@@ -332,6 +383,13 @@ export function profilePlan(profile) {
   const stages = PROFILE_PLANS[profile];
   if (!stages) throw new Error(`unknown profile: ${profile}`);
   return { usesJscout: true, stages };
+}
+
+export function embeddingEnvironmentForProfile(profile) {
+  const plan = profilePlan(profile);
+  return plan.stages.some((stage) => stage.startsWith("embed"))
+    ? { JSCOUT_EMBED_PROVIDER: "local" }
+    : {};
 }
 
 function copyDatabase(source, destination) {
@@ -402,6 +460,7 @@ function prepareJscoutProfile({
   scoutMaxCalls,
   scoutMaxSubjects,
   scoutWarnSubjects,
+  memoryBudgets,
   baseDatabase,
   executionEnvironment,
 }) {
@@ -409,14 +468,12 @@ function prepareJscoutProfile({
   const env = {
     ...process.env,
     ...executionEnvironment,
-    ...(plan.stages.some((stage) => stage.startsWith("embed"))
-      ? { JSCOUT_EMBED_PROVIDER: "local" }
-      : {}),
+    ...embeddingEnvironmentForProfile(profile),
   };
   let stages = plan.stages;
   if (baseDatabase && fs.existsSync(baseDatabase)) {
     copyDatabase(baseDatabase, database);
-    stages = [PROFILE_INCREMENT[profile]];
+    stages = [].concat(PROFILE_INCREMENT[profile]);
     fs.writeFileSync(
       path.join(runDir, "jscout-profile-base.json"),
       `${JSON.stringify({ profile: PROFILE_BASES[profile], database: baseDatabase }, null, 2)}\n`,
@@ -451,13 +508,34 @@ function prepareJscoutProfile({
           log: path.join(runDir, "jscout-scout.log"),
         },
       );
-    } else if (stage === "embed" || stage === "embed-product") {
+    } else if (stage === "workflows" || stage === "cards" || stage === "summaries") {
+      const artifactsBefore = countSemanticArtifacts(database);
+      runLogged(
+        jscout,
+        [
+          "scout", stage, workspace,
+          "--database", database,
+          "--max-calls", String(memoryBudgets[stage]),
+        ],
+        {
+          cwd: workspace,
+          env,
+          log: path.join(runDir, `jscout-${stage}.log`),
+          tolerateExit: (output) => {
+            if (scoutPublishedArtifacts(output)) return true;
+            const after = countSemanticArtifacts(database);
+            return after !== null && artifactsBefore !== null && after > artifactsBefore;
+          },
+        },
+      );
+    } else if (stage === "embed" || stage === "embed-product" || stage === "embed-semantic") {
       runLogged(
         jscout,
         [
           "embed", workspace,
           "--database", database,
           ...(stage === "embed-product" ? ["--product"] : []),
+          ...(stage === "embed-semantic" ? ["--semantic-only"] : []),
         ],
         {
           cwd: workspace,
@@ -725,6 +803,16 @@ async function main() {
       throw new Error(`${name} must be a positive integer or all`);
     }
   }
+  const memoryBudgets = {
+    workflows: Number(options["memory-workflow-calls"] ?? 32),
+    cards: Number(options["memory-card-calls"] ?? 64),
+    summaries: Number(options["memory-summary-calls"] ?? 32),
+  };
+  for (const [stage, budget] of Object.entries(memoryBudgets)) {
+    if (!Number.isInteger(budget) || budget < 1) {
+      throw new Error(`--memory-${stage.replace(/s$/, "")}-calls must be a positive integer`);
+    }
+  }
   const scoutWarnSubjects = Number(options["scout-warn-subjects"] ?? 512);
   if (!Number.isInteger(scoutWarnSubjects) || scoutWarnSubjects < 1) {
     throw new Error("--scout-warn-subjects must be a positive integer");
@@ -850,6 +938,7 @@ async function main() {
               scoutMaxCalls,
               scoutMaxSubjects,
               scoutWarnSubjects,
+              memoryBudgets,
               baseDatabase,
               executionEnvironment,
             });
@@ -907,7 +996,7 @@ async function main() {
             "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
             "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
           );
-          if (stages.some((stage) => stage.startsWith("embed"))) {
+          if (embeddingEnvironmentForProfile(profile).JSCOUT_EMBED_PROVIDER) {
             args.push(
               "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
             );

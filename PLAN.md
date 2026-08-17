@@ -1341,6 +1341,18 @@ roles:
 - repository-owned files outside a workspace package, grouped by stable path
   boundaries rather than one model call per file.
 
+Within each subject tier (packages, then areas, then projects), planning
+orders subjects by indexed member count descending, then subject key. A
+bounded `--max-calls` budget therefore reaches the corpus's weight centers
+before its periphery; the Next.js evaluation showed alphabetical ordering
+spending a 64-call budget on `apps/`/`bench/`/`crates/`/`evals/` while
+skipping 308 subjects including the main package. Member count is a neutral
+structural fact, consistent with the no-path-noun doctrine.
+When a subject is subdivided because it is mixed or exceeds the context
+budget, its children use the same descending-member-count ordering and run
+immediately after their parent. This prevents an identified weight center's
+refinement from falling behind the unrelated remainder of the initial plan.
+
 Each bounded evidence pack includes manifests and scripts, config
 `extends`/`references`/`include`/`exclude`, file-kind and language counts,
 representative outlines, imports/exports, and deterministic entity/relation
