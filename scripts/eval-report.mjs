@@ -100,6 +100,13 @@ export function buildReport(taskSet, responses, telemetry = []) {
     throw new Error("unsupported task-set schema");
   }
   const taskById = new Map(taskSet.tasks.map((task) => [task.id, task]));
+  const workflows = new Set(responses.map((response) => response.workflow ?? "single"));
+  if (workflows.size > 1) {
+    throw new Error(
+      `refusing to pool mixed evaluation workflows: ${[...workflows].sort().join(", ")}`,
+    );
+  }
+  const workflow = [...workflows][0] ?? "single";
   const profiles = {};
   const profileTreatments = {};
   const taskResults = [];
@@ -112,11 +119,16 @@ export function buildReport(taskSet, responses, telemetry = []) {
     }
     const fileScore = setScore(task.gold?.files, response.files);
     const symbolScore = setScore(task.gold?.symbols, response.symbols);
+    const telemetrySessions = new Set(
+      Array.isArray(response.telemetry_sessions) && response.telemetry_sessions.length > 0
+        ? response.telemetry_sessions
+        : [response.session],
+    );
     const calls = telemetry.filter(
       (entry) =>
         entry.task === response.task_id &&
         entry.profile === response.profile &&
-        entry.session === response.session,
+        telemetrySessions.has(entry.session),
     );
     const inspectedFiles = Array.isArray(response.inspected_files)
       ? new Set(response.inspected_files)
@@ -127,6 +139,7 @@ export function buildReport(taskSet, responses, telemetry = []) {
       category: task.category,
       profile: response.profile,
       treatment: response.treatment ?? "unspecified",
+      workflow: response.workflow ?? "single",
       session: response.session,
       file_precision: fileScore.precision,
       file_recall: fileScore.recall,
@@ -255,6 +268,7 @@ export function buildReport(taskSet, responses, telemetry = []) {
   return {
     schema_version: 1,
     repository: taskSet.repository,
+    workflow,
     profiles: summaries,
     profile_treatments: treatmentSummaries,
     structural_minus_baseline: structuralMinusBaseline,

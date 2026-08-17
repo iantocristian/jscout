@@ -10,6 +10,9 @@ import {
   preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
   embeddingEnvironmentForProfile,
+  designPromptFor,
+  implementationPromptFor,
+  validateDesignResponse,
   profilePlan,
   promptFor,
   startBrowserServer,
@@ -67,6 +70,27 @@ test("replay profiles and forced-search contract are explicit", () => {
   assert.ok(natural.includes("do not access external network services"));
   assert.ok(forced.includes("Use jscout exclusively"));
   assert.ok(forced.includes("directly read files and line ranges identified by jscout"));
+
+  const designPrompt = designPromptFor({ story: "Fix it." }, "skill");
+  assert.ok(designPrompt.includes("Do not edit files"));
+  assert.ok(designPrompt.includes("underlying mechanism"));
+  assert.ok(!designPrompt.includes("Implement the change directly"));
+  const design = {
+    mechanism: "State is accepted before validation.",
+    implementation_plan: ["Validate before accepting state."],
+  };
+  const implementationPrompt = implementationPromptFor(
+    { story: "Fix it." },
+    "skill",
+    design,
+  );
+  assert.ok(implementationPrompt.includes("Implement the change directly"));
+  assert.ok(implementationPrompt.includes("State is accepted before validation."));
+  assert.ok(implementationPrompt.includes("Verify it against source and tests"));
+  assert.throws(
+    () => validateDesignResponse({ mechanism: "Only a guess." }),
+    /constraints must be an array of strings/,
+  );
 
   const constrained = promptFor({
     story: "Fix it.",
@@ -201,12 +225,28 @@ const argv = process.argv.slice(2);
 const value = (flag) => argv[argv.indexOf(flag) + 1];
 const workspace = value("--cd");
 if (process.env.JSCOUT_REPLAY_TEST_ENV !== "enabled") throw new Error("execution environment missing");
-if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
-if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+if (process.env.JSCOUT_EVAL_PHASE !== "design") {
+  if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
+  if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+}
 const fdLimit = Number(execFileSync("/bin/sh", ["-c", "ulimit -n"], { encoding: "utf8" }).trim());
 if (fdLimit < 65536) throw new Error("file descriptor limit was not inherited");
 fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
 if (fs.existsSync(path.join(workspace, "gold"))) throw new Error("gold leaked into workspace");
+if (process.env.JSCOUT_EVAL_PHASE === "design") {
+  if (value("--sandbox") !== "read-only") throw new Error("design sandbox is not read-only");
+  fs.writeFileSync(value("--output-last-message"), JSON.stringify({
+    mechanism: "Both a and b participate in the increment behavior.",
+    constraints: ["Preserve exports."],
+    implementation_plan: ["Update a and inspect b."],
+    files: ["src/a.js", "src/b.js"],
+    symbols: ["a", "b"],
+    validation_plan: ["Run the fixture tests."],
+    uncertainties: [],
+  }));
+  console.log(JSON.stringify({ usage: { input_tokens: 7, output_tokens: 3 } }));
+  process.exit(0);
+}
 fs.appendFileSync(path.join(workspace, "src/a.js"), "// stub edit\\n");
 fs.writeFileSync(value("--output-last-message"), JSON.stringify({
   answer: "incremented a", files: ["src/a.js", "src/b.js"], symbols: ["a"], inspected_files: ["src/a.js"],
@@ -297,6 +337,50 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     fs.readFileSync(responses, "utf8").split("\n").filter(Boolean).length,
     1,
     "resume must skip a session with a completed response row",
+  );
+
+  const twoPhaseResponses = path.join(base, "two-phase-responses.jsonl");
+  const twoPhaseArtifacts = path.join(base, "two-phase-artifacts");
+  execFileSync(process.execPath, [
+    runner,
+    "--tasks", tasksFile,
+    "--repository", repo,
+    "--runs-root", runsRoot,
+    "--jscout", "/bin/true",
+    "--responses", twoPhaseResponses,
+    "--telemetry", path.join(base, "two-phase-telemetry.jsonl"),
+    "--artifacts", twoPhaseArtifacts,
+    "--codex", stub,
+    "--profiles", "grep",
+    "--trial", "t2",
+    "--workflow", "design-implement",
+  ], { encoding: "utf8" });
+  const twoPhaseRow = JSON.parse(fs.readFileSync(twoPhaseResponses, "utf8").trim());
+  assert.equal(twoPhaseRow.workflow, "design-implement");
+  assert.equal(twoPhaseRow.session, "grep-control-design-implement-replay-fixture-t2");
+  assert.equal(twoPhaseRow.design.mechanism, "Both a and b participate in the increment behavior.");
+  assert.equal(twoPhaseRow.design_total_tokens, 10);
+  assert.equal(twoPhaseRow.implementation_total_tokens, 15);
+  assert.equal(twoPhaseRow.total_tokens, 25);
+  assert.equal(twoPhaseRow.design_duration_ms > 0, true);
+  assert.equal(twoPhaseRow.implementation_duration_ms > 0, true);
+  const twoPhaseRunDir = path.join(
+    twoPhaseArtifacts,
+    "grep-control-design-implement-replay-fixture-t2",
+  );
+  assert.equal(fs.statSync(path.join(twoPhaseRunDir, "design.patch")).size, 0);
+  assert.match(
+    fs.readFileSync(path.join(twoPhaseRunDir, "design-prompt.txt"), "utf8"),
+    /Do not edit files/,
+  );
+  assert.match(
+    fs.readFileSync(path.join(twoPhaseRunDir, "implementation-prompt.txt"), "utf8"),
+    /Both a and b participate in the increment behavior/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(twoPhaseRunDir, "events.jsonl"), "utf8")
+      .split("\n").filter(Boolean).length,
+    2,
   );
 
   fs.rmSync(base, { recursive: true, force: true });

@@ -10,8 +10,10 @@
 //   1. export the parent with no history, install dependencies, and build;
 //   2. create a synthetic one-commit Git baseline;
 //   3. indexed arms install the skill, index, and mount the MCP server;
-//   4. codex exec with --sandbox workspace-write and the story prompt;
-//   5. save the agent patch, overlay hidden tests, and grade.
+//   4. optionally run a read-only design call and inject its result into a
+//      separate implementation call;
+//   5. codex exec with --sandbox workspace-write and the implementation prompt;
+//   6. save the agent patch, overlay hidden tests, and grade.
 //
 // The gold bundle stays outside every workspace and is never mounted.
 
@@ -121,6 +123,7 @@ function parseArgs(argv) {
     profiles: "grep,structural",
     treatments: "skill,forced",
     trial: "001",
+    workflow: "single",
   };
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
@@ -706,6 +709,229 @@ function commandUsage(events) {
   };
 }
 
+function addUsage(left, right) {
+  const combined = {};
+  for (const key of [
+    "input_tokens",
+    "cached_input_tokens",
+    "noncached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "command_calls",
+    "failed_command_calls",
+    "command_output_bytes",
+  ]) {
+    combined[key] = Number(left[key] ?? 0) + Number(right[key] ?? 0);
+  }
+  combined.max_command_output_bytes = Math.max(
+    Number(left.max_command_output_bytes ?? 0),
+    Number(right.max_command_output_bytes ?? 0),
+  );
+  return combined;
+}
+
+function phaseUsage(events) {
+  return { ...tokenUsage(events), ...commandUsage(events) };
+}
+
+function prefixedUsage(prefix, usage) {
+  return Object.fromEntries(
+    Object.entries(usage).map(([key, value]) => [`${prefix}_${key}`, value]),
+  );
+}
+
+export function validateDesignResponse(value) {
+  const fields = [
+    "mechanism",
+    "constraints",
+    "implementation_plan",
+    "files",
+    "symbols",
+    "validation_plan",
+    "uncertainties",
+  ];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("design response must be an object");
+  }
+  const unexpected = Object.keys(value).filter((key) => !fields.includes(key));
+  if (unexpected.length > 0) {
+    throw new Error(`design response has unexpected fields: ${unexpected.join(", ")}`);
+  }
+  if (typeof value.mechanism !== "string" || value.mechanism.trim() === "") {
+    throw new Error("design response mechanism must be a non-empty string");
+  }
+  for (const field of fields.slice(1)) {
+    if (!Array.isArray(value[field]) || value[field].some((item) => typeof item !== "string")) {
+      throw new Error(`design response ${field} must be an array of strings`);
+    }
+  }
+  if (value.implementation_plan.length === 0) {
+    throw new Error("design response implementation_plan must not be empty");
+  }
+  if (value.validation_plan.length === 0) {
+    throw new Error("design response validation_plan must not be empty");
+  }
+  return value;
+}
+
+export function designPromptFor(task, treatment = "control") {
+  const contract = [
+    "You are the design phase of a repository implementation evaluation.",
+    "Do not edit files, generate a patch, or run mutating commands. Investigate",
+    "the checked-out snapshot and design the complete change before implementation begins.",
+    "A separate implementation phase will receive your design verbatim.",
+    "",
+    "## Story",
+    task.story,
+    "",
+    "## Design contract",
+    "- Explain the underlying mechanism, not only the nearest failing assertion or edit site.",
+    "- Trace the state, control, and data flow far enough to identify every production",
+    "  surface that may need to change.",
+    "- State constraints, uncertainties, and the evidence that would falsify the design.",
+    "- Provide a concrete file/symbol implementation plan and validation plan.",
+    "- Dependencies are already installed. Do not install or update them and do not",
+    "  access external network services.",
+  ];
+  if (task.execution_notes?.length) {
+    contract.push("- Task-specific execution constraints:");
+    for (const note of task.execution_notes) contract.push(`  - ${note}`);
+  }
+  if (treatment === "forced") {
+    contract.push(
+      "- Use jscout exclusively for repository-wide code discovery, symbol lookup,",
+      "  reference tracing, and architectural navigation. Do not use grep, rg,",
+      "  git grep, find, IDE search, or custom repository-scanning scripts.",
+      "- You may directly read files and line ranges identified by jscout.",
+    );
+  }
+  contract.push(
+    "- Work only inside this synthetic one-commit snapshot. Do not inspect other",
+    "  filesystem locations, GitHub, upstream Git history/remotes, or web/search services.",
+    "- Finish with one JSON object matching the design output schema.",
+  );
+  return contract.join("\n");
+}
+
+export function implementationPromptFor(task, treatment, design, options = {}) {
+  return [
+    promptFor(task, treatment, options),
+    "",
+    "## Phase 1 design",
+    "The same execution model produced the following design from this exact snapshot",
+    "in a preceding read-only phase. Use it as the working hypothesis during",
+    "implementation. Verify it against source and tests, revise it if evidence",
+    "contradicts it, and do not silently collapse the change back to only the nearest",
+    "failing assertion or edit site.",
+    "",
+    "```json",
+    JSON.stringify(design, null, 2),
+    "```",
+  ].join("\n");
+}
+
+function codexArgs({
+  options,
+  workspace,
+  schema,
+  lastMessage,
+  sandbox,
+  usesJscout,
+  jscout,
+  database,
+  profile,
+  telemetry,
+  taskId,
+  session,
+  requestLog,
+}) {
+  const args = [
+    "exec",
+    "--ignore-user-config",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--sandbox", sandbox,
+    "--cd", workspace,
+    "--model", options.model,
+    "--json",
+    "--output-schema", schema,
+    "--output-last-message", lastMessage,
+    "--config", `model_reasoning_effort=${JSON.stringify(options.reasoning)}`,
+    "--config", "approval_policy=\"never\"",
+    "--config", "features.multi_agent=false",
+    "--config", "features.apps=false",
+    "--config", `features.browser_use=${REPLAY_EXECUTION_POLICY.webTools}`,
+    "--config", "features.computer_use=false",
+    "--config", "features.plugins=false",
+    "--config", `tools.web_search=${REPLAY_EXECUTION_POLICY.webTools}`,
+  ];
+  if (sandbox === "workspace-write") {
+    // Next.js dev tests bind loopback servers. Codex's macOS no-network
+    // sandbox blocks loopback as well as external traffic, so execution
+    // keeps network capability while the prompt, empty remotes, disabled
+    // web tools, and retained command stream enforce/audit the boundary.
+    args.push(
+      "--config",
+      `sandbox_workspace_write.network_access=${REPLAY_EXECUTION_POLICY.networkAccess}`,
+    );
+  }
+  if (usesJscout) {
+    args.push(
+      "--config", `mcp_servers.jscout.command=${JSON.stringify(jscout)}`,
+      "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", workspace, "--database", database, "--profile", profile === "baseline" ? "baseline" : "structural", "--telemetry", telemetry, "--request-log", requestLog])}`,
+      "--config", `mcp_servers.jscout.env.JSCOUT_TASK_ID=${JSON.stringify(taskId)}`,
+      "--config", `mcp_servers.jscout.env.JSCOUT_SESSION_ID=${JSON.stringify(session)}`,
+      "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
+      "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
+    );
+    if (embeddingEnvironmentForProfile(profile).JSCOUT_EMBED_PROVIDER) {
+      args.push(
+        "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
+      );
+    }
+  }
+  return args;
+}
+
+async function runCodexPhase({
+  options,
+  workspace,
+  childEnvironment,
+  args,
+  prompt,
+  eventsPath,
+  stderrPath,
+  phase,
+  browserEndpoint,
+}) {
+  fs.writeFileSync(path.join(path.dirname(eventsPath), `${phase}-prompt.txt`), `${prompt}\n`);
+  return run(
+    "/bin/sh",
+    [
+      "-c",
+      'ulimit -n 65536 || { echo "failed to raise file-descriptor limit to 65536" >&2; exit 72; }; exec "$@"',
+      "sh",
+      options.codex,
+      ...args,
+      prompt,
+    ],
+    {
+      cwd: workspace,
+      env: {
+        ...childEnvironment,
+        JSCOUT_EVAL_PHASE: phase,
+        ...(browserEndpoint
+          ? { NEXT_TEST_BROWSER_WS_ENDPOINT: browserEndpoint, HEADLESS: "true" }
+          : {}),
+      },
+      eventsPath,
+      stderrPath,
+      timeoutMs: Number(options[`${phase}-timeout`] ?? options["run-timeout"] ?? 1800) * 1000,
+    },
+  );
+}
+
 export function promptFor(task, treatment = "control", options = {}) {
   const contract = [
     "You are implementing a real change in this repository.",
@@ -775,6 +1001,10 @@ async function main() {
   const telemetry = path.resolve(options.telemetry);
   const artifacts = path.resolve(options.artifacts);
   const schema = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../eval/agent-response.schema.json");
+  const designSchema = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../eval/design-response.schema.json",
+  );
   const gradeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "eval-pr-grade.mjs");
   const profiles = options.profiles.split(",").map((value) => value.trim()).filter(Boolean);
   for (const profile of profiles) profilePlan(profile);
@@ -786,6 +1016,9 @@ async function main() {
     if (!["skill", "forced"].includes(treatment)) {
       throw new Error(`unknown treatment: ${treatment}`);
     }
+  }
+  if (!["single", "design-implement"].includes(options.workflow)) {
+    throw new Error("--workflow must be single or design-implement");
   }
   const workRoot = path.resolve(options["work-root"] ?? "/tmp/jr");
   const preparedRoot = options["prepared-root"]
@@ -855,7 +1088,9 @@ async function main() {
         : null;
       for (let treatmentIndex = 0; treatmentIndex < treatments.length; treatmentIndex += 1) {
         const treatment = treatments[treatmentIndex];
-        const session = `${profile}-${treatment}-${task.id}-${options.trial}`;
+        const session = options.workflow === "single"
+          ? `${profile}-${treatment}-${task.id}-${options.trial}`
+          : `${profile}-${treatment}-${options.workflow}-${task.id}-${options.trial}`;
         const runDir = path.join(artifacts, session);
         if (completedSessions.has(session)) {
           process.stderr.write(`[${task.id}] ${profile}/${treatment} — already complete; skipping\n`);
@@ -883,6 +1118,7 @@ async function main() {
         );
 
         let installedSkillSha = null;
+        const database = usesJscout ? path.join(runDir, "jscout.db") : null;
         if (usesJscout) {
           execFileSync(jscout, ["agent-guide", "--install", workspace], {
             stdio: ["ignore", "pipe", "pipe"],
@@ -897,7 +1133,6 @@ async function main() {
           if (sha256(path.join(workspace, ".agents", "skills", "jscout", "SKILL.md")) !== installedSkillSha) {
             throw new Error("synthetic baseline preparation changed the installed jscout skill");
           }
-          const database = path.join(runDir, "jscout.db");
           if (treatmentIndex === 0 && fs.existsSync(profileDatabase)) {
             // Cross-model reuse: an already-prepared profile database (e.g.
             // from a prior trial) is cloned byte-identically instead of being
@@ -960,124 +1195,216 @@ async function main() {
           }
         }
 
+        const isTwoPhase = options.workflow === "design-implement";
         const lastMessage = path.join(runDir, "last-message.json");
-        const args = [
-          "exec",
-          "--ignore-user-config",
-          "--ephemeral",
-          "--skip-git-repo-check",
-          "--sandbox", "workspace-write",
-          "--cd", workspace,
-          "--model", options.model,
-          "--json",
-          "--output-schema", schema,
-          "--output-last-message", lastMessage,
-          "--config", `model_reasoning_effort=${JSON.stringify(options.reasoning)}`,
-          "--config", "approval_policy=\"never\"",
-          "--config", "features.multi_agent=false",
-          "--config", "features.apps=false",
-          "--config", `features.browser_use=${REPLAY_EXECUTION_POLICY.webTools}`,
-          "--config", "features.computer_use=false",
-          "--config", "features.plugins=false",
-          "--config", `tools.web_search=${REPLAY_EXECUTION_POLICY.webTools}`,
-          // Next.js dev tests bind loopback servers. Codex's macOS no-network
-          // sandbox blocks loopback as well as external traffic, so execution
-          // keeps network capability while the prompt, empty remotes, disabled
-          // web tools, and retained command stream enforce/audit the boundary.
-          "--config", `sandbox_workspace_write.network_access=${REPLAY_EXECUTION_POLICY.networkAccess}`,
-        ];
-        if (usesJscout) {
-          const requestLog = path.join(runDir, "jscout-requests.jsonl");
-          args.push(
-            "--config", `mcp_servers.jscout.command=${JSON.stringify(jscout)}`,
-            "--config", `mcp_servers.jscout.args=${JSON.stringify(["mcp", workspace, "--database", path.join(runDir, "jscout.db"), "--profile", profile === "baseline" ? "baseline" : "structural", "--telemetry", telemetry, "--request-log", requestLog])}`,
-            "--config", `mcp_servers.jscout.env.JSCOUT_TASK_ID=${JSON.stringify(task.id)}`,
-            "--config", `mcp_servers.jscout.env.JSCOUT_SESSION_ID=${JSON.stringify(session)}`,
-            "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
-            "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
+        const implementationEventsPath = path.join(
+          runDir,
+          isTwoPhase ? "implementation-events.jsonl" : "events.jsonl",
+        );
+        const implementationStderrPath = path.join(
+          runDir,
+          isTwoPhase ? "implementation-stderr.log" : "stderr.log",
+        );
+        const implementationRequestLog = path.join(
+          runDir,
+          isTwoPhase ? "jscout-requests-implementation.jsonl" : "jscout-requests.jsonl",
+        );
+        let design = null;
+        let designError = null;
+        let designResult = { code: 0, timedOut: false, duration_ms: 0 };
+        let designEvents = [];
+
+        if (isTwoPhase) {
+          const designLastMessage = path.join(runDir, "design-last-message.json");
+          const designEventsPath = path.join(runDir, "design-events.jsonl");
+          const designStderrPath = path.join(runDir, "design-stderr.log");
+          const designRequestLog = path.join(runDir, "jscout-requests-design.jsonl");
+          const designArgs = codexArgs({
+            options,
+            workspace,
+            schema: designSchema,
+            lastMessage: designLastMessage,
+            sandbox: "read-only",
+            usesJscout,
+            jscout,
+            database,
+            profile,
+            telemetry,
+            taskId: task.id,
+            session: `${session}-design`,
+            requestLog: designRequestLog,
+          });
+          const designPrompt = designPromptFor(task, treatment);
+          process.stderr.write(
+            `[${task.id}] ${profile}/${treatment} — design events: ${designEventsPath}\n`,
           );
-          if (embeddingEnvironmentForProfile(profile).JSCOUT_EMBED_PROVIDER) {
-            args.push(
-              "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
+          designResult = await runCodexPhase({
+            options,
+            workspace,
+            childEnvironment,
+            args: designArgs,
+            prompt: designPrompt,
+            eventsPath: designEventsPath,
+            stderrPath: designStderrPath,
+            phase: "design",
+          });
+          recordWorkspaceCleanup(workspace, runDir, "after-design");
+          if (designResult.interrupted) throwIfInterrupted();
+          designEvents = jsonLines(
+            fs.existsSync(designEventsPath) ? fs.readFileSync(designEventsPath, "utf8") : "",
+          );
+          designError = designResult.timedOut
+            ? `design phase timed out after ${options["design-timeout"] ?? options["run-timeout"] ?? 1800}s`
+            : designResult.code === 0
+              ? null
+              : `design phase codex exited ${designResult.code}`;
+          try {
+            design = validateDesignResponse(
+              JSON.parse(fs.readFileSync(designLastMessage, "utf8")),
             );
+          } catch (error) {
+            designError = designError ?? `unable to parse design response: ${error.message}`;
+          }
+          fs.writeFileSync(
+            path.join(runDir, "design-response.json"),
+            `${JSON.stringify(design, null, 2)}\n`,
+          );
+          const designPatch = path.join(runDir, "design.patch");
+          saveAgentPatch(workspace, designPatch);
+          if (fs.statSync(designPatch).size > 0) {
+            designError = designError ?? "design phase modified the source snapshot";
           }
         }
-        const eventsPath = path.join(runDir, "events.jsonl");
-        const stderrPath = path.join(runDir, "stderr.log");
-        const browserLog = path.join(runDir, "browser-server.log");
-        const browser = await startBrowserServer(workspace, browserLog);
-        args.push(promptFor(task, treatment, { browserEndpoint: browser.endpoint }));
-        fs.writeFileSync(
-          path.join(runDir, "browser-server.json"),
-          `${JSON.stringify({ endpoint: browser.endpoint, log: browserLog }, null, 2)}\n`,
-        );
-        process.stderr.write(`[${task.id}] ${profile}/${treatment} — live events: ${eventsPath}\n`);
-        // sh wrapper raises the fd limit for codex and every inner agent
-        // shell (bug-1 EMFILE); "$@" passes args through without re-quoting.
-        let result;
-        try {
-          result = await run(
-            "/bin/sh",
-            [
-              "-c",
-              'ulimit -n 65536 || { echo "failed to raise file-descriptor limit to 65536" >&2; exit 72; }; exec "$@"',
-              "sh",
-              options.codex,
-              ...args,
-            ],
-            {
-              cwd: workspace,
-              env: {
-                ...childEnvironment,
-                NEXT_TEST_BROWSER_WS_ENDPOINT: browser.endpoint,
-                HEADLESS: "true",
-              },
-              eventsPath,
-              stderrPath,
-              timeoutMs: Number(options["run-timeout"] ?? 1800) * 1000,
-            },
+
+        let result = { code: 1, timedOut: false, interrupted: null, duration_ms: 0 };
+        if (!designError) {
+          const browserLog = path.join(runDir, "browser-server.log");
+          const browser = await startBrowserServer(workspace, browserLog);
+          fs.writeFileSync(
+            path.join(runDir, "browser-server.json"),
+            `${JSON.stringify({ endpoint: browser.endpoint, log: browserLog }, null, 2)}\n`,
           );
-        } finally {
-          await stopBrowserServer(browser.child);
+          const implementationArgs = codexArgs({
+            options,
+            workspace,
+            schema,
+            lastMessage,
+            sandbox: "workspace-write",
+            usesJscout,
+            jscout,
+            database,
+            profile,
+            telemetry,
+            taskId: task.id,
+            session: isTwoPhase ? `${session}-implementation` : session,
+            requestLog: implementationRequestLog,
+          });
+          const implementationPrompt = isTwoPhase
+            ? implementationPromptFor(task, treatment, design, { browserEndpoint: browser.endpoint })
+            : promptFor(task, treatment, { browserEndpoint: browser.endpoint });
+          process.stderr.write(
+            `[${task.id}] ${profile}/${treatment} — implementation events: ${implementationEventsPath}\n`,
+          );
+          try {
+            result = await runCodexPhase({
+              options,
+              workspace,
+              childEnvironment,
+              args: implementationArgs,
+              prompt: implementationPrompt,
+              eventsPath: implementationEventsPath,
+              stderrPath: implementationStderrPath,
+              phase: isTwoPhase ? "implementation" : "agent",
+              browserEndpoint: browser.endpoint,
+            });
+          } finally {
+            await stopBrowserServer(browser.child);
+          }
+        } else {
+          fs.writeFileSync(
+            path.join(runDir, "browser-server.json"),
+            `${JSON.stringify({ started: false, reason: designError }, null, 2)}\n`,
+          );
+          fs.writeFileSync(implementationEventsPath, "");
+          fs.writeFileSync(implementationStderrPath, "");
         }
         recordWorkspaceCleanup(workspace, runDir, "after-agent");
         if (result.interrupted) throwIfInterrupted();
+
+        if (usesJscout && isTwoPhase) {
+          const combined = [
+            path.join(runDir, "jscout-requests-design.jsonl"),
+            implementationRequestLog,
+          ].filter((file) => fs.existsSync(file))
+            .map((file) => fs.readFileSync(file, "utf8"))
+            .join("");
+          fs.writeFileSync(path.join(runDir, "jscout-requests.jsonl"), combined);
+        }
+        if (isTwoPhase) {
+          fs.writeFileSync(
+            path.join(runDir, "events.jsonl"),
+            [
+              path.join(runDir, "design-events.jsonl"),
+              implementationEventsPath,
+            ].filter((file) => fs.existsSync(file))
+              .map((file) => fs.readFileSync(file, "utf8"))
+              .join(""),
+          );
+          fs.writeFileSync(
+            path.join(runDir, "stderr.log"),
+            [
+              path.join(runDir, "design-stderr.log"),
+              implementationStderrPath,
+            ].filter((file) => fs.existsSync(file))
+              .map((file) => fs.readFileSync(file, "utf8"))
+              .join(""),
+          );
+        }
 
         const integrationError = usesJscout
           ? verifyInstalledSkill(workspace, installedSkillSha)
           : null;
 
         let answer = { answer: "", files: [], symbols: [], inspected_files: [] };
-        let runnerError = result.timedOut
+        let runnerError = designError ?? (result.timedOut
           ? `timed out after ${options["run-timeout"] ?? 1800}s`
           : result.code === 0
             ? null
-            : `codex exited ${result.code}`;
+            : `codex exited ${result.code}`);
         runnerError = runnerError ?? integrationError;
-        try {
-          answer = JSON.parse(fs.readFileSync(lastMessage, "utf8"));
-        } catch (error) {
-          runnerError = runnerError ?? `unable to parse final response: ${error.message}`;
+        if (!designError) {
+          try {
+            answer = JSON.parse(fs.readFileSync(lastMessage, "utf8"));
+          } catch (error) {
+            runnerError = runnerError ?? `unable to parse final response: ${error.message}`;
+          }
         }
         const responsePath = path.join(runDir, "response.json");
         fs.writeFileSync(responsePath, `${JSON.stringify(answer, null, 2)}\n`);
         saveAgentPatch(workspace, path.join(runDir, "agent.patch"));
 
         const gradePath = path.join(runDir, "grade.json");
-        try {
-          execFileSync(process.execPath, [
-            gradeScript,
-            "--workspace", workspace,
-            "--gold", gold,
-            "--in-place", "true",
-            "--response", responsePath,
-            ...(task.test_command ?? taskSet.test_command
-              ? ["--test-command", task.test_command ?? taskSet.test_command]
-              : []),
-            "--output", gradePath,
-          ], { encoding: "utf8", env: childEnvironment });
-        } catch (error) {
-          runnerError = runnerError ?? `grading failed: ${`${error.stderr ?? error.message}`.slice(0, 300)}`;
+        if (designError) {
+          fs.writeFileSync(
+            path.join(runDir, "grade-skipped.json"),
+            `${JSON.stringify({ reason: designError }, null, 2)}\n`,
+          );
+        } else {
+          try {
+            execFileSync(process.execPath, [
+              gradeScript,
+              "--workspace", workspace,
+              "--gold", gold,
+              "--in-place", "true",
+              "--response", responsePath,
+              ...(task.test_command ?? taskSet.test_command
+                ? ["--test-command", task.test_command ?? taskSet.test_command]
+                : []),
+              "--output", gradePath,
+            ], { encoding: "utf8", env: childEnvironment });
+          } catch (error) {
+            runnerError = runnerError ?? `grading failed: ${`${error.stderr ?? error.message}`.slice(0, 300)}`;
+          }
         }
         recordWorkspaceCleanup(workspace, runDir, "after-grader");
         throwIfInterrupted();
@@ -1085,35 +1412,60 @@ async function main() {
           ? JSON.parse(fs.readFileSync(gradePath, "utf8"))
           : null;
 
-        const events = jsonLines(
-          fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, "utf8") : "",
+        const implementationEvents = jsonLines(
+          fs.existsSync(implementationEventsPath)
+            ? fs.readFileSync(implementationEventsPath, "utf8")
+            : "",
         );
+        const designMetrics = phaseUsage(designEvents);
+        const implementationMetrics = phaseUsage(implementationEvents);
+        const combinedMetrics = addUsage(designMetrics, implementationMetrics);
+        const requestRows = usesJscout
+          ? jsonLines(
+            fs.existsSync(path.join(runDir, "jscout-requests.jsonl"))
+              ? fs.readFileSync(path.join(runDir, "jscout-requests.jsonl"), "utf8")
+              : "",
+          ).filter((entry) => entry.method === "tools/call")
+          : [];
+        const designRequestCount = isTwoPhase && usesJscout
+          ? jsonLines(
+            fs.existsSync(path.join(runDir, "jscout-requests-design.jsonl"))
+              ? fs.readFileSync(path.join(runDir, "jscout-requests-design.jsonl"), "utf8")
+              : "",
+          ).filter((entry) => entry.method === "tools/call").length
+          : 0;
         const row = {
           task_id: task.id,
           profile,
           treatment,
+          workflow: options.workflow,
           session,
+          telemetry_sessions: usesJscout
+            ? isTwoPhase
+              ? [`${session}-design`, `${session}-implementation`]
+              : [session]
+            : [],
           model: options.model,
           reasoning: options.reasoning,
           files: answer.files ?? [],
           symbols: answer.symbols ?? [],
           inspected_files: answer.inspected_files ?? [],
           answer: answer.answer ?? "",
-          ...tokenUsage(events),
-          ...commandUsage(events),
-          duration_ms: result.duration_ms,
+          design,
+          ...combinedMetrics,
+          ...prefixedUsage("design", designMetrics),
+          ...prefixedUsage("implementation", implementationMetrics),
+          design_duration_ms: designResult.duration_ms,
+          implementation_duration_ms: result.duration_ms,
+          duration_ms: designResult.duration_ms + result.duration_ms,
           patched_files: gradeReport?.changes.map((change) => change.file) ?? [],
           gold_matched: gradeReport?.coverage.patched.matched.length ?? null,
           gold_pending_adjudication: gradeReport?.coverage.patched.pending_adjudication.length ?? null,
           layer1: gradeReport?.layer1?.status ?? null,
           jscout_skill_sha256: installedSkillSha,
-          jscout_requests: usesJscout
-            ? jsonLines(
-              fs.existsSync(path.join(runDir, "jscout-requests.jsonl"))
-                ? fs.readFileSync(path.join(runDir, "jscout-requests.jsonl"), "utf8")
-                : "",
-            ).filter((entry) => entry.method === "tools/call").length
-            : 0,
+          jscout_requests: requestRows.length,
+          design_jscout_requests: designRequestCount,
+          implementation_jscout_requests: requestRows.length - designRequestCount,
           execution_network_access: REPLAY_EXECUTION_POLICY.networkAccess,
           execution_network_policy: REPLAY_EXECUTION_POLICY.networkPolicy,
           execution_environment: executionEnvironment,

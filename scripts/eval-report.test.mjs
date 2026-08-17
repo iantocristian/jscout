@@ -156,3 +156,35 @@ test("evaluation report compares full and elided rendered source bytes", () => {
   assert.equal(report.profile_deltas.structural_elided_minus_full.mean_source_rendered_bytes, -500);
   assert.deepEqual(report.missing, []);
 });
+
+test("evaluation report joins both two-phase telemetry sessions without pooling workflows", () => {
+  const tasks = {
+    schema_version: 1,
+    profiles: ["structural"],
+    tasks: [{ id: "hard", gold: { files: [], symbols: [] } }],
+  };
+  const response = {
+    task_id: "hard",
+    profile: "structural",
+    treatment: "skill",
+    workflow: "design-implement",
+    session: "root-session",
+    telemetry_sessions: ["root-session-design", "root-session-implementation"],
+    files: [],
+    symbols: [],
+  };
+  const telemetry = ["design", "implementation"].map((phase) => ({
+    task: "hard",
+    profile: "structural",
+    session: `root-session-${phase}`,
+    tool: "semantic_search",
+    ok: true,
+  }));
+  const report = buildReport(tasks, [response], telemetry);
+  assert.equal(report.workflow, "design-implement");
+  assert.equal(report.profiles.structural.mean_tool_calls, 2);
+  assert.throws(
+    () => buildReport(tasks, [response, { ...response, workflow: "single", session: "other" }]),
+    /refusing to pool mixed evaluation workflows/,
+  );
+});
