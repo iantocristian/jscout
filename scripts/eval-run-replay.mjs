@@ -31,6 +31,18 @@ export const REPLAY_EXECUTION_POLICY = Object.freeze({
   webTools: false,
 });
 
+const NEXT_TEARDOWN_PRELOAD = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "eval-next-teardown-preload.cjs",
+);
+
+export function nodeOptionsWithNextTeardown(existing = "") {
+  const requireOption = `--require=${NEXT_TEARDOWN_PRELOAD}`;
+  const options = existing.trim();
+  if (options.split(/\s+/).includes(requireOption)) return options;
+  return options ? `${options} ${requireOption}` : requireOption;
+}
+
 let activeChild = null;
 let activeBrowserChild = null;
 let activeWorkspace = null;
@@ -906,7 +918,14 @@ async function runCodexPhase({
   browserEndpoint,
 }) {
   fs.writeFileSync(path.join(path.dirname(eventsPath), `${phase}-prompt.txt`), `${prompt}\n`);
-  return run(
+  const processRegistry = browserEndpoint
+    ? path.join(
+      os.tmpdir(),
+      `jscout-eval-next-processes-${process.pid}-${crypto.randomUUID()}.jsonl`,
+    )
+    : null;
+  if (processRegistry) fs.writeFileSync(processRegistry, "");
+  const result = await run(
     "/bin/sh",
     [
       "-c",
@@ -922,7 +941,12 @@ async function runCodexPhase({
         ...childEnvironment,
         JSCOUT_EVAL_PHASE: phase,
         ...(browserEndpoint
-          ? { NEXT_TEST_BROWSER_WS_ENDPOINT: browserEndpoint, HEADLESS: "true" }
+          ? {
+            NEXT_TEST_BROWSER_WS_ENDPOINT: browserEndpoint,
+            HEADLESS: "true",
+            NODE_OPTIONS: nodeOptionsWithNextTeardown(childEnvironment.NODE_OPTIONS),
+            JSCOUT_EVAL_PROCESS_REGISTRY: processRegistry,
+          }
           : {}),
       },
       eventsPath,
@@ -930,6 +954,15 @@ async function runCodexPhase({
       timeoutMs: Number(options[`${phase}-timeout`] ?? options["run-timeout"] ?? 1800) * 1000,
     },
   );
+  if (processRegistry) {
+    const preserved = path.join(path.dirname(eventsPath), `${phase}-process-registry.jsonl`);
+    try {
+      fs.copyFileSync(processRegistry, preserved);
+    } finally {
+      fs.rmSync(processRegistry, { force: true });
+    }
+  }
+  return result;
 }
 
 export function promptFor(task, treatment = "control", options = {}) {
@@ -965,10 +998,11 @@ export function promptFor(task, treatment = "control", options = {}) {
     contract.push(
       "- Browser e2e tests work through a pre-connected browser endpoint: run",
       "  them with the repository's pnpm test scripts, e.g. HEADLESS=true",
-      "  NEXT_TEST_MODE=start pnpm testonly <path>. Avoid the pnpm",
-      "  test-start-turbo / test-dev-* wrappers; their teardown can hang for",
-      "  120s per run. Do not invoke node run-tests.js directly; it replaces",
-      "  the browser endpoint and will fail.",
+      "  NEXT_TEST_MODE=start pnpm testonly <path>. Prefer this direct command",
+      "  over test-start-turbo / test-dev-* wrappers so the pre-connected",
+      "  endpoint and per-command teardown stay under harness control. Do not",
+      "  invoke node run-tests.js directly; it replaces the browser endpoint",
+      "  and will fail.",
     );
   } else {
     contract.push(
@@ -1282,7 +1316,17 @@ async function main() {
           const browser = await startBrowserServer(workspace, browserLog);
           fs.writeFileSync(
             path.join(runDir, "browser-server.json"),
-            `${JSON.stringify({ endpoint: browser.endpoint, log: browserLog }, null, 2)}\n`,
+            `${JSON.stringify({
+              endpoint: browser.endpoint,
+              log: browserLog,
+              next_teardown: {
+                strategy: "registered-pgrep-process-tree",
+                preload: NEXT_TEARDOWN_PRELOAD,
+                registry: isTwoPhase
+                  ? "implementation-process-registry.jsonl"
+                  : "agent-process-registry.jsonl",
+              },
+            }, null, 2)}\n`,
           );
           const implementationArgs = codexArgs({
             options,
