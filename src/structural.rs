@@ -2097,8 +2097,9 @@ fn checker_occurrence_coverage(
 ///
 /// A checker batch belongs to exactly one structural snapshot. Within that
 /// snapshot, source occurrence and target fingerprints are still checked
-/// defensively. A new snapshot drops (full refresh) or ignores (incremental
-/// watch optimization) the whole batch rather than revalidating input files.
+/// defensively. A different snapshot drops (full refresh) or ignores
+/// (test-only incremental indexing) the whole batch rather than revalidating
+/// input files. An identical full refresh may reuse the exact-snapshot batch.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,

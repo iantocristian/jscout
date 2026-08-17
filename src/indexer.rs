@@ -343,6 +343,12 @@ fn index_repo_impl(
     )?;
     let resolution = crate::structural::compute_resolution_hash(conn)?;
     let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
+    if mode == IndexMode::FullRefresh {
+        // Full extraction is disposable, but an exact-snapshot checker batch
+        // is still valid and expensive to reproduce. Old-snapshot batches
+        // are removed before projection can publish the new snapshot.
+        store::retain_checker_batches_for_snapshot(conn, &snapshot)?;
+    }
     let current = ProjectionIdentity {
         snapshot: Some(snapshot.clone()),
         projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
@@ -2141,6 +2147,10 @@ mod tests {
                       'memory-fp', 'artifact-fp');",
         )?;
         conn.execute(
+            "UPDATE checker_enrichment_batches SET source_snapshot=?1 WHERE id=1",
+            [&snapshot],
+        )?;
+        conn.execute(
             "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES(?1, 1, ?2)",
             rusqlite::params![chunk_hash, vec![0_u8; 8]],
         )?;
@@ -2186,11 +2196,144 @@ mod tests {
                 ))
             },
         )?;
-        assert_eq!(counts, (1, 1, 1, 1, 0, 0));
+        assert_eq!(counts, (1, 1, 1, 1, 1, 0));
         assert_eq!(
             semantic::load_artifact(&conn, 3)?.unwrap().freshness,
             "fresh"
         );
+
+        fs::write(
+            repo.path().join("main.ts"),
+            "export function run() { return 'changed'; }\n",
+        )?;
+        refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM checker_enrichment_batches",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "a checker batch must not survive a different structural snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identical_full_refresh_reprojects_the_exact_checker_batch() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("service.ts"),
+            "export class Service { load() {} }\n\
+             export function run(service: Service) { service.load(); }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        let (
+            member_call_id,
+            source_file_id,
+            source_hash,
+            call_start,
+            call_end,
+            receiver_start,
+            receiver_end,
+            property_start,
+            property_end,
+        ) = conn.query_row(
+            "SELECT call.rowid, file.id, file.hash, call.start, call.end,
+                    call.receiver_start, call.receiver_end,
+                    call.property_start, call.property_end
+             FROM member_calls call JOIN files file ON file.id=call.file_id
+             WHERE call.prop='load'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
+        let (target, target_hash, target_start, target_end): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT node.node_key, file.hash, symbol.decl_start, symbol.decl_end
+                 FROM graph_nodes node
+                 JOIN symbols symbol
+                   ON node.native_table='symbols' AND node.native_id=symbol.id
+                 JOIN files file ON file.id=symbol.file_id
+                 WHERE node.display_name='load'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let target_fingerprint =
+            crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end);
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(?1,'5.9.3','test','inputs',1,datetime('now'),1)",
+            [&snapshot],
+        )?;
+        let batch_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO checker_project_runs(
+               batch_id, project_id, status, selected_occurrences,
+               completed_occurrences, checker_input_fingerprint, updated_at
+             ) VALUES(?1,'tsconfig.json','completed',1,1,'inputs',datetime('now'))",
+            [batch_id],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_enrichments(
+               batch_id, member_call_id, source_file_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id, receiver_type,
+               target_anchor, target_fingerprint, confidence, provenance,
+               checker_input_fingerprint
+             ) VALUES(
+               ?1,?2,?3,'service.ts',?4,?5,?6,?7,?8,?9,?10,
+               'tsconfig.json','Service',?11,?12,'likely','checker','inputs'
+             )",
+            rusqlite::params![
+                batch_id,
+                member_call_id,
+                source_file_id,
+                source_hash,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+                target,
+                target_fingerprint,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,'tsconfig.json','inputs','resolved')",
+            rusqlite::params![batch_id, member_call_id],
+        )?;
+        structural::rebuild_projection(&conn, &snapshot)?;
+
+        refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+        let counts: (i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM checker_enrichment_batches),
+               (SELECT count(*) FROM resolved_edges
+                  WHERE provenance='checker' AND dst_key=?1)",
+            [&target],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(counts, (1, 1));
         Ok(())
     }
 
