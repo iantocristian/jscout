@@ -224,7 +224,12 @@ pub fn query(
             options.include_superseded,
             options.limit.saturating_mul(5),
         )?;
-        apply_ranking(&mut candidates, &ranking, &options.query);
+        // Exact artifact identity is authoritative. Query text is ignored for
+        // admission in that mode, including for task-scoped designs that are
+        // intentionally absent from broad ranking.
+        if options.artifact_id.is_none() {
+            apply_ranking(&mut candidates, &ranking, &options.query);
+        }
         let candidate_ids = candidates
             .iter()
             .map(|candidate| candidate.id)
@@ -404,6 +409,7 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
                  WHERE successor.supersedes_artifact_id=artifact.id) AS superseded_by
          FROM semantic_artifacts artifact
          WHERE (?1 IS NULL OR artifact.id=?1)
+           AND (?1 IS NOT NULL OR artifact.artifact_type!='design')
            AND (?2 IS NULL OR EXISTS(
              SELECT 1 FROM semantic_supports support
              WHERE support.artifact_id=artifact.id AND support.anchor_key=?2
