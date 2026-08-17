@@ -17,6 +17,16 @@ schemas, and exported API types without claiming they execute.
 
 ## Getting started
 
+Prebuilt binaries are published on npm as
+[`@jscout/cli`](https://www.npmjs.com/package/@jscout/cli) for `darwin-arm64`,
+`darwin-x64`, `linux-x64-gnu`, and `linux-arm64-gnu`:
+
+```bash
+npm install -g @jscout/cli       # no compile step, no install script
+```
+
+From a source checkout:
+
 ```bash
 cargo build --release            # binary at target/release/jscout
 jscout index /path/to/repo       # rebuild the current structural snapshot
@@ -146,6 +156,22 @@ directories with the binary. Indexing and retrieval do not start Node.
 `jscout enrich` starts the checker for typed member-call resolution;
 `jscout scout repository` starts both the checker inventory and the pi-ai
 gateway because configured projects are explicit reconnaissance subjects.
+
+Build the npm publish tree instead — a `@jscout/cli` wrapper plus one
+per-platform binary package, staged under `target/npm/`:
+
+```bash
+node scripts/npm-package.mjs                  # host platform + wrapper
+node scripts/npm-package.mjs --target TRIPLE
+```
+
+The wrapper vendors no `node_modules`: it declares the sidecar dependencies
+and lets the installer resolve them. Because the binary lands in a separate
+platform package, `current_exe()` sidecar discovery cannot reach the bundled
+`gateway/` and `checker/`, so `npm/cli/bin/jscout.mjs` sets
+`JSCOUT_PI_AI_GATEWAY` and `JSCOUT_CHECKER_SIDECAR` before exec. Publishing is
+driven by `.github/workflows/release-npm.yml` on a `vX.Y.Z` tag; the tag must
+match the Cargo.toml version.
 
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
@@ -991,6 +1017,16 @@ timings during indexing.
 {
   "mcpServers": {
     "jscout": { "command": "/path/to/jscout", "args": ["mcp", "/path/to/repo"] }
+  }
+}
+```
+
+From the npm package, with no absolute path to maintain:
+
+```json
+{
+  "mcpServers": {
+    "jscout": { "command": "npx", "args": ["-y", "@jscout/cli", "mcp", "/path/to/repo"] }
   }
 }
 ```

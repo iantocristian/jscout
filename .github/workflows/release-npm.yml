@@ -1,0 +1,160 @@
+name: Release (npm)
+
+# Publishes @jscout/cli and its per-platform binary packages.
+#
+# Tag a release commit as vX.Y.Z to publish; the tag must match the version in
+# Cargo.toml, which is the single source of version truth. Run manually with
+# dry-run left on to exercise the whole pipeline without publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and pack without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.97.1
+  NODE_VERSION: 22.19.0
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            native: true
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            native: false
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            native: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Assemble platform package
+        run: node scripts/npm-package.mjs --platform-only --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        if: matrix.native
+        run: |
+          binary="target/${{ matrix.target }}/release/jscout"
+          "$binary" --version
+          "$binary" index . --database "$RUNNER_TEMP/smoke.db"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.target }}
+          # The whole directory, not a glob: the artifact root must stay
+          # target/npm so each platform keeps its own subdirectory when the
+          # publish job merges all four.
+          path: target/npm
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for trusted publishing
+        # Node 22.19.0 ships npm 10.x; OIDC needs >= 11.5.1.
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cargo_version="$(awk -F '"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: target/npm
+          pattern: npm-*
+          merge-multiple: true
+
+      - name: Assemble the wrapper package
+        run: node scripts/npm-package.mjs --wrapper-only
+
+      - name: Restore executable bits
+        # upload-artifact does not preserve file modes.
+        run: |
+          set -euo pipefail
+          chmod 755 target/npm/cli/bin/jscout.mjs
+          for binary in target/npm/*/jscout; do
+            [ -f "$binary" ] && chmod 755 "$binary"
+          done
+          ls -l target/npm/*/jscout
+
+      - name: Show what would be published
+        run: |
+          for package in target/npm/*/; do
+            echo "--- $package"
+            npm pack --dry-run "$package" 2>&1 | tail -5
+          done
+
+      - name: Publish
+        # Authenticated by OIDC trusted publishing: no token, no NODE_AUTH_TOKEN.
+        # Every package in target/npm must have a trusted publisher configured
+        # at npmjs.com/package/<name>/access naming this workflow file.
+        #
+        # Platform packages first: the wrapper's optionalDependencies must
+        # already resolve when the first install of it happens.
+        if: github.event_name == 'push' || inputs.dry-run == false
+        run: |
+          set -euo pipefail
+          publish() {
+            local dir="$1"
+            local name version
+            name="$(node -p "require('./$dir/package.json').name")"
+            version="$(node -p "require('./$dir/package.json').version")"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "skip: $name@$version is already published"
+              return
+            fi
+            npm publish "$dir" --access public --provenance
+          }
+          for package in target/npm/*/; do
+            [ "$(basename "$package")" = "cli" ] && continue
+            publish "${package%/}"
+          done
+          publish target/npm/cli
