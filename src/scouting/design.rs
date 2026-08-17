@@ -26,7 +26,7 @@ use crate::semantic::{self, AnnotateInput, SupportInput, WorkflowCandidate};
 use crate::{origin, recon, search, store, structural};
 
 pub const PROMPT_VERSION: &str = "design-scout/v1";
-pub const PLANNING_VERSION: &str = "design-evidence/v1";
+pub const PLANNING_VERSION: &str = "design-evidence/v2";
 pub const SUBMIT_TOOL_NAME: &str = "submit_task_design";
 pub const DEFAULT_SEARCH_LIMIT: usize = 12;
 pub const DEFAULT_SEED_LIMIT: usize = 6;
@@ -479,7 +479,7 @@ fn plan_in_snapshot(
     }
 
     let mut evidence =
-        evidence::build_titled(root, conn, &candidates, "Design evidence candidates")?;
+        evidence::build_titled_design(root, conn, &candidates, "Design evidence candidates")?;
     let mut evidence_file_policy = Vec::new();
     for path in evidence.files.keys() {
         let (role, file_origin): (String, String) = conn.query_row(

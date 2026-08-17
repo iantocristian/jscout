@@ -1,6 +1,8 @@
 //! Bounded, line-numbered evidence packs. Full source is the default input;
-//! deterministic entity occurrences annotate each file. Rendering is fully
-//! deterministic so the pack can participate in the input fingerprint.
+//! design scouting can instead retain complete candidate declarations plus a
+//! small surrounding window. Deterministic entity occurrences annotate each
+//! file. Rendering is fully deterministic so the pack can participate in the
+//! input fingerprint.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,6 +28,11 @@ pub struct EvidencePack {
 /// neighbours reports the omitted count rather than truncating silently.
 const CONTEXT_EDGES_PER_DIRECTION: usize = 40;
 
+/// Design claims can cite only candidate declaration spans. Keeping those
+/// spans complete plus nearby imports/control context avoids shipping an
+/// unrelated 4,000-line file merely because one symbol localized there.
+pub const DESIGN_CONTEXT_LINES: usize = 12;
+
 /// Build the pack for a candidate set inside the caller's read snapshot.
 /// Fails when any candidate file changed on disk since indexing: scouting
 /// against un-indexed edits would publish evidence that immediately reads
@@ -45,6 +52,29 @@ pub fn build_titled(
     conn: &Connection,
     candidates: &[WorkflowCandidate],
     section: &str,
+) -> Result<EvidencePack> {
+    build_titled_with_windows(root, conn, candidates, section, None)
+}
+
+/// Build a design pack from complete candidate declaration spans and bounded
+/// surrounding source. Original line numbers are preserved, and omitted
+/// ranges are explicit. Hashes and line counts still cover the whole file so
+/// freshness validation remains identical to a full-source pack.
+pub fn build_titled_design(
+    root: &Path,
+    conn: &Connection,
+    candidates: &[WorkflowCandidate],
+    section: &str,
+) -> Result<EvidencePack> {
+    build_titled_with_windows(root, conn, candidates, section, Some(DESIGN_CONTEXT_LINES))
+}
+
+fn build_titled_with_windows(
+    root: &Path,
+    conn: &Connection,
+    candidates: &[WorkflowCandidate],
+    section: &str,
+    context_lines: Option<usize>,
 ) -> Result<EvidencePack> {
     let mut files: BTreeMap<String, FileEvidence> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
@@ -100,14 +130,91 @@ pub fn build_titled(
                 rendered.push_str(&format!("- {annotation}\n"));
             }
         }
-        rendered.push_str("```\n");
-        for (index, line) in source.lines().enumerate() {
-            rendered.push_str(&format!("{:>5} | {line}\n", index + 1));
+        let line_count = source.lines().count();
+        let ranges =
+            context_lines.map(|context| candidate_windows(candidates, file, line_count, context));
+        if ranges.is_some() {
+            rendered.push_str(&format!(
+                "Candidate source windows (complete declarations plus {DESIGN_CONTEXT_LINES} surrounding lines; omitted ranges are not evidence):\n"
+            ));
         }
+        rendered.push_str("```\n");
+        render_numbered_source(&mut rendered, source, ranges.as_deref());
         rendered.push_str("```\n");
     }
 
     Ok(EvidencePack { rendered, files })
+}
+
+fn candidate_windows(
+    candidates: &[WorkflowCandidate],
+    file: &str,
+    line_count: usize,
+    context_lines: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = candidates
+        .iter()
+        .filter(|candidate| candidate.file == file)
+        .map(|candidate| {
+            let start = usize::try_from(candidate.evidence_start_line)
+                .unwrap_or(1)
+                .max(1)
+                .saturating_sub(context_lines)
+                .max(1)
+                .min(line_count.max(1));
+            let end = usize::try_from(candidate.evidence_end_line)
+                .unwrap_or(line_count)
+                .max(start)
+                .saturating_add(context_lines)
+                .min(line_count);
+            (start, end)
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1.saturating_add(1)
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn render_numbered_source(rendered: &mut String, source: &str, ranges: Option<&[(usize, usize)]>) {
+    let lines = source.lines().collect::<Vec<_>>();
+    let ranges = ranges.map(|ranges| ranges.to_vec()).unwrap_or_else(|| {
+        (!lines.is_empty())
+            .then_some((1, lines.len()))
+            .into_iter()
+            .collect()
+    });
+    let mut previous_end: usize = 0;
+    for (start, end) in ranges {
+        if start > previous_end.saturating_add(1) {
+            rendered.push_str(&format!(
+                "      | /* … jscout omitted source lines {}-{} … */\n",
+                previous_end + 1,
+                start - 1,
+            ));
+        }
+        for line_number in start..=end {
+            if let Some(line) = lines.get(line_number - 1) {
+                rendered.push_str(&format!("{line_number:>5} | {line}\n"));
+            }
+        }
+        previous_end = previous_end.max(end);
+    }
+    if previous_end < lines.len() {
+        rendered.push_str(&format!(
+            "      | /* … jscout omitted source lines {}-{} … */\n",
+            previous_end + 1,
+            lines.len(),
+        ));
+    }
 }
 
 /// Deterministic depth-1 in/out edges of one anchor, rendered for a card
@@ -248,6 +355,47 @@ mod tests {
         let error = super::build(repo.path(), &conn, &candidates.candidates)
             .expect_err("changed file must be rejected");
         assert!(error.to_string().contains("changed since indexing"));
+        Ok(())
+    }
+
+    #[test]
+    fn design_pack_keeps_complete_candidate_spans_and_omits_unrelated_source() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = (1..=80)
+            .map(|line| {
+                if line == 40 {
+                    "export function target() { return 40; }".to_string()
+                } else {
+                    format!("const line{line} = {line};")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(repo.path().join("large.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let candidate = crate::semantic::WorkflowCandidate {
+            anchor: "sym:large.ts#::target@1".into(),
+            display_name: "target".into(),
+            file: "large.ts".into(),
+            evidence_start_line: 40,
+            evidence_end_line: 40,
+            relevance: 1.0,
+            seed: true,
+        };
+
+        let pack = super::build_titled_design(
+            repo.path(),
+            &conn,
+            &[candidate],
+            "Design evidence candidates",
+        )?;
+        assert!(pack.rendered.contains("   40 | export function target()"));
+        assert!(pack.rendered.contains("omitted source lines 1-27"));
+        assert!(pack.rendered.contains("omitted source lines 53-80"));
+        assert!(!pack.rendered.contains("    1 | const line1"));
+        assert_eq!(pack.files["large.ts"].line_count, 80);
         Ok(())
     }
 

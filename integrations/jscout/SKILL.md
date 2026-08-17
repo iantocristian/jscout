@@ -15,6 +15,9 @@ questions, then verify decisive claims in source.
 - Before editing a causal regression, multi-mechanism defect, or cross-file
   behavioral feature, call `design_task` with the original task statement and
   any exact anchors already localized. Do not propose a patch inside the task.
+  If the call must be retried, preserve the original task text exactly and
+  adjust only localization bounds or exact seeds; never promote a tentative
+  mechanism into the task statement.
   Inspect the returned mechanism, detection channel, cure semantics,
   touchpoints, invariants, and validation oracle; if the result is unresolved
   or incomplete, localize the missing evidence before editing.

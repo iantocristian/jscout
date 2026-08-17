@@ -768,7 +768,7 @@ enum ScoutCommand {
         /// Maximum graph/search localization seeds
         #[arg(long, default_value_t = scouting::design::DEFAULT_SEED_LIMIT)]
         seed_limit: usize,
-        /// Maximum full-source evidence files
+        /// Maximum bounded candidate-source evidence files
         #[arg(long, default_value_t = scouting::design::DEFAULT_FILE_LIMIT)]
         file_limit: usize,
         /// Deterministic graph traversal depth

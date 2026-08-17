@@ -510,8 +510,9 @@ model.
 `jscout scout design <root> --task TEXT` is the explicit design-before-edit
 surface for causal, cross-file, or architecturally ambiguous work. It starts
 from the behavioral task statement, uses hybrid search plus bounded structural
-traversal to construct a closed, full-source evidence pack, and asks the model
-for competing mechanisms, detection signals/channels, cure semantics,
+traversal to construct a closed evidence pack containing complete candidate
+declarations with line-numbered surrounding windows, and asks the model for
+competing mechanisms, detection signals/channels, cure semantics,
 touchpoints, propagation, invariants, and a validation oracle—not a patch.
 Optional repeatable `--seed` values must be exact current `sym:` anchors. All
 search, seed, file, graph, candidate, context, and response bounds are explicit;
