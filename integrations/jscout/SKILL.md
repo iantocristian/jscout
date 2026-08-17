@@ -9,7 +9,9 @@ Use jscout as the primary localization interface for unfamiliar repository
 questions, then verify decisive claims in source.
 
 - On a cold repository, call `repository_overview` once. Keep its deterministic
-  inventory separate from the optional untrusted `semantic_overlay`.
+  inventory separate from the optional untrusted `semantic_overlay`. Scope rows
+  are compact by default; request one exact `reconnaissance_subject` with
+  `reconnaissance_detail=true` only when its full cited explanation matters.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
   `semantic_memory`. Use its `anchor` or `related_to` filters for code-to-memory
   joins and `include_source=true` for hash-verified evidence drill-down.
@@ -19,7 +21,10 @@ questions, then verify decisive claims in source.
   `budget_omitted` is positive, retrieve it with `semantic_memory` instead of
   widening the combined search response. `candidate_pool` is the bounded
   lexical/vector retrieval pool, not a count of relevant matches; its lexical
-  and vector-cosine score signals are diagnostics, not probabilities.
+  and vector-cosine score signals are diagnostics, not probabilities. Attached
+  previews require direct, bounded-graph, or artifact-relation evidence to the
+  returned code. `no_connected_memory` is honest absence from that attachment,
+  not proof that broad semantic memory has no relevant artifact.
 - For selected current, fresh concepts, use the returned `concept_tags` as
   deterministic file/chunk localization hints. They follow fingerprinted
   concept-to-child claims and derive from the child's exact support-span
@@ -35,6 +40,10 @@ questions, then verify decisive claims in source.
 - For blast-radius, multi-hop, or workflow questions, use
   `semantic_search` with `expand=true` and a small depth/budget.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
+  When a search hit includes `followups`, copy its complete `arguments` object
+  unchanged into one of the named tools; do not shorten or reinterpret the
+  opaque anchor. Exact anchor mode preserves same-named methods. Use fuzzy
+  `symbol` mode only for a human-authored name query.
 - Use `file_outline` after localizing a file when the relevant symbol is still
   unclear; go directly to `definition` when the exact symbol is already known.
   Use `events` for string-keyed emit/listener wiring.

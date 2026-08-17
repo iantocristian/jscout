@@ -250,9 +250,13 @@ output presents the effective role without adding a second metadata field.
 `jscout overview` and MCP `repository_overview` attach a bounded, explicitly
 untrusted `reconnaissance` section whenever current classifications exist. It
 prioritizes mixed/unknown/conflicting scopes and includes role counts, effective
-file counts, explanations, citation IDs, and bounded evidence excerpts. Use
-`--reconnaissance-limit` or MCP `reconnaissance_limit` to cap it; set the limit
-to `0` to omit reconnaissance from the response.
+file counts, scope identity, confidence, policy, conflicts, a one-line reason,
+and citation count. Full explanations, citation IDs, and bounded evidence
+excerpts are opt-in: pass the exact returned subject to
+`--reconnaissance-subject SUBJECT --reconnaissance-detail` (MCP:
+`reconnaissance_subject` plus `reconnaissance_detail=true`). Use
+`--reconnaissance-limit` or MCP `reconnaissance_limit` to cap the compact
+inventory; set the limit to `0` to omit reconnaissance from the response.
 
 ## TypeScript checker enrichment
 
@@ -492,10 +496,18 @@ anchor, direct relation, or historical artifact id. Current artifacts are the
 default; an exact historical id reports `current: false` and its
 `superseded_by` successor.
 
-`semantic_search` attaches only compact memory previews: artifact identity, a
-short purpose/overview/description/claim, freshness, retrieval signals, and one
-evidence locator. Full bodies, relations, and evidence belong to
-`semantic_memory`.
+`semantic_search` attaches only compact, evidence-connected memory previews:
+artifact identity, a short purpose/overview/description/claim, freshness,
+retrieval signals, and one evidence locator. An artifact is eligible only when
+its support is in a returned hit or enclosing file, within the bounded
+likely/certain memory graph path, or directly related to an artifact connected
+that way. Text/vector similarity ranks candidates inside those tiers; it cannot
+promote an unrelated generic card over direct evidence. `memory_depth` and
+`memory_nodes` (CLI: `--memory-depth`, `--memory-nodes`) are explicit,
+widenable bounds. `attachment.status: "no_connected_memory"` means the broad
+semantic candidate pool had no evidence connection to the returned code; use
+`semantic_memory` for unconstrained discovery. Full bodies, relations, and
+evidence always belong to `semantic_memory`.
 Annotations preview their required `claim` field. The envelope reports the
 bounded `candidate_pool`, previews `selected` before the response budget,
 actual `returned`, and `budget_omitted`; the pool is not a count of relevant
@@ -504,6 +516,13 @@ diagnostic signals, not calibrated probabilities. A degraded vector status and
 the follow-up tool remain visible when memory exists even if the query has no
 lexical matches; the envelope also survives when the byte budget removes every
 selected preview.
+
+Compact code hits include copy-safe follow-up arguments. Symbol anchors and
+their snapshot can be passed unchanged to `definition`, `who_uses`, or
+`neighborhood`; file-only hits expose only `file_outline` and `neighborhood`.
+Exact `definition`/`who_uses` anchor mode is mutually exclusive with their
+human-authored fuzzy `symbol` mode and preserves same-named methods instead of
+round-tripping through a lossy `path:name` shorthand.
 
 When an interactive `annotate` call starts with a healthy semantic vector
 index, jscout embeds the new document and incrementally synchronizes that
@@ -542,8 +561,9 @@ inventory from one pinned SQLite read snapshot. Generated memory is absent by
 default. `--semantic`/`include_semantic=true` adds a separately labelled,
 untrusted overlay containing only current artifacts whose computed freshness is
 `fresh`; cards require explicit type selection. Whole-response byte budgets
-drop overlay artifacts before deterministic inventory and report every
-omission. Generated prose never changes search scores.
+drop overlay artifacts and detailed reconnaissance before deterministic
+inventory and report every omission. Generated prose never changes search
+scores.
 
 ## Configuration
 
@@ -699,6 +719,13 @@ diagnostic metadata, empty fields, and repeated defaults. Search
 `--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
 full diagnostic representation.
 
+Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
+`arguments` object accepted unchanged by `definition`, `who_uses`, and
+`neighborhood`; ambiguous chunks return candidate-specific objects. A
+file-only hit exposes only `file_outline` and `neighborhood`. The snapshot is
+part of the arguments so stale exact anchors re-resolve by path/scope/name or
+fail closed instead of silently binding to a same-named declaration.
+
 `--response-bytes` caps whichever complete JSON representation was requested:
 hits, expansion, budget metadata, and serialization overhead. The result
 reports its actual `rendered_bytes`, original `unbudgeted_bytes`, and omitted
@@ -711,10 +738,11 @@ expansion node, edge, and payload limits are subordinate budgets shared across
 all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
 use `possible` only when explicit unresolved candidates are useful.
 
-Matching semantic memory is attached to CLI and structural-profile search by
-default; use `--no-memory` or `--memory-limit` to control it. Every artifact carries
-evidence supports and a computed `fresh`, `degraded`, or `stale` label. The
-complete response-byte limit includes semantic artifacts.
+Evidence-connected semantic memory is attached to CLI and structural-profile
+search by default; use `--no-memory` or `--memory-limit` to control it, and
+`--memory-depth`/`--memory-nodes` to widen its reported structural join bounds.
+Every artifact carries evidence supports and a computed `fresh`, `degraded`,
+or `stale` label. The complete response-byte limit includes semantic artifacts.
 
 `jscout index` reparses the current checkout instead of carrying cheap
 structural rows across snapshots. It preserves content-hash embedding cache

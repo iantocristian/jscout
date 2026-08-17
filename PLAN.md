@@ -1,12 +1,12 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-13.
+> Status: authoritative plan as of 2026-08-17.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
-> snapshot simplification is in progress. Semantic v1 has reached its
-> implementation boundary; product-value testing remains paused until the
-> engineering verification gate below is green.
+> snapshot simplification, G13 repository reconnaissance, and G14 retrieval
+> handoff are implemented; G12 watcher coordination remains planned. G15
+> design-before-edit task memory is the next fixed-snapshot milestone.
 
 ## Document policy
 
@@ -163,7 +163,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v21; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v23; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -1420,6 +1420,258 @@ neutral inclusion only for the affected subject/ancestors; returning to an
 identical fingerprint reuses the prior classification; and depth, subject,
 call, and context limits terminate mixed subdivision deterministically.
 
+## Implemented G14 — retrieval handoff and relevance discipline
+
+G14 is retrieval hygiene, not a claim that more retrieval will solve complex
+implementation tasks. The optimistic-prefetch replays established both sides
+of that boundary: compact hybrid search localized the relevant subsystem and
+fresh vector-backed semantic artifacts reached the agents, while implementation
+still converged on the same incomplete one-file repair. G14 fixes concrete
+transport and selection defects exposed by those runs without increasing
+default response budgets or generating more semantic material.
+
+### Copy-safe drill-down
+
+Every compact search hit with a resolvable target must include bounded,
+ready-to-use follow-up argument objects for the tools that can consume it. For
+example:
+
+```json
+{
+  "at": "packages/app/cache.ts:120-180",
+  "anchor": "sym:packages/app/cache.ts#Cache::invalidate@1",
+  "followups": {
+    "tools": ["definition", "who_uses", "neighborhood"],
+    "arguments": {
+      "anchor": "sym:packages/app/cache.ts#Cache::invalidate@1",
+      "snapshot": "<current-snapshot>",
+      "origins": ["repository"]
+    }
+  }
+}
+```
+
+G14 extends `definition` and `who_uses` with mutually exclusive exact
+`anchor`/optional `snapshot` inputs while retaining their current fuzzy
+`symbol` lookup for human-authored queries. Exact-anchor mode resolves the
+snapshot node directly; it does not round-trip through the lossy
+`path-substring:name` parser, which cannot distinguish same-named methods in one
+file. The emitted keys and values must be the exact G14 MCP schema, not
+descriptive pseudocode. File-only hits expose only file-compatible follow-ups.
+Ambiguous hits expose candidate-specific objects or no object; jscout never
+manufactures a convenient unique alias. Follow-ups share the parent response
+budget and may be shed from lower-ranked hits before source locators or primary
+hit identity. The compact shared `arguments` object is valid for every named
+tool; file-only follow-ups use per-tool call objects where schemas differ.
+Agents remain free to widen tool budgets, but should never need to retype or
+shorten an opaque anchor.
+
+### Compact overview drill-down
+
+`repository_overview` currently spends roughly 20 KB on a large repository
+before task localization. Its default form must retain deterministic totals,
+top-level areas, current reconnaissance roles, freshness state, conflicts, and
+the explicit re-scout action while reducing repeated explanations and evidence
+objects. A scope row carries a one-line reason and citation count by default.
+Exact explanations and cited evidence remain available through an explicit
+scope/detail request on the same tool; an agent may raise `response_bytes` when
+it needs a broader inventory. Budget shedding removes detailed reconnaissance
+before deterministic repository identity and always reports omissions.
+
+### Evidence-connected attached memory
+
+Search-attached memory is a preview of memory relevant to the returned code,
+not a second unconstrained semantic search. Selection therefore proceeds in
+this order:
+
+1. artifacts with exact support in a returned hit or its enclosing file;
+2. artifacts whose support is within a bounded structural path of a top hit;
+3. artifacts directly related to an artifact selected by the first two rules.
+
+Text/vector similarity orders candidates inside those evidence-connected
+tiers; it does not promote a generic semantically similar card over a directly
+supported artifact. Artifact type and support-anchor diversity break ties so
+four previews do not restate one symbol. If no artifact is connected, attached
+memory is omitted with an explicit `no_connected_memory` status. The separate
+`semantic_memory` tool remains the place for broad lexical/vector discovery
+and continues to report its candidate pool and retrieval modes. The structural
+join defaults to depth 2 and 2,000 visited nodes. Both bounds are explicit and
+widenable per search, with depth capped at 8 and nodes at 20,000; truncation is
+reported in the attachment status.
+
+### G14 acceptance
+
+- every emitted follow-up object round-trips through its named MCP tool on
+  symbols, methods, modules, and file-only hits; ambiguous targets remain
+  visible candidates;
+- the anchor shorthand invented in the optimistic-prefetch replay is never
+  emitted by jscout, while the exact returned object resolves without the agent
+  interpreting it;
+- overview honors one complete response-byte budget, preserves deterministic
+  identity under truncation, and retrieves a scope's full explanation only on
+  explicit request;
+- attached memory prefers direct support and bounded graph proximity over a
+  higher vector score from an unrelated area, and honestly returns none when
+  no connected artifact exists;
+- compact/debug representations remain fact-equivalent, and all tests use
+  deterministic fixtures without model calls.
+
+## Planned G15 — design-before-edit task memory
+
+G15 addresses a different bottleneck from retrieval. In the
+optimistic-prefetch campaign, one read-only Sol architecture probe received the
+same anchor-free task story as the implementation agents and produced the
+missing mechanism, detection axes, cure semantics, and cross-file intervention
+site. Across 46 implementation arms, two models, multiple retrieval profiles,
+forced and unforced use, and live semantic memory, that mechanism was never
+generated. Agents localized relevant code and sometimes received `cache.ts`
+memory, then collapsed into an edit/verify loop around
+`optimistic-routes.ts`.
+
+The product consequence is a first-class design phase whose result survives
+implementation pressure. G15 does not merely summarize more source. It makes a
+task-specific hypothesis artifact before editing, stores it in the semantic
+plane, and provides a compact, explicit handoff during implementation.
+
+### Product surface
+
+The initial surface is an explicit command and two structural-profile MCP
+tools:
+
+```text
+jscout scout design ROOT --task TEXT [--seed ANCHOR ...] [--dry-run]
+
+design_task(task, seeds?, budgets?) -> validated design artifact
+implementation_brief(design_id, response_bytes?) -> compact pinned handoff
+```
+
+The command is opt-in generative work through the existing pi-ai gateway. It
+never runs during `index`, plain search, or plain watch. Seeds are optional
+because hard tasks may begin anchor-free; when supplied, they must be exact
+current anchors. Dry-run prints the deterministic localization/evidence plan
+and estimated calls without invoking a model.
+
+### Bounded design evidence pack
+
+The design scout starts from the task statement, not from a proposed patch. It
+builds one fingerprinted, bounded evidence pack from:
+
+- deterministic and hybrid search hits for the task language;
+- exact supplied seeds and their enclosing symbols/files;
+- bounded callers, callees, entities, runtime boundaries, paths, and contract
+  edges around the strongest anchors;
+- current checker facts and evidence-connected semantic artifacts when
+  available;
+- exact source spans and hashes for every cited candidate.
+
+File roles and origins apply before budgets. Production evidence is retained
+before tests/fixtures, while relevant tests remain labelled evidence of the
+oracle rather than implementation truth. Every configured node, edge, source,
+subject, model-call, and response-byte limit is reported and can be widened by
+the requestor. Reaching a limit produces visible omissions, never an implied
+complete repository model.
+
+### Design-mode schema
+
+The model is asked for a design, not a patch. The prompt and output schema have
+no diff or replacement-code field and require reasoning in this order:
+
+1. candidate defect/feature mechanisms and evidence that would distinguish or
+   falsify them;
+2. selected mechanism, or an explicit unresolved candidate set;
+3. runtime detection signals and the observation channel carrying each signal;
+4. cure semantics and invariants, including why retry, invalidation, backoff,
+   fallback, or propagation behavior is correct where applicable;
+5. affected files/symbols and the responsibility of each touchpoint;
+6. cross-file state/control/data propagation required by the design;
+7. validation oracle, regression risks, and unresolved questions.
+
+Mechanism, detection, cure, and touchpoint claims require exact evidence
+supports. Test evidence may establish required behavior but cannot alone prove
+an implementation claim. Unsupported certainty, missing citations, unknown
+anchors, an over-budget response, or an evidence/snapshot race fails
+publication. Model-authored designs remain `likely` or `possible`, never
+`certain`.
+
+### Task-design artifact and lifecycle
+
+`design_task` publishes a new `design` semantic artifact through the existing
+run/support/fingerprint engine. Its identity includes the normalized task,
+ordered seed anchors, deterministic evidence-pack hashes, prompt/schema/model
+policy, and localization algorithm version. Repeating the same task on the
+same evidence reuses the artifact without another model call. Evidence drift
+marks it degraded or stale; refresh creates an immutable successor.
+
+Design artifacts do not enter ordinary search-attached memory or repository
+overview by default. They are task-scoped and retrieved by exact artifact ID,
+an explicitly activated task, or a direct relation. This prevents one-off
+debugging hypotheses from polluting general repository memory. A stale design
+remains readable with its original evidence and a visible label so the
+implementation agent can understand the historical decision rather than lose
+it as soon as it edits a cited file.
+
+### Implementation handoff and gating boundary
+
+`implementation_brief` preserves, in order, the selected mechanism, detection
+signals, cure semantics, touchpoints, invariants, and validation oracle. It
+then includes copy-safe G14 follow-ups to current source. Under byte pressure it
+sheds alternatives, prose, and source excerpts before those fields. Reading a
+brief is recorded in request telemetry, and a later design revision is an
+immutable successor rather than an in-place mutation.
+
+The shipped agent guide establishes the workflow contract for non-trivial,
+cross-file behavioral work:
+
+```text
+localize -> design_task -> inspect/approve design -> implementation_brief
+         -> edit/verify -> optionally publish a design successor
+```
+
+jscout cannot prevent an arbitrary coding client from invoking shell or edit
+tools. It therefore must not claim universal edit locking. Clients and
+evaluation harnesses that can gate mutation may require a valid design ID
+before enabling edit tools; other clients receive guidance plus telemetry that
+shows whether design and handoff occurred before the first observed jscout
+implementation query. The jscout product primitive is the validated persistent
+design and explicit handoff, not a false cross-client sandbox guarantee.
+
+This surface supports three later orchestration policies without baking them
+into the gateway: one agent designs then implements; a read-only designer hands
+off to a separate implementer; or an implementation session activates a design
+already stored in jscout. G15 implements the third as the durable common layer.
+The pi-ai gateway remains a bounded schema-call adapter, not an autonomous
+tool-using coding agent.
+
+### G15 acceptance
+
+- identical task/evidence inputs reuse one immutable design; evidence changes
+  visibly degrade/stale it and refresh publishes one successor;
+- every design claim and touchpoint traces to hash-verified source or labelled
+  behavioral test evidence, with no partial publication on model, validation,
+  cancellation, or snapshot failure;
+- an anchor-free fixture can localize a bounded evidence pack, while exact
+  seeds constrain rather than silently replace that pack;
+- the brief remains within its complete response budget and retains mechanism,
+  detection, cure, touchpoints, and oracle before optional material;
+- task designs remain absent from unrelated search/overview responses and are
+  retrievable by exact ID or activated task;
+- fake-gateway tests cover schema rejection, unresolved mechanisms, reuse,
+  refresh, cancellation, and design-to-brief round trips without paid calls;
+- after G14, G15, and the remaining engineering roadmap are implemented, the
+  product evaluation compares implementation-only, single-agent two-phase,
+  and persisted designer-to-implementer handoff. Correctness and mechanism
+  retention are primary; token and wall-time cost are secondary.
+
+### Out of scope for G15
+
+- autonomous source edits or test execution by the gateway;
+- pretending jscout can lock edit tools in clients it does not control;
+- treating a design as deterministic graph truth;
+- automatically generating a design for every simple lookup or local edit;
+- attaching task-specific designs to unrelated repository search;
+- using more global card generation or larger response budgets as a substitute
+  for hypothesis formation.
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -1435,6 +1687,7 @@ consequences that still govern implementation.
 | Fixed-snapshot workflow memory replay delivered artifacts in every correct warm token win and reduced median session-2 tokens | Keep evidence-backed workflow memory opt-in and proceed with the shared semantic engine |
 | Free-form workflow participant synthesis omitted deterministic continuations | Candidate closure and exhaustive classification are mandatory |
 | Standalone `neighborhood` had no natural selection while expanded search used the same machinery | Treat neighborhood as drill-down plumbing; prioritize agent-reached surfaces |
+| Optimistic-prefetch memory replays delivered fresh vector-backed context but 46 implementation arms never generated the mechanism found by one read-only architecture probe | Treat retrieval polish as G14 hygiene; make hypothesis generation and persistent design-to-implementation handoff the separate G15 product surface |
 
 Relevant result summaries include:
 
@@ -1451,6 +1704,7 @@ Relevant result summaries include:
 - [logical workflow routing](eval/results/workflow-logical-routing-2026-08-10.md)
 - [dependency indexing](eval/results/dependency-indexing-2026-08-10.md)
 - [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
+- [Next.js optimistic-prefetch campaign](eval/results/next-optimistic-prefetch-2026-08-15.md)
 
 ## Positioning versus tsserver/LSP
 
