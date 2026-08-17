@@ -20,7 +20,53 @@ const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
-static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+static CANCELLATION_FLAGS: CancellationFlags = CancellationFlags::new();
+
+struct CancellationFlags {
+    interrupt: AtomicBool,
+    operation: AtomicBool,
+    operation_delivered: AtomicBool,
+}
+
+impl CancellationFlags {
+    const fn new() -> Self {
+        Self {
+            interrupt: AtomicBool::new(false),
+            operation: AtomicBool::new(false),
+            operation_delivered: AtomicBool::new(false),
+        }
+    }
+
+    fn reset(&self) {
+        self.interrupt.store(false, Ordering::SeqCst);
+        self.operation.store(false, Ordering::SeqCst);
+        self.operation_delivered.store(false, Ordering::SeqCst);
+    }
+
+    fn request_interrupt(&self) -> bool {
+        !self.interrupt.swap(true, Ordering::SeqCst)
+    }
+
+    fn request_operation_cancel(&self) -> bool {
+        !self.operation.swap(true, Ordering::SeqCst)
+    }
+
+    fn operation_cancel_delivered(&self) -> bool {
+        self.operation_delivered.load(Ordering::SeqCst)
+    }
+
+    fn mark_operation_cancel_delivered(&self) {
+        self.operation_delivered.store(true, Ordering::SeqCst);
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        self.interrupt.load(Ordering::SeqCst)
+    }
+
+    fn cancellation_pending(&self) -> bool {
+        self.interrupt_pending() || self.operation.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug)]
 pub enum CheckerError {
@@ -113,9 +159,13 @@ fn handle_interrupt() {
 }
 
 fn request_interrupt_cancellation() -> bool {
-    if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
+    if !CANCELLATION_FLAGS.request_interrupt() {
         return false;
     }
+    cancel_active_request()
+}
+
+fn cancel_active_request() -> bool {
     let control = INTERRUPT_CONTROL
         .lock()
         .ok()
@@ -126,11 +176,19 @@ fn request_interrupt_cancellation() -> bool {
         .unwrap_or(false)
 }
 
-/// Cancel the active request for an in-process watcher generation. Setting the
-/// pending bit also stops enrichment at its next project boundary when the
-/// sidecar has not yet registered an active request.
+/// Cancel an in-process watcher generation without impersonating operator
+/// SIGINT. The separate pending bit also stops enrichment at its next project
+/// boundary when the sidecar has not yet registered an active request.
 pub fn cancel_active_operation() -> bool {
-    request_interrupt_cancellation()
+    CANCELLATION_FLAGS.request_operation_cancel();
+    if CANCELLATION_FLAGS.operation_cancel_delivered() {
+        return false;
+    }
+    let canceled = cancel_active_request();
+    if canceled {
+        CANCELLATION_FLAGS.mark_operation_cancel_delivered();
+    }
+    canceled
 }
 
 /// Start one top-level checker operation. Per-project sidecars may replace the
@@ -138,12 +196,16 @@ pub fn cancel_active_operation() -> bool {
 /// canceled an earlier project in the same operation.
 pub(crate) fn begin_interrupt_scope() -> Result<(), CheckerError> {
     install_interrupt_handler()?;
-    INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+    CANCELLATION_FLAGS.reset();
     Ok(())
 }
 
 pub(crate) fn interrupt_pending() -> bool {
-    INTERRUPT_PENDING.load(Ordering::SeqCst)
+    CANCELLATION_FLAGS.interrupt_pending()
+}
+
+pub(crate) fn cancellation_pending() -> bool {
+    CANCELLATION_FLAGS.cancellation_pending()
 }
 
 fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
@@ -542,6 +604,24 @@ done
         let checker = ProcessChecker::spawn(Path::new("/bin/sh"), &script, directory.path())
             .expect("spawn fake");
         (directory, checker)
+    }
+
+    #[test]
+    fn watcher_cancellation_is_distinct_from_operator_interrupt() {
+        let flags = CancellationFlags::new();
+        assert!(flags.request_operation_cancel());
+        assert!(flags.cancellation_pending());
+        assert!(!flags.interrupt_pending());
+        assert!(!flags.request_operation_cancel());
+        assert!(!flags.operation_cancel_delivered());
+        flags.mark_operation_cancel_delivered();
+        assert!(flags.operation_cancel_delivered());
+
+        assert!(flags.request_interrupt());
+        assert!(flags.interrupt_pending());
+        flags.reset();
+        assert!(!flags.cancellation_pending());
+        assert!(!flags.operation_cancel_delivered());
     }
 
     #[test]

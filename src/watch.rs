@@ -712,12 +712,21 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             );
                         }
                         Err(error) => {
+                            let interrupted = checker::process::interrupt_pending();
+                            let superseded = coordinator.is_superseded(work);
                             eprintln!(
-                                "watch generation={} phase=enrich status=failed elapsed_ms={} error={error:#}",
+                                "watch generation={} phase=enrich status={} elapsed_ms={} error={error:#}",
                                 work.generation,
+                                if interrupted {
+                                    "interrupted"
+                                } else if superseded {
+                                    "canceled"
+                                } else {
+                                    "failed"
+                                },
                                 phase_started.elapsed().as_millis()
                             );
-                            if checker::process::interrupt_pending() {
+                            if interrupted {
                                 eprintln!("watch status=stopped reason=interrupt");
                                 return Ok(());
                             }

@@ -336,7 +336,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut failed_projects = Vec::new();
 
     for (project_index, (project_id, occurrences)) in project_plan.iter().enumerate() {
-        if super::process::interrupt_pending() {
+        if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
         }
         if project_complete_and_fresh(&canonical_root, &conn, batch_id, project_id)? {
@@ -391,7 +391,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         }
     }
 
-    if super::process::interrupt_pending() {
+    if super::process::cancellation_pending() {
         bail!("checker enrichment interrupted before activation; staged work retained");
     }
 
@@ -442,7 +442,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
 }
 
 fn project_was_interrupted(error: &anyhow::Error) -> bool {
-    super::process::interrupt_pending() || canceled_checker_error(error)
+    super::process::cancellation_pending() || canceled_checker_error(error)
 }
 
 fn canceled_checker_error(error: &anyhow::Error) -> bool {
