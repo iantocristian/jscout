@@ -127,17 +127,27 @@ pub(crate) fn resolver_options(
 }
 
 /// Incrementally index a repository for differential implementation tests.
-/// No production command uses this path; both manual index and watch refresh
-/// the complete disposable snapshot.
 #[cfg(test)]
 pub fn index_repo(root: &Path, conn: &Connection) -> Result<IndexOutcome> {
     index_repo_with_options(root, conn, &IndexOptions::default())
 }
 
-/// Test-only incremental implementation retained to compare full-refresh
-/// output against the historical per-file replacement algorithm.
+/// Test convenience wrapper for the production incremental refresh.
 #[cfg(test)]
 pub fn index_repo_with_options(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    incremental_refresh_repo_with_options(root, conn, options)
+}
+
+/// Refresh the published snapshot by retaining unchanged first-party rows and
+/// replacing changed or missing files. This is a watch latency optimization:
+/// it still scans and hashes the complete current source tree, re-evaluates
+/// dependency ownership and module resolution, and publishes the same snapshot
+/// contract as a full refresh.
+pub fn incremental_refresh_repo_with_options(
     root: &Path,
     conn: &Connection,
     options: &IndexOptions,
@@ -156,7 +166,6 @@ pub fn refresh_repo_with_options(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum IndexMode {
     Incremental,
     FullRefresh,
@@ -254,6 +263,9 @@ fn index_repo_impl(
         let source = match std::fs::read_to_string(file) {
             Ok(source) => source,
             Err(error) => {
+                if let Some((old_id, _, _)) = existing.get(&rel) {
+                    store::delete_file(conn, *old_id)?;
+                }
                 outcome.record_failure(rel, "read", error);
                 continue;
             }
@@ -291,6 +303,9 @@ fn index_repo_impl(
                 outcome.refs += nrefs;
             }
             Err(e) => {
+                if let Some((old_id, _, _)) = existing.get(&rel) {
+                    store::delete_file(conn, *old_id)?;
+                }
                 outcome.record_failure(rel, "extract", e);
             }
         }
@@ -343,12 +358,10 @@ fn index_repo_impl(
     )?;
     let resolution = crate::structural::compute_resolution_hash(conn)?;
     let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
-    if mode == IndexMode::FullRefresh {
-        // Full extraction is disposable, but an exact-snapshot checker batch
-        // is still valid and expensive to reproduce. Old-snapshot batches
-        // are removed before projection can publish the new snapshot.
-        store::retain_checker_batches_for_snapshot(conn, &snapshot)?;
-    }
+    // An exact-snapshot checker batch is still valid and expensive to
+    // reproduce. Old-snapshot batches are removed before either refresh mode
+    // can publish the new snapshot.
+    store::retain_checker_batches_for_snapshot(conn, &snapshot)?;
     let current = ProjectionIdentity {
         snapshot: Some(snapshot.clone()),
         projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
@@ -1088,8 +1101,8 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        IndexOptions, index_repo, index_repo_with_options, index_repo_without_extraction_reset,
-        refresh_repo_with_options,
+        IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_options,
+        index_repo_without_extraction_reset, refresh_repo_with_options,
     };
     use crate::{embed, origin, query, search, semantic, store, structural};
 
@@ -2215,6 +2228,60 @@ mod tests {
             )?,
             0,
             "a checker batch must not survive a different structural snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_incremental_refresh_retires_old_checker_batches() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let snapshot = structural::current_snapshot(&conn)?;
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, created_at, active
+             ) VALUES(?1, '5.9.3', 'test', 'checker-fp', 1,
+                      '2026-01-01T00:00:00Z', 1)",
+            [&snapshot],
+        )?;
+
+        fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
+        incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM checker_enrichment_batches",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_read_failure_removes_the_stale_file_row() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = repo.path().join("main.ts");
+        fs::write(&source, "export const value = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+
+        fs::write(&source, [0xff, 0xfe])?;
+        let outcome =
+            incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE path='main.ts'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )?,
+            0
         );
         Ok(())
     }
