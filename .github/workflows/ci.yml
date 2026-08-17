@@ -63,6 +63,12 @@ jobs:
           cache-dependency-path: gateway/package-lock.json
       - name: Build self-contained release archive
         run: scripts/package-release.sh
+      - name: Validate npm launcher and package assembly
+        run: |
+          node --test npm/cli/test/launcher.test.mjs
+          node scripts/npm-package.mjs
+          npm pack --dry-run target/npm/cli
+          npm pack --dry-run target/npm/linux-x64-gnu
       - name: Smoke-test outside the checkout
         shell: bash
         run: |

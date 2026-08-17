@@ -25,6 +25,9 @@ Prebuilt binaries are published on npm as
 npm install -g @jscout/cli       # no compile step, no install script
 ```
 
+The GNU/Linux packages require glibc 2.31 or newer. Older GNU/Linux systems
+can build from source against their local libc.
+
 From a source checkout:
 
 ```bash

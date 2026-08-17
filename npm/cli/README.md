@@ -61,6 +61,9 @@ need no Python, no model downloads, and no GPU.
 
 `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`.
 
+The GNU/Linux packages require glibc 2.31 or newer. They are built and
+smoke-tested in that userspace rather than against the current runner image.
+
 Elsewhere, build from source with a Rust toolchain — the binary itself has no
 Node dependency.
 

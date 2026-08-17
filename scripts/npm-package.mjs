@@ -16,6 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const MINIMUM_GLIBC = "2.31";
 
 const TARGETS = new Map([
   ["aarch64-apple-darwin", { key: "darwin-arm64", os: "darwin", cpu: "arm64" }],
@@ -113,7 +114,9 @@ function buildPlatformPackage(target, version, outputRoot) {
   const manifest = {
     name: `@jscout/${descriptor.key}`,
     version,
-    description: `jscout binary for ${descriptor.key}`,
+    description: descriptor.libc
+      ? `jscout binary for ${descriptor.key} (glibc >= ${MINIMUM_GLIBC})`
+      : `jscout binary for ${descriptor.key}`,
     repository: {
       type: "git",
       url: "git+https://github.com/iantocristian/jscout.git",

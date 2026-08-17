@@ -24,25 +24,17 @@ env:
   NODE_VERSION: 22.19.0
 
 jobs:
-  binaries:
+  macos-binaries:
     name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
             native: true
           - target: x86_64-apple-darwin
-            runner: macos-14
             native: false
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            native: true
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            native: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -69,16 +61,62 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: npm-${{ matrix.target }}
+          path: target/npm
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # The npm packages promise this exact runtime floor. Building and running
+    # inside Bullseye prevents bundled C dependencies from binding to the
+    # newer glibc on the host runner.
+    container:
+      image: rust:1.97.1-bullseye@sha256:02d78ca3f928195c2a907543de778adfd728ad7e2a24fdc6aef582b7c77842e0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Verify the GNU/Linux compatibility floor
+        run: |
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.31"
+          rustc --version
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Assemble platform package
+        run: node scripts/npm-package.mjs --platform-only --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        run: |
+          binary="target/${{ matrix.target }}/release/jscout"
+          "$binary" --version
+          "$binary" index . --database "$RUNNER_TEMP/smoke.db"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.target }}
           # The whole directory, not a glob: the artifact root must stay
           # target/npm so each platform keeps its own subdirectory when the
-          # publish job merges all four.
+          # publish job merges all four artifacts from the two build jobs.
           path: target/npm
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish
-    needs: binaries
+    needs: [macos-binaries, linux-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
