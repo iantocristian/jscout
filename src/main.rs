@@ -737,7 +737,75 @@ enum ScoutCommand {
         #[arg(long)]
         gateway_path: Option<PathBuf>,
     },
-    /// Replace stale/degraded generated workflows, cards, summaries, and concepts using recorded inputs
+    /// Produce an evidence-backed, task-scoped design before implementation
+    Design {
+        /// Repository root (must be indexed)
+        root: PathBuf,
+        /// Behavioral task or defect statement
+        #[arg(long)]
+        task: String,
+        /// Exact current symbol anchors that must seed localization (repeatable)
+        #[arg(long = "seed")]
+        seeds: Vec<String>,
+        /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
+        #[arg(long)]
+        model: Option<String>,
+        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Explicit API billing/latency tier; rejected where unsupported
+        #[arg(long)]
+        service_tier: Option<String>,
+        /// Per-request wall-clock limit in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Maximum serialized evidence bytes sent to the model
+        #[arg(long, default_value_t = 240_000)]
+        context_bytes: usize,
+        /// Maximum initial hybrid search results
+        #[arg(long, default_value_t = scouting::design::DEFAULT_SEARCH_LIMIT)]
+        search_limit: usize,
+        /// Maximum graph/search localization seeds
+        #[arg(long, default_value_t = scouting::design::DEFAULT_SEED_LIMIT)]
+        seed_limit: usize,
+        /// Maximum full-source evidence files
+        #[arg(long, default_value_t = scouting::design::DEFAULT_FILE_LIMIT)]
+        file_limit: usize,
+        /// Deterministic graph traversal depth
+        #[arg(long, default_value_t = scouting::design::DEFAULT_GRAPH_DEPTH)]
+        graph_depth: usize,
+        /// Maximum graph nodes visited across seeds
+        #[arg(long, default_value_t = scouting::design::DEFAULT_GRAPH_NODE_LIMIT)]
+        graph_nodes: usize,
+        /// Maximum graph edges traversed across seeds
+        #[arg(long, default_value_t = scouting::design::DEFAULT_GRAPH_EDGE_LIMIT)]
+        graph_edges: usize,
+        /// Maximum evidence candidates
+        #[arg(long, default_value_t = scouting::design::DEFAULT_CANDIDATE_LIMIT)]
+        candidate_limit: usize,
+        /// Restrict localization/evidence to file roles (repeatable; omitted means all)
+        #[arg(long = "file-role")]
+        file_roles: Vec<String>,
+        /// Restrict localization/evidence to file origins (dependency is opt-in)
+        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        file_origins: Vec<String>,
+        /// Maximum rendered design bytes
+        #[arg(long, default_value_t = scouting::design::DEFAULT_RESPONSE_BYTES)]
+        response_bytes: usize,
+        /// Supersede a completed identical run instead of reusing it
+        #[arg(long)]
+        rebuild: bool,
+        /// Print exact localization/evidence inputs; make no model call
+        #[arg(long)]
+        dry_run: bool,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Gateway entry file for development and diagnostics
+        #[arg(long)]
+        gateway_path: Option<PathBuf>,
+    },
+    /// Replace stale/degraded generated workflows, cards, summaries, concepts, and designs using recorded inputs
     Refresh {
         /// Repository root (must be indexed)
         root: PathBuf,
@@ -1358,6 +1426,55 @@ fn main() -> Result<()> {
                     },
                 )
             }
+            ScoutCommand::Design {
+                root,
+                task,
+                seeds,
+                model,
+                reasoning,
+                service_tier,
+                timeout,
+                context_bytes,
+                search_limit,
+                seed_limit,
+                file_limit,
+                graph_depth,
+                graph_nodes,
+                graph_edges,
+                candidate_limit,
+                file_roles,
+                file_origins,
+                response_bytes,
+                rebuild,
+                dry_run,
+                database,
+                gateway_path,
+            } => cmd_scout_design(
+                &root,
+                database.as_deref(),
+                gateway_path.as_deref(),
+                dry_run,
+                response_bytes,
+                scouting::design::DesignScoutOptions {
+                    task,
+                    seeds,
+                    search_limit,
+                    seed_limit,
+                    file_limit,
+                    graph_depth,
+                    graph_node_limit: graph_nodes,
+                    graph_edge_limit: graph_edges,
+                    candidate_limit,
+                    file_roles,
+                    file_origins,
+                    model: llm::config::resolve_model(model.as_deref())?,
+                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                    service_tier,
+                    policy: llm::config::RequestPolicy::new(timeout, 1, context_bytes)?,
+                    rebuild,
+                    supersedes_artifact_id: None,
+                },
+            ),
             ScoutCommand::Refresh {
                 root,
                 artifacts,
@@ -1997,6 +2114,44 @@ fn cmd_scout_concepts(
     scout_batch_exit(&batch)
 }
 
+fn cmd_scout_design(
+    root: &Path,
+    database: Option<&Path>,
+    gateway_path: Option<&Path>,
+    dry_run: bool,
+    response_bytes: usize,
+    options: scouting::design::DesignScoutOptions,
+) -> Result<()> {
+    let conn = open_database_for_write(root, database)?;
+    let provider = embed::Provider::from_env()?;
+    let plan = scouting::design::plan(root, &conn, provider.as_ref(), &options)?;
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&scouting::design::dry_run_report(&plan, &options)?)?
+        );
+        return Ok(());
+    }
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let report = scouting::design::scout(root, &conn, &mut gateway, &options, plan)?;
+    let artifact_id = report.artifact_id;
+    let model_calls = usize::from(report.status != "reused");
+    let batch = scouting::ScoutBatchReport {
+        reports: vec![report],
+        model_calls,
+        ..scouting::ScoutBatchReport::default()
+    };
+    print_scout_batch(&batch);
+    scout_batch_exit(&batch)?;
+    if let Some(artifact_id) = artifact_id {
+        println!(
+            "{}",
+            scouting::design::render_design(&conn, artifact_id, response_bytes)?
+        );
+    }
+    Ok(())
+}
+
 fn cmd_scout_refresh(
     root: &Path,
     database: Option<&Path>,
@@ -2008,7 +2163,7 @@ fn cmd_scout_refresh(
     let conn = open_database_for_write(root, database)?;
     let selection = scouting::refresh::select(&conn, artifacts)?;
     if dry_run {
-        let plans = scouting::plan_refresh(root, &conn, &selection)?;
+        let plans = scouting::plan_refresh(root, &conn, &selection, &policy)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -2034,7 +2189,7 @@ fn cmd_scout_refresh(
         );
     }
     if selection.targets.is_empty() {
-        println!("no stale or degraded generated workflows, cards, or summaries to refresh");
+        println!("no stale or degraded generated semantic artifacts to refresh");
         return Ok(());
     }
     let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
@@ -2229,6 +2384,45 @@ mod main_tests {
             Cli::try_parse_from(["jscout", "scout", "repository", ".", "--max-calls", "0",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn design_scout_exposes_task_seeds_and_all_localization_bounds() {
+        let Cli { command } = Cli::try_parse_from([
+            "jscout",
+            "scout",
+            "design",
+            ".",
+            "--task",
+            "expire rejected predictions",
+            "--seed",
+            "sym:cache.ts#::reject@10",
+            "--graph-nodes",
+            "900",
+            "--response-bytes",
+            "20000",
+            "--dry-run",
+        ])
+        .expect("design scout parses");
+        let Command::Scout {
+            command:
+                ScoutCommand::Design {
+                    task,
+                    seeds,
+                    graph_nodes,
+                    response_bytes,
+                    dry_run,
+                    ..
+                },
+        } = command
+        else {
+            panic!("expected design scout")
+        };
+        assert_eq!(task, "expire rejected predictions");
+        assert_eq!(seeds, ["sym:cache.ts#::reject@10"]);
+        assert_eq!(graph_nodes, 900);
+        assert_eq!(response_bytes, 20_000);
+        assert!(dry_run);
     }
 
     #[test]

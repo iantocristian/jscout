@@ -12,6 +12,17 @@ questions, then verify decisive claims in source.
   inventory separate from the optional untrusted `semantic_overlay`. Scope rows
   are compact by default; request one exact `reconnaissance_subject` with
   `reconnaissance_detail=true` only when its full cited explanation matters.
+- Before editing a causal regression, multi-mechanism defect, or cross-file
+  behavioral feature, call `design_task` with the original task statement and
+  any exact anchors already localized. Do not propose a patch inside the task.
+  Inspect the returned mechanism, detection channel, cure semantics,
+  touchpoints, invariants, and validation oracle; if the result is unresolved
+  or incomplete, localize the missing evidence before editing.
+- Activate a completed design with `implementation_brief` using the exact
+  returned `design_id`, and retain that compact brief while editing and
+  verifying. Copy its follow-up argument objects unchanged. Task designs are
+  deliberately absent from ordinary search and repository overview, so do not
+  expect another query to rediscover the handoff implicitly.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
   `semantic_memory`. Use its `anchor` or `related_to` filters for code-to-memory
   joins and `include_source=true` for hash-verified evidence drill-down.
