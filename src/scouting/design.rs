@@ -26,7 +26,7 @@ use crate::semantic::{self, AnnotateInput, SupportInput, WorkflowCandidate};
 use crate::{origin, recon, search, store, structural};
 
 pub const PROMPT_VERSION: &str = "design-scout/v1";
-pub const PLANNING_VERSION: &str = "design-evidence/v2";
+pub const PLANNING_VERSION: &str = "design-evidence/v3";
 pub const SUBMIT_TOOL_NAME: &str = "submit_task_design";
 pub const DEFAULT_SEARCH_LIMIT: usize = 12;
 pub const DEFAULT_SEED_LIMIT: usize = 6;
@@ -345,6 +345,11 @@ fn plan_in_snapshot(
             "the task localized no exact symbol seeds; refine the task or provide --seed with a current search anchor"
         );
     }
+    let mandatory_seed_anchors = if options.seeds.is_empty() {
+        seeds.iter().take(1).cloned().collect::<HashSet<_>>()
+    } else {
+        options.seeds.iter().cloned().collect::<HashSet<_>>()
+    };
     if seeds.len() > options.seed_limit {
         bail!(
             "{} explicit design seeds exceed the configured seed limit {}",
@@ -448,7 +453,7 @@ fn plan_in_snapshot(
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.0.anchor.cmp(&right.0.anchor))
     });
-    let candidates_truncated = ranked.len() > options.candidate_limit;
+    let mut candidates_truncated = ranked.len() > options.candidate_limit;
     ranked.truncate(options.candidate_limit);
 
     let seed_files = ranked
@@ -478,58 +483,51 @@ fn plan_in_snapshot(
         bail!("design localization produced no evidence candidates");
     }
 
-    let mut evidence =
-        evidence::build_titled_design(root, conn, &candidates, "Design evidence candidates")?;
-    let mut evidence_file_policy = Vec::new();
-    for path in evidence.files.keys() {
-        let (role, file_origin): (String, String) = conn.query_row(
-            "SELECT role, origin FROM files WHERE path=?1",
-            [path],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        evidence_file_policy.push(DesignEvidenceFile {
-            path: path.clone(),
-            runtime_evidence: recon::effective_runtime(conn, Some(path), Some(&role))?,
-            role,
-            origin: file_origin,
-        });
-    }
-    evidence.rendered.push_str(
-        "\n## Evidence file policy\n\nRuntime evidence may support implementation claims. Test, fixture, generated, or documentary evidence may establish behavior or the oracle but cannot alone prove an implementation claim.\n",
-    );
-    for file in &evidence_file_policy {
-        evidence.rendered.push_str(&format!(
-            "- {}: role={}, origin={}, runtime_evidence={}\n",
-            file.path, file.role, file.origin, file.runtime_evidence
-        ));
-    }
-    evidence.rendered.push_str(
-        "\n## Structural context\n\nThese are deterministic likely/certain graph facts for the strongest seeds. They are localization context, not model-authored claims.\n",
-    );
-    for seed in seeds.iter().take(STRUCTURAL_CONTEXT_ANCHOR_LIMIT) {
-        let (context, _) = evidence::structural_context(conn, seed)?;
-        evidence
-            .rendered
-            .push_str(&format!("\n### Seed `{seed}`\n{context}"));
-    }
-    if !search_result.semantic_artifacts.is_empty() {
-        evidence.rendered.push_str(
-            "\n## Existing semantic leads\n\nUntrusted repository memory for localization only. Every design claim still requires exact numbered source evidence.\n",
-        );
-        for artifact in search_result
-            .semantic_artifacts
-            .iter()
-            .take(SEMANTIC_LEAD_LIMIT)
-        {
-            evidence.rendered.push_str(&format!(
-                "- artifact {} [{}; {}] {}: {}\n",
-                artifact.id,
-                artifact.artifact_type,
-                artifact.freshness,
-                artifact.name.as_deref().unwrap_or("unnamed"),
-                semantic_lead_preview(&artifact.body),
-            ));
+    // `context_bytes` is an input-selection budget, not merely a late refusal
+    // threshold. Drop the weakest optional candidates until the complete
+    // request fits. Explicit seeds always survive; when localization supplied
+    // every seed, the strongest one is retained as the mandatory root.
+    let (mut evidence, mut evidence_file_policy) = build_design_evidence(
+        root,
+        conn,
+        &candidates,
+        &seeds,
+        &search_result.semantic_artifacts,
+    )?;
+    loop {
+        let mut request = build_request_parts(&task, &candidates, &evidence, options)?;
+        let (_, request_bytes) =
+            super::reserve_output_and_measure(&mut request, candidates.len().max(1), None)?;
+        if request_bytes <= options.policy.context_bytes {
+            break;
         }
+        let Some(remove_at) = candidates
+            .iter()
+            .rposition(|candidate| !mandatory_seed_anchors.contains(&candidate.anchor))
+        else {
+            bail!(
+                "mandatory design evidence requires {request_bytes} bytes, exceeding the configured context budget {}; increase context_bytes or use narrower seed declarations",
+                options.policy.context_bytes
+            );
+        };
+        let removed = candidates.remove(remove_at);
+        if removed.seed {
+            seeds.retain(|seed| seed != &removed.anchor);
+        }
+        candidates_truncated = true;
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.file == removed.file)
+        {
+            files_truncated = true;
+        }
+        (evidence, evidence_file_policy) = build_design_evidence(
+            root,
+            conn,
+            &candidates,
+            &seeds,
+            &search_result.semantic_artifacts,
+        )?;
     }
 
     let report = DesignPlanReport {
@@ -624,6 +622,65 @@ fn semantic_lead_preview(body: &Value) -> String {
         preview.push('…');
     }
     preview
+}
+
+fn build_design_evidence(
+    root: &Path,
+    conn: &Connection,
+    candidates: &[WorkflowCandidate],
+    seeds: &[String],
+    semantic_artifacts: &[semantic::SemanticArtifact],
+) -> Result<(EvidencePack, Vec<DesignEvidenceFile>)> {
+    let mut evidence =
+        evidence::build_titled_design(root, conn, candidates, "Design evidence candidates")?;
+    let mut evidence_file_policy = Vec::new();
+    for path in evidence.files.keys() {
+        let (role, file_origin): (String, String) = conn.query_row(
+            "SELECT role, origin FROM files WHERE path=?1",
+            [path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        evidence_file_policy.push(DesignEvidenceFile {
+            path: path.clone(),
+            runtime_evidence: recon::effective_runtime(conn, Some(path), Some(&role))?,
+            role,
+            origin: file_origin,
+        });
+    }
+    evidence.rendered.push_str(
+        "\n## Evidence file policy\n\nRuntime evidence may support implementation claims. Test, fixture, generated, or documentary evidence may establish behavior or the oracle but cannot alone prove an implementation claim.\n",
+    );
+    for file in &evidence_file_policy {
+        evidence.rendered.push_str(&format!(
+            "- {}: role={}, origin={}, runtime_evidence={}\n",
+            file.path, file.role, file.origin, file.runtime_evidence
+        ));
+    }
+    evidence.rendered.push_str(
+        "\n## Structural context\n\nThese are deterministic likely/certain graph facts for the strongest seeds. They are localization context, not model-authored claims.\n",
+    );
+    for seed in seeds.iter().take(STRUCTURAL_CONTEXT_ANCHOR_LIMIT) {
+        let (context, _) = evidence::structural_context(conn, seed)?;
+        evidence
+            .rendered
+            .push_str(&format!("\n### Seed `{seed}`\n{context}"));
+    }
+    if !semantic_artifacts.is_empty() {
+        evidence.rendered.push_str(
+            "\n## Existing semantic leads\n\nUntrusted repository memory for localization only. Every design claim still requires exact numbered source evidence.\n",
+        );
+        for artifact in semantic_artifacts.iter().take(SEMANTIC_LEAD_LIMIT) {
+            evidence.rendered.push_str(&format!(
+                "- artifact {} [{}; {}] {}: {}\n",
+                artifact.id,
+                artifact.artifact_type,
+                artifact.freshness,
+                artifact.name.as_deref().unwrap_or("unnamed"),
+                semantic_lead_preview(&artifact.body),
+            ));
+        }
+    }
+    Ok((evidence, evidence_file_policy))
 }
 
 fn validate_options(options: &DesignScoutOptions) -> Result<()> {
@@ -1047,9 +1104,21 @@ fn current_design_for_key(conn: &Connection, key: &str) -> Result<Option<i64>> {
 }
 
 fn build_request(plan: &DesignPlan, options: &DesignScoutOptions) -> Result<CompleteRequest> {
-    let anchors = plan
-        .report
-        .candidates
+    build_request_parts(
+        &plan.report.task,
+        &plan.report.candidates,
+        &plan.evidence,
+        options,
+    )
+}
+
+fn build_request_parts(
+    task: &str,
+    candidates: &[WorkflowCandidate],
+    evidence: &EvidencePack,
+    options: &DesignScoutOptions,
+) -> Result<CompleteRequest> {
+    let anchors = candidates
         .iter()
         .map(|candidate| candidate.anchor.clone())
         .collect::<Vec<_>>();
@@ -1057,13 +1126,13 @@ fn build_request(plan: &DesignPlan, options: &DesignScoutOptions) -> Result<Comp
         .to_string();
     let user = format!(
         "Task:\n{}\n\nCandidate anchors are closed to this list:\n{}\n\nProduce the design before any editing begins.\n\n{}",
-        plan.report.task,
+        task,
         anchors
             .iter()
             .map(|anchor| format!("- {anchor}"))
             .collect::<Vec<_>>()
             .join("\n"),
-        plan.evidence.rendered,
+        evidence.rendered,
     );
     Ok(CompleteRequest {
         model: options.model.spec.clone(),
@@ -2215,6 +2284,49 @@ mod tests {
             attempts: 1,
             response_model: Some("model".into()),
         }
+    }
+
+    #[test]
+    fn context_budget_prunes_optional_design_evidence_before_the_model_call() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let mut source = String::new();
+        for function in 0..12 {
+            source.push_str(&format!("export function part{function}() {{\n"));
+            for line in 0..80 {
+                source.push_str(&format!(
+                    "  const value{line} = 'candidate-{function}-line-{line}-padding-padding-padding';\n"
+                ));
+            }
+            source.push_str("  return 1;\n}\n");
+        }
+        source.push_str("export function root() {\n  return ");
+        source.push_str(
+            &(0..12)
+                .map(|function| format!("part{function}()"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+        );
+        source.push_str(";\n}\n");
+        std::fs::write(repo.path().join("flow.ts"), source)?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let mut options = options("Understand the complete flow before changing its behavior");
+        options.seeds = vec!["sym:flow.ts#::root@1".into()];
+        options.policy = RequestPolicy::new(30, 1, 48_000)?;
+        let plan = super::plan(repo.path(), &conn, None, &options)?;
+        let report = super::dry_run_report(&plan, &options)?;
+
+        assert_eq!(report["would_call"], true);
+        assert!(report["request_bytes"].as_u64().unwrap() <= 48_000);
+        assert!(plan.report.candidates_truncated);
+        assert!(
+            plan.report
+                .candidates
+                .iter()
+                .any(|candidate| candidate.anchor == "sym:flow.ts#::root@1")
+        );
+        Ok(())
     }
 
     #[test]

@@ -527,6 +527,10 @@ must call `design_task`, then explicitly activate the returned ID with
 `implementation_brief`. The brief preserves mechanism, detection, cure,
 touchpoints, invariants, and oracle before optional material, includes
 copy-safe current-anchor follow-ups, and reports stale or unresolved anchors.
+`context_bytes` is an input-selection budget: the planner removes the weakest
+optional candidates until the serialized request fits while preserving every
+explicit seed. It fails only when the mandatory seed declarations themselves
+cannot fit.
 
 Generated workflows record their resolved seeds, traversal limits, service
 tier, model, and reasoning policy in the run ledger; cards record their

@@ -535,7 +535,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "reasoning": { "type": "string", "description": "Provider-normalized reasoning effort; defaults to JSCOUT_LLM_REASONING/provider default" },
                     "service_tier": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1, "default": 300 },
-                    "context_bytes": { "type": "integer", "minimum": 1, "default": 240000 },
+                    "context_bytes": { "type": "integer", "minimum": 1, "default": 240000, "description": "Maximum serialized design request bytes; optional candidates are pruned to fit while explicit seeds are retained" },
                     "search_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": scouting::design::DEFAULT_SEARCH_LIMIT },
                     "seed_limit": { "type": "integer", "minimum": 1, "maximum": 64, "default": scouting::design::DEFAULT_SEED_LIMIT },
                     "file_limit": { "type": "integer", "minimum": 1, "maximum": 64, "default": scouting::design::DEFAULT_FILE_LIMIT },
