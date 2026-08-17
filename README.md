@@ -348,9 +348,11 @@ actual Node error/stack in the command error as well as stderr.
 
 Every checker batch is bound to exactly one structural snapshot. Projection
 accepts it only when `source_snapshot` matches; there is no per-project
-cross-snapshot revalidation. `jscout index` deletes the old checker batch while
-preserving embeddings and semantic memory, so run `jscout enrich` after a full
-index when those occurrence-specific edges are needed.
+cross-snapshot revalidation. `jscout index` preserves a checker batch only when
+the rebuilt checkout produces the exact same structural snapshot; a changed
+snapshot deletes it while preserving embeddings and semantic memory. Run
+`jscout enrich` after a changed full index when those occurrence-specific edges
+are needed.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
 project-batched, resumable checker pass for the resulting snapshot. A newer
@@ -364,9 +366,11 @@ never starts Node.
 
 `jscout watch` subscribes before its startup pass and uses the same full
 disposable-snapshot refresh as `jscout index`. It does not carry per-file
-structural or checker state across generations. The default two-second trailing
-quiet period coalesces edits; an event received during any phase advances the
-desired generation and cannot be consumed by the phase already running.
+structural state across generations. Exact-snapshot checker facts may be reused
+when a rebuild proves that nothing structural changed; any changed snapshot
+drops them. The default two-second trailing quiet period coalesces edits; an
+event received during any phase advances the desired generation and cannot be
+consumed by the phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
 busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
@@ -374,16 +378,24 @@ backoff without waiting for another edit. Three identical per-file extraction
 failure sets expose the same visibly partial snapshot as manual `index`, mark
 the generation degraded, and continue optional phases; the default ten-minute
 reconciliation pass retries that coverage and repairs missed notifications.
+Its interval is measured from completion of the previous generation, avoiding
+back-to-back refreshes when a cycle itself is slow; a nonzero interval must be
+greater than the debounce period. A previously degraded, identical failure set
+can degrade immediately in later generations instead of paying three known-
+futile retries each time.
 Set `--reconcile-seconds 0` only when giving up that bounded recovery is
 acceptable.
 
-Database/WAL/SHM writes are excluded by exact path. Git HEAD/index,
+Database/WAL/SHM writes are excluded by exact path. For long-running watch,
+prefer an external `--database` path (or ensure the selected database family is
+gitignored) so broad staging commands cannot add it. Git HEAD,
 `.gitmodules`, selected dependency roots and locators, and external inputs from
 the latest checker batch are watched as additional invalidation boundaries.
-Branch switches therefore rebuild the complete current file set. During the
-structural transaction the published snapshot marker is absent, so concurrent
-queries may temporarily report that no snapshot is available; watch does not
-maintain a second database generation.
+Branch switches therefore rebuild the complete current file set. From the
+start of the structural reset through extraction, resolution, snapshot
+calculation, and graph publication, the published snapshot marker is absent,
+so concurrent queries may temporarily report that no snapshot is available;
+watch does not maintain a second database generation.
 
 ## Semantic scouting
 
