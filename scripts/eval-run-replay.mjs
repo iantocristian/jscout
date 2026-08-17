@@ -29,6 +29,42 @@ export const REPLAY_EXECUTION_POLICY = Object.freeze({
   webTools: false,
 });
 
+const NEXT_TEARDOWN_PRELOAD = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "eval-next-teardown-preload.cjs",
+);
+
+export function nodeOptionsWithNextTeardown(existing = "") {
+  const requireOption = `--require=${NEXT_TEARDOWN_PRELOAD}`;
+  const options = existing.trim();
+  if (options.split(/\s+/).includes(requireOption)) return options;
+  return options ? `${options} ${requireOption}` : requireOption;
+}
+
+// Codex launches configured MCP servers with the explicit server environment,
+// not the runner's complete process environment. Forward only jscout's
+// non-secret runtime selectors here; credentials remain outside argv/config.
+const JSCOUT_MCP_FORWARDED_ENV = Object.freeze([
+  "JSCOUT_PI_AI_GATEWAY",
+  "JSCOUT_NODE",
+  "JSCOUT_LLM_MODEL",
+  "JSCOUT_LLM_REASONING",
+  "JSCOUT_PI_AI_OPENAI_BASE_URL",
+]);
+
+export function jscoutMcpEnvironmentArgs(environment = {}) {
+  const args = [];
+  for (const name of JSCOUT_MCP_FORWARDED_ENV) {
+    const value = environment[name];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    args.push(
+      "--config",
+      `mcp_servers.jscout.env.${name}=${JSON.stringify(value)}`,
+    );
+  }
+  return args;
+}
+
 let activeChild = null;
 let activeBrowserChild = null;
 let activeWorkspace = null;
@@ -739,10 +775,11 @@ export function promptFor(task, treatment = "control", options = {}) {
     contract.push(
       "- Browser e2e tests work through a pre-connected browser endpoint: run",
       "  them with the repository's pnpm test scripts, e.g. HEADLESS=true",
-      "  NEXT_TEST_MODE=start pnpm testonly <path>. Avoid the pnpm",
-      "  test-start-turbo / test-dev-* wrappers; their teardown can hang for",
-      "  120s per run. Do not invoke node run-tests.js directly; it replaces",
-      "  the browser endpoint and will fail.",
+      "  NEXT_TEST_MODE=start pnpm testonly <path>. Prefer this direct command",
+      "  over test-start-turbo / test-dev-* wrappers so the pre-connected",
+      "  endpoint and per-command teardown stay under harness control. Do not",
+      "  invoke node run-tests.js directly; it replaces the browser endpoint",
+      "  and will fail.",
     );
   } else {
     contract.push(
@@ -996,6 +1033,7 @@ async function main() {
             "--config", `mcp_servers.jscout.env.JSCOUT_PROFILE_LABEL=${JSON.stringify(profile)}`,
             "--config", "mcp_servers.jscout.default_tools_approval_mode=\"approve\"",
           );
+          args.push(...jscoutMcpEnvironmentArgs(childEnvironment));
           if (embeddingEnvironmentForProfile(profile).JSCOUT_EMBED_PROVIDER) {
             args.push(
               "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
@@ -1006,10 +1044,23 @@ async function main() {
         const stderrPath = path.join(runDir, "stderr.log");
         const browserLog = path.join(runDir, "browser-server.log");
         const browser = await startBrowserServer(workspace, browserLog);
+        const processRegistry = path.join(
+          os.tmpdir(),
+          `jscout-eval-next-processes-${process.pid}-${crypto.randomUUID()}.jsonl`,
+        );
+        fs.writeFileSync(processRegistry, "");
         args.push(promptFor(task, treatment, { browserEndpoint: browser.endpoint }));
         fs.writeFileSync(
           path.join(runDir, "browser-server.json"),
-          `${JSON.stringify({ endpoint: browser.endpoint, log: browserLog }, null, 2)}\n`,
+          `${JSON.stringify({
+            endpoint: browser.endpoint,
+            log: browserLog,
+            next_teardown: {
+              strategy: "registered-pgrep-process-tree",
+              preload: NEXT_TEARDOWN_PRELOAD,
+              registry: "agent-process-registry.jsonl",
+            },
+          }, null, 2)}\n`,
         );
         process.stderr.write(`[${task.id}] ${profile}/${treatment} — live events: ${eventsPath}\n`);
         // sh wrapper raises the fd limit for codex and every inner agent
@@ -1031,6 +1082,8 @@ async function main() {
                 ...childEnvironment,
                 NEXT_TEST_BROWSER_WS_ENDPOINT: browser.endpoint,
                 HEADLESS: "true",
+                NODE_OPTIONS: nodeOptionsWithNextTeardown(childEnvironment.NODE_OPTIONS),
+                JSCOUT_EVAL_PROCESS_REGISTRY: processRegistry,
               },
               eventsPath,
               stderrPath,
@@ -1039,6 +1092,12 @@ async function main() {
           );
         } finally {
           await stopBrowserServer(browser.child);
+          const preservedRegistry = path.join(runDir, "agent-process-registry.jsonl");
+          try {
+            fs.copyFileSync(processRegistry, preservedRegistry);
+          } finally {
+            fs.rmSync(processRegistry, { force: true });
+          }
         }
         recordWorkspaceCleanup(workspace, runDir, "after-agent");
         if (result.interrupted) throwIfInterrupted();
