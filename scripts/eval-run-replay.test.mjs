@@ -12,6 +12,7 @@ import {
   embeddingEnvironmentForProfile,
   designPromptFor,
   implementationPromptFor,
+  jscoutMcpEnvironmentArgs,
   nodeOptionsWithNextTeardown,
   validateDesignResponse,
   profilePlan,
@@ -22,6 +23,22 @@ import {
   scoutPublishedArtifacts,
   countSemanticArtifacts,
 } from "./eval-run-replay.mjs";
+
+test("replay forwards non-secret jscout runtime selectors into the MCP server", () => {
+  assert.deepEqual(
+    jscoutMcpEnvironmentArgs({
+      JSCOUT_PI_AI_GATEWAY: "/opt/jscout/gateway/src/main.mjs",
+      JSCOUT_LLM_MODEL: "openai-codex:gpt-5.6-terra",
+      OPENAI_API_KEY: "must-not-enter-codex-config",
+    }),
+    [
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_PI_AI_GATEWAY="/opt/jscout/gateway/src/main.mjs"',
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_LLM_MODEL="openai-codex:gpt-5.6-terra"',
+    ],
+  );
+});
 
 test("Next teardown preload composes with existing NODE_OPTIONS", () => {
   const standalone = nodeOptionsWithNextTeardown();

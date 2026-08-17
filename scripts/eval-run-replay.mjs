@@ -43,6 +43,30 @@ export function nodeOptionsWithNextTeardown(existing = "") {
   return options ? `${options} ${requireOption}` : requireOption;
 }
 
+// Codex launches configured MCP servers with the explicit server environment,
+// not the runner's complete process environment. Forward only jscout's
+// non-secret runtime selectors here; credentials remain outside argv/config.
+const JSCOUT_MCP_FORWARDED_ENV = Object.freeze([
+  "JSCOUT_PI_AI_GATEWAY",
+  "JSCOUT_NODE",
+  "JSCOUT_LLM_MODEL",
+  "JSCOUT_LLM_REASONING",
+  "JSCOUT_PI_AI_OPENAI_BASE_URL",
+]);
+
+export function jscoutMcpEnvironmentArgs(environment = {}) {
+  const args = [];
+  for (const name of JSCOUT_MCP_FORWARDED_ENV) {
+    const value = environment[name];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    args.push(
+      "--config",
+      `mcp_servers.jscout.env.${name}=${JSON.stringify(value)}`,
+    );
+  }
+  return args;
+}
+
 let activeChild = null;
 let activeBrowserChild = null;
 let activeWorkspace = null;
@@ -857,6 +881,7 @@ function codexArgs({
   taskId,
   session,
   requestLog,
+  environment,
 }) {
   const args = [
     "exec",
@@ -902,6 +927,7 @@ function codexArgs({
         "--config", "mcp_servers.jscout.env.JSCOUT_EMBED_PROVIDER=\"local\"",
       );
     }
+    args.push(...jscoutMcpEnvironmentArgs(environment));
   }
   return args;
 }
@@ -1267,6 +1293,7 @@ async function main() {
             taskId: task.id,
             session: `${session}-design`,
             requestLog: designRequestLog,
+            environment: childEnvironment,
           });
           const designPrompt = designPromptFor(task, treatment);
           process.stderr.write(
@@ -1342,6 +1369,7 @@ async function main() {
             taskId: task.id,
             session: isTwoPhase ? `${session}-implementation` : session,
             requestLog: implementationRequestLog,
+            environment: childEnvironment,
           });
           const implementationPrompt = isTwoPhase
             ? implementationPromptFor(task, treatment, design, { browserEndpoint: browser.endpoint })
