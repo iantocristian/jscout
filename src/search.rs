@@ -1194,7 +1194,7 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
                 .hits
                 .iter_mut()
                 .rev()
-                .find(|hit| hit.include_followups)
+                .find(|hit| hit.include_followups && hit.anchors.len() <= 1)
         {
             hit.include_followups = false;
             result.response_budget.omitted_followups += 1;

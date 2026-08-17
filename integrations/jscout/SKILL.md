@@ -40,10 +40,13 @@ questions, then verify decisive claims in source.
 - For blast-radius, multi-hop, or workflow questions, use
   `semantic_search` with `expand=true` and a small depth/budget.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
-  When a search hit includes `followups`, copy its complete `arguments` object
-  unchanged into one of the named tools; do not shorten or reinterpret the
-  opaque anchor. Exact anchor mode preserves same-named methods. Use fuzzy
-  `symbol` mode only for a human-authored name query.
+  A symbol hit carries shared `followups.arguments`; copy that complete object
+  unchanged into one of `followups.tools`. A file hit instead carries
+  `followups.calls`; invoke one named call with that call's own `arguments`.
+  Ambiguous multi-anchor hits intentionally carry no follow-up object. Never
+  shorten or reinterpret an opaque anchor. Exact anchor mode preserves
+  same-named methods. Use fuzzy `symbol` mode only for a human-authored name
+  query.
 - Use `file_outline` after localizing a file when the relevant symbol is still
   unclear; go directly to `definition` when the exact symbol is already known.
   Use `events` for string-keyed emit/listener wiring.

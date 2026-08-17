@@ -162,25 +162,9 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
             value.insert("anchor".into(), json!(hit.file_anchor));
         }
     }
-    if hit.include_followups {
-        let followup_anchors = if hit.anchors.is_empty() {
-            vec![&hit.file_anchor]
-        } else {
-            hit.anchors.iter().collect::<Vec<_>>()
-        };
-        let followups = followup_anchors
-            .into_iter()
-            .map(|anchor| compact_followups(hit, anchor, snapshot))
-            .collect::<Vec<_>>();
-        match followups.as_slice() {
-            [followup] => {
-                value.insert("followups".into(), followup.clone());
-            }
-            followups if !followups.is_empty() => {
-                value.insert("followup_candidates".into(), json!(followups));
-            }
-            _ => {}
-        }
+    if hit.include_followups && hit.anchors.len() <= 1 {
+        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
+        value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
     if !hit.uses.is_empty() {
         value.insert("uses".into(), json!(hit.uses));
@@ -1138,6 +1122,37 @@ mod tests {
                 .iter()
                 .all(|call| call["tool"] != "definition" && call["tool"] != "who_uses")
         );
+    }
+
+    #[test]
+    fn ambiguous_search_hits_do_not_emit_copy_unsafe_followups() {
+        let hit = Hit {
+            chunk_id: 1,
+            file: "src/overlap.ts".into(),
+            file_role: "production".into(),
+            repository_role: None,
+            file_origin: "repository".into(),
+            kind: "module".into(),
+            name: None,
+            start_line: 1,
+            end_line: 20,
+            score: 1.0,
+            snippet: "const first = 1; const second = 2;".into(),
+            snippet_truncated: false,
+            anchors: vec![
+                "sym:src/overlap.ts#::first@1".into(),
+                "sym:src/overlap.ts#::second@1".into(),
+            ],
+            file_anchor: "file:src/overlap.ts".into(),
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: true,
+            include_neighborhood_followup: true,
+        };
+        let value = compact_hit(&hit, "snapshot");
+        assert_eq!(value["anchors"].as_array().map(Vec::len), Some(2));
+        assert!(value.get("followups").is_none());
+        assert!(value.get("followup_candidates").is_none());
     }
 
     #[test]

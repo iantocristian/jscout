@@ -721,10 +721,11 @@ full diagnostic representation.
 
 Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
 `arguments` object accepted unchanged by `definition`, `who_uses`, and
-`neighborhood`; ambiguous chunks return candidate-specific objects. A
-file-only hit exposes only `file_outline` and `neighborhood`. The snapshot is
-part of the arguments so stale exact anchors re-resolve by path/scope/name or
-fail closed instead of silently binding to a same-named declaration.
+`neighborhood`; ambiguous multi-anchor chunks expose their anchors but no
+follow-up object. A file-only hit returns per-tool call objects for
+`file_outline` and `neighborhood`. The snapshot is part of exact-anchor
+arguments so stale anchors re-resolve by path/scope/name or fail closed instead
+of silently binding to a same-named declaration.
 
 `--response-bytes` caps whichever complete JSON representation was requested:
 hits, expansion, budget metadata, and serialization overhead. The result

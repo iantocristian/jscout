@@ -306,9 +306,10 @@ pub fn find_symbol_by_anchor_in_origins(
     ))
 }
 
-/// Exact usage lookup for a canonical symbol anchor. Unlike the fuzzy symbol
-/// surface, this does not add same-name member-call candidates: only projected
-/// structural edges that actually target the requested symbol are returned.
+/// Exact usage lookup for a canonical symbol anchor. Precise projected edges
+/// are returned directly. Unresolved member calls are included only when the
+/// graph projects the requested symbol as one of that member hub's candidates;
+/// those sites remain explicitly `possible`.
 pub fn who_uses_anchor_in_origins(
     conn: &Connection,
     anchor: &str,
@@ -318,7 +319,10 @@ pub fn who_uses_anchor_in_origins(
     let origins_json = serde_json::to_string(file_origins)?;
     let mut statement = conn.prepare(
         "SELECT file.path,file.origin,COALESCE(edge.line,source.line),
-                edge.kind,edge.confidence,edge.detail_json,source.display_name
+                edge.kind,edge.confidence,
+                CASE WHEN json_type(edge.detail_json,'$.detail')='text'
+                     THEN json_extract(edge.detail_json,'$.detail') END,
+                source.display_name
          FROM resolved_edges edge
          JOIN graph_nodes source ON source.node_key=edge.src_key
          JOIN files file ON file.id=COALESCE(edge.source_file_id,source.file_id)
@@ -330,22 +334,60 @@ pub fn who_uses_anchor_in_origins(
            file.path,COALESCE(edge.line,source.line),edge.kind,edge.id",
     )?;
     let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
-        let detail_json = row.get::<_, String>(5)?;
-        let detail = serde_json::from_str::<serde_json::Value>(&detail_json)
-            .ok()
-            .filter(|value| !value.is_null() && value != &serde_json::json!({}))
-            .map(|value| value.to_string());
         Ok(Usage {
             file: row.get(0)?,
             file_origin: row.get(1)?,
             line: row.get(2)?,
             kind: row.get(3)?,
             confidence: row.get(4)?,
-            detail,
+            detail: row.get(5)?,
             chunk_name: row.get(6)?,
         })
     })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut usages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Deterministic extraction represents an unresolved member call as two
+    // edges: caller -> member hub -> candidate symbol. Attribute the candidate
+    // to the caller edge so the usage keeps its real file and line. A checker
+    // or resolver edge for the same site wins over this possible candidate.
+    let mut seen_sites = usages
+        .iter()
+        .map(|usage| (usage.file.clone(), usage.line))
+        .collect::<HashSet<_>>();
+    let mut statement = conn.prepare(
+        "SELECT file.path,file.origin,call.line,'call','possible',
+                CASE WHEN json_type(call.detail_json,'$.object')='text'
+                     THEN json_extract(call.detail_json,'$.object') || '.' ||
+                          json_extract(call.detail_json,'$.property') || '()' END,
+                source.display_name
+         FROM resolved_edges candidate
+         JOIN resolved_edges call
+           ON call.dst_key=candidate.src_key AND call.kind='member_call'
+         JOIN graph_nodes source ON source.node_key=call.src_key
+         JOIN files file ON file.id=COALESCE(call.source_file_id,source.file_id)
+         WHERE candidate.dst_key=?1 AND candidate.kind='member_candidate'
+           AND file.origin IN (SELECT value FROM json_each(?2))
+           AND call.line IS NOT NULL
+         ORDER BY file.path,call.line,call.id,candidate.id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
+        Ok(Usage {
+            file: row.get(0)?,
+            file_origin: row.get(1)?,
+            line: row.get(2)?,
+            kind: row.get(3)?,
+            confidence: row.get(4)?,
+            detail: row.get(5)?,
+            chunk_name: row.get(6)?,
+        })
+    })?;
+    for row in rows {
+        let usage = row?;
+        if seen_sites.insert((usage.file.clone(), usage.line)) {
+            usages.push(usage);
+        }
+    }
+    Ok(usages)
 }
 
 /// Find symbols matching "Name" or "path-substring:Name" within an origin allowlist.
