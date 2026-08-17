@@ -6,7 +6,8 @@
 > large-repository operation until its required scale correction passes. G11
 > snapshot simplification, G13 repository reconnaissance, and G14 retrieval
 > handoff are implemented; G12 watcher coordination remains planned. G15
-> design-before-edit task memory is the next fixed-snapshot milestone.
+> design-before-edit task memory is the next fixed-snapshot milestone. G16 is
+> a conditional post-G15 memory-delivery correction, not a committed rewrite.
 
 ## Document policy
 
@@ -1671,6 +1672,69 @@ tool-using coding agent.
 - attaching task-specific designs to unrelated repository search;
 - using more global card generation or larger response budgets as a substitute
   for hypothesis formation.
+
+## Conditional G16 — adaptive memory delivery
+
+G14 deliberately changed search-attached memory from broad similarity previews
+to evidence-connected selection: direct support first, then bounded graph
+proximity, then relations to an already connected artifact. This prevents a
+high-scoring generic card from displacing code evidence. It also creates an
+intentional hard boundary: a semantically relevant artifact without a current
+code-evidence connection is not attached, and the response redirects the agent
+to `semantic_memory`.
+
+G16 is a decision gate for that boundary, not the next automatic milestone.
+It is considered only after G15 and the full product evaluation. The evaluation
+must retain, per search, the bounded semantic candidate IDs and ranks, why each
+selected artifact connected, the `no_connected_memory` status, the emitted
+follow-up, and whether the agent subsequently called `semantic_memory`. Stored
+request telemetry records identifiers and decisions, not artifact bodies or
+source payloads.
+
+### Entry criteria
+
+G16 enters implementation only when repeated task evidence establishes at
+least one of these failures:
+
+- current artifacts independently adjudicated as useful repeatedly enter the
+  semantic candidate pool but are rejected because the evidence-connection
+  join misses their relevant code relationship; or
+- `no_connected_memory` correctly withholds unconnected prose, but agents
+  repeatedly ignore the explicit `semantic_memory` handoff and consequently
+  miss useful context or mechanisms.
+
+A low attachment count, a high vector score, or one agent declining a
+follow-up is not sufficient. If neither entry criterion is met, G14 selection
+remains final and G16 is closed without implementation.
+
+### Permitted correction
+
+The correction must separate artifact discovery from body attachment. Likely
+options are a bounded set of compact, explicitly unconnected artifact handles
+with copy-safe `semantic_memory` arguments, or a narrower repair to a measured
+false-negative evidence join. Unconnected artifact bodies do not return to
+ordinary search, semantic prose does not enter code ranking, and graph depth or
+response budgets do not widen globally to hide a selection defect.
+
+Any implemented design must preserve:
+
+- direct/graph/relation-connected artifacts ahead of discovery-only handles;
+- explicit connection reason, freshness, and omission counts;
+- one complete response-byte budget, with discovery handles shed before code
+  hits or connected memory;
+- exact follow-up arguments that require no anchor rewriting by the agent; and
+- `semantic_memory` as the only surface for full bodies, relations, and source
+  evidence.
+
+### Conditional acceptance
+
+If G16 is triggered, fixtures and the triggering real tasks must show that the
+previously missed useful artifacts become discoverable and are deliberately
+retrieved, without reattaching unrelated generic memory or reducing code-hit
+quality. The report must compare useful-artifact recall, follow-up rate,
+correctness/mechanism retention, rendered bytes, and irrelevant artifact reads
+against G14. Failure to improve the triggering outcome at the registered byte
+and relevance constraints closes the redesign rather than expanding it again.
 
 ## Evaluation decisions already made
 
