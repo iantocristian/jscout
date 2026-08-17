@@ -531,8 +531,9 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
--- Canonical TypeScript-checker facts are retained across projection rebuilds
--- within one structural snapshot. A full snapshot refresh deletes the batch.
+-- Canonical TypeScript-checker facts are retained across projection and
+-- extraction rebuilds when the resulting structural snapshot is identical.
+-- Publication deletes batches bound to any other snapshot.
 -- Source/target identities are deliberately not foreign keys because a
 -- projection rebuild must not cascade through canonical checker facts.
 CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
@@ -943,18 +944,30 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Delete every row whose identity or meaning belongs to one repository
-/// snapshot while preserving the expensive content-addressed embedding cache
-/// and durable semantic memory. The caller owns the transaction and must not
-/// publish a new snapshot marker until extraction, resolution, projection, and
-/// cached-vector rematerialization have completed.
+/// Delete the cheap source-derived rows for one repository snapshot while
+/// preserving the content-addressed embedding cache, durable semantic memory,
+/// and temporarily hidden checker batches. After computing the rebuilt
+/// snapshot, the caller must remove checker batches for every other snapshot
+/// before projection. The caller owns the transaction and must not publish a
+/// new snapshot marker until extraction, resolution, projection, and cached-
+/// vector rematerialization have completed.
 pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     reset_extraction_state(conn)?;
     conn.execute_batch(
-        "DELETE FROM checker_enrichment_batches;
-         DELETE FROM package_instances;
+        "DELETE FROM package_instances;
          DELETE FROM meta
          WHERE key IN ('root', 'snapshot', 'projection_version', 'resolution_hash');",
+    )?;
+    Ok(())
+}
+
+/// Keep checker facts only when a full extraction rebuild reproduced their
+/// exact structural snapshot. The snapshot marker is still absent here, so a
+/// failed projection cannot expose either retained or stale checker edges.
+pub(crate) fn retain_checker_batches_for_snapshot(conn: &Connection, snapshot: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM checker_enrichment_batches WHERE source_snapshot != ?1",
+        [snapshot],
     )?;
     Ok(())
 }

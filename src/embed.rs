@@ -625,23 +625,6 @@ fn missing_embedding_documents(
     Ok(documents)
 }
 
-pub fn embed_missing(
-    conn: &Connection,
-    provider: &Provider,
-    batch_size: usize,
-) -> Result<(usize, usize)> {
-    embed_missing_for_origins(conn, provider, batch_size, &crate::origin::defaults())
-}
-
-pub fn embed_missing_for_origins(
-    conn: &Connection,
-    provider: &Provider,
-    batch_size: usize,
-    file_origins: &[String],
-) -> Result<(usize, usize)> {
-    embed_missing_for_selection(conn, provider, batch_size, file_origins, false)
-}
-
 pub fn embed_missing_for_selection(
     conn: &Connection,
     provider: &Provider,
@@ -649,10 +632,52 @@ pub fn embed_missing_for_selection(
     file_origins: &[String],
     product_only: bool,
 ) -> Result<(usize, usize)> {
+    let (done, total, _) = embed_missing_for_selection_interruptible(
+        conn,
+        provider,
+        batch_size,
+        file_origins,
+        product_only,
+        || false,
+    )?;
+    Ok((done, total))
+}
+
+/// Embed missing default-origin chunks, stopping between provider batches when
+/// the caller reports that this snapshot generation has been superseded.
+/// Completed vectors remain in the durable content cache and are reused by the
+/// next full refresh.
+pub fn embed_missing_interruptible(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<(usize, usize, bool)> {
+    embed_missing_for_selection_interruptible(
+        conn,
+        provider,
+        batch_size,
+        &crate::origin::defaults(),
+        false,
+        should_cancel,
+    )
+}
+
+fn embed_missing_for_selection_interruptible(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+    file_origins: &[String],
+    product_only: bool,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<(usize, usize, bool)> {
     if batch_size == 0 {
         bail!("embedding batch size must be positive");
     }
     crate::origin::validate_all(file_origins)?;
+    if should_cancel() {
+        return Ok((0, 0, true));
+    }
     let profile = provider.profile()?;
     let mut resolved = existing_profile(conn, &profile)?;
     let resolved_profile_id = resolved.as_ref().map(|profile| profile.id);
@@ -675,6 +700,9 @@ pub fn embed_missing_for_selection(
         batch_size
     };
     for batch in rows.chunks(request_batch_size) {
+        if should_cancel() {
+            return Ok((done, total, true));
+        }
         let texts = batch
             .iter()
             .map(|document| embed_text(&document.content))
@@ -713,10 +741,13 @@ pub fn embed_missing_for_selection(
         done += batch.len();
         eprintln!("embedded {done}/{total}");
     }
+    if should_cancel() {
+        return Ok((done, total, true));
+    }
     if let Some(profile) = resolved {
         sync_vector_index(conn, Some(profile.id))?;
     }
-    Ok((done, total))
+    Ok((done, total, false))
 }
 
 /// Embed current, non-superseded semantic artifacts and materialize their

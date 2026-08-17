@@ -88,8 +88,11 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --max-occurrences N explicitly requests partial coverage
                                #   --all includes normally excluded roles/resolved calls
 jscout watch <root> [--embed] [--enrich]
-                               # hash-incremental parse plus optional vector/checker refresh
+                               # full-snapshot generations; optional vector/checker phases
                                #   repeat --deps from index to retain that corpus
+                               #   --database PATH isolates index/memory state
+                               #   --debounce-ms 2000 waits for a trailing quiet point
+                               #   --reconcile-seconds 600 recovers missed notifications
 jscout embed <root>            # embed code chunks missing embeddings (cached by content hash)
                                #   --database PATH writes an isolated index
   --product                    #   fresh runtime recon + neutral production fallback only
@@ -349,16 +352,54 @@ actual Node error/stack in the command error as well as stderr.
 
 Every checker batch is bound to exactly one structural snapshot. Projection
 accepts it only when `source_snapshot` matches; there is no per-project
-cross-snapshot revalidation. `jscout index` deletes the old checker batch while
-preserving embeddings and semantic memory, so run `jscout enrich` after a full
-index when those occurrence-specific edges are needed.
+cross-snapshot revalidation. `jscout index` preserves a checker batch only when
+the rebuilt checkout produces the exact same structural snapshot; a changed
+snapshot deletes it while preserving embeddings and semantic memory. Run
+`jscout enrich` after a changed full index when those occurrence-specific edges
+are needed.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
 project-batched, resumable checker pass for the resulting snapshot. A newer
 snapshot cannot mix with older staging. If the checker fails or times out,
-staged work stays non-public and a later pass for the exact snapshot can resume
-it. The later watcher coordinator owns quiet-point scheduling under sustained
-churn; plain `watch` never starts Node.
+staged work stays non-public and the coordinator retries it without requiring a
+new filesystem event. Relevant edits that arrive during enrichment cancel or
+supersede that work and require a new structural generation. Plain `watch`
+never starts Node.
+
+### Watcher lifecycle
+
+`jscout watch` subscribes before its startup pass and uses the same full
+disposable-snapshot refresh as `jscout index`. It does not carry per-file
+structural state across generations. Exact-snapshot checker facts may be reused
+when a rebuild proves that nothing structural changed; any changed snapshot
+drops them. The default two-second trailing quiet period coalesces edits; an
+event received during any phase advances the desired generation and cannot be
+consumed by the phase already running.
+
+Each phase opens and closes its own database connection with a finite SQLite
+busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
+backoff without waiting for another edit. Three identical per-file extraction
+failure sets expose the same visibly partial snapshot as manual `index`, mark
+the generation degraded, and continue optional phases; the default ten-minute
+reconciliation pass retries that coverage and repairs missed notifications.
+Its interval is measured from completion of the previous generation, avoiding
+back-to-back refreshes when a cycle itself is slow; a nonzero interval must be
+greater than the debounce period. A previously degraded, identical failure set
+can degrade immediately in later generations instead of paying three known-
+futile retries each time.
+Set `--reconcile-seconds 0` only when giving up that bounded recovery is
+acceptable.
+
+Database/WAL/SHM writes are excluded by exact path. For long-running watch,
+prefer an external `--database` path (or ensure the selected database family is
+gitignored) so broad staging commands cannot add it. Git HEAD,
+`.gitmodules`, selected dependency roots and locators, and external inputs from
+the latest checker batch are watched as additional invalidation boundaries.
+Branch switches therefore rebuild the complete current file set. From the
+start of the structural reset through extraction, resolution, snapshot
+calculation, and graph publication, the published snapshot marker is absent,
+so concurrent queries may temporarily report that no snapshot is available;
+watch does not maintain a second database generation.
 
 ## Semantic scouting
 
@@ -751,7 +792,9 @@ rows, semantic memory, and immutable repository-reconnaissance history, then
 rematerializes current vector occurrences and exact fresh reconnaissance policy
 from those durable planes. Checker enrichment is snapshot-bound and is removed by a full index;
 run `jscout enrich` again when occurrence-specific checker edges are required.
-`jscout watch` remains hash-incremental and is a separate coordination mode.
+`jscout watch` coordinates the same full refresh and optional embedding/checker
+operations, with debounce, retries, and periodic reconciliation. It does not
+use the historical incremental indexing path.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

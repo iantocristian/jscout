@@ -2097,8 +2097,9 @@ fn checker_occurrence_coverage(
 ///
 /// A checker batch belongs to exactly one structural snapshot. Within that
 /// snapshot, source occurrence and target fingerprints are still checked
-/// defensively. A new snapshot drops (full refresh) or ignores (incremental
-/// watch optimization) the whole batch rather than revalidating input files.
+/// defensively. A different snapshot drops (full refresh) or ignores
+/// (test-only incremental indexing) the whole batch rather than revalidating
+/// input files. An identical full refresh may reuse the exact-snapshot batch.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,
@@ -2115,7 +2116,7 @@ fn project_checker_enrichments(
             .push(symbol);
     }
     let mut statement = conn.prepare(
-        "SELECT enrichment.member_call_id, source.id, source.path,
+        "SELECT enrichment.member_call_id, call.rowid, source.id, source.path,
                 call.line, enrichment.call_start, enrichment.call_end,
                 enrichment.receiver_start, enrichment.receiver_end,
                 enrichment.property_start, enrichment.property_end,
@@ -2134,7 +2135,7 @@ fn project_checker_enrichments(
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
-           ON call.rowid=enrichment.member_call_id AND call.file_id=source.id
+           ON call.file_id=source.id
           AND call.start=enrichment.call_start AND call.end=enrichment.call_end
           AND call.receiver_start=enrichment.receiver_start
           AND call.receiver_end=enrichment.receiver_end
@@ -2150,27 +2151,29 @@ fn project_checker_enrichments(
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)?,
             row.get::<_, i64>(9)?,
-            row.get::<_, String>(10)?,
-            row.get::<_, Option<String>>(11)?,
-            row.get::<_, String>(12)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?,
             row.get::<_, String>(13)?,
             row.get::<_, String>(14)?,
             row.get::<_, String>(15)?,
-            row.get::<_, i64>(16)?,
+            row.get::<_, String>(16)?,
             row.get::<_, i64>(17)?,
+            row.get::<_, i64>(18)?,
         ))
     })?;
     let mut projected: BTreeMap<(i64, String), CheckerProjection> = BTreeMap::new();
     for row in rows {
         let (
+            enrichment_member_call_id,
             member_call_id,
             file_id,
             path,
@@ -2190,7 +2193,7 @@ fn project_checker_enrichments(
             target_start,
             target_end,
         ) = row?;
-        let Some(occurrence_coverage) = coverage.get(&member_call_id) else {
+        let Some(occurrence_coverage) = coverage.get(&enrichment_member_call_id) else {
             continue;
         };
         if crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end)
@@ -4917,6 +4920,30 @@ mod tests {
         )?;
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
+
+        // Exact-snapshot batches are identified by source identity and call
+        // spans, not by the disposable member_calls rowid. A future extractor
+        // ordering change must not silently discard an otherwise valid fact.
+        let retained_member_call_id = member_call_id + 10_000;
+        conn.execute(
+            "UPDATE checker_enrichments SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![retained_member_call_id, batch_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_occurrence_projects SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![retained_member_call_id, batch_id],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolved_edges
+                 WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",
+                [&target],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+
         let (checker_source, checker_detail): (String, String) = conn.query_row(
             "SELECT src_key, detail_json FROM resolved_edges
              WHERE kind='member_call' AND provenance='checker' AND dst_key=?1",

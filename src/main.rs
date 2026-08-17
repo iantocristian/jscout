@@ -364,6 +364,9 @@ enum Command {
     Watch {
         /// Repository root
         root: PathBuf,
+        /// Use an index database at this path instead of ROOT/.jscout.db
+        #[arg(long)]
+        database: Option<PathBuf>,
         /// Also embed new/changed chunks on each re-index (needs a provider)
         #[arg(long)]
         embed: bool,
@@ -379,6 +382,12 @@ enum Command {
         /// Checker sidecar entry file for development and diagnostics
         #[arg(long)]
         sidecar_path: Option<PathBuf>,
+        /// Trailing quiet period before a change generation starts
+        #[arg(long, default_value_t = 2_000)]
+        debounce_ms: u64,
+        /// Full-refresh interval for missed-event recovery; zero disables it
+        #[arg(long, default_value_t = 600)]
+        reconcile_seconds: u64,
     },
     /// Show all usages of a symbol: NAME or path-substring:NAME
     WhoUses {
@@ -1043,19 +1052,25 @@ fn main() -> Result<()> {
         }
         Command::Watch {
             root,
+            database,
             embed,
             dependencies,
             enrich,
             enrich_timeout,
             sidecar_path,
+            debounce_ms,
+            reconcile_seconds,
         } => watch::watch(
             &root,
             &watch::WatchOptions {
+                database: database.as_deref(),
                 embed_on_change: embed,
                 dependencies: &dependencies,
                 enrich_on_change: enrich,
                 enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
                 checker_sidecar: sidecar_path.as_deref(),
+                debounce: std::time::Duration::from_millis(debounce_ms),
+                reconcile_interval: std::time::Duration::from_secs(reconcile_seconds),
             },
         ),
         Command::WhoUses {
@@ -1562,9 +1577,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
             ..Default::default()
         },
     )?;
-    // `jscout index` is a full snapshot refresh: per-file hash reuse never
-    // applies here (watch owns the incremental path), so an "unchanged" count
-    // would always read 0 and misreport the rebuild as failed change detection.
+    // `jscout index` and every watcher generation are full snapshot refreshes,
+    // so an "unchanged" count would always read 0 and misreport the rebuild as
+    // failed change detection.
     println!(
         "indexed {} files ({} failed) — {} chunks, {} refs in {:?}",
         o.indexed,
@@ -2304,6 +2319,12 @@ mod main_tests {
             "45",
             "--sidecar-path",
             "checker.mjs",
+            "--database",
+            "watch.db",
+            "--debounce-ms",
+            "750",
+            "--reconcile-seconds",
+            "30",
         ])
         .expect("watch enrichment controls parse");
         let Command::Watch {
@@ -2311,6 +2332,9 @@ mod main_tests {
             enrich,
             enrich_timeout,
             sidecar_path,
+            database,
+            debounce_ms,
+            reconcile_seconds,
             ..
         } = command
         else {
@@ -2320,6 +2344,9 @@ mod main_tests {
         assert!(enrich);
         assert_eq!(enrich_timeout, 45);
         assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
+        assert_eq!(database, Some(PathBuf::from("watch.db")));
+        assert_eq!(debounce_ms, 750);
+        assert_eq!(reconcile_seconds, 30);
     }
 
     #[test]

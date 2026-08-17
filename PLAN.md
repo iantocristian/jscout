@@ -89,7 +89,7 @@ databases:
 
 | Plane | Contents | Lifecycle |
 |---|---|---|
-| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Any row whose meaning depends on repository layout or a snapshot anchor is deleted first. |
+| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Snapshot-dependent rows are deleted first, except that checker batches may be reused only when the rebuilt structural snapshot is byte-identical to their source snapshot. |
 | **Durable content cache** | Embedding profiles and content-hash-keyed embedding vectors | Preserved across snapshot rebuilds. Current chunk occurrences are rematerialized from cached vectors; only unseen content is embedded. |
 | **Durable semantic memory** | Scout runs/classifications and `semantic_*` artifacts, relations, and evidence supports | Preserved across snapshot rebuilds. Evidence hashes and current anchors determine whether a claim is fresh, degraded, stale, or superseded. |
 
@@ -103,12 +103,13 @@ occurrence rematerialization, with publication of a current snapshot only
 after those required phases succeed. Rebuilding source-derived state is cheap;
 recomputing embeddings and discarding reviewed semantic memory are not.
 
-Checker enrichment is also snapshot-bound. A full index deletes checker facts;
-`jscout enrich` may repopulate them for that exact published snapshot. No
-version ladder, transitive input manifest, or cross-snapshot revalidation is
-required to carry checker answers through a rebuild. Within one snapshot,
-publication still validates source hashes, occurrence spans, project answers,
-and the snapshot race boundary.
+Checker enrichment is also snapshot-bound. A full index deletes checker facts
+whose source snapshot differs from the rebuilt snapshot; an exact-snapshot
+batch remains reusable. `jscout enrich` may populate the changed published
+snapshot. No version ladder, transitive input manifest, or cross-snapshot
+revalidation is required to carry checker answers through a changed rebuild.
+Within one snapshot, publication still validates source hashes, occurrence
+spans, project answers, and the snapshot race boundary.
 
 Watch mode is a separate coordination problem, not the correctness model for
 indexing. It may use incremental work as an optimization, but branch switches,
@@ -588,10 +589,11 @@ extend the semantic-v1 completion boundary, and nothing in v1 depends on it.
 **Amendment — watch replenishment (2026-08-13).** The original G10 rule that
 enrichment never runs during `watch` is replaced by the explicit
 `jscout watch --enrich` option. Each refresh launches one explicitly configured
-sidecar pass after deterministic indexing has suppressed stale checker edges,
-then exits the sidecar. This does not authorize a persistent watch-resident
-TypeScript daemon, hidden checker execution in plain `watch`, or checker work in
-`index`.
+sidecar pass after deterministic indexing has suppressed stale checker edges;
+an identical refresh may resolve as a no-op against the already active exact-
+snapshot batch. The sidecar then exits. This does not authorize a persistent
+watch-resident TypeScript daemon, hidden checker execution in plain `watch`, or
+checker work in `index`.
 
 **Amendment — large-repository execution (2026-08-13).** A real repository run
 planned 150,213 eligible member-call occurrences, progressed slowly through
@@ -738,7 +740,8 @@ hashes, target anchors, and current checker inputs. A structural snapshot race
 publishes nothing; the scale-corrected path withholds and reports a project
 whose external inputs drift while allowing explicitly covered unaffected
 projects to assemble one partial batch. Only one batch is active; a full
-`jscout index` deletes active and staging checker state.
+`jscout index` deletes active and staging checker state only when it belongs to
+a different rebuilt structural snapshot.
 
 `jscout watch --enrich` makes replenishment automatic. Each relevant event is
 debounced, indexed first, then enriched. A checker failure leaves the current
@@ -1023,9 +1026,10 @@ Implementation order:
    retaining embeddings and semantic memory, then rematerializes cached vector
    occurrences. **Complete.**
 4. Remove checker cross-snapshot retention from the fixed-snapshot path. A
-   rebuild drops checker batches; enrichment republishes an exact-snapshot
-   batch explicitly. Per-project manifest rehash/freshness joins are removed.
-   **Complete.**
+   rebuild drops batches from a different snapshot; an identical rebuilt
+   snapshot may reuse its exact-snapshot batch. Enrichment republishes changed
+   snapshots explicitly. Per-project manifest rehash/freshness joins are
+   removed. **Complete; exact-snapshot reuse amended in G12 review.**
 5. Separate query-only database opening from schema creation/migration and
    snapshot publication. Retire the historical in-place migration ladder;
    durable-compatible schemas preserve cache/memory while recreating the
@@ -1044,8 +1048,8 @@ Acceptance checks:
 - materialized vector occurrences exactly match chunks in the new snapshot;
 - semantic artifacts and their run ledger survive, while evidence freshness is
   recalculated against the new snapshot;
-- checker facts and package-instance ownership from the old snapshot do not
-  survive a full rebuild;
+- checker facts from a different snapshot and package-instance ownership from
+  the old rebuild do not survive; exact-snapshot checker facts may be reused;
 - a genuine v15 embedding layout is rejected without mutation, while the v16
   durable floor preserves compatible embedding and semantic-memory rows;
 - a fatal required-phase failure never publishes a snapshot marker describing
@@ -1056,7 +1060,17 @@ Acceptance checks:
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
 
-## Planned G12 — watcher coordinator
+## G12 — watcher coordinator
+
+**Implementation complete (2026-08-16); sustained-churn validation on a large
+real repository remains pending.** The production watcher now has no reachable
+incremental-indexing path. It uses a pure generation coordinator, full
+disposable-snapshot refreshes, fresh per-phase connections, explicit optional
+embedding/checker phases, supersession and cancellation, bounded retry and
+stable-failure degradation, exact self-output exclusions, dynamic external
+coverage, and periodic reconciliation. Unit/fixture coverage passes; the next
+operational step is to run it through branch switches and ordinary edits on the
+user's target repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
@@ -1091,9 +1105,10 @@ entire structural-refresh interval, and every cycle logs its actual phase
 durations.
 
 `--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
-does not start the TypeScript checker, and never preserves checker facts from
-the previous generation. Dependency selectors remain authoritative and must
-be supplied to watch exactly as they are to index.
+does not start the TypeScript checker, and never serves checker facts from a
+different structural snapshot. It may reuse an active exact-snapshot batch
+when a full rebuild proves the snapshot unchanged. Dependency selectors remain
+authoritative and must be supplied to watch exactly as they are to index.
 
 ### Generation state machine
 
@@ -1136,14 +1151,18 @@ another filesystem event. Three consecutive refreshes with the same failure
 fingerprint (path, stage, and error) make the snapshot `degraded` rather than
 permanently dirty: optional embedding and enrichment may then run against that
 exact partial snapshot, while the failed paths remain on the reconciliation
-retry set. A relevant event, changed failure fingerprint, or successful read
-resets the threshold. Fatal refresh errors never enter this bounded
-degradation path and remain dirty until a required phase succeeds.
+retry set. The last degraded fingerprint survives later generations, so the
+same permanent failure can degrade immediately rather than paying three full
+retries every cycle. A changed failure fingerprint or successful read resets
+that stability; new input resets only the current retry timer. Fatal refresh
+errors never enter this bounded degradation path and remain dirty until a
+required phase succeeds.
 
-Failures use bounded exponential backoff, reset by new input or a successful
-phase. Retry state lives in memory. Restarting watch always subscribes first
-and then performs a full refresh, so no persistent watcher journal or recovery
-schema is required.
+Failures use bounded exponential backoff. A parked retry gates fresh work for
+that generation and is consumed when it starts; attempts reset on new input or
+a successful phase. Retry and stable-failure state live in memory. Restarting
+watch always subscribes first and then performs a full refresh, so no persistent
+watcher journal or recovery schema is required.
 
 ### Trigger and reconciliation policy
 
@@ -1166,8 +1185,9 @@ Triggers include:
 - indexed source create, update, delete, and rename events;
 - `package.json`, supported lockfiles, tsconfig/jsconfig files, declaration
   files, and other resolver configuration;
-- resolved Git worktree control paths such as `HEAD` and the index, including
-  branch switches and worktree-specific Git directories;
+- resolved Git worktree `HEAD` control paths, including branch switches and
+  worktree-specific Git directories; source notifications cover checkout
+  changes without treating routine `.git/index` writes as rebuild triggers;
 - `.gitmodules`, submodule control paths, and submodule worktree changes;
 - selected dependency locator entries and canonical package roots, including
   pnpm/Yarn symlink replacement and package installation changes;
@@ -1175,6 +1195,11 @@ Triggers include:
   TypeScript, ambient declarations, configs, and inputs under `node_modules`
   or an external package store;
 - notification overflow, backend errors, or unknown non-excluded event shapes.
+
+Existing regular files that fail every relevance rule are ignored rather than
+escalated: documentation, editor metadata, and other unindexed files therefore
+do not rebuild the repository. Pathless/rescan events, directories, and
+otherwise uncertain missing paths remain conservative full-refresh triggers.
 
 After each refresh or enrichment, the coordinator reconciles its narrow
 external watches with the newly resolved package instances and checker input
@@ -1190,6 +1215,10 @@ structural generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
 (default ten minutes) schedules a full refresh even when no event arrived.
+The interval starts when a generation completes, not when its timer fires, so
+a slow refresh cannot cause back-to-back cycles. A nonzero interval must exceed
+the debounce period, and reconciliation starts immediately when due rather
+than entering the edit debounce path.
 Setting the interval to zero explicitly gives up bounded recovery from missed
 events and degraded watch coverage. The default deliberately spends cheap
 structural work instead of building another durable fingerprint system. The
@@ -1209,11 +1238,13 @@ enrichment phases, while SQLite remains the arbiter when another jscout
 process writes concurrently. G12 does not introduce an application-level
 lease until a demonstrated concurrent-writer failure requires one.
 
-A structural refresh always removes the previous checker plane as part of the
-disposable snapshot reset:
+A structural refresh removes checker batches from every different snapshot
+before publishing its graph. An active batch for the exact rebuilt snapshot is
+retained and reprojected:
 
-- plain `watch` leaves checker facts absent;
-- `watch --enrich` publishes one batch bound to the new exact snapshot;
+- plain `watch` starts no checker work and may retain only exact-snapshot facts;
+- `watch --enrich` reuses an exact-snapshot batch as a no-op or publishes one
+  batch bound to the changed snapshot;
 - a failure before controlled activation leaves checker facts absent; a
   scale-planner partial activation exposes only its explicit coverage and keeps
   failed project coverage pending for retry;
@@ -1235,9 +1266,10 @@ delete semantic memory or content-hash embedding rows.
    operation. Open a fresh connection per phase, configure `busy_timeout`,
    audit rollback paths, implement bounded stable-file-failure degradation,
    and make fatal failures retry automatically.
-3. Make checker invalidation unconditional through the structural refresh;
-   sequence optional embedding and exact-snapshot enrichment, and add
-   generation checks plus cancellation between/within optional work.
+3. Invalidate cross-snapshot checker state through the structural refresh while
+   retaining a reusable exact-snapshot batch; sequence optional embedding and
+   exact-snapshot enrichment, and add generation checks plus cancellation
+   between/within optional work. **Amended after implementation review.**
 4. Add exact self-output exclusion plus Git/worktree, submodule,
    selected-dependency, and dynamically reported checker-input watches. Treat
    notification backend errors as full-refresh uncertainty and persistent
@@ -1264,13 +1296,14 @@ delete semantic memory or content-hash embedding rows.
 - three persistent registration failures degrade that path to timer-backed
   coverage without causing a refresh loop, and registration is retried later;
 - branch switches replace the complete file set without retaining old files,
-  projections, package ownership, vector occurrences, or checker facts;
+  projections, package ownership, vector occurrences, or checker facts from a
+  different snapshot;
 - submodule, manifest, lockfile, selected dependency, symlink-target, tsconfig,
   TypeScript runtime, and ambient declaration changes converge;
 - edit -> enrich -> revert cannot reactivate a checker batch created before
   intervening external checker-input changes;
-- no reachable G12 code path invokes incremental indexing or skips the
-  full-refresh checker-batch deletion;
+- no reachable G12 code path invokes incremental indexing or can project a
+  checker batch from a different snapshot;
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
