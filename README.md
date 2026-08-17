@@ -176,6 +176,24 @@ platform package, `current_exe()` sidecar discovery cannot reach the bundled
 driven by `.github/workflows/release-npm.yml` on a `vX.Y.Z` tag; the tag must
 match the Cargo.toml version.
 
+That workflow authenticates by OIDC trusted publishing, which cannot perform a
+package's *first* publish: the trusted publisher is configured per package at
+`npmjs.com/package/<name>/access`, which requires the package to already exist
+([npm/cli#8544](https://github.com/npm/cli/issues/8544)). Any newly named
+package — a new platform target as much as the initial release — is therefore
+published once from a workstation:
+
+```bash
+node scripts/npm-bootstrap-publish.mjs --run-id RUN --dry-run
+node scripts/npm-bootstrap-publish.mjs --run-id RUN
+```
+
+It takes the binaries from a workflow run rather than rebuilding them, and
+refuses to publish unless every platform package the wrapper declares is
+present at the Cargo.toml version with a binary whose actual architecture
+matches its target. npm prompts for the one-time password, so no token is
+created. Provenance begins with the first release published by the workflow.
+
 `SPEC` is `NAME` or `path-substring:NAME`, e.g. `getUser` or `services/user:getUser`.
 
 Workflow-candidate seeds must each resolve uniquely to a symbol.
