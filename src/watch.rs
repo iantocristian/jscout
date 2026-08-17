@@ -74,7 +74,7 @@ struct Coordinator {
     desired_generation: u64,
     completed_generation: u64,
     last_dirty_at: Duration,
-    startup_immediate: bool,
+    refresh_immediate: bool,
     active: Option<Work>,
     ready: Option<Work>,
     retry: Option<Retry>,
@@ -96,7 +96,7 @@ impl Coordinator {
             desired_generation: 0,
             completed_generation: 0,
             last_dirty_at: Duration::ZERO,
-            startup_immediate: true,
+            refresh_immediate: false,
             active: None,
             ready: None,
             retry: None,
@@ -112,20 +112,38 @@ impl Coordinator {
             enrich,
         };
         coordinator.mark_dirty(Duration::ZERO, "startup");
-        coordinator.startup_immediate = true;
+        coordinator.refresh_immediate = true;
         coordinator
     }
 
     fn mark_dirty(&mut self, now: Duration, reason: impl Into<String>) {
-        self.desired_generation += 1;
+        let current_generation_has_work = self
+            .active
+            .is_some_and(|work| work.generation == self.desired_generation)
+            || self
+                .ready
+                .is_some_and(|work| work.generation == self.desired_generation)
+            || self
+                .retry
+                .is_some_and(|retry| retry.work.generation == self.desired_generation);
+        if self.desired_generation == self.completed_generation || current_generation_has_work {
+            self.desired_generation += 1;
+            self.dirty_reasons.clear();
+        }
         self.last_dirty_at = now;
         self.dirty_reasons.insert(reason.into());
+        self.refresh_immediate = false;
         self.ready = None;
         self.retry = None;
         self.retry_attempts.clear();
-        self.stable_failure = None;
         self.cycle_snapshot = None;
         self.cycle_degraded = false;
+    }
+
+    fn mark_reconciliation(&mut self, now: Duration) {
+        debug_assert!(self.is_clean());
+        self.mark_dirty(now, "periodic-reconciliation");
+        self.refresh_immediate = true;
     }
 
     fn next_work(&mut self, now: Duration) -> Option<Work> {
@@ -148,9 +166,10 @@ impl Coordinator {
             self.active = Some(work);
             return Some(work);
         }
-        if let Some(retry) = self.retry
-            && now >= retry.due
-        {
+        if let Some(retry) = self.retry {
+            if now < retry.due {
+                return None;
+            }
             self.retry = None;
             self.active = Some(retry.work);
             return Some(retry.work);
@@ -158,10 +177,10 @@ impl Coordinator {
         if self.desired_generation <= self.completed_generation {
             return None;
         }
-        if !self.startup_immediate && now < self.last_dirty_at.saturating_add(self.debounce) {
+        if !self.refresh_immediate && now < self.last_dirty_at.saturating_add(self.debounce) {
             return None;
         }
-        self.startup_immediate = false;
+        self.refresh_immediate = false;
         let work = Work {
             generation: self.desired_generation,
             phase: Phase::Refresh,
@@ -178,7 +197,7 @@ impl Coordinator {
             return Some(retry.due);
         }
         (self.desired_generation > self.completed_generation).then(|| {
-            if self.startup_immediate {
+            if self.refresh_immediate {
                 Duration::ZERO
             } else {
                 self.last_dirty_at.saturating_add(self.debounce)
@@ -197,18 +216,19 @@ impl Coordinator {
         if work.generation != self.desired_generation {
             return FinishState::Superseded;
         }
-        self.retry_attempts.remove(&Phase::Refresh);
         if let Some(fingerprint) = failure_fingerprint {
             let repeats = match &self.stable_failure {
-                Some((previous, repeats)) if previous == &fingerprint => repeats + 1,
+                Some((previous, repeats)) if previous == &fingerprint => repeats.saturating_add(1),
                 _ => 1,
             };
             self.stable_failure = Some((fingerprint, repeats));
             if repeats < STABLE_FAILURE_THRESHOLD {
                 return self.schedule_retry(now, work);
             }
+            self.retry_attempts.remove(&Phase::Refresh);
             self.cycle_degraded = true;
         } else {
+            self.retry_attempts.remove(&Phase::Refresh);
             self.stable_failure = None;
             self.cycle_degraded = false;
         }
@@ -281,6 +301,13 @@ impl Coordinator {
     fn is_superseded(&self, work: Work) -> bool {
         self.desired_generation != work.generation
     }
+
+    fn is_clean(&self) -> bool {
+        self.desired_generation == self.completed_generation
+            && self.active.is_none()
+            && self.ready.is_none()
+            && self.retry.is_none()
+    }
 }
 
 #[derive(Default)]
@@ -317,7 +344,7 @@ impl EventClassifier {
         if paths.is_empty() {
             return Some("unknown-event".into());
         }
-        let mut saw_non_noise = false;
+        let mut saw_uncertain = false;
         for path in paths {
             let path = self.absolute(path);
             if self.excluded.contains(&path) {
@@ -337,12 +364,19 @@ impl EventClassifier {
             if is_noise(&path) {
                 continue;
             }
-            saw_non_noise = true;
             if is_relevant(&path) {
                 return Some(format!("source:{}", display_path(&self.root, &path)));
             }
+            // Existing regular files with irrelevant extensions are ordinary
+            // repository noise (README edits, Finder metadata, and similar).
+            // Missing paths and directories remain conservative because a
+            // backend may be reporting a delete, rename, or rescan without
+            // enough type information to classify it safely.
+            if !path.is_file() {
+                saw_uncertain = true;
+            }
         }
-        saw_non_noise.then(|| "unknown-event".into())
+        saw_uncertain.then(|| "unknown-event".into())
     }
 
     fn absolute(&self, path: &Path) -> PathBuf {
@@ -453,12 +487,7 @@ struct RefreshResult {
 }
 
 pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
-    if options.enrich_on_change && options.enrich_timeout.is_zero() {
-        bail!("--enrich-timeout must be greater than zero seconds");
-    }
-    if options.debounce.is_zero() {
-        bail!("--debounce-ms must be greater than zero");
-    }
+    validate_options(options)?;
     let root = root.canonicalize()?;
     let database = absolute_database_path(&root, options.database);
     let provider = if options.embed_on_change {
@@ -468,6 +497,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     } else {
         None
     };
+
     let (sender, receiver) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
@@ -490,8 +520,10 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     normalize_targets(&mut targets);
     update_classifier_targets(&mut classifier, &targets);
     registry.reconcile(&mut watcher, &root, &targets);
-    let mut next_reconcile = (!options.reconcile_interval.is_zero())
-        .then(|| started.elapsed().saturating_add(options.reconcile_interval));
+    // Reconciliation is anchored after a complete generation, not process
+    // start or timer fire. Long generations therefore cannot create a
+    // back-to-back refresh loop.
+    let mut next_reconcile = None;
 
     eprintln!(
         "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} enrich={}",
@@ -510,9 +542,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
 
     loop {
         let now = started.elapsed();
-        if next_reconcile.is_some_and(|deadline| now >= deadline) {
-            coordinator.mark_dirty(now, "periodic-reconciliation");
-            next_reconcile = Some(now.saturating_add(options.reconcile_interval));
+        if next_reconcile.is_some_and(|deadline| now >= deadline) && coordinator.is_clean() {
+            coordinator.mark_reconciliation(now);
+            next_reconcile = None;
         }
         drain_events(&receiver, &classifier, &mut coordinator, started.elapsed());
 
@@ -574,6 +606,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 result.snapshot,
                                 result.failure_fingerprint,
                             ),
+                            started.elapsed(),
+                            options.reconcile_interval,
+                            &mut next_reconcile,
                         );
                     }
                     Err(error) => {
@@ -582,7 +617,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             work.generation,
                             phase_started.elapsed().as_millis()
                         );
-                        report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                        report_finish(
+                            work,
+                            coordinator.finish_error(started.elapsed(), work),
+                            started.elapsed(),
+                            options.reconcile_interval,
+                            &mut next_reconcile,
+                        );
                     }
                 },
                 Phase::Embed => {
@@ -605,12 +646,15 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 if canceled { "canceled" } else { "succeeded" },
                                 phase_started.elapsed().as_millis()
                             );
-                            let state = if canceled && !coordinator.is_superseded(work) {
-                                coordinator.finish_error(started.elapsed(), work)
-                            } else {
-                                coordinator.finish_optional(work)
-                            };
-                            report_finish(work, state);
+                            debug_assert!(!canceled || coordinator.is_superseded(work));
+                            let state = coordinator.finish_optional(work);
+                            report_finish(
+                                work,
+                                state,
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
                         }
                         Err(error) => {
                             eprintln!(
@@ -618,7 +662,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 work.generation,
                                 phase_started.elapsed().as_millis()
                             );
-                            report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                            report_finish(
+                                work,
+                                coordinator.finish_error(started.elapsed(), work),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
                         }
                     }
                 }
@@ -653,7 +703,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             normalize_targets(&mut targets);
                             update_classifier_targets(&mut classifier, &targets);
                             registry.reconcile(&mut watcher, &root, &targets);
-                            report_finish(work, coordinator.finish_optional(work));
+                            report_finish(
+                                work,
+                                coordinator.finish_optional(work),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
                         }
                         Err(error) => {
                             eprintln!(
@@ -661,7 +717,17 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 work.generation,
                                 phase_started.elapsed().as_millis()
                             );
-                            report_finish(work, coordinator.finish_error(started.elapsed(), work));
+                            if checker::process::interrupt_pending() {
+                                eprintln!("watch status=stopped reason=interrupt");
+                                return Ok(());
+                            }
+                            report_finish(
+                                work,
+                                coordinator.finish_error(started.elapsed(), work),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
                         }
                     }
                 }
@@ -691,6 +757,19 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
+}
+
+fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
+    if options.enrich_on_change && options.enrich_timeout.is_zero() {
+        bail!("--enrich-timeout must be greater than zero seconds");
+    }
+    if options.debounce.is_zero() {
+        bail!("--debounce-ms must be greater than zero");
+    }
+    if !options.reconcile_interval.is_zero() && options.reconcile_interval <= options.debounce {
+        bail!("--reconcile-seconds must exceed --debounce-ms or be zero");
+    }
+    Ok(())
 }
 
 fn run_refresh(root: &Path, database: &Path, dependencies: &[String]) -> Result<RefreshResult> {
@@ -837,14 +916,24 @@ fn drain_events(
     }
 }
 
-fn report_finish(work: Work, state: FinishState) {
+fn report_finish(
+    work: Work,
+    state: FinishState,
+    now: Duration,
+    reconcile_interval: Duration,
+    next_reconcile: &mut Option<Duration>,
+) {
     match state {
         FinishState::Continue => {}
-        FinishState::Complete { degraded } => eprintln!(
-            "watch generation={} status={}",
-            work.generation,
-            if degraded { "degraded" } else { "clean" }
-        ),
+        FinishState::Complete { degraded } => {
+            eprintln!(
+                "watch generation={} status={}",
+                work.generation,
+                if degraded { "degraded" } else { "clean" }
+            );
+            *next_reconcile =
+                (!reconcile_interval.is_zero()).then(|| now.saturating_add(reconcile_interval));
+        }
         FinishState::Retry { after } => eprintln!(
             "watch generation={} phase={} status=retry-wait retry_ms={}",
             work.generation,
@@ -969,7 +1058,6 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     if let Some(git_dir) = git_dir {
         let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
         paths.insert(git_dir.join("HEAD"));
-        paths.insert(git_dir.join("index"));
     }
     paths
 }
@@ -1098,7 +1186,8 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        Coordinator, EventClassifier, FinishState, Phase, is_noise, is_relevant, run_refresh,
+        Coordinator, EventClassifier, FinishState, Phase, WatchOptions, is_noise, is_relevant,
+        run_refresh, validate_options,
     };
 
     fn seconds(value: u64) -> Duration {
@@ -1142,7 +1231,7 @@ mod tests {
 
     #[test]
     fn failed_work_retries_without_a_new_event_with_bounded_backoff() {
-        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let mut coordinator = Coordinator::new(Duration::from_millis(100), false, false);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(
             coordinator.finish_error(Duration::ZERO, refresh),
@@ -1150,11 +1239,29 @@ mod tests {
                 after: Duration::from_millis(500)
             }
         );
+        // The parked retry gates the fresh-work path even though debounce has
+        // already elapsed.
+        assert!(coordinator.next_work(Duration::from_millis(100)).is_none());
         assert!(coordinator.next_work(Duration::from_millis(499)).is_none());
+        let retry = coordinator
+            .next_work(Duration::from_millis(500))
+            .expect("retry");
+        assert_eq!(retry, refresh);
+        assert_eq!(
+            coordinator.finish_error(Duration::from_millis(500), retry),
+            FinishState::Retry {
+                after: Duration::from_secs(1)
+            }
+        );
+        assert!(
+            coordinator
+                .next_work(Duration::from_millis(1_499))
+                .is_none()
+        );
         assert_eq!(
             coordinator
-                .next_work(Duration::from_millis(500))
-                .expect("retry"),
+                .next_work(Duration::from_millis(1_500))
+                .expect("second retry"),
             refresh
         );
     }
@@ -1175,11 +1282,85 @@ mod tests {
                 let FinishState::Retry { after } = state else {
                     panic!("expected retry")
                 };
+                assert_eq!(
+                    after,
+                    if attempt == 0 {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(1)
+                    }
+                );
                 now = now.saturating_add(after);
             } else {
                 assert_eq!(state, FinishState::Complete { degraded: true });
             }
         }
+    }
+
+    #[test]
+    fn a_known_degraded_failure_does_not_pay_three_retries_each_generation() {
+        let mut coordinator = Coordinator::new(Duration::from_millis(100), false, false);
+        let mut now = Duration::ZERO;
+        for _ in 0..3 {
+            let work = coordinator.next_work(now).expect("refresh attempt");
+            match coordinator.finish_refresh(
+                now,
+                work,
+                "partial".into(),
+                Some("permanent-failure".into()),
+            ) {
+                FinishState::Retry { after } => now = now.saturating_add(after),
+                FinishState::Complete { degraded: true } => {}
+                other => panic!("unexpected state: {other:?}"),
+            }
+        }
+
+        coordinator.mark_dirty(now, "source:still-unreadable.ts");
+        now = now.saturating_add(Duration::from_millis(100));
+        let work = coordinator.next_work(now).expect("next generation");
+        assert_eq!(
+            coordinator.finish_refresh(
+                now,
+                work,
+                "partial".into(),
+                Some("permanent-failure".into()),
+            ),
+            FinishState::Complete { degraded: true }
+        );
+    }
+
+    #[test]
+    fn reconciliation_is_immediate_only_after_the_previous_generation_completes() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(
+            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            FinishState::Complete { degraded: false }
+        );
+        assert!(coordinator.is_clean());
+
+        coordinator.mark_reconciliation(seconds(10));
+        let refresh = coordinator
+            .next_work(seconds(10))
+            .expect("immediate reconciliation");
+        assert_eq!(refresh.generation, 2);
+    }
+
+    #[test]
+    fn events_coalesce_into_one_successor_generation_and_drop_old_reasons() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        coordinator.mark_dirty(seconds(1), "source:a.ts");
+        coordinator.mark_dirty(seconds(2), "source:b.ts");
+        assert_eq!(coordinator.desired_generation, 2);
+        assert_eq!(
+            coordinator.dirty_reasons,
+            ["source:a.ts".to_string(), "source:b.ts".to_string()].into()
+        );
+        assert_eq!(
+            coordinator.finish_refresh(seconds(2), startup, "old".into(), None),
+            FinishState::Superseded
+        );
     }
 
     #[test]
@@ -1227,6 +1408,58 @@ mod tests {
         assert!(is_relevant(Path::new("types/ambient.d.ts")));
         assert!(is_noise(Path::new("node_modules/dep/index.js")));
         assert!(!is_noise(Path::new("pnpm-lock.yaml")));
+    }
+
+    #[test]
+    fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(root.path().join("README.md"), "documentation\n")?;
+        fs::write(root.path().join(".DS_Store"), "metadata\n")?;
+        fs::create_dir(root.path().join("renamed-directory"))?;
+        fs::create_dir(root.path().join(".git"))?;
+        fs::write(root.path().join(".git/index"), "git metadata\n")?;
+        let classifier = EventClassifier::new(root.path(), &root.path().join("watch.db"));
+
+        assert!(
+            classifier
+                .classify(&[root.path().join("README.md")])
+                .is_none()
+        );
+        assert!(
+            classifier
+                .classify(&[root.path().join(".DS_Store")])
+                .is_none()
+        );
+        assert!(
+            classifier
+                .classify(&[root.path().join(".git/index")])
+                .is_none()
+        );
+        assert_eq!(
+            classifier.classify(&[root.path().join("renamed-directory")]),
+            Some("unknown-event".into())
+        );
+        assert_eq!(
+            classifier.classify(&[root.path().join("deleted-unknown-file")]),
+            Some("unknown-event".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_interval_must_exceed_debounce() {
+        let options = WatchOptions {
+            database: None,
+            embed_on_change: false,
+            dependencies: &[],
+            enrich_on_change: false,
+            enrich_timeout: seconds(300),
+            checker_sidecar: None,
+            debounce: seconds(2),
+            reconcile_interval: seconds(2),
+        };
+        let error = validate_options(&options).expect_err("invalid interval");
+        assert!(error.to_string().contains("must exceed"));
     }
 
     #[test]
