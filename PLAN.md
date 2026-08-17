@@ -6,8 +6,10 @@
 > large-repository operation until its required scale correction passes. G11
 > snapshot simplification, G13 repository reconnaissance, and G14 retrieval
 > handoff are implemented; G12 watcher coordination remains planned. G15
-> design-before-edit task memory is the next fixed-snapshot milestone. G16 is
-> a conditional post-G15 memory-delivery correction, not a committed rewrite.
+> design-before-edit task memory is parked as product-surface expansion while
+> the same hypothesis is tested entirely in the evaluation harness. G16 is
+> also parked; it remains a conditional memory-delivery correction, not a
+> committed rewrite.
 
 ## Document policy
 
@@ -1550,9 +1552,18 @@ reported in the attachment status.
 - compact/debug representations remain fact-equivalent, and all tests use
   deterministic fixtures without model calls.
 
-## Planned G15 — design-before-edit task memory
+## Parked G15 — design-before-edit task memory
 
-G15 addresses a different bottleneck from retrieval. In the
+**Decision amendment (2026-08-17):** do not ship or evaluate G15 as a jscout
+product surface now. PR #45 is blocked. The next experiment implements the
+intervention only in the replay harness: one read-only design call followed by
+a separate implementation call that receives the captured design in its
+prompt. No design artifact, command, MCP tool, semantic-plane write, or agent
+guide change is added to jscout. The design below is retained only as the
+bounded proposal to reconsider if the harness experiment establishes value
+that cannot be achieved through orchestration alone.
+
+The proposed G15 addresses a different bottleneck from retrieval. In the
 optimistic-prefetch campaign, one read-only Sol architecture probe received the
 same anchor-free task story as the implementation agents and produced the
 missing mechanism, detection axes, cure semantics, and cross-file intervention
@@ -1562,12 +1573,13 @@ generated. Agents localized relevant code and sometimes received `cache.ts`
 memory, then collapsed into an edit/verify loop around
 `optimistic-routes.ts`.
 
-The product consequence is a first-class design phase whose result survives
-implementation pressure. G15 does not merely summarize more source. It makes a
-task-specific hypothesis artifact before editing, stores it in the semantic
-plane, and provides a compact, explicit handoff during implementation.
+The experiment consequence is a first-class design phase whose result survives
+implementation pressure. Whether persistence belongs in jscout is explicitly
+unresolved. The parked G15 proposal would make a task-specific hypothesis
+artifact before editing, store it in the semantic plane, and provide a compact,
+explicit handoff during implementation.
 
-### Product surface
+### Parked product proposal
 
 The initial surface is an explicit command and two structural-profile MCP
 tools:
@@ -1676,7 +1688,7 @@ already stored in jscout. G15 implements the third as the durable common layer.
 The pi-ai gateway remains a bounded schema-call adapter, not an autonomous
 tool-using coding agent.
 
-### G15 acceptance
+### Acceptance if unparked
 
 - identical task/evidence inputs reuse one immutable design; evidence changes
   visibly degrade/stale it and refresh publishes one successor;
@@ -1717,8 +1729,8 @@ code-evidence connection is not attached, and the response redirects the agent
 to `semantic_memory`.
 
 G16 is a decision gate for that boundary, not the next automatic milestone.
-It is considered only after G15 and the full product evaluation. The evaluation
-must retain, per search, the bounded semantic candidate IDs and ranks, why each
+It is considered only if G15 is unparked and after the full product evaluation.
+The evaluation must retain, per search, the bounded semantic candidate IDs and ranks, why each
 selected artifact connected, the `no_connected_memory` status, the emitted
 follow-up, and whether the agent subsequently called `semantic_memory`. Stored
 request telemetry records identifiers and decisions, not artifact bodies or
@@ -1784,7 +1796,7 @@ consequences that still govern implementation.
 | Fixed-snapshot workflow memory replay delivered artifacts in every correct warm token win and reduced median session-2 tokens | Keep evidence-backed workflow memory opt-in and proceed with the shared semantic engine |
 | Free-form workflow participant synthesis omitted deterministic continuations | Candidate closure and exhaustive classification are mandatory |
 | Standalone `neighborhood` had no natural selection while expanded search used the same machinery | Treat neighborhood as drill-down plumbing; prioritize agent-reached surfaces |
-| Optimistic-prefetch memory replays delivered fresh vector-backed context but 46 implementation arms never generated the mechanism found by one read-only architecture probe | Treat retrieval polish as G14 hygiene; make hypothesis generation and persistent design-to-implementation handoff the separate G15 product surface |
+| Optimistic-prefetch memory replays delivered fresh vector-backed context but 46 implementation arms never generated the mechanism found by one read-only architecture probe | Treat retrieval polish as G14 hygiene; test a read-only design phase followed by implementation in the eval harness before considering any persistent jscout product surface |
 
 Relevant result summaries include:
 
