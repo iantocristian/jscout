@@ -9,6 +9,7 @@ use crate::{file_role, origin, semantic, store, structural};
 
 const OVERVIEW_CITATIONS_PER_CLASSIFICATION: usize = 3;
 const OVERVIEW_CITATION_CHARS: usize = 320;
+const OVERVIEW_REASON_CHARS: usize = 180;
 
 #[derive(Debug, Clone)]
 pub struct EntityLookupOptions {
@@ -286,6 +287,8 @@ pub struct OverviewOptions {
     pub semantic_limit: usize,
     pub semantic_types: Vec<String>,
     pub reconnaissance_limit: usize,
+    pub reconnaissance_subject: Option<String>,
+    pub reconnaissance_detail: bool,
     pub response_byte_limit: usize,
 }
 
@@ -299,6 +302,8 @@ impl Default for OverviewOptions {
             semantic_limit: 8,
             semantic_types: Vec::new(),
             reconnaissance_limit: 12,
+            reconnaissance_subject: None,
+            reconnaissance_detail: false,
             response_byte_limit: 24_000,
         }
     }
@@ -346,14 +351,22 @@ pub struct ReconnaissanceClassification {
     pub role: String,
     pub confidence: String,
     pub policy: String,
+    pub reason: String,
+    pub citation_count: usize,
+    pub member_count: usize,
+    pub conflict_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ReconnaissanceClassificationDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconnaissanceClassificationDetail {
     pub explanation: String,
     pub citation_ids: Vec<String>,
     pub cited_evidence: Vec<ReconnaissanceCitation>,
     pub cited_evidence_truncated: bool,
-    pub member_count: usize,
     pub deterministic_file_roles: BTreeMap<String, usize>,
     pub effective_file_roles: BTreeMap<String, usize>,
-    pub conflict_files: usize,
     pub depth: usize,
     pub prompt_version: String,
 }
@@ -382,6 +395,7 @@ pub struct OverviewResponseBudget {
     pub omitted_relations: usize,
     pub omitted_areas: usize,
     pub omitted_entity_inventory: usize,
+    pub omitted_reconnaissance_details: usize,
     pub omitted_reconnaissance_classifications: usize,
 }
 
@@ -566,6 +580,12 @@ pub fn overview_response(
     if options.reconnaissance_limit > 100 {
         bail!("reconnaissance overview limit must be between 0 and 100");
     }
+    if options.reconnaissance_detail && options.reconnaissance_subject.is_none() {
+        bail!("reconnaissance detail requires an exact reconnaissance subject");
+    }
+    if options.reconnaissance_detail && options.reconnaissance_limit == 0 {
+        bail!("reconnaissance detail cannot be requested with a zero reconnaissance limit");
+    }
     validate_semantic_types(&options.semantic_types)?;
     store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
         let overview = overview_unpinned(
@@ -580,7 +600,13 @@ pub fn overview_response(
             .transpose()?;
         let reconnaissance = (options.reconnaissance_limit > 0)
             .then(|| {
-                reconnaissance_overlay(conn, &options.file_origins, options.reconnaissance_limit)
+                reconnaissance_overlay(
+                    conn,
+                    &options.file_origins,
+                    options.reconnaissance_limit,
+                    options.reconnaissance_subject.as_deref(),
+                    options.reconnaissance_detail,
+                )
             })
             .transpose()?
             .flatten();
@@ -626,10 +652,13 @@ fn reconnaissance_overlay(
     conn: &Connection,
     file_origins: &[String],
     limit: usize,
+    subject: Option<&str>,
+    include_detail: bool,
 ) -> Result<Option<ReconnaissanceOverlay>> {
     let matched: usize = conn.query_row(
-        "SELECT count(*) FROM repository_current_classifications",
-        [],
+        "SELECT count(*) FROM repository_current_classifications
+         WHERE (?1 IS NULL OR subject_key=?1)",
+        [subject],
         |row| Ok(row.get::<_, i64>(0)? as usize),
     )?;
     if matched == 0 {
@@ -639,10 +668,16 @@ fn reconnaissance_overlay(
                JOIN scout_runs run ON run.id=classification.run_id
                WHERE run.status='completed'
                  AND classification.subject_kind IN ('package','area')
+                 AND (?1 IS NULL OR classification.subject_key=?1)
              )",
-            [],
+            [subject],
             |row| row.get(0),
         )?;
+        if let Some(subject) = subject
+            && !historical
+        {
+            bail!("reconnaissance subject `{subject}` was not found");
+        }
         return Ok(historical.then_some(ReconnaissanceOverlay {
             trust: "untrusted_semantic_policy",
             status: "no_current_classifications",
@@ -660,9 +695,10 @@ fn reconnaissance_overlay(
     let mut roles = BTreeMap::new();
     let mut statement = conn.prepare(
         "SELECT role, count(*) FROM repository_current_classifications
+         WHERE (?1 IS NULL OR subject_key=?1)
          GROUP BY role ORDER BY role",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([subject], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
     })?;
     for row in rows {
@@ -677,10 +713,11 @@ fn reconnaissance_overlay(
          FROM files file
          LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE file.origin IN (SELECT value FROM json_each(?1))
+           AND (?2 IS NULL OR policy.subject_key=?2)
          GROUP BY COALESCE(policy.effective_role, file.role)
          ORDER BY COALESCE(policy.effective_role, file.role)",
     )?;
-    let rows = statement.query_map([origins_json], |row| {
+    let rows = statement.query_map(params![origins_json, subject], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
     })?;
     for row in rows {
@@ -694,15 +731,16 @@ fn reconnaissance_overlay(
                 deterministic_roles_json,effective_roles_json,conflict_files,
                 depth,prompt_version
          FROM repository_current_classifications
+         WHERE (?1 IS NULL OR subject_key=?1)
          ORDER BY
            CASE role WHEN 'mixed' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
            CASE confidence WHEN 'possible' THEN 0 ELSE 1 END,
            (conflict_files > 0) DESC,
            CASE role WHEN 'runtime' THEN 1 ELSE 0 END,
            conflict_files DESC, subject_key
-         LIMIT ?1",
+         LIMIT ?2",
     )?;
-    let rows = statement.query_map([limit as i64], |row| {
+    let rows = statement.query_map(params![subject, limit as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -737,13 +775,20 @@ fn reconnaissance_overlay(
             prompt_version,
         ) = row?;
         let citation_ids = serde_json::from_str::<Vec<String>>(&citations_json)?;
-        let cited_evidence_values = serde_json::from_str::<Vec<Value>>(&cited_evidence_json)?;
-        let cited_evidence_matched = cited_evidence_values.len();
-        let cited_evidence = cited_evidence_values
-            .into_iter()
-            .take(OVERVIEW_CITATIONS_PER_CLASSIFICATION)
-            .map(reconnaissance_citation)
-            .collect::<Result<Vec<_>>>()?;
+        let (cited_evidence, cited_evidence_matched) = if include_detail {
+            let values = serde_json::from_str::<Vec<Value>>(&cited_evidence_json)?;
+            let matched = values.len();
+            (
+                values
+                    .into_iter()
+                    .take(OVERVIEW_CITATIONS_PER_CLASSIFICATION)
+                    .map(reconnaissance_citation)
+                    .collect::<Result<Vec<_>>>()?,
+                matched,
+            )
+        } else {
+            (Vec::new(), 0)
+        };
         let policy = if confidence == "likely"
             && matches!(
                 role.as_str(),
@@ -753,22 +798,31 @@ fn reconnaissance_overlay(
         } else {
             "neutral"
         };
+        let detail = if include_detail {
+            Some(ReconnaissanceClassificationDetail {
+                explanation: explanation.clone(),
+                citation_ids: citation_ids.clone(),
+                cited_evidence_truncated: cited_evidence_matched > cited_evidence.len(),
+                cited_evidence,
+                deterministic_file_roles: parse_count_map(&deterministic_roles_json)?,
+                effective_file_roles: parse_count_map(&effective_roles_json)?,
+                depth,
+                prompt_version,
+            })
+        } else {
+            None
+        };
         classifications.push(ReconnaissanceClassification {
             subject,
             kind,
             role,
             confidence,
             policy: policy.into(),
-            explanation,
-            citation_ids,
-            cited_evidence_truncated: cited_evidence_matched > cited_evidence.len(),
-            cited_evidence,
+            reason: compact_reconnaissance_reason(&explanation),
+            citation_count: citation_ids.len(),
             member_count,
-            deterministic_file_roles: parse_count_map(&deterministic_roles_json)?,
-            effective_file_roles: parse_count_map(&effective_roles_json)?,
             conflict_files,
-            depth,
-            prompt_version,
+            detail,
         });
     }
     let returned = classifications.len();
@@ -783,6 +837,18 @@ fn reconnaissance_overlay(
         effective_file_roles,
         classifications,
     }))
+}
+
+fn compact_reconnaissance_reason(explanation: &str) -> String {
+    let one_line = explanation.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= OVERVIEW_REASON_CHARS {
+        return one_line;
+    }
+    one_line
+        .chars()
+        .take(OVERVIEW_REASON_CHARS)
+        .collect::<String>()
+        + "…"
 }
 
 fn parse_count_map(value: &str) -> Result<BTreeMap<String, usize>> {
@@ -940,6 +1006,18 @@ fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()
             overlay.returned = overlay.artifacts.len();
             overlay.truncated = true;
             response.response_budget.omitted_semantic_artifacts += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
+        if let Some(overlay) = response.reconnaissance.as_mut()
+            && let Some(classification) = overlay
+                .classifications
+                .iter_mut()
+                .rev()
+                .find(|classification| classification.detail.is_some())
+        {
+            classification.detail = None;
+            response.response_budget.omitted_reconnaissance_details += 1;
             settle_overview_bytes(response)?;
             continue;
         }
@@ -1185,12 +1263,74 @@ mod tests {
         assert_eq!(overlay.effective_file_roles["runtime"], 1);
         assert_eq!(overlay.effective_file_roles["test"], 1);
         assert_eq!(overlay.classifications[0].conflict_files, 1);
-        assert_eq!(overlay.classifications[0].citation_ids, ["E001"]);
+        assert_eq!(overlay.classifications[0].citation_count, 1);
         assert_eq!(
-            overlay.classifications[0].cited_evidence[0]
-                .source
-                .as_deref(),
+            overlay.classifications[0].reason,
+            "document-domain runtime implementation"
+        );
+        assert!(overlay.classifications[0].detail.is_none());
+
+        let detailed = overview_response(
+            &conn,
+            &OverviewOptions {
+                reconnaissance_subject: Some(state.subject_key.clone()),
+                reconnaissance_detail: true,
+                ..Default::default()
+            },
+        )?
+        .reconnaissance
+        .expect("scoped reconnaissance detail");
+        assert_eq!(detailed.matched, 1);
+        assert_eq!(detailed.returned, 1);
+        let detail = detailed.classifications[0]
+            .detail
+            .as_ref()
+            .expect("explicit detail");
+        assert_eq!(detail.citation_ids, ["E001"]);
+        assert_eq!(
+            detail.cited_evidence[0].source.as_deref(),
             Some("docs/runtime.ts")
+        );
+        let scoped_compact = overview_response(
+            &conn,
+            &OverviewOptions {
+                reconnaissance_subject: Some(state.subject_key.clone()),
+                ..Default::default()
+            },
+        )?;
+        let bounded_detail = overview_response(
+            &conn,
+            &OverviewOptions {
+                reconnaissance_subject: Some(state.subject_key.clone()),
+                reconnaissance_detail: true,
+                response_byte_limit: scoped_compact.response_budget.rendered_bytes + 32,
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            bounded_detail
+                .reconnaissance
+                .as_ref()
+                .unwrap()
+                .classifications[0]
+                .detail
+                .is_none()
+        );
+        assert_eq!(
+            bounded_detail
+                .response_budget
+                .omitted_reconnaissance_details,
+            1
+        );
+        assert!(
+            overview_response(
+                &conn,
+                &OverviewOptions {
+                    reconnaissance_detail: true,
+                    ..Default::default()
+                },
+            )
+            .is_err()
         );
 
         let without_reconnaissance = overview_response(

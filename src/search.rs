@@ -9,6 +9,10 @@ type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
+pub const DEFAULT_MEMORY_GRAPH_DEPTH: usize = 2;
+pub const DEFAULT_MEMORY_GRAPH_NODE_LIMIT: usize = 2_000;
+pub const MAX_MEMORY_GRAPH_DEPTH: usize = 8;
+pub const MAX_MEMORY_GRAPH_NODE_LIMIT: usize = 20_000;
 const DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -56,12 +60,21 @@ pub struct SearchOptions {
     pub file_origins: Vec<String>,
     pub include_memory: bool,
     pub memory_limit: usize,
+    /// Maximum likely/certain structural hops used to connect a semantic
+    /// support to a returned code hit.
+    pub memory_graph_depth: usize,
+    /// Maximum graph nodes visited while connecting memory to code hits.
+    pub memory_graph_node_limit: usize,
     /// Apply the separately configured cross-encoder to the fused candidate
     /// pool. This is independent of whether vector retrieval is enabled.
     pub rerank: bool,
     /// Budget and render the agent-facing compact transport rather than the
     /// diagnostic representation.
     pub compact: bool,
+    /// Emit neighborhood follow-ups when that structural tool is available.
+    /// Baseline MCP search disables these while retaining exact definition and
+    /// who_uses hand-offs.
+    pub include_neighborhood_followups: bool,
     pub expansion: ExpansionOptions,
 }
 
@@ -75,8 +88,11 @@ impl Default for SearchOptions {
             file_origins: origin::defaults(),
             include_memory: true,
             memory_limit: 4,
+            memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
+            memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
             rerank: true,
             compact: false,
+            include_neighborhood_followups: true,
             expansion: ExpansionOptions::default(),
         }
     }
@@ -91,6 +107,8 @@ pub struct SearchResult {
     pub semantic_artifacts: Vec<semantic::SemanticArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_retrieval: Option<semantic::ArtifactRetrievalStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_attachment: Option<MemoryAttachmentStatus>,
     /// Ranked retrieval pool before the memory result limit. This is a
     /// candidate count, not a calibrated relevant-match count.
     #[serde(skip)]
@@ -110,6 +128,15 @@ pub struct RetrievalStatus {
     pub reranker: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_action: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryAttachmentStatus {
+    pub status: &'static str,
+    pub connected_candidates: usize,
+    pub graph_depth: usize,
+    pub graph_nodes: usize,
+    pub graph_truncated: bool,
 }
 
 impl RetrievalStatus {
@@ -160,6 +187,7 @@ pub struct ResponseBudget {
     pub omitted_semantic_supports: usize,
     pub omitted_nodes: usize,
     pub omitted_edges: usize,
+    pub omitted_followups: usize,
     pub truncated_snippets: usize,
 }
 
@@ -201,6 +229,12 @@ pub struct Hit {
     pub uses: Vec<String>,
     /// Symbols declared here that other files use, with usage counts.
     pub used_by: Vec<String>,
+    /// Compact transport may shed copy-safe follow-up arguments from lower
+    /// ranked hits before dropping the hit itself.
+    #[serde(skip)]
+    pub include_followups: bool,
+    #[serde(skip)]
+    pub include_neighborhood_followup: bool,
 }
 
 /// Build an FTS5 query: each identifier-ish token quoted, OR-joined, so any
@@ -363,9 +397,22 @@ pub fn search(
     file_role::validate_all(&options.expansion.file_roles)?;
     origin::validate_all(&options.file_origins)?;
     origin::validate_all(&options.expansion.file_origins)?;
+    if options.memory_graph_depth > MAX_MEMORY_GRAPH_DEPTH {
+        anyhow::bail!("memory graph depth must be at most {MAX_MEMORY_GRAPH_DEPTH}");
+    }
+    if options.memory_graph_node_limit == 0
+        || options.memory_graph_node_limit > MAX_MEMORY_GRAPH_NODE_LIMIT
+    {
+        anyhow::bail!(
+            "memory graph node limit must be between 1 and {MAX_MEMORY_GRAPH_NODE_LIMIT}"
+        );
+    }
+    if options.include_memory && (options.memory_limit == 0 || options.memory_limit > 100) {
+        anyhow::bail!("memory limit must be between 1 and 100");
+    }
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let (hits, retrieval) = ranked_hits(
+        let (mut hits, retrieval) = ranked_hits(
             conn,
             provider,
             q,
@@ -374,13 +421,29 @@ pub fn search(
             &options.file_origins,
             options.rerank,
         )?;
-        let (semantic_artifacts, semantic_retrieval, semantic_candidates) =
+        if !options.include_neighborhood_followups {
+            for hit in &mut hits {
+                hit.include_neighborhood_followup = false;
+            }
+        }
+        let (semantic_artifacts, semantic_retrieval, semantic_attachment, semantic_candidates) =
             if options.include_memory {
+                let candidate_limit = options.memory_limit.saturating_mul(8).clamp(1, 100);
                 let (artifacts, retrieval, candidates) =
-                    semantic::search_with_provider(conn, provider, q, options.memory_limit)?;
-                (artifacts, Some(retrieval), candidates)
+                    semantic::search_with_provider(conn, provider, q, candidate_limit)?;
+                let (artifacts, attachment) = select_attached_memory(
+                    conn,
+                    artifacts,
+                    &hits,
+                    options.memory_limit,
+                    options.memory_graph_depth,
+                    options.memory_graph_node_limit,
+                    &options.file_origins,
+                )?;
+                let attachment = (retrieval.corpus_artifacts > 0).then_some(attachment);
+                (artifacts, Some(retrieval), attachment, candidates)
             } else {
-                (Vec::new(), None, 0)
+                (Vec::new(), None, None, 0)
             };
         let semantic_selected = semantic_artifacts.len();
         let expansion = options
@@ -393,6 +456,7 @@ pub fn search(
             hits,
             semantic_artifacts,
             semantic_retrieval,
+            semantic_attachment,
             semantic_candidates,
             semantic_selected,
             expansion,
@@ -404,6 +468,311 @@ pub fn search(
         apply_response_budget(&mut result, options.compact)?;
         Ok(result)
     })
+}
+
+#[derive(Debug)]
+struct ConnectedMemoryCandidate {
+    artifact: semantic::SemanticArtifact,
+    tier: u8,
+    rank: usize,
+    support_key: Option<String>,
+}
+
+fn select_attached_memory(
+    conn: &Connection,
+    artifacts: Vec<semantic::SemanticArtifact>,
+    hits: &[Hit],
+    limit: usize,
+    graph_depth: usize,
+    graph_node_limit: usize,
+    file_origins: &[String],
+) -> Result<(Vec<semantic::SemanticArtifact>, MemoryAttachmentStatus)> {
+    let mut seed_keys = Vec::new();
+    let mut seen_seeds = HashSet::new();
+    let mut hit_files = HashSet::new();
+    for hit in hits {
+        hit_files.insert(hit.file.as_str());
+        for anchor in hit.anchors.iter().chain(std::iter::once(&hit.file_anchor)) {
+            if seen_seeds.insert(anchor.as_str()) {
+                seed_keys.push(anchor.clone());
+            }
+        }
+    }
+    let (distances, graph_truncated) = memory_graph_distances(
+        conn,
+        &seed_keys,
+        graph_depth,
+        graph_node_limit,
+        file_origins,
+    )?;
+
+    let mut connected = Vec::new();
+    let mut unconnected = Vec::new();
+    for (rank, artifact) in artifacts.into_iter().enumerate() {
+        let direct = artifact.supports.iter().find(|support| {
+            seen_seeds.contains(support.anchor.as_str())
+                || hit_files.contains(support.evidence_file.as_str())
+        });
+        if let Some(support) = direct {
+            connected.push(ConnectedMemoryCandidate {
+                support_key: Some(support.anchor.clone()),
+                artifact,
+                tier: 0,
+                rank,
+            });
+            continue;
+        }
+        let nearby = artifact
+            .supports
+            .iter()
+            .filter_map(|support| {
+                distances
+                    .get(&support.anchor)
+                    .copied()
+                    .filter(|distance| *distance > 0 && *distance <= graph_depth)
+                    .map(|distance| (distance, support.anchor.clone()))
+            })
+            .min_by_key(|(distance, _)| *distance);
+        if let Some((_, support_key)) = nearby {
+            connected.push(ConnectedMemoryCandidate {
+                artifact,
+                tier: 1,
+                rank,
+                support_key: Some(support_key),
+            });
+        } else {
+            unconnected.push((rank, artifact));
+        }
+    }
+
+    if !connected.is_empty() && !unconnected.is_empty() {
+        let base_ids = connected
+            .iter()
+            .map(|candidate| candidate.artifact.id)
+            .collect::<HashSet<_>>();
+        let candidate_ids = unconnected
+            .iter()
+            .map(|(_, artifact)| artifact.id)
+            .chain(base_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let candidate_json = serde_json::to_string(&candidate_ids)?;
+        let mut related_to_base = HashMap::<i64, i64>::new();
+        let mut statement = conn.prepare(
+            "SELECT src_artifact_id,dst_artifact_id FROM semantic_relations
+             WHERE src_artifact_id IN (SELECT value FROM json_each(?1))
+                OR dst_artifact_id IN (SELECT value FROM json_each(?1))
+             ORDER BY src_artifact_id,dst_artifact_id",
+        )?;
+        let rows = statement.query_map([candidate_json], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (src, dst) = row?;
+            if base_ids.contains(&src) {
+                related_to_base.entry(dst).or_insert(src);
+            }
+            if base_ids.contains(&dst) {
+                related_to_base.entry(src).or_insert(dst);
+            }
+        }
+        for (rank, artifact) in unconnected {
+            if let Some(base_id) = related_to_base.get(&artifact.id) {
+                connected.push(ConnectedMemoryCandidate {
+                    artifact,
+                    tier: 2,
+                    rank,
+                    support_key: Some(format!("artifact:{base_id}")),
+                });
+            }
+        }
+    }
+
+    let connected_candidates = connected.len();
+    connected.sort_by(|left, right| {
+        left.tier.cmp(&right.tier).then_with(|| {
+            let left_score = left
+                .artifact
+                .retrieval_score
+                .as_ref()
+                .map_or(0.0, |score| score.rank_score);
+            let right_score = right
+                .artifact
+                .retrieval_score
+                .as_ref()
+                .map_or(0.0, |score| score.rank_score);
+            right_score
+                .total_cmp(&left_score)
+                .then(left.rank.cmp(&right.rank))
+        })
+    });
+    let selected = diversify_memory_ties(connected, limit)
+        .into_iter()
+        .map(|candidate| candidate.artifact)
+        .collect::<Vec<_>>();
+    Ok((
+        selected,
+        MemoryAttachmentStatus {
+            status: if connected_candidates == 0 {
+                "no_connected_memory"
+            } else {
+                "connected"
+            },
+            connected_candidates,
+            graph_depth,
+            graph_nodes: distances.len(),
+            graph_truncated,
+        },
+    ))
+}
+
+fn diversify_memory_ties(
+    candidates: Vec<ConnectedMemoryCandidate>,
+    limit: usize,
+) -> Vec<ConnectedMemoryCandidate> {
+    let mut selected = Vec::new();
+    let mut seen_types = HashSet::new();
+    let mut seen_supports = HashSet::new();
+    let mut cursor = 0;
+    while cursor < candidates.len() && selected.len() < limit {
+        let tier = candidates[cursor].tier;
+        let score = candidates[cursor]
+            .artifact
+            .retrieval_score
+            .as_ref()
+            .map_or(0.0, |score| score.rank_score);
+        let mut end = cursor + 1;
+        while end < candidates.len()
+            && candidates[end].tier == tier
+            && candidates[end]
+                .artifact
+                .retrieval_score
+                .as_ref()
+                .map_or(0.0, |score| score.rank_score)
+                .to_bits()
+                == score.to_bits()
+        {
+            end += 1;
+        }
+        let mut group = candidates[cursor..end].iter().collect::<Vec<_>>();
+        while !group.is_empty() && selected.len() < limit {
+            let mut choice = 0;
+            let mut best_novelty = 0;
+            for (index, candidate) in group.iter().enumerate() {
+                let novelty = usize::from(!seen_types.contains(&candidate.artifact.artifact_type))
+                    + usize::from(
+                        candidate
+                            .support_key
+                            .as_ref()
+                            .is_some_and(|key| !seen_supports.contains(key)),
+                    );
+                if novelty > best_novelty {
+                    choice = index;
+                    best_novelty = novelty;
+                }
+            }
+            let candidate = group.remove(choice);
+            seen_types.insert(candidate.artifact.artifact_type.clone());
+            if let Some(key) = &candidate.support_key {
+                seen_supports.insert(key.clone());
+            }
+            selected.push(candidate.rank);
+        }
+        cursor = end;
+    }
+    let mut by_rank = candidates
+        .into_iter()
+        .map(|candidate| (candidate.rank, candidate))
+        .collect::<HashMap<_, _>>();
+    selected
+        .into_iter()
+        .filter_map(|rank| by_rank.remove(&rank))
+        .collect()
+}
+
+fn memory_graph_distances(
+    conn: &Connection,
+    seeds: &[String],
+    max_depth: usize,
+    node_limit: usize,
+    file_origins: &[String],
+) -> Result<(HashMap<String, usize>, bool)> {
+    let mut distances = HashMap::new();
+    let mut frontier = Vec::new();
+    let mut truncated = false;
+    for seed in seeds {
+        if distances.len() == node_limit {
+            truncated = true;
+            break;
+        }
+        if distances.insert(seed.clone(), 0).is_none() {
+            frontier.push(seed.clone());
+        }
+    }
+    if max_depth == 0 || frontier.is_empty() {
+        return Ok((distances, truncated));
+    }
+    let origins_json = serde_json::to_string(file_origins)?;
+    for depth in 1..=max_depth {
+        let mut next = Vec::new();
+        for frontier_chunk in frontier.chunks(400) {
+            let frontier_json = serde_json::to_string(frontier_chunk)?;
+            let row_limit = node_limit.saturating_mul(4).saturating_add(1) as i64;
+            let mut statement = conn.prepare_cached(
+                "SELECT edge.src_key,edge.dst_key
+                 FROM resolved_edges edge
+                 JOIN graph_nodes src ON src.node_key=edge.src_key
+                 JOIN graph_nodes dst ON dst.node_key=edge.dst_key
+                 LEFT JOIN files src_file ON src_file.id=src.file_id
+                 LEFT JOIN files dst_file ON dst_file.id=dst.file_id
+                 WHERE edge.confidence IN ('certain','likely')
+                   AND (edge.src_key IN (SELECT value FROM json_each(?1))
+                     OR edge.dst_key IN (SELECT value FROM json_each(?1)))
+                   AND (src.file_id IS NULL
+                     OR src_file.origin IN (SELECT value FROM json_each(?2)))
+                   AND (dst.file_id IS NULL
+                     OR dst_file.origin IN (SELECT value FROM json_each(?2)))
+                 ORDER BY edge.id
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![frontier_json, origins_json, row_limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let frontier_set = frontier_chunk
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            let mut row_count = 0usize;
+            for row in rows {
+                row_count += 1;
+                let (src, dst) = row?;
+                let neighbor = if frontier_set.contains(src.as_str()) {
+                    dst
+                } else if frontier_set.contains(dst.as_str()) {
+                    src
+                } else {
+                    continue;
+                };
+                if distances.contains_key(&neighbor) {
+                    continue;
+                }
+                if distances.len() == node_limit {
+                    truncated = true;
+                    continue;
+                }
+                distances.insert(neighbor.clone(), depth);
+                next.push(neighbor);
+            }
+            if row_count >= row_limit as usize {
+                truncated = true;
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok((distances, truncated))
 }
 
 fn ranked_hits(
@@ -747,6 +1116,8 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         file_anchor,
         uses,
         used_by,
+        include_followups: true,
+        include_neighborhood_followup: true,
     }))
 }
 
@@ -816,6 +1187,18 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
                 expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
                 continue;
             }
+        }
+
+        if compact
+            && let Some(hit) = result
+                .hits
+                .iter_mut()
+                .rev()
+                .find(|hit| hit.include_followups)
+        {
+            hit.include_followups = false;
+            result.response_budget.omitted_followups += 1;
+            continue;
         }
 
         // Ranked hits are the primary product. Shed only lower-ranked hits;
@@ -1274,10 +1657,11 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, Hit, ResponseBudget, RetrievalStatus,
-        SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
-        apply_response_budget, candidate_pool_limits, merge_reranked_prefix,
-        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
+        DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
+        ExpansionOptions, Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchOptions,
+        SearchResult, apply_repository_policy_penalty, apply_response_budget,
+        candidate_pool_limits, merge_reranked_prefix, prefilter_ranking_by_role,
+        record_vector_ranking, reranker_document, search, select_attached_memory,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1434,8 +1818,11 @@ mod tests {
                 file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
+                memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
+                memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
                 rerank: true,
                 compact: true,
+                include_neighborhood_followups: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     depth: 1,
@@ -1473,8 +1860,11 @@ mod tests {
                 file_origins: origin::defaults(),
                 include_memory: true,
                 memory_limit: 4,
+                memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
+                memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
                 rerank: true,
                 compact: false,
+                include_neighborhood_followups: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
                     byte_limit: 1,
@@ -1488,6 +1878,140 @@ mod tests {
         assert!(byte_starved.edges.is_empty());
         assert!(byte_starved.payload_bytes <= 1);
         assert!(byte_starved.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("entry.ts"),
+            "import { nearby } from './nearby';\nexport function entry() { return nearby(); }\n",
+        )?;
+        fs::write(
+            repo.path().join("nearby.ts"),
+            "export function nearby() { return 1; }\n",
+        )?;
+        fs::write(
+            repo.path().join("unrelated.ts"),
+            "export function unrelated() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let anchor = |name: &str| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT node_key FROM graph_nodes
+                 WHERE node_kind='symbol' AND display_name=?1
+                 ORDER BY node_key LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        let entry = anchor("entry")?;
+        let nearby = anchor("nearby")?;
+        let unrelated = anchor("unrelated")?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        for id in [1_i64, 2, 3, 4] {
+            conn.execute(
+                "INSERT INTO semantic_artifacts(
+                   id,artifact_type,canonical_name,body_json,model,prompt_version,
+                   confidence,source_snapshot,created_at,input_fingerprint,artifact_fingerprint
+                 ) VALUES(?1,'card',?2,'{}','test','test/v1','likely',?3,'now',?2,?2)",
+                rusqlite::params![id, format!("artifact-{id}"), snapshot],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO semantic_relations(
+               src_artifact_id,dst_artifact_id,relation,claim_path,confidence,dst_fingerprint
+             ) VALUES(4,1,'related_to','/related','likely','artifact-1')",
+            [],
+        )?;
+
+        let support = |anchor: &str, file: &str| SemanticSupport {
+            claim_path: "/claim".into(),
+            anchor: anchor.into(),
+            relationship: "defining-evidence".into(),
+            role: None,
+            evidence_file: file.into(),
+            evidence_start_line: 1,
+            evidence_end_line: 1,
+            source_hash: "h".repeat(64),
+            context_hash: "c".repeat(64),
+            confidence: "likely".into(),
+            freshness: "fresh".into(),
+        };
+        let artifact = |id: i64, score: f64, supports: Vec<SemanticSupport>| -> SemanticArtifact {
+            SemanticArtifact {
+                id,
+                supersedes: None,
+                artifact_type: if id == 4 { "concept" } else { "card" }.into(),
+                name: Some(format!("artifact-{id}")),
+                trust: "untrusted-semantic-memory".into(),
+                body: serde_json::json!({ "purpose": format!("artifact {id}") }),
+                model: "test".into(),
+                prompt_version: "test/v1".into(),
+                confidence: "likely".into(),
+                source_snapshot: snapshot.clone(),
+                created_at: "now".into(),
+                freshness: "fresh".into(),
+                supports,
+                retrieval_score: Some(ArtifactRetrievalScore {
+                    rank_score: score,
+                    lexical_score: Some(score),
+                    vector_cosine: None,
+                }),
+            }
+        };
+        let hit = Hit {
+            chunk_id: 1,
+            file: "entry.ts".into(),
+            file_role: "production".into(),
+            repository_role: None,
+            file_origin: "repository".into(),
+            kind: "function".into(),
+            name: Some("entry".into()),
+            start_line: 2,
+            end_line: 2,
+            score: 1.0,
+            snippet: "entry() { return nearby(); }".into(),
+            snippet_truncated: false,
+            anchors: vec![entry.clone()],
+            file_anchor: "file:entry.ts".into(),
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: true,
+            include_neighborhood_followup: true,
+        };
+        let candidates = vec![
+            artifact(3, 1.0, vec![support(&unrelated, "unrelated.ts")]),
+            artifact(2, 0.8, vec![support(&nearby, "nearby.ts")]),
+            artifact(4, 0.9, Vec::new()),
+            artifact(1, 0.1, vec![support(&entry, "entry.ts")]),
+        ];
+        let (selected, status) =
+            select_attached_memory(&conn, candidates, &[hit], 4, 2, 2_000, &origin::defaults())?;
+        assert_eq!(
+            selected
+                .iter()
+                .map(|artifact| artifact.id)
+                .collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(status.status, "connected");
+        assert_eq!(status.connected_candidates, 3);
+
+        let disconnected = artifact(3, 1.0, vec![support(&unrelated, "unrelated.ts")]);
+        let (_, status) = select_attached_memory(
+            &conn,
+            vec![disconnected],
+            &[],
+            4,
+            2,
+            2_000,
+            &origin::defaults(),
+        )?;
+        assert_eq!(status.status, "no_connected_memory");
+        assert_eq!(status.connected_candidates, 0);
         Ok(())
     }
 
@@ -1549,6 +2073,7 @@ mod tests {
             hits: Vec::new(),
             semantic_artifacts: Vec::new(),
             semantic_retrieval: None,
+            semantic_attachment: None,
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: Some(SearchExpansion {
@@ -1601,6 +2126,8 @@ mod tests {
                 file_anchor: "file:src/large.ts".into(),
                 uses: vec!["helper (call)".into()],
                 used_by: vec!["caller: 1 site".into()],
+                include_followups: true,
+                include_neighborhood_followup: true,
             }],
             semantic_artifacts: vec![SemanticArtifact {
                 id: 1,
@@ -1629,6 +2156,7 @@ mod tests {
                 }),
             }],
             semantic_retrieval: None,
+            semantic_attachment: None,
             semantic_candidates: 1,
             semantic_selected: 1,
             expansion: None,
@@ -1645,6 +2173,51 @@ mod tests {
         assert!(result.hits[0].snippet_truncated);
         assert!(result.response_budget.truncated);
         assert!(result.response_budget.rendered_bytes <= 2_000);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
+        let mut result = SearchResult {
+            snapshot: "s".repeat(64),
+            retrieval: RetrievalStatus::vector_disabled(),
+            hits: vec![Hit {
+                chunk_id: 1,
+                file: "src/target.ts".into(),
+                file_role: "production".into(),
+                repository_role: None,
+                file_origin: "repository".into(),
+                kind: "function".into(),
+                name: Some("target".into()),
+                start_line: 10,
+                end_line: 12,
+                score: 1.0,
+                snippet: "export function target() { return 1; }".into(),
+                snippet_truncated: false,
+                anchors: vec!["sym:src/target.ts#::target@1".into()],
+                file_anchor: "file:src/target.ts".into(),
+                uses: Vec::new(),
+                used_by: Vec::new(),
+                include_followups: true,
+                include_neighborhood_followup: true,
+            }],
+            semantic_artifacts: Vec::new(),
+            semantic_retrieval: None,
+            semantic_attachment: None,
+            semantic_candidates: 0,
+            semantic_selected: 0,
+            expansion: None,
+            response_budget: ResponseBudget {
+                byte_limit: 500,
+                ..Default::default()
+            },
+        };
+
+        apply_response_budget(&mut result, true)?;
+        assert_eq!(result.hits.len(), 1);
+        assert!(!result.hits[0].include_followups);
+        assert_eq!(result.response_budget.omitted_followups, 1);
+        assert!(result.response_budget.rendered_bytes <= 500);
         Ok(())
     }
 
@@ -1694,6 +2267,7 @@ mod tests {
             hits: Vec::new(),
             semantic_artifacts: vec![artifact, second_artifact],
             semantic_retrieval: None,
+            semantic_attachment: None,
             semantic_candidates: 2,
             semantic_selected: 2,
             expansion: None,

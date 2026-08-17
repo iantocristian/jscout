@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod agent;
 mod calls;
 mod checker;
@@ -120,6 +122,12 @@ enum Command {
         /// Maximum matching semantic artifacts
         #[arg(long, default_value_t = 4)]
         memory_limit: usize,
+        /// Likely/certain graph hops allowed between hits and attached memory
+        #[arg(long, default_value_t = search::DEFAULT_MEMORY_GRAPH_DEPTH)]
+        memory_depth: usize,
+        /// Maximum graph nodes visited while connecting attached memory
+        #[arg(long, default_value_t = search::DEFAULT_MEMORY_GRAPH_NODE_LIMIT)]
+        memory_nodes: usize,
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = search::DEFAULT_RESPONSE_BYTE_LIMIT)]
         response_bytes: usize,
@@ -319,6 +327,12 @@ enum Command {
         /// Maximum current reconnaissance classifications with cited explanations
         #[arg(long, default_value_t = 12)]
         reconnaissance_limit: usize,
+        /// Exact reconnaissance subject key to drill into
+        #[arg(long)]
+        reconnaissance_subject: Option<String>,
+        /// Include full explanation and cited evidence for one exact subject
+        #[arg(long, requires = "reconnaissance_subject")]
+        reconnaissance_detail: bool,
         /// Maximum bytes in the complete rendered JSON response
         #[arg(long, default_value_t = 24_000)]
         response_bytes: usize,
@@ -807,6 +821,8 @@ fn main() -> Result<()> {
             file_origins,
             no_memory,
             memory_limit,
+            memory_depth,
+            memory_nodes,
             response_bytes,
             no_vector,
             no_rerank,
@@ -835,8 +851,11 @@ fn main() -> Result<()> {
                 file_origins: file_origins.clone(),
                 include_memory: !no_memory,
                 memory_limit,
+                memory_graph_depth: memory_depth,
+                memory_graph_node_limit: memory_nodes,
                 rerank: !(no_rerank || lexical_only),
                 compact: json,
+                include_neighborhood_followups: true,
                 response_byte_limit: response_bytes,
                 expansion: search::ExpansionOptions {
                     depth: expand_depth,
@@ -976,6 +995,8 @@ fn main() -> Result<()> {
             semantic_limit,
             semantic_types,
             reconnaissance_limit,
+            reconnaissance_subject,
+            reconnaissance_detail,
             response_bytes,
             database,
         } => {
@@ -990,6 +1011,8 @@ fn main() -> Result<()> {
                     semantic_limit,
                     semantic_types,
                     reconnaissance_limit,
+                    reconnaissance_subject,
+                    reconnaissance_detail,
                     response_byte_limit: response_bytes,
                 },
             )?;
@@ -1436,6 +1459,20 @@ fn cmd_search(
     );
     if let Some(action) = result.retrieval.vector_action {
         println!("vector action: {action}");
+    }
+    if let Some(attachment) = &result.semantic_attachment {
+        println!(
+            "semantic attachment: {} ({} connected candidates; graph depth {}, {} nodes{})",
+            attachment.status,
+            attachment.connected_candidates,
+            attachment.graph_depth,
+            attachment.graph_nodes,
+            if attachment.graph_truncated {
+                ", truncated"
+            } else {
+                ""
+            }
+        );
     }
     if result.hits.is_empty() && result.semantic_artifacts.is_empty() {
         println!("no results");

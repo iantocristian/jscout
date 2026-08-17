@@ -21,16 +21,21 @@ pub(crate) fn search_rendered_bytes(result: &search::SearchResult) -> Result<usi
 }
 
 pub(crate) fn search_value(result: &search::SearchResult) -> Value {
-    let hits = result.hits.iter().map(compact_hit).collect::<Vec<_>>();
+    let hits = result
+        .hits
+        .iter()
+        .map(|hit| compact_hit(hit, &result.snapshot))
+        .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
     response.insert("retrieval".into(), json!(result.retrieval));
     response.insert("hits".into(), Value::Array(hits));
 
-    if result.semantic_retrieval.as_ref().is_some_and(|retrieval| {
-        retrieval.corpus_artifacts > 0
-            && (result.semantic_candidates > 0 || retrieval.vector == "degraded")
-    }) {
+    if result
+        .semantic_retrieval
+        .as_ref()
+        .is_some_and(|retrieval| retrieval.corpus_artifacts > 0)
+    {
         let artifacts = result
             .semantic_artifacts
             .iter()
@@ -70,6 +75,7 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
             json!({
                 "trust": "untrusted",
                 "retrieval": result.semantic_retrieval,
+                "attachment": result.semantic_attachment.as_ref().map(memory_attachment_value),
                 "candidate_pool": result.semantic_candidates,
                 "selected": result.semantic_selected,
                 "returned": artifacts.len(),
@@ -95,6 +101,20 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     Value::Object(response)
 }
 
+fn memory_attachment_value(attachment: &search::MemoryAttachmentStatus) -> Value {
+    let mut value = Map::new();
+    value.insert("status".into(), json!(attachment.status));
+    value.insert("connected".into(), json!(attachment.connected_candidates));
+    let mut graph = Map::new();
+    graph.insert("depth".into(), json!(attachment.graph_depth));
+    graph.insert("nodes".into(), json!(attachment.graph_nodes));
+    if attachment.graph_truncated {
+        graph.insert("truncated".into(), json!(true));
+    }
+    value.insert("graph".into(), Value::Object(graph));
+    Value::Object(value)
+}
+
 fn semantic_preview(body: &Value) -> Option<String> {
     let object = body.as_object()?;
     let value = ["claim", "purpose", "overview", "description", "definition"]
@@ -113,7 +133,7 @@ fn semantic_preview(body: &Value) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
-fn compact_hit(hit: &search::Hit) -> Value {
+fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -138,7 +158,29 @@ fn compact_hit(hit: &search::Hit) -> Value {
         anchors if !anchors.is_empty() => {
             value.insert("anchors".into(), json!(anchors));
         }
-        _ => {}
+        _ => {
+            value.insert("anchor".into(), json!(hit.file_anchor));
+        }
+    }
+    if hit.include_followups {
+        let followup_anchors = if hit.anchors.is_empty() {
+            vec![&hit.file_anchor]
+        } else {
+            hit.anchors.iter().collect::<Vec<_>>()
+        };
+        let followups = followup_anchors
+            .into_iter()
+            .map(|anchor| compact_followups(hit, anchor, snapshot))
+            .collect::<Vec<_>>();
+        match followups.as_slice() {
+            [followup] => {
+                value.insert("followups".into(), followup.clone());
+            }
+            followups if !followups.is_empty() => {
+                value.insert("followup_candidates".into(), json!(followups));
+            }
+            _ => {}
+        }
     }
     if !hit.uses.is_empty() {
         value.insert("uses".into(), json!(hit.uses));
@@ -156,6 +198,44 @@ fn compact_hit(hit: &search::Hit) -> Value {
     Value::Object(value)
 }
 
+fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
+    let origins = [&hit.file_origin];
+    if anchor.starts_with("sym:") {
+        let tools = if hit.include_neighborhood_followup {
+            vec!["definition", "who_uses", "neighborhood"]
+        } else {
+            vec!["definition", "who_uses"]
+        };
+        json!({
+            "tools": tools,
+            "arguments": {
+                "anchor": anchor,
+                "snapshot": snapshot,
+                "origins": origins,
+            }
+        })
+    } else {
+        let mut calls = vec![json!({
+            "tool": "file_outline",
+            "arguments": {
+                "path": hit.file,
+                "origins": origins,
+            }
+        })];
+        if hit.include_neighborhood_followup {
+            calls.push(json!({
+                "tool": "neighborhood",
+                "arguments": {
+                    "anchor": anchor,
+                    "snapshot": snapshot,
+                    "origins": origins,
+                }
+            }));
+        }
+        json!({ "calls": calls })
+    }
+}
+
 fn search_budget_value(budget: &search::ResponseBudget) -> Value {
     let mut value = Map::new();
     value.insert("byte_limit".into(), json!(budget.byte_limit));
@@ -170,6 +250,7 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
             ("supports", budget.omitted_semantic_supports),
             ("nodes", budget.omitted_nodes),
             ("edges", budget.omitted_edges),
+            ("followups", budget.omitted_followups),
             ("snippets", budget.truncated_snippets),
         ] {
             if count > 0 {
@@ -886,8 +967,11 @@ fn source_at_option(file: Option<&str>, start: Option<i64>, end: Option<i64>) ->
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
-        definition_string, render_neighborhood, search_string, semantic_preview, who_uses_string,
+        compact_hit, definition_string, render_neighborhood, search_string, semantic_preview,
+        who_uses_string,
     };
     use crate::{
         origin,
@@ -966,9 +1050,12 @@ mod tests {
                 file_anchor: "file:src/workflow.ts".into(),
                 uses: Vec::new(),
                 used_by: Vec::new(),
+                include_followups: true,
+                include_neighborhood_followup: true,
             }],
             semantic_artifacts: Vec::new(),
             semantic_retrieval: None,
+            semantic_attachment: None,
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: Some(SearchExpansion {
@@ -999,6 +1086,15 @@ mod tests {
         assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
         assert_eq!(value["hits"][0]["symbol"], "start");
         assert_eq!(value["hits"][0]["anchor"], root);
+        assert_eq!(
+            value["hits"][0]["followups"]["tools"],
+            json!(["definition", "who_uses", "neighborhood"])
+        );
+        assert_eq!(value["hits"][0]["followups"]["arguments"]["anchor"], root);
+        assert_eq!(
+            value["hits"][0]["followups"]["arguments"]["snapshot"],
+            "s".repeat(64)
+        );
         assert!(value["hits"][0].get("chunk_id").is_none());
         assert_eq!(value["graph"]["edges"][0][3], "likely");
         assert_eq!(value["graph"]["edges"][0][4], "typescript-checker");
@@ -1007,6 +1103,41 @@ mod tests {
             "QueueService"
         );
         Ok(())
+    }
+
+    #[test]
+    fn file_only_search_hits_offer_only_file_compatible_followups() {
+        let hit = Hit {
+            chunk_id: 1,
+            file: "src/config.ts".into(),
+            file_role: "production".into(),
+            repository_role: None,
+            file_origin: "repository".into(),
+            kind: "module".into(),
+            name: None,
+            start_line: 1,
+            end_line: 20,
+            score: 1.0,
+            snippet: "export const config = {};".into(),
+            snippet_truncated: false,
+            anchors: Vec::new(),
+            file_anchor: "file:src/config.ts".into(),
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: true,
+            include_neighborhood_followup: true,
+        };
+        let value = compact_hit(&hit, "snapshot");
+        assert_eq!(value["anchor"], "file:src/config.ts");
+        assert_eq!(value["followups"]["calls"][0]["tool"], "file_outline");
+        assert_eq!(value["followups"]["calls"][1]["tool"], "neighborhood");
+        assert!(
+            value["followups"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|call| call["tool"] != "definition" && call["tool"] != "who_uses")
+        );
     }
 
     #[test]
@@ -1032,6 +1163,8 @@ mod tests {
                 file_anchor: format!("file:src/services/service-{index}.ts"),
                 uses: vec!["next (call)".into()],
                 used_by: Vec::new(),
+                include_followups: true,
+                include_neighborhood_followup: true,
             })
             .collect();
         let result = SearchResult {
@@ -1040,6 +1173,7 @@ mod tests {
             hits,
             semantic_artifacts: Vec::new(),
             semantic_retrieval: None,
+            semantic_attachment: None,
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: None,
@@ -1101,6 +1235,13 @@ mod tests {
                 corpus_artifacts: 8,
                 vector_action: None,
             }),
+            semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
+                status: "connected",
+                connected_candidates: 1,
+                graph_depth: 2,
+                graph_nodes: 1,
+                graph_truncated: false,
+            }),
             semantic_candidates: 8,
             semantic_selected: 1,
             expansion: None,
@@ -1115,6 +1256,7 @@ mod tests {
         assert_eq!(memory["candidate_pool"], 8);
         assert_eq!(memory["selected"], 1);
         assert_eq!(memory["returned"], 1);
+        assert_eq!(memory["attachment"]["status"], "connected");
         assert_eq!(memory["next_tool"], "semantic_memory");
         assert_eq!(
             memory["artifacts"][0]["summary"],
@@ -1149,6 +1291,13 @@ mod tests {
                 corpus_artifacts: 20,
                 vector_action: Some("start or repair the configured embedding service, then retry"),
             }),
+            semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
+                status: "no_connected_memory",
+                connected_candidates: 0,
+                graph_depth: 2,
+                graph_nodes: 0,
+                graph_truncated: false,
+            }),
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: None,
@@ -1161,6 +1310,10 @@ mod tests {
         assert_eq!(value["semantic_memory"]["candidate_pool"], 0);
         assert_eq!(value["semantic_memory"]["returned"], 0);
         assert_eq!(value["semantic_memory"]["retrieval"]["vector"], "degraded");
+        assert_eq!(
+            value["semantic_memory"]["attachment"]["status"],
+            "no_connected_memory"
+        );
         Ok(())
     }
 
@@ -1176,6 +1329,13 @@ mod tests {
                 vector: "degraded",
                 corpus_artifacts: 20,
                 vector_action: Some("run jscout embed <root> --semantic-only"),
+            }),
+            semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
+                status: "connected",
+                connected_candidates: 3,
+                graph_depth: 2,
+                graph_nodes: 10,
+                graph_truncated: false,
             }),
             semantic_candidates: 12,
             semantic_selected: 3,

@@ -3350,6 +3350,24 @@ pub fn resolve_current_anchor_in_origins(
     resolve_anchor(conn, anchor, None, &snapshot, &allowed).map(|(resolved, _)| resolved)
 }
 
+/// Resolve an exact or user-facing anchor against an explicitly expected
+/// structural snapshot and origin boundary. Read surfaces use this to consume
+/// copy-safe anchors returned by an earlier query without routing them through
+/// a lossy `path:name` symbol lookup. A stale symbol anchor is re-resolved by
+/// path, scope, and name using the same fail-closed ambiguity policy as
+/// neighborhood traversal.
+pub fn resolve_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    expected_snapshot: Option<&str>,
+    file_origins: &[String],
+) -> Result<(String, String)> {
+    origin::validate_all(file_origins)?;
+    let allowed = file_origins.iter().map(String::as_str).collect();
+    let snapshot = current_snapshot(conn)?;
+    resolve_anchor(conn, anchor, expected_snapshot, &snapshot, &allowed)
+}
+
 fn resolve_anchor(
     conn: &Connection,
     anchor: &str,

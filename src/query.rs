@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
-use rusqlite::Connection;
+use anyhow::{Result, bail};
+use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone)]
 struct ExportEntry {
@@ -239,6 +239,113 @@ pub struct SymbolTarget {
     pub kind: String,
     pub line: i64,
     pub exported: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SymbolAnchorResolution {
+    pub snapshot: String,
+    pub requested_anchor: String,
+    pub resolved_anchor: String,
+    pub anchor_status: String,
+}
+
+/// Resolve a snapshot-scoped structural symbol anchor to the exact canonical
+/// symbol row consumed by definition and usage queries. This deliberately does
+/// not accept file anchors or fall back to fuzzy name matching.
+pub fn find_symbol_by_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    expected_snapshot: Option<&str>,
+    file_origins: &[String],
+) -> Result<(SymbolTarget, SymbolAnchorResolution)> {
+    let snapshot = crate::structural::current_snapshot(conn)?;
+    let (resolved_anchor, anchor_status) = crate::structural::resolve_anchor_in_origins(
+        conn,
+        anchor,
+        expected_snapshot,
+        file_origins,
+    )?;
+    let target = conn
+        .query_row(
+            "SELECT file.path, file.origin, file.id, symbol.name, symbol.kind,
+                    symbol.line, symbol.exported
+             FROM graph_nodes node
+             JOIN symbols symbol
+               ON node.native_table='symbols' AND node.native_id=symbol.id
+             JOIN files file ON file.id=symbol.file_id
+             WHERE node.node_key=?1 AND node.node_kind='symbol'",
+            [&resolved_anchor],
+            |row| {
+                Ok(SymbolTarget {
+                    file: row.get(0)?,
+                    file_origin: row.get(1)?,
+                    file_id: row.get(2)?,
+                    name: row.get(3)?,
+                    kind: row.get(4)?,
+                    line: row.get(5)?,
+                    exported: row.get::<_, i64>(6)? != 0,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("anchor `{resolved_anchor}` is not a symbol node"))?;
+    if !file_origins
+        .iter()
+        .any(|origin| origin == &target.file_origin)
+    {
+        bail!("anchor `{resolved_anchor}` is outside the requested file origins");
+    }
+    Ok((
+        target,
+        SymbolAnchorResolution {
+            snapshot,
+            requested_anchor: anchor.to_string(),
+            resolved_anchor,
+            anchor_status,
+        },
+    ))
+}
+
+/// Exact usage lookup for a canonical symbol anchor. Unlike the fuzzy symbol
+/// surface, this does not add same-name member-call candidates: only projected
+/// structural edges that actually target the requested symbol are returned.
+pub fn who_uses_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    file_origins: &[String],
+) -> Result<Vec<Usage>> {
+    crate::origin::validate_all(file_origins)?;
+    let origins_json = serde_json::to_string(file_origins)?;
+    let mut statement = conn.prepare(
+        "SELECT file.path,file.origin,COALESCE(edge.line,source.line),
+                edge.kind,edge.confidence,edge.detail_json,source.display_name
+         FROM resolved_edges edge
+         JOIN graph_nodes source ON source.node_key=edge.src_key
+         JOIN files file ON file.id=COALESCE(edge.source_file_id,source.file_id)
+         WHERE edge.dst_key=?1
+           AND file.origin IN (SELECT value FROM json_each(?2))
+           AND COALESCE(edge.line,source.line) IS NOT NULL
+         ORDER BY
+           CASE edge.confidence WHEN 'certain' THEN 0 WHEN 'likely' THEN 1 ELSE 2 END,
+           file.path,COALESCE(edge.line,source.line),edge.kind,edge.id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
+        let detail_json = row.get::<_, String>(5)?;
+        let detail = serde_json::from_str::<serde_json::Value>(&detail_json)
+            .ok()
+            .filter(|value| !value.is_null() && value != &serde_json::json!({}))
+            .map(|value| value.to_string());
+        Ok(Usage {
+            file: row.get(0)?,
+            file_origin: row.get(1)?,
+            line: row.get(2)?,
+            kind: row.get(3)?,
+            confidence: row.get(4)?,
+            detail,
+            chunk_name: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Find symbols matching "Name" or "path-substring:Name" within an origin allowlist.
