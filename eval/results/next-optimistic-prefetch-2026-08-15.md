@@ -320,12 +320,17 @@ measurement.
   delivered). Upstreamed: #41 split the profiles (`memory` embed-free by
   design, `memory-embed` retrievable).
 
-**sol-mem-004** re-ran the pair with retrievability as the only variable.
-The prepared database was grafted, not re-scouted: `checker-scout-embed.db`
-as the base, sol-mem-003's semantic plane inserted byte-identically
-(hash-verified; 425 artifacts = 314 cards / 63 workflows / 48 summaries),
-then migrated across the v23 boundary (post-#42 binary; 425/425 semantic
-embeddings; freshness verified per-support). Two unbilled gates ran before
+**sol-mem-004** re-ran the pair on a retrievable substrate with the corpus
+held constant. The prepared database was grafted, not re-scouted:
+`checker-scout-embed.db` as the base, sol-mem-003's semantic plane inserted
+byte-identically (hash-verified; 425 artifacts = 314 cards / 63 workflows /
+48 summaries), then migrated across the v23 boundary (post-#42 binary;
+425/425 semantic embeddings; freshness verified per-support).
+Retrievability is the treatment, not literally the only difference against
+mem-003 — it arrives together with the #42 binary, tool surface, and skill,
+and the grafted base carries trial-001's checker facts and product
+embeddings. What the graft holds constant is artifact content, so delivery
+differences are not corpus differences. Two unbilled gates ran before
 any agent turn: the search preview envelope attaching fresh segment-cache
 cards (pass) and the #42 `semantic_memory` drill-down returning 13 fresh
 artifacts at the default budget (pass). Arms ran as profile `memory-embed`;
@@ -345,8 +350,10 @@ Oracle is failed/total hidden tests; ✓ = livelock suite fixed.
 | Total tokens | 14.91M | 28.56M | 13.78M | 18.96M |
 | Time | 24.0m | 34.6m | 26.1m | 32.0m |
 
-What the treatment changed — delivery, verifiably. Vector and reranker were
-active on every retrieval call in both mem-004 arms; the `semantic_memory`
+What the treatment changed — delivery, verifiably. Vector retrieval was
+active on every call in both mem-004 arms, and the reranker on every search
+(reranking is a search-pipeline stage; direct memory retrieval is
+lexical+vector fusion without it). The `semantic_memory`
 drill-down was called exactly once per arm, both times as the *first*
 retrieval action (the #42 skill guidance fires; neither agent returned to
 it once previews arrived); and segment-cache cards reached the agents
@@ -365,11 +372,12 @@ gold overlap 1/7 in 42 of 44. The four memory arms are not in the 39-arm
 blind adjudication; given identical patch shape there is no reason to
 expect different verdicts.
 
-Why, on the evidence: corpus power, not plumbing. The plane holds no
-artifact naming `optimistic-routes.ts` — automatic scouting never aimed at
-the fix's subsystem, and the file's low incoming-reference weight (rank
-2,353) keeps it outside any bounded card budget — and only 3 of the 7 gold
-files carry any artifact. Of those, only `segment-cache/cache.ts` ever
+Plumbing is now eliminated as the retrieval-side limitation; the one that
+remains is corpus power — a limitation, not the exclusive cause of the
+failures. The plane holds no artifact naming `optimistic-routes.ts` —
+automatic scouting never aimed at the fix's subsystem, and the file's low
+incoming-reference weight (rank 2,353) keeps it outside any bounded card
+budget — and only 3 of the 7 gold files carry any artifact. Of those, only `segment-cache/cache.ts` ever
 surfaced to an agent; `navigation.ts` and `ppr-navigations.ts` never did.
 The retrieval machinery is now demonstrably live end-to-end; what it
 retrieves over is adjacent context. Read with the architecture probe, the
