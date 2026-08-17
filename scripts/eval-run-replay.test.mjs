@@ -10,6 +10,8 @@ import {
   preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
   embeddingEnvironmentForProfile,
+  jscoutMcpEnvironmentArgs,
+  nodeOptionsWithNextTeardown,
   profilePlan,
   promptFor,
   startBrowserServer,
@@ -18,6 +20,81 @@ import {
   scoutPublishedArtifacts,
   countSemanticArtifacts,
 } from "./eval-run-replay.mjs";
+
+test("replay forwards non-secret jscout runtime selectors into the MCP server", () => {
+  assert.deepEqual(
+    jscoutMcpEnvironmentArgs({
+      JSCOUT_PI_AI_GATEWAY: "/opt/jscout/gateway/src/main.mjs",
+      JSCOUT_LLM_MODEL: "openai-codex:gpt-5.6-terra",
+      OPENAI_API_KEY: "must-not-enter-codex-config",
+    }),
+    [
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_PI_AI_GATEWAY="/opt/jscout/gateway/src/main.mjs"',
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_LLM_MODEL="openai-codex:gpt-5.6-terra"',
+    ],
+  );
+});
+
+test("Next teardown preload composes with existing NODE_OPTIONS", () => {
+  const standalone = nodeOptionsWithNextTeardown();
+  assert.match(standalone, /^--require=.*eval-next-teardown-preload\.cjs$/);
+  assert.equal(nodeOptionsWithNextTeardown(standalone), standalone);
+  assert.equal(
+    nodeOptionsWithNextTeardown("--trace-warnings"),
+    `--trace-warnings ${standalone}`,
+  );
+});
+
+test("Next teardown preload answers pgrep from the scoped process registry", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-pgrep-registry-"));
+  const registry = path.join(directory, "processes.jsonl");
+  fs.writeFileSync(
+    registry,
+    [
+      { kind: "process", pid: 4100, ppid: 4000, group: "launch-one" },
+      { kind: "process", pid: 4101, ppid: 4100, group: "launch-one" },
+      { kind: "process", pid: 5101, ppid: 5100, group: "other-launch" },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+  );
+  const preload = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname),
+    "eval-next-teardown-preload.cjs",
+  );
+  const output = execFileSync(
+    process.execPath,
+    [
+      "--require", preload,
+      "-e",
+      `
+        const { spawn } = require("node:child_process");
+        const child = spawn("pgrep", ["-P", "4100"]);
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk; });
+        child.on("close", (code) => {
+          if (code !== 0) process.exit(code);
+          process.stdout.write(output);
+        });
+      `,
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, JSCOUT_EVAL_PROCESS_REGISTRY: registry },
+    },
+  );
+  assert.equal(output.trim(), "4101");
+  const records = fs.readFileSync(registry, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.ok(records.some((record) =>
+    record.kind === "pgrep" &&
+    record.parent_pid === 4100 &&
+    JSON.stringify(record.registered_children) === "[4101]"
+  ));
+  fs.rmSync(directory, { recursive: true, force: true });
+});
 
 function git(repo, args) {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
@@ -203,6 +280,8 @@ const workspace = value("--cd");
 if (process.env.JSCOUT_REPLAY_TEST_ENV !== "enabled") throw new Error("execution environment missing");
 if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
 if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+if (!process.env.NODE_OPTIONS?.includes("eval-next-teardown-preload.cjs")) throw new Error("Next teardown preload missing");
+if (!process.env.JSCOUT_EVAL_PROCESS_REGISTRY) throw new Error("Next process registry missing");
 const fdLimit = Number(execFileSync("/bin/sh", ["-c", "ulimit -n"], { encoding: "utf8" }).trim());
 if (fdLimit < 65536) throw new Error("file descriptor limit was not inherited");
 fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
@@ -268,6 +347,10 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     fs.readFileSync(path.join(runDir, "browser-server.json"), "utf8"),
   );
   assert.equal(browser.endpoint, "ws://127.0.0.1:43210/fake-browser");
+  assert.equal(browser.next_teardown.strategy, "registered-pgrep-process-tree");
+  assert.match(browser.next_teardown.preload, /eval-next-teardown-preload\.cjs$/);
+  assert.equal(browser.next_teardown.registry, "agent-process-registry.jsonl");
+  assert.ok(fs.existsSync(path.join(runDir, browser.next_teardown.registry)));
   assert.match(fs.readFileSync(browser.log, "utf8"), /FAKE_BROWSER_SERVER_CLOSED/);
 
   const grade = JSON.parse(

@@ -7,6 +7,7 @@
 
 pub mod card;
 pub mod concept;
+pub mod design;
 pub mod evidence;
 pub mod ledger;
 pub mod plan;
@@ -23,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::embed;
 use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{
     ChatMessage, CompleteRequest, ModelCapabilities, PROTOCOL_VERSION, ProviderOptions,
@@ -164,6 +166,8 @@ pub struct RefreshPlanItem {
     pub summary: Option<plan::SummaryPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concept: Option<plan::ConceptPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub design: Option<design::DesignPlanReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +206,7 @@ enum PreparedRefresh {
     Card(Box<CardScoutOptions>, Box<PreparedCard>),
     Summary(Box<SummaryScoutOptions>, Box<PreparedSummary>),
     Concept(Box<ConceptScoutOptions>, Box<PreparedConcept>),
+    Design(Box<design::DesignScoutOptions>, Box<design::PreparedDesign>),
 }
 
 #[derive(Default)]
@@ -644,6 +649,7 @@ pub fn plan_refresh(
     root: &Path,
     conn: &Connection,
     selection: &refresh::RefreshSelection,
+    policy: &RequestPolicy,
 ) -> Result<RefreshPlanningReport> {
     let mut plans = Vec::new();
     let mut skipped_unresolvable = Vec::new();
@@ -658,6 +664,7 @@ pub fn plan_refresh(
             card: None,
             summary: None,
             concept: None,
+            design: None,
         };
         let planned = match &target.config {
             refresh::RefreshConfig::Workflow(config) => plan::workflows(
@@ -695,6 +702,21 @@ pub fn plan_refresh(
                         concept: Some(concept),
                         ..item.clone()
                     }
+                })
+            }
+            refresh::RefreshConfig::Design(config) => {
+                let options = design_options_from_refresh(
+                    conn,
+                    config.clone(),
+                    target.model.clone(),
+                    target.reasoning.clone(),
+                    target.artifact_id,
+                    policy.clone(),
+                )?;
+                let provider = embed::Provider::from_env()?;
+                design::plan(root, conn, provider.as_ref(), &options).map(|plan| RefreshPlanItem {
+                    design: Some(plan.report),
+                    ..item.clone()
                 })
             }
         };
@@ -749,6 +771,9 @@ pub fn scout_refresh(
                 // Concepts depend directly on cards/workflows and run last;
                 // summaries do not depend on concepts.
                 refresh::RefreshConfig::Concept(_) => 4,
+                // Task designs are leaf memory and do not feed ordinary
+                // semantic search; refresh them after the repository plane.
+                refresh::RefreshConfig::Design(_) => 5,
             },
             target.artifact_id,
         )
@@ -800,6 +825,17 @@ pub fn scout_refresh(
                 target.reasoning,
                 &policy,
             ),
+            refresh::RefreshConfig::Design(config) => prepare_design_refresh(
+                root,
+                conn,
+                gateway,
+                &mut cache,
+                artifact_id,
+                config,
+                target.model,
+                target.reasoning,
+                &policy,
+            ),
         };
         match outcome {
             Ok(Some(prepared)) => {
@@ -808,6 +844,7 @@ pub fn scout_refresh(
                     PreparedRefresh::Card(_, card) => &card.spec,
                     PreparedRefresh::Summary(_, summary) => &summary.spec,
                     PreparedRefresh::Concept(_, concept) => &concept.spec,
+                    PreparedRefresh::Design(_, design) => &design.spec,
                 };
                 let reusable = ledger::reusable_run(conn, spec)?.is_some();
                 if !reusable && model_calls >= policy.max_calls {
@@ -843,6 +880,9 @@ pub fn scout_refresh(
                         *concept,
                         allow_new_call,
                     )?,
+                    PreparedRefresh::Design(options, design) => {
+                        design::execute(root, conn, gateway, &options, *design, allow_new_call)?
+                    }
                 };
                 if report.status != "reused" {
                     model_calls += 1;
@@ -1022,6 +1062,70 @@ fn prepare_concept_refresh(
     };
     let prepared = prepare_concept(gateway, cache, plan.items.remove(0), &options)?;
     Ok(Some(PreparedRefresh::Concept(
+        Box::new(options),
+        Box::new(prepared),
+    )))
+}
+
+fn design_options_from_refresh(
+    conn: &Connection,
+    mut config: design::DesignRunConfig,
+    model: ModelSpec,
+    reasoning: Option<String>,
+    artifact_id: i64,
+    policy: RequestPolicy,
+) -> Result<design::DesignScoutOptions> {
+    let artifact = semantic::load_artifact(conn, artifact_id)?
+        .with_context(|| format!("design artifact {artifact_id} disappeared before refresh"))?;
+    for seed in &mut config.seeds {
+        let (resolved, _) = structural::resolve_anchor_in_origins(
+            conn,
+            seed,
+            Some(&artifact.source_snapshot),
+            &crate::origin::defaults(),
+        )?;
+        *seed = resolved;
+    }
+    Ok(design::DesignScoutOptions {
+        task: config.task,
+        seeds: config.seeds,
+        search_limit: config.search_limit,
+        seed_limit: config.seed_limit,
+        file_limit: config.file_limit,
+        graph_depth: config.graph_depth,
+        graph_node_limit: config.graph_node_limit,
+        graph_edge_limit: config.graph_edge_limit,
+        candidate_limit: config.candidate_limit,
+        file_roles: config.file_roles,
+        file_origins: config.file_origins,
+        model,
+        reasoning,
+        service_tier: config.service_tier,
+        policy,
+        rebuild: false,
+        supersedes_artifact_id: Some(artifact_id),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_design_refresh(
+    root: &Path,
+    conn: &Connection,
+    gateway: &mut dyn LlmGateway,
+    cache: &mut PreparationCache,
+    artifact_id: i64,
+    config: design::DesignRunConfig,
+    model: ModelSpec,
+    reasoning: Option<String>,
+    policy: &RequestPolicy,
+) -> Result<Option<PreparedRefresh>> {
+    let options =
+        design_options_from_refresh(conn, config, model, reasoning, artifact_id, policy.clone())?;
+    let provider = embed::Provider::from_env()?;
+    let plan = design::plan(root, conn, provider.as_ref(), &options)
+        .map_err(|error| anyhow::Error::from(UnresolvableRefresh(error.to_string())))?;
+    let prepared = design::prepare(gateway, cache, plan, &options)?;
+    Ok(Some(PreparedRefresh::Design(
         Box::new(options),
         Box::new(prepared),
     )))

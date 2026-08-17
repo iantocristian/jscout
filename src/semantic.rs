@@ -982,10 +982,11 @@ pub(crate) fn rank_artifacts(
         "SELECT artifact.id, artifact.artifact_type, artifact.canonical_name,
                 artifact.body_json
          FROM semantic_artifacts artifact
-         WHERE ?1 OR NOT EXISTS(
-           SELECT 1 FROM semantic_artifacts successor
-           WHERE successor.supersedes_artifact_id=artifact.id
-         )
+         WHERE artifact.artifact_type!='design'
+           AND (?1 OR NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           ))
          ORDER BY artifact.id DESC",
     )?;
     let rows = statement
@@ -1749,10 +1750,10 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     validate_confidence(&input.confidence)?;
     if !matches!(
         input.artifact_type.as_str(),
-        "workflow" | "annotation" | "card" | "summary" | "concept"
+        "workflow" | "annotation" | "card" | "summary" | "concept" | "design"
     ) {
         bail!(
-            "semantic artifact type must be one of: workflow, annotation, card, summary, concept"
+            "semantic artifact type must be one of: workflow, annotation, card, summary, concept, design"
         );
     }
     if !input.body.is_object() {
@@ -1800,6 +1801,13 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
     required_claims.retain(|claim_path| {
         !(claim_path.starts_with("/participants/")
             && (claim_path.ends_with("/anchor") || claim_path.ends_with("/scope")))
+            && !(input.artifact_type == "design"
+                && (claim_path == "/resolution"
+                    || (claim_path.starts_with("/touchpoints/")
+                        && claim_path.ends_with("/anchor"))
+                    || (claim_path.starts_with("/propagation/")
+                        && (claim_path.ends_with("/from_anchor")
+                            || claim_path.ends_with("/to_anchor")))))
     });
     if input.artifact_type != "concept" {
         for claim_path in &required_claims {
@@ -1886,6 +1894,29 @@ fn validate_input(input: &AnnotateInput) -> Result<()> {
                 "card supports must cite the subject anchor `{subject}`, not `{}`",
                 support.anchor
             );
+        }
+        return Ok(());
+    }
+    if input.artifact_type == "design" {
+        let Some(task_key) = input
+            .name
+            .as_deref()
+            .filter(|name| name.starts_with("task:"))
+        else {
+            bail!("design artifacts require a hashed task key as their name");
+        };
+        if task_key.len() != "task:".len() + 64
+            || !task_key["task:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("design task keys must contain a complete BLAKE3 hash");
+        }
+        if !matches!(
+            input.body.get("resolution").and_then(Value::as_str),
+            Some("resolved" | "unresolved")
+        ) {
+            bail!("design body requires resolution `resolved` or `unresolved`");
         }
         return Ok(());
     }

@@ -105,7 +105,7 @@ jscout paths <root> A B        # bounded ranked paths between exact boundaries
 jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
 jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
-                               #   semantic_memory, exact evidence, and annotate tools
+                               #   semantic memory, design/brief handoff, exact evidence, annotate
 jscout memory <root> [query]   # bounded semantic artifacts, relations, and freshness
   --anchor EXACT_ANCHOR --source
                                #   code-to-memory join + hash-verified source drill-down
@@ -123,7 +123,8 @@ jscout scout summaries R       # bottom-up file/module/repository summaries over
   --max-calls N                #   --level file|module|repository, --scope KEY (repeatable)
 jscout scout concepts R        # concepts from exact workflow-name/card-domain-term vocabulary
   --max-calls N                #   --term TEXT selects normalized groups explicitly (repeatable)
-jscout scout refresh R         # replace stale/degraded workflows, cards, summaries, and concepts
+jscout scout design R --task T # task-scoped design-before-edit artifact; optional --seed ANCHOR
+jscout scout refresh R         # replace stale/degraded workflows, cards, summaries, concepts, designs
   --max-calls N                #   reuses each artifact's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
@@ -403,7 +404,8 @@ watch does not maintain a second database generation.
 
 ## Semantic scouting
 
-`jscout scout repository`, `workflows`, `cards`, `summaries`, and `concepts` make
+`jscout scout repository`, `workflows`, `cards`, `summaries`, `concepts`, and
+`design` make
 schema-constrained model calls through the bundled pi-ai gateway. Workflow and
 concept runs additionally require exhaustive candidate classification.
 Generative calls default to
@@ -505,16 +507,39 @@ similarity, stemming, and embedding proximity never cause an implicit merge.
 input bytes, skips, and budget decisions without starting Node or contacting a
 model.
 
+`jscout scout design <root> --task TEXT` is the explicit design-before-edit
+surface for causal, cross-file, or architecturally ambiguous work. It starts
+from the behavioral task statement, uses hybrid search plus bounded structural
+traversal to construct a closed, full-source evidence pack, and asks the model
+for competing mechanisms, detection signals/channels, cure semantics,
+touchpoints, propagation, invariants, and a validation oracle—not a patch.
+Optional repeatable `--seed` values must be exact current `sym:` anchors. All
+search, seed, file, graph, candidate, context, and response bounds are explicit;
+`--dry-run` reports localization, evidence, and truncation without a model call.
+
+A completed run publishes an immutable `design` artifact keyed by the
+normalized task and fingerprinted evidence. Identical inputs reuse it; evidence
+drift makes it degraded or stale, and `scout refresh` publishes a successor.
+Designs are deliberately excluded from ordinary search-attached memory,
+semantic embeddings, and repository overview. Structural-profile MCP clients
+must call `design_task`, then explicitly activate the returned ID with
+`implementation_brief`. The brief preserves mechanism, detection, cure,
+touchpoints, invariants, and oracle before optional material, includes
+copy-safe current-anchor follow-ups, and reports stale or unresolved anchors.
+
 Generated workflows record their resolved seeds, traversal limits, service
 tier, model, and reasoning policy in the run ledger; cards record their
 subject anchor, summaries their level and scope key, and concepts their
-normalized vocabulary group the same way. After
+normalized vocabulary group the same way. Designs record the normalized task,
+resolved seeds, and every localization bound. After
 indexing exposes source or structural-context drift, `jscout scout refresh
---max-calls N` selects current stale/degraded generated workflows, cards, and
-summaries, and concepts and publishes immutable successors. A summary needs no
-rule of its own here: child drift already makes it non-fresh, so it selects
-naturally and is replanned against the children that are current now; a concept
-is replanned from the currently supported exact vocabulary group. Index and
+--max-calls N` selects current stale/degraded generated workflows, cards,
+summaries, concepts, and designs and publishes immutable successors. A summary
+needs no rule of its own here: child drift already makes it non-fresh, so it
+selects naturally and is replanned against the children that are current now; a concept
+is replanned from the currently supported exact vocabulary group; a design
+relocalizes its task and re-resolves saved seeds against the historical
+snapshot. Index and
 watch never make model calls. Runs created before replay configuration was
 stored remain visible but are reported as non-refreshable; jscout does not
 guess their original boundary. A stale target whose recorded seed or scope no

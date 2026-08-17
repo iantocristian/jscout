@@ -505,10 +505,11 @@ fn semantic_embedding_documents(conn: &Connection) -> Result<Vec<SemanticEmbeddi
                   )
                 ), '')
          FROM semantic_artifacts artifact
-         WHERE NOT EXISTS(
-           SELECT 1 FROM semantic_artifacts successor
-           WHERE successor.supersedes_artifact_id=artifact.id
-         )
+         WHERE artifact.artifact_type!='design'
+           AND NOT EXISTS(
+             SELECT 1 FROM semantic_artifacts successor
+             WHERE successor.supersedes_artifact_id=artifact.id
+           )
          ORDER BY artifact.id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1766,6 +1767,14 @@ mod tests {
              ) VALUES(?1,'/purpose','sym:src/cache.ts#::resolveRoute@1',
                       'src/cache.ts',10,20,'source','context','likely')",
             [current_id],
+        )?;
+        connection.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type,canonical_name,body_json,model,prompt_version,
+               confidence,source_snapshot,created_at,artifact_fingerprint
+             ) VALUES('design','task:hidden','{\"resolution\":\"resolved\"}',
+                      'test','design/v1','likely','snapshot','now','design')",
+            [],
         )?;
 
         let documents = semantic_embedding_documents(&connection)?;

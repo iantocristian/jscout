@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Serialize;
 
+use super::design::DesignRunConfig;
 use super::{CardRunConfig, ConceptRunConfig, SummaryRunConfig, WorkflowRunConfig};
 use crate::llm::config::ModelSpec;
 use crate::semantic;
@@ -18,6 +19,7 @@ pub enum RefreshConfig {
     Card(CardRunConfig),
     Summary(SummaryRunConfig),
     Concept(ConceptRunConfig),
+    Design(DesignRunConfig),
 }
 
 impl RefreshConfig {
@@ -27,6 +29,7 @@ impl RefreshConfig {
             RefreshConfig::Card(_) => "card",
             RefreshConfig::Summary(_) => "summary",
             RefreshConfig::Concept(_) => "concept",
+            RefreshConfig::Design(_) => "design",
         }
     }
 }
@@ -53,7 +56,7 @@ pub struct RefreshSelection {
     pub summary: RefreshSelectionSummary,
 }
 
-/// Select current model-generated workflow, card, summary, and concept artifacts.
+/// Select current model-generated workflow, card, summary, concept, and design artifacts.
 /// Explicit IDs are validated against that same boundary; fresh artifacts are
 /// never refreshed. A summary whose child drifted is no longer fresh (the
 /// freshness engine folds pinned child fingerprints into the parent), so it
@@ -65,7 +68,7 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
              FROM semantic_artifacts artifact
              JOIN scout_runs run ON run.id=artifact.scout_run_id
              WHERE artifact.artifact_type=run.scout_kind
-               AND run.scout_kind IN ('workflow','card','summary','concept')
+               AND run.scout_kind IN ('workflow','card','summary','concept','design')
                AND NOT EXISTS(
                  SELECT 1 FROM semantic_artifacts successor
                  WHERE successor.supersedes_artifact_id=artifact.id
@@ -96,7 +99,7 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
                     )
              FROM semantic_artifacts artifact
              JOIN scout_runs run ON run.id=artifact.scout_run_id
-             WHERE artifact.id=?1 AND run.scout_kind IN ('workflow','card','summary','concept')",
+             WHERE artifact.id=?1 AND run.scout_kind IN ('workflow','card','summary','concept','design')",
             [id],
             |row| {
                 Ok((
@@ -115,7 +118,9 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
                 format!("artifact {id} is not a model-generated artifact or does not exist")
             })?;
         if artifact_type != scout_kind || has_successor {
-            bail!("artifact {id} is not a current generated workflow, card, summary, or concept");
+            bail!(
+                "artifact {id} is not a current generated workflow, card, summary, concept, or design"
+            );
         }
         let artifact = semantic::load_artifact(conn, id)?
             .with_context(|| format!("semantic artifact {id} disappeared"))?;
@@ -165,6 +170,10 @@ fn replay_config(scout_kind: &str, config_json: &str) -> Option<RefreshConfig> {
         "concept" => {
             let config = serde_json::from_str::<ConceptRunConfig>(config_json).ok()?;
             (!config.term.is_empty()).then_some(RefreshConfig::Concept(config))
+        }
+        "design" => {
+            let config = serde_json::from_str::<DesignRunConfig>(config_json).ok()?;
+            (!config.task.is_empty()).then_some(RefreshConfig::Design(config))
         }
         _ => None,
     }

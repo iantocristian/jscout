@@ -5,8 +5,8 @@
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
 > snapshot simplification, G13 repository reconnaissance, and G14 retrieval
-> handoff are implemented; G12 watcher coordination remains planned. G15
-> design-before-edit task memory is the next fixed-snapshot milestone. G16 is
+> handoff and G15 design-before-edit task memory are implemented; G12 watcher
+> coordination remains planned. G16 is
 > a conditional post-G15 memory-delivery correction, not a committed rewrite.
 
 ## Document policy
@@ -1550,7 +1550,7 @@ reported in the attachment status.
 - compact/debug representations remain fact-equivalent, and all tests use
   deterministic fixtures without model calls.
 
-## Planned G15 — design-before-edit task memory
+## Implemented G15 — design-before-edit task memory
 
 G15 addresses a different bottleneck from retrieval. In the
 optimistic-prefetch campaign, one read-only Sol architecture probe received the
@@ -1638,7 +1638,7 @@ marks it degraded or stale; refresh creates an immutable successor.
 
 Design artifacts do not enter ordinary search-attached memory or repository
 overview by default. They are task-scoped and retrieved by exact artifact ID,
-an explicitly activated task, or a direct relation. This prevents one-off
+or an explicitly activated task. This prevents one-off
 debugging hypotheses from polluting general repository memory. A stale design
 remains readable with its original evidence and a visible label so the
 implementation agent can understand the historical decision rather than lose
