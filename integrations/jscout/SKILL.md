@@ -48,6 +48,10 @@ questions, then verify decisive claims in source.
   concrete symbol, state transition, or subsystem term, issue a follow-up
   search with those terms before editing; do not treat one broad query as the
   complete repository investigation.
+- Omit `origins` for normal first-party work so jscout uses its
+  `repository,workspace` default. `repository` alone excludes source owned by
+  monorepo workspace packages. Narrow origins only deliberately, and preserve
+  the complete origin allowlist when carrying an anchor into a follow-up call.
 - For blast-radius, multi-hop, or workflow questions, use
   `semantic_search` with `expand=true` and a small depth/budget.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
