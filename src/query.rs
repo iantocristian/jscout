@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
-use rusqlite::Connection;
+use anyhow::{Result, bail};
+use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone)]
 struct ExportEntry {
@@ -239,6 +239,155 @@ pub struct SymbolTarget {
     pub kind: String,
     pub line: i64,
     pub exported: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SymbolAnchorResolution {
+    pub snapshot: String,
+    pub requested_anchor: String,
+    pub resolved_anchor: String,
+    pub anchor_status: String,
+}
+
+/// Resolve a snapshot-scoped structural symbol anchor to the exact canonical
+/// symbol row consumed by definition and usage queries. This deliberately does
+/// not accept file anchors or fall back to fuzzy name matching.
+pub fn find_symbol_by_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    expected_snapshot: Option<&str>,
+    file_origins: &[String],
+) -> Result<(SymbolTarget, SymbolAnchorResolution)> {
+    let snapshot = crate::structural::current_snapshot(conn)?;
+    let (resolved_anchor, anchor_status) = crate::structural::resolve_anchor_in_origins(
+        conn,
+        anchor,
+        expected_snapshot,
+        file_origins,
+    )?;
+    let target = conn
+        .query_row(
+            "SELECT file.path, file.origin, file.id, symbol.name, symbol.kind,
+                    symbol.line, symbol.exported
+             FROM graph_nodes node
+             JOIN symbols symbol
+               ON node.native_table='symbols' AND node.native_id=symbol.id
+             JOIN files file ON file.id=symbol.file_id
+             WHERE node.node_key=?1 AND node.node_kind='symbol'",
+            [&resolved_anchor],
+            |row| {
+                Ok(SymbolTarget {
+                    file: row.get(0)?,
+                    file_origin: row.get(1)?,
+                    file_id: row.get(2)?,
+                    name: row.get(3)?,
+                    kind: row.get(4)?,
+                    line: row.get(5)?,
+                    exported: row.get::<_, i64>(6)? != 0,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("anchor `{resolved_anchor}` is not a symbol node"))?;
+    if !file_origins
+        .iter()
+        .any(|origin| origin == &target.file_origin)
+    {
+        bail!("anchor `{resolved_anchor}` is outside the requested file origins");
+    }
+    Ok((
+        target,
+        SymbolAnchorResolution {
+            snapshot,
+            requested_anchor: anchor.to_string(),
+            resolved_anchor,
+            anchor_status,
+        },
+    ))
+}
+
+/// Exact usage lookup for a canonical symbol anchor. Precise projected edges
+/// are returned directly. Unresolved member calls are included only when the
+/// graph projects the requested symbol as one of that member hub's candidates;
+/// those sites remain explicitly `possible`.
+pub fn who_uses_anchor_in_origins(
+    conn: &Connection,
+    anchor: &str,
+    file_origins: &[String],
+) -> Result<Vec<Usage>> {
+    crate::origin::validate_all(file_origins)?;
+    let origins_json = serde_json::to_string(file_origins)?;
+    let mut statement = conn.prepare(
+        "SELECT file.path,file.origin,COALESCE(edge.line,source.line),
+                edge.kind,edge.confidence,
+                CASE WHEN json_type(edge.detail_json,'$.detail')='text'
+                     THEN json_extract(edge.detail_json,'$.detail') END,
+                source.display_name
+         FROM resolved_edges edge
+         JOIN graph_nodes source ON source.node_key=edge.src_key
+         JOIN files file ON file.id=COALESCE(edge.source_file_id,source.file_id)
+         WHERE edge.dst_key=?1
+           AND file.origin IN (SELECT value FROM json_each(?2))
+           AND COALESCE(edge.line,source.line) IS NOT NULL
+         ORDER BY
+           CASE edge.confidence WHEN 'certain' THEN 0 WHEN 'likely' THEN 1 ELSE 2 END,
+           file.path,COALESCE(edge.line,source.line),edge.kind,edge.id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
+        Ok(Usage {
+            file: row.get(0)?,
+            file_origin: row.get(1)?,
+            line: row.get(2)?,
+            kind: row.get(3)?,
+            confidence: row.get(4)?,
+            detail: row.get(5)?,
+            chunk_name: row.get(6)?,
+        })
+    })?;
+    let mut usages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Deterministic extraction represents an unresolved member call as two
+    // edges: caller -> member hub -> candidate symbol. Attribute the candidate
+    // to the caller edge so the usage keeps its real file and line. A checker
+    // or resolver edge for the same site wins over this possible candidate.
+    let mut seen_sites = usages
+        .iter()
+        .map(|usage| (usage.file.clone(), usage.line))
+        .collect::<HashSet<_>>();
+    let mut statement = conn.prepare(
+        "SELECT file.path,file.origin,call.line,'call','possible',
+                CASE WHEN json_type(call.detail_json,'$.object')='text'
+                     THEN json_extract(call.detail_json,'$.object') || '.' ||
+                          json_extract(call.detail_json,'$.property') || '()' END,
+                source.display_name
+         FROM resolved_edges candidate
+         JOIN resolved_edges call
+           ON call.dst_key=candidate.src_key AND call.kind='member_call'
+         JOIN graph_nodes source ON source.node_key=call.src_key
+         JOIN files file ON file.id=COALESCE(call.source_file_id,source.file_id)
+         WHERE candidate.dst_key=?1 AND candidate.kind='member_candidate'
+           AND file.origin IN (SELECT value FROM json_each(?2))
+           AND call.line IS NOT NULL
+         ORDER BY file.path,call.line,call.id,candidate.id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
+        Ok(Usage {
+            file: row.get(0)?,
+            file_origin: row.get(1)?,
+            line: row.get(2)?,
+            kind: row.get(3)?,
+            confidence: row.get(4)?,
+            detail: row.get(5)?,
+            chunk_name: row.get(6)?,
+        })
+    })?;
+    for row in rows {
+        let usage = row?;
+        if seen_sites.insert((usage.file.clone(), usage.line)) {
+            usages.push(usage);
+        }
+    }
+    Ok(usages)
 }
 
 /// Find symbols matching "Name" or "path-substring:Name" within an origin allowlist.
