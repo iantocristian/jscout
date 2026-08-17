@@ -377,3 +377,26 @@ leverage question shifts from "can the agent reach memory" (yes) to what
 the scout writes into it — mechanism-level artifacts on the production
 surface — and whether any retrieved context competes with implementation
 pressure once editing begins.
+
+Corroboration (`trial-codex-memory-vector-006/RESULTS.md`): Codex ran
+skill-only memory-embed arms on terra and sol with an independently
+prepared workspace, checker, and structural plane but the byte-identical
+425-artifact semantic plane (verified here: artifact row sets hash equal
+across the two databases; its trial-005 was invalidated by the same
+v22→v23 snapshot trap recorded above). Both its models adopted jscout
+naturally (7–8 calls, no forcing), vector active throughout — and both
+landed at 1/7 gold, `optimistic-routes.ts` only, rewrite misprediction
+unfixed; its terra arm also dropped the livelock, within terra's
+documented variance on that case. The cross-experiment constants are now
+46/46 on the same corpus, and its conclusion matches this section's
+independently: memory was "non-empty but generic," and neither budgets
+nor embedding coverage are the lever. Its new finding, bounded by this
+trial's data: both its models invented shorthand drill-down arguments
+(`optimistic-routes:matchKnownRoute`, zero targets) where this trial's
+sol arms copied full `path:symbol` anchors and resolved 8 of 9
+definition calls to source — the failure is real but non-deterministic,
+and its proposed fix (emit copy-ready tool arguments beside each hit)
+would also cover this trial's one miss, an unqualified class-member
+anchor. Its second recommendation — `repository_overview` is now the
+largest automatic response — reproduces here (21.5KB and 17.4KB in the
+two mem-004 arms).
