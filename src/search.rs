@@ -539,7 +539,136 @@ fn exact_occurrence_chunks(
     for row in rows {
         result.push(row?);
     }
+
+    // Structured tables deliberately omit many property-key occurrences:
+    // object-literal fields, non-call member reads/writes, and some computed
+    // state containers are not refs or member calls. Use FTS only as a bounded
+    // candidate generator, then enforce case-sensitive identifier boundaries
+    // against the stored source chunk before admitting an exact occurrence.
+    if result.len() < limit {
+        let mut textual = conn.prepare_cached(
+            "SELECT chunk.id, chunk.content
+             FROM chunks_fts
+             JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+             JOIN files file ON file.id=chunk.file_id
+             WHERE chunks_fts MATCH ?1
+               AND ((?2 AND file.origin='repository')
+                 OR (?3 AND file.origin='workspace')
+                 OR (?4 AND file.origin='dependency'))
+               AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+             ORDER BY file.path, chunk.start, chunk.id
+             LIMIT ?7",
+        )?;
+        let candidate_limit = limit.saturating_mul(32).clamp(32, 4_096) as i64;
+        let rows = textual.query_map(
+            rusqlite::params![
+                format!("\"{identifier}\""),
+                flags.0,
+                flags.1,
+                flags.2,
+                file_roles.is_empty(),
+                roles_json,
+                candidate_limit,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut seen = result.iter().copied().collect::<HashSet<_>>();
+        for row in rows {
+            let (chunk_id, content) = row?;
+            if contains_code_identifier(&content, identifier) && seen.insert(chunk_id) {
+                result.push(chunk_id);
+                if result.len() == limit {
+                    break;
+                }
+            }
+        }
+    }
     Ok(result)
+}
+
+fn contains_code_identifier(content: &str, identifier: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum LexicalState {
+        Code,
+        SingleQuoted,
+        DoubleQuoted,
+        Template,
+        LineComment,
+        BlockComment,
+    }
+
+    let source = content.as_bytes();
+    let needle = identifier.as_bytes();
+    let mut state = LexicalState::Code;
+    let mut cursor = 0;
+    while cursor < source.len() {
+        match state {
+            LexicalState::Code => {
+                if source[cursor..].starts_with(b"//") {
+                    state = LexicalState::LineComment;
+                    cursor += 2;
+                    continue;
+                }
+                if source[cursor..].starts_with(b"/*") {
+                    state = LexicalState::BlockComment;
+                    cursor += 2;
+                    continue;
+                }
+                state = match source[cursor] {
+                    b'\'' => LexicalState::SingleQuoted,
+                    b'"' => LexicalState::DoubleQuoted,
+                    b'`' => LexicalState::Template,
+                    _ => {
+                        if source[cursor..].starts_with(needle)
+                            && (cursor == 0 || !is_identifier_continue_byte(source[cursor - 1]))
+                            && (cursor + needle.len() == source.len()
+                                || !is_identifier_continue_byte(source[cursor + needle.len()]))
+                        {
+                            return true;
+                        }
+                        cursor += 1;
+                        continue;
+                    }
+                };
+                cursor += 1;
+            }
+            LexicalState::SingleQuoted | LexicalState::DoubleQuoted | LexicalState::Template => {
+                if source[cursor] == b'\\' {
+                    cursor = (cursor + 2).min(source.len());
+                    continue;
+                }
+                let closes = matches!(
+                    (state, source[cursor]),
+                    (LexicalState::SingleQuoted, b'\'')
+                        | (LexicalState::DoubleQuoted, b'"')
+                        | (LexicalState::Template, b'`')
+                );
+                if closes {
+                    state = LexicalState::Code;
+                }
+                cursor += 1;
+            }
+            LexicalState::LineComment => {
+                if source[cursor] == b'\n' {
+                    state = LexicalState::Code;
+                }
+                cursor += 1;
+            }
+            LexicalState::BlockComment => {
+                if source[cursor..].starts_with(b"*/") {
+                    state = LexicalState::Code;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_identifier_continue_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 
 fn tiered_candidates(
@@ -2046,9 +2175,9 @@ mod tests {
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
         ExpansionOptions, Hit, MatchReason, ResponseBudget, RetrievalStatus, SearchExpansion,
         SearchOptions, SearchResult, apply_repository_policy_penalty, apply_response_budget,
-        candidate_pool_limits, exact_intent_tokens, merge_reranked_prefix,
-        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
-        select_attached_memory, tiered_candidates,
+        candidate_pool_limits, contains_code_identifier, exact_intent_tokens,
+        merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
+        search, select_attached_memory, tiered_candidates,
     };
     use crate::{
         file_role, indexer, origin,
@@ -2161,6 +2290,22 @@ mod tests {
             exact_intent_tokens("CreateRouteTypesManifest"),
             ["CreateRouteTypesManifest"]
         );
+        assert!(contains_code_identifier(
+            "const state = { collectedRootParams: {} };",
+            "collectedRootParams"
+        ));
+        assert!(contains_code_identifier(
+            "state.collectedRootParams = next;",
+            "collectedRootParams"
+        ));
+        assert!(!contains_code_identifier(
+            "// collectedRootParams\nconst label = 'collectedRootParams';",
+            "collectedRootParams"
+        ));
+        assert!(!contains_code_identifier(
+            "const collectedRootParamsExtra = true;",
+            "collectedRootParams"
+        ));
     }
 
     #[test]
@@ -2294,6 +2439,31 @@ mod tests {
         );
         assert!(occurrence.hits.iter().any(|hit| {
             hit.file == "caller.ts" && hit.match_reason == MatchReason::ExactOccurrence
+        }));
+
+        fs::write(
+            repo.path().join("state.ts"),
+            "export const state = { registeredOptions: {} as Record<string, boolean> };\n\
+             export function update() { state.registeredOptions['x'] = true; }\n",
+        )?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let property_occurrence = search(
+            &conn,
+            None,
+            "registeredOptions",
+            &SearchOptions {
+                limit: 3,
+                include_memory: false,
+                ..Default::default()
+            },
+        )?;
+        assert!(property_occurrence.hits.iter().any(|hit| {
+            hit.file == "state.ts"
+                && hit.match_reason == MatchReason::ExactOccurrence
+                && hit
+                    .matched_identifiers
+                    .iter()
+                    .any(|identifier| identifier == "registeredOptions")
         }));
         Ok(())
     }
