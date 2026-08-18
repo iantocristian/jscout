@@ -422,6 +422,29 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     fs.readFileSync(path.join(base, "artifacts", "grep-control-replay-fixture-t1", "agent-argv.json"), "utf8"),
   );
   assert.ok(agentArgv.includes("sandbox_workspace_write.network_access=true"));
+  assert.ok(
+    agentArgv.includes(
+      'shell_environment_policy.set.JSCOUT_REPLAY_TEST_ENV="enabled"',
+    ),
+  );
+  assert.ok(
+    agentArgv.includes(
+      'shell_environment_policy.set.NEXT_TEST_BROWSER_WS_ENDPOINT="ws://127.0.0.1:43210/fake-browser"',
+    ),
+  );
+  assert.ok(agentArgv.includes('shell_environment_policy.set.HEADLESS="true"'));
+  assert.ok(
+    agentArgv.some((argument) =>
+      argument.startsWith('shell_environment_policy.set.NODE_OPTIONS='),
+    ),
+  );
+  assert.ok(
+    agentArgv.some((argument) =>
+      argument.startsWith(
+        'shell_environment_policy.set.JSCOUT_EVAL_PROCESS_REGISTRY=',
+      ),
+    ),
+  );
 
   const runDir = path.join(base, "artifacts", "grep-control-replay-fixture-t1");
   const browser = JSON.parse(

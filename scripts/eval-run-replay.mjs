@@ -979,6 +979,7 @@ async function runCodexPhase({
   options,
   workspace,
   childEnvironment,
+  executionEnvironment,
   args,
   prompt,
   eventsPath,
@@ -994,6 +995,24 @@ async function runCodexPhase({
     )
     : null;
   if (processRegistry) fs.writeFileSync(processRegistry, "");
+  const forwardedEnvironment = {
+    ...executionEnvironment,
+    JSCOUT_EVAL_PHASE: phase,
+    ...(browserEndpoint
+      ? {
+        NEXT_TEST_BROWSER_WS_ENDPOINT: browserEndpoint,
+        HEADLESS: "true",
+        NODE_OPTIONS: nodeOptionsWithNextTeardown(childEnvironment.NODE_OPTIONS),
+        JSCOUT_EVAL_PROCESS_REGISTRY: processRegistry,
+      }
+      : {}),
+  };
+  const shellEnvironmentArgs = Object.entries(forwardedEnvironment).flatMap(
+    ([name, value]) => [
+      "--config",
+      `shell_environment_policy.set.${name}=${JSON.stringify(value)}`,
+    ],
+  );
   const result = await run(
     "/bin/sh",
     [
@@ -1002,21 +1021,14 @@ async function runCodexPhase({
       "sh",
       options.codex,
       ...args,
+      ...shellEnvironmentArgs,
       prompt,
     ],
     {
       cwd: workspace,
       env: {
         ...childEnvironment,
-        JSCOUT_EVAL_PHASE: phase,
-        ...(browserEndpoint
-          ? {
-            NEXT_TEST_BROWSER_WS_ENDPOINT: browserEndpoint,
-            HEADLESS: "true",
-            NODE_OPTIONS: nodeOptionsWithNextTeardown(childEnvironment.NODE_OPTIONS),
-            JSCOUT_EVAL_PROCESS_REGISTRY: processRegistry,
-          }
-          : {}),
+        ...forwardedEnvironment,
       },
       eventsPath,
       stderrPath,
@@ -1348,6 +1360,7 @@ async function main() {
             options,
             workspace,
             childEnvironment,
+            executionEnvironment,
             args: designArgs,
             prompt: designPrompt,
             eventsPath: designEventsPath,
@@ -1449,6 +1462,7 @@ async function main() {
               options,
               workspace,
               childEnvironment,
+              executionEnvironment,
               args: implementationArgs,
               prompt: implementationPrompt,
               eventsPath: implementationEventsPath,
