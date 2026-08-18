@@ -13,8 +13,14 @@ questions, then verify decisive claims in source.
   are compact by default; request one exact `reconnaissance_subject` with
   `reconnaissance_detail=true` only when its full cited explanation matters.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
-  `semantic_memory`. Use its `anchor` or `related_to` filters for code-to-memory
-  joins and `include_source=true` for hash-verified evidence drill-down.
+  `semantic_memory`. Broad queries return compact artifact handles, not full
+  bodies. Follow one handle's exact `artifact` argument to inspect that body,
+  its relations, concept tags, or `include_source=true` hash-verified evidence.
+  After localizing code, use `anchor`, `file`, or an exact current
+  `reconnaissance_subject` for a hard code-to-memory join. If that returns
+  `no_supported_memory`, the corpus has no directly supported artifact for the
+  supplied surface; refine code localization or generate targeted cards rather
+  than increasing the response budget to retrieve weak analogies.
 - For causal questions, regressions with multiple mechanisms, or behavior that
   crosses files, call `semantic_memory` directly. The memory attached to
   `semantic_search` is only a compact preview. If a preview is relevant, or
@@ -60,6 +66,9 @@ questions, then verify decisive claims in source.
   applies. Refine the query or drill into exact definitions before increasing
   result budgets. Lower the byte budget only when omissions are acceptable;
   graph context can contain irrelevant structural neighbors.
+- Treat `match: exact_definition` and `match: exact_occurrence` as deterministic
+  search-intent tiers. `default_match: hybrid` applies to compact hits without
+  an explicit match field. Learned reranking cannot demote an exact tier.
 - If jscout returns no relevant evidence, fall back to repository-local search.
 
 `semantic_search` can also attach a small persistent-memory section, but it

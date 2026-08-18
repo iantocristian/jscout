@@ -65,6 +65,8 @@ pub struct WorkflowRunConfig {
 #[derive(Debug, Clone)]
 pub struct CardScoutOptions {
     pub anchors: Vec<String>,
+    pub files: Vec<String>,
+    pub reconnaissance_subjects: Vec<String>,
     pub model: ModelSpec,
     pub reasoning: Option<String>,
     pub service_tier: Option<String>,
@@ -141,6 +143,23 @@ pub struct ScoutBatchReport {
     /// Repository reconnaissance records its complete initial-plus-subdivided
     /// subject count here. Other scout families leave it absent.
     pub subjects_considered: Option<usize>,
+    /// Card-only coverage and execution accounting by deterministic selection
+    /// scope. Other scout families leave this empty.
+    pub card_scope_coverage: BTreeMap<String, CardScopeExecutionCoverage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CardScopeExecutionCoverage {
+    pub discovered: usize,
+    pub selected: usize,
+    pub omitted: usize,
+    pub reused: usize,
+    pub model_calls: usize,
+    pub completed: usize,
+    pub incomplete: usize,
+    pub failed: usize,
+    pub skipped_call_budget: usize,
+    pub skipped_context_budget: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +200,7 @@ struct PreparedWorkflow {
 
 struct PreparedCard {
     subject: card::CardSubject,
+    selection_scope: String,
     snapshot: String,
     evidence: EvidencePack,
     request: CompleteRequest,
@@ -367,6 +387,7 @@ pub fn scout_workflow_plan(
         skipped_over_budget,
         skipped_unresolvable: Vec::new(),
         subjects_considered: None,
+        card_scope_coverage: BTreeMap::new(),
     })
 }
 
@@ -382,15 +403,37 @@ pub fn scout_card_plan(
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let skipped_unselectable = plan.skipped.len();
     let anchor_limit_reached = plan.anchor_limit_reached;
-    let automatic = plan.mode == "automatic";
+    let skip_subject_failures = plan.mode != "explicit";
+    let mut scope_coverage = plan
+        .scope_coverage
+        .iter()
+        .map(|(scope, coverage)| {
+            (
+                scope.clone(),
+                CardScopeExecutionCoverage {
+                    discovered: coverage.discovered,
+                    selected: coverage.selected,
+                    omitted: coverage.omitted,
+                    ..CardScopeExecutionCoverage::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut cache = PreparationCache::default();
     let mut prepared = Vec::new();
     let mut skipped_over_budget = Vec::new();
     for item in plan.items {
         let subject = item.anchor.clone();
+        let selection_scope = item.selection_scope.clone();
         match prepare_card(gateway, &mut cache, item, options) {
             Ok(card) => prepared.push(card),
-            Err(error) if automatic && error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+            Err(error)
+                if skip_subject_failures
+                    && error.downcast_ref::<ContextBudgetExceeded>().is_some() =>
+            {
+                if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
+                    coverage.skipped_context_budget += 1;
+                }
                 skipped_over_budget.push(BatchSkip {
                     subject,
                     reason: error.to_string(),
@@ -403,9 +446,13 @@ pub fn scout_card_plan(
     let mut model_calls = 0;
     let mut skipped = 0;
     for prepared in prepared {
+        let selection_scope = prepared.selection_scope.clone();
         let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
         if !reusable && model_calls >= options.policy.max_calls {
             skipped += 1;
+            if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
+                coverage.skipped_call_budget += 1;
+            }
             continue;
         }
         let report = execute_prepared_card(
@@ -419,6 +466,24 @@ pub fn scout_card_plan(
         if report.status != "reused" {
             model_calls += 1;
         }
+        if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
+            match report.status.as_str() {
+                "reused" => coverage.reused += 1,
+                "completed" => {
+                    coverage.model_calls += 1;
+                    coverage.completed += 1;
+                }
+                "incomplete" => {
+                    coverage.model_calls += 1;
+                    coverage.incomplete += 1;
+                }
+                "failed" => {
+                    coverage.model_calls += 1;
+                    coverage.failed += 1;
+                }
+                _ => coverage.model_calls += 1,
+            }
+        }
         reports.push(report);
     }
     Ok(ScoutBatchReport {
@@ -428,6 +493,7 @@ pub fn scout_card_plan(
         skipped_unscoutable: skipped_unselectable,
         auto_limit_reached: anchor_limit_reached,
         skipped_over_budget,
+        card_scope_coverage: scope_coverage,
         ..ScoutBatchReport::default()
     })
 }
@@ -551,9 +617,33 @@ pub fn card_dry_run_report(
     plan: &plan::CardPlan,
     options: &CardScoutOptions,
 ) -> Result<serde_json::Value> {
+    #[derive(Default, Serialize)]
+    struct ScopePreview {
+        discovered: usize,
+        selected: usize,
+        omitted: usize,
+        would_call: usize,
+        over_context_bytes: usize,
+    }
+
     let mut annotated = serde_json::to_value(plan)?;
     let mut eligible = 0_usize;
     let mut over_budget = 0_usize;
+    let mut scopes = plan
+        .scope_coverage
+        .iter()
+        .map(|(scope, coverage)| {
+            (
+                scope.clone(),
+                ScopePreview {
+                    discovered: coverage.discovered,
+                    selected: coverage.selected,
+                    omitted: coverage.omitted,
+                    ..ScopePreview::default()
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     if let Some(items) = annotated
         .get_mut("items")
         .and_then(serde_json::Value::as_array_mut)
@@ -565,8 +655,14 @@ pub fn card_dry_run_report(
             let would_call = !over && eligible < options.policy.max_calls;
             if over {
                 over_budget += 1;
+                if let Some(scope) = scopes.get_mut(&item.selection_scope) {
+                    scope.over_context_bytes += 1;
+                }
             } else {
                 eligible += 1;
+                if would_call && let Some(scope) = scopes.get_mut(&item.selection_scope) {
+                    scope.would_call += 1;
+                }
             }
             rendered["request_bytes"] = request_bytes.into();
             rendered["over_context_bytes"] = over.into();
@@ -579,6 +675,7 @@ pub fn card_dry_run_report(
         "context_bytes": options.policy.context_bytes,
         "calls_planned": eligible.min(options.policy.max_calls),
         "over_context_bytes_items": over_budget,
+        "scope_execution_preview": scopes,
         "notes": [
             "completed matching runs are reused at execution time without consuming --max-calls; later would_call:false items may still run",
             "the model context-window check needs the gateway and runs at execution time; over_context_bytes covers --context-bytes only",
@@ -938,6 +1035,8 @@ fn prepare_card_refresh(
     }
     let options = CardScoutOptions {
         anchors: vec![config.anchor],
+        files: Vec::new(),
+        reconnaissance_subjects: Vec::new(),
         model,
         reasoning,
         service_tier: config.service_tier,
@@ -1350,6 +1449,7 @@ fn prepare_card(
     item: plan::CardPlanItem,
     options: &CardScoutOptions,
 ) -> Result<PreparedCard> {
+    let selection_scope = item.selection_scope.clone();
     let subject = item.subject();
     let snapshot = item.snapshot;
     let evidence = item.evidence;
@@ -1395,6 +1495,7 @@ fn prepare_card(
     };
     Ok(PreparedCard {
         subject,
+        selection_scope,
         snapshot,
         evidence,
         request,
@@ -1412,6 +1513,7 @@ fn execute_prepared_card(
 ) -> Result<ScoutReport> {
     let PreparedCard {
         subject,
+        selection_scope: _,
         snapshot,
         evidence,
         request,
@@ -4319,6 +4421,8 @@ mod tests {
     fn card_options() -> CardScoutOptions {
         CardScoutOptions {
             anchors: vec!["flow.ts:start".into()],
+            files: Vec::new(),
+            reconnaissance_subjects: Vec::new(),
             model: ModelSpec::parse("faux:faux-model").expect("model spec"),
             reasoning: None,
             service_tier: None,

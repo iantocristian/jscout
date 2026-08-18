@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{embed, origin, semantic, store, structural};
+use crate::{embed, origin, recon, semantic, store, structural};
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_SOURCE_BYTE_LIMIT: usize = 2_000;
@@ -31,6 +31,8 @@ pub struct QueryOptions {
     pub query: String,
     pub artifact_id: Option<i64>,
     pub anchor: Option<String>,
+    pub file: Option<String>,
+    pub reconnaissance_subject: Option<String>,
     pub related_to: Option<i64>,
     pub artifact_types: Vec<String>,
     pub freshness: Vec<String>,
@@ -53,6 +55,8 @@ impl Default for QueryOptions {
             query: String::new(),
             artifact_id: None,
             anchor: None,
+            file: None,
+            reconnaissance_subject: None,
             related_to: None,
             artifact_types: Vec::new(),
             freshness: Vec::new(),
@@ -104,6 +108,43 @@ pub struct ArtifactHeader {
     pub current: bool,
     pub confidence: String,
     pub freshness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactSupportHandle {
+    pub anchor: String,
+    pub file: String,
+    pub lines: [i64; 2],
+    pub freshness: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactFollowup {
+    pub tool: &'static str,
+    pub arguments: ArtifactFollowupArguments,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactFollowupArguments {
+    pub artifact: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactHandle {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub name: Option<String>,
+    pub current: bool,
+    pub confidence: String,
+    pub freshness: String,
+    pub support_count: usize,
+    pub supports: Vec<ArtifactSupportHandle>,
+    pub supports_truncated: bool,
+    pub selection_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_score: Option<semantic::ArtifactRetrievalScore>,
+    pub followup: ArtifactFollowup,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,12 +226,22 @@ pub struct ResponseBudget {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     pub snapshot: String,
+    /// `discovery` returns compact handles; `artifact_detail` is the only mode
+    /// that returns full semantic bodies and relation/source payloads.
+    pub mode: &'static str,
+    /// `no_supported_memory` is a successful localized lookup with no direct
+    /// evidence match. Unsupported analogies are never used as filler.
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resolved_evidence_scope: Vec<String>,
     pub retrieval: semantic::ArtifactRetrievalStatus,
     /// Ranked candidates after exact type/anchor/relation/freshness filters,
     /// before the caller's result and byte budgets. This is not a calibrated
     /// count of semantically relevant artifacts.
     pub candidate_artifacts: usize,
     pub matched_concept_tags: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifact_handles: Vec<ArtifactHandle>,
     pub semantic_artifacts: Vec<ArtifactView>,
     pub related_artifacts: Vec<RelatedArtifact>,
     pub concept_tags: Vec<ConceptTag>,
@@ -205,6 +256,37 @@ struct Candidate {
     current: bool,
     superseded_by: Option<i64>,
     retrieval_score: Option<semantic::ArtifactRetrievalScore>,
+    retrieval_rank: usize,
+    support_tier: u8,
+    selection_reason: String,
+}
+
+#[derive(Debug, Default)]
+struct SupportScope {
+    anchor: Option<String>,
+    file: Option<String>,
+    reconnaissance_subject: Option<String>,
+    subject_files: HashSet<String>,
+}
+
+impl SupportScope {
+    fn localized(&self) -> bool {
+        self.anchor.is_some() || self.file.is_some() || self.reconnaissance_subject.is_some()
+    }
+
+    fn labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        if let Some(anchor) = &self.anchor {
+            labels.push(format!("anchor:{anchor}"));
+        }
+        if let Some(file) = &self.file {
+            labels.push(format!("file:{file}"));
+        }
+        if let Some(subject) = &self.reconnaissance_subject {
+            labels.push(format!("subject:{subject}"));
+        }
+        labels
+    }
 }
 
 pub fn query(
@@ -216,15 +298,31 @@ pub fn query(
     validate_options(options)?;
     store::with_read_snapshot(conn, "jscout_semantic_query", || {
         let snapshot = structural::current_snapshot(conn)?;
+        let support_scope = resolve_support_scope(conn, options)?;
+        let localized = support_scope.localized();
+        let detail_mode = options.artifact_id.is_some();
         let mut candidates = candidates(conn, options)?;
+        if localized {
+            apply_support_scope(conn, &mut candidates, &support_scope)?;
+        }
+        let ranking_limit = if localized || detail_mode {
+            options.limit.saturating_mul(5).max(candidates.len())
+        } else {
+            options.limit.saturating_mul(5)
+        };
         let (ranking, retrieval) = semantic::rank_artifacts(
             conn,
             provider,
             &options.query,
             options.include_superseded,
-            options.limit.saturating_mul(5),
+            ranking_limit,
         )?;
-        apply_ranking(&mut candidates, &ranking, &options.query);
+        apply_ranking(
+            &mut candidates,
+            &ranking,
+            &options.query,
+            localized || detail_mode,
+        );
         let candidate_ids = candidates
             .iter()
             .map(|candidate| candidate.id)
@@ -246,6 +344,10 @@ pub fn query(
             .iter()
             .map(|candidate| (candidate.id, candidate.superseded_by))
             .collect::<HashMap<_, _>>();
+        let selection_reasons = candidates
+            .iter()
+            .map(|candidate| (candidate.id, candidate.selection_reason.clone()))
+            .collect::<HashMap<_, _>>();
 
         let mut loaded = semantic::load_artifacts(conn, &candidate_ids)?;
         loaded.retain(|artifact| {
@@ -266,9 +368,12 @@ pub fn query(
             .iter()
             .map(|artifact| artifact.id)
             .collect::<Vec<_>>();
-        let (related_artifacts, omitted_relations) =
-            related_artifacts(conn, &selected_ids, options.relation_limit)?;
-        let source_result = if options.include_source {
+        let (related_artifacts, omitted_relations) = if detail_mode {
+            related_artifacts(conn, &selected_ids, options.relation_limit)?
+        } else {
+            (Vec::new(), 0)
+        };
+        let source_result = if detail_mode && options.include_source {
             source_evidence(root, conn, &selected_ids, options)?
         } else {
             SourceEvidenceResult::default()
@@ -282,21 +387,45 @@ pub fn query(
             relation_paths_truncated,
             relation_cycles_skipped,
         } = source_result;
-        let mut concept_tags = concept_tags(conn, &loaded, &current, &options.file_origins)?;
+        let mut concept_tags = if detail_mode {
+            concept_tags(conn, &loaded, &current, &options.file_origins)?
+        } else {
+            Vec::new()
+        };
         let matched_concept_tags = concept_tags.len();
         concept_tags.truncate(options.concept_tag_limit);
         let omitted_concept_tags = matched_concept_tags.saturating_sub(concept_tags.len());
-        let semantic_artifacts: Vec<ArtifactView> = loaded
-            .into_iter()
-            .map(|artifact| {
-                artifact_view(
-                    artifact,
-                    &current,
-                    &superseded_by,
-                    options.supports_per_artifact,
-                )
-            })
-            .collect();
+        let (artifact_handles, semantic_artifacts) = if detail_mode {
+            (
+                Vec::new(),
+                loaded
+                    .into_iter()
+                    .map(|artifact| {
+                        artifact_view(
+                            artifact,
+                            &current,
+                            &superseded_by,
+                            options.supports_per_artifact,
+                        )
+                    })
+                    .collect(),
+            )
+        } else {
+            (
+                loaded
+                    .into_iter()
+                    .map(|artifact| {
+                        artifact_handle(
+                            artifact,
+                            &current,
+                            &selection_reasons,
+                            options.supports_per_artifact.min(2),
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        };
         let omitted_supports = semantic_artifacts
             .iter()
             .map(|artifact| {
@@ -304,7 +433,15 @@ pub fn query(
                     .support_count
                     .saturating_sub(artifact.supports.len())
             })
-            .sum();
+            .sum::<usize>()
+            + artifact_handles
+                .iter()
+                .map(|artifact| {
+                    artifact
+                        .support_count
+                        .saturating_sub(artifact.supports.len())
+                })
+                .sum::<usize>();
         let truncated_sources = source_evidence
             .iter()
             .filter(|source| source.source_truncated)
@@ -320,9 +457,21 @@ pub fn query(
             || relation_paths_truncated;
         let mut result = QueryResult {
             snapshot,
+            mode: if detail_mode {
+                "artifact_detail"
+            } else {
+                "discovery"
+            },
+            status: if localized && candidate_artifacts == 0 {
+                "no_supported_memory"
+            } else {
+                "results"
+            },
+            resolved_evidence_scope: support_scope.labels(),
             retrieval,
             candidate_artifacts,
             matched_concept_tags,
+            artifact_handles,
             semantic_artifacts,
             related_artifacts,
             concept_tags,
@@ -371,10 +520,27 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     if options.response_byte_limit == 0 {
         bail!("response byte limit must be greater than zero");
     }
+    if options.include_source && options.artifact_id.is_none() {
+        bail!("semantic source evidence requires an exact artifact id drill-down");
+    }
     if options.evidence_relation_depth == 0 || options.evidence_relation_depth > 32 {
         bail!("evidence relation depth must be between 1 and 32");
     }
     origin::validate_all(&options.file_origins)?;
+    if options
+        .file
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("semantic evidence file must not be empty");
+    }
+    if options
+        .reconnaissance_subject
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("semantic reconnaissance subject must not be empty");
+    }
     if let Some(value) = options
         .freshness
         .iter()
@@ -393,6 +559,116 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     Ok(())
 }
 
+fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<SupportScope> {
+    let anchor = options
+        .anchor
+        .as_deref()
+        .map(|anchor| {
+            structural::resolve_current_anchor_in_origins(conn, anchor, &options.file_origins)
+        })
+        .transpose()?;
+    let file = options
+        .file
+        .as_deref()
+        .map(|file| file.strip_prefix("./").unwrap_or(file).to_string());
+    if let Some(file) = &file {
+        let origins_json = serde_json::to_string(&options.file_origins)?;
+        let indexed = conn
+            .query_row(
+                "SELECT 1 FROM files
+                 WHERE path=?1 AND origin IN (SELECT value FROM json_each(?2))",
+                rusqlite::params![file, origins_json],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if indexed.is_none() {
+            bail!("semantic evidence file `{file}` is not indexed in the requested origins");
+        }
+    }
+    let reconnaissance_subject = options.reconnaissance_subject.clone();
+    let subject_files = if let Some(subject) = &reconnaissance_subject {
+        let origins_json = serde_json::to_string(&options.file_origins)?;
+        let allowed = conn
+            .prepare(
+                "SELECT path FROM files
+                 WHERE origin IN (SELECT value FROM json_each(?1))",
+            )?
+            .query_map([origins_json], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        recon::current_subject_members(conn, subject)?
+            .into_iter()
+            .filter_map(|member| allowed.contains(&member.path).then_some(member.path))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    Ok(SupportScope {
+        anchor,
+        file,
+        reconnaissance_subject,
+        subject_files,
+    })
+}
+
+fn apply_support_scope(
+    conn: &Connection,
+    candidates: &mut Vec<Candidate>,
+    scope: &SupportScope,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let candidate_ids = serde_json::to_string(
+        &candidates
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>(),
+    )?;
+    let mut supports = conn.prepare(
+        "SELECT artifact_id, anchor_key, evidence_file
+         FROM semantic_supports
+         WHERE artifact_id IN (SELECT value FROM json_each(?1))
+         ORDER BY artifact_id, anchor_key, evidence_file,
+                  evidence_start_line, evidence_end_line",
+    )?;
+    let rows = supports.query_map([candidate_ids], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut matches = HashMap::<i64, (u8, String)>::new();
+    for row in rows {
+        let (artifact_id, anchor, file) = row?;
+        let match_reason = if scope.anchor.as_deref() == Some(anchor.as_str()) {
+            Some((0, "exact_anchor_support".to_string()))
+        } else if scope.file.as_deref() == Some(file.as_str()) {
+            Some((1, "exact_file_support".to_string()))
+        } else if scope.subject_files.contains(&file) {
+            Some((2, "reconnaissance_scope_support".to_string()))
+        } else {
+            None
+        };
+        if let Some(match_reason) = match_reason
+            && matches
+                .get(&artifact_id)
+                .is_none_or(|(best, _)| match_reason.0 < *best)
+        {
+            matches.insert(artifact_id, match_reason);
+        }
+    }
+    candidates.retain_mut(|candidate| {
+        let Some((tier, reason)) = matches.get(&candidate.id) else {
+            return false;
+        };
+        candidate.support_tier = *tier;
+        candidate.selection_reason = reason.clone();
+        true
+    });
+    Ok(())
+}
+
 fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate>> {
     let mut statement = conn.prepare(
         "SELECT artifact.id, artifact.artifact_type,
@@ -405,18 +681,14 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
          FROM semantic_artifacts artifact
          WHERE (?1 IS NULL OR artifact.id=?1)
            AND (?2 IS NULL OR EXISTS(
-             SELECT 1 FROM semantic_supports support
-             WHERE support.artifact_id=artifact.id AND support.anchor_key=?2
-           ))
-           AND (?3 IS NULL OR EXISTS(
              SELECT 1 FROM semantic_relations relation
-             WHERE (relation.src_artifact_id=artifact.id AND relation.dst_artifact_id=?3)
-                OR (relation.dst_artifact_id=artifact.id AND relation.src_artifact_id=?3)
+             WHERE (relation.src_artifact_id=artifact.id AND relation.dst_artifact_id=?2)
+                OR (relation.dst_artifact_id=artifact.id AND relation.src_artifact_id=?2)
            ))
          ORDER BY artifact.id DESC",
     )?;
     let rows = statement.query_map(
-        rusqlite::params![options.artifact_id, options.anchor, options.related_to],
+        rusqlite::params![options.artifact_id, options.related_to],
         |row| {
             Ok(Candidate {
                 id: row.get(0)?,
@@ -424,6 +696,13 @@ fn candidates(conn: &Connection, options: &QueryOptions) -> Result<Vec<Candidate
                 current: row.get(2)?,
                 superseded_by: row.get(3)?,
                 retrieval_score: None,
+                retrieval_rank: usize::MAX,
+                support_tier: u8::MAX,
+                selection_reason: if options.query.trim().is_empty() {
+                    "recent".into()
+                } else {
+                    "semantic_match".into()
+                },
             })
         },
     )?;
@@ -455,8 +734,14 @@ fn apply_ranking(
     candidates: &mut Vec<Candidate>,
     ranking: &[semantic::RankedArtifact],
     query: &str,
+    preserve_unranked: bool,
 ) {
     if query.trim().is_empty() {
+        candidates.sort_by(|left, right| {
+            left.support_tier
+                .cmp(&right.support_tier)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         return;
     }
     let ranks = ranking
@@ -464,19 +749,33 @@ fn apply_ranking(
         .enumerate()
         .map(|(rank, artifact)| (artifact.id, (rank, artifact.retrieval_score.clone())))
         .collect::<HashMap<_, _>>();
-    candidates.retain_mut(|candidate| {
-        let Some((_, retrieval_score)) = ranks.get(&candidate.id) else {
-            return false;
-        };
-        candidate.retrieval_score = Some(retrieval_score.clone());
-        true
+    candidates.retain_mut(|candidate| match ranks.get(&candidate.id) {
+        Some((rank, retrieval_score)) => {
+            candidate.retrieval_rank = *rank;
+            candidate.retrieval_score = Some(retrieval_score.clone());
+            if candidate.support_tier == u8::MAX {
+                candidate.selection_reason = retrieval_reason(retrieval_score);
+            }
+            true
+        }
+        None => preserve_unranked,
     });
-    candidates.sort_by_key(|candidate| {
-        ranks
-            .get(&candidate.id)
-            .map(|(rank, _)| *rank)
-            .unwrap_or(usize::MAX)
+    candidates.sort_by(|left, right| {
+        left.support_tier
+            .cmp(&right.support_tier)
+            .then_with(|| left.retrieval_rank.cmp(&right.retrieval_rank))
+            .then_with(|| right.id.cmp(&left.id))
     });
+}
+
+fn retrieval_reason(score: &semantic::ArtifactRetrievalScore) -> String {
+    match (score.lexical_score.is_some(), score.vector_cosine.is_some()) {
+        (true, true) => "lexical_vector_match",
+        (true, false) => "lexical_match",
+        (false, true) => "vector_match",
+        (false, false) => "recent",
+    }
+    .into()
 }
 
 fn artifact_view(
@@ -506,6 +805,47 @@ fn artifact_view(
         support_count,
         supports_truncated: support_count > artifact.supports.len(),
         supports: artifact.supports,
+    }
+}
+
+fn artifact_handle(
+    mut artifact: semantic::SemanticArtifact,
+    current: &HashMap<i64, bool>,
+    selection_reasons: &HashMap<i64, String>,
+    support_limit: usize,
+) -> ArtifactHandle {
+    let support_count = artifact.supports.len();
+    artifact.supports.truncate(support_limit);
+    ArtifactHandle {
+        id: artifact.id,
+        artifact_type: artifact.artifact_type,
+        name: artifact.name,
+        current: current.get(&artifact.id).copied().unwrap_or(false),
+        confidence: artifact.confidence,
+        freshness: artifact.freshness,
+        support_count,
+        supports_truncated: support_count > artifact.supports.len(),
+        supports: artifact
+            .supports
+            .into_iter()
+            .map(|support| ArtifactSupportHandle {
+                anchor: support.anchor,
+                file: support.evidence_file,
+                lines: [support.evidence_start_line, support.evidence_end_line],
+                freshness: support.freshness,
+            })
+            .collect(),
+        selection_reason: selection_reasons
+            .get(&artifact.id)
+            .cloned()
+            .unwrap_or_else(|| "recent".into()),
+        retrieval_score: artifact.retrieval_score,
+        followup: ArtifactFollowup {
+            tool: "semantic_memory",
+            arguments: ArtifactFollowupArguments {
+                artifact: artifact.id,
+            },
+        },
     }
 }
 
@@ -1058,6 +1398,24 @@ fn apply_response_budget(result: &mut QueryResult) -> Result<()> {
     while result.response_budget.rendered_bytes > byte_limit {
         result.response_budget.truncated = true;
         let rendered = result.response_budget.rendered_bytes;
+        if let Some(handle) = result
+            .artifact_handles
+            .iter_mut()
+            .rev()
+            .find(|handle| !handle.supports.is_empty())
+        {
+            handle.supports.pop();
+            handle.supports_truncated = true;
+            result.response_budget.omitted_supports += 1;
+            settle_rendered_bytes(result)?;
+            continue;
+        }
+        if result.artifact_handles.len() > 1 {
+            result.artifact_handles.pop();
+            result.response_budget.omitted_artifacts += 1;
+            settle_rendered_bytes(result)?;
+            continue;
+        }
         if result.concept_tags.pop().is_some() {
             result.response_budget.omitted_concept_tags += 1;
             settle_rendered_bytes(result)?;
@@ -1278,18 +1636,31 @@ mod tests {
             &QueryOptions {
                 query: "settlement".into(),
                 artifact_types: vec!["card".into()],
-                include_source: true,
                 ..Default::default()
             },
         )?;
         assert_eq!(result.candidate_artifacts, 1);
-        assert_eq!(result.semantic_artifacts[0].id, card.id);
-        assert!(result.semantic_artifacts[0].current);
-        assert_eq!(result.semantic_artifacts[0].freshness, "fresh");
-        assert_eq!(result.source_evidence.len(), 1);
-        assert_eq!(result.source_evidence[0].source_status, "current-source");
+        assert_eq!(result.mode, "discovery");
+        assert_eq!(result.artifact_handles[0].id, card.id);
+        assert!(result.artifact_handles[0].current);
+        assert_eq!(result.artifact_handles[0].freshness, "fresh");
+        assert!(result.semantic_artifacts.is_empty());
+        assert!(result.source_evidence.is_empty());
+        let detail = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                include_source: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(detail.mode, "artifact_detail");
+        assert_eq!(detail.semantic_artifacts[0].id, card.id);
+        assert_eq!(detail.source_evidence[0].source_status, "current-source");
         assert!(
-            result.source_evidence[0]
+            detail.source_evidence[0]
                 .source
                 .as_deref()
                 .is_some_and(|source| source.contains("function start"))
@@ -1320,6 +1691,161 @@ mod tests {
         assert_eq!(stale.source_evidence[0].support_freshness, "source-stale");
         assert_eq!(stale.source_evidence[0].source_status, "source-stale");
         assert!(stale.source_evidence[0].source.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn localized_memory_never_backfills_unsupported_semantic_analogs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("target.ts"),
+            "export function targetRootLayout() { return 1; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("cms.ts"),
+            "export function cmsExample() { return 2; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("blind.ts"),
+            "export function blindSpot() { return 3; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let target =
+            crate::structural::resolve_current_anchor(&conn, "target.ts:targetRootLayout")?;
+        let cms = crate::structural::resolve_current_anchor(&conn, "cms.ts:cmsExample")?;
+        let blind = crate::structural::resolve_current_anchor(&conn, "blind.ts:blindSpot")?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let publish =
+            |_name: &str, body: serde_json::Value, anchor: &str, file: &str| -> Result<i64> {
+                Ok(semantic::annotate(
+                    repo.path(),
+                    &conn,
+                    &semantic::AnnotateInput {
+                        artifact_type: "card".into(),
+                        name: Some(anchor.into()),
+                        body,
+                        supports: vec![semantic::SupportInput {
+                            claim_path: "/purpose".into(),
+                            anchor: anchor.into(),
+                            role: None,
+                            evidence_file: file.into(),
+                            evidence_start_line: 1,
+                            evidence_end_line: 1,
+                            confidence: "likely".into(),
+                        }],
+                        confidence: "likely".into(),
+                        snapshot: snapshot.clone(),
+                        supersedes: None,
+                    },
+                )?
+                .id)
+            };
+        let target_card = publish(
+            "target card",
+            json!({"purpose": "builds route parameters"}),
+            &target,
+            "target.ts",
+        )?;
+        publish(
+            "CMS root layout example",
+            json!({"purpose": "createRouteTypesManifest root layout parameter generation"}),
+            &cms,
+            "cms.ts",
+        )?;
+
+        let anchored = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                query: "createRouteTypesManifest root layout parameter generation".into(),
+                anchor: Some(target.clone()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(anchored.status, "results");
+        assert_eq!(anchored.candidate_artifacts, 1);
+        assert_eq!(anchored.artifact_handles[0].id, target_card);
+        assert_eq!(
+            anchored.artifact_handles[0].selection_reason,
+            "exact_anchor_support"
+        );
+        assert_eq!(
+            anchored.artifact_handles[0].followup.arguments.artifact,
+            target_card
+        );
+        let rendered = serde_json::to_value(&anchored)?;
+        assert!(rendered["artifact_handles"][0].get("body").is_none());
+        assert_eq!(rendered["semantic_artifacts"], json!([]));
+
+        let tiered = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                anchor: Some(target.clone()),
+                file: Some("cms.ts".into()),
+                limit: 2,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(tiered.artifact_handles.len(), 2);
+        assert_eq!(tiered.artifact_handles[0].id, target_card);
+        assert_eq!(
+            tiered.artifact_handles[0].selection_reason,
+            "exact_anchor_support"
+        );
+        assert_eq!(
+            tiered.artifact_handles[1].selection_reason,
+            "exact_file_support"
+        );
+
+        let detail = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(target_card),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            detail.semantic_artifacts[0].body["purpose"],
+            "builds route parameters"
+        );
+        assert!(detail.artifact_handles.is_empty());
+
+        let file_scoped = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                query: "CMS root layout".into(),
+                file: Some("target.ts".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(file_scoped.artifact_handles[0].id, target_card);
+        assert_eq!(
+            file_scoped.artifact_handles[0].selection_reason,
+            "exact_file_support"
+        );
+
+        let unsupported = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                query: "root layout".into(),
+                anchor: Some(blind),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(unsupported.status, "no_supported_memory");
+        assert_eq!(unsupported.candidate_artifacts, 0);
+        assert!(unsupported.artifact_handles.is_empty());
+        assert!(unsupported.semantic_artifacts.is_empty());
         Ok(())
     }
 
@@ -1710,10 +2236,10 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result.semantic_artifacts.len(), 1);
-        assert_eq!(result.semantic_artifacts[0].id, concept.id);
+        assert_eq!(result.artifact_handles.len(), 1);
+        assert_eq!(result.artifact_handles[0].id, concept.id);
         assert_eq!(
-            result.semantic_artifacts[0]
+            result.artifact_handles[0]
                 .retrieval_score
                 .as_ref()
                 .expect("retrieval score")
@@ -1756,9 +2282,9 @@ mod tests {
             },
         )?;
         assert_eq!(result.candidate_artifacts, 1);
-        assert_eq!(result.semantic_artifacts[0].id, expected.id);
+        assert_eq!(result.artifact_handles[0].id, expected.id);
         assert_eq!(
-            result.semantic_artifacts[0]
+            result.artifact_handles[0]
                 .retrieval_score
                 .as_ref()
                 .expect("retrieval score")
@@ -1852,9 +2378,20 @@ mod tests {
             },
         )?;
         assert_eq!(result.candidate_artifacts, 2);
-        assert!(!result.concept_tags.is_empty());
+        assert_eq!(result.artifact_handles.len(), 2);
+        assert!(result.concept_tags.is_empty());
+        let detail = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(current.id),
+                ..Default::default()
+            },
+        )?;
+        assert!(!detail.concept_tags.is_empty());
         assert!(
-            result
+            detail
                 .concept_tags
                 .iter()
                 .all(|tag| tag.concept_artifact_id == current.id)

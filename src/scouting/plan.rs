@@ -2,11 +2,11 @@
 //! scouting kinds. Planning never starts the gateway and never makes a model
 //! call.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -15,7 +15,7 @@ use super::concept::{self, ConceptSource, ConceptSourceAlias, SourceSupport};
 use super::evidence::{self, EvidencePack};
 use super::summary::{self};
 use crate::semantic::{self, WorkflowCandidateOptions, WorkflowCandidateSet};
-use crate::{origin, store, structural};
+use crate::{origin, recon, store, structural};
 
 const AUTO_SEED_LIMIT: usize = 256;
 /// Automatic card selection is capped so a large repository reports a visibly
@@ -165,6 +165,9 @@ pub struct CardPlanItem {
     pub anchor: String,
     pub display_name: String,
     pub file: String,
+    /// Deterministic coverage bucket used for automatic allocation and batch
+    /// accounting. It never changes artifact identity or confidence.
+    pub selection_scope: String,
     pub sources: Vec<String>,
     pub declaration_start_line: i64,
     pub declaration_end_line: i64,
@@ -195,6 +198,22 @@ pub struct CardPlanSkip {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct CardScopeCoverage {
+    pub discovered: usize,
+    pub selected: usize,
+    pub omitted: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CardSelectors {
+    pub anchors: Vec<String>,
+    pub files: Vec<String>,
+    pub reconnaissance_subjects: Vec<String>,
+}
+
+type ScopedCardSubject = (String, Vec<String>, String);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CardPlan {
     pub mode: String,
@@ -211,6 +230,10 @@ pub struct CardPlan {
     /// Automatic mode: selection sources of every discovered subject, so a
     /// capped plan also shows which sources it left out.
     pub discovered_sources: BTreeMap<String, usize>,
+    /// Selection accounting by current reconnaissance or deterministic
+    /// structural scope. Counts reconcile with `anchors_discovered` and the
+    /// selected item count before unscoutable symbols are removed.
+    pub scope_coverage: BTreeMap<String, CardScopeCoverage>,
 }
 
 /// Build exact card subjects and their bounded evidence. Explicit anchors are
@@ -218,9 +241,30 @@ pub struct CardPlan {
 /// selects exported symbols, runtime boundary endpoints, and participants of
 /// current published workflows.
 pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Result<CardPlan> {
+    cards_with_selectors(
+        root,
+        conn,
+        &CardSelectors {
+            anchors: explicit_anchors.to_vec(),
+            ..CardSelectors::default()
+        },
+    )
+}
+
+/// Build card subjects from automatic coverage or the exact union of supplied
+/// anchors, indexed files, and current reconnaissance subjects. Targeted
+/// selectors never widen to repository-wide discovery when they resolve to no
+/// eligible symbol.
+pub fn cards_with_selectors(
+    root: &Path,
+    conn: &Connection,
+    selectors: &CardSelectors,
+) -> Result<CardPlan> {
     store::with_read_snapshot(conn, "jscout_card_plan", || {
         let mut discovered_sources: BTreeMap<String, usize> = BTreeMap::new();
-        let (mode, selected, limit_reached, discovered_count) = if explicit_anchors.is_empty() {
+        let targeted = !selectors.files.is_empty() || !selectors.reconnaissance_subjects.is_empty();
+        let automatic = selectors.anchors.is_empty() && !targeted;
+        let (mode, selected, limit_reached, discovered_count, mut scope_coverage) = if automatic {
             let discovered = automatic_card_subjects(conn)?;
             let discovered_count = discovered.len();
             for (_, sources) in &discovered {
@@ -228,25 +272,62 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
                     *discovered_sources.entry(source.clone()).or_insert(0) += 1;
                 }
             }
+            let scoped = attach_card_selection_scopes(conn, discovered)?;
+            let (selected, coverage) = stratify_card_subjects(scoped, CARD_LIMIT);
             (
                 "automatic",
-                discovered.into_iter().take(CARD_LIMIT).collect::<Vec<_>>(),
+                selected,
                 discovered_count > CARD_LIMIT,
                 Some(discovered_count),
+                coverage,
+            )
+        } else if targeted {
+            let discovered = targeted_card_subjects(conn, selectors)?;
+            let discovered_count = discovered.len();
+            for (_, sources, _) in &discovered {
+                for source in sources {
+                    *discovered_sources.entry(source.clone()).or_insert(0) += 1;
+                }
+            }
+            let (selected, coverage) = stratify_card_subjects(discovered, CARD_LIMIT);
+            (
+                "targeted",
+                selected,
+                discovered_count > CARD_LIMIT,
+                Some(discovered_count),
+                coverage,
             )
         } else {
-            let mut resolved = explicit_anchors
+            let mut resolved = selectors
+                .anchors
                 .iter()
                 .map(|anchor| {
                     structural::resolve_current_anchor_in_origins(conn, anchor, &origin::defaults())
-                        .map(|resolved| (resolved, vec!["agent-supplied".to_string()]))
+                        .map(|resolved| {
+                            (
+                                resolved.clone(),
+                                vec!["agent-supplied".to_string()],
+                                format!("anchor:{resolved}"),
+                            )
+                        })
                 })
                 .collect::<Result<Vec<_>>>()?;
             resolved.sort();
             resolved.dedup_by(|left, right| left.0 == right.0);
-            ("explicit", resolved, false, None)
+            let mut coverage = BTreeMap::new();
+            for (_, _, scope) in &resolved {
+                coverage.insert(
+                    scope.clone(),
+                    CardScopeCoverage {
+                        discovered: 1,
+                        selected: 1,
+                        omitted: 0,
+                    },
+                );
+            }
+            ("explicit", resolved, false, None, coverage)
         };
-        if selected.is_empty() {
+        if selected.is_empty() && mode != "targeted" {
             bail!("no deterministic card subjects were found; pass --anchor with a symbol anchor");
         }
 
@@ -254,7 +335,7 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
         let mut items = Vec::new();
         let mut skipped = Vec::new();
         let mut sources = BTreeMap::new();
-        for (anchor, anchor_sources) in selected {
+        for (anchor, anchor_sources, selection_scope) in selected {
             let Some(subject) = semantic::symbol_candidate(root, conn, &anchor)? else {
                 if mode == "explicit" {
                     bail!(
@@ -266,6 +347,10 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
                     anchor,
                     reason: "not a file-backed symbol in the current snapshot".into(),
                 });
+                if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
+                    coverage.selected = coverage.selected.saturating_sub(1);
+                    coverage.omitted += 1;
+                }
                 continue;
             };
             let mut evidence =
@@ -279,6 +364,7 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
                 anchor,
                 display_name: subject.display_name,
                 file: subject.file,
+                selection_scope,
                 sources: anchor_sources,
                 declaration_start_line: subject.evidence_start_line,
                 declaration_end_line: subject.evidence_end_line,
@@ -299,8 +385,168 @@ pub fn cards(root: &Path, conn: &Connection, explicit_anchors: &[String]) -> Res
             anchors_discovered: discovered_count,
             sources,
             discovered_sources,
+            scope_coverage,
         })
     })
+}
+
+fn attach_card_selection_scopes(
+    conn: &Connection,
+    subjects: Vec<(String, Vec<String>)>,
+) -> Result<Vec<ScopedCardSubject>> {
+    let neutral_memberships = recon::current_scope_memberships(conn)?;
+    let mut scope_statement = conn.prepare_cached(
+        "SELECT node.file_id, file.path, file.origin, policy.subject_key
+         FROM graph_nodes node
+         JOIN files file ON file.id=node.file_id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
+         WHERE node.node_key=?1",
+    )?;
+    let mut scoped = Vec::with_capacity(subjects.len());
+    for (anchor, sources) in subjects {
+        let (file_id, path, file_origin, policy_subject) =
+            scope_statement.query_row([&anchor], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+        let scope = policy_subject
+            .or_else(|| neutral_memberships.get(&file_id).cloned())
+            .unwrap_or_else(|| structural_card_scope(&file_origin, &path));
+        scoped.push((anchor, sources, scope));
+    }
+    Ok(scoped)
+}
+
+fn structural_card_scope(file_origin: &str, path: &str) -> String {
+    let area = path
+        .split_once('/')
+        .map(|(area, _)| area)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("(root)");
+    format!("structural:{file_origin}:{area}")
+}
+
+fn stratify_card_subjects(
+    subjects: Vec<ScopedCardSubject>,
+    limit: usize,
+) -> (Vec<ScopedCardSubject>, BTreeMap<String, CardScopeCoverage>) {
+    let mut queues = BTreeMap::<String, VecDeque<ScopedCardSubject>>::new();
+    let mut scope_order = Vec::new();
+    let mut coverage = BTreeMap::<String, CardScopeCoverage>::new();
+    for subject in subjects {
+        let scope = subject.2.clone();
+        if !queues.contains_key(&scope) {
+            scope_order.push(scope.clone());
+        }
+        queues.entry(scope.clone()).or_default().push_back(subject);
+        coverage.entry(scope).or_default().discovered += 1;
+    }
+    let mut selected = Vec::new();
+    while selected.len() < limit {
+        let mut admitted = false;
+        for scope in &scope_order {
+            if selected.len() == limit {
+                break;
+            }
+            let Some(subject) = queues.get_mut(scope).and_then(VecDeque::pop_front) else {
+                continue;
+            };
+            selected.push(subject);
+            coverage.get_mut(scope).expect("scope was counted").selected += 1;
+            admitted = true;
+        }
+        if !admitted {
+            break;
+        }
+    }
+    for value in coverage.values_mut() {
+        value.omitted = value.discovered.saturating_sub(value.selected);
+    }
+    (selected, coverage)
+}
+
+fn targeted_card_subjects(
+    conn: &Connection,
+    selectors: &CardSelectors,
+) -> Result<Vec<ScopedCardSubject>> {
+    let mut subjects = BTreeMap::<String, (BTreeSet<String>, String)>::new();
+    for anchor in &selectors.anchors {
+        let resolved =
+            structural::resolve_current_anchor_in_origins(conn, anchor, &origin::defaults())?;
+        subjects
+            .entry(resolved.clone())
+            .or_insert_with(|| (BTreeSet::new(), format!("anchor:{resolved}")))
+            .0
+            .insert("target:anchor".into());
+    }
+
+    let mut target_files = BTreeMap::<String, (String, String)>::new();
+    for file in &selectors.files {
+        let file = file.strip_prefix("./").unwrap_or(file);
+        let exists = conn
+            .query_row(
+                "SELECT origin FROM files WHERE path=?1 AND origin IN ('repository','workspace')",
+                [file],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            bail!("target card file `{file}` is not an indexed repository/workspace file");
+        }
+        target_files.insert(
+            file.to_string(),
+            (format!("target:file:{file}"), format!("file:{file}")),
+        );
+    }
+    for subject_key in &selectors.reconnaissance_subjects {
+        for member in recon::current_subject_members(conn, subject_key)? {
+            target_files
+                .entry(member.path)
+                .or_insert_with(|| (format!("target:subject:{subject_key}"), subject_key.clone()));
+        }
+    }
+
+    let mut symbols = conn.prepare_cached(
+        "SELECT node.node_key
+         FROM graph_nodes node
+         JOIN symbols symbol ON symbol.id=node.native_id AND node.native_table='symbols'
+         JOIN files file ON file.id=node.file_id
+         WHERE node.node_kind='symbol' AND file.path=?1
+           AND file.origin IN ('repository','workspace')
+         ORDER BY symbol.exported DESC,
+                  CASE WHEN symbol.scope_chain='' THEN 0 ELSE 1 END,
+                  symbol.line, node.node_key",
+    )?;
+    for (file, (source, scope)) in target_files {
+        let rows = symbols.query_map([&file], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let anchor = row?;
+            let entry = subjects
+                .entry(anchor)
+                .or_insert_with(|| (BTreeSet::new(), scope.clone()));
+            entry.0.insert(source.clone());
+        }
+    }
+
+    let weights = incoming_reference_weights(conn)?;
+    let mut subjects = subjects
+        .into_iter()
+        .map(|(anchor, (sources, scope))| (anchor, sources.into_iter().collect::<Vec<_>>(), scope))
+        .collect::<Vec<_>>();
+    subjects.sort_by(|left, right| {
+        weights
+            .get(&right.0)
+            .copied()
+            .unwrap_or(0.0)
+            .total_cmp(&weights.get(&left.0).copied().unwrap_or(0.0))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(subjects)
 }
 
 /// One concept prompt may cite at most this many current child artifacts. A
@@ -2232,6 +2478,160 @@ mod tests {
             "a capped plan still reports everything discovery found"
         );
         assert_eq!(plan.sources["exported-symbol"], super::CARD_LIMIT);
+        assert_eq!(
+            plan.scope_coverage
+                .values()
+                .map(|coverage| coverage.discovered)
+                .sum::<usize>(),
+            discovered
+        );
+        assert_eq!(
+            plan.scope_coverage
+                .values()
+                .map(|coverage| coverage.omitted)
+                .sum::<usize>(),
+            discovered - super::CARD_LIMIT
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn card_scope_allocation_covers_scopes_before_repeating_one() {
+        let subjects = vec![
+            (
+                "a1".into(),
+                vec!["exported-symbol".into()],
+                "scope-a".into(),
+            ),
+            (
+                "a2".into(),
+                vec!["exported-symbol".into()],
+                "scope-a".into(),
+            ),
+            (
+                "a3".into(),
+                vec!["exported-symbol".into()],
+                "scope-a".into(),
+            ),
+            (
+                "b1".into(),
+                vec!["exported-symbol".into()],
+                "scope-b".into(),
+            ),
+            (
+                "b2".into(),
+                vec!["exported-symbol".into()],
+                "scope-b".into(),
+            ),
+        ];
+        let (selected, coverage) = super::stratify_card_subjects(subjects, 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(anchor, _, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            ["a1", "b1", "a2"]
+        );
+        assert_eq!(coverage["scope-a"].selected, 2);
+        assert_eq!(coverage["scope-a"].omitted, 1);
+        assert_eq!(coverage["scope-b"].selected, 1);
+        assert_eq!(coverage["scope-b"].omitted, 1);
+    }
+
+    #[test]
+    fn targeted_card_files_and_recon_subjects_never_widen() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir_all(repo.path().join("apps/target"))?;
+        std::fs::write(
+            repo.path().join("apps/target/index.ts"),
+            "export function targetEntry() { return targetHelper(); }\n\
+             function targetHelper() { return 1; }\n",
+        )?;
+        std::fs::write(
+            repo.path().join("unrelated.ts"),
+            "export function unrelated() { return 2; }\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let file_plan = super::cards_with_selectors(
+            repo.path(),
+            &conn,
+            &super::CardSelectors {
+                files: vec!["apps/target/index.ts".into()],
+                ..super::CardSelectors::default()
+            },
+        )?;
+        assert_eq!(file_plan.mode, "targeted");
+        assert_eq!(file_plan.items.len(), 2);
+        assert!(
+            file_plan
+                .items
+                .iter()
+                .all(|item| item.file == "apps/target/index.ts"
+                    && item.selection_scope == "file:apps/target/index.ts")
+        );
+
+        conn.execute(
+            "INSERT INTO scout_runs(
+               scout_kind,status,gateway_protocol,provider,model,billing_path,
+               prompt_version,source_snapshot,input_fingerprint,request_hash,
+               config_json,started_at,completed_at
+             ) VALUES('repository','completed',1,'test','test','custom','test/v1',
+                      'snapshot','target-scope','target-scope','{}','now','now')",
+            [],
+        )?;
+        let run_id = conn.last_insert_rowid();
+        let selector = crate::recon::SubjectSelector::RepositoryArea {
+            scope: "apps/target".into(),
+            direct_only: false,
+        };
+        let state = crate::recon::build_scope_state(
+            repo.path(),
+            &conn,
+            "area:repository:apps/target".into(),
+            selector.clone(),
+        )?;
+        crate::recon::persist_classification(
+            &conn,
+            &crate::recon::NewClassification {
+                run_id,
+                subject_key: "area:repository:apps/target",
+                subject_kind: "area",
+                selector: &selector,
+                parent_subject_key: None,
+                depth: 1,
+                role: "runtime",
+                confidence: "likely",
+                explanation: "target runtime area",
+                citations_json: "[\"E001\"]",
+                cited_evidence_json: "[]",
+                evidence_fingerprint: &state.evidence_fingerprint,
+                classification_fingerprint: "target-classification",
+                source_snapshot: "snapshot",
+            },
+        )?;
+        crate::recon::reconcile_file_policy(repo.path(), &conn)?;
+
+        let subject_plan = super::cards_with_selectors(
+            repo.path(),
+            &conn,
+            &super::CardSelectors {
+                reconnaissance_subjects: vec!["area:repository:apps/target".into()],
+                ..super::CardSelectors::default()
+            },
+        )?;
+        assert_eq!(subject_plan.items.len(), 2);
+        assert!(subject_plan.items.iter().all(|item| {
+            item.file == "apps/target/index.ts"
+                && item.selection_scope == "area:repository:apps/target"
+        }));
+        assert!(
+            subject_plan
+                .items
+                .iter()
+                .all(|item| !item.anchor.contains("unrelated"))
+        );
         Ok(())
     }
 

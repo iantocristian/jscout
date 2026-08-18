@@ -656,6 +656,109 @@ pub fn is_auxiliary(role: &str) -> bool {
     matches!(role, "tooling" | "documentation" | "test" | "generated")
 }
 
+/// Resolve one exact current reconnaissance subject to its current indexed
+/// members. Only classifications admitted to the disposable current
+/// projection are targetable; stale durable history must not silently widen a
+/// targeted scout or semantic-memory query.
+pub fn current_subject_members(conn: &Connection, subject_key: &str) -> Result<Vec<MemberFile>> {
+    let selector_json = conn
+        .query_row(
+            "SELECT classification.selector_json
+             FROM repository_current_classifications current
+             JOIN repository_classifications classification
+               ON classification.id=current.classification_id
+             WHERE current.subject_key=?1",
+            [subject_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .with_context(|| {
+            format!(
+                "reconnaissance subject `{subject_key}` is not current; run `jscout overview` to list current subject keys"
+            )
+        })?;
+    let selector: SubjectSelector = serde_json::from_str(&selector_json).with_context(|| {
+        format!("current reconnaissance subject `{subject_key}` has invalid selector JSON")
+    })?;
+    members_for_selector(conn, &selector)
+}
+
+/// Most-specific current reconnaissance scope for each indexed member. This
+/// includes neutral mixed/unknown classifications that intentionally do not
+/// enter `repository_file_policy`, allowing coverage accounting without
+/// turning those classifications into hard retrieval policy.
+pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, String>> {
+    let mut statement = conn.prepare(
+        "SELECT current.subject_key, current.depth, classification.selector_json
+         FROM repository_current_classifications current
+         JOIN repository_classifications classification
+           ON classification.id=current.classification_id
+         ORDER BY current.depth DESC, current.subject_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut selectors = Vec::new();
+    for row in rows {
+        let (subject_key, _, selector_json) = row?;
+        let selector: SubjectSelector =
+            serde_json::from_str(&selector_json).with_context(|| {
+                format!("current reconnaissance subject `{subject_key}` has invalid selector JSON")
+            })?;
+        selectors.push((subject_key, selector));
+    }
+
+    // Scope matching is a literal-prefix operation. Scan file identity once
+    // instead of materializing every file once per current subject.
+    let mut files = conn.prepare(
+        "SELECT file.id, file.path, file.origin, package.origin, package.locator
+         FROM files file
+         LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         ORDER BY file.id",
+    )?;
+    let rows = files.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut memberships = BTreeMap::new();
+    for row in rows {
+        let (file_id, path, file_origin, package_origin, package_locator) = row?;
+        let subject = selectors.iter().find_map(|(subject_key, selector)| {
+            let matches = match selector {
+                SubjectSelector::RepositoryArea { scope, direct_only } => {
+                    file_origin == "repository"
+                        && package_origin.is_none()
+                        && path_in_scope(&path, scope, *direct_only)
+                }
+                SubjectSelector::WorkspaceArea {
+                    package_root,
+                    scope,
+                    direct_only,
+                } => {
+                    package_origin.as_deref() == Some("workspace")
+                        && package_locator.as_deref() == Some(package_root.as_str())
+                        && path_in_scope(&path, scope, *direct_only)
+                }
+                SubjectSelector::Project { .. } => false,
+            };
+            matches.then_some(subject_key)
+        });
+        if let Some(subject) = subject {
+            memberships.insert(file_id, subject.clone());
+        }
+    }
+    Ok(memberships)
+}
+
 fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result<Vec<MemberFile>> {
     let mut members = Vec::new();
     match selector {

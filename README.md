@@ -120,11 +120,10 @@ jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
 jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
                                #   semantic_memory, exact evidence, and annotate tools
-jscout memory <root> [query]   # bounded semantic artifacts, relations, and freshness
-  --anchor EXACT_ANCHOR --source
-                               #   code-to-memory join + hash-verified source drill-down
+jscout memory <root> [query]   # compact semantic handles and freshness
+  --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
 jscout memory <root> --artifact ID --source
-                               #   inspect a current or historical artifact exactly
+                               #   full body/relations + optional hash-verified source
 jscout annotate <root> in.json # write a validated semantic artifact
 jscout llm doctor              # verify Node, pi-ai, plan auth, and default model capabilities
 jscout scout workflows R       # auto-select deterministic workflow entry surfaces
@@ -132,7 +131,7 @@ jscout scout workflows R       # auto-select deterministic workflow entry surfac
 jscout scout workflows R       # classify one agent-supplied workflow boundary
   --seed ANCHOR                #   repeat --seed to define one multi-seed boundary
 jscout scout cards R           # evidence-backed cards for selected symbols
-  --max-calls N                #   --anchor SPEC selects subjects explicitly (repeatable)
+  --max-calls N                #   --anchor/--file/--subject target exact surfaces
 jscout scout summaries R       # bottom-up file/module/repository summaries over artifacts
   --max-calls N                #   --level file|module|repository, --scope KEY (repeatable)
 jscout scout concepts R        # concepts from exact workflow-name/card-domain-term vocabulary
@@ -493,20 +492,25 @@ counts, and evidence bytes without starting Node or contacting a model.
 `jscout scout cards` writes one evidence-backed card per selected symbol.
 Without `--anchor`, subjects are the union of exported production symbols,
 runtime boundary endpoints, and participants of current published workflows,
-deduped by anchor and capped at 1024 with the discovered count and the
-per-source breakdown of everything discovery found reported.
+deduped by anchor and capped at 1024. Selection is allocated round-robin across
+current reconnaissance scopes (or deterministic top-level structural scopes)
+before repeating a scope. The plan reports discovered, selected, and omitted
+subjects per scope so the cap cannot be mistaken for repository coverage.
 `--anchor` selects subjects explicitly — each resolves uniquely to a symbol,
-like a workflow seed, and each becomes its own run; automatic mode requires
-`--max-calls`, explicit mode defaults it to the number of anchors. Evidence is
-the subject's declaring file plus its deterministic depth-1 edges, which the
-prompt forbids restating: a card carries purpose, architectural role, domain
-terms, side effects, invariants, and failure modes, never signatures or call
-lists. Every individual claim cites its own line ranges in that file and is
-published as its own support at `likely` confidence; an optional field the
+like a workflow seed, and each becomes its own run. Repeatable `--file` and
+`--subject` selectors target symbols only inside an exact indexed file or one
+current `repository_overview` reconnaissance subject; they never widen when
+the selected surface has no eligible symbol. Automatic and file/subject modes
+require `--max-calls`; anchor-only mode defaults it to the number of anchors.
+Evidence is the subject's declaring file plus its deterministic depth-1 edges,
+which the prompt forbids restating: a card carries purpose, architectural role,
+domain terms, side effects, invariants, and failure modes, never signatures or
+call lists. Every individual claim cites its own line ranges in that file and
+is published as its own support at `likely` confidence; an optional field the
 model cannot support is omitted rather than guessed, and a claim without exact
 evidence fails the run instead of downgrading it. `--dry-run` prints the
-selected subjects, evidence bytes, per-item request bytes, and budget
-decisions without starting Node or contacting a model.
+selected subjects, evidence bytes, per-item request bytes, and budget decisions
+without starting Node or contacting a model.
 
 `jscout scout summaries` writes one summary per scope, strictly bottom-up over
 already-validated artifacts and never over raw source. Levels are `file`
@@ -592,10 +596,17 @@ materialized semantic index, retrieval reports `vector: degraded` and falls
 back to lexical matching. `--no-vector` (MCP: `vector=false`) requests lexical
 matching explicitly.
 
-Memory retrieval filters by artifact type, computed freshness, exact evidence
-anchor, direct relation, or historical artifact id. Current artifacts are the
-default; an exact historical id reports `current: false` and its
-`superseded_by` successor.
+Memory discovery filters by artifact type, computed freshness, direct relation,
+or historical artifact id. Broad calls return compact handles with bounded
+support summaries and a copy-safe exact-artifact follow-up. Supplying an exact
+anchor, indexed file, or current reconnaissance subject creates a hard evidence
+scope: direct anchor support ranks before file support and scope-member support,
+and unsupported lexical/vector analogies are not used as filler. An empty
+localized result reports `no_supported_memory`. Full bodies, relations, concept
+tags, and source evidence are returned only for an exact artifact-id drill-down.
+Current artifacts are the default; an exact historical id reports
+`current: false` and its `superseded_by` successor. The default complete response
+budget remains 24 KB.
 
 `semantic_search` attaches only compact, evidence-connected memory previews:
 artifact identity, a short purpose/overview/description/claim, freshness,

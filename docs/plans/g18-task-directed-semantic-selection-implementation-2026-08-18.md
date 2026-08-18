@@ -74,7 +74,7 @@ Preserve the existing exact-anchor behavior: resolve the current anchor and buil
 
 ### File selector
 
-The path must resolve to one indexed repository or selected-dependency file. Select bounded card-worthy symbols in that exact file using the existing subject eligibility rules and deterministic priority. If the file contains no eligible symbol, return an explicit empty selection rather than widening to neighboring files.
+The path must resolve to one indexed repository or workspace file. Select file-backed symbols in that exact file, order them deterministically by structural weight and symbol position, and apply the normal subject limit. Dependency-card targeting remains outside this change because card scouting has no origin selector and dependency code is default-invisible. If the file contains no symbol, return an explicit empty selection rather than widening to neighboring files.
 
 ### Reconnaissance subject selector
 
@@ -89,7 +89,7 @@ Targeted generation is bounded by:
 - the command call budget;
 - deterministic selector membership.
 
-No target selector implicitly increases any bound. Dry-run remains available and must show reuse versus new-call decisions before model execution.
+No target selector implicitly increases any bound. Dry-run remains available and shows deterministic selection, context admission, and call-slot admission. Exact reuse remains an execution-time decision because the reusable fingerprint includes gateway-resolved model and endpoint capabilities.
 
 ## Part C: support-aware direct semantic retrieval
 
@@ -199,7 +199,8 @@ The first implementation should not require a database migration. It derives sco
 - reconnaissance subject selects only current member files;
 - combined selectors deduplicate subjects;
 - missing file/subject returns an error and never widens globally;
-- dry-run accurately distinguishes reusable subjects from calls;
+- dry-run accurately reports selection, context admission, and provisional call-slot admission;
+- completed matching runs are reused at execution without consuming call slots;
 - call and subject limits still terminate deterministically.
 
 ### Semantic selection
@@ -238,7 +239,7 @@ Commits should keep scouting coverage, targeted generation, support-aware retrie
 
 ## Failure handling and rollback
 
-Scouting selection is stateless until the existing run ledger claims work. Dry-run must therefore expose the entire decision before calls begin. A targeted selector resolution failure aborts before any model call. Per-subject remote timeouts keep current subject-local failure behavior; gateway protocol or publication invalidation remains batch-fatal.
+Scouting selection is stateless until the existing run ledger claims work. Dry-run must expose every decision that can be made without resolving the gateway fingerprint; it labels call admission as provisional and states that execution-time reuse can release slots for later subjects. A targeted selector resolution failure aborts before any model call. Per-subject remote timeouts keep current subject-local failure behavior; gateway protocol or publication invalidation remains batch-fatal.
 
 Semantic selection is read-only apart from the repository’s pre-existing database-open behavior. The new compact discovery shape can be reverted independently of stored artifacts. Existing artifacts, supports, embeddings, and recon classifications require no rewrite.
 
