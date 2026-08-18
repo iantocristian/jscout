@@ -276,16 +276,16 @@ fn fts_query(q: &str) -> String {
 }
 
 fn exact_intent_tokens(query: &str) -> Vec<String> {
-    let trimmed = query.trim();
-    let single_identifier = is_identifier_token(trimmed);
-    let mut tokens = Vec::new();
-    let mut seen = HashSet::new();
-    for token in query
+    let raw_tokens = query
         .split(|character: char| {
             !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
         })
         .filter(|token| !token.is_empty())
-    {
+        .collect::<Vec<_>>();
+    let single_identifier = raw_tokens.len() == 1 && is_identifier_token(raw_tokens[0]);
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    for token in raw_tokens {
         if !is_identifier_token(token) || (!single_identifier && !is_code_shaped_identifier(token))
         {
             continue;
@@ -2148,6 +2148,8 @@ mod tests {
     #[test]
     fn exact_identifier_intent_does_not_promote_plain_prose() {
         assert_eq!(exact_intent_tokens("insert"), ["insert"]);
+        assert_eq!(exact_intent_tokens("insert()"), ["insert"]);
+        assert_eq!(exact_intent_tokens("`insert`"), ["insert"]);
         assert_eq!(
             exact_intent_tokens(
                 "find createRouteTypesManifest and NextTypesPlugin in root_layout files"
