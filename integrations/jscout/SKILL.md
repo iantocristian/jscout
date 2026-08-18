@@ -8,6 +8,11 @@ description: Use the jscout repository index to localize definitions, callers, w
 Use jscout as the primary localization interface for unfamiliar repository
 questions, then verify decisive claims in source.
 
+- Normally omit `origins`; the default includes both first-party origin
+  classes. In an explicit filter, `workspace` means files owned by monorepo or
+  workspace packages, while `repository` means root-level or otherwise
+  unowned first-party files. `repository` alone does not mean the whole repo.
+  Add `dependency` only when third-party internals are relevant.
 - On a cold repository, call `repository_overview` once. Keep its deterministic
   inventory separate from the optional untrusted `semantic_overlay`. Scope rows
   are compact by default; request one exact `reconnaissance_subject` with
@@ -68,7 +73,10 @@ questions, then verify decisive claims in source.
   graph context can contain irrelevant structural neighbors.
 - Treat `match: exact_definition` and `match: exact_occurrence` as deterministic
   search-intent tiers. `default_match: hybrid` applies to compact hits without
-  an explicit match field. Learned reranking cannot demote an exact tier.
+  an explicit match field. Learned reranking cannot demote an admitted exact
+  tier. Mixed natural-language queries admit one exact occurrence per parsed
+  identifier; query the learned identifier alone when you need its remaining
+  exact occurrences.
 - If jscout returns no relevant evidence, fall back to repository-local search.
 
 `semantic_search` can also attach a small persistent-memory section, but it

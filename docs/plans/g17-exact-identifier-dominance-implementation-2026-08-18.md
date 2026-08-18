@@ -20,7 +20,9 @@ Search results are partitioned into these tiers:
 2. `exact_occurrence`: a non-definition chunk whose indexed symbol inventory contains the identifier as a case-sensitive whole token;
 3. `hybrid`: the existing BM25/vector/RRF/reranker/repository-policy result.
 
-Tier order is absolute. Ranking may reorder candidates inside one tier but cannot move a lower-tier candidate above a higher-tier candidate. Existing origin filters and explicit role filters apply to every tier.
+Tier order is absolute for exact definitions and for the admitted exact-occurrence coverage set. Ranking may reorder candidates inside one tier but cannot move a lower-tier candidate above a higher-tier candidate. Existing origin filters and explicit role filters apply to every tier.
+
+A pure single-identifier query admits every bounded exact occurrence before hybrid results. A mixed natural-language query admits at most one exact occurrence per parsed identifier, then resumes hybrid ranking. This prevents a common incidental type name from consuming the complete result budget while preserving deterministic exact coverage and an incremental path: issue the learned identifier alone to request its remaining occurrences.
 
 For multiple identifiers, selection is coverage-first: one candidate for each resolvable identifier is emitted before a second candidate for any identifier, subject to the caller’s result limit. Same-named definitions remain separate candidates.
 
@@ -78,7 +80,7 @@ Exact retrieval shares one filter helper with hybrid retrieval:
 Build deterministic per-token queues for definitions and occurrences. Merge them in this order:
 
 1. round-robin over definition queues;
-2. round-robin over occurrence queues;
+2. round-robin over occurrence queues (all bounded occurrences for a pure identifier lookup, or one per identifier for a mixed query);
 3. append hybrid candidates not already emitted.
 
 Within a token’s definition queue, preserve a deterministic ordering by exact chunk-name preference, exported declaration preference, path, source position, and chunk ID. Within occurrences, use the existing hybrid order when the chunk is present there, followed by path/source order for exact-only candidates.
@@ -139,6 +141,7 @@ No schema migration is required because `symbols`, `chunks`, and `chunks_fts` al
 - same-name definitions remain distinct;
 - a chunk matching several tokens is emitted once with all reasons;
 - round-robin covers each token before repeated candidates.
+- mixed natural-language queries do not let one identifier's occurrences fill the result limit;
 
 ### Search integration tests
 

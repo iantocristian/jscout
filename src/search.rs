@@ -276,12 +276,7 @@ fn fts_query(q: &str) -> String {
 }
 
 fn exact_intent_tokens(query: &str) -> Vec<String> {
-    let raw_tokens = query
-        .split(|character: char| {
-            !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
-        })
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
+    let raw_tokens = identifier_tokens(query);
     let single_identifier = raw_tokens.len() == 1 && is_identifier_token(raw_tokens[0]);
     let mut tokens = Vec::new();
     let mut seen = HashSet::new();
@@ -295,6 +290,20 @@ fn exact_intent_tokens(query: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+fn identifier_tokens(query: &str) -> Vec<&str> {
+    query
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn is_single_identifier_intent(query: &str) -> bool {
+    let tokens = identifier_tokens(query);
+    tokens.len() == 1 && is_identifier_token(tokens[0])
 }
 
 fn is_identifier_token(value: &str) -> bool {
@@ -331,6 +340,15 @@ fn exact_intent_candidates(
     file_origins: &[String],
 ) -> Result<ExactIntentCandidates> {
     let identifiers = exact_intent_tokens(query);
+    // A pure identifier lookup is an explicit request for every exact usage.
+    // In a mixed natural-language query, one occurrence per identifier is
+    // enough to establish exact coverage; letting a common incidental type
+    // consume the whole result budget would hide the hybrid task matches.
+    let occurrence_limit = if is_single_identifier_intent(query) {
+        per_identifier_limit
+    } else {
+        1
+    };
     let mut definitions = Vec::with_capacity(identifiers.len());
     let mut occurrences = Vec::with_capacity(identifiers.len());
     for identifier in &identifiers {
@@ -342,7 +360,11 @@ fn exact_intent_candidates(
             file_origins,
         )?;
         let definition_set = definition_ids.iter().copied().collect::<HashSet<_>>();
-        let occurrence_ids = exact_occurrence_chunks(
+        // Fetch through the normal bounded per-identifier window before
+        // applying the mixed-query admission cap. A definition chunk can also
+        // contain an occurrence; limiting first could filter that one row and
+        // incorrectly hide the next non-definition occurrence.
+        let mut occurrence_ids = exact_occurrence_chunks(
             conn,
             identifier,
             per_identifier_limit,
@@ -351,7 +373,8 @@ fn exact_intent_candidates(
         )?
         .into_iter()
         .filter(|chunk_id| !definition_set.contains(chunk_id))
-        .collect();
+        .collect::<Vec<_>>();
+        occurrence_ids.truncate(occurrence_limit);
         definitions.push(definition_ids);
         occurrences.push(occurrence_ids);
     }
@@ -676,6 +699,24 @@ fn tiered_candidates(
     hybrid: &[(i64, f64)],
 ) -> Vec<RankedHitCandidate> {
     let hybrid_scores = hybrid.iter().copied().collect::<HashMap<_, _>>();
+    let hybrid_positions = hybrid
+        .iter()
+        .enumerate()
+        .map(|(position, (chunk_id, _))| (*chunk_id, position))
+        .collect::<HashMap<_, _>>();
+    let mut occurrences = exact.occurrences;
+    for per_identifier in &mut occurrences {
+        // Exact occurrences retain their absolute tier, but peers which also
+        // survived the hybrid pipeline use its reranker/repository-policy
+        // order. Stable sorting preserves the structural/path order for
+        // exact-only candidates outside the bounded hybrid pool.
+        per_identifier.sort_by_key(|chunk_id| {
+            hybrid_positions
+                .get(chunk_id)
+                .copied()
+                .map_or((1, usize::MAX), |position| (0, position))
+        });
+    }
     let mut ranked = Vec::<RankedHitCandidate>::new();
     let mut positions = HashMap::<i64, usize>::new();
 
@@ -691,7 +732,7 @@ fn tiered_candidates(
         &mut ranked,
         &mut positions,
         &exact.identifiers,
-        &exact.occurrences,
+        &occurrences,
         MatchReason::ExactOccurrence,
         &hybrid_scores,
     );
@@ -2313,15 +2354,15 @@ mod tests {
         let exact = super::ExactIntentCandidates {
             identifiers: vec!["firstThing".into(), "SecondThing".into()],
             definitions: vec![vec![1, 4], vec![2, 5]],
-            occurrences: vec![vec![6], vec![7]],
+            occurrences: vec![vec![6, 8], vec![7]],
         };
-        let ranked = tiered_candidates(exact, &[(9, 100.0), (7, 90.0), (2, -10.0)]);
+        let ranked = tiered_candidates(exact, &[(9, 100.0), (7, 90.0), (8, 80.0), (2, -10.0)]);
         assert_eq!(
             ranked
                 .iter()
                 .map(|candidate| candidate.chunk_id)
                 .collect::<Vec<_>>(),
-            [1, 2, 4, 5, 6, 7, 9]
+            [1, 2, 4, 5, 8, 7, 6, 9]
         );
         assert!(
             ranked[..4]
@@ -2329,11 +2370,11 @@ mod tests {
                 .all(|candidate| candidate.match_reason == MatchReason::ExactDefinition)
         );
         assert!(
-            ranked[4..6]
+            ranked[4..7]
                 .iter()
                 .all(|candidate| candidate.match_reason == MatchReason::ExactOccurrence)
         );
-        assert_eq!(ranked[6].match_reason, MatchReason::Hybrid);
+        assert_eq!(ranked[7].match_reason, MatchReason::Hybrid);
     }
 
     #[test]
@@ -2440,6 +2481,25 @@ mod tests {
         assert!(occurrence.hits.iter().any(|hit| {
             hit.file == "caller.ts" && hit.match_reason == MatchReason::ExactOccurrence
         }));
+
+        let mixed_intent = search(
+            &conn,
+            None,
+            "locate createRouteTypesManifest behavior",
+            &SearchOptions {
+                limit: 3,
+                include_memory: false,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            mixed_intent
+                .hits
+                .iter()
+                .filter(|hit| hit.match_reason == MatchReason::ExactOccurrence)
+                .count(),
+            1
+        );
 
         fs::write(
             repo.path().join("state.ts"),

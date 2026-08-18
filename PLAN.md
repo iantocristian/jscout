@@ -1831,11 +1831,15 @@ G17 adds an intent lane for identifier-shaped query tokens:
 1. Parse case-sensitive identifier tokens without promoting ordinary prose.
 2. Retrieve exact chunk-name/symbol definitions and exact whole-token symbol
    occurrences before hybrid candidates. Existing origin and explicit role
-   filters still apply.
+   filters still apply. A pure identifier lookup may return its complete
+   bounded occurrence tier; a mixed natural-language query admits one exact
+   occurrence per identifier before hybrid ranking resumes, so an incidental
+   common type cannot consume the whole result limit.
 3. For a multi-identifier query, reserve coverage across distinct identifiers
    before returning repeated occurrences of one identifier. Ambiguous exact
    definitions remain visible candidates; exactness does not manufacture
-   uniqueness.
+   uniqueness. Exact occurrence peers that survive hybrid retrieval use its
+   reranker/repository-policy order without crossing the tier boundary.
 4. Run vector fusion, reranking, and repository-policy penalties only inside
    lower intent tiers. They may reorder exact peers but cannot place a partial,
    example, or vector-only match above an exact definition.
