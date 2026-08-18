@@ -51,13 +51,21 @@ mod tests {
         let repo = tempfile::tempdir()?;
         let source_build = repo.path().join("packages/app/src/build");
         let declarations = repo.path().join("packages/app");
+        let ignored_build = repo.path().join("build");
         let generated_dist = repo.path().join("packages/app/dist");
+        fs::create_dir_all(repo.path().join(".git"))?;
         fs::create_dir_all(&source_build)?;
+        fs::create_dir_all(&ignored_build)?;
         fs::create_dir_all(&generated_dist)?;
+        fs::write(repo.path().join(".gitignore"), "/build/\n")?;
         fs::write(source_build.join("plugin.ts"), "export const plugin = 1\n")?;
         fs::write(
             declarations.join("contracts.d.ts"),
             "export interface Contract { value: string }\n",
+        )?;
+        fs::write(
+            ignored_build.join("generated.d.ts"),
+            "export interface IgnoredGenerated {}\n",
         )?;
         fs::write(
             generated_dist.join("generated.d.ts"),
@@ -74,6 +82,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(files.contains(&PathBuf::from("packages/app/src/build/plugin.ts")));
         assert!(files.contains(&PathBuf::from("packages/app/contracts.d.ts")));
+        assert!(!files.contains(&PathBuf::from("build/generated.d.ts")));
         assert!(!files.contains(&PathBuf::from("packages/app/dist/generated.d.ts")));
         Ok(())
     }
