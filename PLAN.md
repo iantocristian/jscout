@@ -1,14 +1,16 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-17.
+> Status: authoritative plan as of 2026-08-18.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
 > snapshot simplification, G12 watcher coordination and incremental source
 > refresh, G13 repository reconnaissance, and G14 retrieval handoff are
-> implemented. G15
-> design-before-edit task memory is the next fixed-snapshot milestone. G16 is
-> a conditional post-G15 memory-delivery correction, not a committed rewrite.
+> implemented. G15 design-before-edit task memory is parked after its harness
+> treatment preserved wrong design contracts on a real task. G16 remains an
+> independent conditional correction to G14 attached-memory delivery. G17
+> exact-identifier dominance and G18 task-directed semantic selection are the
+> next fixed-snapshot retrieval milestones.
 
 ## Document policy
 
@@ -1577,9 +1579,20 @@ reported in the attachment status.
 - compact/debug representations remain fact-equivalent, and all tests use
   deterministic fixtures without model calls.
 
-## Planned G15 — design-before-edit task memory
+## Parked G15 — design-before-edit task memory
 
-G15 addresses a different bottleneck from retrieval. In the
+**Decision amendment (2026-08-18):** do not ship G15 as a jscout product
+surface. PR #45 is blocked. In the Next.js root-layout replay, two-phase arms
+cost more, passed less often, and twice preserved a coherent but wrong output
+contract through implementation. Two-phase execution remains an optional
+evaluation-harness treatment. No design artifact, command, MCP tool,
+semantic-plane write, or agent-guide change is added to jscout. The design
+below is retained only as a bounded proposal to reconsider if repeated tasks
+show that a read-only design phase finds a correct mechanism that
+implementation-only agents miss and that the handoff improves implementation
+rather than merely anchoring it.
+
+The proposed G15 addresses a different bottleneck from retrieval. In the
 optimistic-prefetch campaign, one read-only Sol architecture probe received the
 same anchor-free task story as the implementation agents and produced the
 missing mechanism, detection axes, cure semantics, and cross-file intervention
@@ -1589,12 +1602,13 @@ generated. Agents localized relevant code and sometimes received `cache.ts`
 memory, then collapsed into an edit/verify loop around
 `optimistic-routes.ts`.
 
-The product consequence is a first-class design phase whose result survives
-implementation pressure. G15 does not merely summarize more source. It makes a
-task-specific hypothesis artifact before editing, stores it in the semantic
-plane, and provides a compact, explicit handoff during implementation.
+The experiment consequence is a first-class design phase whose result survives
+implementation pressure. Whether persistence belongs in jscout is explicitly
+unresolved. The parked G15 proposal would make a task-specific hypothesis
+artifact before editing, store it in the semantic plane, and provide a compact,
+explicit handoff during implementation.
 
-### Product surface
+### Parked product proposal
 
 The initial surface is an explicit command and two structural-profile MCP
 tools:
@@ -1703,7 +1717,7 @@ already stored in jscout. G15 implements the third as the durable common layer.
 The pi-ai gateway remains a bounded schema-call adapter, not an autonomous
 tool-using coding agent.
 
-### G15 acceptance
+### Acceptance if unparked
 
 - identical task/evidence inputs reuse one immutable design; evidence changes
   visibly degrade/stale it and refresh publishes one successor;
@@ -1733,7 +1747,7 @@ tool-using coding agent.
 - using more global card generation or larger response budgets as a substitute
   for hypothesis formation.
 
-## Conditional G16 — adaptive memory delivery
+## Conditional G16 — adaptive attached-memory delivery
 
 G14 deliberately changed search-attached memory from broad similarity previews
 to evidence-connected selection: direct support first, then bounded graph
@@ -1744,8 +1758,9 @@ code-evidence connection is not attached, and the response redirects the agent
 to `semantic_memory`.
 
 G16 is a decision gate for that boundary, not the next automatic milestone.
-It is considered only after G15 and the full product evaluation. The evaluation
-must retain, per search, the bounded semantic candidate IDs and ranks, why each
+It is independent of G15 and is considered only when task evidence satisfies
+the entry criteria below. The evaluation must retain, per search, the bounded
+semantic candidate IDs and ranks, why each
 selected artifact connected, the `no_connected_memory` status, the emitted
 follow-up, and whether the agent subsequently called `semantic_memory`. Stored
 request telemetry records identifiers and decisions, not artifact bodies or
@@ -1796,6 +1811,93 @@ correctness/mechanism retention, rendered bytes, and irrelevant artifact reads
 against G14. Failure to improve the triggering outcome at the registered byte
 and relevance constraints closes the redesign rather than expanding it again.
 
+G16 does not repair a semantic corpus that lacks useful artifacts, broad
+`semantic_memory` queries that rank unrelated artifacts, or batch scouting that
+never generated memory for the relevant code surface. Those are G18 concerns.
+The root-layout replay did not trigger G16: independent adjudication found no
+artifact describing the required causal chain, so there was no useful existing
+artifact for the attachment boundary to miss.
+
+## Planned G17 — exact-identifier dominance
+
+Hybrid retrieval currently lets RRF, the cross-encoder, and repository policy
+place semantic or partial-name matches above an exact symbol definition. This
+is wrong query intent. BM25 score magnitude is discarded by RRF, and the
+reranker can then demote the remaining exact hit. Exact identifier lookup must
+be a deterministic tier ahead of learned ranking, not another score feature.
+
+G17 adds an intent lane for identifier-shaped query tokens:
+
+1. Parse case-sensitive identifier tokens without promoting ordinary prose.
+2. Retrieve exact chunk-name/symbol definitions and exact whole-token symbol
+   occurrences before hybrid candidates. Existing origin and explicit role
+   filters still apply.
+3. For a multi-identifier query, reserve coverage across distinct identifiers
+   before returning repeated occurrences of one identifier. Ambiguous exact
+   definitions remain visible candidates; exactness does not manufacture
+   uniqueness.
+4. Run vector fusion, reranking, and repository-policy penalties only inside
+   lower intent tiers. They may reorder exact peers but cannot place a partial,
+   example, or vector-only match above an exact definition.
+5. Return a compact match reason such as `exact_definition`,
+   `exact_occurrence`, or `hybrid`, while preserving existing score fields as
+   diagnostics rather than calibrated relevance.
+
+### G17 acceptance
+
+- exact definition or occurrence hits for `createRouteTypesManifest`,
+  `getRootParamsFromLayouts`, `collectedRootParams`, and `NextTypesPlugin`
+  precede unrelated example and Sitecore chunks with embeddings and reranking
+  enabled;
+- a hostile fake reranker cannot demote an exact definition below a hybrid
+  candidate;
+- same-named definitions remain separate candidates and multi-identifier
+  queries cover each resolvable identifier within the requested limit;
+- prose-only queries retain the current hybrid path and complete response-byte
+  budget.
+
+## Planned G18 — task-directed semantic coverage and selection
+
+Whole-repository weight ordering is not a workable completeness strategy for
+generated cards. In the Next.js root-layout run, 448 card calls still missed
+the relevant type-generation surface, while three broad `semantic_memory`
+calls returned 26 mostly unrelated artifacts from candidate pools of 93–270.
+No larger response budget can recover information that was never generated,
+and returning more weak analogs increases anchoring risk.
+
+G18 changes both generation selection and direct semantic retrieval:
+
+1. Keep batch scouting opt-in, but allocate bounded coverage across G13
+   reconnaissance scopes before spending the remainder by subject weight.
+   Report selected and omitted subjects per scope so a global cutoff cannot
+   masquerade as repository coverage.
+2. Add bounded targeted card generation from exact anchors, files, or one
+   reconnaissance subject. This is semantic enrichment of a localized surface,
+   not a task-design agent and not automatic work during index/search/watch.
+3. Rank direct semantic-memory results by exact support/anchor and current
+   reconnaissance scope before lexical/vector similarity. Generic analogous
+   artifacts cannot outrank memory supported by the localized code surface.
+4. Separate discovery from payload: broad query results return compact artifact
+   handles, type/freshness/support summaries, relevance reason, and copy-safe
+   exact-ID follow-ups. Full bodies, relations, and evidence remain an explicit
+   artifact drill-down. Do not raise the 24 KB default.
+5. Return an explicit `no_supported_memory` result when no artifact is connected
+   to supplied anchors/scopes. Do not fill the response with weak analogs merely
+   to satisfy `limit`.
+
+### G18 acceptance
+
+- fixed budgets provide deterministic per-scope coverage and report every
+  omitted scope/subject count;
+- targeted scouting of root-layout type-generation anchors selects relevant
+  subjects without spending hundreds of calls on unrelated areas;
+- a direct query with localized anchors returns supported artifacts before CMS
+  examples, or honestly returns `no_supported_memory` when the corpus is blind;
+- broad discovery stays compact and requires an explicit artifact-ID request
+  before returning a full semantic body;
+- useful-artifact precision improves without widening global generation or
+  response budgets, and generated prose remains separate from code ranking.
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -1811,7 +1913,11 @@ consequences that still govern implementation.
 | Fixed-snapshot workflow memory replay delivered artifacts in every correct warm token win and reduced median session-2 tokens | Keep evidence-backed workflow memory opt-in and proceed with the shared semantic engine |
 | Free-form workflow participant synthesis omitted deterministic continuations | Candidate closure and exhaustive classification are mandatory |
 | Standalone `neighborhood` had no natural selection while expanded search used the same machinery | Treat neighborhood as drill-down plumbing; prioritize agent-reached surfaces |
-| Optimistic-prefetch memory replays delivered fresh vector-backed context but 46 implementation arms never generated the mechanism found by one read-only architecture probe | Treat retrieval polish as G14 hygiene; make hypothesis generation and persistent design-to-implementation handoff the separate G15 product surface |
+| Optimistic-prefetch memory replays delivered fresh vector-backed context but 46 implementation arms never generated the mechanism found by one read-only architecture probe | Treat retrieval polish as G14 hygiene; test a read-only design phase followed by implementation in the eval harness before considering any persistent jscout product surface |
+| Root-layout searches ranked partial example and Sitecore chunks above exact identifiers | Implement G17 deterministic exact-identifier tiers before adding retrieval surface |
+| Root-layout scouting spent 448 card calls without covering the relevant type-generation surface, while broad semantic-memory calls returned mostly unrelated artifacts | Implement G18 scope-stratified and targeted scouting plus support-aware compact semantic discovery; do not increase default budgets |
+| Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
+| Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
 
 Relevant result summaries include:
 
@@ -1829,6 +1935,7 @@ Relevant result summaries include:
 - [dependency indexing](eval/results/dependency-indexing-2026-08-10.md)
 - [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
 - [Next.js optimistic-prefetch campaign](eval/results/next-optimistic-prefetch-2026-08-15.md)
+- [Next.js root-layout parameter types](eval/results/next-root-params-types-2026-08-17.md)
 
 ## Positioning versus tsserver/LSP
 

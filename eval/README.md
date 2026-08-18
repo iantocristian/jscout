@@ -487,6 +487,40 @@ history-free snapshot; grading compares against the real implementation.
    `profile/treatment` summaries separate instead of silently pooling
    skill-only and forced-search runs.
 
+   Complex implementation tasks can opt into an evaluation-only two-phase
+   workflow with `--workflow design-implement`. The runner first dispatches a
+   read-only design call on the prepared snapshot, validates its structured
+   design response, and verifies that the phase produced no patch. Only then
+   does it dispatch a fresh implementation call with that design injected
+   verbatim into the normal implementation prompt. This is harness
+   orchestration; it does not invoke or require a jscout design-memory product
+   surface.
+
+   The run directory retains `design-prompt.txt`, `design-response.json`,
+   `design-events.jsonl`, `design.patch`, and matching implementation files.
+   Response rows report design and implementation tokens, commands, duration,
+   and jscout request counts separately as well as in aggregate. A failed,
+   invalid, timed-out, or mutating design phase prevents implementation for
+   that arm and skips grading. `--design-timeout` and
+   `--implementation-timeout` may override the shared `--run-timeout`; all
+   values are seconds.
+   Phase-specific telemetry session IDs are retained in each response row;
+   `eval-report.mjs` joins both phases and refuses to pool single-phase and
+   two-phase responses in one report.
+
+   ```bash
+   node scripts/eval-run-replay.mjs \
+     --tasks eval/tasks/next-calibration.json \
+     --repository /path/to/next.js \
+     --runs-root /runs/next-calibration \
+     --jscout "$PWD/target/release/jscout" \
+     --responses /runs/two-phase/responses.jsonl \
+     --telemetry /runs/two-phase/telemetry.jsonl \
+     --artifacts /runs/two-phase/artifacts \
+     --profiles grep,memory-embed --treatments skill \
+     --workflow design-implement --trial design-001
+   ```
+
    PR-replay calibration supports these cumulative jscout profiles:
 
    - `structural`: parser-derived index and graph;
@@ -545,6 +579,20 @@ history-free snapshot; grading compares against the real implementation.
    cache replay uses `WATCHPACK_POLLING=250` because native Watchpack watchers
    exhaust the Codex sandbox's descriptor allowance even when no orphaned test
    process exists.
+
+   Browser support is configured per suite or task with `browser_server`:
+   `auto` (the default) starts the out-of-sandbox Playwright sidecar only when
+   the prepared workspace can resolve its own `playwright` package; `required`
+   fails the run when Playwright is absent or the sidecar cannot start; and
+   `disabled` never starts it. This is local to the replay runner, uses an
+   OS-assigned loopback port and per-arm process registry, and requires no
+   launch changes for parallel runners. Every arm records the decision in
+   `browser-server.json`. Next browser task sets should use `required` and set
+   `WATCHPACK_POLLING=250`. Next task sets whose agent-visible verification uses
+   the prepared dependency tree should also set `NEXT_SKIP_ISOLATE=1`; the
+   committed Next replay suites do both. The agent prompt repeats
+   `NEXT_SKIP_ISOLATE=1` for direct `pnpm testonly` commands so Next does not
+   attempt a nested dependency installation inside the Codex sandbox.
 
 The task unit is a **change arc**, not a single PR/commit: seed + every
 semantically related follow-up until the feature stabilized (see

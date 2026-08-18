@@ -9,15 +9,97 @@ import { buildSnapshot } from "./eval-pr-snapshot.mjs";
 import {
   preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
+  browserServerCapability,
   embeddingEnvironmentForProfile,
+  designPromptFor,
+  implementationPromptFor,
+  jscoutMcpEnvironmentArgs,
+  nodeOptionsWithNextTeardown,
+  validateDesignResponse,
   profilePlan,
   promptFor,
+  resolveBrowserServerPolicy,
   startBrowserServer,
   validatePreparedDatabaseManifest,
   workspaceProcessGroups,
   scoutPublishedArtifacts,
   countSemanticArtifacts,
 } from "./eval-run-replay.mjs";
+
+test("replay forwards non-secret jscout runtime selectors into the MCP server", () => {
+  assert.deepEqual(
+    jscoutMcpEnvironmentArgs({
+      JSCOUT_PI_AI_GATEWAY: "/opt/jscout/gateway/src/main.mjs",
+      JSCOUT_LLM_MODEL: "openai-codex:gpt-5.6-terra",
+      OPENAI_API_KEY: "must-not-enter-codex-config",
+    }),
+    [
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_PI_AI_GATEWAY="/opt/jscout/gateway/src/main.mjs"',
+      "--config",
+      'mcp_servers.jscout.env.JSCOUT_LLM_MODEL="openai-codex:gpt-5.6-terra"',
+    ],
+  );
+});
+
+test("Next teardown preload composes with existing NODE_OPTIONS", () => {
+  const standalone = nodeOptionsWithNextTeardown();
+  assert.match(standalone, /^--require=.*eval-next-teardown-preload\.cjs$/);
+  assert.equal(nodeOptionsWithNextTeardown(standalone), standalone);
+  assert.equal(
+    nodeOptionsWithNextTeardown("--trace-warnings"),
+    `--trace-warnings ${standalone}`,
+  );
+});
+
+test("Next teardown preload answers pgrep from the scoped process registry", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-pgrep-registry-"));
+  const registry = path.join(directory, "processes.jsonl");
+  fs.writeFileSync(
+    registry,
+    [
+      { kind: "process", pid: 4100, ppid: 4000, group: "launch-one" },
+      { kind: "process", pid: 4101, ppid: 4100, group: "launch-one" },
+      { kind: "process", pid: 5101, ppid: 5100, group: "other-launch" },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n",
+  );
+  const preload = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname),
+    "eval-next-teardown-preload.cjs",
+  );
+  const output = execFileSync(
+    process.execPath,
+    [
+      "--require", preload,
+      "-e",
+      `
+        const { spawn } = require("node:child_process");
+        const child = spawn("pgrep", ["-P", "4100"]);
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk; });
+        child.on("close", (code) => {
+          if (code !== 0) process.exit(code);
+          process.stdout.write(output);
+        });
+      `,
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, JSCOUT_EVAL_PROCESS_REGISTRY: registry },
+    },
+  );
+  assert.equal(output.trim(), "4101");
+  const records = fs.readFileSync(registry, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.ok(records.some((record) =>
+    record.kind === "pgrep" &&
+    record.parent_pid === 4100 &&
+    JSON.stringify(record.registered_children) === "[4101]"
+  ));
+  fs.rmSync(directory, { recursive: true, force: true });
+});
 
 function git(repo, args) {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
@@ -68,6 +150,27 @@ test("replay profiles and forced-search contract are explicit", () => {
   assert.ok(forced.includes("Use jscout exclusively"));
   assert.ok(forced.includes("directly read files and line ranges identified by jscout"));
 
+  const designPrompt = designPromptFor({ story: "Fix it." }, "skill");
+  assert.ok(designPrompt.includes("Do not edit files"));
+  assert.ok(designPrompt.includes("underlying mechanism"));
+  assert.ok(!designPrompt.includes("Implement the change directly"));
+  const design = {
+    mechanism: "State is accepted before validation.",
+    implementation_plan: ["Validate before accepting state."],
+  };
+  const implementationPrompt = implementationPromptFor(
+    { story: "Fix it." },
+    "skill",
+    design,
+  );
+  assert.ok(implementationPrompt.includes("Implement the change directly"));
+  assert.ok(implementationPrompt.includes("State is accepted before validation."));
+  assert.ok(implementationPrompt.includes("Verify it against source and tests"));
+  assert.throws(
+    () => validateDesignResponse({ mechanism: "Only a guess." }),
+    /constraints must be an array of strings/,
+  );
+
   const constrained = promptFor({
     story: "Fix it.",
     execution_notes: ["Do not start the persistent package watcher."],
@@ -81,7 +184,9 @@ test("replay profiles and forced-search contract are explicit", () => {
     browserEndpoint: "ws://127.0.0.1:1/token",
   });
   assert.ok(withBrowser.includes("pre-connected browser endpoint"));
-  assert.ok(withBrowser.includes("NEXT_TEST_MODE=start pnpm testonly <path>"));
+  assert.ok(withBrowser.includes(
+    "NEXT_SKIP_ISOLATE=1 NEXT_TEST_MODE=start pnpm testonly <path>",
+  ));
   assert.ok(withBrowser.includes("test-start-turbo / test-dev-* wrappers"));
   assert.ok(!withBrowser.includes("No browser endpoint is available"));
   assert.ok(!natural.includes("pre-connected browser endpoint"));
@@ -93,6 +198,41 @@ test("replay profiles and forced-search contract are explicit", () => {
     networkPolicy: "prompt-restricted-external; loopback-required",
     webTools: false,
   });
+});
+
+test("browser server policy is backward-compatible and capability-aware", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-browser-policy-"));
+  assert.equal(resolveBrowserServerPolicy({}, {}), "auto");
+  assert.equal(
+    resolveBrowserServerPolicy({ browser_server: "required" }, {}),
+    "required",
+  );
+  assert.equal(
+    resolveBrowserServerPolicy(
+      { browser_server: "required" },
+      { browser_server: "disabled" },
+    ),
+    "disabled",
+  );
+  assert.throws(
+    () => resolveBrowserServerPolicy({ browser_server: "sometimes" }, {}),
+    /must be auto, required, or disabled/,
+  );
+  assert.deepEqual(browserServerCapability(workspace), {
+    start: false,
+    policy: "auto",
+    reason: "playwright is not installed in the prepared workspace",
+  });
+  assert.deepEqual(browserServerCapability(workspace, "disabled"), {
+    start: false,
+    policy: "disabled",
+    reason: "browser server disabled by task configuration",
+  });
+  assert.throws(
+    () => browserServerCapability(workspace, "required"),
+    /required but playwright is not installed/,
+  );
+  fs.rmSync(workspace, { recursive: true, force: true });
 });
 
 test("prepared database manifests reject a different source snapshot", () => {
@@ -201,12 +341,30 @@ const argv = process.argv.slice(2);
 const value = (flag) => argv[argv.indexOf(flag) + 1];
 const workspace = value("--cd");
 if (process.env.JSCOUT_REPLAY_TEST_ENV !== "enabled") throw new Error("execution environment missing");
-if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
-if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+if (process.env.JSCOUT_EVAL_PHASE !== "design") {
+  if (process.env.NEXT_TEST_BROWSER_WS_ENDPOINT !== "ws://127.0.0.1:43210/fake-browser") throw new Error("browser endpoint missing");
+  if (process.env.HEADLESS !== "true") throw new Error("headless browser mode missing");
+  if (!process.env.NODE_OPTIONS?.includes("eval-next-teardown-preload.cjs")) throw new Error("Next teardown preload missing");
+  if (!process.env.JSCOUT_EVAL_PROCESS_REGISTRY) throw new Error("Next process registry missing");
+}
 const fdLimit = Number(execFileSync("/bin/sh", ["-c", "ulimit -n"], { encoding: "utf8" }).trim());
 if (fdLimit < 65536) throw new Error("file descriptor limit was not inherited");
 fs.writeFileSync(path.join(path.dirname(value("--output-last-message")), "agent-argv.json"), JSON.stringify(argv));
 if (fs.existsSync(path.join(workspace, "gold"))) throw new Error("gold leaked into workspace");
+if (process.env.JSCOUT_EVAL_PHASE === "design") {
+  if (value("--sandbox") !== "read-only") throw new Error("design sandbox is not read-only");
+  fs.writeFileSync(value("--output-last-message"), JSON.stringify({
+    mechanism: "Both a and b participate in the increment behavior.",
+    constraints: ["Preserve exports."],
+    implementation_plan: ["Update a and inspect b."],
+    files: ["src/a.js", "src/b.js"],
+    symbols: ["a", "b"],
+    validation_plan: ["Run the fixture tests."],
+    uncertainties: [],
+  }));
+  console.log(JSON.stringify({ usage: { input_tokens: 7, output_tokens: 3 } }));
+  process.exit(0);
+}
 fs.appendFileSync(path.join(workspace, "src/a.js"), "// stub edit\\n");
 fs.writeFileSync(value("--output-last-message"), JSON.stringify({
   answer: "incremented a", files: ["src/a.js", "src/b.js"], symbols: ["a"], inspected_files: ["src/a.js"],
@@ -256,6 +414,8 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     "prompt-restricted-external; loopback-required",
   );
   assert.deepEqual(row.execution_environment, { JSCOUT_REPLAY_TEST_ENV: "enabled" });
+  assert.equal(row.browser_server_policy, "auto");
+  assert.equal(row.browser_server_started, true);
   assert.equal(row.runner_error, undefined);
 
   const agentArgv = JSON.parse(
@@ -267,7 +427,13 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   const browser = JSON.parse(
     fs.readFileSync(path.join(runDir, "browser-server.json"), "utf8"),
   );
+  assert.equal(browser.started, true);
+  assert.equal(browser.policy, "auto");
   assert.equal(browser.endpoint, "ws://127.0.0.1:43210/fake-browser");
+  assert.equal(browser.next_teardown.strategy, "registered-pgrep-process-tree");
+  assert.match(browser.next_teardown.preload, /eval-next-teardown-preload\.cjs$/);
+  assert.equal(browser.next_teardown.registry, "agent-process-registry.jsonl");
+  assert.ok(fs.existsSync(path.join(runDir, browser.next_teardown.registry)));
   assert.match(fs.readFileSync(browser.log, "utf8"), /FAKE_BROWSER_SERVER_CLOSED/);
 
   const grade = JSON.parse(
@@ -297,6 +463,50 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     fs.readFileSync(responses, "utf8").split("\n").filter(Boolean).length,
     1,
     "resume must skip a session with a completed response row",
+  );
+
+  const twoPhaseResponses = path.join(base, "two-phase-responses.jsonl");
+  const twoPhaseArtifacts = path.join(base, "two-phase-artifacts");
+  execFileSync(process.execPath, [
+    runner,
+    "--tasks", tasksFile,
+    "--repository", repo,
+    "--runs-root", runsRoot,
+    "--jscout", "/bin/true",
+    "--responses", twoPhaseResponses,
+    "--telemetry", path.join(base, "two-phase-telemetry.jsonl"),
+    "--artifacts", twoPhaseArtifacts,
+    "--codex", stub,
+    "--profiles", "grep",
+    "--trial", "t2",
+    "--workflow", "design-implement",
+  ], { encoding: "utf8" });
+  const twoPhaseRow = JSON.parse(fs.readFileSync(twoPhaseResponses, "utf8").trim());
+  assert.equal(twoPhaseRow.workflow, "design-implement");
+  assert.equal(twoPhaseRow.session, "grep-control-design-implement-replay-fixture-t2");
+  assert.equal(twoPhaseRow.design.mechanism, "Both a and b participate in the increment behavior.");
+  assert.equal(twoPhaseRow.design_total_tokens, 10);
+  assert.equal(twoPhaseRow.implementation_total_tokens, 15);
+  assert.equal(twoPhaseRow.total_tokens, 25);
+  assert.equal(twoPhaseRow.design_duration_ms > 0, true);
+  assert.equal(twoPhaseRow.implementation_duration_ms > 0, true);
+  const twoPhaseRunDir = path.join(
+    twoPhaseArtifacts,
+    "grep-control-design-implement-replay-fixture-t2",
+  );
+  assert.equal(fs.statSync(path.join(twoPhaseRunDir, "design.patch")).size, 0);
+  assert.match(
+    fs.readFileSync(path.join(twoPhaseRunDir, "design-prompt.txt"), "utf8"),
+    /Do not edit files/,
+  );
+  assert.match(
+    fs.readFileSync(path.join(twoPhaseRunDir, "implementation-prompt.txt"), "utf8"),
+    /Both a and b participate in the increment behavior/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(twoPhaseRunDir, "events.jsonl"), "utf8")
+      .split("\n").filter(Boolean).length,
+    2,
   );
 
   fs.rmSync(base, { recursive: true, force: true });
