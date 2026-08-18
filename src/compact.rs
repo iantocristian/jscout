@@ -29,6 +29,7 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
     response.insert("retrieval".into(), json!(result.retrieval));
+    response.insert("default_match".into(), json!("hybrid"));
     response.insert("hits".into(), Value::Array(hits));
 
     if result
@@ -81,7 +82,7 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 "returned": artifacts.len(),
                 "budget_omitted": result.semantic_selected.saturating_sub(artifacts.len()),
                 "next_tool": "semantic_memory",
-                "detail": "preview only; candidate_pool and scores are not calibrated relevance; use semantic_memory for full bodies and evidence",
+                "detail": "preview; pool/scores are uncalibrated; use semantic_memory for bodies/evidence",
                 "artifacts": artifacts,
             }),
         );
@@ -145,6 +146,12 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
     );
     if let Some(name) = &hit.name {
         value.insert("symbol".into(), json!(name));
+    }
+    if hit.match_reason != search::MatchReason::Hybrid {
+        value.insert("match".into(), json!(hit.match_reason));
+    }
+    if !hit.matched_identifiers.is_empty() {
+        value.insert("matched_identifiers".into(), json!(hit.matched_identifiers));
     }
     value.insert("kind".into(), json!(hit.kind));
     value.insert("snippet".into(), json!(hit.snippet));
@@ -961,7 +968,9 @@ mod tests {
         origin,
         query::{SymbolTarget, Usage},
         scout::RenderedSource,
-        search::{Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchResult},
+        search::{
+            Hit, MatchReason, ResponseBudget, RetrievalStatus, SearchExpansion, SearchResult,
+        },
         semantic::{ArtifactRetrievalScore, SemanticArtifact, SemanticSupport},
         structural::{GraphEdge, GraphNode, Neighborhood},
     };
@@ -1028,6 +1037,8 @@ mod tests {
                 start_line: 1,
                 end_line: 8,
                 score: 0.98,
+                match_reason: MatchReason::Hybrid,
+                matched_identifiers: Vec::new(),
                 snippet: "start() { return this.queue.finish(); }".into(),
                 snippet_truncated: false,
                 anchors: vec![root.into()],
@@ -1102,6 +1113,8 @@ mod tests {
             start_line: 1,
             end_line: 20,
             score: 1.0,
+            match_reason: MatchReason::Hybrid,
+            matched_identifiers: Vec::new(),
             snippet: "export const config = {};".into(),
             snippet_truncated: false,
             anchors: Vec::new(),
@@ -1137,6 +1150,8 @@ mod tests {
             start_line: 1,
             end_line: 20,
             score: 1.0,
+            match_reason: MatchReason::Hybrid,
+            matched_identifiers: Vec::new(),
             snippet: "const first = 1; const second = 2;".into(),
             snippet_truncated: false,
             anchors: vec![
@@ -1169,6 +1184,8 @@ mod tests {
                 start_line: 10 + index,
                 end_line: 14 + index,
                 score: 1.0 / (index + 1) as f64,
+                match_reason: MatchReason::Hybrid,
+                matched_identifiers: Vec::new(),
                 snippet: format!("export function handleStep{index}() {{ return next(); }}"),
                 snippet_truncated: false,
                 anchors: vec![format!(

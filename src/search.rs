@@ -220,6 +220,10 @@ pub struct Hit {
     pub start_line: i64,
     pub end_line: i64,
     pub score: f64,
+    #[serde(rename = "match")]
+    pub match_reason: MatchReason,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_identifiers: Vec<String>,
     pub snippet: String,
     pub snippet_truncated: bool,
     /// Snapshot-scoped structural handles projected from this retrieval chunk.
@@ -237,6 +241,29 @@ pub struct Hit {
     pub include_neighborhood_followup: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchReason {
+    ExactDefinition,
+    ExactOccurrence,
+    Hybrid,
+}
+
+#[derive(Debug)]
+struct ExactIntentCandidates {
+    identifiers: Vec<String>,
+    definitions: Vec<Vec<i64>>,
+    occurrences: Vec<Vec<i64>>,
+}
+
+#[derive(Debug)]
+struct RankedHitCandidate {
+    chunk_id: i64,
+    score: f64,
+    match_reason: MatchReason,
+    matched_identifiers: Vec<String>,
+}
+
 /// Build an FTS5 query: each identifier-ish token quoted, OR-joined, so any
 /// match ranks (BM25 handles weighting) and no user input is FTS syntax.
 fn fts_query(q: &str) -> String {
@@ -246,6 +273,349 @@ fn fts_query(q: &str) -> String {
         .map(|t| format!("\"{t}\""))
         .collect();
     tokens.join(" OR ")
+}
+
+fn exact_intent_tokens(query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    let single_identifier = is_identifier_token(trimmed);
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    for token in query
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
+        })
+        .filter(|token| !token.is_empty())
+    {
+        if !is_identifier_token(token) || (!single_identifier && !is_code_shaped_identifier(token))
+        {
+            continue;
+        }
+        if seen.insert(token.to_string()) {
+            tokens.push(token.to_string());
+        }
+    }
+    tokens
+}
+
+fn is_identifier_token(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '$'
+        })
+}
+
+fn is_code_shaped_identifier(value: &str) -> bool {
+    value.starts_with('_')
+        || value.starts_with('$')
+        || value.contains('_')
+        || value.contains('$')
+        || value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_uppercase())
+        || value
+            .chars()
+            .skip(1)
+            .any(|character| character.is_ascii_uppercase())
+}
+
+fn exact_intent_candidates(
+    conn: &Connection,
+    query: &str,
+    per_identifier_limit: usize,
+    file_roles: &[String],
+    file_origins: &[String],
+) -> Result<ExactIntentCandidates> {
+    let identifiers = exact_intent_tokens(query);
+    let mut definitions = Vec::with_capacity(identifiers.len());
+    let mut occurrences = Vec::with_capacity(identifiers.len());
+    for identifier in &identifiers {
+        let definition_ids = exact_definition_chunks(
+            conn,
+            identifier,
+            per_identifier_limit,
+            file_roles,
+            file_origins,
+        )?;
+        let definition_set = definition_ids.iter().copied().collect::<HashSet<_>>();
+        let occurrence_ids = exact_occurrence_chunks(
+            conn,
+            identifier,
+            per_identifier_limit,
+            file_roles,
+            file_origins,
+        )?
+        .into_iter()
+        .filter(|chunk_id| !definition_set.contains(chunk_id))
+        .collect();
+        definitions.push(definition_ids);
+        occurrences.push(occurrence_ids);
+    }
+    Ok(ExactIntentCandidates {
+        identifiers,
+        definitions,
+        occurrences,
+    })
+}
+
+fn exact_definition_chunks(
+    conn: &Connection,
+    identifier: &str,
+    limit: usize,
+    file_roles: &[String],
+    file_origins: &[String],
+) -> Result<Vec<i64>> {
+    let flags = origin_flags(file_origins);
+    let roles_json = serde_json::to_string(file_roles)?;
+    let row_limit = limit.max(1) as i64;
+    let mut rows = Vec::<(i64, i64, i64, i64, String, i64)>::new();
+
+    let mut named_chunks = conn.prepare_cached(
+        "SELECT chunk.id, 0 AS name_priority, 1 AS export_priority,
+                chunk.end-chunk.start AS span, file.path, chunk.start
+         FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         WHERE chunk.name=?1 COLLATE BINARY
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+         ORDER BY file.path, chunk.start, chunk.id
+         LIMIT ?7",
+    )?;
+    let named = named_chunks.query_map(
+        rusqlite::params![
+            identifier,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+            row_limit,
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    for row in named {
+        rows.push(row?);
+    }
+
+    let roles_json = serde_json::to_string(file_roles)?;
+    let mut containing_chunks = conn.prepare_cached(
+        "SELECT chunk.id,
+                CASE WHEN chunk.name=?1 COLLATE BINARY THEN 0 ELSE 1 END AS name_priority,
+                CASE WHEN symbol.exported=1 THEN 0 ELSE 1 END AS export_priority,
+                chunk.end-chunk.start AS span, file.path, chunk.start
+         FROM symbols symbol
+         JOIN files file ON file.id=symbol.file_id
+         JOIN chunks chunk ON chunk.file_id=symbol.file_id
+           AND chunk.start<=symbol.decl_start AND symbol.decl_start<chunk.end
+         WHERE symbol.name=?1 COLLATE BINARY
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+         ORDER BY name_priority, export_priority, span, file.path, chunk.start, chunk.id
+         LIMIT ?7",
+    )?;
+    let containing = containing_chunks.query_map(
+        rusqlite::params![
+            identifier,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+            row_limit,
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    for row in containing {
+        rows.push(row?);
+    }
+
+    rows.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.5.cmp(&right.5))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for (chunk_id, ..) in rows {
+        if seen.insert(chunk_id) {
+            result.push(chunk_id);
+            if result.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn exact_occurrence_chunks(
+    conn: &Connection,
+    identifier: &str,
+    limit: usize,
+    file_roles: &[String],
+    file_origins: &[String],
+) -> Result<Vec<i64>> {
+    let flags = origin_flags(file_origins);
+    let roles_json = serde_json::to_string(file_roles)?;
+    let mut statement = conn.prepare_cached(
+        "SELECT candidate.chunk_id
+         FROM (
+           SELECT ref.chunk_id AS chunk_id, file.path AS path, ref.start AS position
+           FROM refs ref
+           JOIN chunks chunk ON chunk.id=ref.chunk_id
+           JOIN files file ON file.id=chunk.file_id
+           WHERE ref.chunk_id IS NOT NULL AND ref.target_name=?1 COLLATE BINARY
+             AND ((?2 AND file.origin='repository')
+               OR (?3 AND file.origin='workspace')
+               OR (?4 AND file.origin='dependency'))
+             AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           UNION ALL
+           SELECT call.chunk_id, file.path, call.start
+           FROM member_calls call
+           JOIN chunks chunk ON chunk.id=call.chunk_id
+           JOIN files file ON file.id=chunk.file_id
+           WHERE call.chunk_id IS NOT NULL AND call.prop=?1 COLLATE BINARY
+             AND ((?2 AND file.origin='repository')
+               OR (?3 AND file.origin='workspace')
+               OR (?4 AND file.origin='dependency'))
+             AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           UNION ALL
+           SELECT site.chunk_id, file.path, site.start
+           FROM entity_sites site
+           JOIN chunks chunk ON chunk.id=site.chunk_id
+           JOIN files file ON file.id=chunk.file_id
+           WHERE site.chunk_id IS NOT NULL AND site.target_name=?1 COLLATE BINARY
+             AND ((?2 AND file.origin='repository')
+               OR (?3 AND file.origin='workspace')
+               OR (?4 AND file.origin='dependency'))
+             AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+         ) candidate
+         GROUP BY candidate.chunk_id
+         ORDER BY MIN(candidate.path), MIN(candidate.position), candidate.chunk_id
+         LIMIT ?7",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            identifier,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+            limit.max(1) as i64,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+fn tiered_candidates(
+    exact: ExactIntentCandidates,
+    hybrid: &[(i64, f64)],
+) -> Vec<RankedHitCandidate> {
+    let hybrid_scores = hybrid.iter().copied().collect::<HashMap<_, _>>();
+    let mut ranked = Vec::<RankedHitCandidate>::new();
+    let mut positions = HashMap::<i64, usize>::new();
+
+    append_exact_tier(
+        &mut ranked,
+        &mut positions,
+        &exact.identifiers,
+        &exact.definitions,
+        MatchReason::ExactDefinition,
+        &hybrid_scores,
+    );
+    append_exact_tier(
+        &mut ranked,
+        &mut positions,
+        &exact.identifiers,
+        &exact.occurrences,
+        MatchReason::ExactOccurrence,
+        &hybrid_scores,
+    );
+    for &(chunk_id, score) in hybrid {
+        if positions.contains_key(&chunk_id) {
+            continue;
+        }
+        positions.insert(chunk_id, ranked.len());
+        ranked.push(RankedHitCandidate {
+            chunk_id,
+            score,
+            match_reason: MatchReason::Hybrid,
+            matched_identifiers: Vec::new(),
+        });
+    }
+    ranked
+}
+
+fn append_exact_tier(
+    ranked: &mut Vec<RankedHitCandidate>,
+    positions: &mut HashMap<i64, usize>,
+    identifiers: &[String],
+    candidates: &[Vec<i64>],
+    match_reason: MatchReason,
+    hybrid_scores: &HashMap<i64, f64>,
+) {
+    let maximum_depth = candidates.iter().map(Vec::len).max().unwrap_or(0);
+    for depth in 0..maximum_depth {
+        for (identifier, per_identifier) in identifiers.iter().zip(candidates) {
+            let Some(&chunk_id) = per_identifier.get(depth) else {
+                continue;
+            };
+            if let Some(&position) = positions.get(&chunk_id) {
+                if !ranked[position]
+                    .matched_identifiers
+                    .iter()
+                    .any(|value| value == identifier)
+                {
+                    ranked[position]
+                        .matched_identifiers
+                        .push(identifier.clone());
+                }
+                continue;
+            }
+            positions.insert(chunk_id, ranked.len());
+            ranked.push(RankedHitCandidate {
+                chunk_id,
+                score: hybrid_scores.get(&chunk_id).copied().unwrap_or(0.0),
+                match_reason,
+                matched_identifiers: vec![identifier.clone()],
+            });
+        }
+    }
 }
 
 fn bm25_ranking(
@@ -786,6 +1156,7 @@ fn ranked_hits(
 ) -> Result<(Vec<Hit>, RetrievalStatus)> {
     let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let (pool, vector_pool) = candidate_pool_limits(limit, !file_roles.is_empty());
+    let exact = exact_intent_candidates(conn, q, limit, file_roles, file_origins)?;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(conn, q, pool, file_roles, file_origins)?];
     let mut retrieval = RetrievalStatus::vector_disabled();
@@ -850,11 +1221,18 @@ fn ranked_hits(
     if file_roles.is_empty() {
         apply_repository_policy_penalty(conn, &mut fused)?;
     }
+    let ranked = tiered_candidates(exact, &fused);
 
     let mut hits = Vec::new();
     let allowed_roles: HashSet<&str> = file_roles.iter().map(String::as_str).collect();
-    for (chunk_id, score) in fused {
-        if let Some(hit) = load_hit(conn, chunk_id, score)? {
+    for candidate in ranked {
+        if let Some(hit) = load_hit(
+            conn,
+            candidate.chunk_id,
+            candidate.score,
+            candidate.match_reason,
+            candidate.matched_identifiers,
+        )? {
             if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
                 continue;
             }
@@ -1028,7 +1406,13 @@ fn record_vector_ranking(
     }
 }
 
-fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>> {
+fn load_hit(
+    conn: &Connection,
+    chunk_id: i64,
+    score: f64,
+    match_reason: MatchReason,
+    matched_identifiers: Vec<String>,
+) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
@@ -1110,6 +1494,8 @@ fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<Option<Hit>>
         start_line,
         end_line,
         score,
+        match_reason,
+        matched_identifiers,
         snippet,
         snippet_truncated: false,
         anchors,
@@ -1652,16 +2038,17 @@ fn expand_hits(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
     use anyhow::Result;
 
     use super::{
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
-        ExpansionOptions, Hit, ResponseBudget, RetrievalStatus, SearchExpansion, SearchOptions,
-        SearchResult, apply_repository_policy_penalty, apply_response_budget,
-        candidate_pool_limits, merge_reranked_prefix, prefilter_ranking_by_role,
-        record_vector_ranking, reranker_document, search, select_attached_memory,
+        ExpansionOptions, Hit, MatchReason, ResponseBudget, RetrievalStatus, SearchExpansion,
+        SearchOptions, SearchResult, apply_repository_policy_penalty, apply_response_budget,
+        candidate_pool_limits, exact_intent_tokens, merge_reranked_prefix,
+        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
+        select_attached_memory, tiered_candidates,
     };
     use crate::{
         file_role, indexer, origin,
@@ -1756,6 +2143,157 @@ mod tests {
                 .collect::<Vec<_>>(),
             (51..=60).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn exact_identifier_intent_does_not_promote_plain_prose() {
+        assert_eq!(exact_intent_tokens("insert"), ["insert"]);
+        assert_eq!(
+            exact_intent_tokens(
+                "find createRouteTypesManifest and NextTypesPlugin in root_layout files"
+            ),
+            ["createRouteTypesManifest", "NextTypesPlugin", "root_layout"]
+        );
+        assert!(exact_intent_tokens("development cache behavior").is_empty());
+        assert_eq!(
+            exact_intent_tokens("CreateRouteTypesManifest"),
+            ["CreateRouteTypesManifest"]
+        );
+    }
+
+    #[test]
+    fn exact_tiers_survive_hostile_hybrid_order_and_cover_identifiers() {
+        let exact = super::ExactIntentCandidates {
+            identifiers: vec!["firstThing".into(), "SecondThing".into()],
+            definitions: vec![vec![1, 4], vec![2, 5]],
+            occurrences: vec![vec![6], vec![7]],
+        };
+        let ranked = tiered_candidates(exact, &[(9, 100.0), (7, 90.0), (2, -10.0)]);
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.chunk_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 5, 6, 7, 9]
+        );
+        assert!(
+            ranked[..4]
+                .iter()
+                .all(|candidate| candidate.match_reason == MatchReason::ExactDefinition)
+        );
+        assert!(
+            ranked[4..6]
+                .iter()
+                .all(|candidate| candidate.match_reason == MatchReason::ExactOccurrence)
+        );
+        assert_eq!(ranked[6].match_reason, MatchReason::Hybrid);
+    }
+
+    #[test]
+    fn exact_identifier_search_precedes_examples_and_preserves_ambiguity() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("manifest.ts"),
+            "export function createRouteTypesManifest() { return true; }\n\
+             export function getRootParamsFromLayouts() { return {}; }\n\
+             export const collectedRootParams = new Map();\n",
+        )?;
+        fs::write(
+            repo.path().join("plugin-a.ts"),
+            "export class NextTypesPlugin { apply() {} }\n",
+        )?;
+        fs::write(
+            repo.path().join("plugin-b.ts"),
+            "export class NextTypesPlugin { apply() { return 'second'; } }\n",
+        )?;
+        fs::write(
+            repo.path().join("caller.ts"),
+            "import { createRouteTypesManifest } from './manifest';\n\
+             export function callManifest() { return createRouteTypesManifest(); }\n",
+        )?;
+        fs::write(
+            repo.path().join("sitecore-example.ts"),
+            "export const sitecoreExample = 'createRouteTypesManifest NextTypesPlugin collectedRootParams';\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let multi = search(
+            &conn,
+            None,
+            "createRouteTypesManifest getRootParamsFromLayouts collectedRootParams NextTypesPlugin",
+            &SearchOptions {
+                limit: 4,
+                include_memory: false,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(multi.hits.len(), 4);
+        assert!(
+            multi
+                .hits
+                .iter()
+                .all(|hit| hit.match_reason == MatchReason::ExactDefinition)
+        );
+        let covered = multi
+            .hits
+            .iter()
+            .flat_map(|hit| hit.matched_identifiers.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            covered,
+            HashSet::from([
+                "createRouteTypesManifest",
+                "getRootParamsFromLayouts",
+                "collectedRootParams",
+                "NextTypesPlugin",
+            ])
+        );
+        assert!(
+            multi
+                .hits
+                .iter()
+                .all(|hit| hit.file != "sitecore-example.ts")
+        );
+        let compact = crate::compact::search_value(&multi);
+        assert_eq!(compact["default_match"], "hybrid");
+        assert_eq!(compact["hits"][0]["match"], "exact_definition");
+        assert!(compact["hits"][0]["matched_identifiers"].is_array());
+
+        let ambiguous = search(
+            &conn,
+            None,
+            "NextTypesPlugin",
+            &SearchOptions {
+                limit: 2,
+                include_memory: false,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(ambiguous.hits.len(), 2);
+        assert!(ambiguous.hits.iter().all(|hit| {
+            hit.match_reason == MatchReason::ExactDefinition
+                && hit.name.as_deref() == Some("NextTypesPlugin")
+        }));
+
+        let occurrence = search(
+            &conn,
+            None,
+            "createRouteTypesManifest",
+            &SearchOptions {
+                limit: 3,
+                include_memory: false,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            occurrence.hits[0].match_reason,
+            MatchReason::ExactDefinition
+        );
+        assert!(occurrence.hits.iter().any(|hit| {
+            hit.file == "caller.ts" && hit.match_reason == MatchReason::ExactOccurrence
+        }));
+        Ok(())
     }
 
     #[test]
@@ -1973,6 +2511,8 @@ mod tests {
             start_line: 2,
             end_line: 2,
             score: 1.0,
+            match_reason: MatchReason::Hybrid,
+            matched_identifiers: Vec::new(),
             snippet: "entry() { return nearby(); }".into(),
             snippet_truncated: false,
             anchors: vec![entry.clone()],
@@ -2120,6 +2660,8 @@ mod tests {
                 start_line: 1,
                 end_line: 200,
                 score: 1.0,
+                match_reason: MatchReason::Hybrid,
+                matched_identifiers: Vec::new(),
                 snippet: "x".repeat(8_000),
                 snippet_truncated: false,
                 anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
@@ -2192,6 +2734,8 @@ mod tests {
                 start_line: 10,
                 end_line: 12,
                 score: 1.0,
+                match_reason: MatchReason::Hybrid,
+                matched_identifiers: Vec::new(),
                 snippet: "export function target() { return 1; }".into(),
                 snippet_truncated: false,
                 anchors: vec!["sym:src/target.ts#::target@1".into()],
