@@ -10,7 +10,8 @@
 > treatment preserved wrong design contracts on a real task. G16 remains an
 > independent conditional correction to G14 attached-memory delivery. G17
 > exact-identifier dominance and G18 task-directed semantic coverage and
-> selection are implemented.
+> selection are implemented. G13 has one planned extension: evidence-backed
+> generated-output boundary reconnaissance for unignored build artifacts.
 
 ## Document policy
 
@@ -1482,6 +1483,79 @@ branch edit preserve freshness; in-scope membership/evidence drift restores
 neutral inclusion only for the affected subject/ancestors; returning to an
 identical fingerprint reuses the prior classification; and depth, subject,
 call, and context limits terminate mixed subdivision deterministically.
+
+### Planned G13 extension — generated-output boundary reconnaissance
+
+The neutral walker must not treat an ambiguous directory noun such as `build`,
+`lib`, or `generated` as structural truth. A directory named `build` may contain
+authored product code, as it does in Next.js and Twenty, while an unignored
+directory with another name may be reproducible compiler output. L1 therefore
+continues to index every otherwise-indexable, non-ignored file. Repository
+scouting, not the walker, determines whether an indexed scope belongs in the
+default product corpus.
+
+The current reconnaissance input is insufficient for this case. It can classify
+packages, areas, and projects from bounded representatives, but a definite
+runtime parent need not subdivide. An unmarked output subtree can consequently
+inherit runtime treatment when its files have neither a high-precision
+generated path nor a generated header. The follow-up adds exact output-candidate
+subjects without requiring their parent to be `mixed`.
+
+Candidate discovery remains deterministic and treats path names only as weak
+labels. It assembles evidence from bounded, auditable signals such as:
+
+- `tsconfig`/`jsconfig` `outDir`, `declarationDir`, and project-reference output
+  relationships;
+- `package.json` `main`, `module`, `types`, `typings`, `exports`, `bin`, and
+  files/publication boundaries that point into a candidate directory;
+- explicit output paths recoverable from package build scripts and tool
+  configuration, retained as evidence rather than accepted as a verdict;
+- generated headers, source-map links, bundled/minified or transpiled shapes,
+  and bounded source/output correspondence;
+- indexed membership, import/export direction, and representative symbol and
+  entity surfaces for the exact candidate scope.
+
+Gitignored output remains outside L1 and needs no classification. Source-control
+tracked/untracked state may be recorded as supporting evidence when available,
+but cannot be required because history-free snapshots and exported source trees
+must behave coherently.
+
+The model classifies each exact candidate as `runtime`, `tooling`, `generated`,
+`mixed`, or `unknown`, with the existing citation, confidence, context, call,
+and freshness rules. A directory name alone cannot support `likely generated`.
+Fresh `likely generated` output policy is more specific than a runtime parent;
+it may set the child files' effective role to `generated` without requiring the
+parent to become `mixed`. `possible`, `unknown`, stale, invalid, or failed
+classifications remain neutral. A fresh authored/runtime result prevents a weak
+path-name suspicion from demoting the scope.
+
+This is product-corpus policy, not destructive compaction:
+
+- files remain in L1 and remain explicitly searchable;
+- default search retains them with the existing generated-surface penalty;
+- `embed --product` and automatic workflow/card/summary/concept scouting omit
+  fresh generated output by default;
+- overview and dry-run expose the exact boundary, decision, explanation,
+  citations, and downstream policy;
+- output evidence and exact membership participate in the subject fingerprint,
+  so an in-scope rebuild or branch change restores neutral behavior until the
+  matching classification is reused or refreshed.
+
+Acceptance requires at least these paired cases:
+
+1. a Next.js-like authored `src/build/**` scope remains runtime/tooling and in
+   the product corpus;
+2. an unignored compiler-output `build/**` scope is classified generated and
+   omitted from product embedding and automatic semantic scouting;
+3. generated output under a neutral name is discovered from explicit compiler
+   or package boundaries;
+4. a runtime package with a generated child receives the specific child policy
+   without classifying the whole package as mixed;
+5. a name-only suspicion and insufficient or conflicting evidence stay neutral;
+6. gitignored output is never indexed or submitted to the scout;
+7. changing only unrelated repository content reuses the classification, while
+   changing the candidate membership or its cited producer/output evidence
+   invalidates it.
 
 ## Implemented G14 — retrieval handoff and relevance discipline
 
