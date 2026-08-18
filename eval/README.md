@@ -580,6 +580,18 @@ history-free snapshot; grading compares against the real implementation.
    exhaust the Codex sandbox's descriptor allowance even when no orphaned test
    process exists.
 
+   Browser support is configured per suite or task with `browser_server`:
+   `auto` (the default) starts the out-of-sandbox Playwright sidecar only when
+   the prepared workspace can resolve its own `playwright` package; `required`
+   fails the run when Playwright is absent or the sidecar cannot start; and
+   `disabled` never starts it. This is local to the replay runner, uses an
+   OS-assigned loopback port and per-arm process registry, and requires no
+   launch changes for parallel runners. Every arm records the decision in
+   `browser-server.json`. Next browser task sets should use `required` and set
+   `WATCHPACK_POLLING=250`. The agent prompt uses
+   `NEXT_SKIP_ISOLATE=1` for direct `pnpm testonly` commands so Next does not
+   attempt a nested dependency installation inside the Codex sandbox.
+
 The task unit is a **change arc**, not a single PR/commit: seed + every
 semantically related follow-up until the feature stabilized (see
 [`value-hypotheses-2026-08-09.md`](value-hypotheses-2026-08-09.md)). Arc

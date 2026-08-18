@@ -9,6 +9,7 @@ import { buildSnapshot } from "./eval-pr-snapshot.mjs";
 import {
   preparedDatabaseManifest,
   REPLAY_EXECUTION_POLICY,
+  browserServerCapability,
   embeddingEnvironmentForProfile,
   designPromptFor,
   implementationPromptFor,
@@ -17,6 +18,7 @@ import {
   validateDesignResponse,
   profilePlan,
   promptFor,
+  resolveBrowserServerPolicy,
   startBrowserServer,
   validatePreparedDatabaseManifest,
   workspaceProcessGroups,
@@ -182,7 +184,9 @@ test("replay profiles and forced-search contract are explicit", () => {
     browserEndpoint: "ws://127.0.0.1:1/token",
   });
   assert.ok(withBrowser.includes("pre-connected browser endpoint"));
-  assert.ok(withBrowser.includes("NEXT_TEST_MODE=start pnpm testonly <path>"));
+  assert.ok(withBrowser.includes(
+    "NEXT_SKIP_ISOLATE=1 NEXT_TEST_MODE=start pnpm testonly <path>",
+  ));
   assert.ok(withBrowser.includes("test-start-turbo / test-dev-* wrappers"));
   assert.ok(!withBrowser.includes("No browser endpoint is available"));
   assert.ok(!natural.includes("pre-connected browser endpoint"));
@@ -194,6 +198,41 @@ test("replay profiles and forced-search contract are explicit", () => {
     networkPolicy: "prompt-restricted-external; loopback-required",
     webTools: false,
   });
+});
+
+test("browser server policy is backward-compatible and capability-aware", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-browser-policy-"));
+  assert.equal(resolveBrowserServerPolicy({}, {}), "auto");
+  assert.equal(
+    resolveBrowserServerPolicy({ browser_server: "required" }, {}),
+    "required",
+  );
+  assert.equal(
+    resolveBrowserServerPolicy(
+      { browser_server: "required" },
+      { browser_server: "disabled" },
+    ),
+    "disabled",
+  );
+  assert.throws(
+    () => resolveBrowserServerPolicy({ browser_server: "sometimes" }, {}),
+    /must be auto, required, or disabled/,
+  );
+  assert.deepEqual(browserServerCapability(workspace), {
+    start: false,
+    policy: "auto",
+    reason: "playwright is not installed in the prepared workspace",
+  });
+  assert.deepEqual(browserServerCapability(workspace, "disabled"), {
+    start: false,
+    policy: "disabled",
+    reason: "browser server disabled by task configuration",
+  });
+  assert.throws(
+    () => browserServerCapability(workspace, "required"),
+    /required but playwright is not installed/,
+  );
+  fs.rmSync(workspace, { recursive: true, force: true });
 });
 
 test("prepared database manifests reject a different source snapshot", () => {
@@ -375,6 +414,8 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
     "prompt-restricted-external; loopback-required",
   );
   assert.deepEqual(row.execution_environment, { JSCOUT_REPLAY_TEST_ENV: "enabled" });
+  assert.equal(row.browser_server_policy, "auto");
+  assert.equal(row.browser_server_started, true);
   assert.equal(row.runner_error, undefined);
 
   const agentArgv = JSON.parse(
@@ -386,6 +427,8 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   const browser = JSON.parse(
     fs.readFileSync(path.join(runDir, "browser-server.json"), "utf8"),
   );
+  assert.equal(browser.started, true);
+  assert.equal(browser.policy, "auto");
   assert.equal(browser.endpoint, "ws://127.0.0.1:43210/fake-browser");
   assert.equal(browser.next_teardown.strategy, "registered-pgrep-process-tree");
   assert.match(browser.next_teardown.preload, /eval-next-teardown-preload\.cjs$/);

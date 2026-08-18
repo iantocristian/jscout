@@ -17,6 +17,10 @@
   },
   "setup_command": "corepack pnpm install --frozen-lockfile && corepack pnpm build",
   "test_command": "corepack pnpm build && corepack pnpm test-start test/e2e/app-dir/proxy-headers-live-view/proxy-headers-live-view.test.ts",
+  "browser_server": "required",
+  "execution_environment": {
+    "WATCHPACK_POLLING": "250"
+  },
   "notes": [
     "The agent receives a history-free archive of the parent commit. The source clone, issue, PR, gold patches, and hidden tests remain outside the agent workspace.",
     "Every execution arm independently archives, installs, and builds the historical parent before the agent starts.",

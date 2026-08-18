@@ -20,6 +20,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -602,6 +603,43 @@ function resolveExecutionEnvironment(taskSet, task) {
   return merged;
 }
 
+export function resolveBrowserServerPolicy(taskSet = {}, task = {}) {
+  const policy = task.browser_server ?? taskSet.browser_server ?? "auto";
+  if (!["auto", "required", "disabled"].includes(policy)) {
+    throw new Error("browser_server must be auto, required, or disabled");
+  }
+  return policy;
+}
+
+export function browserServerCapability(workspace, policy = "auto") {
+  if (policy === "disabled") {
+    return {
+      start: false,
+      policy,
+      reason: "browser server disabled by task configuration",
+    };
+  }
+  try {
+    const workspaceRequire = createRequire(path.join(path.resolve(workspace), "package.json"));
+    return {
+      start: true,
+      policy,
+      playwrightModule: workspaceRequire.resolve("playwright"),
+    };
+  } catch {
+    if (policy === "required") {
+      throw new Error(
+        "browser_server is required but playwright is not installed in the prepared workspace",
+      );
+    }
+    return {
+      start: false,
+      policy,
+      reason: "playwright is not installed in the prepared workspace",
+    };
+  }
+}
+
 function stopBrowserServer(child, graceMs = 5_000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     if (activeBrowserChild === child) activeBrowserChild = null;
@@ -629,16 +667,21 @@ function stopBrowserServer(child, graceMs = 5_000) {
 // browser server runs OUTSIDE the sandbox and the workspace's own e2e
 // harness connects to it via NEXT_TEST_BROWSER_WS_ENDPOINT (native support
 // in test/lib/browsers/playwright.ts). Loopback sockets are sandbox-allowed.
-export function startBrowserServer(workspace, logPath, timeoutMs = 60_000) {
+export function startBrowserServer(
+  workspace,
+  logPath,
+  timeoutMs = 60_000,
+  playwrightModule = "playwright",
+) {
   return new Promise((resolve, reject) => {
     const log = fs.createWriteStream(logPath, { flags: "a" });
     const child = spawn(process.execPath, ["-e", `
-      const { chromium } = require('playwright');
+      const { chromium } = require(process.argv[1]);
       chromium.launchServer({ host: '127.0.0.1', headless: true }).then((server) => {
         console.log('WS_ENDPOINT=' + server.wsEndpoint());
         process.on('SIGTERM', () => server.close().then(() => process.exit(0)));
       }).catch((error) => { console.error(error); process.exit(1); });
-    `], { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] });
+    `, playwrightModule], { cwd: workspace, stdio: ["ignore", "pipe", "pipe"] });
     activeBrowserChild = child;
     let out = "";
     let settled = false;
@@ -1024,7 +1067,8 @@ export function promptFor(task, treatment = "control", options = {}) {
     contract.push(
       "- Browser e2e tests work through a pre-connected browser endpoint: run",
       "  them with the repository's pnpm test scripts, e.g. HEADLESS=true",
-      "  NEXT_TEST_MODE=start pnpm testonly <path>. Prefer this direct command",
+      "  NEXT_SKIP_ISOLATE=1 NEXT_TEST_MODE=start pnpm testonly <path>. Prefer",
+      "  this direct command",
       "  over test-start-turbo / test-dev-* wrappers so the pre-connected",
       "  endpoint and per-command teardown stay under harness control. Do not",
       "  invoke node run-tests.js directly; it replaces the browser endpoint",
@@ -1131,6 +1175,7 @@ async function main() {
     }
     if (!task.story) throw new Error(`task ${task.id} has no story`);
     const executionEnvironment = resolveExecutionEnvironment(taskSet, task);
+    const browserPolicy = resolveBrowserServerPolicy(taskSet, task);
     const childEnvironment = { ...process.env, ...executionEnvironment };
     const goldTask = JSON.parse(fs.readFileSync(path.join(gold, "task.json"), "utf8"));
     const parent = task.parent ?? goldTask.parent;
@@ -1338,12 +1383,26 @@ async function main() {
         }
 
         let result = { code: 1, timedOut: false, interrupted: null, duration_ms: 0 };
+        let browserReport = {
+          started: false,
+          policy: browserPolicy,
+          reason: designError,
+        };
         if (!designError) {
           const browserLog = path.join(runDir, "browser-server.log");
-          const browser = await startBrowserServer(workspace, browserLog);
-          fs.writeFileSync(
-            path.join(runDir, "browser-server.json"),
-            `${JSON.stringify({
+          const browserCapability = browserServerCapability(workspace, browserPolicy);
+          const browser = browserCapability.start
+            ? await startBrowserServer(
+              workspace,
+              browserLog,
+              60_000,
+              browserCapability.playwrightModule,
+            )
+            : null;
+          browserReport = browser
+            ? {
+              started: true,
+              policy: browserPolicy,
               endpoint: browser.endpoint,
               log: browserLog,
               next_teardown: {
@@ -1353,7 +1412,15 @@ async function main() {
                   ? "implementation-process-registry.jsonl"
                   : "agent-process-registry.jsonl",
               },
-            }, null, 2)}\n`,
+            }
+            : {
+              started: false,
+              policy: browserPolicy,
+              reason: browserCapability.reason,
+            };
+          fs.writeFileSync(
+            path.join(runDir, "browser-server.json"),
+            `${JSON.stringify(browserReport, null, 2)}\n`,
           );
           const implementationArgs = codexArgs({
             options,
@@ -1372,8 +1439,8 @@ async function main() {
             environment: childEnvironment,
           });
           const implementationPrompt = isTwoPhase
-            ? implementationPromptFor(task, treatment, design, { browserEndpoint: browser.endpoint })
-            : promptFor(task, treatment, { browserEndpoint: browser.endpoint });
+            ? implementationPromptFor(task, treatment, design, { browserEndpoint: browser?.endpoint })
+            : promptFor(task, treatment, { browserEndpoint: browser?.endpoint });
           process.stderr.write(
             `[${task.id}] ${profile}/${treatment} — implementation events: ${implementationEventsPath}\n`,
           );
@@ -1387,15 +1454,15 @@ async function main() {
               eventsPath: implementationEventsPath,
               stderrPath: implementationStderrPath,
               phase: isTwoPhase ? "implementation" : "agent",
-              browserEndpoint: browser.endpoint,
+              browserEndpoint: browser?.endpoint,
             });
           } finally {
-            await stopBrowserServer(browser.child);
+            await stopBrowserServer(browser?.child);
           }
         } else {
           fs.writeFileSync(
             path.join(runDir, "browser-server.json"),
-            `${JSON.stringify({ started: false, reason: designError }, null, 2)}\n`,
+            `${JSON.stringify(browserReport, null, 2)}\n`,
           );
           fs.writeFileSync(implementationEventsPath, "");
           fs.writeFileSync(implementationStderrPath, "");
@@ -1541,6 +1608,8 @@ async function main() {
           execution_network_access: REPLAY_EXECUTION_POLICY.networkAccess,
           execution_network_policy: REPLAY_EXECUTION_POLICY.networkPolicy,
           execution_environment: executionEnvironment,
+          browser_server_policy: browserPolicy,
+          browser_server_started: browserReport.started,
         };
         if (runnerError) row.runner_error = runnerError;
         fs.appendFileSync(responses, `${JSON.stringify(row)}\n`);
