@@ -265,13 +265,19 @@ enum Command {
         /// Restrict artifacts to those with direct evidence on this exact anchor
         #[arg(long)]
         anchor: Option<String>,
+        /// Restrict artifacts to direct evidence in this exact indexed file
+        #[arg(long)]
+        file: Option<String>,
+        /// Restrict artifacts to direct evidence in this current reconnaissance subject
+        #[arg(long)]
+        reconnaissance_subject: Option<String>,
         /// Restrict artifacts to direct semantic relations with this artifact id
         #[arg(long)]
         related_to: Option<i64>,
         /// Include superseded artifacts in list/search mode
         #[arg(long)]
         include_superseded: bool,
-        /// Include exact, hash-verified source evidence (follows summary children)
+        /// Include exact, hash-verified source evidence; requires --artifact
         #[arg(long)]
         source: bool,
         /// Maximum source evidence rows
@@ -283,7 +289,7 @@ enum Command {
         /// Maximum source bytes per evidence row
         #[arg(long, default_value_t = semantic_query::DEFAULT_SOURCE_BYTE_LIMIT)]
         source_bytes: usize,
-        /// Restrict source drill-down to file origins (dependency is opt-in)
+        /// Restrict semantic evidence/source files to origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
         /// Maximum bytes in the complete rendered JSON response
@@ -627,6 +633,12 @@ enum ScoutCommand {
         /// Subject symbol anchors or uniquely resolvable symbol names (repeatable)
         #[arg(long = "anchor")]
         anchors: Vec<String>,
+        /// Select card subjects from this exact indexed file (repeatable)
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Select card subjects from this current reconnaissance subject (repeatable)
+        #[arg(long = "subject")]
+        reconnaissance_subjects: Vec<String>,
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
@@ -639,7 +651,7 @@ enum ScoutCommand {
         /// Per-request wall-clock limit in seconds
         #[arg(long, default_value_t = 300)]
         timeout: u64,
-        /// Hard command-level request budget; required without --anchor
+        /// Hard request budget; required for automatic or file/subject-targeted selection
         #[arg(long)]
         max_calls: Option<usize>,
         /// Maximum serialized evidence bytes sent to the model
@@ -949,6 +961,8 @@ fn main() -> Result<()> {
             freshness,
             artifact,
             anchor,
+            file,
+            reconnaissance_subject,
             related_to,
             include_superseded,
             source,
@@ -976,6 +990,8 @@ fn main() -> Result<()> {
                     query,
                     artifact_id: artifact,
                     anchor,
+                    file,
+                    reconnaissance_subject,
                     related_to,
                     artifact_types,
                     freshness,
@@ -1256,6 +1272,8 @@ fn main() -> Result<()> {
             ScoutCommand::Cards {
                 root,
                 anchors,
+                files,
+                reconnaissance_subjects,
                 model,
                 reasoning,
                 service_tier,
@@ -1269,8 +1287,13 @@ fn main() -> Result<()> {
             } => {
                 let max_calls = match max_calls {
                     Some(value) => value,
-                    None if anchors.is_empty() => {
-                        anyhow::bail!("automatic card scouting requires --max-calls")
+                    None if anchors.is_empty()
+                        || !files.is_empty()
+                        || !reconnaissance_subjects.is_empty() =>
+                    {
+                        anyhow::bail!(
+                            "automatic or file/subject-targeted card scouting requires --max-calls"
+                        )
                     }
                     // One run per explicitly requested subject.
                     None => anchors.len(),
@@ -1282,6 +1305,8 @@ fn main() -> Result<()> {
                     dry_run,
                     scouting::CardScoutOptions {
                         anchors,
+                        files,
+                        reconnaissance_subjects,
                         model: llm::config::resolve_model(model.as_deref())?,
                         reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
                         service_tier,
@@ -1961,7 +1986,15 @@ fn cmd_scout_cards(
     options: scouting::CardScoutOptions,
 ) -> Result<()> {
     let conn = open_database_for_write(root, database)?;
-    let plan = scouting::plan::cards(root, &conn, &options.anchors)?;
+    let plan = scouting::plan::cards_with_selectors(
+        root,
+        &conn,
+        &scouting::plan::CardSelectors {
+            anchors: options.anchors.clone(),
+            files: options.files.clone(),
+            reconnaissance_subjects: options.reconnaissance_subjects.clone(),
+        },
+    )?;
     if dry_run {
         println!(
             "{}",
@@ -2113,6 +2146,21 @@ fn print_scout_batch(batch: &scouting::ScoutBatchReport) {
     );
     if batch.auto_limit_reached {
         println!("automatic selection reached its deterministic limit");
+    }
+    for (scope, coverage) in &batch.card_scope_coverage {
+        println!(
+            "  card scope {scope}: discovered {}; selected {}; omitted {}; reused {}; calls {}; completed {}; incomplete {}; failed {}; skipped call/context {}/{}",
+            coverage.discovered,
+            coverage.selected,
+            coverage.omitted,
+            coverage.reused,
+            coverage.model_calls,
+            coverage.completed,
+            coverage.incomplete,
+            coverage.failed,
+            coverage.skipped_call_budget,
+            coverage.skipped_context_budget,
+        );
     }
     for skipped in &batch.skipped_over_budget {
         println!(

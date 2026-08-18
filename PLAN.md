@@ -9,8 +9,8 @@
 > implemented. G15 design-before-edit task memory is parked after its harness
 > treatment preserved wrong design contracts on a real task. G16 remains an
 > independent conditional correction to G14 attached-memory delivery. G17
-> exact-identifier dominance and G18 task-directed semantic selection are the
-> next fixed-snapshot retrieval milestones.
+> exact-identifier dominance and G18 task-directed semantic coverage and
+> selection are implemented.
 
 ## Document policy
 
@@ -1818,7 +1818,7 @@ The root-layout replay did not trigger G16: independent adjudication found no
 artifact describing the required causal chain, so there was no useful existing
 artifact for the attachment boundary to miss.
 
-## Planned G17 — exact-identifier dominance
+## Implemented G17 — exact-identifier dominance
 
 Hybrid retrieval currently lets RRF, the cross-encoder, and repository policy
 place semantic or partial-name matches above an exact symbol definition. This
@@ -1831,11 +1831,15 @@ G17 adds an intent lane for identifier-shaped query tokens:
 1. Parse case-sensitive identifier tokens without promoting ordinary prose.
 2. Retrieve exact chunk-name/symbol definitions and exact whole-token symbol
    occurrences before hybrid candidates. Existing origin and explicit role
-   filters still apply.
+   filters still apply. A pure identifier lookup may return its complete
+   bounded occurrence tier; a mixed natural-language query admits one exact
+   occurrence per identifier before hybrid ranking resumes, so an incidental
+   common type cannot consume the whole result limit.
 3. For a multi-identifier query, reserve coverage across distinct identifiers
    before returning repeated occurrences of one identifier. Ambiguous exact
    definitions remain visible candidates; exactness does not manufacture
-   uniqueness.
+   uniqueness. Exact occurrence peers that survive hybrid retrieval use its
+   reranker/repository-policy order without crossing the tier boundary.
 4. Run vector fusion, reranking, and repository-policy penalties only inside
    lower intent tiers. They may reorder exact peers but cannot place a partial,
    example, or vector-only match above an exact definition.
@@ -1856,7 +1860,7 @@ G17 adds an intent lane for identifier-shaped query tokens:
 - prose-only queries retain the current hybrid path and complete response-byte
   budget.
 
-## Planned G18 — task-directed semantic coverage and selection
+## Implemented G18 — task-directed semantic coverage and selection
 
 Whole-repository weight ordering is not a workable completeness strategy for
 generated cards. In the Next.js root-layout run, 448 card calls still missed
