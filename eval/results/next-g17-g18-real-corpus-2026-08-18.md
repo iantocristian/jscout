@@ -225,8 +225,10 @@ variables through explicit `shell_environment_policy.set.*` CLI configuration,
 in addition to the outer process environment. This follows the
 [official Codex configuration contract](https://developers.openai.com/codex/config-reference/)
 for explicit subprocess environment values. The runner test asserts each
-generated setting. The registered hidden oracle did not need Chromium and
-passed before this harness correction.
+generated setting. A minimal actual `gpt-5.6-sol` CLI probe then ran an inner
+shell assertion against the configured `NEXT_TEST_BROWSER_WS_ENDPOINT` and
+printed `BROWSER_ENV_OK`. The registered hidden oracle did not need Chromium
+and passed before this harness correction.
 
 The agent's optional dev-mode test still hit `EMFILE` despite the inherited
 65,536 descriptor limit. That is not explained by the former low-ulimit bug;
@@ -248,6 +250,7 @@ Focused checks performed during review:
 - Terra and Sol real-agent replays plus a focused Sol interface rerun;
 - hidden oracle grading for all three replays;
 - replay-runner browser environment regression test.
+- actual Sol CLI inner-shell environment probe (`BROWSER_ENV_OK`).
 
 The final repository gate also runs formatting, warnings-as-errors Clippy, the
 complete Rust suite, and the npm script suite before delivery.
