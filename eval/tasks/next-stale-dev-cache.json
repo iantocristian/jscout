@@ -20,6 +20,7 @@
   "test_command": "corepack pnpm build && corepack pnpm test-dev-webpack test/e2e/app-dir/use-cache-dev/use-cache-dev.test.ts && corepack pnpm test-dev-turbo test/e2e/app-dir/use-cache-dev/use-cache-dev.test.ts",
   "browser_server": "required",
   "execution_environment": {
+    "NEXT_SKIP_ISOLATE": "1",
     "WATCHPACK_POLLING": "250"
   },
   "notes": [

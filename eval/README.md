@@ -588,7 +588,9 @@ history-free snapshot; grading compares against the real implementation.
    OS-assigned loopback port and per-arm process registry, and requires no
    launch changes for parallel runners. Every arm records the decision in
    `browser-server.json`. Next browser task sets should use `required` and set
-   `WATCHPACK_POLLING=250`. The agent prompt uses
+   `WATCHPACK_POLLING=250`. Next task sets whose agent-visible verification uses
+   the prepared dependency tree should also set `NEXT_SKIP_ISOLATE=1`; the
+   committed Next replay suites do both. The agent prompt repeats
    `NEXT_SKIP_ISOLATE=1` for direct `pnpm testonly` commands so Next does not
    attempt a nested dependency installation inside the Codex sandbox.
 

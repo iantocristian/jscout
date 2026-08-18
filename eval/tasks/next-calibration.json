@@ -19,6 +19,7 @@
   "test_command": "corepack pnpm build && corepack pnpm test-start test/e2e/app-dir/proxy-headers-live-view/proxy-headers-live-view.test.ts",
   "browser_server": "required",
   "execution_environment": {
+    "NEXT_SKIP_ISOLATE": "1",
     "WATCHPACK_POLLING": "250"
   },
   "notes": [
