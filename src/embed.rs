@@ -651,6 +651,7 @@ pub fn embed_missing_interruptible(
     conn: &Connection,
     provider: &Provider,
     batch_size: usize,
+    product_only: bool,
     should_cancel: impl FnMut() -> bool,
 ) -> Result<(usize, usize, bool)> {
     embed_missing_for_selection_interruptible(
@@ -658,7 +659,7 @@ pub fn embed_missing_interruptible(
         provider,
         batch_size,
         &crate::origin::defaults(),
-        false,
+        product_only,
         should_cancel,
     )
 }

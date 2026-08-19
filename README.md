@@ -100,9 +100,10 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage
                                #   --all includes normally excluded roles/resolved calls
-jscout watch <root> [--embed] [--enrich]
+jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
                                # optional vector/checker phases
+                               #   --product keeps embedding to the effective product corpus
                                #   repeat --deps from index to retain that corpus
                                #   --database PATH isolates index/memory state
                                #   --debounce-ms 2000 waits for a trailing quiet point
@@ -867,7 +868,10 @@ changed snapshot removes it. Run `jscout enrich` again when those
 occurrence-specific edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
-periodic full reconciliation. Manual `jscout index` always remains a full
+periodic full reconciliation. `watch --embed` updates the default corpus;
+`watch --embed --product` applies the same fresh reconnaissance policy and
+neutral production fallback as `jscout embed --product`, so it does not widen a
+product-only vector cache. Manual `jscout index` always remains a full
 disposable-snapshot rebuild.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP

@@ -376,6 +376,9 @@ enum Command {
         /// Also embed new/changed chunks on each re-index (needs a provider)
         #[arg(long)]
         embed: bool,
+        /// Restrict watched embedding to the effective product corpus
+        #[arg(long, requires = "embed")]
+        product: bool,
         /// Keep these installed dependency packages in the watched index
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
@@ -1070,6 +1073,7 @@ fn main() -> Result<()> {
             root,
             database,
             embed,
+            product,
             dependencies,
             enrich,
             enrich_timeout,
@@ -1081,6 +1085,7 @@ fn main() -> Result<()> {
             &watch::WatchOptions {
                 database: database.as_deref(),
                 embed_on_change: embed,
+                embed_product_only: product,
                 dependencies: &dependencies,
                 enrich_on_change: enrich,
                 enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
@@ -2362,6 +2367,7 @@ mod main_tests {
             "watch",
             ".",
             "--embed",
+            "--product",
             "--enrich",
             "--enrich-timeout",
             "45",
@@ -2377,6 +2383,7 @@ mod main_tests {
         .expect("watch enrichment controls parse");
         let Command::Watch {
             embed,
+            product,
             enrich,
             enrich_timeout,
             sidecar_path,
@@ -2389,12 +2396,15 @@ mod main_tests {
             panic!("expected watch")
         };
         assert!(embed);
+        assert!(product);
         assert!(enrich);
         assert_eq!(enrich_timeout, 45);
         assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
         assert_eq!(database, Some(PathBuf::from("watch.db")));
         assert_eq!(debounce_ms, 750);
         assert_eq!(reconcile_seconds, 30);
+
+        assert!(Cli::try_parse_from(["jscout", "watch", ".", "--product"]).is_err());
     }
 
     #[test]

@@ -22,6 +22,7 @@ const MAX_INCREMENTAL_SOURCE_PATHS: usize = 256;
 pub struct WatchOptions<'a> {
     pub database: Option<&'a Path>,
     pub embed_on_change: bool,
+    pub embed_product_only: bool,
     pub dependencies: &'a [String],
     pub enrich_on_change: bool,
     pub enrich_timeout: Duration,
@@ -616,12 +617,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     let mut next_reconcile = None;
 
     eprintln!(
-        "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} enrich={}",
+        "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={}",
         root.display(),
         database.display(),
         options.debounce.as_millis(),
         options.reconcile_interval.as_secs(),
         options.embed_on_change,
+        options.embed_product_only,
         options.enrich_on_change
     );
     if options.reconcile_interval.is_zero() {
@@ -742,7 +744,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             work,
                             started,
                         };
-                        run_embedding_interruptible(&root, &database, provider, &mut monitor)
+                        run_embedding_interruptible(
+                            &root,
+                            &database,
+                            provider,
+                            options.embed_product_only,
+                            &mut monitor,
+                        )
                     };
                     match result {
                         Ok((done, total, canceled)) => {
@@ -875,6 +883,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
 }
 
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
+    if options.embed_product_only && !options.embed_on_change {
+        bail!("--product requires --embed");
+    }
     if options.enrich_on_change && options.enrich_timeout.is_zero() {
         bail!("--enrich-timeout must be greater than zero seconds");
     }
@@ -912,6 +923,7 @@ fn run_embedding_interruptible(
     root: &Path,
     database: &Path,
     provider: Arc<embed::Provider>,
+    product_only: bool,
     monitor: &mut PhaseMonitor<'_>,
 ) -> Result<(usize, usize, bool)> {
     let root = root.to_path_buf();
@@ -920,7 +932,7 @@ fn run_embedding_interruptible(
     let worker_canceled = Arc::clone(&canceled);
     let worker = thread::spawn(move || -> Result<(usize, usize, bool)> {
         let conn = open_phase_database(&root, &database)?;
-        embed::embed_missing_interruptible(&conn, &provider, 64, || {
+        embed::embed_missing_interruptible(&conn, &provider, 64, product_only, || {
             worker_canceled.load(Ordering::SeqCst)
         })
     });
@@ -1590,6 +1602,7 @@ mod tests {
         let options = WatchOptions {
             database: None,
             embed_on_change: false,
+            embed_product_only: false,
             dependencies: &[],
             enrich_on_change: false,
             enrich_timeout: seconds(300),
@@ -1599,6 +1612,23 @@ mod tests {
         };
         let error = validate_options(&options).expect_err("invalid interval");
         assert!(error.to_string().contains("must exceed"));
+    }
+
+    #[test]
+    fn product_embedding_requires_embedding_phase() {
+        let options = WatchOptions {
+            database: None,
+            embed_on_change: false,
+            embed_product_only: true,
+            dependencies: &[],
+            enrich_on_change: false,
+            enrich_timeout: seconds(300),
+            checker_sidecar: None,
+            debounce: seconds(2),
+            reconcile_interval: seconds(600),
+        };
+        let error = validate_options(&options).expect_err("product needs embedding");
+        assert_eq!(error.to_string(), "--product requires --embed");
     }
 
     #[test]

@@ -1120,12 +1120,14 @@ not a latency target. A query may report that no snapshot is published for the
 entire structural-refresh interval, and every cycle logs its actual phase
 durations.
 
-`--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
-does not start the TypeScript checker, and never serves checker facts from a
-different structural snapshot. It may reuse an active exact-snapshot batch
-when either refresh mode proves the snapshot unchanged. Dependency selectors
-remain authoritative and must be supplied to watch exactly as they are to
-index.
+`--embed` and `--enrich` remain explicit. `--product` is subordinate to
+`--embed` and applies the same effective-product selection as manual
+`jscout embed --product`; a product-only vector cache must not be silently
+widened by the watcher. Plain watch performs no model calls, does not start the
+TypeScript checker, and never serves checker facts from a different structural
+snapshot. It may reuse an active exact-snapshot batch when either refresh mode
+proves the snapshot unchanged. Dependency selectors remain authoritative and
+must be supplied to watch exactly as they are to index.
 
 ### Generation state machine
 
