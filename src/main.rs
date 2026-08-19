@@ -1611,9 +1611,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     // "unchanged" count would always read 0 and misreport the rebuild as failed
     // change detection. Watch reports reuse for its incremental generations.
     println!(
-        "indexed {} files ({} failed) — {} chunks, {} refs in {:?}",
+        "indexed {} files ({} skipped) — {} chunks, {} refs in {:?}",
         o.indexed,
-        o.failed,
+        o.skipped,
         o.chunks,
         o.refs,
         started.elapsed()
@@ -1621,7 +1621,7 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     if o.extraction_reset {
         println!("snapshot refresh: rebuilt disposable structural state");
     }
-    indexer::report_failures(&o);
+    indexer::report_skips(&o);
     if !dependencies.is_empty() {
         println!(
             "dependency corpus: {} packages, {} files / {} bytes, {} files / {} bytes skipped",

@@ -430,23 +430,22 @@ coalesced generation.
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
 needed. Exact-snapshot checker facts may be reused when the resulting snapshot
-is unchanged; any changed snapshot drops them. A changed file that fails read
-or extraction is omitted from the visibly partial snapshot rather than served
-from its old row. The default two-second trailing quiet period coalesces edits;
-an event received during any phase advances the desired generation and cannot
-be consumed by the phase already running.
+is unchanged; any changed snapshot drops them. A source-looking file that
+cannot be read or extracted is reported and skipped; an old row for that path
+is not served as current. The refresh still succeeds over the indexable corpus.
+The default two-second trailing quiet period coalesces edits; an event received
+during any phase advances the desired generation and cannot be consumed by the
+phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
 busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
-backoff without waiting for another edit. Three identical per-file extraction
-failure sets expose the same visibly partial snapshot as manual `index`, mark
-the generation degraded, and continue optional phases; the default ten-minute
-reconciliation pass retries that coverage and repairs missed notifications.
-Its interval is measured from completion of the previous generation, avoiding
-back-to-back refreshes when a cycle itself is slow; a nonzero interval must be
-greater than the debounce period. A previously degraded, identical failure set
-can degrade immediately in later generations instead of paying three known-
-futile retries each time.
+backoff without waiting for another edit. File-local read or extraction skips
+do not fail or degrade a refresh and never trigger whole-repository retries;
+their path, stage, and error remain visible in every index report. The default
+ten-minute reconciliation pass naturally attempts those paths again while also
+repairing missed notifications. Its interval is measured from completion of
+the previous generation, avoiding back-to-back refreshes when a cycle itself is
+slow; a nonzero interval must be greater than the debounce period.
 Set `--reconcile-seconds 0` only when giving up that bounded recovery is
 acceptable.
 

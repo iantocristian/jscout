@@ -1201,7 +1201,7 @@ mod tests {
         )?;
         std::fs::write(repo.path().join("src/run.ts"), "export const run = 2;\n")?;
         let outcome = crate::indexer::index_repo(repo.path(), &conn)?;
-        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 0);
         assert!(file_policy_by_path(&conn, "src/run.ts")?.is_none());
         Ok(())
     }

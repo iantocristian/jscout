@@ -1057,8 +1057,8 @@ Acceptance checks:
   durable floor preserves compatible embedding and semantic-memory rows;
 - a fatal required-phase failure never publishes a snapshot marker describing
   new or partially rebuilt structural rows; individual file read/extraction
-  failures may publish the same visibly reported partial snapshot as
-  `jscout index`;
+  skips are reported and excluded from the successfully published indexable
+  corpus;
 - retrieval-only commands do not create or migrate a missing database;
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
@@ -1069,8 +1069,8 @@ Acceptance checks:
 real repository remains pending.** The production watcher uses a pure
 generation coordinator, a typed full/incremental refresh scope, fresh per-phase
 connections, explicit optional embedding/checker phases, supersession and
-cancellation, bounded retry and stable-failure degradation, exact self-output
-exclusions, dynamic external coverage, and periodic reconciliation. Unit and
+cancellation, bounded phase-error retry, exact self-output exclusions, dynamic
+external coverage, and periodic reconciliation. Unit and
 fixture coverage passes; the next operational step is to run it through branch
 switches and ordinary edits on the user's target repository.
 
@@ -1108,8 +1108,8 @@ inputs, selected dependency roots, external checker inputs, directories,
 backend errors, and unclassifiable missing paths also require full refresh.
 Full scope is sticky within a generation, so a mixed event cannot be downgraded
 by later source notifications. A changed file that cannot be read or extracted
-is removed from the published partial snapshot rather than leaving its
-previous structural row live.
+is reported and skipped rather than leaving its previous structural row live.
+The operation still publishes the indexable corpus successfully.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1149,7 +1149,7 @@ clean
   -> refreshing(generation)
   -> embedding(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
-  -> clean | degraded(snapshot, warnings)
+  -> clean
 
 any phase + newer event -> dirty(newer generation)
 any failed phase        -> retry-wait(same generation, phase) -> retry
@@ -1163,16 +1163,15 @@ checker work terminates its bounded sidecar when superseded. Before starting
 either optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh that returns individual file failures may expose the
-same explicitly reported partial snapshot as `jscout index`. The watcher
-reports every skipped path/stage/error, marks the generation `degraded`, and
-continues immediately to requested embedding and enrichment against that exact
-partial snapshot. A file-level read or parse rejection is subject-local; a
-whole-repository retry cannot repair deterministic inputs such as binary media
-with a source-looking extension. A later file event or periodic reconciliation
-naturally tries the path again. Only a refresh operation that returns `Err`
-(database, transaction, discovery, or other phase-level failure) enters retry
-wait and remains dirty until the required phase succeeds.
+A structural refresh may return individual file skips. `jscout index` and the
+watcher report every skipped path/stage/error and publish the indexable corpus
+as a successful, clean generation. A file-level read or parse rejection is
+subject-local; it does not degrade the generation, and a whole-repository retry
+cannot repair deterministic inputs such as binary media with a source-looking
+extension. A later file event or periodic reconciliation naturally tries the
+path again. Only a refresh operation that returns `Err` (database, transaction,
+discovery, or other phase-level failure) enters retry wait and remains dirty
+until the required phase succeeds.
 
 Phase-level failures use bounded exponential backoff. A parked retry gates
 fresh work for that generation and is consumed when it starts; attempts reset
@@ -1282,12 +1281,12 @@ delete semantic memory or content-hash embedding rows.
 
 1. Extract a coordinator with injectable event input, clock, and phase
    executor. Track desired/completed generations, dirty reasons, per-phase
-   retry state, debounce, degraded snapshots/coverage, and structured cycle
-   telemetry without timing-dependent tests.
+   retry state, debounce, degraded external-watch coverage, and structured
+   cycle telemetry without timing-dependent tests.
 2. Replace the pre-G12 watch loop with the normal full-refresh operation. Open
    a fresh connection per phase, configure `busy_timeout`, audit rollback
-   paths, implement bounded stable-file-failure degradation, and make fatal
-   failures retry automatically.
+   paths, report and skip file-local rejections, and make fatal phase failures
+   retry automatically.
 3. Invalidate cross-snapshot checker state through the structural refresh while
    retaining a reusable exact-snapshot batch; sequence optional embedding and
    exact-snapshot enrichment, and add generation checks plus cancellation
@@ -1335,9 +1334,9 @@ delete semantic memory or content-hash embedding rows.
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
-- a failed file reports the exact path/stage/error, publishes one visibly
-  degraded snapshot without repeating the repository refresh, and remains
-  covered by later file events and periodic reconciliation;
+- an unindexable file reports the exact path/stage/error, is skipped without
+  failing or degrading the refresh, and remains covered by later file events
+  and periodic reconciliation;
 - the default ten-minute reconciliation repairs a deliberately dropped
   notification, while explicitly disabling it reports the lost guarantee;
 - repeated full generations reuse cached embeddings, embed only unseen

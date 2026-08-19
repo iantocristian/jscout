@@ -110,7 +110,7 @@ struct Retry {
 #[derive(Debug, PartialEq, Eq)]
 enum FinishState {
     Continue,
-    Complete { degraded: bool },
+    Complete,
     Retry { after: Duration },
     Superseded,
 }
@@ -127,8 +127,6 @@ struct Coordinator {
     ready: Option<Work>,
     retry: Option<Retry>,
     retry_attempts: BTreeMap<Phase, u32>,
-    cycle_snapshot: Option<String>,
-    cycle_degraded: bool,
     dirty_reasons: BTreeSet<String>,
     dirty_source_paths: BTreeSet<String>,
     refresh_scope: RefreshScope,
@@ -150,8 +148,6 @@ impl Coordinator {
             ready: None,
             retry: None,
             retry_attempts: BTreeMap::new(),
-            cycle_snapshot: None,
-            cycle_degraded: false,
             dirty_reasons: BTreeSet::new(),
             dirty_source_paths: BTreeSet::new(),
             refresh_scope: RefreshScope::Full,
@@ -210,8 +206,6 @@ impl Coordinator {
         self.ready = None;
         self.retry = None;
         self.retry_attempts.clear();
-        self.cycle_snapshot = None;
-        self.cycle_degraded = false;
     }
 
     fn mark_reconciliation(&mut self, now: Duration) {
@@ -280,18 +274,15 @@ impl Coordinator {
         })
     }
 
-    fn finish_refresh(&mut self, work: Work, snapshot: String, degraded: bool) -> FinishState {
+    fn finish_refresh(&mut self, work: Work) -> FinishState {
         self.clear_active(work);
         if work.generation != self.desired_generation {
             return FinishState::Superseded;
         }
-        // The refresh operation succeeded and published a coherent snapshot.
-        // Individual files that could not be read or parsed are subject-local
-        // omissions: report them, mark the generation degraded, and continue.
-        // Only an Err from the refresh operation enters finish_error/retry.
+        // A returned outcome means the refresh successfully published the
+        // indexable corpus. File-local read/extraction skips are diagnostics,
+        // not phase failures. Only Err enters finish_error/retry.
         self.retry_attempts.remove(&Phase::Refresh);
-        self.cycle_degraded = degraded;
-        self.cycle_snapshot = Some(snapshot);
         self.advance(work)
     }
 
@@ -352,10 +343,7 @@ impl Coordinator {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
             self.dirty_source_paths.clear();
-            self.cycle_snapshot = None;
-            let degraded = self.cycle_degraded;
-            self.cycle_degraded = false;
-            FinishState::Complete { degraded }
+            FinishState::Complete
         }
     }
 
@@ -658,21 +646,16 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                 Phase::Refresh => {
                     match run_refresh(&root, &database, options.dependencies, work.refresh_scope) {
                         Ok(result) => {
-                            indexer::report_failures(&result.outcome);
+                            indexer::report_skips(&result.outcome);
                             eprintln!(
-                                "watch generation={} phase=refresh refresh_scope={} status={} snapshot={} indexed={} unchanged={} removed={} failed={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
+                                "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} skipped={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
                                 work.generation,
                                 work.refresh_scope,
-                                if result.outcome.failed == 0 {
-                                    "succeeded"
-                                } else {
-                                    "partial"
-                                },
                                 result.snapshot,
                                 result.outcome.indexed,
                                 result.outcome.unchanged,
                                 result.outcome.removed,
-                                result.outcome.failed,
+                                result.outcome.skipped,
                                 result.outcome.chunks,
                                 result.outcome.refs,
                                 if result.outcome.projection_rebuilt {
@@ -708,11 +691,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             );
                             report_finish(
                                 work,
-                                coordinator.finish_refresh(
-                                    work,
-                                    result.snapshot,
-                                    result.outcome.failed > 0,
-                                ),
+                                coordinator.finish_refresh(work),
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -1054,12 +1033,8 @@ fn report_finish(
 ) {
     match state {
         FinishState::Continue => {}
-        FinishState::Complete { degraded } => {
-            eprintln!(
-                "watch generation={} status={}",
-                work.generation,
-                if degraded { "degraded" } else { "clean" }
-            );
+        FinishState::Complete => {
+            eprintln!("watch generation={} status=clean", work.generation);
             *next_reconcile =
                 (!reconcile_interval.is_zero()).then(|| now.saturating_add(reconcile_interval));
         }
@@ -1318,19 +1293,13 @@ mod tests {
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(refresh.phase, Phase::Refresh);
         assert_eq!(refresh.refresh_scope, RefreshScope::Full);
-        assert_eq!(
-            coordinator.finish_refresh(refresh, "s1".into(), false),
-            FinishState::Continue
-        );
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
         let embed = coordinator.next_work(Duration::ZERO).expect("embed");
         assert_eq!(embed.phase, Phase::Embed);
         assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
         let enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
         assert_eq!(enrich.phase, Phase::Enrich);
-        assert_eq!(
-            coordinator.finish_optional(enrich),
-            FinishState::Complete { degraded: false }
-        );
+        assert_eq!(coordinator.finish_optional(enrich), FinishState::Complete);
     }
 
     #[test]
@@ -1338,10 +1307,7 @@ mod tests {
         let mut coordinator = Coordinator::new(seconds(2), true, true);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
-        assert_eq!(
-            coordinator.finish_refresh(refresh, "s1".into(), false),
-            FinishState::Superseded
-        );
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Superseded);
         assert!(coordinator.next_work(seconds(2)).is_none());
         let next = coordinator.next_work(seconds(3)).expect("next refresh");
         assert_eq!(next.generation, 2);
@@ -1387,19 +1353,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_refresh_advances_immediately_as_degraded() {
+    fn skipped_files_do_not_degrade_a_successful_refresh() {
         let mut coordinator = Coordinator::new(seconds(2), true, false);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
-        assert_eq!(
-            coordinator.finish_refresh(refresh, "partial".into(), true),
-            FinishState::Continue
-        );
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
         let embed = coordinator.next_work(Duration::ZERO).expect("embed");
         assert_eq!(embed.phase, Phase::Embed);
-        assert_eq!(
-            coordinator.finish_optional(embed),
-            FinishState::Complete { degraded: true }
-        );
+        assert_eq!(coordinator.finish_optional(embed), FinishState::Complete);
         assert!(coordinator.retry.is_none());
     }
 
@@ -1407,10 +1367,7 @@ mod tests {
     fn reconciliation_is_immediate_only_after_the_previous_generation_completes() {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
-        assert_eq!(
-            coordinator.finish_refresh(startup, "s1".into(), false),
-            FinishState::Complete { degraded: false }
-        );
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Complete);
         assert!(coordinator.is_clean());
 
         coordinator.mark_reconciliation(seconds(10));
@@ -1433,20 +1390,14 @@ mod tests {
             ["source:a.ts".to_string(), "source:b.ts".to_string()].into()
         );
         assert_eq!(coordinator.refresh_scope, RefreshScope::Incremental);
-        assert_eq!(
-            coordinator.finish_refresh(startup, "old".into(), false),
-            FinishState::Superseded
-        );
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Superseded);
     }
 
     #[test]
     fn a_full_refresh_signal_is_sticky_within_the_generation() {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
-        assert_eq!(
-            coordinator.finish_refresh(startup, "s1".into(), false),
-            FinishState::Complete { degraded: false }
-        );
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Complete);
 
         coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
         coordinator.mark_dirty(seconds(2), DirtySignal::full("boundary:package.json"));
@@ -1467,10 +1418,7 @@ mod tests {
     fn a_large_source_batch_promotes_to_full_refresh() {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
-        assert_eq!(
-            coordinator.finish_refresh(startup, "s1".into(), false),
-            FinishState::Complete { degraded: false }
-        );
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Complete);
 
         for index in 0..=MAX_INCREMENTAL_SOURCE_PATHS {
             let path = format!("src/file-{index}.ts");
@@ -1649,6 +1597,20 @@ mod tests {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(paths, vec!["b.ts"]);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_with_an_unreadable_source_succeeds_with_a_skip() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("video.ts"), [0xff, 0xfe])?;
+        let database = directory.path().join("watch.db");
+
+        let result = run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
+
+        assert_eq!(result.outcome.skipped, 1);
+        assert_eq!(result.outcome.skips[0].path, "video.ts");
+        assert!(!result.snapshot.is_empty());
         Ok(())
     }
 

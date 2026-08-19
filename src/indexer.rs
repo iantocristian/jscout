@@ -23,8 +23,10 @@ pub struct IndexOutcome {
     /// Previously indexed first-party files omitted from the resulting
     /// snapshot because they disappeared or failed read/extraction.
     pub removed: usize,
-    pub failed: usize,
-    pub failures: Vec<IndexFailure>,
+    /// Source-looking inputs omitted because they could not be read or
+    /// extracted. These are file-local corpus exclusions, not index failures.
+    pub skipped: usize,
+    pub skips: Vec<IndexSkip>,
     pub chunks: usize,
     pub refs: usize,
     pub dependency_packages: usize,
@@ -43,21 +45,21 @@ pub struct IndexOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexFailure {
+pub struct IndexSkip {
     pub path: String,
     pub stage: &'static str,
     pub error: String,
 }
 
 impl IndexOutcome {
-    fn record_failure(
+    fn record_skip(
         &mut self,
         path: impl Into<String>,
         stage: &'static str,
         error: impl std::fmt::Display,
     ) {
-        self.failed += 1;
-        self.failures.push(IndexFailure {
+        self.skipped += 1;
+        self.skips.push(IndexSkip {
             path: path.into(),
             stage,
             error: error.to_string(),
@@ -65,14 +67,14 @@ impl IndexOutcome {
     }
 }
 
-pub fn report_failures(outcome: &IndexOutcome) {
-    if outcome.failures.is_empty() {
+pub fn report_skips(outcome: &IndexOutcome) {
+    if outcome.skips.is_empty() {
         return;
     }
-    eprintln!("index failures ({}):", outcome.failures.len());
-    for failure in &outcome.failures {
-        let error = failure.error.replace('\n', "\n      ");
-        eprintln!("  [{}] {}: {error}", failure.stage, failure.path);
+    eprintln!("source files skipped ({}):", outcome.skips.len());
+    for skip in &outcome.skips {
+        let error = skip.error.replace('\n', "\n      ");
+        eprintln!("  [{}] {}: {error}", skip.stage, skip.path);
     }
 }
 
@@ -200,8 +202,8 @@ fn index_repo_impl(
         indexed: 0,
         unchanged: 0,
         removed: 0,
-        failed: 0,
-        failures: Vec::new(),
+        skipped: 0,
+        skips: Vec::new(),
         chunks: 0,
         refs: 0,
         dependency_packages: 0,
@@ -278,7 +280,7 @@ fn index_repo_impl(
                 if let Some((old_id, _, _)) = existing.get(&rel) {
                     store::delete_file(conn, *old_id)?;
                 }
-                outcome.record_failure(rel, "read", error);
+                outcome.record_skip(rel, "read", error);
                 continue;
             }
         };
@@ -320,7 +322,7 @@ fn index_repo_impl(
                 if let Some((old_id, _, _)) = existing.get(&rel) {
                     store::delete_file(conn, *old_id)?;
                 }
-                outcome.record_failure(rel, "extract", e);
+                outcome.record_skip(rel, "extract", e);
             }
         }
     }
@@ -798,7 +800,7 @@ fn index_dependency_files(
                         // transient read failure; a later successful cycle can
                         // replace it without first losing known-good data.
                         seen.insert(display.clone());
-                        outcome.record_failure(
+                        outcome.record_skip(
                             display,
                             "read",
                             format!("{}: {error}", file.source_path.display()),
@@ -849,7 +851,7 @@ fn index_dependency_files(
                         outcome.refs += refs;
                     }
                     Err(error) => {
-                        outcome.record_failure(display, "extract", error);
+                        outcome.record_skip(display, "extract", error);
                     }
                 }
             }
@@ -1122,18 +1124,19 @@ mod tests {
     use crate::{embed, origin, query, search, semantic, store, structural};
 
     #[test]
-    fn reports_the_file_and_stage_for_read_failures() -> Result<()> {
+    fn reports_the_file_and_stage_for_skipped_reads() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(repo.path().join("bad.ts"), [0xff, 0xfe])?;
         let conn = store::open(repo.path())?;
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!(outcome.failed, 1);
-        assert_eq!(outcome.failures.len(), 1);
-        assert_eq!(outcome.failures[0].path, "bad.ts");
-        assert_eq!(outcome.failures[0].stage, "read");
-        assert!(!outcome.failures[0].error.is_empty());
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.skips.len(), 1);
+        assert_eq!(outcome.skips[0].path, "bad.ts");
+        assert_eq!(outcome.skips[0].stage, "read");
+        assert!(!outcome.skips[0].error.is_empty());
+        assert!(!structural::current_snapshot(&conn)?.is_empty());
         Ok(())
     }
 
@@ -1148,7 +1151,7 @@ mod tests {
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!((outcome.indexed, outcome.failed), (1, 0));
+        assert_eq!((outcome.indexed, outcome.skipped), (1, 0));
         let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
         assert!(chunks > 0);
         Ok(())
@@ -2194,7 +2197,7 @@ mod tests {
         let refreshed = refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
         assert!(refreshed.extraction_reset);
         assert_eq!(
-            (refreshed.indexed, refreshed.unchanged, refreshed.failed),
+            (refreshed.indexed, refreshed.unchanged, refreshed.skipped),
             (1, 0, 0)
         );
         assert_eq!(structural::current_snapshot(&conn)?, snapshot);
@@ -2284,7 +2287,7 @@ mod tests {
         let outcome =
             incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
-        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.removed, 1);
         assert_eq!(
             conn.query_row(
@@ -2614,8 +2617,8 @@ mod tests {
         let fast = index_repo_with_options(repo.path(), &reset, &options)?;
         assert!(fast.extraction_reset, "cleared hashes must take the reset");
         assert_eq!(
-            (fast.indexed, fast.unchanged, fast.failed),
-            (slow.indexed, slow.unchanged, slow.failed)
+            (fast.indexed, fast.unchanged, fast.skipped),
+            (slow.indexed, slow.unchanged, slow.skipped)
         );
 
         for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?
