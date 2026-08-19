@@ -13,7 +13,9 @@
 > selection are implemented. G13 has one planned extension: evidence-backed
 > generated-output boundary reconnaissance for unignored build artifacts.
 > Real-monorepo use has also registered a syntax-aware G17 occurrence-ordering
-> correction and staged-use guidance for the existing G14/G18 surfaces.
+> correction and staged-use guidance for the existing G14/G18 surfaces. G19 is
+> planned as a compact-transport and path-projection pass; it does not trigger
+> G16 or widen the semantic product surface.
 
 ## Document policy
 
@@ -2076,6 +2078,209 @@ judgment against stated criteria.
 - useful-artifact precision improves without widening global generation or
   response budgets, and generated prose remains separate from code ranking.
 
+## Planned G19 — session-efficient compact transport
+
+Real-monorepo use established a second bottleneck after localization quality:
+individually budgeted responses can still repeat enough metadata across an
+exploratory session to consume more context than the repository evidence. In
+one 42-call review, 27 responses with retained measurements totalled 358,334
+inner JSON bytes. Extrapolation across 15 truncated, omitted, or error responses
+put total jscout output near 460–510 KiB, or roughly 115k–145k raw tokens before
+client-side truncation. Approximately 11.8k additional tool-discovery tokens
+were a client orchestration cost and are excluded from the jscout total.
+
+The useful payload was much narrower: exact symbols and locations, short source
+snippets, opaque anchors, direct uses/call edges, one-sentence workflow meaning,
+defining participants, and freshness. G19 reduces repeated transport without
+removing those facts, weakening source verification, or raising the existing
+24 KB per-response default.
+
+### Confirmed serializer defects
+
+The current compact serializers already remove many diagnostic fields, but the
+review and code inspection confirm these remaining defects:
+
+- search emits the snapshot once at response level and repeats it inside every
+  symbol follow-up together with tool names and origins;
+- a generated follow-up restricts `origins` to the hit's single origin. For a
+  workspace hit this can omit root/unowned first-party usages, while a
+  dependency-only follow-up can omit the first-party callers that matter. This
+  is a correctness defect, not just duplicated bytes;
+- compact search still emits normal-path retrieval, candidate-pool, semantic
+  score, and successful memory-attachment traversal diagnostics whose primary
+  consumer is telemetry rather than the coding agent;
+- exact semantic-artifact detail always returns model/prompt/snapshot/timestamp
+  provenance and up to eight complete supports containing source/context hashes,
+  even when hash-verified source was not requested;
+- expanded search serializes a ranked induced neighborhood rather than the
+  smallest useful cross-file continuations, retaining unrelated graph nodes and
+  high-frequency framework edges; and
+- MCP serializes the JSON result inside `content[].text`. This is compatible
+  with existing clients but can appear as escaped JSON inside another captured
+  result and must be measured separately from the inner rendered-byte budget.
+
+Short source excerpts are retained: the review found them useful and estimated
+that they were less than one fifth of total payload. G19 targets metadata,
+diagnostics, repeated defaults, and graph shape before reducing source evidence.
+
+### Compact search and follow-up contract
+
+Compact search keeps one response-level snapshot. Each hit keeps its exact
+anchor and a short list of compatible follow-up tools, not a repeated complete
+arguments object. Exact-anchor tools already accept an anchor without a
+snapshot and fail with candidates rather than guessing if current resolution is
+ambiguous; a caller that needs strict pinning may copy the one response-level
+snapshot into the follow-up.
+
+First-party follow-ups omit `origins`, preserving the normal combined
+`repository` plus `workspace` corpus. A dependency target carries an explicit
+non-default inclusion that permits the dependency definition and first-party
+callers instead of constraining the entire drill-down to `dependency`. Tests
+must cover repository-to-workspace, workspace-to-repository, and
+first-party-to-dependency usage edges.
+
+G19 does not initially add server-side short handles. Handles require session
+state, expiry, collision, replay, and reconnect semantics; removing repeated
+defaults captures most of the measured waste while anchors remain durable and
+copy-safe. A stateful handle enters consideration only if post-G19 measurement
+shows anchor strings, rather than bodies or graphs, remain a material share.
+
+The intended default shape is approximately:
+
+```json
+{
+  "snapshot": "...",
+  "hits": [
+    {
+      "anchor": "...",
+      "at": "file:line",
+      "symbol": "...",
+      "snippet": "...",
+      "tools": ["definition", "who_uses", "neighborhood"],
+      "key_edges": ["calls X", "used by Y"]
+    }
+  ]
+}
+```
+
+Lower-ranked hits may lose snippets before identity, location, and key edges.
+Session-aware suppression of previously returned snippets is deferred; staged
+limits and `include_memory: false` avoid adding retrieval-session state for the
+first correction.
+
+### Compact semantic-artifact views
+
+Exact `semantic_memory` drill-down gains an explicit view with a type-aware
+compact default:
+
+- `compact`: identity, freshness, one-sentence description or primary claim,
+  and, for workflows, defining participants only;
+- `body`: the complete artifact body plus one compact evidence locator by
+  default, without model/prompt/timestamp provenance or hashes;
+- `full`: the current diagnostic artifact, relations, complete selected
+  supports, provenance, and hashes.
+
+`include_source` remains explicit and hash verification remains mandatory
+internally. Its default returned evidence count becomes one and stays widenable.
+The compact/body response reports support and relation omission counts so a
+caller can request `full` deliberately. Supporting leaf helpers and related
+summaries do not accompany a defining-workflow request unless selected by the
+view or relation request.
+
+Broad semantic discovery continues to return compact handles. G18's
+support/participant-overlap investigation owns duplicate or overlapping
+workflow diversity; G19 does not deduplicate artifacts by prose similarity.
+
+### Agent diagnostics versus telemetry
+
+Default compact responses retain diagnostics only when they change the next
+action:
+
+- degraded/failed lexical, vector, or reranker stages;
+- truncation plus actionable omission counts;
+- `no_connected_memory` and `no_supported_memory` handoffs; and
+- artifact freshness and trust labels.
+
+Candidate-pool size, uncalibrated component scores, successful attachment graph
+depth/node counts, full byte accounting, model/prompt provenance, and evidence
+hashes move behind `debug: true` or the `full` artifact view. They remain in
+per-tool telemetry so G16 and retrieval evaluations do not lose observability.
+`rendered_bytes` remains visible when a response truncates; normal-path byte
+measurements are available in telemetry and debug output rather than repeated
+in every agent response.
+
+### Path-shaped expansion
+
+Expanded search gains a path projection optimized for the product question:
+"how does this localized entry point reach another package, handler, state
+transition, or effect?" The compact default returns a ranked path forest rooted
+at the selected hit seeds. It retains the edges required to explain each
+cross-file continuation and gives nodes response-local short IDs while keeping
+the exact anchor at its first occurrence.
+
+The existing induced neighborhood remains an explicit diagnostic mode.
+High-frequency/common calls are suppressed through existing edge-kind weights,
+degree/hub damping, and path contribution—not a brittle blacklist of names such
+as `default`, `object`, or `string`. An edge on a selected connecting path is
+retained even when its display name is common. Omitted path/node/edge counts and
+truncation remain visible, and agents may widen every existing bound.
+
+### MCP structured-content experiment
+
+The serializer first produces one canonical structured value so text and any
+future MCP `structuredContent` representation are fact-equivalent. G19 then
+tests Codex, Claude Code, and the supported pi/MCP clients before changing the
+wire shape. A client that ignores structured content must retain the JSON-text
+fallback; a client that exposes both forms must not receive two full copies in
+model context. Structured content ships only through a negotiated/profiled
+path that demonstrates lower client-visible bytes. It is not assumed to solve
+compression merely because the protocol can represent it.
+
+Measurement distinguishes:
+
+1. inner canonical JSON bytes;
+2. JSON-RPC wire bytes after escaping/envelopes; and
+3. client-visible model-context bytes after the client's MCP rendering.
+
+### Implementation order and acceptance
+
+1. Retain or reconstruct a representative query/artifact transcript before
+   changing serializers; label the historical 460–510 KiB estimate as an
+   estimate rather than an exact baseline.
+2. Fix cross-origin follow-up semantics and remove repeated first-party defaults.
+3. Add compact artifact views and debug-gate routine diagnostics.
+4. Add path-shaped expansion while preserving explicit neighborhood mode.
+5. Run the structured-content compatibility experiment; ship it only where it
+   reduces client-visible context without a fallback regression.
+6. Replay the staged 4–6-result workflow queries and one deliberately broad
+   diagnostic set.
+
+Acceptance requires:
+
+- all previously identified high-value facts—locations, anchors, snippets,
+  decisive edges, descriptions, defining participants, and freshness—remain
+  available without `debug` or `full`;
+- compact/default aggregate inner JSON bytes fall by at least 60% on the
+  retained representative replay at equal fact coverage. The reported 65–75%
+  reduction remains a hypothesis until measured;
+- strict individual response-byte budgets and explicit omission reporting
+  remain intact;
+- copy-safe exact drill-down returns cross-origin usages rather than silently
+  applying the seed hit's origin as a global filter;
+- `compact`, `body`, and `full` artifact views are deterministic, and `full` is
+  fact-equivalent to the pre-G19 diagnostic result;
+- path mode preserves the verified configuration-publish skeleton with fewer
+  returned nodes/edges than neighborhood mode, while explicitly requested
+  neighborhood output remains available;
+- normal compact responses omit successful-stage scores/pools/hashes, while
+  degraded/truncated responses and telemetry retain enough information to
+  diagnose the event; and
+- no client receives both complete text and structured copies in model context.
+
+This milestone is independent of G15 and does not trigger G16. The observed
+failure was excessive/repeated delivery of memory and graph metadata, not a
+useful artifact hidden solely by G14's evidence-connection boundary.
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -2097,6 +2302,7 @@ consequences that still govern implementation.
 | Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
 | Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
 | Real 7,000-plus-file monorepo use localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and evidence-backed consolidated workflow write-back; do not trigger G16 or claim retrieval rank measures importance |
+| The same 42-call review produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G19 compact artifact views, routine-diagnostic gating, cross-origin-safe concise follow-ups, and path-shaped expansion; target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
 
 Relevant result summaries include:
 
