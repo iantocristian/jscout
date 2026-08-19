@@ -26,8 +26,12 @@ import { buildRegistry } from "../src/registry.mjs";
 
 const VERSIONS = { gateway: "0.1.0-test", pi_ai: "0.84.1", node: process.versions.node };
 
-function fauxState({ responses = [], retryPolicy, exit } = {}) {
-  const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-model", reasoning: false }] });
+function fauxState({ responses = [], retryPolicy, exit, api = "faux" } = {}) {
+  const faux = fauxProvider({
+    api,
+    provider: "faux",
+    models: [{ id: "faux-model", reasoning: false }],
+  });
   faux.setResponses(responses);
   const models = createModels();
   models.setProvider(faux.provider);
@@ -106,6 +110,7 @@ test("capabilities describes a known model and rejects malformed specs", async (
 test("complete returns started then exactly one submit-tool call", async () => {
   let seenToolChoice;
   const { state } = fauxState({
+    api: "openai-codex-responses",
     responses: [
       (_context, options) => {
         seenToolChoice = options.toolChoice;
@@ -175,10 +180,52 @@ test("text-only and multi-tool responses are protocol failures", async () => {
 });
 
 test("tool-contract failures retry and recover within the configured policy", async () => {
+  const success = () =>
+    fauxAssistantMessage(
+      [fauxToolCall("submit_workflow_classification", { ok: true })],
+      { stopReason: "toolUse" },
+    );
   const { state, faux } = fauxState({
     retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
     responses: [
       fauxAssistantMessage([fauxText("ordinary text instead")], { stopReason: "stop" }),
+      success(),
+    ],
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  await handleMessage(state, completeRequest(), send);
+
+  const retried = sent.at(-1);
+  assert.equal(retried.kind, "result");
+  assert.equal(retried.attempts, 2);
+  assert.equal(faux.state.callCount, 2);
+
+  faux.setResponses([success()]);
+  await handleMessage(state, completeRequest({ id: "req-2" }), send);
+  const single = sent.at(-1);
+  assert.equal(single.kind, "result");
+  assert.equal(single.attempts, 1);
+  assert.equal(
+    retried.usage.input_tokens,
+    single.usage.input_tokens * 2,
+    "the repeated prompt usage is accumulated",
+  );
+  assert.ok(
+    retried.usage.output_tokens > single.usage.output_tokens,
+    "the rejected text response is included in output usage",
+  );
+  assert.ok(retried.usage.total_tokens > single.usage.total_tokens);
+});
+
+test("exhausted tool-contract retries leave the gateway usable", async () => {
+  const textOnly = () => fauxAssistantMessage([fauxText("ordinary text")], { stopReason: "stop" });
+  const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
+    responses: [
+      textOnly(),
+      textOnly(),
+      textOnly(),
       fauxAssistantMessage(
         [fauxToolCall("submit_workflow_classification", { ok: true })],
         { stopReason: "toolUse" },
@@ -189,9 +236,15 @@ test("tool-contract failures retry and recover within the configured policy", as
   await greet(state, send);
   await handleMessage(state, completeRequest(), send);
 
+  assert.equal(sent.at(-1).kind, "error");
+  assert.equal(sent.at(-1).error.code, "tool_contract");
+  assert.equal(faux.state.callCount, 3);
+  assert.equal(state.active, null);
+
+  await handleMessage(state, completeRequest({ id: "req-2" }), send);
   assert.equal(sent.at(-1).kind, "result");
-  assert.equal(sent.at(-1).attempts, 2);
-  assert.equal(faux.state.callCount, 2);
+  assert.equal(sent.at(-1).id, "req-2");
+  assert.equal(faux.state.callCount, 4);
 });
 
 test("forced-tool mode is normalized across pi-ai APIs", () => {
@@ -199,6 +252,7 @@ test("forced-tool mode is normalized across pi-ai APIs", () => {
   assert.equal(requiredToolChoice("anthropic-messages"), "any");
   assert.equal(requiredToolChoice("google-generative-ai"), "any");
   assert.equal(requiredToolChoice("azure-openai-responses"), undefined);
+  assert.equal(requiredToolChoice("future-api"), undefined);
 });
 
 test("a second complete while one is active reports busy", async () => {
