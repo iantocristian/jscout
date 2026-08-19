@@ -1690,8 +1690,12 @@ condition, not a reason to weaken deterministic retrieval.
 MCP `tools/list` necessarily returns complete schemas; a client may present a
 names-only inventory, but jscout will not add a parallel discovery protocol or
 remove schema guidance solely to compensate for a client that prints every
-definition. Valid rejection of impossible bounds such as `source_limit: 0`
-also remains part of the contract.
+definition. Optional payload limits use zero consistently to mean omission when
+that interpretation is unambiguous. In particular, `source_limit: 0` is
+equivalent to `include_source: false` rather than an error; the architecture
+inquiry otherwise spent six parallel calls learning a constraint that provided
+no safety or retrieval value. Positive limits retain their declared bounds and
+invalid contradictory combinations still fail explicitly.
 
 ## Parked G15 — design-before-edit task memory
 
@@ -2053,8 +2057,11 @@ must preserve separately useful stages.
 
 When an agent verifies a stable end-to-end workflow that existing memory splits
 across narrower artifacts, the intended correction is evidence-backed
-`annotate` write-back. It publishes the consolidated workflow with exact source
-participants rather than launching another broad speculative scouting batch.
+`annotate` write-back when the operator or task workflow authorizes persistent
+memory mutation. A read-only repository question does not implicitly authorize
+write-back. When authorized, it publishes the consolidated workflow with exact
+source participants rather than launching another broad speculative scouting
+batch.
 The configuration-publish review is the registered case: analysis/staging,
 queue dispatch, publish mutation, completion notification, and UI state form one
 verified larger skeleton while remaining individually inspectable stages.
@@ -2082,12 +2089,21 @@ judgment against stated criteria.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
-exploratory session to consume more context than the repository evidence. In
-one 42-call review, 27 responses with retained measurements totalled 358,334
-inner JSON bytes. Extrapolation across 15 truncated, omitted, or error responses
-put total jscout output near 460–510 KiB, or roughly 115k–145k raw tokens before
-client-side truncation. Approximately 11.8k additional tool-discovery tokens
-were a client orchestration cost and are excluded from the jscout total.
+exploratory session to consume more context than the repository evidence. The
+[architecture-inquiry call report](eval/results/workflow-architecture-inquiry-2026-08-19.md)
+records the exact 42-call inventory. Twenty-seven responses with retained
+measurements totalled 358,334 inner JSON bytes. Extrapolation across 15
+truncated, omitted, or error responses put total jscout output near 460–510
+KiB, or roughly 115k–145k raw tokens before client-side truncation.
+Approximately 11.8k additional tool-discovery tokens were a client
+orchestration cost and are excluded from the jscout total.
+
+This is an architecture-inquiry workload: the agent was explicitly asked to
+discover and explain several product workflows. It is a valid primary jscout
+use case and a useful stress test for conceptual retrieval, but it is not an
+independent coding agent localizing evidence while implementing a story or
+fixing a bug. G19 may use it to optimize transport; claims about implementation
+behavior require later real-work evidence.
 
 The useful payload was much narrower: exact symbols and locations, short source
 snippets, opaque anchors, direct uses/call edges, one-sentence workflow meaning,
@@ -2125,12 +2141,21 @@ diagnostics, repeated defaults, and graph shape before reducing source evidence.
 
 ### Compact search and follow-up contract
 
-Compact search keeps one response-level snapshot. Each hit keeps its exact
-anchor and a short list of compatible follow-up tools, not a repeated complete
-arguments object. Exact-anchor tools already accept an anchor without a
-snapshot and fail with candidates rather than guessing if current resolution is
-ambiguous; a caller that needs strict pinning may copy the one response-level
-snapshot into the follow-up.
+**Decision amendment to G14:** compact search no longer emits a complete
+arguments object for every eligible hit. The architecture-inquiry agent used
+none of the objects, but that does not establish that implementation agents
+will also ignore them. The highest-ranked uniquely anchored hit therefore keeps
+one complete copy-safe follow-up object by default. Lower hits keep their exact
+anchor and compatible tool names without repeating snapshot/default arguments.
+An explicit debug or widened-follow-up mode may return complete objects for more
+hits.
+
+Compact search also keeps one response-level snapshot. Exact-anchor tools accept
+an anchor without a snapshot and fail with candidates rather than guessing if
+current resolution is ambiguous; a caller that needs strict pinning may use the
+complete top-hit object or copy the one response-level snapshot. Later real
+implementation work must measure whether the top-hit handoff is selected before
+G19 removes or multiplies it.
 
 First-party follow-ups omit `origins`, preserving the normal combined
 `repository` plus `workspace` corpus. A dependency target carries an explicit
@@ -2157,6 +2182,9 @@ The intended default shape is approximately:
       "symbol": "...",
       "snippet": "...",
       "tools": ["definition", "who_uses", "neighborhood"],
+      "followup": {
+        "arguments": {"anchor": "...", "snapshot": "..."}
+      },
       "key_edges": ["calls X", "used by Y"]
     }
   ]
@@ -2244,16 +2272,25 @@ Measurement distinguishes:
 
 ### Implementation order and acceptance
 
-1. Retain or reconstruct a representative query/artifact transcript before
-   changing serializers; label the historical 460–510 KiB estimate as an
-   estimate rather than an exact baseline.
+1. Preserve the architecture-inquiry call inventory and any recoverable raw
+   responses before changing serializers; label the historical 460–510 KiB
+   total as an estimate rather than an exact baseline.
 2. Fix cross-origin follow-up semantics and remove repeated first-party defaults.
 3. Add compact artifact views and debug-gate routine diagnostics.
 4. Add path-shaped expansion while preserving explicit neighborhood mode.
 5. Run the structured-content compatibility experiment; ship it only where it
    reduces client-visible context without a fallback regression.
-6. Replay the staged 4–6-result workflow queries and one deliberately broad
-   diagnostic set.
+6. Run two separate replays:
+   - a fixed-call transport replay with the same valid queries, arguments, call
+     count, and ordering, measuring serializer changes only; and
+   - a staged-session replay with sequential 4–6-result queries, one artifact at
+     a time, delayed expansion, and memory disabled after discovery, measuring
+     skill/orchestration behavior.
+
+The fixed replay excludes the six invalid historical requests
+from byte parity but tests their replacement (`source_limit: 0`) separately.
+The staged replay reports reduced calls and bytes independently; its savings
+cannot be credited to the serializer target.
 
 Acceptance requires:
 
@@ -2261,12 +2298,19 @@ Acceptance requires:
   decisive edges, descriptions, defining participants, and freshness—remain
   available without `debug` or `full`;
 - compact/default aggregate inner JSON bytes fall by at least 60% on the
-  retained representative replay at equal fact coverage. The reported 65–75%
-  reduction remains a hypothesis until measured;
+  fixed-call transport replay at equal fact coverage and call count. The
+  reported 65–75% reduction remains a hypothesis until measured;
+- the staged-session replay reports call count, inner/wire/client-visible bytes,
+  and recovered high-value facts separately, without presenting strategy
+  savings as transport savings;
 - strict individual response-byte budgets and explicit omission reporting
   remain intact;
+- `source_limit: 0` performs a successful no-source artifact read and a
+  positive source limit remains bounded and widenable;
 - copy-safe exact drill-down returns cross-origin usages rather than silently
   applying the seed hit's origin as a global filter;
+- the top-hit complete follow-up still round-trips, while lower-hit compact
+  anchors remain sufficient for deliberate drill-down;
 - `compact`, `body`, and `full` artifact views are deterministic, and `full` is
   fact-equivalent to the pre-G19 diagnostic result;
 - path mode preserves the verified configuration-publish skeleton with fewer
@@ -2301,8 +2345,8 @@ consequences that still govern implementation.
 | Root-layout scouting spent 448 card calls without covering the relevant type-generation surface, while broad semantic-memory calls returned mostly unrelated artifacts | Implement G18 scope-stratified and targeted scouting plus support-aware compact semantic discovery; do not increase default budgets |
 | Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
 | Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
-| Real 7,000-plus-file monorepo use localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and evidence-backed consolidated workflow write-back; do not trigger G16 or claim retrieval rank measures importance |
-| The same 42-call review produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G19 compact artifact views, routine-diagnostic gating, cross-origin-safe concise follow-ups, and path-shaped expansion; target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
+| Architecture-inquiry use on a 7,000-plus-file monorepo localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and authorized evidence-backed consolidated workflow write-back; do not generalize tool-selection behavior to implementation tasks, trigger G16, or claim retrieval rank measures importance |
+| The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G19 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
 
 Relevant result summaries include:
 
@@ -2321,6 +2365,7 @@ Relevant result summaries include:
 - [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
 - [Next.js optimistic-prefetch campaign](eval/results/next-optimistic-prefetch-2026-08-15.md)
 - [Next.js root-layout parameter types](eval/results/next-root-params-types-2026-08-17.md)
+- [workflow architecture-inquiry call trace](eval/results/workflow-architecture-inquiry-2026-08-19.md)
 
 ## Positioning versus tsserver/LSP
 
