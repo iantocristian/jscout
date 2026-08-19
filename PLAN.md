@@ -1056,9 +1056,9 @@ Acceptance checks:
 - a genuine v15 embedding layout is rejected without mutation, while the v16
   durable floor preserves compatible embedding and semantic-memory rows;
 - a fatal required-phase failure never publishes a snapshot marker describing
-  new or partially rebuilt structural rows; individual file read/extraction
-  skips are reported and excluded from the successfully published indexable
-  corpus;
+  new or partially rebuilt structural rows; non-retryable file reads and
+  deterministic extraction rejections are reported and excluded from the
+  successfully published indexable corpus;
 - retrieval-only commands do not create or migrate a missing database;
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
@@ -1107,9 +1107,11 @@ package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
 inputs, selected dependency roots, external checker inputs, directories,
 backend errors, and unclassifiable missing paths also require full refresh.
 Full scope is sticky within a generation, so a mixed event cannot be downgraded
-by later source notifications. A changed file that cannot be read or extracted
-is reported and skipped rather than leaving its previous structural row live.
-The operation still publishes the indexable corpus successfully.
+by later source notifications. A changed file with a non-retryable read or
+deterministic extraction failure is reported and excluded rather than leaving
+its previous structural row live. The operation still publishes the indexable
+corpus successfully. A recognized transient read failure instead rolls back
+the transaction and fails the refresh for retry.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1163,15 +1165,25 @@ checker work terminates its bounded sidecar when superseded. Before starting
 either optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh may return individual file skips. `jscout index` and the
-watcher report every skipped path/stage/error and publish the indexable corpus
-as a successful, clean generation. A file-level read or parse rejection is
-subject-local; it does not degrade the generation, and a whole-repository retry
-cannot repair deterministic inputs such as binary media with a source-looking
-extension. A later file event or periodic reconciliation naturally tries the
-path again. Only a refresh operation that returns `Err` (database, transaction,
-discovery, or other phase-level failure) enters retry wait and remains dirty
-until the required phase succeeds.
+A structural refresh may return individual file rejections. `jscout index` and
+the watcher report every rejected path/stage/error and publish the indexable
+corpus as a successful, clean generation. Non-retryable read failures and
+deterministic parse rejections are subject-local: a whole-repository retry
+cannot repair binary media with a source-looking extension or a permanently
+protected file.
+A later file event or periodic reconciliation naturally tries the path again.
+
+Read-error disposition is one explicit rule. Descriptor exhaustion,
+interrupted or timed-out I/O, connection/network failures, stale handles,
+temporary resource pressure, and a discovered file vanishing during the pass
+are retryable phase errors. Unknown errors and permission denial are rejected
+inputs so a single permanently inaccessible file cannot wedge watch forever.
+Retryable reads roll back the active transaction and return `Err`; watch
+remains dirty and retries even when periodic reconciliation is disabled.
+Other database, transaction, discovery, and phase-level failures follow the
+same retry path.
+Repository and selected-dependency traversal errors are phase failures rather
+than partial inventories, regardless of their underlying error kind.
 
 Phase-level failures use bounded exponential backoff. A parked retry gates
 fresh work for that generation and is consumed when it starts; attempts reset
@@ -1227,12 +1239,12 @@ external watches with the newly resolved package instances and checker input
 set. These paths are ephemeral coordinator state, not a cross-snapshot
 freshness manifest stored in SQLite.
 
-Failure to register a narrow external watch retries with backoff. Three
-consecutive failures for the same path move that path to `degraded` coverage:
-the coordinator logs it, relies on periodic reconciliation for that path, and
-retries registration on the next reconciliation tick or when the external
-path set changes. Persistent registration failure does not itself keep the
-structural generation dirty or cause a full-refresh loop.
+Failure to register a narrow external watch marks that path as `degraded`
+coverage immediately. Registration is attempted again whenever targets are
+reconciled: after a successful refresh or enrichment, on the next periodic
+reconciliation, or when the target set changes. It has no independent retry
+timer. Persistent registration failure does not itself keep the structural
+generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
 (default ten minutes) schedules a full refresh even when no event arrived.
@@ -1334,9 +1346,11 @@ delete semantic memory or content-hash embedding rows.
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
-- an unindexable file reports the exact path/stage/error, is skipped without
-  failing or degrading the refresh, and remains covered by later file events
-  and periodic reconciliation;
+- a deterministically unindexable file reports the exact path/stage/error, is
+  excluded without failing or degrading the refresh, and remains covered by
+  later file events and periodic reconciliation;
+- a recognized transient read failure rolls back and retries without
+  publishing a reduced corpus;
 - the default ten-minute reconciliation repairs a deliberately dropped
   notification, while explicitly disabling it reports the lost guarantee;
 - repeated full generations reuse cached embeddings, embed only unseen

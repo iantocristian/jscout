@@ -430,24 +430,36 @@ coalesced generation.
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
 needed. Exact-snapshot checker facts may be reused when the resulting snapshot
-is unchanged; any changed snapshot drops them. A source-looking file that
-cannot be read or extracted is reported and skipped; an old row for that path
-is not served as current. The refresh still succeeds over the indexable corpus.
+is unchanged; any changed snapshot drops them. A deterministic extraction
+rejection or non-retryable read failure is reported and excluded; an old row
+for that path is not served as current. The refresh still succeeds over the
+indexable corpus.
 The default two-second trailing quiet period coalesces edits; an event received
 during any phase advances the desired generation and cannot be consumed by the
 phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
 busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
-backoff without waiting for another edit. File-local read or extraction skips
-do not fail or degrade a refresh and never trigger whole-repository retries;
+backoff without waiting for another edit. Recognized transient read failures
+such as descriptor exhaustion, interrupted/network I/O, stale handles, or a
+file disappearing during the inventory pass are phase errors: the transaction
+rolls back and watch retries instead of publishing a reduced corpus.
+Repository or selected-dependency traversal errors are also phase errors
+because the complete file inventory is unknown.
+Non-retryable file reads and deterministic extraction failures are rejected
+inputs. They do not degrade a refresh or trigger whole-repository retries, and
 their path, stage, and error remain visible in every index report. The default
 ten-minute reconciliation pass naturally attempts those paths again while also
 repairing missed notifications. Its interval is measured from completion of
 the previous generation, avoiding back-to-back refreshes when a cycle itself is
 slow; a nonzero interval must be greater than the debounce period.
 Set `--reconcile-seconds 0` only when giving up that bounded recovery is
-acceptable.
+acceptable; it does not disable phase-error retries.
+
+An external dependency/checker path that cannot be registered with the native
+filesystem watcher is marked as degraded coverage immediately. Registration is
+attempted again on later target reconciliation; it does not have a separate
+retry loop.
 
 Database/WAL/SHM writes are excluded by exact path. For long-running watch,
 prefer an external `--database` path (or ensure the selected database family is
@@ -769,9 +781,11 @@ Retrieval and diagnostics:
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
-Indexing continues past file-local read and extraction errors. The final count
-is followed by every failed path, its stage (`read` or `extract`), and the
-underlying error on stderr; `watch` prints the same detail on each cycle.
+Indexing continues past non-retryable file reads and deterministic extraction
+errors. The final count is followed by every rejected path, its stage (`read` or
+`extract`), and the underlying error on stderr; `watch` prints the same detail
+on each cycle. A recognized transient read error fails the phase instead, so a
+reduced corpus is not published; watch retries it with bounded backoff.
 
 ## Call-site queries
 
