@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-18.
+> Status: authoritative plan as of 2026-08-19.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -12,6 +12,8 @@
 > exact-identifier dominance and G18 task-directed semantic coverage and
 > selection are implemented. G13 has one planned extension: evidence-backed
 > generated-output boundary reconnaissance for unignored build artifacts.
+> Real-monorepo use has also registered a syntax-aware G17 occurrence-ordering
+> correction and staged-use guidance for the existing G14/G18 surfaces.
 
 ## Document policy
 
@@ -1653,6 +1655,42 @@ reported in the attachment status.
 - compact/debug representations remain fact-equivalent, and all tests use
   deterministic fixtures without model calls.
 
+### Operational interaction amendment (2026-08-19)
+
+Real use on a 7,000-plus-file monorepo confirmed that jscout's primary value is
+cross-package localization and copy-safe source drill-down. Broad conceptual
+ranking, concurrent expansions, and parallel full-artifact reads created noise,
+latency, and truncated client output without improving the verified workflow.
+The shipped skill and structural MCP instructions therefore standardize this
+staged interaction:
+
+1. use `repository_overview` once for structural orientation, not to rank the
+   repository's semantic artifacts;
+2. split the task into distinct behaviors and issue narrow, unexpanded searches
+   sequentially, normally with limits of 4–6;
+3. refine with learned symbols and use the returned opaque `definition` or
+   `who_uses` arguments before broad source reads;
+4. enable expansion only after localizing an exact entry point, expand one
+   query at a time, and widen its independently reported bounds only when the
+   omitted context is relevant;
+5. retrieve one exact semantic artifact at a time; never fetch several full
+   bodies concurrently through one client output channel; and
+6. after the useful artifacts are known, set `include_memory: false` on later
+   code searches rather than repeatedly attaching the same previews.
+
+This observation does not justify larger global response, expansion, or memory
+traversal budgets. Telemetry and reports must distinguish the returned
+`expand_nodes` context bound from the internal `memory_nodes` evidence-join
+bound before attributing a 2,000-node truncation to graph expansion. A degraded
+reranker with useful lexical/structural fallback remains a visible provider
+condition, not a reason to weaken deterministic retrieval.
+
+MCP `tools/list` necessarily returns complete schemas; a client may present a
+names-only inventory, but jscout will not add a parallel discovery protocol or
+remove schema guidance solely to compensate for a client that prints every
+definition. Valid rejection of impossible bounds such as `source_limit: 0`
+also remains part of the contract.
+
 ## Parked G15 — design-before-edit task memory
 
 **Decision amendment (2026-08-18):** do not ship G15 as a jscout product
@@ -1821,7 +1859,7 @@ tool-using coding agent.
 - using more global card generation or larger response budgets as a substitute
   for hypothesis formation.
 
-## Conditional G16 — adaptive attached-memory delivery
+## Conditional G16 — independent G14 attached-memory fallback
 
 G14 deliberately changed search-attached memory from broad similarity previews
 to evidence-connected selection: direct support first, then bounded graph
@@ -1892,6 +1930,14 @@ The root-layout replay did not trigger G16: independent adjudication found no
 artifact describing the required causal chain, so there was no useful existing
 artifact for the attachment boundary to miss.
 
+The configuration-publish review also does not trigger G16. Useful artifacts
+were deliberately found through `semantic_memory`, attached previews were
+sometimes repeated after discovery, and no useful artifact was shown to be
+rejected solely by the G14 evidence-connection boundary. Its actionable issues
+are staged tool use, G17 occurrence ordering, possible workflow-overlap
+diversity, and consolidated write-back. Adding unconnected bodies or larger
+attachment budgets would worsen the observed noise.
+
 ## Implemented G17 — exact-identifier dominance
 
 Hybrid retrieval currently lets RRF, the cross-encoder, and repository policy
@@ -1921,6 +1967,34 @@ G17 adds an intent lane for identifier-shaped query tokens:
    `exact_occurrence`, or `hybrid`, while preserving existing score fields as
    diagnostics rather than calibrated relevance.
 
+### Planned G17 residual — syntax-aware exact occurrences
+
+The initial G17 tier treats every verified whole-token occurrence as the same
+kind of exactness. In a multi-identifier behavioral query, an import specifier
+can consequently consume the one reserved occurrence for an identifier ahead
+of the call, state transition, or implementation that gives the identifier
+runtime meaning. Exact text is not sufficient to establish equal navigational
+value.
+
+Occurrence ordering becomes deterministic and syntax-aware within the exact
+tier:
+
+```text
+exact definition
+  -> executable occurrence (call, read/write, condition, argument)
+  -> contract/type occurrence
+  -> import/export occurrence
+  -> hybrid candidate
+```
+
+Indexed structural occurrence kinds are authoritative where available. The
+bounded lexer fallback must at minimum recognize import/export-only lines so
+they cannot displace an available executable occurrence. Pure identifier
+lookups retain bounded import/export occurrences; mixed and multi-identifier
+queries use the strongest available occurrence for each identifier's reserved
+slot before returning weaker exact peers. This changes ordering, not recall,
+and does not infer runtime behavior from an import alone.
+
 ### G17 acceptance
 
 - exact definition or occurrence hits for `createRouteTypesManifest`,
@@ -1931,6 +2005,9 @@ G17 adds an intent lane for identifier-shaped query tokens:
   candidate;
 - same-named definitions remain separate candidates and multi-identifier
   queries cover each resolvable identifier within the requested limit;
+- a multi-identifier behavioral query containing `ExportJobPayload` returns an
+  available executable use before its import specifiers, while a pure
+  `ExportJobPayload` lookup still exposes those import sites;
 - prose-only queries retain the current hybrid path and complete response-byte
   budget.
 
@@ -1962,6 +2039,29 @@ G18 changes both generation selection and direct semantic retrieval:
 5. Return an explicit `no_supported_memory` result when no artifact is connected
    to supplied anchors/scopes. Do not fill the response with weak analogs merely
    to satisfy `limit`.
+
+### Observed G18 follow-up — overlap and verified consolidation
+
+Broad semantic discovery can still return several apparently duplicate or
+overlapping workflows. Before changing retrieval, diagnostics must distinguish
+true duplicate artifacts from legitimate narrower workflows that share an
+entry point. Any diversity correction uses current support/participant overlap,
+artifact relations, freshness, and supersession—not prose similarity alone—and
+must preserve separately useful stages.
+
+When an agent verifies a stable end-to-end workflow that existing memory splits
+across narrower artifacts, the intended correction is evidence-backed
+`annotate` write-back. It publishes the consolidated workflow with exact source
+participants rather than launching another broad speculative scouting batch.
+The configuration-publish review is the registered case: analysis/staging,
+queue dispatch, publish mutation, completion notification, and UI state form one
+verified larger skeleton while remaining individually inspectable stages.
+
+Semantic relevance is not architectural or product importance. Jscout may
+provide package boundaries, callers, acceptance/test surfaces, and workflow
+participation as evidence, but it does not convert retrieval scores into a
+universal importance ranking. The requesting agent must label such a ranking as
+judgment against stated criteria.
 
 ### G18 acceptance
 
@@ -1996,6 +2096,7 @@ consequences that still govern implementation.
 | Root-layout scouting spent 448 card calls without covering the relevant type-generation surface, while broad semantic-memory calls returned mostly unrelated artifacts | Implement G18 scope-stratified and targeted scouting plus support-aware compact semantic discovery; do not increase default budgets |
 | Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
 | Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
+| Real 7,000-plus-file monorepo use localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and evidence-backed consolidated workflow write-back; do not trigger G16 or claim retrieval rank measures importance |
 
 Relevant result summaries include:
 
