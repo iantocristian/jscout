@@ -126,25 +126,38 @@ export function extractSubmission(message, toolName) {
     throw new CompletionError(
       "tool_contract",
       `model returned no ${toolName} call (stop reason ${message.stopReason})`,
+      { retryable: true },
     );
   }
   if (toolCalls.length > 1) {
-    throw new CompletionError("tool_contract", `model returned ${toolCalls.length} tool calls; expected one`);
+    throw new CompletionError(
+      "tool_contract",
+      `model returned ${toolCalls.length} tool calls; expected one`,
+      { retryable: true },
+    );
   }
   const [call] = toolCalls;
   if (call.name !== toolName) {
-    throw new CompletionError("tool_contract", `model called unknown tool ${JSON.stringify(call.name)}`);
+    throw new CompletionError(
+      "tool_contract",
+      `model called unknown tool ${JSON.stringify(call.name)}`,
+      { retryable: true },
+    );
   }
   let args = call.arguments;
   if (typeof args === "string") {
     try {
       args = JSON.parse(args);
     } catch {
-      throw new CompletionError("tool_contract", "tool arguments are not valid JSON");
+      throw new CompletionError("tool_contract", "tool arguments are not valid JSON", {
+        retryable: true,
+      });
     }
   }
   if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    throw new CompletionError("tool_contract", "tool arguments must be a JSON object");
+    throw new CompletionError("tool_contract", "tool arguments must be a JSON object", {
+      retryable: true,
+    });
   }
   return {
     tool_call: { name: call.name, arguments: args },
@@ -152,6 +165,24 @@ export function extractSubmission(message, toolName) {
     usage: normalizeUsage(message.usage),
     response_model: message.responseModel ?? null,
   };
+}
+
+// Pi-ai exposes equivalent forced-tool modes under different names. There is
+// exactly one submit tool in the context, so `any` and `required` both force
+// the declared contract. Azure's current adapter does not expose toolChoice;
+// its bounded contract retry remains the fallback until pi-ai does.
+export function requiredToolChoice(api) {
+  switch (api) {
+    case "anthropic-messages":
+    case "bedrock-converse-stream":
+    case "google-generative-ai":
+    case "google-vertex":
+      return "any";
+    case "azure-openai-responses":
+      return undefined;
+    default:
+      return "required";
+  }
 }
 
 /// Classify provider/transport failures into stable retryability categories.
@@ -313,6 +344,10 @@ export async function startCompletion({ registry, parsed, request, signal, retry
     // retries so attempts cannot multiply invisibly underneath it.
     maxRetries: 0,
   };
+  const toolChoice = requiredToolChoice(model.api);
+  if (toolChoice !== undefined) {
+    options.toolChoice = toolChoice;
+  }
   if (Number.isInteger(request.max_tokens) && request.max_tokens > 0) {
     options.maxTokens = request.max_tokens;
   }

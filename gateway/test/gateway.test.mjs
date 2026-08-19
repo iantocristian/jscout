@@ -13,7 +13,7 @@ import {
   fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
-import { classifyProviderFailure } from "../src/completion.mjs";
+import { classifyProviderFailure, requiredToolChoice } from "../src/completion.mjs";
 import { createGatewayState, handleMessage } from "../src/server.mjs";
 import {
   LineOverflowError,
@@ -104,15 +104,19 @@ test("capabilities describes a known model and rejects malformed specs", async (
 });
 
 test("complete returns started then exactly one submit-tool call", async () => {
+  let seenToolChoice;
   const { state } = fauxState({
     responses: [
-      fauxAssistantMessage(
-        [
-          fauxThinking("hidden reasoning that must not leak"),
-          fauxToolCall("submit_workflow_classification", { ok: true }),
-        ],
-        { stopReason: "toolUse" },
-      ),
+      (_context, options) => {
+        seenToolChoice = options.toolChoice;
+        return fauxAssistantMessage(
+          [
+            fauxThinking("hidden reasoning that must not leak"),
+            fauxToolCall("submit_workflow_classification", { ok: true }),
+          ],
+          { stopReason: "toolUse" },
+        );
+      },
     ],
   });
   const { sent, send } = collector();
@@ -133,6 +137,7 @@ test("complete returns started then exactly one submit-tool call", async () => {
   });
   assert.equal(result.stop_reason, "toolUse");
   assert.equal(result.attempts, 1);
+  assert.equal(seenToolChoice, "required");
   assert.equal(typeof result.usage.total_tokens, "number");
   assert.ok(!JSON.stringify(result).includes("hidden reasoning"));
   assert.equal(state.active, null);
@@ -140,6 +145,7 @@ test("complete returns started then exactly one submit-tool call", async () => {
 
 test("text-only and multi-tool responses are protocol failures", async () => {
   const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 },
     responses: [fauxAssistantMessage([fauxText("no tool call")], { stopReason: "stop" })],
   });
   const { sent, send } = collector();
@@ -147,6 +153,7 @@ test("text-only and multi-tool responses are protocol failures", async () => {
   await handleMessage(state, completeRequest(), send);
   assert.equal(sent.at(-1).kind, "error");
   assert.equal(sent.at(-1).error.code, "tool_contract");
+  assert.equal(sent.at(-1).error.retryable, true);
 
   faux.setResponses([
     fauxAssistantMessage(
@@ -165,6 +172,33 @@ test("text-only and multi-tool responses are protocol failures", async () => {
   ]);
   await handleMessage(state, completeRequest({ id: "req-3" }), send);
   assert.equal(sent.at(-1).error.code, "tool_contract");
+});
+
+test("tool-contract failures retry and recover within the configured policy", async () => {
+  const { state, faux } = fauxState({
+    retryPolicy: { maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
+    responses: [
+      fauxAssistantMessage([fauxText("ordinary text instead")], { stopReason: "stop" }),
+      fauxAssistantMessage(
+        [fauxToolCall("submit_workflow_classification", { ok: true })],
+        { stopReason: "toolUse" },
+      ),
+    ],
+  });
+  const { sent, send } = collector();
+  await greet(state, send);
+  await handleMessage(state, completeRequest(), send);
+
+  assert.equal(sent.at(-1).kind, "result");
+  assert.equal(sent.at(-1).attempts, 2);
+  assert.equal(faux.state.callCount, 2);
+});
+
+test("forced-tool mode is normalized across pi-ai APIs", () => {
+  assert.equal(requiredToolChoice("openai-codex-responses"), "required");
+  assert.equal(requiredToolChoice("anthropic-messages"), "any");
+  assert.equal(requiredToolChoice("google-generative-ai"), "any");
+  assert.equal(requiredToolChoice("azure-openai-responses"), undefined);
 });
 
 test("a second complete while one is active reports busy", async () => {
