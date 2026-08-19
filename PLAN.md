@@ -1175,15 +1175,25 @@ A later file event or periodic reconciliation naturally tries the path again.
 
 Read-error disposition is one explicit rule. Descriptor exhaustion,
 interrupted or timed-out I/O, connection/network failures, stale handles,
-temporary resource pressure, and a discovered file vanishing during the pass
-are retryable phase errors. Unknown errors and permission denial are rejected
-inputs so a single permanently inaccessible file cannot wedge watch forever.
+and temporary resource pressure are retryable phase errors. Unknown errors and
+permission denial are rejected inputs so a single permanently inaccessible
+file or subtree cannot wedge watch forever. A path that disappears or changes
+between file and directory after inventory is checkout churn: its old row is
+removed, and a later event or reconciliation converges on the next state. The
+walker applies the same classification to directory and ignore-file errors;
+retryable I/O aborts while permanent subtree failures remain visible
+rejections.
 Retryable reads roll back the active transaction and return `Err`; watch
 remains dirty and retries even when periodic reconciliation is disabled.
 Other database, transaction, discovery, and phase-level failures follow the
 same retry path.
-Repository and selected-dependency traversal errors are phase failures rather
-than partial inventories, regardless of their underlying error kind.
+Selected-dependency traversal errors remain phase failures rather than partial
+inventories. One classified workspace map is built before mutation. First-party
+extraction, dependency discovery from the newly extracted importers, and every
+selected-dependency source read are then prepared in the same rollbackable
+transaction before the old snapshot publication is invalidated. A retryable
+acquisition failure therefore leaves the previous snapshot queryable instead
+of exposing an unpublished gap.
 
 Phase-level failures use bounded exponential backoff. A parked retry gates
 fresh work for that generation and is consumed when it starts; attempts reset

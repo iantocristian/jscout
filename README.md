@@ -434,6 +434,11 @@ is unchanged; any changed snapshot drops them. A deterministic extraction
 rejection or non-retryable read failure is reported and excluded; an old row
 for that path is not served as current. The refresh still succeeds over the
 indexable corpus.
+The classified workspace map is built first. First-party extraction,
+current-import dependency discovery, and every selected-dependency source read
+then complete in one rollbackable transaction before the old snapshot
+publication is invalidated. A retryable acquisition failure therefore leaves
+the previous snapshot queryable until a complete replacement can commit.
 The default two-second trailing quiet period coalesces edits; an event received
 during any phase advances the desired generation and cannot be consumed by the
 phase already running.
@@ -441,11 +446,18 @@ phase already running.
 Each phase opens and closes its own database connection with a finite SQLite
 busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
 backoff without waiting for another edit. Recognized transient read failures
-such as descriptor exhaustion, interrupted/network I/O, stale handles, or a
-file disappearing during the inventory pass are phase errors: the transaction
-rolls back and watch retries instead of publishing a reduced corpus.
-Repository or selected-dependency traversal errors are also phase errors
-because the complete file inventory is unknown.
+such as descriptor exhaustion, interrupted/network I/O, or stale handles are
+phase errors: the transaction rolls back and watch retries instead of
+publishing a reduced corpus. A path that disappears or changes between file and
+directory after inventory is ordinary checkout churn, not evidence of an
+atomic-snapshot violation; its old row is removed and later events or
+reconciliation converge on the next state.
+Repository traversal applies the same classifier at subtree granularity:
+retryable I/O aborts the phase, while a permanently inaccessible subtree is
+reported and excluded without losing accessible siblings. Attached
+`.gitignore`/`.ignore` errors are surfaced rather than discarded. Selected-
+dependency traversal remains a phase error because that explicitly requested
+package inventory is planned as one bounded unit.
 Non-retryable file reads and deterministic extraction failures are rejected
 inputs. They do not degrade a refresh or trigger whole-repository retries, and
 their path, stage, and error remain visible in every index report. The default
@@ -781,11 +793,13 @@ Retrieval and diagnostics:
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
-Indexing continues past non-retryable file reads and deterministic extraction
-errors. The final count is followed by every rejected path, its stage (`read` or
-`extract`), and the underlying error on stderr; `watch` prints the same detail
-on each cycle. A recognized transient read error fails the phase instead, so a
-reduced corpus is not published; watch retries it with bounded backoff.
+Indexing continues past non-retryable file reads, permanent subtree/boundary
+failures, and deterministic extraction errors. The final count is followed by
+every rejected path, its stage (`walk`, `ignore`, `workspace-manifest`,
+`workspace-canonicalize`, `read`, or `extract`), and the underlying error on
+stderr; `watch` prints the same detail on each cycle. A recognized transient read error
+fails the phase instead, so a reduced corpus is not published; watch retries it
+with bounded backoff.
 
 ## Call-site queries
 
