@@ -17,7 +17,6 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(30);
 const OPTIONAL_PHASE_POLL: Duration = Duration::from_millis(100);
-const STABLE_FAILURE_THRESHOLD: u8 = 3;
 const MAX_INCREMENTAL_SOURCE_PATHS: usize = 256;
 
 pub struct WatchOptions<'a> {
@@ -127,7 +126,6 @@ struct Coordinator {
     ready: Option<Work>,
     retry: Option<Retry>,
     retry_attempts: BTreeMap<Phase, u32>,
-    stable_failure: Option<(String, u8)>,
     cycle_snapshot: Option<String>,
     cycle_degraded: bool,
     dirty_reasons: BTreeSet<String>,
@@ -151,7 +149,6 @@ impl Coordinator {
             ready: None,
             retry: None,
             retry_attempts: BTreeMap::new(),
-            stable_failure: None,
             cycle_snapshot: None,
             cycle_degraded: false,
             dirty_reasons: BTreeSet::new(),
@@ -282,33 +279,17 @@ impl Coordinator {
         })
     }
 
-    fn finish_refresh(
-        &mut self,
-        now: Duration,
-        work: Work,
-        snapshot: String,
-        failure_fingerprint: Option<String>,
-    ) -> FinishState {
+    fn finish_refresh(&mut self, work: Work, snapshot: String, degraded: bool) -> FinishState {
         self.clear_active(work);
         if work.generation != self.desired_generation {
             return FinishState::Superseded;
         }
-        if let Some(fingerprint) = failure_fingerprint {
-            let repeats = match &self.stable_failure {
-                Some((previous, repeats)) if previous == &fingerprint => repeats.saturating_add(1),
-                _ => 1,
-            };
-            self.stable_failure = Some((fingerprint, repeats));
-            if repeats < STABLE_FAILURE_THRESHOLD {
-                return self.schedule_retry(now, work);
-            }
-            self.retry_attempts.remove(&Phase::Refresh);
-            self.cycle_degraded = true;
-        } else {
-            self.retry_attempts.remove(&Phase::Refresh);
-            self.stable_failure = None;
-            self.cycle_degraded = false;
-        }
+        // The refresh operation succeeded and published a coherent snapshot.
+        // Individual files that could not be read or parsed are subject-local
+        // omissions: report them, mark the generation degraded, and continue.
+        // Only an Err from the refresh operation enters finish_error/retry.
+        self.retry_attempts.remove(&Phase::Refresh);
+        self.cycle_degraded = degraded;
         self.cycle_snapshot = Some(snapshot);
         self.advance(work)
     }
@@ -593,7 +574,6 @@ impl WatchRegistry {
 struct RefreshResult {
     snapshot: String,
     outcome: indexer::IndexOutcome,
-    failure_fingerprint: Option<String>,
 }
 
 pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
@@ -727,10 +707,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_refresh(
-                                    started.elapsed(),
                                     work,
                                     result.snapshot,
-                                    result.failure_fingerprint,
+                                    result.outcome.failed > 0,
                                 ),
                                 started.elapsed(),
                                 options.reconcile_interval,
@@ -926,12 +905,7 @@ fn run_refresh(
         RefreshScope::Full => indexer::refresh_repo_with_options(root, &conn, &options)?,
     };
     let snapshot = structural::current_snapshot(&conn)?;
-    let failure_fingerprint = failure_fingerprint(&outcome);
-    Ok(RefreshResult {
-        snapshot,
-        outcome,
-        failure_fingerprint,
-    })
+    Ok(RefreshResult { snapshot, outcome })
 }
 
 fn run_embedding_interruptible(
@@ -1116,23 +1090,6 @@ fn absolute_database_path(root: &Path, selected: Option<&Path>) -> PathBuf {
             .unwrap_or(path),
         _ => path,
     }
-}
-
-fn failure_fingerprint(outcome: &indexer::IndexOutcome) -> Option<String> {
-    if outcome.failures.is_empty() {
-        return None;
-    }
-    let mut failures = outcome
-        .failures
-        .iter()
-        .map(|failure| format!("{}\0{}\0{}", failure.path, failure.stage, failure.error))
-        .collect::<Vec<_>>();
-    failures.sort();
-    Some(
-        blake3::hash(failures.join("\n").as_bytes())
-            .to_hex()
-            .to_string(),
-    )
 }
 
 /// Paths whose changes can alter source discovery, package ownership, module
@@ -1350,7 +1307,7 @@ mod tests {
         assert_eq!(refresh.phase, Phase::Refresh);
         assert_eq!(refresh.refresh_scope, RefreshScope::Full);
         assert_eq!(
-            coordinator.finish_refresh(Duration::ZERO, refresh, "s1".into(), None),
+            coordinator.finish_refresh(refresh, "s1".into(), false),
             FinishState::Continue
         );
         let embed = coordinator.next_work(Duration::ZERO).expect("embed");
@@ -1370,7 +1327,7 @@ mod tests {
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         coordinator.mark_dirty(seconds(1), source_signal("a.ts"));
         assert_eq!(
-            coordinator.finish_refresh(seconds(1), refresh, "s1".into(), None),
+            coordinator.finish_refresh(refresh, "s1".into(), false),
             FinishState::Superseded
         );
         assert!(coordinator.next_work(seconds(2)).is_none());
@@ -1418,66 +1375,20 @@ mod tests {
     }
 
     #[test]
-    fn three_identical_partial_refreshes_publish_a_degraded_generation() {
-        let mut coordinator = Coordinator::new(seconds(2), false, false);
-        let mut now = Duration::ZERO;
-        for attempt in 0..3 {
-            let work = coordinator.next_work(now).expect("refresh attempt");
-            let state = coordinator.finish_refresh(
-                now,
-                work,
-                format!("s{attempt}"),
-                Some("same-failure".into()),
-            );
-            if attempt < 2 {
-                let FinishState::Retry { after } = state else {
-                    panic!("expected retry")
-                };
-                assert_eq!(
-                    after,
-                    if attempt == 0 {
-                        Duration::from_millis(500)
-                    } else {
-                        Duration::from_secs(1)
-                    }
-                );
-                now = now.saturating_add(after);
-            } else {
-                assert_eq!(state, FinishState::Complete { degraded: true });
-            }
-        }
-    }
-
-    #[test]
-    fn a_known_degraded_failure_does_not_pay_three_retries_each_generation() {
-        let mut coordinator = Coordinator::new(Duration::from_millis(100), false, false);
-        let mut now = Duration::ZERO;
-        for _ in 0..3 {
-            let work = coordinator.next_work(now).expect("refresh attempt");
-            match coordinator.finish_refresh(
-                now,
-                work,
-                "partial".into(),
-                Some("permanent-failure".into()),
-            ) {
-                FinishState::Retry { after } => now = now.saturating_add(after),
-                FinishState::Complete { degraded: true } => {}
-                other => panic!("unexpected state: {other:?}"),
-            }
-        }
-
-        coordinator.mark_dirty(now, source_signal("still-unreadable.ts"));
-        now = now.saturating_add(Duration::from_millis(100));
-        let work = coordinator.next_work(now).expect("next generation");
+    fn partial_refresh_advances_immediately_as_degraded() {
+        let mut coordinator = Coordinator::new(seconds(2), true, false);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(
-            coordinator.finish_refresh(
-                now,
-                work,
-                "partial".into(),
-                Some("permanent-failure".into()),
-            ),
+            coordinator.finish_refresh(refresh, "partial".into(), true),
+            FinishState::Continue
+        );
+        let embed = coordinator.next_work(Duration::ZERO).expect("embed");
+        assert_eq!(embed.phase, Phase::Embed);
+        assert_eq!(
+            coordinator.finish_optional(embed),
             FinishState::Complete { degraded: true }
         );
+        assert!(coordinator.retry.is_none());
     }
 
     #[test]
@@ -1485,7 +1396,7 @@ mod tests {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
         assert_eq!(
-            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            coordinator.finish_refresh(startup, "s1".into(), false),
             FinishState::Complete { degraded: false }
         );
         assert!(coordinator.is_clean());
@@ -1511,7 +1422,7 @@ mod tests {
         );
         assert_eq!(coordinator.refresh_scope, RefreshScope::Incremental);
         assert_eq!(
-            coordinator.finish_refresh(seconds(2), startup, "old".into(), None),
+            coordinator.finish_refresh(startup, "old".into(), false),
             FinishState::Superseded
         );
     }
@@ -1521,7 +1432,7 @@ mod tests {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
         assert_eq!(
-            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            coordinator.finish_refresh(startup, "s1".into(), false),
             FinishState::Complete { degraded: false }
         );
 
@@ -1545,7 +1456,7 @@ mod tests {
         let mut coordinator = Coordinator::new(seconds(2), false, false);
         let startup = coordinator.next_work(Duration::ZERO).expect("startup");
         assert_eq!(
-            coordinator.finish_refresh(Duration::ZERO, startup, "s1".into(), None),
+            coordinator.finish_refresh(startup, "s1".into(), false),
             FinishState::Complete { degraded: false }
         );
 

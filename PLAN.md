@@ -1163,21 +1163,18 @@ phase if a newer structural generation is already required.
 
 A structural refresh that returns individual file failures may expose the
 same explicitly reported partial snapshot as `jscout index`. The watcher
-reports every path/stage/error and retries the generation without requiring
-another filesystem event. Three consecutive refreshes with the same failure
-fingerprint (path, stage, and error) make the snapshot `degraded` rather than
-permanently dirty: optional embedding and enrichment may then run against that
-exact partial snapshot, while the failed paths remain on the reconciliation
-retry set. The last degraded fingerprint survives later generations, so the
-same permanent failure can degrade immediately rather than paying three full
-retries every cycle. A changed failure fingerprint or successful read resets
-that stability; new input resets only the current retry timer. Fatal refresh
-errors never enter this bounded degradation path and remain dirty until a
-required phase succeeds.
+reports every skipped path/stage/error, marks the generation `degraded`, and
+continues immediately to requested embedding and enrichment against that exact
+partial snapshot. A file-level read or parse rejection is subject-local; a
+whole-repository retry cannot repair deterministic inputs such as binary media
+with a source-looking extension. A later file event or periodic reconciliation
+naturally tries the path again. Only a refresh operation that returns `Err`
+(database, transaction, discovery, or other phase-level failure) enters retry
+wait and remains dirty until the required phase succeeds.
 
-Failures use bounded exponential backoff. A parked retry gates fresh work for
-that generation and is consumed when it starts; attempts reset on new input or
-a successful phase. Retry and stable-failure state live in memory. Restarting
+Phase-level failures use bounded exponential backoff. A parked retry gates
+fresh work for that generation and is consumed when it starts; attempts reset
+on new input or a successful phase. Retry state lives in memory. Restarting
 watch always subscribes first and then performs a full refresh, so no persistent
 watcher journal or recovery schema is required.
 
@@ -1336,10 +1333,9 @@ delete semantic memory or content-hash embedding rows.
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
-- a transient failed-file result remains dirty initially, reports the exact
-  path/stage/error, and converges after the file becomes readable;
-- three identical failed-file generations publish a visibly degraded snapshot,
-  allow exact-snapshot enrichment, and retain periodic retry coverage;
+- a failed file reports the exact path/stage/error, publishes one visibly
+  degraded snapshot without repeating the repository refresh, and remains
+  covered by later file events and periodic reconciliation;
 - the default ten-minute reconciliation repairs a deliberately dropped
   notification, while explicitly disabling it reports the lost guarantee;
 - repeated full generations reuse cached embeddings, embed only unseen
