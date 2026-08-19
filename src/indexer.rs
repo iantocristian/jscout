@@ -1264,10 +1264,11 @@ mod tests {
         let old_snapshot = structural::current_snapshot(&conn)?;
 
         fs::write(&source, "export const after = 2;\n")?;
-        inject_read_failure(
-            source.canonicalize()?,
-            std::io::Error::from(ErrorKind::Interrupted),
-        );
+        #[cfg(unix)]
+        let transient_error = std::io::Error::from_raw_os_error(libc::EMFILE);
+        #[cfg(not(unix))]
+        let transient_error = std::io::Error::from(ErrorKind::Interrupted);
+        inject_read_failure(source.canonicalize()?, transient_error);
         let error = index_repo(repo.path(), &conn)
             .err()
             .expect("retryable source read must abort preparation");

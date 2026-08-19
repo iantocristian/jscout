@@ -20,6 +20,27 @@ use crate::io_policy;
 use crate::package_exports::collect_active_targets;
 use crate::walk;
 
+fn read_workspace_file(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    if let Some(error) = TEST_IO_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
+        return Err(error);
+    }
+    fs::read_to_string(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_IO_FAILURES: std::cell::RefCell<std::collections::HashMap<PathBuf, io::Error>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+fn inject_io_failure(path: PathBuf, error: io::Error) {
+    TEST_IO_FAILURES.with(|failures| {
+        failures.borrow_mut().insert(path, error);
+    });
+}
+
 /// How a workspace mapping was established. `Manifest` mappings use a target
 /// the package.json names directly (modulo TS extension aliasing, which the
 /// resolver itself applies); `Inferred` mappings come from layout heuristics
@@ -137,7 +158,7 @@ impl WorkspaceMap {
             let Some(text) = classified_io(
                 &manifest,
                 "workspace-manifest",
-                fs::read_to_string(&manifest),
+                read_workspace_file(&manifest),
                 &mut rejections,
             )?
             else {
@@ -517,7 +538,7 @@ fn checked_workspace_globs(
     if let Some(yaml) = classified_io(
         &pnpm,
         "workspace-manifest",
-        fs::read_to_string(&pnpm),
+        read_workspace_file(&pnpm),
         rejections,
     )? {
         let globs = pnpm_workspace_globs(&yaml);
@@ -530,7 +551,7 @@ fn checked_workspace_globs(
     let Some(text) = classified_io(
         &manifest,
         "workspace-manifest",
-        fs::read_to_string(&manifest),
+        read_workspace_file(&manifest),
         rejections,
     )?
     else {
@@ -1094,7 +1115,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{WorkspaceMap, classified_io, package_entry_paths, pnpm_workspace_globs};
+    use super::{WorkspaceMap, inject_io_failure, package_entry_paths, pnpm_workspace_globs};
     use oxc_resolver::AliasValue;
 
     fn write(path: &Path, content: &str) {
@@ -1151,17 +1172,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checked_discovery_propagates_resource_exhaustion() {
-        let mut rejections = Vec::new();
-        let error = classified_io::<()>(
-            Path::new("package.json"),
-            "workspace-manifest",
-            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
-            &mut rejections,
-        )
-        .unwrap_err();
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(
+            &root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        );
+        let manifest = root.join("packages/app/package.json");
+        write(&manifest, r#"{"name":"app"}"#);
+        let source = root.join("packages/app/src/index.ts");
+        write(&source, "export const value = 1;\n");
+        inject_io_failure(manifest, std::io::Error::from_raw_os_error(libc::EMFILE));
+
+        let error = WorkspaceMap::discover_for_index(root, &[source])
+            .err()
+            .expect("resource exhaustion must abort workspace discovery");
 
         assert!(error.to_string().contains("workspace-manifest"));
-        assert!(rejections.is_empty());
     }
 
     #[test]
