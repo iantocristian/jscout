@@ -1220,17 +1220,8 @@ fn execute_prepared_workflow(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A REMOTE per-request timeout is subject-local: the gateway
-            // aborted that one request, sent a correlated terminal frame,
-            // and the connection is synchronized for the next subject —
-            // the batch continues with a failed report, exactly as contract
-            // failures do (a second memory-prep abort came from one slow
-            // card killing 98 published artifacts). The LOCAL frame-deadline
-            // `GatewayError::Timeout` poisons the connection (request
-            // correlation is lost), so it stays batch-fatal, as do
-            // spawn/protocol/io/cancel errors.
-            if remote_timeout(&error) {
-                return Ok(gateway_timeout_report(
+            if subject_local_gateway_failure(&error) {
+                return Ok(gateway_failure_report(
                     run_id,
                     &spec,
                     candidate_set.seeds.join(", "),
@@ -1539,17 +1530,8 @@ fn execute_prepared_card(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A REMOTE per-request timeout is subject-local: the gateway
-            // aborted that one request, sent a correlated terminal frame,
-            // and the connection is synchronized for the next subject —
-            // the batch continues with a failed report, exactly as contract
-            // failures do (a second memory-prep abort came from one slow
-            // card killing 98 published artifacts). The LOCAL frame-deadline
-            // `GatewayError::Timeout` poisons the connection (request
-            // correlation is lost), so it stays batch-fatal, as do
-            // spawn/protocol/io/cancel errors.
-            if remote_timeout(&error) {
-                return Ok(gateway_timeout_report(
+            if subject_local_gateway_failure(&error) {
+                return Ok(gateway_failure_report(
                     run_id,
                     &spec,
                     subject.anchor.clone(),
@@ -1898,17 +1880,8 @@ fn execute_prepared_concept(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A REMOTE per-request timeout is subject-local: the gateway
-            // aborted that one request, sent a correlated terminal frame,
-            // and the connection is synchronized for the next subject —
-            // the batch continues with a failed report, exactly as contract
-            // failures do (a second memory-prep abort came from one slow
-            // card killing 98 published artifacts). The LOCAL frame-deadline
-            // `GatewayError::Timeout` poisons the connection (request
-            // correlation is lost), so it stays batch-fatal, as do
-            // spawn/protocol/io/cancel errors.
-            if remote_timeout(&error) {
-                return Ok(gateway_timeout_report(
+            if subject_local_gateway_failure(&error) {
+                return Ok(gateway_failure_report(
                     run_id,
                     &spec,
                     canonical_name.clone(),
@@ -2456,17 +2429,8 @@ fn execute_prepared_summary(
                 other => (RunOutcome::Failed, other.code()),
             };
             ledger::finish_run(conn, run_id, status, None, Some(&code))?;
-            // A REMOTE per-request timeout is subject-local: the gateway
-            // aborted that one request, sent a correlated terminal frame,
-            // and the connection is synchronized for the next subject —
-            // the batch continues with a failed report, exactly as contract
-            // failures do (a second memory-prep abort came from one slow
-            // card killing 98 published artifacts). The LOCAL frame-deadline
-            // `GatewayError::Timeout` poisons the connection (request
-            // correlation is lost), so it stays batch-fatal, as do
-            // spawn/protocol/io/cancel errors.
-            if remote_timeout(&error) {
-                return Ok(gateway_timeout_report(
+            if subject_local_gateway_failure(&error) {
+                return Ok(gateway_failure_report(
                     run_id,
                     &spec,
                     scope.scope_key.clone(),
@@ -3315,25 +3279,29 @@ fn scout_report(
 /// failed run, the model call counts against the budget, and later subjects
 /// still get their turn. Gateway/infrastructure errors and invalidated
 /// publication state keep aborting via `Err`.
-/// True only for the gateway-reported per-request timeout: the remote side
-/// aborted the request and remains synchronized. The local frame-deadline
-/// `GatewayError::Timeout` is deliberately excluded — it poisons the
-/// connection and must abort the batch.
-pub(crate) fn remote_timeout(error: &GatewayError) -> bool {
-    matches!(error, GatewayError::Remote(remote) if remote.code == "timeout")
+/// Remote timeout and exhausted tool-contract failures carry a correlated
+/// terminal frame, so the gateway connection remains synchronized and the
+/// next subject can run. Local frame timeouts and infrastructure failures can
+/// poison the connection and remain batch-fatal.
+pub(crate) fn subject_local_gateway_failure(error: &GatewayError) -> bool {
+    matches!(error, GatewayError::Remote(remote) if matches!(remote.code.as_str(), "timeout" | "tool_contract"))
 }
 
-/// A gateway timeout finishes the run as failed and yields a subject-local
-/// failed report with no usage or provider identity (the request never
-/// completed). The caller passes its real subject identity so the slow
-/// subject is visible in command output without a database investigation.
-fn gateway_timeout_report(
+/// A synchronized gateway failure finishes the run and yields a subject-local
+/// report. Error frames do not currently carry usage or provider identity.
+fn gateway_failure_report(
     run_id: i64,
     spec: &RunSpec,
     subject: String,
     candidate_count: usize,
     error: GatewayError,
 ) -> ScoutReport {
+    let failure = match &error {
+        GatewayError::Remote(remote) if remote.code == "timeout" => {
+            format!("gateway timeout: {error}")
+        }
+        _ => error.to_string(),
+    };
     ScoutReport {
         kind: spec.scout_kind.clone(),
         subject,
@@ -3346,7 +3314,7 @@ fn gateway_timeout_report(
         billing_path: spec.billing_path.clone(),
         started: None,
         incomplete_reason: None,
-        failure: Some(format!("gateway timeout: {error}")),
+        failure: Some(failure),
     }
 }
 
@@ -5565,6 +5533,47 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids.len(), 2);
         Ok(ids)
+    }
+
+    #[test]
+    fn summary_tool_contract_failure_is_subject_local() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = fixture(repo.path())?;
+        seed_card(repo.path(), &conn)?;
+        let mut gateway = FakeGateway::new(vec![Err(GatewayError::Remote(
+            crate::llm::protocol::RemoteError {
+                code: "tool_contract".into(),
+                message: "model returned no submit_scope_summary call".into(),
+                retryable: true,
+                capacity: false,
+            },
+        ))]);
+
+        let batch = super::scout_summaries(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &summary_options(Some("file"), 1),
+        )?;
+
+        assert_eq!(batch.model_calls, 1);
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.reports[0].status, "failed");
+        assert!(
+            batch.reports[0]
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("tool_contract"))
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM scout_runs WHERE id=?1",
+                [batch.reports[0].run_id],
+                |row| row.get::<_, String>(0),
+            )?,
+            "failed"
+        );
+        Ok(())
     }
 
     #[test]

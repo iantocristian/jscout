@@ -110,6 +110,21 @@ function numberOrZero(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function addUsage(total, attempt) {
+  return {
+    input_tokens: total.input_tokens + attempt.input_tokens,
+    output_tokens: total.output_tokens + attempt.output_tokens,
+    reasoning_tokens:
+      total.reasoning_tokens === null && attempt.reasoning_tokens === null
+        ? null
+        : (total.reasoning_tokens ?? 0) + (attempt.reasoning_tokens ?? 0),
+    cache_read_tokens: total.cache_read_tokens + attempt.cache_read_tokens,
+    cache_write_tokens: total.cache_write_tokens + attempt.cache_write_tokens,
+    total_tokens: total.total_tokens + attempt.total_tokens,
+    cost_total: total.cost_total + attempt.cost_total,
+  };
+}
+
 /// Enforce the structured-output contract: the final message must contain
 /// exactly one call of the declared submit tool with object arguments.
 /// Text alongside the call is tolerated and dropped; hidden reasoning is
@@ -126,25 +141,38 @@ export function extractSubmission(message, toolName) {
     throw new CompletionError(
       "tool_contract",
       `model returned no ${toolName} call (stop reason ${message.stopReason})`,
+      { retryable: true },
     );
   }
   if (toolCalls.length > 1) {
-    throw new CompletionError("tool_contract", `model returned ${toolCalls.length} tool calls; expected one`);
+    throw new CompletionError(
+      "tool_contract",
+      `model returned ${toolCalls.length} tool calls; expected one`,
+      { retryable: true },
+    );
   }
   const [call] = toolCalls;
   if (call.name !== toolName) {
-    throw new CompletionError("tool_contract", `model called unknown tool ${JSON.stringify(call.name)}`);
+    throw new CompletionError(
+      "tool_contract",
+      `model called unknown tool ${JSON.stringify(call.name)}`,
+      { retryable: true },
+    );
   }
   let args = call.arguments;
   if (typeof args === "string") {
     try {
       args = JSON.parse(args);
     } catch {
-      throw new CompletionError("tool_contract", "tool arguments are not valid JSON");
+      throw new CompletionError("tool_contract", "tool arguments are not valid JSON", {
+        retryable: true,
+      });
     }
   }
   if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    throw new CompletionError("tool_contract", "tool arguments must be a JSON object");
+    throw new CompletionError("tool_contract", "tool arguments must be a JSON object", {
+      retryable: true,
+    });
   }
   return {
     tool_call: { name: call.name, arguments: args },
@@ -152,6 +180,29 @@ export function extractSubmission(message, toolName) {
     usage: normalizeUsage(message.usage),
     response_model: message.responseModel ?? null,
   };
+}
+
+// Pi-ai exposes equivalent forced-tool modes under different names. There is
+// exactly one submit tool in the context, so `any` and `required` both force
+// the declared contract. Azure's current adapter and unknown future adapters
+// receive no unverified option; their bounded contract retry is the fallback.
+export function requiredToolChoice(api) {
+  switch (api) {
+    case "openai-completions":
+    case "openai-responses":
+    case "openai-codex-responses":
+    case "mistral-conversations":
+    case "pi-messages":
+      return "required";
+    case "anthropic-messages":
+    case "bedrock-converse-stream":
+    case "google-generative-ai":
+    case "google-vertex":
+      return "any";
+    case "azure-openai-responses":
+    default:
+      return undefined;
+  }
 }
 
 /// Classify provider/transport failures into stable retryability categories.
@@ -276,10 +327,12 @@ function abortableDelay(delayMs, signal) {
 }
 
 async function completeWithRetry({ models, model, context, options, toolName, signal, policy }) {
+  let usage = normalizeUsage(undefined);
   for (let attempt = 0; ; attempt += 1) {
     try {
       const message = await models.complete(model, context, options);
-      return { ...extractSubmission(message, toolName), attempts: attempt + 1 };
+      usage = addUsage(usage, normalizeUsage(message.usage));
+      return { ...extractSubmission(message, toolName), usage, attempts: attempt + 1 };
     } catch (error) {
       let classified = error;
       if (!(error instanceof CompletionError) && !(error instanceof RegistryError)) {
@@ -313,6 +366,10 @@ export async function startCompletion({ registry, parsed, request, signal, retry
     // retries so attempts cannot multiply invisibly underneath it.
     maxRetries: 0,
   };
+  const toolChoice = requiredToolChoice(model.api);
+  if (toolChoice !== undefined) {
+    options.toolChoice = toolChoice;
+  }
   if (Number.isInteger(request.max_tokens) && request.max_tokens > 0) {
     options.maxTokens = request.max_tokens;
   }
