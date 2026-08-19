@@ -10,10 +10,13 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use oxc_resolver::{Alias, AliasValue};
 
+use crate::io_policy;
 use crate::package_exports::collect_active_targets;
 use crate::walk;
 
@@ -46,6 +49,18 @@ pub struct WorkspaceMap {
     manifest_specifiers: HashSet<String>,
     /// Every aliased workspace package name.
     package_names: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRejection {
+    pub path: PathBuf,
+    pub stage: &'static str,
+    pub error: String,
+}
+
+pub struct WorkspaceDiscovery {
+    pub map: WorkspaceMap,
+    pub rejections: Vec<WorkspaceRejection>,
 }
 
 impl WorkspaceMap {
@@ -102,6 +117,88 @@ impl WorkspaceMap {
         map
     }
 
+    /// Indexing-specific workspace discovery. Unlike the historical
+    /// best-effort builder, this applies the same retry/rejection policy as
+    /// source inventory and returns every permanent boundary exclusion for
+    /// the index outcome.
+    pub fn discover_for_index(root: &Path, source_files: &[PathBuf]) -> Result<WorkspaceDiscovery> {
+        let mut rejections = Vec::new();
+        let indexed_sources = IndexedSources::new(source_files);
+        let globs = checked_workspace_globs(root, &mut rejections)?;
+        let dirs = checked_package_dirs(root, &globs, source_files);
+        let mut map = WorkspaceMap {
+            aliases: Vec::new(),
+            packages: Vec::new(),
+            manifest_specifiers: HashSet::new(),
+            package_names: HashSet::new(),
+        };
+        for dir in dirs {
+            let manifest = dir.join("package.json");
+            let Some(text) = classified_io(
+                &manifest,
+                "workspace-manifest",
+                fs::read_to_string(&manifest),
+                &mut rejections,
+            )?
+            else {
+                continue;
+            };
+            let pkg = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(pkg) => pkg,
+                Err(error) => {
+                    rejections.push(WorkspaceRejection {
+                        path: manifest,
+                        stage: "workspace-manifest",
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let Some(name) = pkg.get("name").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if name.is_empty() || name.starts_with('.') || name.starts_with('/') {
+                continue;
+            }
+            let Some(canonical_root) = classified_io(
+                &dir,
+                "workspace-canonicalize",
+                dir.canonicalize(),
+                &mut rejections,
+            )?
+            else {
+                continue;
+            };
+            map.packages.push(WorkspacePackage {
+                name: name.to_string(),
+                version: pkg
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                canonical_root,
+                manifest_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
+            });
+            map.add_indexed_package(name, &dir, &pkg, &indexed_sources);
+        }
+        map.aliases.sort_by(|left, right| right.0.cmp(&left.0));
+        map.aliases.dedup_by(|left, right| left.0 == right.0);
+        map.packages
+            .sort_by(|left, right| left.canonical_root.cmp(&right.canonical_root));
+        map.packages
+            .dedup_by(|left, right| left.canonical_root == right.canonical_root);
+        Ok(WorkspaceDiscovery { map, rejections })
+    }
+
+    fn add_indexed_package(
+        &mut self,
+        name: &str,
+        dir: &Path,
+        package: &serde_json::Value,
+        sources: &IndexedSources,
+    ) {
+        self.add_package_with_sources(name, dir, package, sources);
+    }
+
     pub fn package_named(&self, name: &str) -> Option<&WorkspacePackage> {
         self.packages.iter().find(|package| package.name == name)
     }
@@ -147,19 +244,29 @@ impl WorkspaceMap {
     ///   keeping whichever exist. Subpath-only packages (exports like `"./*"`
     ///   with no `"."`) get no entry file but still resolve through `src/`.
     fn add_package(&mut self, name: &str, dir: &Path, pkg: &serde_json::Value) {
+        self.add_package_with_sources(name, dir, pkg, &FilesystemSources);
+    }
+
+    fn add_package_with_sources<S: SourceLookup>(
+        &mut self,
+        name: &str,
+        dir: &Path,
+        pkg: &serde_json::Value,
+        sources: &S,
+    ) {
         self.package_names.insert(name.to_string());
-        self.subpath_export_aliases(name, dir, pkg);
+        self.subpath_export_aliases(name, dir, pkg, sources);
 
         let src = dir.join("src");
         let mut dist_values = Vec::new();
         let mut values = Vec::new();
-        if let Some((entry, origin)) = package_entry(dir, pkg) {
+        if let Some((entry, origin)) = package_entry_with_sources(dir, pkg, sources) {
             if origin == Origin::Manifest {
                 self.manifest_specifiers.insert(name.to_string());
             }
             values.push(AliasValue::Path(entry.to_string_lossy().into_owned()));
         }
-        if src.is_dir() {
+        if sources.is_dir(&src) {
             dist_values.push(AliasValue::Path(format!("{}/*", src.to_string_lossy())));
             values.push(AliasValue::Path(src.to_string_lossy().into_owned()));
         }
@@ -171,7 +278,13 @@ impl WorkspaceMap {
 
     /// Aliases for declared subpath exports (`"./tool": {...}`), pointing
     /// each at the source its dist target was built from.
-    fn subpath_export_aliases(&mut self, name: &str, dir: &Path, pkg: &serde_json::Value) {
+    fn subpath_export_aliases<S: SourceLookup>(
+        &mut self,
+        name: &str,
+        dir: &Path,
+        pkg: &serde_json::Value,
+        sources: &S,
+    ) {
         let Some(serde_json::Value::Object(map)) = pkg.get("exports") else {
             return;
         };
@@ -188,10 +301,10 @@ impl WorkspaceMap {
             let mut targets = Vec::new();
             collect_active_targets(value, &mut targets);
             if sub.contains('*') {
-                if let Some(entry) = wildcard_subpath_alias(name, dir, sub, &targets) {
+                if let Some(entry) = wildcard_subpath_alias(name, dir, sub, &targets, sources) {
                     self.aliases.push(entry);
                 }
-            } else if let Some((source, origin)) = subpath_source(dir, sub, &targets) {
+            } else if let Some((source, origin)) = subpath_source(dir, sub, &targets, sources) {
                 if origin == Origin::Manifest {
                     self.manifest_specifiers.insert(format!("{name}/{sub}"));
                 }
@@ -373,6 +486,133 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+fn classified_io<T>(
+    path: &Path,
+    stage: &'static str,
+    result: io::Result<T>,
+    rejections: &mut Vec<WorkspaceRejection>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if io_policy::is_inventory_race(&error) => Ok(None),
+        Err(error) if io_policy::is_retryable(&error) => {
+            Err(anyhow::Error::new(error).context(format!("{stage} at {}", path.display())))
+        }
+        Err(error) => {
+            rejections.push(WorkspaceRejection {
+                path: path.to_path_buf(),
+                stage,
+                error: error.to_string(),
+            });
+            Ok(None)
+        }
+    }
+}
+
+fn checked_workspace_globs(
+    root: &Path,
+    rejections: &mut Vec<WorkspaceRejection>,
+) -> Result<Vec<String>> {
+    let pnpm = root.join("pnpm-workspace.yaml");
+    if let Some(yaml) = classified_io(
+        &pnpm,
+        "workspace-manifest",
+        fs::read_to_string(&pnpm),
+        rejections,
+    )? {
+        let globs = pnpm_workspace_globs(&yaml);
+        if !globs.is_empty() {
+            return Ok(globs);
+        }
+    }
+
+    let manifest = root.join("package.json");
+    let Some(text) = classified_io(
+        &manifest,
+        "workspace-manifest",
+        fs::read_to_string(&manifest),
+        rejections,
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let package = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(package) => package,
+        Err(error) => {
+            rejections.push(WorkspaceRejection {
+                path: manifest,
+                stage: "workspace-manifest",
+                error: error.to_string(),
+            });
+            return Ok(Vec::new());
+        }
+    };
+    let Some(workspaces) = package.get("workspaces") else {
+        return Ok(Vec::new());
+    };
+    let values = if workspaces.is_array() {
+        workspaces
+    } else if let Some(packages) = workspaces.get("packages") {
+        packages
+    } else {
+        return Ok(Vec::new());
+    };
+    Ok(values
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Derive package roots from the already classified source inventory instead
+/// of walking the workspace tree a second time. A package with no indexable
+/// source cannot be an internal resolution target, while every filesystem
+/// failure that could hide a real package was already classified by the main
+/// repository walk.
+fn checked_package_dirs(root: &Path, globs: &[String], source_files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for glob in globs {
+        let glob = glob.trim().trim_start_matches("./").trim_end_matches('/');
+        match glob.strip_prefix('!') {
+            Some(negative) => exclude.push(segments(negative)),
+            None if !glob.is_empty() => include.push(segments(glob)),
+            None => {}
+        }
+    }
+    let mut packages = HashSet::new();
+    for file in source_files {
+        let mut directory = file.parent();
+        while let Some(candidate) = directory {
+            let Ok(relative) = candidate.strip_prefix(root) else {
+                break;
+            };
+            if relative.as_os_str().is_empty() {
+                break;
+            }
+            let parts = relative
+                .iter()
+                .filter_map(|part| part.to_str())
+                .collect::<Vec<_>>();
+            if include
+                .iter()
+                .any(|pattern| segments_match(pattern, &parts))
+                && !exclude
+                    .iter()
+                    .any(|pattern| segments_match(pattern, &parts))
+            {
+                packages.insert(candidate.to_path_buf());
+            }
+            directory = candidate.parent();
+        }
+    }
+    let mut packages = packages.into_iter().collect::<Vec<_>>();
+    packages.sort();
+    packages
+}
+
 /// Match a full segment list against a `**`/`*` pattern (used for exclusions).
 fn segments_match(pattern: &[String], path: &[&str]) -> bool {
     match pattern.first() {
@@ -443,6 +683,14 @@ const ENTRY_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs
 /// the `browser` field (not a resolver main field) and source conventions
 /// (`src/index.*`, `index.*`).
 fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<(PathBuf, Origin)> {
+    package_entry_with_sources(dir, pkg, &FilesystemSources)
+}
+
+fn package_entry_with_sources<S: SourceLookup>(
+    dir: &Path,
+    pkg: &serde_json::Value,
+    sources: &S,
+) -> Option<(PathBuf, Origin)> {
     let mut manifest_fields = root_export_targets(pkg);
     for field in ["source", "module", "main"] {
         if let Some(s) = pkg.get(field).and_then(|v| v.as_str()) {
@@ -450,7 +698,7 @@ fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<(PathBuf, Origin
         }
     }
     for field in &manifest_fields {
-        if let Some(path) = first_existing(dir, field) {
+        if let Some(path) = first_existing(dir, field, sources) {
             return Some((path, Origin::Manifest));
         }
     }
@@ -461,7 +709,7 @@ fn package_entry(dir: &Path, pkg: &serde_json::Value) -> Option<(PathBuf, Origin
     inferred_fields.push("src/index".to_string());
     inferred_fields.push("index".to_string());
     for field in &inferred_fields {
-        if let Some(path) = first_existing(dir, field) {
+        if let Some(path) = first_existing(dir, field, sources) {
             return Some((path, Origin::Inferred));
         }
     }
@@ -504,11 +752,101 @@ pub fn package_entry_paths(root: &Path) -> Vec<String> {
     entries
 }
 
-fn first_existing(dir: &Path, field: &str) -> Option<PathBuf> {
+trait SourceLookup {
+    fn is_file(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &Path) -> bool;
+    fn unique_source_match(&self, src: &Path, subpath: &str) -> Option<PathBuf>;
+}
+
+struct FilesystemSources;
+
+impl SourceLookup for FilesystemSources {
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+
+    fn unique_source_match(&self, src: &Path, subpath: &str) -> Option<PathBuf> {
+        unique_source_match(src, subpath)
+    }
+}
+
+struct IndexedSources {
+    files: HashSet<PathBuf>,
+    directories: HashSet<PathBuf>,
+}
+
+impl IndexedSources {
+    fn new(files: &[PathBuf]) -> Self {
+        let files = files.iter().cloned().collect::<HashSet<_>>();
+        let mut directories = HashSet::new();
+        for file in &files {
+            let mut parent = file.parent();
+            while let Some(directory) = parent {
+                if !directories.insert(directory.to_path_buf()) {
+                    break;
+                }
+                parent = directory.parent();
+            }
+        }
+        Self { files, directories }
+    }
+}
+
+impl SourceLookup for IndexedSources {
+    fn is_file(&self, path: &Path) -> bool {
+        self.files.contains(path)
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        self.directories.contains(path)
+    }
+
+    fn unique_source_match(&self, src: &Path, subpath: &str) -> Option<PathBuf> {
+        let mut matches = Vec::new();
+        for file in &self.files {
+            let Ok(relative) = file.strip_prefix(src) else {
+                continue;
+            };
+            if relative.components().count() > 5 {
+                continue;
+            }
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let Some((stem, extension)) = relative.rsplit_once('.') else {
+                continue;
+            };
+            if !ENTRY_EXTENSIONS.contains(&extension) {
+                continue;
+            }
+            let parent = file
+                .parent()
+                .and_then(|parent| parent.strip_prefix(src).ok())
+                .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let file_match = stem == subpath || stem.ends_with(&format!("/{subpath}"));
+            let index_match = file
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "index")
+                && (parent == subpath || parent.ends_with(&format!("/{subpath}")));
+            if file_match || index_match {
+                matches.push(file.clone());
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        (matches.len() == 1).then(|| matches.remove(0))
+    }
+}
+
+fn first_existing<S: SourceLookup>(dir: &Path, field: &str, sources: &S) -> Option<PathBuf> {
     entry_candidates(field)
         .into_iter()
         .map(|candidate| dir.join(candidate))
-        .find(|path| path.is_file())
+        .find(|path| sources.is_file(path))
 }
 
 /// On-disk paths a package.json field value could denote, in preference
@@ -556,22 +894,29 @@ const DIST_FLAVOR_DIRS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "li
 /// when they don't, fall back to a unique source dir/file named after the
 /// subpath (`"./define"` -> `src/sdk/define/index.ts`). Both fallbacks are
 /// heuristic and reported as such.
-fn subpath_source(dir: &Path, sub: &str, targets: &[String]) -> Option<(PathBuf, Origin)> {
+fn subpath_source<S: SourceLookup>(
+    dir: &Path,
+    sub: &str,
+    targets: &[String],
+    sources: &S,
+) -> Option<(PathBuf, Origin)> {
     for target in targets {
-        if let Some(path) = first_existing(dir, target) {
+        if let Some(path) = first_existing(dir, target, sources) {
             return Some((path, Origin::Manifest));
         }
     }
     for target in targets {
         for tail in mirror_tails(target) {
             for base in ["src/", ""] {
-                if let Some(path) = first_existing(dir, &format!("{base}{tail}")) {
+                if let Some(path) = first_existing(dir, &format!("{base}{tail}"), sources) {
                     return Some((path, Origin::Inferred));
                 }
             }
         }
     }
-    unique_source_match(&dir.join("src"), sub).map(|path| (path, Origin::Inferred))
+    sources
+        .unique_source_match(&dir.join("src"), sub)
+        .map(|path| (path, Origin::Inferred))
 }
 
 /// Source-relative tails a build-output target may mirror:
@@ -600,11 +945,12 @@ fn mirror_tails(target: &str) -> Vec<String> {
 /// its suffix dropped so resolver extension/index handling picks the source
 /// file. Trailing generic values keep specifiers outside the translated tree
 /// resolvable (a matched-but-failing alias would otherwise block them).
-fn wildcard_subpath_alias(
+fn wildcard_subpath_alias<S: SourceLookup>(
     name: &str,
     dir: &Path,
     sub: &str,
     targets: &[String],
+    sources: &S,
 ) -> Option<(String, Vec<AliasValue>)> {
     if sub.matches('*').count() != 1 {
         return None;
@@ -623,7 +969,7 @@ fn wildcard_subpath_alias(
             values.push(format!("{dir_str}/{translated}*"));
         }
     }
-    if dir.join("src").is_dir() {
+    if sources.is_dir(&dir.join("src")) {
         values.push(format!("{dir_str}/src/*"));
     }
     values.push(format!("{dir_str}/*"));
@@ -748,7 +1094,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{WorkspaceMap, package_entry_paths, pnpm_workspace_globs};
+    use super::{WorkspaceMap, classified_io, package_entry_paths, pnpm_workspace_globs};
     use oxc_resolver::AliasValue;
 
     fn write(path: &Path, content: &str) {
@@ -770,6 +1116,52 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_discovery_reports_permanently_unreadable_manifests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(
+            &root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        );
+        let manifest = root.join("packages/locked/package.json");
+        write(&manifest, r#"{"name":"locked"}"#);
+        write(
+            &root.join("packages/locked/src/index.ts"),
+            "export const value = 1;\n",
+        );
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let sources = vec![root.join("packages/locked/src/index.ts")];
+        let result = WorkspaceMap::discover_for_index(root, &sources);
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+        let discovery = result.unwrap();
+
+        assert!(discovery.map.packages.is_empty());
+        assert_eq!(discovery.rejections.len(), 1);
+        assert_eq!(discovery.rejections[0].path, manifest);
+        assert_eq!(discovery.rejections[0].stage, "workspace-manifest");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_discovery_propagates_resource_exhaustion() {
+        let mut rejections = Vec::new();
+        let error = classified_io::<()>(
+            Path::new("package.json"),
+            "workspace-manifest",
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            &mut rejections,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("workspace-manifest"));
+        assert!(rejections.is_empty());
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod graph;
 mod heur;
 mod indexer;
 mod inference;
+mod io_policy;
 mod llm;
 mod mcp;
 mod origin;
