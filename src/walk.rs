@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use ignore::WalkBuilder;
 
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
@@ -17,7 +18,7 @@ pub fn is_indexable(path: &Path) -> bool {
 }
 
 /// Walk a repository root, honoring .gitignore, returning indexable source files.
-pub fn source_files(root: &Path) -> Vec<PathBuf> {
+pub fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(true)
@@ -29,13 +30,14 @@ pub fn source_files(root: &Path) -> Vec<PathBuf> {
             !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&name))
         })
         .build();
-    for entry in walker.flatten() {
+    for entry in walker {
+        let entry = entry?;
         if entry.file_type().is_some_and(|t| t.is_file()) && is_indexable(entry.path()) {
             files.push(entry.into_path());
         }
     }
     files.sort();
-    files
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -72,7 +74,7 @@ mod tests {
             "export interface Generated {}\n",
         )?;
 
-        let files = source_files(repo.path())
+        let files = source_files(repo.path())?
             .into_iter()
             .map(|path| {
                 path.strip_prefix(repo.path())
@@ -84,6 +86,15 @@ mod tests {
         assert!(files.contains(&PathBuf::from("packages/app/contracts.d.ts")));
         assert!(!files.contains(&PathBuf::from("build/generated.d.ts")));
         assert!(!files.contains(&PathBuf::from("packages/app/dist/generated.d.ts")));
+        Ok(())
+    }
+
+    #[test]
+    fn traversal_errors_are_not_silently_dropped() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let missing = repo.path().join("missing");
+
+        assert!(source_files(&missing).is_err());
         Ok(())
     }
 }

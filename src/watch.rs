@@ -163,6 +163,12 @@ impl Coordinator {
     }
 
     fn mark_dirty(&mut self, now: Duration, signal: DirtySignal) {
+        // A failed structural refresh has not consumed its inventory/config
+        // requirement. If a newer source event supersedes its parked retry,
+        // carry the old scope and reasons into the successor generation.
+        let preserve_refresh_requirement = self.retry.is_some_and(|retry| {
+            retry.work.generation == self.desired_generation && retry.work.phase == Phase::Refresh
+        });
         let current_generation_has_work = self
             .active
             .is_some_and(|work| work.generation == self.desired_generation)
@@ -174,9 +180,11 @@ impl Coordinator {
                 .is_some_and(|retry| retry.work.generation == self.desired_generation);
         if self.desired_generation == self.completed_generation || current_generation_has_work {
             self.desired_generation += 1;
-            self.dirty_reasons.clear();
-            self.dirty_source_paths.clear();
-            self.refresh_scope = RefreshScope::Incremental;
+            if !preserve_refresh_requirement {
+                self.dirty_reasons.clear();
+                self.dirty_source_paths.clear();
+                self.refresh_scope = RefreshScope::Incremental;
+            }
         }
         self.last_dirty_at = now;
         self.refresh_scope = self.refresh_scope.max(signal.scope);
@@ -280,8 +288,9 @@ impl Coordinator {
             return FinishState::Superseded;
         }
         // A returned outcome means the refresh successfully published the
-        // indexable corpus. File-local read/extraction skips are diagnostics,
-        // not phase failures. Only Err enters finish_error/retry.
+        // indexable corpus. Non-retryable file reads and deterministic
+        // extraction skips are diagnostics, not phase failures. Retryable
+        // reads and other phase errors return Err and enter finish_error.
         self.retry_attempts.remove(&Phase::Refresh);
         self.advance(work)
     }
@@ -512,6 +521,7 @@ impl WatchRegistry {
                 })
                 .or_insert(target.mode);
         }
+        self.failures.retain(|path, _| desired.contains_key(path));
         let removed = self
             .active
             .keys()
@@ -545,13 +555,8 @@ impl WatchRegistry {
                     let failures = self.failures.entry(path.clone()).or_default();
                     *failures = failures.saturating_add(1);
                     eprintln!(
-                        "watch coverage path={} status={} attempt={} error={error}",
+                        "watch coverage path={} status=degraded attempt={} recovery=target-reconciliation error={error}",
                         path.display(),
-                        if *failures >= 3 {
-                            "degraded"
-                        } else {
-                            "retrying"
-                        },
                         failures
                     );
                 }
@@ -627,6 +632,11 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             next_reconcile = None;
         }
         drain_events(&receiver, &classifier, &mut coordinator, started.elapsed());
+        // Any ordinary generation supersedes the previous clean-generation
+        // reconciliation deadline. A new deadline is anchored only when this
+        // generation completes; retaining an overdue deadline would poll at
+        // the one-millisecond floor throughout retry wait.
+        clear_reconciliation_deadline_if_dirty(&coordinator, &mut next_reconcile);
 
         if let Some(work) = coordinator.next_work(started.elapsed()) {
             let phase_started = Instant::now();
@@ -646,16 +656,16 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                 Phase::Refresh => {
                     match run_refresh(&root, &database, options.dependencies, work.refresh_scope) {
                         Ok(result) => {
-                            indexer::report_skips(&result.outcome);
+                            indexer::report_rejections(&result.outcome);
                             eprintln!(
-                                "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} skipped={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
+                                "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} rejected={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
                                 work.generation,
                                 work.refresh_scope,
                                 result.snapshot,
                                 result.outcome.indexed,
                                 result.outcome.unchanged,
                                 result.outcome.removed,
-                                result.outcome.skipped,
+                                result.outcome.rejected,
                                 result.outcome.chunks,
                                 result.outcome.refs,
                                 if result.outcome.projection_rebuilt {
@@ -1051,6 +1061,15 @@ fn report_finish(
     }
 }
 
+fn clear_reconciliation_deadline_if_dirty(
+    coordinator: &Coordinator,
+    next_reconcile: &mut Option<Duration>,
+) {
+    if !coordinator.is_clean() {
+        *next_reconcile = None;
+    }
+}
+
 fn open_phase_database(root: &Path, database: &Path) -> Result<Connection> {
     let conn = if database == store::db_path(root) {
         store::open(root)?
@@ -1275,8 +1294,8 @@ mod tests {
 
     use super::{
         Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS,
-        Phase, RefreshScope, WatchOptions, is_noise, is_refresh_boundary, run_refresh,
-        validate_options,
+        Phase, RefreshScope, WatchOptions, clear_reconciliation_deadline_if_dirty, is_noise,
+        is_refresh_boundary, run_refresh, validate_options,
     };
 
     fn seconds(value: u64) -> Duration {
@@ -1353,14 +1372,56 @@ mod tests {
     }
 
     #[test]
-    fn skipped_files_do_not_degrade_a_successful_refresh() {
+    fn source_event_cannot_downgrade_a_failed_full_refresh_retry() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        assert_eq!(refresh.refresh_scope, RefreshScope::Full);
+        assert!(matches!(
+            coordinator.finish_error(Duration::ZERO, refresh),
+            FinishState::Retry { .. }
+        ));
+
+        coordinator.mark_dirty(Duration::from_millis(100), source_signal("changed.ts"));
+        let successor = coordinator
+            .next_work(Duration::from_millis(2_100))
+            .expect("successor refresh");
+
+        assert_eq!(successor.generation, 2);
+        assert_eq!(successor.refresh_scope, RefreshScope::Full);
+        assert!(coordinator.dirty_reasons.contains("startup"));
+        assert!(coordinator.dirty_reasons.contains("source:changed.ts"));
+    }
+
+    #[test]
+    fn optional_phase_retry_does_not_force_the_next_refresh_full() {
         let mut coordinator = Coordinator::new(seconds(2), true, false);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
         let embed = coordinator.next_work(Duration::ZERO).expect("embed");
-        assert_eq!(embed.phase, Phase::Embed);
-        assert_eq!(coordinator.finish_optional(embed), FinishState::Complete);
-        assert!(coordinator.retry.is_none());
+        assert!(matches!(
+            coordinator.finish_error(Duration::ZERO, embed),
+            FinishState::Retry { .. }
+        ));
+
+        coordinator.mark_dirty(Duration::from_millis(100), source_signal("changed.ts"));
+        let successor = coordinator
+            .next_work(Duration::from_millis(2_100))
+            .expect("successor refresh");
+
+        assert_eq!(successor.refresh_scope, RefreshScope::Incremental);
+    }
+
+    #[test]
+    fn dirty_generation_discards_the_old_reconciliation_deadline() {
+        let mut coordinator = Coordinator::new(seconds(2), false, false);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Complete);
+        let mut next_reconcile = Some(seconds(600));
+
+        coordinator.mark_dirty(seconds(599), source_signal("changed.ts"));
+        clear_reconciliation_deadline_if_dirty(&coordinator, &mut next_reconcile);
+
+        assert_eq!(next_reconcile, None);
     }
 
     #[test]
@@ -1601,15 +1662,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_with_an_unreadable_source_succeeds_with_a_skip() -> Result<()> {
+    fn refresh_with_an_unreadable_source_succeeds_with_a_rejection() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("video.ts"), [0xff, 0xfe])?;
         let database = directory.path().join("watch.db");
 
         let result = run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
 
-        assert_eq!(result.outcome.skipped, 1);
-        assert_eq!(result.outcome.skips[0].path, "video.ts");
+        assert_eq!(result.outcome.rejected, 1);
+        assert_eq!(result.outcome.rejections[0].path, "video.ts");
         assert!(!result.snapshot.is_empty());
         Ok(())
     }

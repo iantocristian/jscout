@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -21,12 +22,14 @@ pub struct IndexOutcome {
     pub indexed: usize,
     pub unchanged: usize,
     /// Previously indexed first-party files omitted from the resulting
-    /// snapshot because they disappeared or failed read/extraction.
+    /// snapshot because they disappeared or had a non-retryable
+    /// read/extraction failure.
     pub removed: usize,
-    /// Source-looking inputs omitted because they could not be read or
-    /// extracted. These are file-local corpus exclusions, not index failures.
-    pub skipped: usize,
-    pub skips: Vec<IndexSkip>,
+    /// Source-looking inputs omitted because they had a non-retryable read or
+    /// extraction failure. These are file-local corpus exclusions, not index
+    /// failures.
+    pub rejected: usize,
+    pub rejections: Vec<IndexRejection>,
     pub chunks: usize,
     pub refs: usize,
     pub dependency_packages: usize,
@@ -45,21 +48,77 @@ pub struct IndexOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexSkip {
+pub struct IndexRejection {
     pub path: String,
     pub stage: &'static str,
     pub error: String,
 }
 
+/// Read failures are either safe, file-local exclusions or phase failures
+/// that must be retried without publishing a reduced corpus. Keep the list
+/// explicit: unknown and permission errors remain skips so one permanently
+/// inaccessible file cannot wedge indexing forever.
+fn retryable_read_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+    retryable_os_error(error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn retryable_os_error(code: Option<i32>) -> bool {
+    code.is_some_and(|code| {
+        matches!(
+            code,
+            libc::EIO
+                | libc::EINTR
+                | libc::EAGAIN
+                | libc::ENOMEM
+                | libc::EBUSY
+                | libc::EMFILE
+                | libc::ENFILE
+                | libc::ETIMEDOUT
+                | libc::ENETDOWN
+                | libc::ENETUNREACH
+                | libc::ENETRESET
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::ENOBUFS
+                | libc::ESTALE
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn retryable_os_error(_code: Option<i32>) -> bool {
+    false
+}
+
+fn retryable_read_failure(path: &str, error: io::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!("retryable read failure for `{path}`"))
+}
+
 impl IndexOutcome {
-    fn record_skip(
+    fn record_rejection(
         &mut self,
         path: impl Into<String>,
         stage: &'static str,
         error: impl std::fmt::Display,
     ) {
-        self.skipped += 1;
-        self.skips.push(IndexSkip {
+        self.rejected += 1;
+        self.rejections.push(IndexRejection {
             path: path.into(),
             stage,
             error: error.to_string(),
@@ -67,14 +126,14 @@ impl IndexOutcome {
     }
 }
 
-pub fn report_skips(outcome: &IndexOutcome) {
-    if outcome.skips.is_empty() {
+pub fn report_rejections(outcome: &IndexOutcome) {
+    if outcome.rejections.is_empty() {
         return;
     }
-    eprintln!("source files skipped ({}):", outcome.skips.len());
-    for skip in &outcome.skips {
-        let error = skip.error.replace('\n', "\n      ");
-        eprintln!("  [{}] {}: {error}", skip.stage, skip.path);
+    eprintln!("index inputs rejected ({}):", outcome.rejections.len());
+    for rejection in &outcome.rejections {
+        let error = rejection.error.replace('\n', "\n      ");
+        eprintln!("  [{}] {}: {error}", rejection.stage, rejection.path);
     }
 }
 
@@ -197,13 +256,13 @@ fn index_repo_impl(
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     ensure_extraction_version(conn)?;
-    let files = walk::source_files(&root);
+    let files = walk::source_files(&root)?;
     let mut outcome = IndexOutcome {
         indexed: 0,
         unchanged: 0,
         removed: 0,
-        skipped: 0,
-        skips: Vec::new(),
+        rejected: 0,
+        rejections: Vec::new(),
         chunks: 0,
         refs: 0,
         dependency_packages: 0,
@@ -276,11 +335,16 @@ fn index_repo_impl(
         seen.insert(rel.clone());
         let source = match std::fs::read_to_string(file) {
             Ok(source) => source,
+            Err(error) if retryable_read_error(&error) => {
+                let error = retryable_read_failure(&rel, error);
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
             Err(error) => {
                 if let Some((old_id, _, _)) = existing.get(&rel) {
                     store::delete_file(conn, *old_id)?;
                 }
-                outcome.record_skip(rel, "read", error);
+                outcome.record_rejection(rel, "read", error);
                 continue;
             }
         };
@@ -322,7 +386,7 @@ fn index_repo_impl(
                 if let Some((old_id, _, _)) = existing.get(&rel) {
                     store::delete_file(conn, *old_id)?;
                 }
-                outcome.record_skip(rel, "extract", e);
+                outcome.record_rejection(rel, "extract", e);
             }
         }
     }
@@ -795,12 +859,16 @@ fn index_dependency_files(
                 let display = dependency_display_path(&plan.package, &file.package_path);
                 let source = match std::fs::read_to_string(&file.source_path) {
                     Ok(source) => source,
+                    Err(error) if retryable_read_error(&error) => {
+                        let path = format!("{display} ({})", file.source_path.display());
+                        return Err(retryable_read_failure(&path, error));
+                    }
                     Err(error) => {
-                        // Preserve the last successfully indexed row on a
-                        // transient read failure; a later successful cycle can
-                        // replace it without first losing known-good data.
                         seen.insert(display.clone());
-                        outcome.record_skip(
+                        if let Some((old_id, _, _, _, _)) = existing.get(&display) {
+                            store::delete_file(conn, *old_id)?;
+                        }
+                        outcome.record_rejection(
                             display,
                             "read",
                             format!("{}: {error}", file.source_path.display()),
@@ -851,7 +919,10 @@ fn index_dependency_files(
                         outcome.refs += refs;
                     }
                     Err(error) => {
-                        outcome.record_skip(display, "extract", error);
+                        if let Some((old_id, _, _, _, _)) = existing.get(&display) {
+                            store::delete_file(conn, *old_id)?;
+                        }
+                        outcome.record_rejection(display, "extract", error);
                     }
                 }
             }
@@ -1114,28 +1185,58 @@ pub(crate) fn package_name(request: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, ErrorKind};
 
     use anyhow::Result;
 
     use super::{
         IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_options,
-        index_repo_without_extraction_reset, refresh_repo_with_options,
+        index_repo_without_extraction_reset, refresh_repo_with_options, retryable_read_error,
     };
     use crate::{embed, origin, query, search, semantic, store, structural};
 
     #[test]
-    fn reports_the_file_and_stage_for_skipped_reads() -> Result<()> {
+    fn read_errors_have_one_explicit_retryability_rule() {
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert!(retryable_read_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::InvalidInput,
+            ErrorKind::PermissionDenied,
+        ] {
+            assert!(!retryable_read_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        #[cfg(unix)]
+        {
+            assert!(retryable_read_error(&io::Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(retryable_read_error(&io::Error::from_raw_os_error(
+                libc::ESTALE
+            )));
+        }
+    }
+
+    #[test]
+    fn reports_the_file_and_stage_for_rejected_reads() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(repo.path().join("bad.ts"), [0xff, 0xfe])?;
         let conn = store::open(repo.path())?;
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!(outcome.skipped, 1);
-        assert_eq!(outcome.skips.len(), 1);
-        assert_eq!(outcome.skips[0].path, "bad.ts");
-        assert_eq!(outcome.skips[0].stage, "read");
-        assert!(!outcome.skips[0].error.is_empty());
+        assert_eq!(outcome.rejected, 1);
+        assert_eq!(outcome.rejections.len(), 1);
+        assert_eq!(outcome.rejections[0].path, "bad.ts");
+        assert_eq!(outcome.rejections[0].stage, "read");
+        assert!(!outcome.rejections[0].error.is_empty());
         assert!(!structural::current_snapshot(&conn)?.is_empty());
         Ok(())
     }
@@ -1151,7 +1252,7 @@ mod tests {
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!((outcome.indexed, outcome.skipped), (1, 0));
+        assert_eq!((outcome.indexed, outcome.rejected), (1, 0));
         let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
         assert!(chunks > 0);
         Ok(())
@@ -1693,6 +1794,71 @@ mod tests {
     }
 
     #[test]
+    fn non_retryable_dependency_rejections_remove_stale_rows() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import value from 'selected-dep';\nexport const result = value;\n",
+        )?;
+        let dependency = repo.path().join("node_modules/selected-dep");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        let entry = dependency.join("index.js");
+        fs::write(
+            &entry,
+            "export const dependencyStaleMarker = true;\nexport default 1;\n",
+        )?;
+
+        let conn = store::open(repo.path())?;
+        let options = IndexOptions {
+            dependencies: vec!["selected-dep".into()],
+            ..Default::default()
+        };
+        index_repo_with_options(repo.path(), &conn, &options)?;
+
+        fs::write(&entry, [0xff, 0xfe])?;
+        let unreadable = index_repo_with_options(repo.path(), &conn, &options)?;
+        assert_eq!(unreadable.rejected, 1);
+        assert_eq!(unreadable.rejections[0].stage, "read");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE origin='dependency'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'dependencyStaleMarker'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+
+        fs::write(&entry, "export default 2;\n")?;
+        index_repo_with_options(repo.path(), &conn, &options)?;
+        fs::write(&entry, "export default function Broken() { return <main>")?;
+        let unparseable = index_repo_with_options(repo.path(), &conn, &options)?;
+        assert_eq!(unparseable.rejected, 1);
+        assert_eq!(unparseable.rejections[0].stage, "extract");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE origin='dependency'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert!(!structural::current_snapshot(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn indexes_only_selected_dependency_files_and_removes_them_when_omitted() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
@@ -2197,7 +2363,7 @@ mod tests {
         let refreshed = refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
         assert!(refreshed.extraction_reset);
         assert_eq!(
-            (refreshed.indexed, refreshed.unchanged, refreshed.skipped),
+            (refreshed.indexed, refreshed.unchanged, refreshed.rejected),
             (1, 0, 0)
         );
         assert_eq!(structural::current_snapshot(&conn)?, snapshot);
@@ -2287,7 +2453,7 @@ mod tests {
         let outcome =
             incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
-        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.rejected, 1);
         assert_eq!(outcome.removed, 1);
         assert_eq!(
             conn.query_row(
@@ -2617,8 +2783,8 @@ mod tests {
         let fast = index_repo_with_options(repo.path(), &reset, &options)?;
         assert!(fast.extraction_reset, "cleared hashes must take the reset");
         assert_eq!(
-            (fast.indexed, fast.unchanged, fast.skipped),
-            (slow.indexed, slow.unchanged, slow.skipped)
+            (fast.indexed, fast.unchanged, fast.rejected),
+            (slow.indexed, slow.unchanged, slow.rejected)
         );
 
         for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?

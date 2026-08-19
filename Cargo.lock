@@ -635,6 +635,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "ignore",
+ "libc",
  "notify",
  "oxc_allocator",
  "oxc_ast",
