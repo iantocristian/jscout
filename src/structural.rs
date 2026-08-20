@@ -2076,6 +2076,16 @@ fn checker_occurrence_coverage(
           AND batch.source_snapshot=?1
          JOIN checker_project_runs run
            ON run.batch_id=project.batch_id AND run.project_id=project.project_id
+         JOIN files source
+           ON source.path=project.source_file AND source.hash=project.source_hash
+         JOIN member_calls call
+           ON call.rowid=project.member_call_id
+          AND call.file_id=source.id
+          AND call.start=project.call_start AND call.end=project.call_end
+          AND call.receiver_start=project.receiver_start
+          AND call.receiver_end=project.receiver_end
+          AND call.property_start=project.property_start
+          AND call.property_end=project.property_end
          ORDER BY project.member_call_id, project.project_id",
     )?;
     let rows = statement.query_map([snapshot], |row| {
@@ -2105,9 +2115,9 @@ fn checker_occurrence_coverage(
 ///
 /// A checker batch belongs to exactly one structural snapshot. Within that
 /// snapshot, source occurrence and target fingerprints are still checked
-/// defensively. A different snapshot drops (full refresh) or ignores
-/// (test-only incremental indexing) the whole batch rather than revalidating
-/// input files. An identical full refresh may reuse the exact-snapshot batch.
+/// defensively. A different snapshot never projects: manual indexing drops
+/// it, while watch may keep it hidden only long enough to construct a newly
+/// rebound batch for the current snapshot.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,
@@ -2143,7 +2153,8 @@ fn project_checker_enrichments(
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
-           ON call.file_id=source.id
+           ON call.rowid=enrichment.member_call_id
+          AND call.file_id=source.id
           AND call.start=enrichment.call_start AND call.end=enrichment.call_end
           AND call.receiver_start=enrichment.receiver_start
           AND call.receiver_end=enrichment.receiver_end
@@ -4898,17 +4909,43 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,'tsconfig.json','inputs','resolved')",
-            rusqlite::params![batch_id, member_call_id],
+             ) VALUES(?1,?2,'service.ts',?3,?4,?5,?6,?7,?8,?9,
+                      'tsconfig.json','inputs','resolved')",
+            rusqlite::params![
+                batch_id,
+                member_call_id,
+                source_hash,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+            ],
         )?;
         conn.execute(
             "INSERT INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,'tsconfig.stray.json','stray-inputs','unknown')",
-            rusqlite::params![batch_id, member_call_id],
+             ) VALUES(?1,?2,'service.ts',?3,?4,?5,?6,?7,?8,?9,
+                      'tsconfig.stray.json','stray-inputs','unknown')",
+            rusqlite::params![
+                batch_id,
+                member_call_id,
+                source_hash,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+            ],
         )?;
         rebuild_projection(&conn, &snapshot)?;
 
@@ -4929,9 +4966,9 @@ mod tests {
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
 
-        // Exact-snapshot batches are identified by source identity and call
-        // spans, not by the disposable member_calls rowid. A future extractor
-        // ordering change must not silently discard an otherwise valid fact.
+        // Canonical facts must be explicitly rebound to the current
+        // member_calls row before projection. Source identity and spans remain
+        // defense in depth, but cannot authorize a stale rowid by themselves.
         let retained_member_call_id = member_call_id + 10_000;
         conn.execute(
             "UPDATE checker_enrichments SET member_call_id=?1 WHERE batch_id=?2",
@@ -4949,8 +4986,18 @@ mod tests {
                 [&target],
                 |row| row.get::<_, i64>(0),
             )?,
-            1
+            0
         );
+
+        conn.execute(
+            "UPDATE checker_enrichments SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![member_call_id, batch_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_occurrence_projects SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![member_call_id, batch_id],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
 
         let (checker_source, checker_detail): (String, String) = conn.query_row(
             "SELECT src_key, detail_json FROM resolved_edges
@@ -5096,10 +5143,25 @@ mod tests {
             )?;
             conn.execute(
                 "INSERT INTO checker_occurrence_projects(
-                   batch_id, member_call_id, project_id,
+                   batch_id, member_call_id, source_file, source_hash,
+                   call_start, call_end, receiver_start, receiver_end,
+                   property_start, property_end, project_id,
                    checker_input_fingerprint, status
-                 ) VALUES(?1,?2,?3,?4,'resolved')",
-                rusqlite::params![batch_id, call, &project, &input_fingerprint],
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'resolved')",
+                rusqlite::params![
+                    batch_id,
+                    call,
+                    &query_file,
+                    &hash,
+                    spans[0],
+                    spans[1],
+                    spans[2],
+                    spans[3],
+                    spans[4],
+                    spans[5],
+                    &project,
+                    &input_fingerprint,
+                ],
             )?;
             conn.execute(
                 "INSERT INTO checker_enrichments(

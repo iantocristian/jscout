@@ -338,6 +338,8 @@ configuration counts after a configuration-only ownership pass and does not
 construct a TypeScript Program. Its coverage fields distinguish eligible files
 and occurrences without configured owners from occurrences actually skipped by
 the default inferred-project gate.
+`--full` bypasses exact-batch reuse and recomputes every selected project. It is
+the manual equivalent of the watcher's periodic carry-free checker drift flush.
 
 The default plan excludes calls whose member name has indexed namesakes only
 outside effective-runtime files; `--all` bypasses that necessary anchorability
@@ -408,20 +410,34 @@ actual Node error/stack in the command error as well as stderr.
 ### Checker snapshot lifecycle
 
 Every checker batch is bound to exactly one structural snapshot. Projection
-accepts it only when `source_snapshot` matches; there is no per-project
-cross-snapshot revalidation. `jscout index` preserves a checker batch only when
-the rebuilt checkout produces the exact same structural snapshot; a changed
-snapshot deletes it while preserving embeddings and semantic memory. Run
-`jscout enrich` after a changed full index when those occurrence-specific edges
-are needed.
+accepts it only when `source_snapshot` matches. Manual `jscout index` clears all
+checker batches, even when the rebuilt structural snapshot is identical; run
+`jscout enrich` afterward when occurrence-specific checker edges are needed.
+
+`tsconfig` files are checker invalidation boundaries, not structural snapshot
+inputs. Editing or deleting one can therefore leave the reported structural
+snapshot hash unchanged. In watch mode the boundary event still starts a
+generation, and the checker planner's configuration-chain and membership
+fingerprints determine which projects must run again; snapshot equality alone
+does not imply that checker configuration was unchanged.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
-project-batched, resumable checker pass for the resulting snapshot. A newer
-snapshot cannot mix with older staging. If the checker fails or times out,
-staged work stays non-public and the coordinator retries it without requiring a
-new filesystem event. Relevant edits that arrive during enrichment cancel or
-supersede that work and require a new structural generation. Plain `watch`
-never starts Node.
+project-batched, resumable checker pass for the resulting snapshot. Across a
+changed snapshot it may carry an unchanged project when its configuration
+chain, membership, checker identity, and protocol fingerprint match. Each fact
+is rebound to the current member-call row only when its source hash and exact
+call/receiver/property spans still match and its target fingerprint remains
+current. If any owner of a multi-project occurrence cannot carry, all owners
+are re-queried. Dirty projects and occurrences run first; fully carried
+projects construct no TypeScript Program. The old batch remains non-public and
+is deleted when the new current-snapshot batch activates.
+
+External checker inputs remain watched for carried projects. An independent
+daily-scale deadline schedules `enrich --full` semantics inside the watcher;
+this is separate from the default ten-minute structural reconciliation. If a
+source event supersedes that generation, the carry-free requirement follows
+the successor instead of being dropped. Plain `watch` never starts Node and
+never projects an old-snapshot batch.
 
 Watch maintains structural state and, when explicitly enabled, checker facts
 plus code and semantic vector indexes. It does not generate semantic content:
@@ -455,8 +471,9 @@ coalesced generation.
 
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
-needed. Exact-snapshot checker facts may be reused when the resulting snapshot
-is unchanged; any changed snapshot drops them. A deterministic extraction
+needed. Manual indexing clears checker facts. Watch may reuse an exact-snapshot
+batch or keep one changed-snapshot batch hidden as input to the following
+validated carry pass. A deterministic extraction
 rejection or non-retryable read failure is reported and excluded; an old row
 for that path is not served as current. The refresh still succeeds over the
 indexable corpus.
@@ -473,8 +490,8 @@ complete replacement can commit.
 
 Compatibility note: repositories indexed by the brief source-derived
 workspace-discovery implementation get a one-time resolution-identity change
-when source-less members return to the workspace map. The resulting snapshot
-change intentionally invalidates exact-snapshot checker batches once.
+when source-less members return to the workspace map. In watch, the resulting
+membership-fingerprint change forces the affected checker projects to run once.
 The default two-second trailing quiet period coalesces edits; an event received
 during any phase advances the desired generation and cannot be consumed by the
 phase already running.
@@ -936,10 +953,11 @@ or `stale` label. The complete response-byte limit includes semantic artifacts.
 structural rows across snapshots. It preserves content-hash embedding cache
 rows, semantic memory, and immutable repository-reconnaissance history, then
 rematerializes current vector occurrences and exact fresh reconnaissance policy
-from those durable planes. Checker enrichment is snapshot-bound: an exact
-batch survives either refresh mode when the snapshot is unchanged, while a
-changed snapshot removes it. Run `jscout enrich` again when those
-occurrence-specific edges are required.
+from those durable planes. Checker enrichment is snapshot-bound: manual index
+clears it, while watch may reuse an exact batch or validate and rebind
+unchanged project facts into a newly published current-snapshot batch. Run
+`jscout enrich` again after manual indexing when those occurrence-specific
+edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
 periodic full reconciliation. `watch --embed` updates the default corpus;

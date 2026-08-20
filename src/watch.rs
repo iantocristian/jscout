@@ -17,6 +17,7 @@ use crate::{checker, embed, indexer, store, structural, walk};
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(30);
+const CHECKER_DRIFT_FLUSH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const OPTIONAL_PHASE_POLL: Duration = Duration::from_millis(100);
 const MAX_INCREMENTAL_SOURCE_PATHS: usize = 256;
 
@@ -71,6 +72,7 @@ struct DirtySignal {
     scope: RefreshScope,
     reasons: BTreeSet<String>,
     source_paths: BTreeSet<String>,
+    force_full_enrichment: bool,
 }
 
 impl DirtySignal {
@@ -79,6 +81,7 @@ impl DirtySignal {
             scope: RefreshScope::Full,
             reasons: [reason.into()].into(),
             source_paths: BTreeSet::new(),
+            force_full_enrichment: false,
         }
     }
 
@@ -87,6 +90,16 @@ impl DirtySignal {
             scope: RefreshScope::Incremental,
             reasons: [reason.into()].into(),
             source_paths: [path.into()].into(),
+            force_full_enrichment: false,
+        }
+    }
+
+    fn checker_drift_flush() -> Self {
+        Self {
+            scope: RefreshScope::Incremental,
+            reasons: ["checker-drift-flush".to_string()].into(),
+            source_paths: BTreeSet::new(),
+            force_full_enrichment: true,
         }
     }
 
@@ -94,6 +107,7 @@ impl DirtySignal {
         self.scope = self.scope.max(other.scope);
         self.reasons.extend(other.reasons);
         self.source_paths.extend(other.source_paths);
+        self.force_full_enrichment |= other.force_full_enrichment;
     }
 }
 
@@ -102,6 +116,7 @@ struct Work {
     generation: u64,
     phase: Phase,
     refresh_scope: RefreshScope,
+    force_full_enrichment: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -140,6 +155,7 @@ struct Coordinator {
     embed: bool,
     enrich: bool,
     partial_generation: bool,
+    force_full_enrichment: bool,
 }
 
 impl Coordinator {
@@ -162,6 +178,7 @@ impl Coordinator {
             embed,
             enrich,
             partial_generation: false,
+            force_full_enrichment: false,
         };
         coordinator.mark_dirty(Duration::ZERO, DirtySignal::full("startup"));
         coordinator.refresh_immediate = true;
@@ -175,6 +192,7 @@ impl Coordinator {
         let preserve_refresh_requirement = self.retry.is_some_and(|retry| {
             retry.work.generation == self.desired_generation && retry.work.phase == Phase::Refresh
         });
+        let preserve_checker_flush_requirement = self.force_full_enrichment;
         let current_generation_has_work = self
             .active
             .is_some_and(|work| work.generation == self.desired_generation)
@@ -192,9 +210,13 @@ impl Coordinator {
                 self.dirty_source_paths.clear();
                 self.refresh_scope = RefreshScope::Incremental;
             }
+            if preserve_checker_flush_requirement {
+                self.dirty_reasons.insert("checker-drift-flush".to_string());
+            }
         }
         self.last_dirty_at = now;
         self.refresh_scope = self.refresh_scope.max(signal.scope);
+        self.force_full_enrichment |= signal.force_full_enrichment;
         self.dirty_reasons.extend(
             signal
                 .reasons
@@ -226,6 +248,13 @@ impl Coordinator {
     fn mark_reconciliation(&mut self, now: Duration) {
         debug_assert!(self.is_clean());
         self.mark_dirty(now, DirtySignal::full("periodic-reconciliation"));
+        self.refresh_immediate = true;
+    }
+
+    fn mark_checker_drift_flush(&mut self, now: Duration) {
+        debug_assert!(self.is_clean());
+        debug_assert!(self.enrich);
+        self.mark_dirty(now, DirtySignal::checker_drift_flush());
         self.refresh_immediate = true;
     }
 
@@ -268,6 +297,7 @@ impl Coordinator {
             generation: self.desired_generation,
             phase: Phase::Refresh,
             refresh_scope: self.refresh_scope,
+            force_full_enrichment: self.force_full_enrichment,
         };
         self.active = Some(work);
         Some(work)
@@ -365,12 +395,14 @@ impl Coordinator {
                 generation: work.generation,
                 phase,
                 refresh_scope: work.refresh_scope,
+                force_full_enrichment: work.force_full_enrichment,
             });
             FinishState::Continue
         } else {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
             self.dirty_source_paths.clear();
+            self.force_full_enrichment = false;
             if std::mem::take(&mut self.partial_generation) {
                 FinishState::Partial
             } else {
@@ -647,6 +679,12 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     // start or timer fire. Long generations therefore cannot create a
     // back-to-back refresh loop.
     let mut next_reconcile = None;
+    // Checker carry-forward intentionally ignores some ambient type drift.
+    // Bound that window independently of the frequent structural reconcile.
+    let mut next_checker_flush = options
+        .enrich_on_change
+        .then_some(CHECKER_DRIFT_FLUSH_INTERVAL);
+    let mut checker_flush_pending = false;
 
     eprintln!(
         "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={}",
@@ -666,6 +704,11 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
 
     loop {
         let now = started.elapsed();
+        if next_checker_flush.is_some_and(|deadline| now >= deadline) && coordinator.is_clean() {
+            coordinator.mark_checker_drift_flush(now);
+            next_checker_flush = None;
+            checker_flush_pending = true;
+        }
         if next_reconcile.is_some_and(|deadline| now >= deadline) && coordinator.is_clean() {
             coordinator.mark_reconciliation(now);
             next_reconcile = None;
@@ -837,12 +880,14 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     match result {
                         Ok(report) => {
                             eprintln!(
-                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} files_without_configured_project={} occurrences_skipped_inferred_project={} elapsed_ms={}",
+                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} projects_carried={} occurrences_carried={} files_without_configured_project={} occurrences_skipped_inferred_project={} elapsed_ms={}",
                                 work.generation,
                                 report.snapshot,
                                 report.facts_published,
                                 report.occurrences_queried,
                                 report.projects,
+                                report.projects_carried,
+                                report.occurrences_carried,
                                 report.files_without_configured_project,
                                 report.occurrences_skipped_inferred_project,
                                 phase_started.elapsed().as_millis()
@@ -960,16 +1005,27 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     }
                 }
             }
+            if checker_flush_pending && coordinator.is_clean() {
+                checker_flush_pending = false;
+                next_checker_flush = Some(
+                    started
+                        .elapsed()
+                        .saturating_add(CHECKER_DRIFT_FLUSH_INTERVAL),
+                );
+            }
             continue;
         }
 
         let now = started.elapsed();
         let phase_deadline = coordinator.next_deadline();
-        let deadline = match (phase_deadline, next_reconcile) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
+        let checker_deadline = coordinator
+            .is_clean()
+            .then_some(next_checker_flush)
+            .flatten();
+        let deadline = [phase_deadline, next_reconcile, checker_deadline]
+            .into_iter()
+            .flatten()
+            .min();
         let received = match deadline {
             Some(deadline) => {
                 receiver.recv_timeout(deadline.saturating_sub(now).max(Duration::from_millis(1)))
@@ -1018,7 +1074,7 @@ fn run_refresh(
         RefreshScope::Incremental => {
             indexer::incremental_refresh_repo_with_options(root, &conn, &options)?
         }
-        RefreshScope::Full => indexer::refresh_repo_with_options(root, &conn, &options)?,
+        RefreshScope::Full => indexer::watch_full_refresh_repo_with_options(root, &conn, &options)?,
     };
     let snapshot = structural::current_snapshot(&conn)?;
     Ok(RefreshResult { snapshot, outcome })
@@ -1091,6 +1147,13 @@ fn run_enrichment_interruptible(
     let database = database.to_path_buf();
     let sidecar = options.checker_sidecar.map(Path::to_path_buf);
     let timeout = options.enrich_timeout;
+    let force_full = monitor.work.force_full_enrichment;
+    let dirty_files = monitor
+        .coordinator
+        .dirty_source_paths
+        .iter()
+        .cloned()
+        .collect();
     let worker = thread::spawn(move || {
         checker::enrich(
             &root,
@@ -1105,6 +1168,9 @@ fn run_enrichment_interruptible(
                 max_occurrences: None,
                 include_all: false,
                 dry_run: false,
+                carry_forward: !force_full,
+                force_full,
+                dirty_files,
             },
         )
     });
@@ -1609,6 +1675,53 @@ mod tests {
             .expect("immediate reconciliation");
         assert_eq!(refresh.generation, 2);
         assert_eq!(refresh.refresh_scope, RefreshScope::Full);
+        assert!(!refresh.force_full_enrichment);
+    }
+
+    #[test]
+    fn checker_drift_flush_is_independent_and_forces_only_enrichment() {
+        let mut coordinator = Coordinator::new(seconds(2), false, true);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+        let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+        assert_eq!(
+            coordinator.finish_optional(startup_enrich),
+            FinishState::Complete
+        );
+
+        coordinator.mark_checker_drift_flush(seconds(86_400));
+        let refresh = coordinator
+            .next_work(seconds(86_400))
+            .expect("drift refresh");
+        assert_eq!(refresh.refresh_scope, RefreshScope::Incremental);
+        assert!(refresh.force_full_enrichment);
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+        let enrich = coordinator.next_work(seconds(86_400)).expect("full enrich");
+        assert_eq!(enrich.phase, Phase::Enrich);
+        assert!(enrich.force_full_enrichment);
+        assert_eq!(coordinator.finish_optional(enrich), FinishState::Complete);
+        assert!(!coordinator.force_full_enrichment);
+    }
+
+    #[test]
+    fn source_event_superseding_a_drift_flush_keeps_the_full_enrichment_requirement() {
+        let mut coordinator = Coordinator::new(seconds(2), false, true);
+        let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+        assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+        let enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+        assert_eq!(coordinator.finish_optional(enrich), FinishState::Complete);
+
+        coordinator.mark_checker_drift_flush(seconds(86_400));
+        let drift_refresh = coordinator.next_work(seconds(86_400)).expect("drift");
+        coordinator.mark_dirty(seconds(86_401), source_signal("changed.ts"));
+        assert_eq!(
+            coordinator.finish_refresh(drift_refresh),
+            FinishState::Superseded
+        );
+        let successor = coordinator.next_work(seconds(86_403)).expect("successor");
+        assert!(successor.force_full_enrichment);
+        assert!(coordinator.dirty_reasons.contains("checker-drift-flush"));
+        assert!(coordinator.dirty_reasons.contains("source:changed.ts"));
     }
 
     #[test]
