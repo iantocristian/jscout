@@ -1043,6 +1043,29 @@ pub fn search(
     })
 }
 
+/// Count the repository-wide same-name reference occurrences that the compact
+/// search surface deliberately no longer labels as exact callers.
+///
+/// This reproduces the former top-three-symbol diagnostic for telemetry only.
+/// It is intentionally approximate: references are matched by name, not by a
+/// resolved declaration anchor, and the same reference may contribute to more
+/// than one returned hit. Callers should never render this as `used_by`.
+pub(crate) fn approximate_name_usage_occurrences(conn: &Connection, hits: &[Hit]) -> Result<usize> {
+    let mut symbols_stmt = conn.prepare_cached("SELECT symbols FROM chunks WHERE id = ?1")?;
+    let mut count_stmt =
+        conn.prepare_cached("SELECT COUNT(*) FROM refs WHERE target_name = ?1 AND chunk_id != ?2")?;
+    let mut total = 0_u64;
+    for hit in hits {
+        let symbols: String = symbols_stmt.query_row([hit.chunk_id], |row| row.get(0))?;
+        for symbol in symbols.split_whitespace().take(3) {
+            let count: i64 =
+                count_stmt.query_row(rusqlite::params![symbol, hit.chunk_id], |row| row.get(0))?;
+            total = total.saturating_add(count.max(0) as u64);
+        }
+    }
+    Ok(usize::try_from(total).unwrap_or(usize::MAX))
+}
+
 #[derive(Debug)]
 struct ConnectedMemoryCandidate {
     artifact: semantic::SemanticArtifact,
@@ -2267,10 +2290,10 @@ mod tests {
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
         ExpansionOptions, Hit, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
         SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
-        apply_response_budget, candidate_pool_limits, contains_code_identifier,
-        exact_intent_tokens, merge_reranked_prefix, prefilter_ranking_by_role,
-        record_vector_ranking, reranker_document, search, select_attached_memory,
-        tiered_candidates,
+        apply_response_budget, approximate_name_usage_occurrences, candidate_pool_limits,
+        contains_code_identifier, exact_intent_tokens, merge_reranked_prefix,
+        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
+        select_attached_memory, tiered_candidates,
     };
     use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
     use crate::{
@@ -2658,6 +2681,7 @@ mod tests {
         assert_eq!(definition.file_anchor, "file:a.ts");
         assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
         assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
+        assert!(approximate_name_usage_occurrences(&conn, &result.hits)? > 0);
         assert_eq!(
             result
                 .hits

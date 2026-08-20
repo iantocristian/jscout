@@ -69,6 +69,7 @@ pub fn serve(
         ),
         None => None,
     };
+    let collect_telemetry = telemetry.is_some();
     let mut request_log = match request_log_path {
         Some(path) => Some(
             OpenOptions::new()
@@ -168,6 +169,7 @@ pub fn serve(
                                 source_view,
                                 search_defaults: &runtime.effective.search,
                                 timing: runtime.effective.diagnostics.timing,
+                                collect_telemetry,
                                 retrieval_timings: &retrieval_timings,
                             },
                             name,
@@ -186,6 +188,7 @@ pub fn serve(
                             source_view,
                             search_defaults: &runtime.effective.search,
                             timing: runtime.effective.diagnostics.timing,
+                            collect_telemetry,
                             retrieval_timings: &retrieval_timings,
                         },
                         name,
@@ -725,6 +728,7 @@ struct ToolContext<'a> {
     source_view: scout::SourceView,
     search_defaults: &'a config::SearchSettings,
     timing: bool,
+    collect_telemetry: bool,
     retrieval_timings: &'a RefCell<RetrievalStageMetrics>,
 }
 
@@ -740,6 +744,7 @@ struct RetrievalStageMetrics {
     semantic_vector_action: Option<&'static str>,
     semantic_candidates: usize,
     semantic_selected: usize,
+    name_only_usage_occurrences: Option<usize>,
     transport_sections: Option<search::SearchSectionBytes>,
 }
 
@@ -761,6 +766,17 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
             let result =
                 search::search(conn, if use_vector { provider } else { None }, q, &options)?;
             let transport_sections = crate::compact::search_section_bytes(&result)?;
+            let name_only_usage_occurrences = if context.collect_telemetry {
+                match search::approximate_name_usage_occurrences(conn, &result.hits) {
+                    Ok(count) => Some(count),
+                    Err(error) => {
+                        eprintln!("warning: failed to collect name-only usage telemetry: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             context.retrieval_timings.replace(RetrievalStageMetrics {
                 code_vector: result.retrieval.vector_timings,
                 semantic_vector: result
@@ -781,6 +797,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     .and_then(|retrieval| retrieval.vector_action),
                 semantic_candidates: result.semantic_candidates,
                 semantic_selected: result.semantic_selected,
+                name_only_usage_occurrences,
                 transport_sections: Some(transport_sections),
             });
             if debug {
@@ -1587,6 +1604,7 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         "semantic_artifacts_written": usize::from(*tool == "annotate" && ok),
         "semantic_candidate_pool": retrieval_timings.semantic_candidates,
         "semantic_selected": retrieval_timings.semantic_selected,
+        "name_only_usage_occurrences": retrieval_timings.name_only_usage_occurrences,
         "retrieval_vector": retrieval_vector,
         "retrieval_vector_action": retrieval_vector_action,
         "retrieval_reranker": retrieval_reranker,
@@ -1781,6 +1799,7 @@ fn call_tool(
             source_view,
             search_defaults: &config::SearchSettings::default(),
             timing: false,
+            collect_telemetry: false,
             retrieval_timings: &retrieval_timings,
         },
         name,
