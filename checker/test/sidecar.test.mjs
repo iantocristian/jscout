@@ -181,6 +181,27 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   await checker.close();
 });
 
+test("reports a file outside configured projects as inferred ownership", async (context) => {
+  const root = fixture({
+    "configured.ts": "export const configured = true;\n",
+    "orphan.mjs": "export function run(value) { value.call(); }\n",
+    "tsconfig.json": JSON.stringify({ files: ["configured.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["orphan.mjs"] });
+  assert.deepEqual(plan.result.files, [{
+    file: "orphan.mjs",
+    project_ids: ["inferred:orphan.mjs"],
+    excluded_project_ids: [],
+    tooling_fallback: false,
+  }]);
+  await checker.close();
+});
+
 test("excludes tooling config ownership only when a non-tooling owner remains", async (context) => {
   const shared = "declare const shared: { run(): void };\nshared.run()\n";
   const lintOnly = "declare const lintOnly: { run(): void };\nlintOnly.run()\n";

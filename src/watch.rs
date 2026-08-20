@@ -837,12 +837,14 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     match result {
                         Ok(report) => {
                             eprintln!(
-                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} elapsed_ms={}",
+                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} files_without_configured_project={} occurrences_skipped_inferred_project={} elapsed_ms={}",
                                 work.generation,
                                 report.snapshot,
                                 report.facts_published,
                                 report.occurrences_queried,
                                 report.projects,
+                                report.files_without_configured_project,
+                                report.occurrences_skipped_inferred_project,
                                 phase_started.elapsed().as_millis()
                             );
                             targets =
