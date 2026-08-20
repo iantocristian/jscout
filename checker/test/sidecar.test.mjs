@@ -395,6 +395,184 @@ test("executes a noEmit main config promoted above an overlapping dist config", 
   await checker.close();
 });
 
+test("every planner-selected owner accepts a file shared by several configs", async (context) => {
+  const source = "declare const shared: { run(): void };\nshared.run()\n";
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.browser.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.server.json": JSON.stringify({ files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const planner = client(root);
+  context.after(() => planner.child.kill());
+  await planner.request("hello");
+  const plan = await planner.request("plan_members", { files: ["main.ts"] });
+  await planner.close();
+
+  assert.deepEqual(plan.result.files[0].project_ids, [
+    "tsconfig.browser.json",
+    "tsconfig.json",
+    "tsconfig.server.json",
+  ]);
+  assert.deepEqual(plan.result.files[0].excluded_project_ids, []);
+  for (const projectId of plan.result.files[0].project_ids) {
+    const resolver = client(root);
+    context.after(() => resolver.child.kill());
+    await resolver.request("hello");
+    const result = await resolver.request("resolve_members", {
+      project_id: projectId,
+      queries: [queryFor(source, "shared.run()", "shared", "run")],
+    });
+    assert.equal(result.kind, "resolve_members_result", `${projectId}: ${JSON.stringify(result)}`);
+    await resolver.close();
+  }
+});
+
+test("keeps every tooling owner when no general project owns the file", async (context) => {
+  const root = fixture({
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.eslint.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.lint.json": JSON.stringify({ files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.deepEqual(plan.result.files[0], {
+    file: "main.ts",
+    project_ids: ["tsconfig.eslint.json", "tsconfig.lint.json"],
+    excluded_project_ids: [],
+    tooling_fallback: true,
+  });
+  await checker.close();
+});
+
+test("keeps solution-style project references out of leaf ownership", async (context) => {
+  const appSource = "declare const app: { run(): void };\napp.run()\n";
+  const libSource = "declare const lib: { run(): void };\nlib.run()\n";
+  const root = fixture({
+    "tsconfig.json": JSON.stringify({
+      files: [],
+      references: [{ path: "./packages/app" }, { path: "./packages/lib" }],
+    }),
+    "packages/app/src/app.ts": appSource,
+    "packages/app/tsconfig.json": JSON.stringify({
+      compilerOptions: { composite: true },
+      include: ["src"],
+      references: [{ path: "../lib" }],
+    }),
+    "packages/lib/src/lib.ts": libSource,
+    "packages/lib/tsconfig.json": JSON.stringify({
+      compilerOptions: { composite: true },
+      include: ["src"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", {
+    files: ["packages/app/src/app.ts", "packages/lib/src/lib.ts"],
+  });
+  assert.deepEqual(plan.result.files, [
+    {
+      file: "packages/app/src/app.ts",
+      project_ids: ["packages/app/tsconfig.json"],
+      excluded_project_ids: [],
+      tooling_fallback: false,
+    },
+    {
+      file: "packages/lib/src/lib.ts",
+      project_ids: ["packages/lib/tsconfig.json"],
+      excluded_project_ids: [],
+      tooling_fallback: false,
+    },
+  ]);
+  assert.ok(plan.result.projects.some((project) => (
+    project.project_id === "tsconfig.json" && project.file_count === 0
+  )));
+  await checker.close();
+});
+
+test("reports a config that becomes malformed after planning as project_not_found", async (context) => {
+  const root = fixture({
+    "main.ts": "export const value = 1;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const planner = client(root);
+  context.after(() => planner.child.kill());
+  await planner.request("hello");
+  const plan = await planner.request("plan_members", { files: ["main.ts"] });
+  assert.deepEqual(plan.result.files[0].project_ids, ["tsconfig.json"]);
+  await planner.close();
+
+  fs.writeFileSync(path.join(root, "tsconfig.json"), "{");
+  const resolver = client(root);
+  context.after(() => resolver.child.kill());
+  await resolver.request("hello");
+  const result = await resolver.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [{
+      file: "main.ts",
+      indexed_hash: sourceHash("export const value = 1;\n"),
+      call_start: 0,
+      call_end: 1,
+      receiver_start: 0,
+      receiver_end: 1,
+      property_start: 0,
+      property_end: 1,
+    }],
+  });
+  assert.equal(result.kind, "error");
+  assert.equal(result.error.code, "project_not_found");
+  await resolver.close();
+});
+
+test("discovers paired configs independently across workspace members", async (context) => {
+  const source = (name) => `declare const ${name}: { run(): void };\n${name}.run()\n`;
+  const root = fixture({
+    "package.json": JSON.stringify({ private: true, workspaces: ["packages/*"] }),
+    "packages/alpha/package.json": JSON.stringify({
+      name: "alpha",
+      scripts: { "lint:types": "tsc -p tsconfig.json" },
+    }),
+    "packages/alpha/src/agent.ts": source("alpha"),
+    "packages/alpha/tsconfig.json": JSON.stringify({
+      compilerOptions: { noEmit: true }, include: ["src"],
+    }),
+    "packages/alpha/tsconfig.dist.json": JSON.stringify({ include: ["src"] }),
+    "packages/beta/package.json": JSON.stringify({
+      name: "beta",
+      scripts: { "lint:types": "tsc -p tsconfig.json" },
+    }),
+    "packages/beta/src/agent.ts": source("beta"),
+    "packages/beta/tsconfig.json": JSON.stringify({
+      compilerOptions: { noEmit: true }, include: ["src"],
+    }),
+    "packages/beta/tsconfig.dist.json": JSON.stringify({ include: ["src"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", {
+    files: ["packages/alpha/src/agent.ts", "packages/beta/src/agent.ts"],
+  });
+  for (const ownership of plan.result.files) {
+    const member = ownership.file.split("/")[1];
+    assert.deepEqual(ownership.project_ids, [`packages/${member}/tsconfig.dist.json`]);
+    assert.deepEqual(ownership.excluded_project_ids, [`packages/${member}/tsconfig.json`]);
+    assert.equal(ownership.tooling_fallback, false);
+  }
+  await checker.close();
+});
+
 test("does not borrow a lint signal from a neighboring compound command", async (context) => {
   const root = fixture({
     "package.json": JSON.stringify({
