@@ -118,10 +118,8 @@ pub struct SearchResult {
     pub semantic_attachment: Option<MemoryAttachmentStatus>,
     /// Ranked retrieval pool before the memory result limit. This is a
     /// candidate count, not a calibrated relevant-match count.
-    #[serde(skip)]
     pub semantic_candidates: usize,
     /// Memory previews selected before the whole-response byte budget.
-    #[serde(skip)]
     pub semantic_selected: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
@@ -206,6 +204,29 @@ pub struct ResponseBudget {
     pub omitted_edges: usize,
     pub omitted_followups: usize,
     pub truncated_snippets: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_sections: Option<SearchSectionBytes>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchSectionBytes {
+    pub hits_bytes: usize,
+    pub graph_bytes: usize,
+    pub memory_bytes: usize,
+    pub envelope_bytes: usize,
+    pub total_bytes: usize,
+}
+
+impl SearchSectionBytes {
+    fn reserved() -> Self {
+        Self {
+            hits_bytes: usize::MAX,
+            graph_bytes: usize::MAX,
+            memory_bytes: usize::MAX,
+            envelope_bytes: usize::MAX,
+            total_bytes: usize::MAX,
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1013,6 +1034,7 @@ pub fn search(
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
+                transport_sections: (!options.compact).then(SearchSectionBytes::reserved),
                 ..Default::default()
             },
         };
@@ -1696,6 +1718,9 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
     if byte_limit == 0 {
         anyhow::bail!("response byte limit must be greater than zero");
     }
+    if !compact && result.response_budget.transport_sections.is_none() {
+        result.response_budget.transport_sections = Some(SearchSectionBytes::reserved());
+    }
 
     capture_unbudgeted_bytes(result, compact)?;
 
@@ -1832,6 +1857,16 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
         );
     }
 
+    if !compact {
+        for _ in 0..8 {
+            let sections = crate::compact::search_section_bytes(result)?;
+            if result.response_budget.transport_sections == Some(sections) {
+                break;
+            }
+            result.response_budget.transport_sections = Some(sections);
+            settle_rendered_bytes(result, compact)?;
+        }
+    }
     settle_rendered_bytes(result, compact)?;
     Ok(())
 }
@@ -2951,7 +2986,7 @@ mod tests {
                 truncated: false,
             }),
             response_budget: ResponseBudget {
-                byte_limit: 1_650,
+                byte_limit: 2_000,
                 ..Default::default()
             },
         };
@@ -2962,7 +2997,7 @@ mod tests {
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
-        assert!(result.response_budget.rendered_bytes <= 1_650);
+        assert!(result.response_budget.rendered_bytes <= 2_000);
         Ok(())
     }
 
@@ -3074,7 +3109,7 @@ mod tests {
             semantic_selected: 0,
             expansion: None,
             response_budget: ResponseBudget {
-                byte_limit: 550,
+                byte_limit: 425,
                 ..Default::default()
             },
         };
@@ -3086,7 +3121,16 @@ mod tests {
         let compact = crate::compact::search_value(&result);
         assert!(compact["hits"][0]["followups"]["tools"].is_array());
         assert!(compact["hits"][0]["followups"].get("arguments").is_none());
-        assert!(result.response_budget.rendered_bytes <= 550);
+        assert!(result.response_budget.rendered_bytes <= 425);
+        let sections = crate::compact::search_section_bytes(&result)?;
+        assert_eq!(
+            sections.hits_bytes
+                + sections.graph_bytes
+                + sections.memory_bytes
+                + sections.envelope_bytes,
+            sections.total_bytes
+        );
+        assert_eq!(sections.total_bytes, serde_json::to_vec(&compact)?.len());
         Ok(())
     }
 

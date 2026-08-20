@@ -2264,7 +2264,15 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
-## Planned G20 — session-efficient compact transport
+## In progress G20 — session-efficient compact transport
+
+G20a implements the correctness and compact-transport portion: cross-origin
+exact follow-ups, one complete top-hit handoff, opt-in search-attached memory,
+bounded checker receiver display, exact usage labels, compact/body/full artifact
+views, successful-diagnostic gating, and canonical section-byte telemetry.
+Path-shaped expansion, the structured-content compatibility experiment, and
+the registered fixed/staged replays remain G20b work; no aggregate byte claim
+is made before those replays run.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an

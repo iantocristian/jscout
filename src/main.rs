@@ -294,6 +294,12 @@ enum Command {
         /// Load one artifact by id (historical artifacts are allowed)
         #[arg(long)]
         artifact: Option<i64>,
+        /// Exact-artifact projection: compact, body, or full
+        #[arg(long, value_parser = ["compact", "body", "full"])]
+        view: Option<String>,
+        /// Include retrieval diagnostics in discovery output; exact reads use --view full
+        #[arg(long)]
+        debug: bool,
         /// Restrict artifacts to those with direct evidence on this exact anchor
         #[arg(long)]
         anchor: Option<String>,
@@ -313,7 +319,7 @@ enum Command {
         #[arg(long)]
         source: bool,
         /// Maximum source evidence rows
-        #[arg(long, default_value_t = 12)]
+        #[arg(long, default_value_t = 1)]
         source_limit: usize,
         /// Maximum semantic-relation hops followed during source drill-down
         #[arg(long, default_value_t = 8)]
@@ -328,8 +334,8 @@ enum Command {
         #[arg(long, default_value_t = semantic_query::DEFAULT_RESPONSE_BYTE_LIMIT)]
         response_bytes: usize,
         /// Maximum direct evidence supports retained per artifact
-        #[arg(long, default_value_t = 8)]
-        supports_per_artifact: usize,
+        #[arg(long)]
+        supports_per_artifact: Option<usize>,
         /// Maximum direct semantic relations returned
         #[arg(long, default_value_t = 40)]
         relation_limit: usize,
@@ -1247,6 +1253,8 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             artifact_types,
             freshness,
             artifact,
+            view,
+            debug,
             anchor,
             file,
             reconnaissance_subject,
@@ -1282,6 +1290,18 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     &runtime.effective.inference,
                 )?
             };
+            let artifact_view = match view.as_deref() {
+                Some(value) => semantic_query::ArtifactViewMode::parse(value)?,
+                None if artifact.is_some() && !debug => semantic_query::ArtifactViewMode::Compact,
+                None => semantic_query::ArtifactViewMode::Full,
+            };
+            let supports_per_artifact = supports_per_artifact.unwrap_or_else(|| {
+                if artifact.is_some() && artifact_view != semantic_query::ArtifactViewMode::Full {
+                    1
+                } else {
+                    8
+                }
+            });
             let result = semantic_query::query(
                 &root,
                 &conn,
@@ -1306,6 +1326,8 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     supports_per_artifact,
                     relation_limit,
                     concept_tag_limit,
+                    artifact_view,
+                    debug,
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -2873,6 +2895,33 @@ mod main_tests {
             panic!("expected memory")
         };
         assert!(no_vector);
+
+        let Cli { command, .. } = Cli::try_parse_from([
+            "jscout",
+            "memory",
+            ".",
+            "--artifact",
+            "7",
+            "--view",
+            "body",
+            "--supports-per-artifact",
+            "3",
+        ])
+        .expect("semantic artifact view parses");
+        let Command::Memory {
+            artifact,
+            view,
+            supports_per_artifact,
+            source_limit,
+            ..
+        } = command
+        else {
+            panic!("expected memory")
+        };
+        assert_eq!(artifact, Some(7));
+        assert_eq!(view.as_deref(), Some("body"));
+        assert_eq!(supports_per_artifact, Some(3));
+        assert_eq!(source_limit, 1);
     }
 
     #[test]

@@ -20,6 +20,35 @@ pub(crate) fn search_rendered_bytes(result: &search::SearchResult) -> Result<usi
     Ok(serde_json::to_string(&search_value(result))?.len())
 }
 
+pub(crate) fn search_section_bytes(
+    result: &search::SearchResult,
+) -> Result<search::SearchSectionBytes> {
+    let value = search_value(result);
+    let total_bytes = serde_json::to_vec(&value)?.len();
+    let hits_bytes = serde_json::to_vec(&value["hits"])?.len();
+    let graph_bytes = value
+        .get("graph")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let memory_bytes = value
+        .get("semantic_memory")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let envelope_bytes = total_bytes
+        .saturating_sub(hits_bytes)
+        .saturating_sub(graph_bytes)
+        .saturating_sub(memory_bytes);
+    Ok(search::SearchSectionBytes {
+        hits_bytes,
+        graph_bytes,
+        memory_bytes,
+        envelope_bytes,
+        total_bytes,
+    })
+}
+
 pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     let hits = result
         .hits
@@ -28,15 +57,20 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
-    response.insert("retrieval".into(), json!(result.retrieval));
+    if search_retrieval_is_actionable(&result.retrieval) {
+        response.insert("retrieval".into(), json!(result.retrieval));
+    }
     response.insert("default_match".into(), json!("hybrid"));
     response.insert("hits".into(), Value::Array(hits));
 
-    if result
-        .semantic_retrieval
-        .as_ref()
-        .is_some_and(|retrieval| retrieval.corpus_artifacts > 0)
-    {
+    if let Some(retrieval) = result.semantic_retrieval.as_ref().filter(|retrieval| {
+        retrieval.corpus_artifacts > 0
+            || semantic_retrieval_is_actionable(retrieval)
+            || result
+                .semantic_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.status != "connected")
+    }) {
         let artifacts = result
             .semantic_artifacts
             .iter()
@@ -52,9 +86,6 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 }
                 value.insert("confidence".into(), json!(artifact.confidence));
                 value.insert("freshness".into(), json!(artifact.freshness));
-                if let Some(score) = &artifact.retrieval_score {
-                    value.insert("score".into(), json!(score));
-                }
                 if let Some(support) = artifact.supports.first() {
                     value.insert(
                         "evidence".into(),
@@ -71,21 +102,25 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 Value::Object(value)
             })
             .collect::<Vec<_>>();
-        response.insert(
-            "semantic_memory".into(),
-            json!({
-                "trust": "untrusted",
-                "retrieval": result.semantic_retrieval,
-                "attachment": result.semantic_attachment.as_ref().map(memory_attachment_value),
-                "candidate_pool": result.semantic_candidates,
-                "selected": result.semantic_selected,
-                "returned": artifacts.len(),
-                "budget_omitted": result.semantic_selected.saturating_sub(artifacts.len()),
-                "next_tool": "semantic_memory",
-                "detail": "preview; pool/scores are uncalibrated; use semantic_memory for bodies/evidence",
-                "artifacts": artifacts,
-            }),
-        );
+        let mut memory = Map::new();
+        memory.insert("trust".into(), json!("untrusted"));
+        if semantic_retrieval_is_actionable(retrieval) {
+            memory.insert("retrieval".into(), json!(retrieval));
+        }
+        if let Some(attachment) = result
+            .semantic_attachment
+            .as_ref()
+            .filter(|attachment| attachment.status != "connected" || attachment.graph_truncated)
+        {
+            memory.insert("attachment".into(), memory_attachment_value(attachment));
+        }
+        let omitted = result.semantic_selected.saturating_sub(artifacts.len());
+        if omitted > 0 {
+            memory.insert("omitted".into(), json!({ "artifacts": omitted }));
+        }
+        memory.insert("next_tool".into(), json!("semantic_memory"));
+        memory.insert("artifacts".into(), Value::Array(artifacts));
+        response.insert("semantic_memory".into(), Value::Object(memory));
     }
 
     if let Some(expansion) = &result.expansion {
@@ -95,24 +130,39 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         }
         response.insert("graph".into(), graph);
     }
-    response.insert(
-        "response".into(),
-        search_budget_value(&result.response_budget),
-    );
+    if result.response_budget.truncated {
+        response.insert(
+            "response".into(),
+            search_budget_value(&result.response_budget),
+        );
+    }
     Value::Object(response)
+}
+
+fn search_retrieval_is_actionable(retrieval: &search::RetrievalStatus) -> bool {
+    retrieval.lexical != "active"
+        || matches!(retrieval.vector, "degraded" | "failed")
+        || matches!(retrieval.reranker, "degraded" | "failed")
+        || retrieval.vector_action.is_some()
+}
+
+fn semantic_retrieval_is_actionable(retrieval: &crate::semantic::ArtifactRetrievalStatus) -> bool {
+    retrieval.lexical != "active"
+        || matches!(retrieval.vector, "degraded" | "failed")
+        || retrieval.vector_action.is_some()
 }
 
 fn memory_attachment_value(attachment: &search::MemoryAttachmentStatus) -> Value {
     let mut value = Map::new();
     value.insert("status".into(), json!(attachment.status));
-    value.insert("connected".into(), json!(attachment.connected_candidates));
-    let mut graph = Map::new();
-    graph.insert("depth".into(), json!(attachment.graph_depth));
-    graph.insert("nodes".into(), json!(attachment.graph_nodes));
     if attachment.graph_truncated {
+        value.insert("connected".into(), json!(attachment.connected_candidates));
+        let mut graph = Map::new();
+        graph.insert("depth".into(), json!(attachment.graph_depth));
+        graph.insert("nodes".into(), json!(attachment.graph_nodes));
         graph.insert("truncated".into(), json!(true));
+        value.insert("graph".into(), Value::Object(graph));
     }
-    value.insert("graph".into(), Value::Object(graph));
     Value::Object(value)
 }
 
@@ -245,11 +295,9 @@ fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
 
 fn search_budget_value(budget: &search::ResponseBudget) -> Value {
     let mut value = Map::new();
-    value.insert("byte_limit".into(), json!(budget.byte_limit));
     value.insert("rendered_bytes".into(), json!(budget.rendered_bytes));
     if budget.truncated {
         value.insert("truncated".into(), json!(true));
-        value.insert("unbudgeted_bytes".into(), json!(budget.unbudgeted_bytes));
         let mut omitted = Map::new();
         for (name, count) in [
             ("hits", budget.omitted_hits),
@@ -1124,9 +1172,7 @@ mod tests {
         let diagnostic = serde_json::to_string_pretty(&result)?;
         assert!(compact.len() * 2 < diagnostic.len());
         let value: serde_json::Value = serde_json::from_str(&compact)?;
-        assert_eq!(value["retrieval"]["lexical"], "active");
-        assert_eq!(value["retrieval"]["vector"], "disabled");
-        assert_eq!(value["retrieval"]["reranker"], "disabled");
+        assert!(value.get("retrieval").is_none());
         assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
         assert_eq!(value["hits"][0]["symbol"], "start");
         assert_eq!(value["hits"][0]["anchor"], root);
@@ -1150,6 +1196,15 @@ mod tests {
         assert_eq!(
             value["graph"]["edges"][0][6]["receiver_types"][0],
             "QueueService"
+        );
+        let sections = super::search_section_bytes(&result)?;
+        assert_eq!(sections.total_bytes, compact.len());
+        assert_eq!(
+            sections.hits_bytes
+                + sections.graph_bytes
+                + sections.memory_bytes
+                + sections.envelope_bytes,
+            sections.total_bytes
         );
         Ok(())
     }
@@ -1394,10 +1449,11 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
         let memory = &value["semantic_memory"];
-        assert_eq!(memory["candidate_pool"], 8);
-        assert_eq!(memory["selected"], 1);
-        assert_eq!(memory["returned"], 1);
-        assert_eq!(memory["attachment"]["status"], "connected");
+        assert!(memory.get("candidate_pool").is_none());
+        assert!(memory.get("selected").is_none());
+        assert!(memory.get("returned").is_none());
+        assert!(memory.get("retrieval").is_none());
+        assert!(memory.get("attachment").is_none());
         assert_eq!(memory["next_tool"], "semantic_memory");
         assert_eq!(
             memory["artifacts"][0]["summary"],
@@ -1405,6 +1461,7 @@ mod tests {
         );
         assert!(memory["artifacts"][0].get("body").is_none());
         assert!(memory["artifacts"][0].get("supports").is_none());
+        assert!(memory["artifacts"][0].get("score").is_none());
         assert!(search_string(&result)?.len() < 1_000);
         Ok(())
     }
@@ -1449,8 +1506,8 @@ mod tests {
             },
         };
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
-        assert_eq!(value["semantic_memory"]["candidate_pool"], 0);
-        assert_eq!(value["semantic_memory"]["returned"], 0);
+        assert!(value["semantic_memory"].get("candidate_pool").is_none());
+        assert!(value["semantic_memory"].get("returned").is_none());
         assert_eq!(value["semantic_memory"]["retrieval"]["vector"], "degraded");
         assert_eq!(
             value["semantic_memory"]["attachment"]["status"],
@@ -1491,10 +1548,10 @@ mod tests {
             },
         };
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
-        assert_eq!(value["semantic_memory"]["candidate_pool"], 12);
-        assert_eq!(value["semantic_memory"]["selected"], 3);
-        assert_eq!(value["semantic_memory"]["returned"], 0);
-        assert_eq!(value["semantic_memory"]["budget_omitted"], 3);
+        assert!(value["semantic_memory"].get("candidate_pool").is_none());
+        assert!(value["semantic_memory"].get("selected").is_none());
+        assert!(value["semantic_memory"].get("returned").is_none());
+        assert_eq!(value["semantic_memory"]["omitted"]["artifacts"], 3);
         assert_eq!(value["semantic_memory"]["next_tool"], "semantic_memory");
         Ok(())
     }

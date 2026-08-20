@@ -19,8 +19,11 @@ questions, then verify decisive claims in source.
   `reconnaissance_detail=true` only when its full cited explanation matters.
 - Query workflows, cards, summaries, concepts, relations, and freshness with
   `semantic_memory`. Broad queries return compact artifact handles, not full
-  bodies. Follow one handle's exact `artifact` argument to inspect that body,
-  its relations, concept tags, or `include_source=true` hash-verified evidence.
+  bodies. Follow one handle's exact arguments (`view=body`) to inspect one
+  complete body with a compact evidence locator. Exact artifact reads otherwise
+  default to `view=compact`; request `view=full` only for relations, concept
+  tags, provenance, hashes, or the selected complete supports. Add
+  `include_source=true` only for hash-verified source evidence.
   After localizing code, use `anchor`, `file`, or an exact current
   `reconnaissance_subject` for a hard code-to-memory join. If that returns
   `no_supported_memory`, the corpus has no directly supported artifact for the
@@ -33,7 +36,8 @@ questions, then verify decisive claims in source.
   preview with `semantic_memory` instead of widening the combined search
   response. `no_connected_memory` is honest absence from that attachment, not
   proof that broad semantic memory has no relevant artifact.
-- For selected current, fresh concepts, use the returned `concept_tags` as
+- For selected current, fresh concepts, use `view=full` and the returned
+  `concept_tags` as
   deterministic file/chunk localization hints. They follow fingerprinted
   concept-to-child claims and derive from the child's exact support-span
   overlap, not separate model claims; increase
