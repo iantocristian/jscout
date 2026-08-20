@@ -702,9 +702,11 @@ fn package_entry_with_sources<S: SourceLookup>(
     None
 }
 
-/// Prefer aliases that land on indexed source. When no such target exists,
-/// restore manifest/filesystem behavior so source-less or gitignored members
-/// retain their declared identity and entry alias.
+/// Preserve manifest-before-inferred entry semantics while preferring indexed
+/// source over recognized build-output layouts. A manifest target outside a
+/// skipped output directory keeps its historical precedence even when it is
+/// not indexed. Build output itself is the final fallback for a genuinely
+/// source-less package.
 fn preferred_package_entry(
     dir: &Path,
     pkg: &serde_json::Value,
@@ -717,20 +719,25 @@ fn preferred_package_entry(
             return Ok(Some((path, Origin::Manifest)));
         }
     }
+    for field in &manifest_fields {
+        if let Some(path) = classified_first_existing(dir, field, false, rejections)? {
+            return Ok(Some((path, Origin::Manifest)));
+        }
+    }
     let inferred_fields = inferred_entry_fields(pkg);
     for field in &inferred_fields {
         if let Some(path) = first_existing(dir, field, sources) {
             return Ok(Some((path, Origin::Inferred)));
         }
     }
-    for field in &manifest_fields {
-        if let Some(path) = classified_first_existing(dir, field, true, rejections)? {
-            return Ok(Some((path, Origin::Manifest)));
-        }
-    }
     for field in &inferred_fields {
         if let Some(path) = classified_first_existing(dir, field, false, rejections)? {
             return Ok(Some((path, Origin::Inferred)));
+        }
+    }
+    for field in &manifest_fields {
+        if let Some(path) = classified_first_existing(dir, field, true, rejections)? {
+            return Ok(Some((path, Origin::Manifest)));
         }
     }
     Ok(None)
@@ -1262,7 +1269,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{WorkspaceMap, inject_io_failure, package_entry_paths, pnpm_workspace_globs};
+    use super::{
+        IndexedSources, Origin, WorkspaceMap, inject_io_failure, package_entry_paths,
+        pnpm_workspace_globs, preferred_package_entry,
+    };
     use oxc_resolver::AliasValue;
 
     fn write(path: &Path, content: &str) {
@@ -1420,6 +1430,129 @@ catalog:
         );
         assert_eq!(map.classify("dist-only"), "workspace");
         assert_eq!(map.classify("ignored-source"), "workspace");
+    }
+
+    #[test]
+    fn manifest_entry_precedes_an_indexed_inferred_entry() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        write(
+            &root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        );
+        write(&root.join(".gitignore"), "packages/lib/lib/\n");
+        write(
+            &root.join("packages/lib/package.json"),
+            r#"{"name":"acme-lib","main":"lib/index.js"}"#,
+        );
+        write(
+            &root.join("packages/lib/lib/index.js"),
+            "module.exports = 1;\n",
+        );
+        write(
+            &root.join("packages/lib/src/index.ts"),
+            "export const source = 1;\n",
+        );
+
+        let inventory = crate::walk::source_inventory(root).unwrap();
+        assert!(
+            inventory
+                .files
+                .contains(&root.join("packages/lib/src/index.ts"))
+        );
+        assert!(
+            !inventory
+                .files
+                .contains(&root.join("packages/lib/lib/index.js"))
+        );
+        let map = WorkspaceMap::discover(root, &inventory.files).unwrap().map;
+
+        assert_eq!(
+            alias_paths(&map.aliases, "acme-lib")[0],
+            root.join("packages/lib/lib/index.js").to_string_lossy()
+        );
+        assert_eq!(map.classify("acme-lib"), "workspace");
+    }
+
+    #[test]
+    fn package_entry_preference_matrix_preserves_source_and_manifest_semantics() {
+        struct Case {
+            name: &'static str,
+            manifest: &'static str,
+            files: &'static [&'static str],
+            indexed: &'static [&'static str],
+            expected: &'static str,
+            origin: Origin,
+        }
+
+        let cases = [
+            Case {
+                name: "standard-src-and-dist",
+                manifest: r#"{"main":"dist/index.js"}"#,
+                files: &["dist/index.js", "src/index.ts"],
+                indexed: &["src/index.ts"],
+                expected: "src/index.ts",
+                origin: Origin::Inferred,
+            },
+            Case {
+                name: "unrecognized-lib-output",
+                manifest: r#"{"main":"lib/index.js"}"#,
+                files: &["lib/index.js", "src/index.ts"],
+                indexed: &["src/index.ts"],
+                expected: "lib/index.js",
+                origin: Origin::Manifest,
+            },
+            Case {
+                name: "dist-only",
+                manifest: r#"{"main":"dist/index.js"}"#,
+                files: &["dist/index.js"],
+                indexed: &[],
+                expected: "dist/index.js",
+                origin: Origin::Manifest,
+            },
+            Case {
+                name: "gitignored-source",
+                manifest: r#"{"main":"src/index.ts"}"#,
+                files: &["src/index.ts"],
+                indexed: &[],
+                expected: "src/index.ts",
+                origin: Origin::Manifest,
+            },
+            Case {
+                name: "exports-map",
+                manifest: r#"{"exports":{".":{"import":"./source.ts"}}}"#,
+                files: &["source.ts", "src/index.ts"],
+                indexed: &["source.ts", "src/index.ts"],
+                expected: "source.ts",
+                origin: Origin::Manifest,
+            },
+        ];
+
+        for case in cases {
+            let package = tempfile::tempdir().unwrap();
+            for file in case.files {
+                write(&package.path().join(file), "export const value = 1;\n");
+            }
+            let sources = IndexedSources::new(
+                &case
+                    .indexed
+                    .iter()
+                    .map(|file| package.path().join(file))
+                    .collect::<Vec<_>>(),
+            );
+            let manifest = serde_json::from_str(case.manifest).unwrap();
+            let mut rejections = Vec::new();
+
+            let (entry, origin) =
+                preferred_package_entry(package.path(), &manifest, &sources, &mut rejections)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{} produced no entry", case.name));
+
+            assert_eq!(entry, package.path().join(case.expected), "{}", case.name);
+            assert_eq!(origin, case.origin, "{}", case.name);
+            assert!(rejections.is_empty(), "{}", case.name);
+        }
     }
 
     #[cfg(unix)]
