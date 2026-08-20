@@ -414,6 +414,13 @@ accepts it only when `source_snapshot` matches. Manual `jscout index` clears all
 checker batches, even when the rebuilt structural snapshot is identical; run
 `jscout enrich` afterward when occurrence-specific checker edges are needed.
 
+`tsconfig` files are checker invalidation boundaries, not structural snapshot
+inputs. Editing or deleting one can therefore leave the reported structural
+snapshot hash unchanged. In watch mode the boundary event still starts a
+generation, and the checker planner's configuration-chain and membership
+fingerprints determine which projects must run again; snapshot equality alone
+does not imply that checker configuration was unchanged.
+
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
 project-batched, resumable checker pass for the resulting snapshot. Across a
 changed snapshot it may carry an unchanged project when its configuration
