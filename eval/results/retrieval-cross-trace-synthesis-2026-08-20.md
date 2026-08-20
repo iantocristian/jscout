@@ -73,11 +73,13 @@ correctly re-established its evidence boundary.
    skill text. The first expanded search per investigation earns its bytes;
    later expansions mostly repeat known graph context. G20's path-shaped
    expansion fixes the shape; the posture change removes the repetition.
-4. **`who_uses` needs a decision.** Two production workloads and the
-   evaluation record show near-zero selection. Either fold its compact value
-   into `definition`/search decorations (one fewer tool description paid in
-   every session), or keep it and have the skill say when it beats search.
-   The status quo pays its description cost for zero observed use.
+4. **`who_uses`: cap first, then decide.** The two traces here show zero
+   selection, but the wider telemetry window
+   (`mcp-telemetry-first-window-2026-08-20.md`) shows occasional use — and an
+   unguarded worst case: three byte-identical 1.86MB responses on a
+   high-fanout symbol, with no truncation ever firing. A response cap is
+   immediate; fold-vs-keep waits for delivered-vs-selected data once call
+   arguments are recorded.
 
 ## Concrete skill amendment proposed (G14)
 
