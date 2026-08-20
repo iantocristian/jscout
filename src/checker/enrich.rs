@@ -25,6 +25,14 @@ pub struct EnrichOptions<'a> {
     pub max_occurrences: Option<usize>,
     pub include_all: bool,
     pub dry_run: bool,
+    /// Internal watcher policy: seed a new snapshot batch from the previous
+    /// active batch when project and fact identities still validate.
+    pub carry_forward: bool,
+    /// Discard exact-snapshot reuse, staging resume, and watch carry. Exposed
+    /// as manual `enrich --full` and used by the watch drift-flush timer.
+    pub force_full: bool,
+    /// Current watcher event paths used only to order delta work.
+    pub dirty_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +57,8 @@ pub struct EnrichReport {
     pub checker_version: String,
     pub checker_source: String,
     pub projects: usize,
+    pub projects_carried: usize,
+    pub occurrences_carried: usize,
     pub configured_projects: usize,
     pub configuration_problems: usize,
     /// Eligible source files whose member-call candidates have no configured
@@ -166,6 +176,65 @@ struct Occurrence {
     runtime_namesake: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OccurrenceIdentity {
+    file: String,
+    hash: String,
+    call_start: i64,
+    call_end: i64,
+    receiver_start: i64,
+    receiver_end: i64,
+    property_start: i64,
+    property_end: i64,
+}
+
+impl From<&Occurrence> for OccurrenceIdentity {
+    fn from(occurrence: &Occurrence) -> Self {
+        Self {
+            file: occurrence.file.clone(),
+            hash: occurrence.hash.clone(),
+            call_start: occurrence.call_start,
+            call_end: occurrence.call_end,
+            receiver_start: occurrence.receiver_start,
+            receiver_end: occurrence.receiver_end,
+            property_start: occurrence.property_start,
+            property_end: occurrence.property_end,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CarryCoverage {
+    input_fingerprint: String,
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct CarryFact {
+    receiver_type: Option<String>,
+    target: Target,
+    confidence: String,
+    input_fingerprint: String,
+}
+
+#[derive(Debug, Default)]
+struct CarryOutcome {
+    projects_carried: usize,
+    occurrences_carried: usize,
+    projects_requiring_check: BTreeSet<String>,
+}
+
+struct StagingPlan<'a> {
+    snapshot: &'a str,
+    plan_fingerprint: &'a str,
+    checker: &'a TypeScriptIdentity,
+    protocol: u32,
+    selected_occurrences: usize,
+    projects: &'a BTreeMap<String, Vec<Occurrence>>,
+    project_fingerprints: &'a BTreeMap<String, String>,
+    force_new: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Target {
     anchor: String,
@@ -257,6 +326,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_version: "not-invoked".into(),
             checker_source: "not-invoked".into(),
             projects: 0,
+            projects_carried: 0,
+            occurrences_carried: 0,
             configured_projects: 0,
             configuration_problems: 0,
             files_without_configured_project: 0,
@@ -276,15 +347,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let mut ownership = planner.plan_members(
-        eligible
-            .iter()
-            .map(|occurrence| occurrence.file.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-        options.timeout,
-    )?;
+    let dirty_files = current_dirty_source_files(&conn, &options.dirty_files)?;
+    let mut planning_files = eligible
+        .iter()
+        .map(|occurrence| occurrence.file.clone())
+        .collect::<BTreeSet<_>>();
+    planning_files.extend(dirty_files.iter().cloned());
+    let mut ownership =
+        planner.plan_members(planning_files.into_iter().collect(), options.timeout)?;
     let protocol = planner.versions.protocol;
     drop(planner);
     apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
@@ -316,6 +386,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_version: ownership.typescript.version,
             checker_source: ownership.typescript.source,
             projects: 0,
+            projects_carried: 0,
+            occurrences_carried: 0,
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -351,6 +423,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         protocol,
         options,
     );
+    let project_fingerprints = project_planning_fingerprints(
+        &project_plan,
+        &ownership.projects,
+        &ownership.typescript,
+        protocol,
+    );
+    let dirty_projects = dirty_projects(&ownership.files, &dirty_files, options.include_all);
 
     if options.dry_run {
         return Ok(EnrichReport {
@@ -373,6 +452,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_version: ownership.typescript.version,
             checker_source: ownership.typescript.source,
             projects: project_plan.len(),
+            projects_carried: 0,
+            occurrences_carried: 0,
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -389,13 +470,15 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         });
     }
 
-    if let Some(batch_id) = reusable_active_batch(
-        &canonical_root,
-        &conn,
-        &snapshot,
-        &plan_fingerprint,
-        project_plan.keys(),
-    )? {
+    if !options.force_full
+        && let Some(batch_id) = reusable_active_batch(
+            &canonical_root,
+            &conn,
+            &snapshot,
+            &plan_fingerprint,
+            project_plan.keys(),
+        )?
+    {
         let facts_published = conn.query_row(
             "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
             [batch_id],
@@ -422,6 +505,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_version: ownership.typescript.version,
             checker_source: ownership.typescript.source,
             projects: project_plan.len(),
+            projects_carried: 0,
+            occurrences_carried: 0,
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -437,19 +522,47 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             peak_heap_bytes: 0,
         });
     }
-    if deactivate_stale_active_batch(&canonical_root, &conn, &snapshot)? {
+    if !options.carry_forward && deactivate_stale_active_batch(&canonical_root, &conn, &snapshot)? {
         crate::structural::rebuild_projection(&conn, &snapshot)?;
     }
 
     let batch_id = open_staging_batch(
         &conn,
-        &snapshot,
-        &plan_fingerprint,
-        &ownership.typescript,
-        protocol,
-        selected.len(),
-        &project_plan,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: &plan_fingerprint,
+            checker: &ownership.typescript,
+            protocol,
+            selected_occurrences: selected.len(),
+            projects: &project_plan,
+            project_fingerprints: &project_fingerprints,
+            force_new: options.force_full,
+        },
     )?;
+    let carry = if options.carry_forward && !options.force_full {
+        carry_forward_projects(
+            &canonical_root,
+            &conn,
+            batch_id,
+            &ownership.typescript,
+            protocol,
+            &project_plan,
+            &project_fingerprints,
+        )?
+    } else {
+        CarryOutcome::default()
+    };
+    if carry.occurrences_carried != 0 {
+        eprintln!(
+            "checker enrichment: carried {}/{} occurrences across {}/{} projects",
+            carry.occurrences_carried,
+            selected.len(),
+            carry.projects_carried,
+            project_plan.len()
+        );
+    }
+    let mut priority_projects = dirty_projects;
+    priority_projects.extend(carry.projects_requiring_check.iter().cloned());
     let mut occurrences_queried = 0;
     let mut occurrences_resumed = 0;
     let mut request_batches = 0;
@@ -460,9 +573,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut peak_heap_bytes = 0;
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
-    for (project_index, (project_id, occurrences)) in projects_in_execution_order(&project_plan)
-        .into_iter()
-        .enumerate()
+    for (project_index, (project_id, occurrences)) in
+        projects_in_execution_order(&project_plan, &priority_projects)
+            .into_iter()
+            .enumerate()
     {
         if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
@@ -476,11 +590,22 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             reset_project_staging(&conn, batch_id, project_id)?;
             completed.clear();
         }
-        let pending = occurrences
+        let mut pending = occurrences
             .iter()
             .filter(|occurrence| !completed.contains(&occurrence.id))
             .cloned()
             .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            (!dirty_files.contains(&left.file))
+                .cmp(&(!dirty_files.contains(&right.file)))
+                .then_with(|| {
+                    (&left.file, left.call_start, left.id).cmp(&(
+                        &right.file,
+                        right.call_start,
+                        right.id,
+                    ))
+                })
+        });
         occurrences_resumed += completed.len();
         mark_project_pending(&conn, batch_id, project_id)?;
         eprintln!(
@@ -567,6 +692,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         checker_version: ownership.typescript.version,
         checker_source: ownership.typescript.source,
         projects: project_plan.len(),
+        projects_carried: carry.projects_carried,
+        occurrences_carried: carry.occurrences_carried,
         configured_projects: ownership.projects.len(),
         configuration_problems: ownership.configuration_problems.len(),
         files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -1164,16 +1291,101 @@ fn project_decision<'a>(
     })
 }
 
-fn projects_in_execution_order(
-    projects: &BTreeMap<String, Vec<Occurrence>>,
-) -> Vec<(&String, &Vec<Occurrence>)> {
+fn current_dirty_source_files(
+    conn: &Connection,
+    dirty_files: &[String],
+) -> Result<BTreeSet<String>> {
+    if dirty_files.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let requested = dirty_files.iter().collect::<BTreeSet<_>>();
+    let mut statement = conn.prepare(
+        "SELECT path FROM files
+         WHERE origin IN ('repository', 'workspace')
+         ORDER BY path",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| requested.contains(path))
+        .collect())
+}
+
+fn dirty_projects(
+    ownership: &[FileOwnership],
+    dirty_files: &BTreeSet<String>,
+    include_inferred: bool,
+) -> BTreeSet<String> {
+    ownership
+        .iter()
+        .filter(|entry| dirty_files.contains(&entry.file))
+        .flat_map(|entry| entry.project_ids.iter())
+        .filter(|project| include_inferred || !is_inferred_project(project))
+        .cloned()
+        .collect()
+}
+
+fn projects_in_execution_order<'a>(
+    projects: &'a BTreeMap<String, Vec<Occurrence>>,
+    priority_projects: &BTreeSet<String>,
+) -> Vec<(&'a String, &'a Vec<Occurrence>)> {
     let mut ordered = projects.iter().collect::<Vec<_>>();
     ordered.sort_by(|(left, _), (right, _)| {
-        is_inferred_project(left)
-            .cmp(&is_inferred_project(right))
-            .then_with(|| left.cmp(right))
+        (!priority_projects.contains(*left))
+            .cmp(&(!priority_projects.contains(*right)))
+            .then_with(|| {
+                is_inferred_project(left)
+                    .cmp(&is_inferred_project(right))
+                    .then_with(|| left.cmp(right))
+            })
     });
     ordered
+}
+
+fn project_planning_fingerprints(
+    projects: &BTreeMap<String, Vec<Occurrence>>,
+    summaries: &[ProjectSummary],
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+) -> BTreeMap<String, String> {
+    let summaries = summaries
+        .iter()
+        .map(|summary| (summary.project_id.as_str(), summary))
+        .collect::<HashMap<_, _>>();
+    projects
+        .iter()
+        .map(|(project_id, occurrences)| {
+            let summary = summaries.get(project_id.as_str());
+            let membership = summary.map_or_else(
+                || {
+                    occurrences
+                        .iter()
+                        .map(|occurrence| occurrence.file.as_str())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join("\0")
+                },
+                |summary| summary.membership_fingerprint.clone(),
+            );
+            let config = summary.map_or("", |summary| summary.config_fingerprint.as_str());
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"jscout-checker-project-plan-v1\0");
+            for value in [
+                project_id.as_str(),
+                checker.version.as_str(),
+                checker.source.as_str(),
+                &protocol.to_string(),
+                membership.as_str(),
+                config,
+            ] {
+                hasher.update(value.as_bytes());
+                hasher.update(b"\0");
+            }
+            (project_id.clone(), hasher.finalize().to_hex().to_string())
+        })
+        .collect()
 }
 
 fn plan_fingerprint(
@@ -1247,38 +1459,8 @@ fn reusable_active_batch<'a>(
     if complete as usize != project_ids.len() {
         return Ok(None);
     }
-    let mut statement = conn.prepare(
-        "SELECT input_kind, input_path, source_hash FROM checker_project_inputs
-         WHERE batch_id=?1 ORDER BY input_kind, input_path",
-    )?;
-    let mut inputs = BTreeMap::<(String, String), String>::new();
-    for row in statement.query_map([batch_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })? {
-        let (kind, path, hash) = row?;
-        if let Some(previous) = inputs.insert((kind, path), hash.clone())
-            && previous != hash
-        {
-            return Ok(None);
-        }
-    }
-    if inputs.is_empty() {
-        return Ok(None);
-    }
-    for ((kind, path), source_hash) in inputs {
-        let input = ValidatedInput {
-            kind,
-            path,
-            source_hash,
-        };
-        let fresh = fs::read(input_path(root, &input))
-            .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
-            .unwrap_or(false);
-        if !fresh {
+    for project_id in project_ids {
+        if !project_complete_and_fresh(root, conn, batch_id, project_id)? {
             return Ok(None);
         }
     }
@@ -1332,18 +1514,11 @@ fn deactivate_stale_active_batch(root: &Path, conn: &Connection, snapshot: &str)
     }
 }
 
-fn open_staging_batch(
-    conn: &Connection,
-    snapshot: &str,
-    plan_fingerprint: &str,
-    checker: &TypeScriptIdentity,
-    protocol: u32,
-    selected_occurrences: usize,
-    projects: &BTreeMap<String, Vec<Occurrence>>,
-) -> Result<i64> {
-    if let Some(batch_id) = conn
-        .query_row(
-            "SELECT id FROM checker_enrichment_batches
+fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> {
+    if !plan.force_new
+        && let Some(batch_id) = conn
+            .query_row(
+                "SELECT id FROM checker_enrichment_batches
              WHERE source_snapshot=?1 AND plan_fingerprint=?2
                AND checker_version=?3 AND checker_source=?4
                AND sidecar_protocol=?5
@@ -1353,16 +1528,16 @@ fn open_staging_batch(
                    AND run.status!='completed'
                ))
              ORDER BY active DESC, id DESC LIMIT 1",
-            params![
-                snapshot,
-                plan_fingerprint,
-                checker.version,
-                checker.source,
-                protocol
-            ],
-            |row| row.get(0),
-        )
-        .optional()?
+                params![
+                    plan.snapshot,
+                    plan.plan_fingerprint,
+                    plan.checker.version,
+                    plan.checker.source,
+                    plan.protocol
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
     {
         return Ok(batch_id);
     }
@@ -1376,24 +1551,33 @@ fn open_staging_batch(
                selected_occurrences, total_projects, created_at, active
              ) VALUES(?1,?2,?3,'',?4,?5,?6,?7,datetime('now'),0)",
             params![
-                snapshot,
-                checker.version,
-                checker.source,
-                protocol,
-                plan_fingerprint,
-                selected_occurrences as i64,
-                projects.len() as i64
+                plan.snapshot,
+                plan.checker.version,
+                plan.checker.source,
+                plan.protocol,
+                plan.plan_fingerprint,
+                plan.selected_occurrences as i64,
+                plan.projects.len() as i64
             ],
         )?;
         let batch_id = conn.last_insert_rowid();
         let mut insert = conn.prepare_cached(
             "INSERT INTO checker_project_runs(
                batch_id, project_id, status, selected_occurrences,
-               completed_occurrences, updated_at
-             ) VALUES(?1,?2,'pending',?3,0,datetime('now'))",
+               completed_occurrences, planning_fingerprint, updated_at
+             ) VALUES(?1,?2,'pending',?3,0,?4,datetime('now'))",
         )?;
-        for (project_id, occurrences) in projects {
-            insert.execute(params![batch_id, project_id, occurrences.len() as i64])?;
+        for (project_id, occurrences) in plan.projects {
+            let fingerprint = plan
+                .project_fingerprints
+                .get(project_id)
+                .with_context(|| format!("missing planning fingerprint for {project_id}"))?;
+            insert.execute(params![
+                batch_id,
+                project_id,
+                occurrences.len() as i64,
+                fingerprint
+            ])?;
         }
         Ok(batch_id)
     })();
@@ -1409,20 +1593,397 @@ fn open_staging_batch(
     }
 }
 
+/// Seed a new-snapshot staging batch from the previous active batch. Project
+/// fingerprints authorize consideration; exact source occurrence identity and
+/// current target fingerprints authorize each carried answer. If one owner of
+/// an occurrence cannot carry, every owner is re-queried so cross-project
+/// ambiguity can be recomputed from one coherent answer set.
+fn carry_forward_projects(
+    root: &Path,
+    conn: &Connection,
+    batch_id: i64,
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+    projects: &BTreeMap<String, Vec<Occurrence>>,
+    project_fingerprints: &BTreeMap<String, String>,
+) -> Result<CarryOutcome> {
+    let already_staged: i64 = conn.query_row(
+        "SELECT count(*) FROM checker_occurrence_projects WHERE batch_id=?1",
+        [batch_id],
+        |row| row.get(0),
+    )?;
+    if already_staged != 0 {
+        return Ok(CarryOutcome::default());
+    }
+    let Some(previous_batch) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE active=1 AND id!=?1
+               AND checker_version=?2 AND checker_source=?3
+               AND sidecar_protocol=?4",
+            params![batch_id, checker.version, checker.source, protocol],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(CarryOutcome::default());
+    };
+
+    let previous_projects = conn
+        .prepare(
+            "SELECT project_id, planning_fingerprint
+             FROM checker_project_runs
+             WHERE batch_id=?1 AND status='completed'",
+        )?
+        .query_map([previous_batch], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+    // Preserve external checker-input watch coverage for fully carried
+    // projects. Repository inputs are deliberately not copied: source edits
+    // are handled fact-by-fact instead of invalidating the entire Program.
+    let mut previous_external_inputs = BTreeMap::<String, Vec<ValidatedInput>>::new();
+    let mut statement = conn.prepare(
+        "SELECT project_id, input_kind, input_path, source_hash
+         FROM checker_project_inputs
+         WHERE batch_id=?1 AND input_kind='absolute'
+         ORDER BY project_id, input_path",
+    )?;
+    for row in statement.query_map([previous_batch], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            ValidatedInput {
+                kind: row.get(1)?,
+                path: row.get(2)?,
+                source_hash: row.get(3)?,
+            },
+        ))
+    })? {
+        let (project, input) = row?;
+        previous_external_inputs
+            .entry(project)
+            .or_default()
+            .push(input);
+    }
+    let external_inputs_fresh = |project: &str| {
+        previous_external_inputs
+            .get(project)
+            .into_iter()
+            .flatten()
+            .all(|input| {
+                fs::read(input_path(root, input))
+                    .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
+                    .unwrap_or(false)
+            })
+    };
+    let mut projects_requiring_check = projects
+        .keys()
+        .filter(|project| {
+            previous_projects.get(*project) != project_fingerprints.get(*project)
+                || !external_inputs_fresh(project)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut previous_coverage = BTreeMap::<(OccurrenceIdentity, String), CarryCoverage>::new();
+    let mut statement = conn.prepare(
+        "SELECT source_file, source_hash, call_start, call_end,
+                receiver_start, receiver_end, property_start, property_end,
+                project_id, checker_input_fingerprint, status
+         FROM checker_occurrence_projects WHERE batch_id=?1
+         ORDER BY source_file, call_start, project_id",
+    )?;
+    for row in statement.query_map([previous_batch], |row| {
+        Ok((
+            OccurrenceIdentity {
+                file: row.get(0)?,
+                hash: row.get(1)?,
+                call_start: row.get(2)?,
+                call_end: row.get(3)?,
+                receiver_start: row.get(4)?,
+                receiver_end: row.get(5)?,
+                property_start: row.get(6)?,
+                property_end: row.get(7)?,
+            },
+            row.get::<_, String>(8)?,
+            CarryCoverage {
+                input_fingerprint: row.get(9)?,
+                status: row.get(10)?,
+            },
+        ))
+    })? {
+        let (identity, project, coverage) = row?;
+        if previous_coverage
+            .insert((identity, project), coverage)
+            .is_some()
+        {
+            bail!("previous checker batch contains duplicate occurrence coverage");
+        }
+    }
+
+    let mut previous_facts = BTreeMap::<(OccurrenceIdentity, String), Vec<CarryFact>>::new();
+    let mut statement = conn.prepare(
+        "SELECT source_file, source_hash, call_start, call_end,
+                receiver_start, receiver_end, property_start, property_end,
+                project_id, receiver_type, target_anchor, target_fingerprint,
+                confidence, checker_input_fingerprint
+         FROM checker_enrichments WHERE batch_id=?1
+         ORDER BY source_file, call_start, project_id, target_anchor",
+    )?;
+    for row in statement.query_map([previous_batch], |row| {
+        Ok((
+            OccurrenceIdentity {
+                file: row.get(0)?,
+                hash: row.get(1)?,
+                call_start: row.get(2)?,
+                call_end: row.get(3)?,
+                receiver_start: row.get(4)?,
+                receiver_end: row.get(5)?,
+                property_start: row.get(6)?,
+                property_end: row.get(7)?,
+            },
+            row.get::<_, String>(8)?,
+            CarryFact {
+                receiver_type: row.get(9)?,
+                target: Target {
+                    anchor: row.get(10)?,
+                    fingerprint: row.get(11)?,
+                },
+                confidence: row.get(12)?,
+                input_fingerprint: row.get(13)?,
+            },
+        ))
+    })? {
+        let (identity, project, fact) = row?;
+        previous_facts
+            .entry((identity, project))
+            .or_default()
+            .push(fact);
+    }
+
+    let mut current_occurrences = BTreeMap::<i64, Occurrence>::new();
+    let mut current_owners = BTreeMap::<i64, BTreeSet<String>>::new();
+    for (project, occurrences) in projects {
+        for occurrence in occurrences {
+            current_occurrences
+                .entry(occurrence.id)
+                .or_insert_with(|| occurrence.clone());
+            current_owners
+                .entry(occurrence.id)
+                .or_default()
+                .insert(project.clone());
+        }
+    }
+
+    let mut carried = Vec::<(Occurrence, String, CarryCoverage, Vec<CarryFact>)>::new();
+    let mut occurrences_carried = 0;
+    for (occurrence_id, occurrence) in current_occurrences {
+        let identity = OccurrenceIdentity::from(&occurrence);
+        let owners = current_owners
+            .get(&occurrence_id)
+            .context("checker project plan omitted occurrence owners")?;
+        let mut answers = Vec::new();
+        let mut can_carry = true;
+        for project in owners {
+            let current_fingerprint = project_fingerprints
+                .get(project)
+                .with_context(|| format!("missing planning fingerprint for {project}"))?;
+            if previous_projects.get(project) != Some(current_fingerprint) {
+                can_carry = false;
+                break;
+            }
+            if !external_inputs_fresh(project) {
+                can_carry = false;
+                break;
+            }
+            let key = (identity.clone(), project.clone());
+            let Some(coverage) = previous_coverage.get(&key) else {
+                can_carry = false;
+                break;
+            };
+            if !matches!(coverage.status.as_str(), "resolved" | "unknown") {
+                can_carry = false;
+                break;
+            }
+            let facts = previous_facts.get(&key).cloned().unwrap_or_default();
+            if coverage.status == "unknown" && !facts.is_empty() {
+                can_carry = false;
+                break;
+            }
+            for fact in &facts {
+                if !target_is_current(conn, &fact.target)? {
+                    can_carry = false;
+                    break;
+                }
+            }
+            if !can_carry {
+                break;
+            }
+            answers.push((project.clone(), coverage, facts));
+        }
+        if !can_carry {
+            projects_requiring_check.extend(owners.iter().cloned());
+            continue;
+        }
+        occurrences_carried += 1;
+        for (project, coverage, facts) in answers {
+            carried.push((
+                occurrence.clone(),
+                project,
+                CarryCoverage {
+                    input_fingerprint: coverage.input_fingerprint.clone(),
+                    status: coverage.status.clone(),
+                },
+                facts,
+            ));
+        }
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<CarryOutcome> {
+        let mut insert_coverage = conn.prepare_cached(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        )?;
+        let mut insert_fact = conn.prepare_cached(
+            "INSERT INTO checker_enrichments(
+               batch_id, member_call_id, source_file_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id, receiver_type,
+               target_anchor, target_fingerprint, confidence, provenance,
+               checker_input_fingerprint
+             ) VALUES(
+               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+               'checker',?17
+             )",
+        )?;
+        let mut insert_input = conn.prepare_cached(
+            "INSERT INTO checker_project_inputs(
+               batch_id, project_id, input_kind, input_path, source_hash
+             ) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for (occurrence, project, coverage, facts) in &carried {
+            insert_coverage.execute(params![
+                batch_id,
+                occurrence.id,
+                occurrence.file,
+                occurrence.hash,
+                occurrence.call_start,
+                occurrence.call_end,
+                occurrence.receiver_start,
+                occurrence.receiver_end,
+                occurrence.property_start,
+                occurrence.property_end,
+                project,
+                coverage.input_fingerprint,
+                coverage.status,
+            ])?;
+            for fact in facts {
+                insert_fact.execute(params![
+                    batch_id,
+                    occurrence.id,
+                    occurrence.file_id,
+                    occurrence.file,
+                    occurrence.hash,
+                    occurrence.call_start,
+                    occurrence.call_end,
+                    occurrence.receiver_start,
+                    occurrence.receiver_end,
+                    occurrence.property_start,
+                    occurrence.property_end,
+                    project,
+                    fact.receiver_type,
+                    fact.target.anchor,
+                    fact.target.fingerprint,
+                    fact.confidence,
+                    fact.input_fingerprint,
+                ])?;
+            }
+        }
+
+        let mut projects_carried = 0;
+        for (project, occurrences) in projects {
+            let completed: i64 = conn.query_row(
+                "SELECT count(*) FROM checker_occurrence_projects
+                 WHERE batch_id=?1 AND project_id=?2 AND status!='failed'",
+                params![batch_id, project],
+                |row| row.get(0),
+            )?;
+            if completed as usize == occurrences.len() {
+                let fingerprint = project_fingerprints
+                    .get(project)
+                    .with_context(|| format!("missing planning fingerprint for {project}"))?;
+                conn.execute(
+                    "UPDATE checker_project_runs
+                     SET status='completed', completed_occurrences=?3,
+                         checker_input_fingerprint=?4, execution_kind='carried',
+                         error=NULL, updated_at=datetime('now')
+                     WHERE batch_id=?1 AND project_id=?2",
+                    params![batch_id, project, completed, fingerprint],
+                )?;
+                projects_carried += 1;
+            } else {
+                conn.execute(
+                    "UPDATE checker_project_runs
+                     SET completed_occurrences=?3,
+                         execution_kind=CASE WHEN ?3>0 THEN 'mixed' ELSE 'checked' END,
+                         updated_at=datetime('now')
+                     WHERE batch_id=?1 AND project_id=?2",
+                    params![batch_id, project, completed],
+                )?;
+            }
+            if completed > 0 {
+                for input in previous_external_inputs.get(project).into_iter().flatten() {
+                    insert_input.execute(params![
+                        batch_id,
+                        project,
+                        input.kind,
+                        input.path,
+                        input.source_hash,
+                    ])?;
+                }
+            }
+        }
+        Ok(CarryOutcome {
+            projects_carried,
+            occurrences_carried,
+            projects_requiring_check,
+        })
+    })();
+    match result {
+        Ok(outcome) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn project_complete_and_fresh(
     root: &Path,
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
 ) -> Result<bool> {
-    let status = conn
+    let run = conn
         .query_row(
-            "SELECT status FROM checker_project_runs WHERE batch_id=?1 AND project_id=?2",
+            "SELECT status, execution_kind FROM checker_project_runs
+             WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    if status.as_deref() != Some("completed") {
+    let Some((status, execution_kind)) = run else {
+        return Ok(false);
+    };
+    if status != "completed" {
         return Ok(false);
     }
     let mut statement = conn.prepare(
@@ -1439,7 +2000,7 @@ fn project_complete_and_fresh(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if inputs.is_empty() {
-        return Ok(false);
+        return Ok(execution_kind == "carried");
     }
     Ok(inputs.iter().all(|input| {
         fs::read(input_path(root, input))
@@ -1466,7 +2027,8 @@ fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> 
         conn.execute(
             "UPDATE checker_project_runs
              SET status='pending', completed_occurrences=0,
-                 checker_input_fingerprint=NULL, error=NULL, updated_at=datetime('now')
+                 checker_input_fingerprint=NULL, execution_kind='checked',
+                 error=NULL, updated_at=datetime('now')
              WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
         )?;
@@ -1517,12 +2079,26 @@ fn mark_project_failed(
     let result = (|| -> Result<()> {
         let mut insert = conn.prepare_cached(
             "INSERT OR IGNORE INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,?3,'','failed')",
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'','failed')",
         )?;
         for occurrence in occurrences {
-            insert.execute(params![batch_id, occurrence.id, project_id])?;
+            insert.execute(params![
+                batch_id,
+                occurrence.id,
+                occurrence.file,
+                occurrence.hash,
+                occurrence.call_start,
+                occurrence.call_end,
+                occurrence.receiver_start,
+                occurrence.receiver_end,
+                occurrence.property_start,
+                occurrence.property_end,
+                project_id,
+            ])?;
         }
         conn.execute(
             "UPDATE checker_project_runs
@@ -1747,14 +2323,24 @@ fn stage_batch(
         }
         let mut insert_project = conn.prepare_cached(
             "INSERT OR REPLACE INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,?3,?4,?5)",
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         )?;
         for project in projects {
             insert_project.execute(params![
                 batch_id,
                 project.occurrence.id,
+                project.occurrence.file,
+                project.occurrence.hash,
+                project.occurrence.call_start,
+                project.occurrence.call_end,
+                project.occurrence.receiver_start,
+                project.occurrence.receiver_end,
+                project.occurrence.property_start,
+                project.occurrence.property_end,
                 project.project_id,
                 project.input_fingerprint,
                 project.status,
@@ -1831,10 +2417,28 @@ fn complete_project(
         for ((kind, path), hash) in seen {
             insert.execute(params![batch_id, project_id, kind, path, hash])?;
         }
+        // A partially carried project is checked as one coherent TypeScript
+        // Program. Rebind its retained rows to that exact input identity so
+        // the completed run does not mix planning and checker fingerprints.
+        conn.execute(
+            "UPDATE checker_enrichments
+             SET checker_input_fingerprint=?3
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id, fingerprint],
+        )?;
+        conn.execute(
+            "UPDATE checker_occurrence_projects
+             SET checker_input_fingerprint=?3
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id, fingerprint],
+        )?;
         conn.execute(
             "UPDATE checker_project_runs
              SET status='completed', checker_input_fingerprint=?3,
-                 peak_rss_bytes=?4, peak_heap_bytes=?5, error=NULL,
+                 execution_kind=CASE
+                   WHEN execution_kind='mixed' THEN 'mixed' ELSE 'checked' END,
+                 peak_rss_bytes=?4,
+                 peak_heap_bytes=?5, error=NULL,
                  updated_at=datetime('now')
              WHERE batch_id=?1 AND project_id=?2
                AND completed_occurrences=selected_occurrences",
@@ -2305,14 +2909,24 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
         }
         let mut insert_project = conn.prepare_cached(
             "INSERT INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,?3,?4,?5)",
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         )?;
         for project in plan.projects {
             insert_project.execute(params![
                 batch_id,
                 project.occurrence.id,
+                project.occurrence.file,
+                project.occurrence.hash,
+                project.occurrence.call_start,
+                project.occurrence.call_end,
+                project.occurrence.receiver_start,
+                project.occurrence.receiver_end,
+                project.occurrence.property_start,
+                project.occurrence.property_end,
                 project.project_id,
                 project.input_fingerprint,
                 project.status,
@@ -2382,6 +2996,13 @@ fn recheck_occurrence(root: &Path, conn: &Connection, occurrence: &Occurrence) -
 }
 
 fn recheck_target(conn: &Connection, target: &Target) -> Result<()> {
+    if !target_is_current(conn, target)? {
+        bail!("checker target changed while enrichment was running; published nothing");
+    }
+    Ok(())
+}
+
+fn target_is_current(conn: &Connection, target: &Target) -> Result<bool> {
     let current = conn
         .query_row(
             "SELECT file.hash, symbol.decl_start, symbol.decl_end
@@ -2400,12 +3021,9 @@ fn recheck_target(conn: &Connection, target: &Target) -> Result<()> {
         )
         .optional()?;
     let Some((hash, start, end)) = current else {
-        bail!("checker target anchor disappeared while enrichment was running; published nothing");
+        return Ok(false);
     };
-    if target_fingerprint(&target.anchor, &hash, start, end) != target.fingerprint {
-        bail!("checker target changed while enrichment was running; published nothing");
-    }
-    Ok(())
+    Ok(target_fingerprint(&target.anchor, &hash, start, end) == target.fingerprint)
 }
 
 #[cfg(test)]
@@ -2456,7 +3074,19 @@ mod tests {
             max_occurrences: None,
             include_all: false,
             dry_run: false,
+            carry_forward: false,
+            force_full: false,
+            dirty_files: Vec::new(),
         }
+    }
+
+    fn test_project_fingerprints(
+        projects: &BTreeMap<String, Vec<Occurrence>>,
+    ) -> BTreeMap<String, String> {
+        projects
+            .keys()
+            .map(|project| (project.clone(), format!("planning:{project}")))
+            .collect()
     }
 
     #[test]
@@ -2657,7 +3287,7 @@ mod tests {
         assert_eq!(coverage.occurrences_skipped_inferred_project, 0);
         let all_plan = build_project_plan(&all, &ownership, &projects, true)?;
         assert_eq!(
-            projects_in_execution_order(&all_plan.projects)
+            projects_in_execution_order(&all_plan.projects, &BTreeSet::new())
                 .into_iter()
                 .map(|(project, _)| project.as_str())
                 .collect::<Vec<_>>(),
@@ -3165,7 +3795,20 @@ mod tests {
             source: "bundled".into(),
         };
         let projects = BTreeMap::from([("tsconfig.json".into(), vec![occurrence.clone()])]);
-        let batch_id = open_staging_batch(&conn, &snapshot, "plan", &identity, 2, 1, &projects)?;
+        let fingerprints = test_project_fingerprints(&projects);
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &fingerprints,
+                force_new: false,
+            },
+        )?;
         let answer = ProjectAnswer {
             project_id: "tsconfig.json".into(),
             status: "unknown".into(),
@@ -3215,7 +3858,20 @@ mod tests {
             ("tsconfig.good.json".into(), vec![occurrence.clone()]),
             ("tsconfig.failed.json".into(), vec![occurrence.clone()]),
         ]);
-        let batch_id = open_staging_batch(&conn, &snapshot, "partial", &identity, 2, 1, &projects)?;
+        let fingerprints = test_project_fingerprints(&projects);
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "partial",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &fingerprints,
+                force_new: false,
+            },
+        )?;
 
         let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
         let good = project_answer("tsconfig.good.json", vec![declaration]);
@@ -3266,7 +3922,19 @@ mod tests {
             serde_json::json!(["tsconfig.failed.json"])
         );
         assert_eq!(
-            open_staging_batch(&conn, &snapshot, "partial", &identity, 2, 1, &projects)?,
+            open_staging_batch(
+                &conn,
+                &StagingPlan {
+                    snapshot: &snapshot,
+                    plan_fingerprint: "partial",
+                    checker: &identity,
+                    protocol: 2,
+                    selected_occurrences: 1,
+                    projects: &projects,
+                    project_fingerprints: &fingerprints,
+                    force_new: false,
+                },
+            )?,
             batch_id,
             "the partial active batch must remain the resume target"
         );
@@ -3289,14 +3957,19 @@ mod tests {
 
         let healthy_projects =
             BTreeMap::from([("tsconfig.healthy.json".into(), vec![occurrence.clone()])]);
+        let healthy_fingerprints = test_project_fingerprints(&healthy_projects);
         let healthy_batch = open_staging_batch(
             &conn,
-            &snapshot,
-            "healthy-plan",
-            &identity,
-            2,
-            1,
-            &healthy_projects,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "healthy-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &healthy_projects,
+                project_fingerprints: &healthy_fingerprints,
+                force_new: false,
+            },
         )?;
         let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
         let answer = project_answer("tsconfig.healthy.json", vec![declaration]);
@@ -3330,14 +4003,19 @@ mod tests {
 
         let failed_projects =
             BTreeMap::from([("tsconfig.failed.json".into(), vec![occurrence.clone()])]);
+        let failed_fingerprints = test_project_fingerprints(&failed_projects);
         let failed_batch = open_staging_batch(
             &conn,
-            &snapshot,
-            "failed-plan",
-            &identity,
-            2,
-            1,
-            &failed_projects,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "failed-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &failed_projects,
+                project_fingerprints: &failed_fingerprints,
+                force_new: false,
+            },
         )?;
         mark_project_failed(
             &conn,
@@ -3409,10 +4087,368 @@ mod tests {
     }
 
     fn occurrence(conn: &Connection) -> Result<Occurrence> {
+        occurrence_in(conn, "main.ts")
+    }
+
+    fn occurrence_in(conn: &Connection, file: &str) -> Result<Occurrence> {
         Ok(load_occurrences(conn)?
             .into_iter()
-            .find(|occurrence| occurrence.member == "insert")
+            .find(|occurrence| occurrence.file == file && occurrence.member == "insert")
             .expect("indexed insert occurrence"))
+    }
+
+    fn seed_active_checker_batch(
+        root: &Path,
+        conn: &Connection,
+        source_hash: &str,
+        occurrence: &Occurrence,
+        declaration: &DeclarationSite,
+        project_fingerprints: &BTreeMap<String, String>,
+    ) -> Result<i64> {
+        let snapshot = crate::structural::current_snapshot(conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let projects = project_fingerprints
+            .keys()
+            .map(|project| (project.clone(), vec![occurrence.clone()]))
+            .collect::<BTreeMap<_, _>>();
+        let batch_id = open_staging_batch(
+            conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "initial-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints,
+                force_new: false,
+            },
+        )?;
+        for project in project_fingerprints.keys() {
+            let answer = project_answer(project, vec![declaration.clone()]);
+            let outcome = map_occurrence(conn, occurrence, &[answer])?;
+            stage_batch(
+                conn,
+                batch_id,
+                project,
+                std::slice::from_ref(occurrence),
+                &outcome.facts,
+                &outcome.projects,
+            )?;
+            complete_project(
+                root,
+                conn,
+                batch_id,
+                project,
+                &format!("{project}-inputs"),
+                &[super::super::protocol::CheckerInputFile {
+                    path: root.join("main.ts").to_string_lossy().into_owned(),
+                    source_hash: source_hash.to_string(),
+                }],
+                1,
+                1,
+            )?;
+        }
+        activate_staging_batch(root, conn, batch_id, &snapshot, false)?;
+        crate::structural::rebuild_projection(conn, &snapshot)?;
+        Ok(batch_id)
+    }
+
+    #[test]
+    fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let old_occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let project_fingerprints =
+            BTreeMap::from([("tsconfig.json".to_string(), "stable-plan".to_string())]);
+        let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let old_batch = seed_active_checker_batch(
+            repo.path(),
+            &conn,
+            &hash,
+            &old_occurrence,
+            &declaration,
+            &project_fingerprints,
+        )?;
+        let external = tempfile::tempdir()?;
+        let external_input = external.path().join("ambient.d.ts");
+        fs::write(&external_input, "declare const ambient: string;\n")?;
+        let external_hash = blake3::hash(&fs::read(&external_input)?)
+            .to_hex()
+            .to_string();
+        conn.execute(
+            "INSERT INTO checker_project_inputs(
+               batch_id, project_id, input_kind, input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','absolute',?2,?3)",
+            params![
+                old_batch,
+                external_input.to_string_lossy().as_ref(),
+                external_hash
+            ],
+        )?;
+
+        fs::write(
+            repo.path().join("a.ts"),
+            "class Earlier { insert(): void {} }\n\
+             declare const earlier: Earlier; earlier.insert();\n",
+        )?;
+        crate::indexer::watch_full_refresh_repo_with_options(
+            repo.path(),
+            &conn,
+            &crate::indexer::IndexOptions::default(),
+        )?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let current_occurrence = occurrence_in(&conn, "main.ts")?;
+        assert_ne!(
+            current_occurrence.id, old_occurrence.id,
+            "fixture must exercise rowid rebinding"
+        );
+        let projects = BTreeMap::from([(
+            "tsconfig.json".to_string(),
+            vec![current_occurrence.clone()],
+        )]);
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "next-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &project_fingerprints,
+                force_new: false,
+            },
+        )?;
+        let carried = carry_forward_projects(
+            repo.path(),
+            &conn,
+            batch_id,
+            &identity,
+            2,
+            &projects,
+            &project_fingerprints,
+        )?;
+        assert_eq!(carried.projects_carried, 1);
+        assert_eq!(carried.occurrences_carried, 1);
+        assert!(carried.projects_requiring_check.is_empty());
+        assert!(project_complete_and_fresh(
+            repo.path(),
+            &conn,
+            batch_id,
+            "tsconfig.json"
+        )?);
+        let rebound: i64 = conn.query_row(
+            "SELECT member_call_id FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id='tsconfig.json'",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rebound, current_occurrence.id);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM checker_project_inputs
+                 WHERE batch_id=?1 AND project_id='tsconfig.json'
+                   AND input_kind='absolute' AND input_path=?2",
+                params![batch_id, external_input.to_string_lossy().as_ref()],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1,
+            "carried projects retain external checker-input watch coverage"
+        );
+
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false)?;
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolved_edges
+                 WHERE provenance='checker' AND source_ref_id=?1",
+                [current_occurrence.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_changed_owner_prevents_every_owner_from_carrying_an_occurrence() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let old_occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let old_fingerprints = BTreeMap::from([
+            ("tsconfig.a.json".to_string(), "stable-a".to_string()),
+            ("tsconfig.b.json".to_string(), "old-b".to_string()),
+        ]);
+        let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+        seed_active_checker_batch(
+            repo.path(),
+            &conn,
+            &hash,
+            &old_occurrence,
+            &declaration,
+            &old_fingerprints,
+        )?;
+        fs::write(
+            repo.path().join("unrelated.ts"),
+            "export const value = 1;\n",
+        )?;
+        crate::indexer::watch_full_refresh_repo_with_options(
+            repo.path(),
+            &conn,
+            &crate::indexer::IndexOptions::default(),
+        )?;
+        let current_occurrence = occurrence(&conn)?;
+        let projects = BTreeMap::from([
+            (
+                "tsconfig.a.json".to_string(),
+                vec![current_occurrence.clone()],
+            ),
+            ("tsconfig.b.json".to_string(), vec![current_occurrence]),
+        ]);
+        let current_fingerprints = BTreeMap::from([
+            ("tsconfig.a.json".to_string(), "stable-a".to_string()),
+            ("tsconfig.b.json".to_string(), "changed-b".to_string()),
+        ]);
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "next-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &current_fingerprints,
+                force_new: false,
+            },
+        )?;
+        let carried = carry_forward_projects(
+            repo.path(),
+            &conn,
+            batch_id,
+            &identity,
+            2,
+            &projects,
+            &current_fingerprints,
+        )?;
+        assert_eq!(carried.projects_carried, 0);
+        assert_eq!(carried.occurrences_carried, 0);
+        assert_eq!(
+            carried.projects_requiring_check,
+            BTreeSet::from(["tsconfig.a.json".to_string(), "tsconfig.b.json".to_string()])
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM checker_occurrence_projects WHERE batch_id=?1",
+                [batch_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_target_content_prevents_fact_carry_even_when_project_scope_is_stable() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        let main_source = "import { CardTable } from './target';\n\
+                           declare const card: CardTable; card.insert();\n";
+        let target_source = "export class CardTable { insert(): void {} }\n";
+        fs::write(repo.path().join("main.ts"), main_source)?;
+        fs::write(repo.path().join("target.ts"), target_source)?;
+        let conn = crate::store::open(repo.path())?;
+        crate::indexer::index_repo(repo.path(), &conn)?;
+        let main_hash =
+            conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let target_hash =
+            conn.query_row("SELECT hash FROM files WHERE path='target.ts'", [], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let initial_occurrence = occurrence(&conn)?;
+        let declaration_start = target_source.find("insert").expect("declaration") as i64;
+        let declaration = DeclarationSite {
+            file: Some("target.ts".into()),
+            outside_root: false,
+            start: declaration_start,
+            end: declaration_start + "insert".len() as i64,
+            source_hash: target_hash,
+            context: Some("repo".into()),
+        };
+        let fingerprints =
+            BTreeMap::from([("tsconfig.json".to_string(), "stable-plan".to_string())]);
+        seed_active_checker_batch(
+            repo.path(),
+            &conn,
+            &main_hash,
+            &initial_occurrence,
+            &declaration,
+            &fingerprints,
+        )?;
+
+        fs::write(
+            repo.path().join("target.ts"),
+            "export class CardTable { insert(): void { return; } }\n",
+        )?;
+        crate::indexer::watch_full_refresh_repo_with_options(
+            repo.path(),
+            &conn,
+            &crate::indexer::IndexOptions::default(),
+        )?;
+        let current_occurrence = occurrence(&conn)?;
+        let projects = BTreeMap::from([("tsconfig.json".to_string(), vec![current_occurrence])]);
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "next-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &fingerprints,
+                force_new: false,
+            },
+        )?;
+        let carried = carry_forward_projects(
+            repo.path(),
+            &conn,
+            batch_id,
+            &identity,
+            2,
+            &projects,
+            &fingerprints,
+        )?;
+        assert_eq!(carried.occurrences_carried, 0);
+        assert_eq!(
+            carried.projects_requiring_check,
+            BTreeSet::from(["tsconfig.json".to_string()])
+        );
+        Ok(())
     }
 
     /// Anchoring by span containment alone let any declaration nested inside an

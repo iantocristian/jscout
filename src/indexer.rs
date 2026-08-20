@@ -181,7 +181,14 @@ pub fn index_repo_with_options(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    incremental_refresh_repo_with_options(root, conn, options)
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::Incremental,
+        CheckerRetention::Drop,
+    )
 }
 
 /// Refresh the published snapshot by retaining unchanged first-party rows and
@@ -194,7 +201,14 @@ pub fn incremental_refresh_repo_with_options(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    index_repo_impl(root, conn, options, true, IndexMode::Incremental)
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::Incremental,
+        CheckerRetention::PreserveActiveForWatch,
+    )
 }
 
 /// Rebuild every repository-derived row for the current checkout while
@@ -204,13 +218,44 @@ pub fn refresh_repo_with_options(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    index_repo_impl(root, conn, options, true, IndexMode::FullRefresh)
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::FullRefresh,
+        CheckerRetention::Drop,
+    )
+}
+
+/// Full structural refresh for the watcher. Unlike manual `jscout index`, it
+/// keeps only the previous active checker batch as a hidden carry source for
+/// the following enrichment phase.
+pub fn watch_full_refresh_repo_with_options(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::FullRefresh,
+        CheckerRetention::PreserveActiveForWatch,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IndexMode {
     Incremental,
     FullRefresh,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckerRetention {
+    Drop,
+    PreserveActiveForWatch,
 }
 
 /// The pre-reset code path: always replace files one at a time, even when
@@ -222,7 +267,14 @@ pub(crate) fn index_repo_without_extraction_reset(
     conn: &Connection,
     options: &IndexOptions,
 ) -> Result<IndexOutcome> {
-    index_repo_impl(root, conn, options, false, IndexMode::Incremental)
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        false,
+        IndexMode::Incremental,
+        CheckerRetention::Drop,
+    )
 }
 
 fn index_repo_impl(
@@ -231,6 +283,7 @@ fn index_repo_impl(
     options: &IndexOptions,
     allow_extraction_reset: bool,
     mode: IndexMode,
+    checker_retention: CheckerRetention,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory = walk::source_inventory(&root)?;
@@ -439,17 +492,22 @@ fn index_repo_impl(
     )?;
     let resolution = crate::structural::compute_resolution_hash(conn)?;
     let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
-    // An exact-snapshot checker batch is still valid and expensive to
-    // reproduce. Old-snapshot batches are removed before either refresh mode
-    // can publish the new snapshot.
-    store::retain_checker_batches_for_snapshot(conn, &snapshot)?;
+    // Manual indexing always resets the optional checker plane. Watch keeps
+    // one old active batch hidden for the immediately following per-project
+    // carry step; projection still rejects a mismatched source snapshot.
+    let checker_batches_changed = match checker_retention {
+        CheckerRetention::Drop => store::clear_checker_batches(conn)?,
+        CheckerRetention::PreserveActiveForWatch => {
+            store::preserve_active_checker_batch_for_watch(conn)?
+        }
+    };
     let current = ProjectionIdentity {
         snapshot: Some(snapshot.clone()),
         projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
         resolution_hash: Some(resolution.clone()),
     };
     let projection_started = std::time::Instant::now();
-    if previous == current {
+    if previous == current && !checker_batches_changed {
         // The projection is a pure function of the canonical tables: the
         // snapshot covers every extracted row (file content identity) and the
         // resolution hash covers module edges, whose inputs (tsconfigs,
@@ -2541,7 +2599,7 @@ mod tests {
                 ))
             },
         )?;
-        assert_eq!(counts, (1, 1, 1, 1, 1, 0));
+        assert_eq!(counts, (1, 1, 1, 1, 0, 0));
         assert_eq!(
             semantic::load_artifact(&conn, 3)?.unwrap().freshness,
             "fresh"
@@ -2565,7 +2623,8 @@ mod tests {
     }
 
     #[test]
-    fn changed_incremental_refresh_retires_old_checker_batches() -> Result<()> {
+    fn watcher_incremental_refresh_preserves_old_checker_batch_as_hidden_carry_source() -> Result<()>
+    {
         let repo = tempfile::tempdir()?;
         fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
         let conn = store::open(repo.path())?;
@@ -2583,14 +2642,14 @@ mod tests {
         fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
         incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM checker_enrichment_batches",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?,
-            0
-        );
+        let current = structural::current_snapshot(&conn)?;
+        let retained: (i64, i64) = conn.query_row(
+            "SELECT count(*), count(*) FILTER (WHERE source_snapshot=?1)
+             FROM checker_enrichment_batches",
+            [&current],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(retained, (1, 0));
         Ok(())
     }
 
@@ -2702,14 +2761,14 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )?,
-            1,
-            "an unchanged full reconciliation must retain the exact checker batch"
+            0,
+            "manual full indexing always resets checker enrichment"
         );
         Ok(())
     }
 
     #[test]
-    fn identical_full_refresh_reprojects_the_exact_checker_batch() -> Result<()> {
+    fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
             repo.path().join("service.ts"),
@@ -2806,12 +2865,34 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO checker_occurrence_projects(
-               batch_id, member_call_id, project_id,
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
                checker_input_fingerprint, status
-             ) VALUES(?1,?2,'tsconfig.json','inputs','resolved')",
-            rusqlite::params![batch_id, member_call_id],
+             ) VALUES(?1,?2,'service.ts',?3,?4,?5,?6,?7,?8,?9,
+                      'tsconfig.json','inputs','resolved')",
+            rusqlite::params![
+                batch_id,
+                member_call_id,
+                source_hash,
+                call_start,
+                call_end,
+                receiver_start,
+                receiver_end,
+                property_start,
+                property_end,
+            ],
         )?;
         structural::rebuild_projection(&conn, &snapshot)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM resolved_edges
+                 WHERE provenance='checker' AND dst_key=?1",
+                [&target],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
 
         refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
         let counts: (i64, i64) = conn.query_row(
@@ -2822,7 +2903,7 @@ mod tests {
             [&target],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(counts, (1, 1));
+        assert_eq!(counts, (0, 0));
         Ok(())
     }
 

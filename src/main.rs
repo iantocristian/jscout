@@ -486,6 +486,9 @@ enum Command {
         /// Print the deterministic ownership/selection plan without building TypeScript Programs
         #[arg(long)]
         dry_run: bool,
+        /// Recompute every selected project without exact-batch reuse or watch carry-forward
+        #[arg(long)]
+        full: bool,
         /// Checker sidecar entry file for development and diagnostics
         #[arg(long)]
         sidecar_path: Option<PathBuf>,
@@ -1152,6 +1155,7 @@ fn main() -> Result<()> {
             max_occurrences,
             all,
             dry_run,
+            full,
             sidecar_path,
             database,
         } => {
@@ -1168,6 +1172,9 @@ fn main() -> Result<()> {
                     max_occurrences,
                     include_all: all,
                     dry_run,
+                    carry_forward: false,
+                    force_full: full,
+                    dirty_files: Vec::new(),
                 },
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2438,6 +2445,7 @@ mod main_tests {
             "--max-occurrences",
             "25",
             "--all",
+            "--full",
         ])
         .expect("enrichment plan controls parse");
         let Command::Enrich {
@@ -2448,6 +2456,7 @@ mod main_tests {
             max_occurrences,
             all,
             dry_run,
+            full,
             ..
         } = command
         else {
@@ -2460,6 +2469,7 @@ mod main_tests {
         assert_eq!(max_occurrences, Some(25));
         assert!(all);
         assert!(dry_run);
+        assert!(full);
 
         let Cli { command } =
             Cli::try_parse_from(["jscout", "enrich", "."]).expect("default enrich parses");

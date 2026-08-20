@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "23";
+pub const SCHEMA_VERSION: &str = "24";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -217,7 +217,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='23' WHERE key='schema_version';",
+             UPDATE meta SET value='24' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +235,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '23')
+INSERT INTO meta(key, value) VALUES('schema_version', '24')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -531,9 +531,10 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
--- Canonical TypeScript-checker facts are retained across projection and
--- extraction rebuilds when the resulting structural snapshot is identical.
--- Publication deletes batches bound to any other snapshot.
+-- Canonical TypeScript-checker facts are exact-snapshot public data. A watch
+-- refresh may temporarily retain the prior active batch as a hidden source
+-- for validated, per-project carry into the next snapshot; manual indexing
+-- clears the plane.
 -- Source/target identities are deliberately not foreign keys because a
 -- projection rebuild must not cascade through canonical checker facts.
 CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
@@ -560,7 +561,10 @@ CREATE TABLE IF NOT EXISTS checker_project_runs(
   status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
   selected_occurrences INTEGER NOT NULL,
   completed_occurrences INTEGER NOT NULL DEFAULT 0,
+  planning_fingerprint TEXT NOT NULL DEFAULT '',
   checker_input_fingerprint TEXT,
+  execution_kind TEXT NOT NULL DEFAULT 'checked'
+    CHECK(execution_kind IN ('checked', 'carried', 'mixed')),
   peak_rss_bytes INTEGER NOT NULL DEFAULT 0,
   peak_heap_bytes INTEGER NOT NULL DEFAULT 0,
   error TEXT,
@@ -611,6 +615,14 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
 CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   member_call_id INTEGER NOT NULL,
+  source_file TEXT NOT NULL DEFAULT '',
+  source_hash TEXT NOT NULL DEFAULT '',
+  call_start INTEGER NOT NULL DEFAULT 0,
+  call_end INTEGER NOT NULL DEFAULT 0,
+  receiver_start INTEGER NOT NULL DEFAULT 0,
+  receiver_end INTEGER NOT NULL DEFAULT 0,
+  property_start INTEGER NOT NULL DEFAULT 0,
+  property_end INTEGER NOT NULL DEFAULT 0,
   project_id TEXT NOT NULL,
   checker_input_fingerprint TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('resolved', 'unknown', 'failed')),
@@ -961,15 +973,21 @@ pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Keep checker facts only when extraction reproduced their exact structural
-/// snapshot. The snapshot marker is still absent here, so a failed projection
-/// cannot expose either retained or stale checker edges.
-pub(crate) fn retain_checker_batches_for_snapshot(conn: &Connection, snapshot: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM checker_enrichment_batches WHERE source_snapshot != ?1",
-        [snapshot],
-    )?;
-    Ok(())
+/// Manual fixed-snapshot indexing starts the optional checker plane from
+/// scratch. This is deliberately caller policy rather than a user-facing
+/// retention flag.
+pub(crate) fn clear_checker_batches(conn: &Connection) -> Result<bool> {
+    let changed = conn.execute("DELETE FROM checker_enrichment_batches", [])? != 0;
+    Ok(changed)
+}
+
+/// A watcher refresh may keep the one previously active batch hidden as a
+/// carry source. Staging rows belong to an interrupted old plan and cannot be
+/// reused after structural refresh; ordinary projection still requires the
+/// batch's source snapshot to equal the current snapshot.
+pub(crate) fn preserve_active_checker_batch_for_watch(conn: &Connection) -> Result<bool> {
+    let changed = conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])? != 0;
+    Ok(changed)
 }
 
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
