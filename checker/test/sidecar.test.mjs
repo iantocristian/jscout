@@ -187,11 +187,11 @@ test("excludes tooling config ownership only when a non-tooling owner remains", 
   const root = fixture({
     "main.ts": shared,
     "lint-only.ts": lintOnly,
-    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "tsconfig.json": JSON.stringify({ include: ["main.ts"] }),
     "tsconfig.eslint.json": JSON.stringify({
       extends: "./tsconfig.json",
       compilerOptions: { allowJs: true },
-      files: ["main.ts", "lint-only.ts"],
+      include: ["*.ts"],
     }),
   });
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -233,13 +233,19 @@ test("excludes tooling config ownership only when a non-tooling owner remains", 
 
   const fallback = await checker.request("resolve_members", {
     project_id: "tsconfig.eslint.json",
-    queries: [{
-      ...queryFor(lintOnly, "lintOnly.run()", "lintOnly", "run"),
-      file: "lint-only.ts",
-    }],
+    queries: [
+      {
+        ...queryFor(lintOnly, "lintOnly.run()", "lintOnly", "run"),
+        file: "lint-only.ts",
+      },
+      // Rust repository policy may promote this heuristically excluded owner.
+      // It is still a real TypeScript member and must remain executable.
+      queryFor(shared, "shared.run()", "shared", "run"),
+    ],
   });
   assert.equal(fallback.kind, "resolve_members_result", JSON.stringify(fallback));
-  assert.equal(fallback.result.results[0].answer.status, "resolved");
+  assert.equal(fallback.result.results.length, 2);
+  assert.ok(fallback.result.results.every((result) => result.answer.status === "resolved"));
   await checker.close();
 });
 

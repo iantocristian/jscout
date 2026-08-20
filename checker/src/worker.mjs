@@ -673,9 +673,14 @@ function resolveMembers(projectId, queries) {
   const firstFile = resolveQueryFile(queries[0].file);
   const project = projectById(projectId, firstFile);
   if (!project) throw coded("project_not_found", `project not found: ${projectId}`);
+  const projectFiles = new Set(project.fileNames);
   for (const query of queries) {
     const queryFile = resolveQueryFile(query.file);
-    if (!owningProjects(queryFile).owners.some((owner) => owner.id === projectId)) {
+    // The Rust planner may deliberately promote an owner that this sidecar's
+    // coarse purpose heuristic put in excluded_project_ids. At execution time
+    // validate actual parsed TypeScript membership, not the heuristic owner
+    // preference a second time.
+    if (!projectFiles.has(queryFile)) {
       throw coded("project_mismatch", `${query.file} is not owned by ${projectId}`);
     }
   }
