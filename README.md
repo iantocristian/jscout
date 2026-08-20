@@ -174,8 +174,9 @@ node scripts/npm-package.mjs --target TRIPLE
 The wrapper vendors no `node_modules`: it declares the sidecar dependencies
 and lets the installer resolve them. Because the binary lands in a separate
 platform package, `current_exe()` sidecar discovery cannot reach the bundled
-`gateway/` and `checker/`, so `npm/cli/bin/jscout.mjs` sets
-`JSCOUT_PI_AI_GATEWAY` and `JSCOUT_CHECKER_SIDECAR` before exec. Publishing is
+`gateway/` and `checker/`, so `npm/cli/bin/jscout.mjs` supplies their paths
+through private bundled-discovery transport before exec. Repository config and
+explicit legacy overrides remain authoritative. Publishing is
 driven by `.github/workflows/release-npm.yml` on a `vX.Y.Z` tag; the tag must
 match the Cargo.toml version.
 
@@ -803,8 +804,9 @@ later re-enabling reranking never causes a re-embed.
 MCP remains one process for one root and one database. `jscout mcp
 /path/to/repo` loads `/path/to/repo/.jscout.toml` once at startup.
 Initialization metadata reports the exact database, config path, binary/config
-fingerprints, and effective retrieval defaults. Restart MCP after editing the
-file; there is no hot reload or multi-repository routing.
+fingerprints, and effective retrieval defaults. MCP and `watch` load policy
+once; restart either long-running process after editing the file. There is no
+hot reload or multi-repository routing.
 
 Secrets never belong in `.jscout.toml`. The file may name an environment
 variable such as `OPENAI_API_KEY`, `VOYAGE_API_KEY`, or a private custom key;

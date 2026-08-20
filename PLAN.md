@@ -17,8 +17,8 @@
 > problem-solving investigation then confirmed that exact definitions are the
 > efficient drill-down surface while repeated expansion dominates response
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
-> is the compact-transport and path-projection pass. G21 is the repository-local
-> runtime-configuration and retrieval-observability pass. None triggers G16 or
+> is the compact-transport and path-projection pass. G21 repository-local
+> runtime configuration and retrieval observability are implemented. None triggers G16 or
 > widens the semantic product surface, and no retrieval default changes without
 > a same-binary, same-snapshot comparison.
 
@@ -2658,7 +2658,7 @@ consequences that still govern implementation.
 | The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G20 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
 | A 19-call TargetsQueue problem-solving investigation naturally selected four exact definitions that carried the mechanism in 11.6 KB, while nine expansions produced 162.9 KB and weak attached memory | Preserve exact definition as progressive drill-down; make search-attached memory opt-in, stop broad expansion after localization, and replay G20 on this workload separately from the architecture inquiry |
 | The same investigation exposed an unbounded generic receiver string and `used_by` counts derived from unresolved repository-wide names | Bound compact receiver displays with full debug fidelity; replace those counts with anchor-resolved edges or label them as approximate name occurrences |
-| The first production telemetry window mixes binaries and intentionally different retrieval postures; vector-active rows also rerank and no relevance labels exist | Use it for incident discovery only; implement G21 configuration/build fingerprints and stage timings, preserve retrieval defaults, and compare reranking with one variable changed before any global flip |
+| The first production telemetry window mixes binaries and intentionally different retrieval postures; vector-active rows also rerank and no relevance labels exist | Use it for incident discovery only; use G21 configuration/build fingerprints and stage timings, preserve retrieval defaults, and compare reranking with one variable changed before any global flip |
 | Three 1.86 MB `who_uses` responses predate the current compact whole-response ceiling | Replay a high-fanout case on the current binary and measure follow-up value; do not schedule a duplicate cap implementation or treat historical bytes as current behavior |
 
 Relevant result summaries include:

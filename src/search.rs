@@ -1372,6 +1372,7 @@ fn ranked_hits(
     if options.rerank
         && let Some(reranker) = options.reranker.as_ref()
     {
+        let started = std::time::Instant::now();
         let top: Vec<(i64, String)> = fused
             .iter()
             .take(reranker.pool)
@@ -1381,7 +1382,6 @@ fn ranked_hits(
             .flatten()
             .collect();
         if !top.is_empty() {
-            let t = std::time::Instant::now();
             match reranker.rerank(q, &top) {
                 Ok(reranked) if !reranked.is_empty() => {
                     fused = merge_reranked_prefix(&fused, reranked);
@@ -1393,10 +1393,11 @@ fn ranked_hits(
                     eprintln!("rerank unavailable, using RRF order: {e}");
                 }
             }
+            let elapsed = started.elapsed();
             if timing {
-                eprintln!("timing: rerank({}) {:?}", top.len(), t.elapsed());
+                eprintln!("timing: rerank({}) {elapsed:?}", top.len());
             }
-            retrieval.reranker_timing = Some(t.elapsed());
+            retrieval.reranker_timing = Some(elapsed);
         }
     }
     if options.file_roles.is_empty() {

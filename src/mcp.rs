@@ -1433,6 +1433,31 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let retrieval_reranker = retrieval
         .as_ref()
         .and_then(|value| value["retrieval"]["reranker"].as_str().map(str::to_string));
+    let retrieval_vector_action = retrieval.as_ref().and_then(|value| {
+        value["retrieval"]["vector_action"]
+            .as_str()
+            .map(str::to_string)
+    });
+    let retrieval_semantic_vector = retrieval.as_ref().and_then(|value| {
+        value["semantic_memory"]["retrieval"]["vector"]
+            .as_str()
+            .or_else(|| {
+                (*tool == "semantic_memory")
+                    .then(|| value["retrieval"]["vector"].as_str())
+                    .flatten()
+            })
+            .map(str::to_string)
+    });
+    let retrieval_semantic_vector_action = retrieval.as_ref().and_then(|value| {
+        value["semantic_memory"]["retrieval"]["vector_action"]
+            .as_str()
+            .or_else(|| {
+                (*tool == "semantic_memory")
+                    .then(|| value["retrieval"]["vector_action"].as_str())
+                    .flatten()
+            })
+            .map(str::to_string)
+    });
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let search_defaults = &runtime.effective.search;
@@ -1499,7 +1524,10 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         "semantic_artifacts_stale": semantic_metrics.stale,
         "semantic_artifacts_written": usize::from(*tool == "annotate" && ok),
         "retrieval_vector": retrieval_vector,
+        "retrieval_vector_action": retrieval_vector_action,
         "retrieval_reranker": retrieval_reranker,
+        "retrieval_semantic_vector": retrieval_semantic_vector,
+        "retrieval_semantic_vector_action": retrieval_semantic_vector_action,
         "requested_retrieval": requested_retrieval,
         "embedding_query_ms": duration_ms(embedding_query),
         "vector_index_ms": duration_ms(vector_index),

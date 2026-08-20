@@ -470,6 +470,31 @@ impl Resolver {
         None
     }
 
+    fn optional_string_with_internal(
+        &mut self,
+        key: &str,
+        configured: Option<String>,
+        legacy_env_name: &str,
+        internal_env_name: &str,
+    ) -> Option<String> {
+        if let Some(value) = configured {
+            self.sources.insert(key.to_string(), ValueSource::Config);
+            return Some(value);
+        }
+        if let Some(value) = nonempty_env(legacy_env_name) {
+            self.sources.insert(key.to_string(), ValueSource::LegacyEnv);
+            return Some(value);
+        }
+        if let Some(value) = nonempty_env(internal_env_name) {
+            // Installed-package launcher transport is an implementation of
+            // built-in discovery, not a user-facing legacy setting.
+            self.sources.insert(key.to_string(), ValueSource::Builtin);
+            return Some(value);
+        }
+        self.sources.insert(key.to_string(), ValueSource::Builtin);
+        None
+    }
+
     fn bool(
         &mut self,
         key: &str,
@@ -671,6 +696,21 @@ impl RuntimeConfig {
                 file_roles: expansion_file_roles,
             },
         };
+        if search.memory_limit > 100 {
+            bail!("search.memory_limit must be at most 100");
+        }
+        if search.memory_depth > search::MAX_MEMORY_GRAPH_DEPTH {
+            bail!(
+                "search.memory_depth must be at most {}",
+                search::MAX_MEMORY_GRAPH_DEPTH
+            );
+        }
+        if search.memory_nodes > search::MAX_MEMORY_GRAPH_NODE_LIMIT {
+            bail!(
+                "search.memory_nodes must be at most {}",
+                search::MAX_MEMORY_GRAPH_NODE_LIMIT
+            );
+        }
 
         let provider = normalize_provider(resolver.optional_string(
             "embedding.provider",
@@ -745,6 +785,9 @@ impl RuntimeConfig {
             batch: resolver.usize("embedding.batch", raw.embedding.batch, None, 64)?,
             origins: embed_origins,
         };
+        validate_optional_nonempty("embedding.model", embedding.model.as_deref())?;
+        validate_optional_nonempty("embedding.revision", embedding.revision.as_deref())?;
+        validate_optional_nonempty("embedding.api_key_env", embedding.api_key_env.as_deref())?;
 
         let inference_host = resolver.string(
             "inference.host",
@@ -752,6 +795,7 @@ impl RuntimeConfig {
             Some("JSCOUT_INFERENCE_HOST"),
             "127.0.0.1",
         );
+        validate_nonempty("inference.host", &inference_host)?;
         let inference_port = resolve_port(&mut resolver, raw.inference.port)?;
         let derived_url = client_url(&inference_host, inference_port);
         let inference_url = resolver.string(
@@ -783,19 +827,23 @@ impl RuntimeConfig {
             Some("JSCOUT_INFERENCE_ALLOW_REMOTE"),
             false,
         )?;
-        if !inference_allow_remote
+        if resolver.sources["inference.host"] == ValueSource::Config
+            && !inference_allow_remote
             && !matches!(inference_host.as_str(), "127.0.0.1" | "localhost" | "::1")
         {
             bail!(
                 "inference.host is non-loopback; set inference.allow_remote = true only on a trusted network"
             );
         }
+        let inference_uv =
+            resolver.string("inference.uv", raw.inference.uv, Some("JSCOUT_UV"), "uv");
+        validate_nonempty("inference.uv", &inference_uv)?;
         let inference = InferenceSettings {
             url: inference_url,
             host: inference_host,
             port: inference_port,
             project: inference_project,
-            uv: resolver.string("inference.uv", raw.inference.uv, Some("JSCOUT_UV"), "uv"),
+            uv: inference_uv,
             allow_remote: inference_allow_remote,
             batch_size: resolver.usize(
                 "inference.batch_size",
@@ -815,6 +863,19 @@ impl RuntimeConfig {
         let reranker_url =
             resolver.optional_string("reranker.url", raw.reranker.url, Some("JSCOUT_RERANK_URL"));
         validate_optional_endpoint("reranker.url", reranker_url.as_deref())?;
+        let mut reranker_top = resolver.usize(
+            "reranker.top",
+            raw.reranker.top,
+            Some("JSCOUT_RERANK_TOP"),
+            50,
+        )?;
+        if reranker_top > 100 {
+            if resolver.sources["reranker.top"] == ValueSource::Config {
+                bail!("reranker.top must be at most 100");
+            }
+            // Preserve the legacy environment surface's historical clamp.
+            reranker_top = 100;
+        }
         let reranker = RerankerSettings {
             url: reranker_url,
             model: resolver.string(
@@ -828,14 +889,7 @@ impl RuntimeConfig {
                 raw.reranker.revision,
                 Some("JSCOUT_RERANK_REVISION"),
             ),
-            top: resolver
-                .usize(
-                    "reranker.top",
-                    raw.reranker.top,
-                    Some("JSCOUT_RERANK_TOP"),
-                    50,
-                )?
-                .min(100),
+            top: reranker_top,
             max_chars: resolver.usize(
                 "reranker.max_chars",
                 raw.reranker.max_chars,
@@ -843,6 +897,8 @@ impl RuntimeConfig {
                 4000,
             )?,
         };
+        validate_nonempty("reranker.model", &reranker.model)?;
+        validate_optional_nonempty("reranker.revision", reranker.revision.as_deref())?;
 
         let openai_base_url = resolver.optional_string(
             "llm.openai_base_url",
@@ -880,20 +936,25 @@ impl RuntimeConfig {
             auth_file: resolve_path(root.as_deref(), &auth_file_text, true)?,
             openai_compatible_providers: compatible_providers,
         };
+        validate_nonempty("llm.model", &llm.model)?;
+        validate_optional_nonempty("llm.reasoning", llm.reasoning.as_deref())?;
+        validate_nonempty("llm.api_key_env", &llm.api_key_env)?;
 
         let gateway = resolver
-            .optional_string(
+            .optional_string_with_internal(
                 "sidecars.gateway",
                 raw.sidecars.gateway,
-                Some("JSCOUT_PI_AI_GATEWAY"),
+                "JSCOUT_PI_AI_GATEWAY",
+                "JSCOUT_BUNDLED_GATEWAY",
             )
             .map(|value| resolve_path(root.as_deref(), &value, true))
             .transpose()?;
         let checker = resolver
-            .optional_string(
+            .optional_string_with_internal(
                 "sidecars.checker",
                 raw.sidecars.checker,
-                Some("JSCOUT_CHECKER_SIDECAR"),
+                "JSCOUT_CHECKER_SIDECAR",
+                "JSCOUT_BUNDLED_CHECKER",
             )
             .map(|value| resolve_path(root.as_deref(), &value, true))
             .transpose()?;
@@ -909,6 +970,7 @@ impl RuntimeConfig {
             gateway,
             checker,
         };
+        validate_nonempty("sidecars.node", &sidecars.node)?;
 
         let profile = resolver.string("mcp.profile", raw.mcp.profile, None, "structural");
         if !matches!(profile.as_str(), "baseline" | "structural") {
@@ -958,6 +1020,7 @@ impl RuntimeConfig {
                 Vec::new(),
             ),
         };
+        validate_string_list("index.dependencies", &index.dependencies)?;
         let watch_dependencies =
             resolver.configured_or("watch.dependencies", raw.watch.dependencies, Vec::new());
         let watch = WatchSettings {
@@ -977,10 +1040,11 @@ impl RuntimeConfig {
                 600,
             ),
         };
+        validate_string_list("watch.dependencies", &watch.dependencies)?;
         if watch.product && !watch.embed {
             bail!("watch.product requires watch.embed = true");
         }
-        if watch.enrich && watch.enrich_timeout_seconds == 0 {
+        if watch.enrich_timeout_seconds == 0 {
             bail!("watch.enrich_timeout_seconds must be greater than zero");
         }
         if watch.debounce_ms == 0 {
@@ -1058,7 +1122,7 @@ impl RuntimeConfig {
                 self.effective.search.response_bytes
             ),
             format!(
-                "embedding: provider={} model={}",
+                "embedding: provider={} model={} endpoint={}",
                 self.effective
                     .embedding
                     .provider
@@ -1068,7 +1132,21 @@ impl RuntimeConfig {
                     .embedding
                     .model
                     .as_deref()
-                    .unwrap_or("<none>")
+                    .unwrap_or("<none>"),
+                self.effective.embedding.url.as_deref().unwrap_or(
+                    match self.effective.embedding.provider.as_deref() {
+                        Some("local") => self.effective.inference.url.as_str(),
+                        Some(_) => "<provider default>",
+                        None => "<none>",
+                    }
+                )
+            ),
+            format!(
+                "inference: client={} bind={}:{} allow_remote={}",
+                self.effective.inference.url,
+                self.effective.inference.host,
+                self.effective.inference.port,
+                self.effective.inference.allow_remote,
             ),
             format!(
                 "reranker: endpoint={} model={}",
@@ -1101,6 +1179,12 @@ impl RuntimeConfig {
                 self.effective.mcp.source_view,
                 display_optional_path(self.effective.telemetry.file.as_deref()),
                 display_optional_path(self.effective.telemetry.request_log.as_deref())
+            ),
+            format!(
+                "sidecars: node={} gateway={} checker={}",
+                self.effective.sidecars.node,
+                display_optional_path(self.effective.sidecars.gateway.as_deref()),
+                display_optional_path(self.effective.sidecars.checker.as_deref()),
             ),
             "sources:".to_string(),
         ];
@@ -1177,6 +1261,31 @@ fn positive(name: &str, value: usize) -> Result<usize> {
         bail!("{name} must be greater than zero");
     }
     Ok(value)
+}
+
+fn validate_nonempty(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{name} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_optional_nonempty(name: &str, value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        validate_nonempty(name, value)?;
+    }
+    Ok(())
+}
+
+fn validate_string_list(name: &str, values: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        validate_nonempty(name, value)?;
+        if !unique.insert(value) {
+            bail!("{name} contains duplicate value `{value}`");
+        }
+    }
+    Ok(())
 }
 
 fn resolve_port(resolver: &mut Resolver, configured: Option<u16>) -> Result<u16> {
@@ -1502,6 +1611,26 @@ file = "logs/mcp.jsonl"
                 .to_string()
                 .contains("inference.allow_remote")
         );
+
+        for (text, expected) in [
+            (
+                "version = 1\n[search]\nmemory_depth = 9\n",
+                "search.memory_depth",
+            ),
+            ("version = 1\n[reranker]\ntop = 101\n", "reranker.top"),
+            (
+                "version = 1\n[watch]\nenrich_timeout_seconds = 0\n",
+                "watch.enrich_timeout_seconds",
+            ),
+        ] {
+            write_config(root.path(), text)?;
+            assert!(
+                RuntimeConfig::load(Some(root.path()), None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
         Ok(())
     }
 

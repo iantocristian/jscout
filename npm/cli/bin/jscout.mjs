@@ -93,14 +93,25 @@ if (!fs.existsSync(binary)) {
   fail(`${platformPackage} is installed but contains no binary at ${binary}`);
 }
 
-// Sidecar overrides. An explicit value from the caller always wins.
+// Bundled sidecar discovery transport. Repository config and the documented
+// legacy override variables remain authoritative in the Rust process.
 const env = { ...process.env };
 const sidecars = [
-  ["JSCOUT_PI_AI_GATEWAY", path.join(packageRoot, "gateway", "src", "main.mjs")],
-  ["JSCOUT_CHECKER_SIDECAR", path.join(packageRoot, "checker", "src", "main.mjs")],
+  [
+    "JSCOUT_PI_AI_GATEWAY",
+    "JSCOUT_BUNDLED_GATEWAY",
+    path.join(packageRoot, "gateway", "src", "main.mjs"),
+  ],
+  [
+    "JSCOUT_CHECKER_SIDECAR",
+    "JSCOUT_BUNDLED_CHECKER",
+    path.join(packageRoot, "checker", "src", "main.mjs"),
+  ],
 ];
-for (const [variable, entry] of sidecars) {
-  if (!env[variable]?.trim() && fs.existsSync(entry)) env[variable] = entry;
+for (const [override, bundled, entry] of sidecars) {
+  if (!env[override]?.trim() && !env[bundled]?.trim() && fs.existsSync(entry)) {
+    env[bundled] = entry;
+  }
 }
 
 const child = spawn(binary, process.argv.slice(2), { stdio: "inherit", env });

@@ -1417,6 +1417,23 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             } else {
                 dependencies
             };
+            let enrich_timeout = enrich_timeout.unwrap_or(configured.enrich_timeout_seconds);
+            let debounce_ms = debounce_ms.unwrap_or(configured.debounce_ms);
+            let reconcile_seconds = reconcile_seconds.unwrap_or(configured.reconcile_seconds);
+            if product && !embed {
+                anyhow::bail!(
+                    "product-only watched embedding requires embedding; enable --embed or disable product-only mode"
+                );
+            }
+            if enrich_timeout == 0 {
+                anyhow::bail!("watch enrichment timeout must be greater than zero");
+            }
+            if debounce_ms == 0 {
+                anyhow::bail!("watch debounce must be greater than zero");
+            }
+            if reconcile_seconds != 0 && reconcile_seconds.saturating_mul(1_000) <= debounce_ms {
+                anyhow::bail!("watch reconciliation must exceed debounce or be zero");
+            }
             let provider = if embed {
                 embed::Provider::from_settings(
                     &runtime.effective.embedding,
@@ -1434,9 +1451,7 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     embed_product_only: product,
                     dependencies: &dependencies,
                     enrich_on_change: enrich,
-                    enrich_timeout: std::time::Duration::from_secs(
-                        enrich_timeout.unwrap_or(configured.enrich_timeout_seconds),
-                    ),
+                    enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
                     checker_sidecar: sidecar_path.as_deref().or(runtime
                         .effective
                         .sidecars
@@ -1445,12 +1460,8 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     checker_node: &runtime.effective.sidecars.node,
                     timing: runtime.effective.diagnostics.timing,
                     debug: runtime.effective.diagnostics.debug,
-                    debounce: std::time::Duration::from_millis(
-                        debounce_ms.unwrap_or(configured.debounce_ms),
-                    ),
-                    reconcile_interval: std::time::Duration::from_secs(
-                        reconcile_seconds.unwrap_or(configured.reconcile_seconds),
-                    ),
+                    debounce: std::time::Duration::from_millis(debounce_ms),
+                    reconcile_interval: std::time::Duration::from_secs(reconcile_seconds),
                 },
             )
         }
