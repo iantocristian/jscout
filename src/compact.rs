@@ -169,7 +169,7 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
             value.insert("anchor".into(), json!(hit.file_anchor));
         }
     }
-    if hit.include_followups && hit.anchors.len() <= 1 {
+    if hit.anchors.len() <= 1 {
         let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
         value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
@@ -203,8 +203,21 @@ fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
         if let Some(origins) = origins {
             arguments.insert("origins".into(), json!(origins));
         }
-        json!({ "tools": tools, "arguments": arguments })
+        let mut followups = Map::new();
+        followups.insert("tools".into(), json!(tools));
+        if hit.include_followups {
+            followups.insert("arguments".into(), Value::Object(arguments));
+        }
+        Value::Object(followups)
     } else {
+        let tools = if hit.include_neighborhood_followup {
+            vec!["file_outline", "neighborhood"]
+        } else {
+            vec!["file_outline"]
+        };
+        if !hit.include_followups {
+            return json!({ "tools": tools });
+        }
         let mut outline_arguments = Map::new();
         outline_arguments.insert("path".into(), json!(hit.file));
         if let Some(origins) = &origins {
@@ -244,7 +257,7 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
             ("supports", budget.omitted_semantic_supports),
             ("nodes", budget.omitted_nodes),
             ("edges", budget.omitted_edges),
-            ("followups", budget.omitted_followups),
+            ("followup_arguments", budget.omitted_followups),
             ("snippets", budget.truncated_snippets),
         ] {
             if count > 0 {

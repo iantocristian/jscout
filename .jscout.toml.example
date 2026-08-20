@@ -9,7 +9,7 @@ path = ".jscout.db"
 [search]
 vector = true
 rerank = true
-attach_memory = true
+attach_memory = false
 limit = 10
 response_bytes = 24000
 file_roles = []

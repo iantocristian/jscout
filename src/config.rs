@@ -74,7 +74,7 @@ impl Default for SearchSettings {
         Self {
             vector: true,
             rerank: true,
-            attach_memory: true,
+            attach_memory: false,
             limit: search::DEFAULT_RESULT_LIMIT,
             response_bytes: search::DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
@@ -625,7 +625,7 @@ impl RuntimeConfig {
                 "search.attach_memory",
                 raw.search.attach_memory,
                 None,
-                true,
+                false,
             )?,
             limit: resolver.usize(
                 "search.limit",
@@ -1530,7 +1530,7 @@ mod tests {
         );
         assert!(config.effective.search.vector);
         assert!(config.effective.search.rerank);
-        assert!(config.effective.search.attach_memory);
+        assert!(!config.effective.search.attach_memory);
         assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
         Ok(())
     }

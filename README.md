@@ -701,7 +701,8 @@ Current artifacts are the default; an exact historical id reports
 `current: false` and its `superseded_by` successor. The default complete response
 budget remains 24 KB.
 
-`semantic_search` attaches only compact, evidence-connected memory previews:
+`semantic_search` attaches compact, evidence-connected memory previews only
+when requested with `--memory` (MCP: `include_memory=true`):
 artifact identity, a short purpose/overview/description/claim, freshness,
 retrieval signals, and one evidence locator. An artifact is eligible only when
 its support is in a returned hit or enclosing file, within the bounded
@@ -722,7 +723,8 @@ the follow-up tool remain visible when memory exists even if the query has no
 lexical matches; the envelope also survives when the byte budget removes every
 selected preview.
 
-Compact code hits include copy-safe follow-up arguments. Symbol anchors and
+Compact code hits advertise compatible follow-up tools. Only the highest-ranked
+eligible hit includes complete copy-safe arguments by default. Symbol anchors and
 their snapshot can be passed unchanged to `definition`, `who_uses`, or
 `neighborhood`; file-only hits expose only `file_outline` and `neighborhood`.
 Exact `definition`/`who_uses` anchor mode is mutually exclusive with their

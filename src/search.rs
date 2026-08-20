@@ -91,7 +91,7 @@ impl Default for SearchOptions {
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
             file_origins: origin::defaults(),
-            include_memory: true,
+            include_memory: false,
             memory_limit: 4,
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
             memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
@@ -250,8 +250,9 @@ pub struct Hit {
     pub uses: Vec<String>,
     /// Symbols declared here that other files use, with usage counts.
     pub used_by: Vec<String>,
-    /// Compact transport may shed copy-safe follow-up arguments from lower
-    /// ranked hits before dropping the hit itself.
+    /// Whether this hit retains the one complete copy-safe argument object.
+    /// Every uniquely anchored compact hit still advertises compatible tools.
+    /// The response budget may shed these arguments before dropping the hit.
     #[serde(skip)]
     pub include_followups: bool,
     #[serde(skip)]
@@ -1425,6 +1426,9 @@ fn ranked_hits(
             }
         }
     }
+    if let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1) {
+        hit.include_followups = true;
+    }
     Ok((hits, retrieval))
 }
 
@@ -1682,7 +1686,7 @@ fn load_hit(
         file_anchor,
         uses,
         used_by,
-        include_followups: true,
+        include_followups: false,
         include_neighborhood_followup: true,
     }))
 }
@@ -2619,6 +2623,28 @@ mod tests {
         assert_eq!(definition.file_anchor, "file:a.ts");
         assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
         assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .filter(|hit| hit.include_followups)
+                .count(),
+            1
+        );
+        let compact = crate::compact::search_value(&result);
+        let compact_hits = compact["hits"].as_array().expect("compact hits");
+        assert_eq!(
+            compact_hits
+                .iter()
+                .filter(|hit| hit["followups"].get("arguments").is_some())
+                .count(),
+            1
+        );
+        assert!(compact_hits.iter().all(|hit| {
+            hit.get("anchors").is_some()
+                || hit["followups"]["tools"].is_array()
+                || hit["followups"]["calls"].is_array()
+        }));
         assert!(result.expansion.is_none());
         Ok(())
     }
@@ -3048,7 +3074,7 @@ mod tests {
             semantic_selected: 0,
             expansion: None,
             response_budget: ResponseBudget {
-                byte_limit: 500,
+                byte_limit: 550,
                 ..Default::default()
             },
         };
@@ -3057,7 +3083,10 @@ mod tests {
         assert_eq!(result.hits.len(), 1);
         assert!(!result.hits[0].include_followups);
         assert_eq!(result.response_budget.omitted_followups, 1);
-        assert!(result.response_budget.rendered_bytes <= 500);
+        let compact = crate::compact::search_value(&result);
+        assert!(compact["hits"][0]["followups"]["tools"].is_array());
+        assert!(compact["hits"][0]["followups"].get("arguments").is_none());
+        assert!(result.response_budget.rendered_bytes <= 550);
         Ok(())
     }
 
