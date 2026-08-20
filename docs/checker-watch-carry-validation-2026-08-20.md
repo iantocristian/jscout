@@ -59,6 +59,28 @@ The comparison was stricter than the planned “modulo re-enriched projects”
 check: semantic rows from every project, including the project deliberately
 rechecked in each arm, were equal.
 
+## Independent adversarial follow-up
+
+An independent review at `3f95f01` repeated the three corpus comparisons with
+a separately written bidirectional `EXCEPT` query and found zero rows in both
+directions. It then exercised three additional n8n invalidation cases, each
+against a fresh carry-free equality arm:
+
+- Editing a shared configuration two hops up an `extends` chain carried 17/19
+  projects and rechecked exactly the two transitively affected projects. Both
+  arms published 102 facts with zero canonical difference.
+- Adding a TypeScript file matching two projects' membership globs carried
+  17/19 projects and rechecked both owners. The new occurrence produced its
+  expected typed fact; both arms published 104 facts with zero difference.
+- Deleting a project configuration removed that project from the plan and
+  published no orphaned facts. Its former files moved to inferred ownership
+  and were excluded by the default inferred-project gate; both arms published
+  100 facts with zero difference.
+
+These are correctness probes, not additional timing samples. They establish
+that configuration-chain changes, membership changes, and project removal
+invalidate the intended project set without widening the recheck.
+
 ## Performance defect found during measurement
 
 The first Next.js carry attempt took 307.879 seconds despite carrying 148/149
@@ -73,10 +95,11 @@ still prevents the owning project from carrying.
 
 ## Scope and limitations
 
-- The source edit was deliberately content-only. Config-chain, membership,
-  target-content, shared-owner, external-input, rowid-rebinding, dirty-order,
-  and daily-flush invalidation paths are covered by focused tests rather than
-  by this three-corpus timing run.
+- The timed source edit was deliberately content-only. Configuration-chain,
+  membership, and project-removal behavior received the independent corpus
+  probes above; target-content, shared-owner, external-input, rowid-rebinding,
+  dirty-order, and daily-flush invalidation paths are covered by focused tests
+  rather than by the three-corpus timing run.
 - The temporary filesystem did not deliver the first live Next.js file event
   to the running watcher. The measurements therefore use watcher startup over
   an edited checkout. This exercises the same changed-snapshot carry planner,
