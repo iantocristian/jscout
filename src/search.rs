@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
@@ -5,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::{embed, file_role, origin, query, semantic, store, structural};
 
-type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
+pub(crate) type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
@@ -14,11 +15,39 @@ pub const DEFAULT_MEMORY_GRAPH_NODE_LIMIT: usize = 2_000;
 pub const MAX_MEMORY_GRAPH_DEPTH: usize = 8;
 pub const MAX_MEMORY_GRAPH_NODE_LIMIT: usize = 20_000;
 const DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT: usize = 8;
+pub const DEFAULT_EXPANSION_PATH_LIMIT: usize = 8;
+pub const MAX_EXPANSION_PATH_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpansionProjection {
+    Paths,
+    Neighborhood,
+}
+
+impl ExpansionProjection {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "paths" => Ok(Self::Paths),
+            "neighborhood" => Ok(Self::Neighborhood),
+            _ => anyhow::bail!("expansion projection must be one of: paths, neighborhood"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paths => "paths",
+            Self::Neighborhood => "neighborhood",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExpansionOptions {
+    pub projection: ExpansionProjection,
     pub depth: usize,
     pub seed_limit: usize,
+    pub path_limit: usize,
     pub node_limit: usize,
     pub edge_limit: usize,
     pub byte_limit: usize,
@@ -32,8 +61,10 @@ pub struct ExpansionOptions {
 impl Default for ExpansionOptions {
     fn default() -> Self {
         Self {
+            projection: ExpansionProjection::Paths,
             depth: 1,
             seed_limit: 3,
+            path_limit: DEFAULT_EXPANSION_PATH_LIMIT,
             node_limit: 40,
             edge_limit: 120,
             byte_limit: 24_000,
@@ -231,9 +262,24 @@ impl SearchSectionBytes {
 
 #[derive(Debug, serde::Serialize)]
 pub struct SearchExpansion {
+    pub projection: ExpansionProjection,
     pub seeds: Vec<String>,
     pub nodes: Vec<structural::GraphNode>,
     pub edges: Vec<structural::GraphEdge>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub candidate_paths: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub selected_paths: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_paths: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_nodes: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted_edges: usize,
+    /// Accepted path edge sets used to keep path omission accounting accurate
+    /// if the outer whole-response budget later sheds graph edges.
+    #[serde(skip)]
+    pub(crate) selected_path_edges: Vec<Vec<EdgeIdentity>>,
     pub node_limit: usize,
     pub edge_limit: usize,
     pub byte_limit: usize,
@@ -241,6 +287,10 @@ pub struct SearchExpansion {
     pub file_origins: Vec<String>,
     pub payload_bytes: usize,
     pub truncated: bool,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1789,8 +1839,12 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             // node-first shedding produced relationship-free context packs.
             if expansion.edges.pop().is_some() {
                 expansion.truncated = true;
+                expansion.omitted_edges += 1;
                 result.response_budget.omitted_edges += 1;
-                result.response_budget.omitted_nodes += prune_expansion_nodes(expansion);
+                let omitted_nodes = prune_expansion_nodes(expansion);
+                expansion.omitted_nodes += omitted_nodes;
+                result.response_budget.omitted_nodes += omitted_nodes;
+                refresh_expansion_path_counts(expansion);
                 expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
                 continue;
             }
@@ -1801,6 +1855,7 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             {
                 expansion.nodes.remove(index);
                 expansion.truncated = true;
+                expansion.omitted_nodes += 1;
                 result.response_budget.omitted_nodes += 1;
                 expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
                 continue;
@@ -1945,6 +2000,25 @@ fn prune_expansion_nodes(expansion: &mut SearchExpansion) -> usize {
     original - expansion.nodes.len()
 }
 
+fn refresh_expansion_path_counts(expansion: &mut SearchExpansion) {
+    if expansion.projection != ExpansionProjection::Paths {
+        return;
+    }
+    let retained = expansion
+        .edges
+        .iter()
+        .map(edge_identity)
+        .collect::<HashSet<_>>();
+    expansion.selected_paths = expansion
+        .selected_path_edges
+        .iter()
+        .filter(|path| path.iter().all(|edge| retained.contains(edge)))
+        .count();
+    expansion.omitted_paths = expansion
+        .candidate_paths
+        .saturating_sub(expansion.selected_paths);
+}
+
 fn settle_rendered_bytes(result: &mut SearchResult, compact: bool) -> Result<usize> {
     for _ in 0..8 {
         let rendered = rendered_bytes(result, compact)?;
@@ -2079,11 +2153,17 @@ fn expand_hits(
     compact: bool,
 ) -> Result<SearchExpansion> {
     if options.seed_limit == 0
+        || options.path_limit == 0
         || options.node_limit == 0
         || options.edge_limit == 0
         || options.byte_limit == 0
     {
-        anyhow::bail!("expansion seed, node, edge, and byte limits must be greater than zero");
+        anyhow::bail!(
+            "expansion seed, path, node, edge, and byte limits must be greater than zero"
+        );
+    }
+    if options.path_limit > MAX_EXPANSION_PATH_LIMIT {
+        anyhow::bail!("expansion path limit must be at most {MAX_EXPANSION_PATH_LIMIT}");
     }
 
     let mut seeds = Vec::new();
@@ -2181,33 +2261,68 @@ fn expand_hits(
         })
     });
 
+    let candidate_node_count = ranked_nodes.len();
+    let candidate_edge_count = ranked_edges.len();
+    let selection = match options.projection {
+        ExpansionProjection::Paths => {
+            select_path_projection(&seeds, &ranked_nodes, &ranked_edges, options, compact)?
+        }
+        ExpansionProjection::Neighborhood => {
+            select_neighborhood_projection(&seeds, &ranked_nodes, &ranked_edges, options, compact)?
+        }
+    };
+    let nodes = selection.nodes;
+    let edges = selection.edges;
+    let omitted_nodes = candidate_node_count.saturating_sub(nodes.len());
+    let omitted_edges = candidate_edge_count.saturating_sub(edges.len());
+    truncated |= selection.truncated || omitted_nodes > 0 || omitted_edges > 0;
+    let payload_bytes = expansion_parts_bytes(&nodes, &edges, &seeds, compact)?;
+    Ok(SearchExpansion {
+        projection: options.projection,
+        seeds,
+        nodes,
+        edges,
+        candidate_paths: selection.candidate_paths,
+        selected_paths: selection.selected_paths,
+        omitted_paths: selection
+            .candidate_paths
+            .saturating_sub(selection.selected_paths),
+        omitted_nodes,
+        omitted_edges,
+        selected_path_edges: selection.selected_path_edges,
+        node_limit: options.node_limit,
+        edge_limit: options.edge_limit,
+        byte_limit: options.byte_limit,
+        file_roles: options.file_roles.clone(),
+        file_origins: options.file_origins.clone(),
+        payload_bytes,
+        truncated,
+    })
+}
+
+struct ExpansionSelection {
+    nodes: Vec<structural::GraphNode>,
+    edges: Vec<structural::GraphEdge>,
+    candidate_paths: usize,
+    selected_paths: usize,
+    selected_path_edges: Vec<Vec<EdgeIdentity>>,
+    truncated: bool,
+}
+
+fn select_neighborhood_projection(
+    seeds: &[String],
+    ranked_nodes: &[structural::GraphNode],
+    ranked_edges: &[structural::GraphEdge],
+    options: &ExpansionOptions,
+    compact: bool,
+) -> Result<ExpansionSelection> {
     let nodes_by_key = ranked_nodes
         .iter()
         .map(|node| (node.key.clone(), node.clone()))
         .collect::<HashMap<_, _>>();
-    let mut nodes = Vec::new();
-    let mut selected_node_keys = HashSet::new();
+    let (mut nodes, mut selected_node_keys, mut truncated) =
+        select_expansion_seeds(seeds, &nodes_by_key, options, compact)?;
     let mut edges = Vec::new();
-
-    // Seeds are the required definitions for interpreting an expansion. Add
-    // them first, then admit relations atomically with both endpoints. The old
-    // nodes-first loop could exhaust the byte budget before a single edge.
-    for seed in &seeds {
-        let Some(node) = nodes_by_key.get(seed) else {
-            continue;
-        };
-        let mut candidate_nodes = nodes.clone();
-        candidate_nodes.push(node.clone());
-        if candidate_nodes.len() <= options.node_limit
-            && expansion_parts_bytes(&candidate_nodes, &edges, &seeds, compact)?
-                <= options.byte_limit
-        {
-            selected_node_keys.insert(seed.clone());
-            nodes = candidate_nodes;
-        } else {
-            truncated = true;
-        }
-    }
 
     for edge in ranked_edges {
         if edges.len() >= options.edge_limit {
@@ -2233,8 +2348,8 @@ fn expand_hits(
             continue;
         }
         let mut candidate_edges = edges.clone();
-        candidate_edges.push(edge);
-        if expansion_parts_bytes(&candidate_nodes, &candidate_edges, &seeds, compact)?
+        candidate_edges.push(edge.clone());
+        if expansion_parts_bytes(&candidate_nodes, &candidate_edges, seeds, compact)?
             > options.byte_limit
         {
             truncated = true;
@@ -2245,8 +2360,7 @@ fn expand_hits(
         edges = candidate_edges;
     }
 
-    // Use remaining space for high-relevance standalone definitions without
-    // sacrificing any already-admitted relation.
+    // Diagnostic neighborhood mode retains high-relevance standalone nodes.
     for node in ranked_nodes {
         if selected_node_keys.contains(&node.key) {
             continue;
@@ -2254,7 +2368,7 @@ fn expand_hits(
         let mut candidate_nodes = nodes.clone();
         candidate_nodes.push(node.clone());
         if candidate_nodes.len() <= options.node_limit
-            && expansion_parts_bytes(&candidate_nodes, &edges, &seeds, compact)?
+            && expansion_parts_bytes(&candidate_nodes, &edges, seeds, compact)?
                 <= options.byte_limit
         {
             selected_node_keys.insert(node.key.clone());
@@ -2263,19 +2377,309 @@ fn expand_hits(
             truncated = true;
         }
     }
-    let payload_bytes = expansion_parts_bytes(&nodes, &edges, &seeds, compact)?;
-    Ok(SearchExpansion {
-        seeds,
+    Ok(ExpansionSelection {
         nodes,
         edges,
-        node_limit: options.node_limit,
-        edge_limit: options.edge_limit,
-        byte_limit: options.byte_limit,
-        file_roles: options.file_roles.clone(),
-        file_origins: options.file_origins.clone(),
-        payload_bytes,
+        candidate_paths: 0,
+        selected_paths: 0,
+        selected_path_edges: Vec::new(),
         truncated,
     })
+}
+
+#[derive(Clone)]
+struct PathReach {
+    root: String,
+    score: f64,
+    depth: usize,
+    parent: Option<(String, EdgeIdentity)>,
+}
+
+struct RankedExpansionPath {
+    key: String,
+    edges: Vec<EdgeIdentity>,
+    priority: u8,
+    score: f64,
+    depth: usize,
+}
+
+fn select_path_projection(
+    seeds: &[String],
+    ranked_nodes: &[structural::GraphNode],
+    ranked_edges: &[structural::GraphEdge],
+    options: &ExpansionOptions,
+    compact: bool,
+) -> Result<ExpansionSelection> {
+    let nodes_by_key = ranked_nodes
+        .iter()
+        .map(|node| (node.key.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let edges_by_key = ranked_edges
+        .iter()
+        .map(|edge| (edge_identity(edge), edge.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut adjacency: HashMap<String, Vec<(String, EdgeIdentity)>> = HashMap::new();
+    for edge in ranked_edges {
+        let identity = edge_identity(edge);
+        adjacency
+            .entry(edge.source.clone())
+            .or_default()
+            .push((edge.target.clone(), identity.clone()));
+        adjacency
+            .entry(edge.target.clone())
+            .or_default()
+            .push((edge.source.clone(), identity));
+    }
+    for neighbors in adjacency.values_mut() {
+        neighbors.sort_by(|(left_node, left_edge), (right_node, right_edge)| {
+            let left = edges_by_key.get(left_edge).expect("path edge");
+            let right = edges_by_key.get(right_edge).expect("path edge");
+            right
+                .relevance
+                .total_cmp(&left.relevance)
+                .then_with(|| left_node.cmp(right_node))
+                .then_with(|| left_edge.cmp(right_edge))
+        });
+    }
+
+    // Multi-source maximum-bottleneck traversal. Every reached node keeps one
+    // deterministic predecessor, producing a bounded forest instead of the
+    // complete induced neighborhood.
+    let seed_keys = seeds.iter().cloned().collect::<HashSet<_>>();
+    let mut reach = seeds
+        .iter()
+        .filter(|seed| nodes_by_key.contains_key(*seed))
+        .map(|seed| {
+            (
+                seed.clone(),
+                PathReach {
+                    root: seed.clone(),
+                    score: 1.0,
+                    depth: 0,
+                    parent: None,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut settled = HashSet::new();
+    loop {
+        let next = reach
+            .iter()
+            .filter(|(key, _)| !settled.contains(*key))
+            .max_by(|(left_key, left), (right_key, right)| {
+                compare_path_reach(left_key, left, right_key, right)
+            })
+            .map(|(key, state)| (key.clone(), state.clone()));
+        let Some((key, state)) = next else { break };
+        settled.insert(key.clone());
+        if state.depth >= options.depth {
+            continue;
+        }
+        for (other, identity) in adjacency.get(&key).into_iter().flatten() {
+            if settled.contains(other) || seed_keys.contains(other) {
+                continue;
+            }
+            let edge = edges_by_key.get(identity).expect("path edge");
+            let candidate = PathReach {
+                root: state.root.clone(),
+                score: state.score.min(edge.relevance),
+                depth: state.depth + 1,
+                parent: Some((key.clone(), identity.clone())),
+            };
+            let replace = reach
+                .get(other)
+                .is_none_or(|current| path_reach_is_stronger(other, &candidate, current));
+            if replace {
+                reach.insert(other.clone(), candidate);
+            }
+        }
+    }
+
+    let mut child_counts: HashMap<String, usize> = HashMap::new();
+    for state in reach.values() {
+        if let Some((parent, _)) = &state.parent {
+            *child_counts.entry(parent.clone()).or_default() += 1;
+        }
+    }
+    let mut paths = reach
+        .iter()
+        .filter_map(|(key, state)| {
+            let node = nodes_by_key.get(key)?;
+            if state.depth == 0 {
+                return None;
+            }
+            let root = nodes_by_key.get(&state.root)?;
+            let boundary = node.kind != "symbol";
+            let cross_file = node.file != root.file;
+            let direct = state.depth == 1;
+            let leaf = child_counts.get(key).copied().unwrap_or(0) == 0;
+            (boundary || cross_file || direct || leaf).then_some(RankedExpansionPath {
+                key: key.clone(),
+                edges: predecessor_path(key, &reach),
+                priority: if boundary || cross_file {
+                    0
+                } else if direct {
+                    1
+                } else {
+                    2
+                },
+                score: state.score,
+                depth: state.depth,
+            })
+        })
+        .collect::<Vec<_>>();
+    // A direct relation between two returned seeds is itself a useful path.
+    // Multi-source traversal keeps both seeds as roots, so admit these edges
+    // explicitly instead of silently dropping root-to-root relationships.
+    paths.extend(
+        ranked_edges
+            .iter()
+            .filter(|edge| seed_keys.contains(&edge.source) && seed_keys.contains(&edge.target))
+            .map(|edge| RankedExpansionPath {
+                key: format!("{}>{}:{}", edge.source, edge.target, edge.kind),
+                edges: vec![edge_identity(edge)],
+                priority: 0,
+                score: edge.relevance,
+                depth: 1,
+            }),
+    );
+    paths.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| right.depth.cmp(&left.depth))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+
+    let candidate_paths = paths.len();
+    let (mut nodes, mut selected_node_keys, mut truncated) =
+        select_expansion_seeds(seeds, &nodes_by_key, options, compact)?;
+    let mut edges = Vec::new();
+    let mut selected_edge_keys = HashSet::new();
+    let mut selected_paths = 0;
+    let mut selected_path_edges = Vec::new();
+    for path in paths {
+        if selected_paths >= options.path_limit {
+            truncated = true;
+            break;
+        }
+        let mut candidate_nodes = nodes.clone();
+        let mut candidate_node_keys = selected_node_keys.clone();
+        let mut candidate_edges = edges.clone();
+        let mut candidate_edge_keys = selected_edge_keys.clone();
+        let mut complete = true;
+        let path_edges = path.edges;
+        for identity in &path_edges {
+            let Some(edge) = edges_by_key.get(identity) else {
+                complete = false;
+                break;
+            };
+            for key in [&edge.source, &edge.target] {
+                if candidate_node_keys.insert(key.clone()) {
+                    let Some(node) = nodes_by_key.get(key) else {
+                        complete = false;
+                        break;
+                    };
+                    candidate_nodes.push(node.clone());
+                }
+            }
+            if !complete {
+                break;
+            }
+            if candidate_edge_keys.insert(identity.clone()) {
+                candidate_edges.push(edge.clone());
+            }
+        }
+        if !complete
+            || candidate_nodes.len() > options.node_limit
+            || candidate_edges.len() > options.edge_limit
+            || expansion_parts_bytes(&candidate_nodes, &candidate_edges, seeds, compact)?
+                > options.byte_limit
+        {
+            truncated = true;
+            continue;
+        }
+        nodes = candidate_nodes;
+        selected_node_keys = candidate_node_keys;
+        edges = candidate_edges;
+        selected_edge_keys = candidate_edge_keys;
+        selected_paths += 1;
+        selected_path_edges.push(path_edges);
+    }
+
+    Ok(ExpansionSelection {
+        nodes,
+        edges,
+        candidate_paths,
+        selected_paths,
+        selected_path_edges,
+        truncated: truncated || selected_paths < candidate_paths,
+    })
+}
+
+fn select_expansion_seeds(
+    seeds: &[String],
+    nodes_by_key: &HashMap<String, structural::GraphNode>,
+    options: &ExpansionOptions,
+    compact: bool,
+) -> Result<(Vec<structural::GraphNode>, HashSet<String>, bool)> {
+    let mut nodes = Vec::new();
+    let mut selected = HashSet::new();
+    let mut truncated = false;
+    for seed in seeds {
+        let Some(node) = nodes_by_key.get(seed) else {
+            continue;
+        };
+        let mut candidate = nodes.clone();
+        candidate.push(node.clone());
+        if candidate.len() <= options.node_limit
+            && expansion_parts_bytes(&candidate, &[], seeds, compact)? <= options.byte_limit
+        {
+            selected.insert(seed.clone());
+            nodes = candidate;
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((nodes, selected, truncated))
+}
+
+fn edge_identity(edge: &structural::GraphEdge) -> EdgeIdentity {
+    (
+        edge.source.clone(),
+        edge.target.clone(),
+        edge.kind.clone(),
+        edge.file.clone(),
+        edge.line,
+    )
+}
+
+fn compare_path_reach(
+    left_key: &str,
+    left: &PathReach,
+    right_key: &str,
+    right: &PathReach,
+) -> Ordering {
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| right.depth.cmp(&left.depth))
+        .then_with(|| right.root.cmp(&left.root))
+        .then_with(|| right_key.cmp(left_key))
+}
+
+fn path_reach_is_stronger(key: &str, candidate: &PathReach, current: &PathReach) -> bool {
+    compare_path_reach(key, candidate, key, current).is_gt()
+}
+
+fn predecessor_path(target: &str, reach: &HashMap<String, PathReach>) -> Vec<EdgeIdentity> {
+    let mut path = Vec::new();
+    let mut cursor = target;
+    while let Some((parent, edge)) = reach.get(cursor).and_then(|state| state.parent.as_ref()) {
+        path.push(edge.clone());
+        cursor = parent;
+    }
+    path.reverse();
+    path
 }
 
 #[cfg(test)]
@@ -2287,13 +2691,14 @@ mod tests {
     use crate::embed;
 
     use super::{
-        DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
-        ExpansionOptions, Hit, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
-        SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
-        apply_response_budget, approximate_name_usage_occurrences, candidate_pool_limits,
-        contains_code_identifier, exact_intent_tokens, merge_reranked_prefix,
-        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
-        select_attached_memory, tiered_candidates,
+        DEFAULT_EXPANSION_PATH_LIMIT, DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
+        DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit, MatchReason,
+        Reranker, ResponseBudget, RetrievalStatus, SearchExpansion, SearchOptions, SearchResult,
+        apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
+        candidate_pool_limits, contains_code_identifier, exact_intent_tokens,
+        merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
+        search, select_attached_memory, select_neighborhood_projection, select_path_projection,
+        tiered_candidates,
     };
     use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
     use crate::{
@@ -2742,8 +3147,10 @@ mod tests {
                 include_neighborhood_followups: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
                 expansion: ExpansionOptions {
+                    projection: ExpansionProjection::Paths,
                     depth: 1,
                     seed_limit: 3,
+                    path_limit: DEFAULT_EXPANSION_PATH_LIMIT,
                     node_limit: 2,
                     edge_limit: 1,
                     byte_limit: 1_500,
@@ -2797,6 +3204,76 @@ mod tests {
         assert!(byte_starved.edges.is_empty());
         assert!(byte_starved.payload_bytes <= 1);
         assert!(byte_starved.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn path_projection_prioritizes_cross_file_continuations_and_keeps_the_full_mode() -> Result<()>
+    {
+        let node = |key: &str, file: &str, relevance: f64| GraphNode {
+            key: key.into(),
+            kind: "symbol".into(),
+            display_name: key.into(),
+            file: Some(file.into()),
+            file_role: Some("production".into()),
+            file_origin: Some("repository".into()),
+            line: Some(1),
+            meta: serde_json::json!({}),
+            relevance,
+        };
+        let edge = |source: &str, target: &str, relevance: f64| GraphEdge {
+            source: source.into(),
+            target: target.into(),
+            kind: "call".into(),
+            confidence: "certain".into(),
+            provenance: "parser".into(),
+            file: Some("src/entry.ts".into()),
+            line: Some(1),
+            detail: serde_json::json!({}),
+            relevance,
+        };
+        let nodes = vec![
+            node("root", "src/entry.ts", 1.0),
+            node("noise", "src/entry.ts", 0.95),
+            node("bridge", "src/entry.ts", 0.9),
+            node("effect", "src/effect.ts", 0.8),
+        ];
+        let edges = vec![
+            edge("root", "noise", 0.95),
+            edge("root", "bridge", 0.9),
+            edge("bridge", "effect", 0.8),
+        ];
+        let seeds = vec!["root".to_string()];
+        let options = ExpansionOptions {
+            projection: ExpansionProjection::Paths,
+            depth: 2,
+            seed_limit: 1,
+            path_limit: 1,
+            node_limit: 10,
+            edge_limit: 10,
+            byte_limit: 24_000,
+            min_confidence: "likely".into(),
+            file_roles: vec!["production".into()],
+            file_origins: origin::defaults(),
+        };
+
+        let paths = select_path_projection(&seeds, &nodes, &edges, &options, true)?;
+        assert_eq!(paths.selected_paths, 1);
+        assert_eq!(paths.candidate_paths, 3);
+        assert_eq!(
+            paths
+                .nodes
+                .iter()
+                .map(|node| node.key.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["root", "bridge", "effect"])
+        );
+        assert_eq!(paths.edges.len(), 2);
+        assert!(paths.edges.iter().all(|edge| edge.target != "noise"));
+
+        let neighborhood = select_neighborhood_projection(&seeds, &nodes, &edges, &options, true)?;
+        assert_eq!(neighborhood.nodes.len(), 4);
+        assert_eq!(neighborhood.edges.len(), 3);
         Ok(())
     }
 
@@ -2998,9 +3475,16 @@ mod tests {
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: Some(SearchExpansion {
+                projection: ExpansionProjection::Neighborhood,
                 seeds: vec!["root".into()],
                 nodes: vec![node("root", 1.0), node("high", 0.8), node("low", 0.1)],
                 edges: vec![edge("high", 0.8, 0), edge("low", 0.1, 1_200)],
+                candidate_paths: 0,
+                selected_paths: 0,
+                omitted_paths: 0,
+                omitted_nodes: 0,
+                omitted_edges: 0,
+                selected_path_edges: Vec::new(),
                 node_limit: 3,
                 edge_limit: 2,
                 byte_limit: 10_000,
@@ -3010,7 +3494,7 @@ mod tests {
                 truncated: false,
             }),
             response_budget: ResponseBudget {
-                byte_limit: 2_000,
+                byte_limit: 2_200,
                 ..Default::default()
             },
         };
@@ -3021,7 +3505,7 @@ mod tests {
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
-        assert!(result.response_budget.rendered_bytes <= 2_000);
+        assert!(result.response_budget.rendered_bytes <= 2_200);
         Ok(())
     }
 

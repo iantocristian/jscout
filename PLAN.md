@@ -2264,15 +2264,15 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
-## In progress G20 — session-efficient compact transport
+## In progress G20b — path transport and measured compatibility
 
-G20a implements the correctness and compact-transport portion: cross-origin
+G20a merged in PR #60 and implements the correctness and compact-transport portion: cross-origin
 exact follow-ups, one complete top-hit handoff, opt-in search-attached memory,
 bounded checker receiver display, exact usage labels, compact/body/full artifact
 views, successful-diagnostic gating, and canonical section-byte telemetry.
-Path-shaped expansion, the structured-content compatibility experiment, and
-the registered fixed/staged replays remain G20b work; no aggregate byte claim
-is made before those replays run.
+G20b implements path-shaped expansion first, then runs the structured-content
+compatibility experiment and the registered fixed/staged replays. No aggregate
+byte claim is made before those replays run.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
@@ -2490,6 +2490,15 @@ transition, or effect?" The compact default returns a ranked path forest rooted
 at the selected hit seeds. It retains the edges required to explain each
 cross-file continuation and gives nodes response-local short IDs while keeping
 the exact anchor at its first occurrence.
+
+The repository default is `search.expansion.mode = "paths"`, with eight ranked
+continuation endpoints (`paths = 8`, widenable to 50) under the existing global
+seed/node/edge/byte bounds. Selection is a deterministic multi-source
+maximum-bottleneck forest over the already ranked neighborhood: cross-file and
+non-symbol boundaries lead same-file leaves, while direct relations between
+two search-hit seeds remain first-class paths. This changes only projection;
+confidence and relation weights, hub damping, role penalties, and origin policy
+remain owned by the structural traversal.
 
 The existing induced neighborhood remains an explicit diagnostic mode.
 High-frequency/common calls are suppressed through existing edge-kind weights,

@@ -20,8 +20,10 @@ memory_nodes = 2000
 
 [search.expansion]
 enabled = false
+mode = "paths" # paths (compact default) or neighborhood (diagnostic)
 depth = 1
 seeds = 3
+paths = 8
 nodes = 40
 edges = 120
 bytes = 24000

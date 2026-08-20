@@ -51,8 +51,12 @@ questions, then verify decisive claims in source.
   complete repository investigation.
 - For blast-radius, multi-hop, or workflow questions, use one
   `semantic_search` with `expand=true` and a small depth/budget after initial
-  localization. Read expanded searches and artifact details sequentially;
-  parallelize only small unexpanded searches.
+  localization. The default path projection keeps ranked cross-file
+  continuations and shared prefixes; widen `expand_paths` only when the
+  omitted count says useful routes were capped. Request
+  `expand_mode=neighborhood` only for diagnostic fan-out. Read expanded
+  searches and artifact details sequentially; parallelize only small
+  unexpanded searches.
 - Use `definition` for exact source and `who_uses` for direct callers/usages.
   Every uniquely anchored hit advertises compatible follow-up tools. Only the
   highest-ranked eligible hit carries complete arguments by default; copy that

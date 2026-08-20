@@ -181,9 +181,15 @@ enum Command {
         /// Structural expansion depth
         #[arg(long)]
         expand_depth: Option<usize>,
+        /// Expansion projection: compact paths or diagnostic neighborhood
+        #[arg(long, value_parser = ["paths", "neighborhood"])]
+        expand_mode: Option<String>,
         /// Maximum search-hit anchors used as expansion seeds
         #[arg(long)]
         expand_seeds: Option<usize>,
+        /// Maximum ranked continuation paths in path mode
+        #[arg(long)]
+        expand_paths: Option<usize>,
         /// Global expansion node budget
         #[arg(long)]
         expand_nodes: Option<usize>,
@@ -1066,7 +1072,9 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             expand,
             no_expand,
             expand_depth,
+            expand_mode,
             expand_seeds,
+            expand_paths,
             expand_nodes,
             expand_edges,
             expand_bytes,
@@ -1152,8 +1160,12 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     include_neighborhood_followups: true,
                     response_byte_limit: response_bytes.unwrap_or(configured.response_bytes),
                     expansion: search::ExpansionOptions {
+                        projection: search::ExpansionProjection::parse(
+                            expand_mode.as_deref().unwrap_or(&configured.expansion.mode),
+                        )?,
                         depth: expand_depth.unwrap_or(configured.expansion.depth),
                         seed_limit: expand_seeds.unwrap_or(configured.expansion.seeds),
+                        path_limit: expand_paths.unwrap_or(configured.expansion.paths),
                         node_limit: expand_nodes.unwrap_or(configured.expansion.nodes),
                         edge_limit: expand_edges.unwrap_or(configured.expansion.edges),
                         byte_limit: expand_bytes.unwrap_or(configured.expansion.bytes),
@@ -2019,7 +2031,8 @@ fn cmd_search(
     }
     if let Some(expansion) = &result.expansion {
         println!(
-            "\nstructural expansion: {} nodes, {} edges, {} bytes{}",
+            "\nstructural expansion ({}): {} nodes, {} edges, {} bytes{}",
+            expansion.projection.as_str(),
             expansion.nodes.len(),
             expansion.edges.len(),
             expansion.payload_bytes,
@@ -2810,6 +2823,31 @@ mod main_tests {
             Cli::try_parse_from(["jscout", "search", ".", "query", "--vector", "--no-vector"])
                 .is_err()
         );
+
+        let Cli { command, .. } = Cli::try_parse_from([
+            "jscout",
+            "search",
+            ".",
+            "query",
+            "--expand",
+            "--expand-mode",
+            "neighborhood",
+            "--expand-paths",
+            "12",
+        ])
+        .expect("expansion projection controls parse");
+        let Command::Search {
+            expand,
+            expand_mode,
+            expand_paths,
+            ..
+        } = command
+        else {
+            panic!("expected search")
+        };
+        assert!(expand);
+        assert_eq!(expand_mode.as_deref(), Some("neighborhood"));
+        assert_eq!(expand_paths, Some(12));
     }
 
     #[test]

@@ -125,8 +125,22 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
 
     if let Some(expansion) = &result.expansion {
         let mut graph = graph_value(&expansion.nodes, &expansion.edges, &expansion.seeds);
+        graph["projection"] = json!(expansion.projection.as_str());
         if expansion.truncated {
             graph["truncated"] = json!(true);
+            let mut omitted = Map::new();
+            for (name, count) in [
+                ("paths", expansion.omitted_paths),
+                ("nodes", expansion.omitted_nodes),
+                ("edges", expansion.omitted_edges),
+            ] {
+                if count > 0 {
+                    omitted.insert(name.into(), json!(count));
+                }
+            }
+            if !omitted.is_empty() {
+                graph["omitted"] = Value::Object(omitted);
+            }
         }
         response.insert("graph".into(), graph);
     }
@@ -1151,9 +1165,22 @@ mod tests {
             semantic_candidates: 0,
             semantic_selected: 0,
             expansion: Some(SearchExpansion {
+                projection: crate::search::ExpansionProjection::Paths,
                 seeds: vec![root.into()],
                 nodes: vec![node(root, 1), node(target, 20)],
                 edges: vec![edge(root, target, 3)],
+                candidate_paths: 1,
+                selected_paths: 1,
+                omitted_paths: 0,
+                omitted_nodes: 0,
+                omitted_edges: 0,
+                selected_path_edges: vec![vec![(
+                    root.into(),
+                    target.into(),
+                    "member_call".into(),
+                    Some("src/workflow.ts".into()),
+                    Some(3),
+                )]],
                 node_limit: 40,
                 edge_limit: 120,
                 byte_limit: 24_000,
@@ -1191,6 +1218,7 @@ mod tests {
                 .is_none()
         );
         assert!(value["hits"][0].get("chunk_id").is_none());
+        assert_eq!(value["graph"]["projection"], "paths");
         assert_eq!(value["graph"]["edges"][0][3], "likely");
         assert_eq!(value["graph"]["edges"][0][4], "typescript-checker");
         assert_eq!(

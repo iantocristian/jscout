@@ -925,9 +925,18 @@ Structural expansion is off by default and does not alter search scores. Add
 ```bash
 jscout search /path/to/repo "checkout inventory" --json --expand \
   --response-bytes 24000 \
-  --expand-depth 1 --expand-seeds 3 \
+  --expand-mode paths --expand-depth 1 --expand-seeds 3 --expand-paths 8 \
   --expand-nodes 40 --expand-edges 120 --expand-bytes 24000
 ```
+
+Compact expansion defaults to a ranked path forest rooted at the selected hit
+anchors. It keeps the shared prefixes needed to reach cross-file symbols,
+runtime hubs, handlers, state transitions, and effects instead of returning
+every incident edge in the induced neighborhood. `--expand-paths` bounds the
+number of ranked continuation endpoints. Depth one is the same compact one-hop
+caller/callee projection. Use `--expand-mode neighborhood` only when the full
+diagnostic neighborhood is actually needed. Both modes report omitted
+path/node/edge counts and retain the existing independently widenable limits.
 
 Expansion defaults to `production` and `unknown` file-backed nodes while
 retaining structural hubs. Use repeatable `--expand-file-role` flags to opt
@@ -962,8 +971,9 @@ expansion node, edge, and payload limits are subordinate budgets shared across
 all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
 use `possible` only when explicit unresolved candidates are useful.
 
-Evidence-connected semantic memory is attached to CLI and structural-profile
-search by default; use `--no-memory` or `--memory-limit` to control it, and
+Evidence-connected semantic memory is opt-in for CLI and structural-profile
+search; use `--memory` when a preview connected to localized code would help,
+then use `--memory-limit` and
 `--memory-depth`/`--memory-nodes` to widen its reported structural join bounds.
 Every artifact carries evidence supports and a computed `fresh`, `degraded`,
 or `stale` label. The complete response-byte limit includes semantic artifacts.
@@ -1231,7 +1241,8 @@ Set
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
 included in each record; `JSCOUT_PROFILE_LABEL` overrides the recorded
 profile label. Expanded searches also record aggregate node totals
-and `expansion_role_counts`; no paths or source are added to telemetry.
+and `expansion_role_counts`, plus projection and candidate/selected/omitted path
+counts; no path bodies or source are added to telemetry.
 Semantic calls add aggregate candidate/selected/returned/written counts and
 fresh/degraded/stale totals. Search calls also record the canonical compact
 `hits_bytes`, `graph_bytes`, `memory_bytes`, `envelope_bytes`, and total; these
