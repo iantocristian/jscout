@@ -2143,7 +2143,8 @@ fn project_checker_enrichments(
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
-           ON call.file_id=source.id
+           ON call.rowid=enrichment.member_call_id
+          AND call.file_id=source.id
           AND call.start=enrichment.call_start AND call.end=enrichment.call_end
           AND call.receiver_start=enrichment.receiver_start
           AND call.receiver_end=enrichment.receiver_end
@@ -4929,9 +4930,9 @@ mod tests {
         assert_eq!(checker_edges, 1);
         assert_eq!(hub_edges, 1);
 
-        // Exact-snapshot batches are identified by source identity and call
-        // spans, not by the disposable member_calls rowid. A future extractor
-        // ordering change must not silently discard an otherwise valid fact.
+        // Canonical facts must be explicitly rebound to the current
+        // member_calls row before projection. Source identity and spans remain
+        // defense in depth, but cannot authorize a stale rowid by themselves.
         let retained_member_call_id = member_call_id + 10_000;
         conn.execute(
             "UPDATE checker_enrichments SET member_call_id=?1 WHERE batch_id=?2",
@@ -4949,8 +4950,18 @@ mod tests {
                 [&target],
                 |row| row.get::<_, i64>(0),
             )?,
-            1
+            0
         );
+
+        conn.execute(
+            "UPDATE checker_enrichments SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![member_call_id, batch_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_occurrence_projects SET member_call_id=?1 WHERE batch_id=?2",
+            rusqlite::params![member_call_id, batch_id],
+        )?;
+        rebuild_projection(&conn, &snapshot)?;
 
         let (checker_source, checker_detail): (String, String) = conn.query_row(
             "SELECT src_key, detail_json FROM resolved_edges
