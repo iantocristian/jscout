@@ -133,6 +133,9 @@ export function parseOpenAICompatibleProviders(value, envName) {
     if (!Array.isArray(provider.models) || provider.models.length === 0) {
       throw new RegistryError("invalid_request", `${prefix}.models must be a non-empty array`);
     }
+    const apiKeyEnv = provider.apiKeyEnv === undefined
+      ? null
+      : requiredText(provider.apiKeyEnv, `${prefix}.apiKeyEnv`);
     const models = provider.models.map((model, modelIndex) => {
       const modelPrefix = `${prefix}.models[${modelIndex}]`;
       if (!isPlainObject(model)) throw new RegistryError("invalid_request", `${modelPrefix} must be an object`);
@@ -147,7 +150,7 @@ export function parseOpenAICompatibleProviders(value, envName) {
       };
     });
     rejectDuplicateIds(models, `${prefix}.models`);
-    return { id, name: requiredText(provider.name ?? id, `${prefix}.name`), baseUrl, models };
+    return { id, name: requiredText(provider.name ?? id, `${prefix}.name`), baseUrl, apiKeyEnv, models };
   });
   rejectDuplicateIds(providers, envName);
   return providers;
@@ -155,7 +158,7 @@ export function parseOpenAICompatibleProviders(value, envName) {
 
 /// Assemble the collection: full built-in catalog over the configured
 /// credential store, then custom OpenAI-compatible providers on top.
-export function buildRegistry({ authFile, customProviders = [], credentialStore, openAIBaseUrl }) {
+export function buildRegistry({ authFile, customProviders = [], credentialStore, openAIBaseUrl, env = {} }) {
   const credentials = credentialStore ?? new JsonCredentialStore(resolveAuthPath(authFile));
   const models = builtinModels({ credentials });
   overrideProviderBaseUrl(models, "openai", openAIBaseUrl, "JSCOUT_PI_AI_OPENAI_BASE_URL");
@@ -176,10 +179,19 @@ export function buildRegistry({ authFile, customProviders = [], credentialStore,
         baseUrl: provider.baseUrl,
         auth: {
           apiKey: {
-            name: `${provider.name} (keyless)`,
-            // The OpenAI SDK insists on a non-empty client key even when the
-            // local server does not authenticate; keyless servers ignore it.
-            resolve: async () => ({ auth: { apiKey: "pi-ai-keyless" } }),
+            name: provider.apiKeyEnv ? `${provider.name} (${provider.apiKeyEnv})` : `${provider.name} (keyless)`,
+            resolve: async () => {
+              if (!provider.apiKeyEnv) {
+                // The OpenAI SDK insists on a non-empty client key even when
+                // the local server does not authenticate.
+                return { auth: { apiKey: "pi-ai-keyless" }, source: "keyless" };
+              }
+              const apiKey = String(env[provider.apiKeyEnv] ?? "").trim();
+              if (!apiKey) {
+                throw new RegistryError("auth", `custom provider ${provider.id} requires ${provider.apiKeyEnv}`);
+              }
+              return { auth: { apiKey }, source: provider.apiKeyEnv };
+            },
           },
         },
         models: provider.models.map((model) => ({

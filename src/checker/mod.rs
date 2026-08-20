@@ -5,23 +5,18 @@ pub mod protocol;
 pub(crate) use enrich::target_fingerprint;
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
 
-use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-pub const SIDECAR_ENV: &str = "JSCOUT_CHECKER_SIDECAR";
-
-pub fn resolve_sidecar(cli: Option<&Path>) -> Result<PathBuf> {
+pub fn resolve_sidecar(cli: Option<&Path>, configured: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = cli {
         return existing(path, "--sidecar-path");
     }
-    if let Ok(value) = env::var(SIDECAR_ENV)
-        && !value.trim().is_empty()
-    {
-        return existing(Path::new(value.trim()), SIDECAR_ENV);
+    if let Some(path) = configured {
+        return existing(path, "sidecars.checker");
     }
-    let executable = env::current_exe()?;
+    let executable = std::env::current_exe()?;
     let Some(binary_dir) = executable.parent() else {
         bail!("could not locate the checker sidecar relative to the jscout binary");
     };
@@ -42,7 +37,7 @@ pub fn resolve_sidecar(cli: Option<&Path>) -> Result<PathBuf> {
         return Ok(path);
     }
     bail!(
-        "TypeScript checker sidecar not found: pass --sidecar-path, set {SIDECAR_ENV}, or install checker/src/main.mjs beside the jscout binary"
+        "TypeScript checker sidecar not found: configure sidecars.checker, pass --sidecar-path, or install checker/src/main.mjs beside the jscout binary"
     )
 }
 
@@ -57,17 +52,28 @@ fn existing(path: &Path, source: &str) -> Result<PathBuf> {
     }
 }
 
-pub fn launch(root: &Path, sidecar: Option<&Path>) -> Result<process::ProcessChecker> {
-    let node = crate::llm::config::resolve_node_for("the TypeScript checker sidecar")?;
+pub fn launch(
+    root: &Path,
+    sidecar: Option<&Path>,
+    configured_sidecar: Option<&Path>,
+    node: &str,
+) -> Result<process::ProcessChecker> {
+    let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     crate::llm::config::verify_node_version(&node)?;
-    let sidecar = resolve_sidecar(sidecar)?;
+    let sidecar = resolve_sidecar(sidecar, configured_sidecar)?;
     Ok(process::ProcessChecker::spawn(&node, &sidecar, root)?)
 }
 
-pub fn doctor(root: &Path, sidecar: Option<&Path>, timeout: std::time::Duration) -> Result<()> {
-    let node = crate::llm::config::resolve_node_for("the TypeScript checker sidecar")?;
+pub fn doctor(
+    root: &Path,
+    sidecar: Option<&Path>,
+    configured_sidecar: Option<&Path>,
+    node: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     let node_version = crate::llm::config::verify_node_version(&node)?;
-    let sidecar = resolve_sidecar(sidecar)?;
+    let sidecar = resolve_sidecar(sidecar, configured_sidecar)?;
     println!("node: {} ({node_version})", node.display());
     println!("checker sidecar: {}", sidecar.display());
     let mut checker = process::ProcessChecker::spawn(&node, &sidecar, root)?;

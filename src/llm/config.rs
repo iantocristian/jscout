@@ -9,10 +9,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-pub const MODEL_ENV: &str = "JSCOUT_LLM_MODEL";
-pub const REASONING_ENV: &str = "JSCOUT_LLM_REASONING";
-pub const GATEWAY_ENV: &str = "JSCOUT_PI_AI_GATEWAY";
-pub const NODE_ENV: &str = "JSCOUT_NODE";
 pub const DEFAULT_MODEL: &str = "openai-codex:gpt-5.6-terra";
 pub const MODEL_EXAMPLE: &str = DEFAULT_MODEL;
 pub const MINIMUM_NODE_VERSION: (u64, u64, u64) = (22, 19, 0);
@@ -42,46 +38,23 @@ impl ModelSpec {
     }
 }
 
-/// `--model`, then `JSCOUT_LLM_MODEL`, then the plan-backed default.
-pub fn resolve_model(cli: Option<&str>) -> Result<ModelSpec> {
-    let configured = env::var(MODEL_ENV).ok();
-    resolve_model_values(cli, configured.as_deref())
+/// Resolve a CLI override over the already resolved repository setting.
+/// Environment compatibility belongs to the top-level configuration loader,
+/// so operational callers do not reread process state here.
+pub fn resolve_model_setting(cli: Option<&str>, configured: &str) -> Result<ModelSpec> {
+    ModelSpec::parse(cli.unwrap_or(configured))
 }
 
-fn resolve_model_values(cli: Option<&str>, configured: Option<&str>) -> Result<ModelSpec> {
-    if let Some(value) = cli {
-        return ModelSpec::parse(value);
-    }
-    if let Some(value) = configured
-        && !value.trim().is_empty()
-    {
-        return ModelSpec::parse(value);
-    }
-    ModelSpec::parse(DEFAULT_MODEL)
+pub fn resolve_reasoning_setting(cli: Option<&str>, configured: Option<&str>) -> Option<String> {
+    cli.or(configured).map(str::to_string)
 }
 
-/// `--reasoning`, then `JSCOUT_LLM_REASONING`; None means provider default.
-pub fn resolve_reasoning(cli: Option<&str>) -> Option<String> {
-    if let Some(value) = cli {
-        return Some(value.to_string());
-    }
-    match env::var(REASONING_ENV) {
-        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
-        _ => None,
-    }
-}
-
-/// Gateway entry file: `--gateway-path`, then `JSCOUT_PI_AI_GATEWAY`, then the
-/// companion checkout/installation next to the running binary. Both settings
-/// name a file path, never a shell command string.
-pub fn resolve_gateway(cli: Option<&Path>) -> Result<PathBuf> {
+pub fn resolve_gateway_setting(cli: Option<&Path>, configured: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = cli {
         return existing_file(path, "--gateway-path");
     }
-    if let Ok(value) = env::var(GATEWAY_ENV)
-        && !value.trim().is_empty()
-    {
-        return existing_file(Path::new(value.trim()), GATEWAY_ENV);
+    if let Some(path) = configured {
+        return existing_file(path, "sidecars.gateway");
     }
     for candidate in companion_candidates() {
         if candidate.is_file() {
@@ -89,9 +62,7 @@ pub fn resolve_gateway(cli: Option<&Path>) -> Result<PathBuf> {
         }
     }
     bail!(
-        "pi-ai gateway not found: pass --gateway-path, set {GATEWAY_ENV}, or install the \
-         companion gateway (gateway/src/main.mjs) beside the jscout binary; \
-         run `jscout llm doctor` after installing"
+        "pi-ai gateway not found: configure sidecars.gateway, pass --gateway-path, or install the companion gateway beside the jscout binary"
     );
 }
 
@@ -135,39 +106,26 @@ fn existing_file(path: &Path, source: &str) -> Result<PathBuf> {
     }
 }
 
-/// Node runtime for the pi-ai gateway: `JSCOUT_NODE`, then `node` on PATH.
-pub fn resolve_node() -> Result<PathBuf> {
-    resolve_node_for("the pi-ai gateway")
-}
-
-/// Node runtime for a named sidecar. Both of jscout's sidecars share one Node
-/// resolution, so the failure names the sidecar the caller actually wanted
-/// rather than telling a `jscout enrich` user about the gateway.
-pub fn resolve_node_for(sidecar: &str) -> Result<PathBuf> {
-    if let Ok(value) = env::var(NODE_ENV)
-        && !value.trim().is_empty()
-    {
-        let path = PathBuf::from(value.trim());
-        if path.is_file() {
-            return Ok(path);
+pub fn resolve_node_setting(value: &str, sidecar: &str) -> Result<PathBuf> {
+    let configured = PathBuf::from(value);
+    if configured.components().count() > 1 || configured.is_absolute() {
+        if configured.is_file() {
+            return Ok(configured);
         }
         bail!(
-            "{NODE_ENV} does not name an existing node executable: {}",
-            path.display()
+            "sidecars.node does not name an existing node executable: {}",
+            configured.display()
         );
     }
     let path_var = env::var_os("PATH").context("PATH is not set; cannot locate node")?;
-    for dir in env::split_paths(&path_var) {
-        for executable in ["node", "node.exe"] {
-            let candidate = dir.join(executable);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
+    for directory in env::split_paths(&path_var) {
+        let candidate = directory.join(value);
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
     bail!(
-        "node not found on PATH: install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}; \
-         {sidecar} is a Node sidecar and cannot run without it"
+        "node executable `{value}` not found on PATH: install Node >= {MINIMUM_NODE_VERSION_TEXT} or configure sidecars.node; {sidecar} cannot run without it"
     )
 }
 
@@ -181,7 +139,7 @@ pub fn verify_node_version(node: &Path) -> Result<String> {
         .with_context(|| format!("failed to run {} --version", node.display()))?;
     if !output.status.success() {
         bail!(
-            "{} --version failed; install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}",
+            "{} --version failed; install Node >= {MINIMUM_NODE_VERSION_TEXT} or configure sidecars.node",
             node.display()
         );
     }
@@ -191,7 +149,7 @@ pub fn verify_node_version(node: &Path) -> Result<String> {
     let parsed = parse_node_version(reported)?;
     if parsed < MINIMUM_NODE_VERSION {
         bail!(
-            "Node {reported} is unsupported; install Node >= {MINIMUM_NODE_VERSION_TEXT} or set {NODE_ENV}"
+            "Node {reported} is unsupported; install Node >= {MINIMUM_NODE_VERSION_TEXT} or configure sidecars.node"
         );
     }
     Ok(reported.to_string())
@@ -246,8 +204,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_resolution_prefers_cli_then_env_then_plan_default() {
-        let spec = resolve_model_values(Some("openai-codex:gpt-5.6-sol"), Some("openai:gpt-5.4"))
+    fn model_resolution_prefers_cli_over_resolved_repository_setting() {
+        let spec = resolve_model_setting(Some("openai-codex:gpt-5.6-sol"), "openai:gpt-5.4")
             .expect("cli model");
         assert_eq!(
             (spec.provider.as_str(), spec.model_id.as_str()),
@@ -258,13 +216,13 @@ mod tests {
         assert!(ModelSpec::parse("provider:").is_err());
 
         assert_eq!(
-            resolve_model_values(None, Some("openai:gpt-5.4"))
-                .expect("environment model")
+            resolve_model_setting(None, "openai:gpt-5.4")
+                .expect("repository model")
                 .spec,
             "openai:gpt-5.4"
         );
         assert_eq!(
-            resolve_model_values(None, None)
+            resolve_model_setting(None, DEFAULT_MODEL)
                 .expect("default model")
                 .spec,
             DEFAULT_MODEL

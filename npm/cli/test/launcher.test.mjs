@@ -36,10 +36,7 @@ function withTimeout(promise, message) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timeout));
 }
 
-test("forwards repeated SIGINT while the child is still running", async (context) => {
-  const { root, launcher } = temporaryLauncher();
-  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
-
+function installFakePlatformBinary(root, source) {
   const packageRoot = path.join(root, "cli", "node_modules", "@jscout", platformKey());
   fs.mkdirSync(packageRoot, { recursive: true });
   fs.writeFileSync(
@@ -47,8 +44,66 @@ test("forwards repeated SIGINT while the child is still running", async (context
     `${JSON.stringify({ name: `@jscout/${platformKey()}`, version: "0.0.0" })}\n`,
   );
   const binary = path.join(packageRoot, "jscout");
-  fs.writeFileSync(
-    binary,
+  fs.writeFileSync(binary, source);
+  fs.chmodSync(binary, 0o755);
+  return binary;
+}
+
+test("passes bundled sidecars without impersonating legacy user overrides", (context) => {
+  const { root, launcher } = temporaryLauncher();
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  installFakePlatformBinary(
+    root,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  bundledGateway: process.env.JSCOUT_BUNDLED_GATEWAY,
+  bundledChecker: process.env.JSCOUT_BUNDLED_CHECKER,
+  legacyGateway: process.env.JSCOUT_PI_AI_GATEWAY,
+}));
+`,
+  );
+  for (const entry of ["gateway/src/main.mjs", "checker/src/main.mjs"]) {
+    const file = path.join(root, "cli", entry);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+  }
+
+  const clean = spawnSync(process.execPath, [launcher], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      JSCOUT_PI_AI_GATEWAY: "",
+      JSCOUT_CHECKER_SIDECAR: "",
+      JSCOUT_BUNDLED_GATEWAY: "",
+      JSCOUT_BUNDLED_CHECKER: "",
+    },
+  });
+  assert.equal(clean.status, 0, clean.stderr);
+  const cleanEnvironment = JSON.parse(clean.stdout);
+  assert.match(cleanEnvironment.bundledGateway, /gateway\/src\/main\.mjs$/);
+  assert.match(cleanEnvironment.bundledChecker, /checker\/src\/main\.mjs$/);
+  assert.equal(cleanEnvironment.legacyGateway, "");
+
+  const overridden = spawnSync(process.execPath, [launcher], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      JSCOUT_PI_AI_GATEWAY: "/operator/gateway.mjs",
+      JSCOUT_BUNDLED_GATEWAY: "",
+    },
+  });
+  assert.equal(overridden.status, 0, overridden.stderr);
+  const overriddenEnvironment = JSON.parse(overridden.stdout);
+  assert.equal(overriddenEnvironment.legacyGateway, "/operator/gateway.mjs");
+  assert.equal(overriddenEnvironment.bundledGateway, "");
+});
+
+test("forwards repeated SIGINT while the child is still running", async (context) => {
+  const { root, launcher } = temporaryLauncher();
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  installFakePlatformBinary(
+    root,
     `#!/usr/bin/env node
 let interrupts = 0;
 process.on("SIGINT", () => {
@@ -60,7 +115,6 @@ process.stdout.write("ready\\n");
 setInterval(() => {}, 1_000);
 `,
   );
-  fs.chmodSync(binary, 0o755);
 
   const child = spawn(process.execPath, [launcher], {
     detached: true,

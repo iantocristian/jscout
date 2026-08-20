@@ -437,6 +437,14 @@ pub(crate) fn compute_snapshot_with_resolution(
 
 /// Rebuild the disposable structural graph from canonical extraction tables.
 pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
+    rebuild_projection_with_timing(conn, snapshot, false)
+}
+
+pub fn rebuild_projection_with_timing(
+    conn: &Connection,
+    snapshot: &str,
+    timing: bool,
+) -> Result<()> {
     let files = load_files(conn)?;
     let graph = ModuleGraph::load_with_contracts(conn)?;
     let symbols = load_symbols(conn, &files)?;
@@ -498,7 +506,6 @@ pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
              ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         )?;
 
-        let timing = std::env::var_os("JSCOUT_TIMING").is_some();
         let stage_started = Instant::now();
         project_module_edges(conn, &files, &mut insert_node, &mut insert_edge)?;
         if timing {

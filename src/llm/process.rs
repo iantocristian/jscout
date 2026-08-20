@@ -4,6 +4,7 @@
 //! outlives the client: drop sends `shutdown`, then kills after a grace
 //! period.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -12,6 +13,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
+
+use anyhow::Context;
 
 use super::config;
 use super::protocol::{
@@ -155,22 +158,68 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+fn gateway_environment(
+    runtime: &crate::config::RuntimeConfig,
+) -> anyhow::Result<Vec<(OsString, OsString)>> {
+    let settings = &runtime.effective.llm;
+    let mut environment = vec![(
+        OsString::from("JSCOUT_PI_AI_AUTH_FILE"),
+        settings.auth_file.as_os_str().to_os_string(),
+    )];
+    if let Some(base_url) = &settings.openai_base_url {
+        environment.push((
+            OsString::from("JSCOUT_PI_AI_OPENAI_BASE_URL"),
+            OsString::from(base_url),
+        ));
+    }
+    if !settings.openai_compatible_providers.is_empty() {
+        environment.push((
+            OsString::from("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS"),
+            OsString::from(serde_json::to_string(
+                &settings.openai_compatible_providers,
+            )?),
+        ));
+    }
+    if settings.api_key_env != "OPENAI_API_KEY" {
+        let value = std::env::var_os(&settings.api_key_env).with_context(|| {
+            format!(
+                "llm.api_key_env references missing secret environment {}",
+                settings.api_key_env
+            )
+        })?;
+        environment.push((OsString::from("OPENAI_API_KEY"), value));
+    }
+    Ok(environment)
+}
+
 impl ProcessGateway {
     /// Spawn and complete the `hello`/`ready` handshake.
+    #[cfg(test)]
     pub fn spawn(node: &Path, gateway: &Path) -> Result<Self, GatewayError> {
-        let mut child = Command::new(node)
+        Self::spawn_with_environment(node, gateway, &[])
+    }
+
+    fn spawn_with_environment(
+        node: &Path,
+        gateway: &Path,
+        environment: &[(OsString, OsString)],
+    ) -> Result<Self, GatewayError> {
+        let mut command = Command::new(node);
+        command
             .arg(gateway)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                GatewayError::Spawn(format!(
-                    "failed to launch `{} {}`: {error}",
-                    node.display(),
-                    gateway.display()
-                ))
-            })?;
+            .stderr(Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            GatewayError::Spawn(format!(
+                "failed to launch `{} {}`: {error}",
+                node.display(),
+                gateway.display()
+            ))
+        })?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -235,11 +284,19 @@ impl ProcessGateway {
     }
 
     /// Convenience: resolve node + gateway from config and spawn.
-    pub fn launch(gateway_path: Option<&Path>) -> anyhow::Result<Self> {
-        let node = config::resolve_node()?;
+    pub fn launch(
+        gateway_path: Option<&Path>,
+        runtime: &crate::config::RuntimeConfig,
+    ) -> anyhow::Result<Self> {
+        let node =
+            config::resolve_node_setting(&runtime.effective.sidecars.node, "the pi-ai gateway")?;
         config::verify_node_version(&node)?;
-        let gateway = config::resolve_gateway(gateway_path)?;
-        let client = Self::spawn(&node, &gateway)?;
+        let gateway = config::resolve_gateway_setting(
+            gateway_path,
+            runtime.effective.sidecars.gateway.as_deref(),
+        )?;
+        let environment = gateway_environment(runtime)?;
+        let client = Self::spawn_with_environment(&node, &gateway, &environment)?;
         register_interrupt_control(client.control())?;
         Ok(client)
     }
@@ -484,9 +541,52 @@ mod tests {
     use super::super::protocol::{ChatMessage, CompleteRequest, SubmitTool};
     use super::super::{GatewayError, LlmGateway};
     use super::{
-        ProcessGateway, register_interrupt_control, request_interrupt_cancellation,
-        write_fake_gateway,
+        ProcessGateway, gateway_environment, register_interrupt_control,
+        request_interrupt_cancellation, write_fake_gateway,
     };
+
+    #[test]
+    fn gateway_environment_contains_typed_non_secret_runtime_configuration() -> anyhow::Result<()> {
+        let mut runtime = crate::config::RuntimeConfig::load(None, None)?;
+        runtime.effective.llm.openai_base_url = Some("https://gateway.example.test/v1".to_string());
+        runtime.effective.llm.api_key_env = "OPENAI_API_KEY".to_string();
+        runtime.effective.llm.openai_compatible_providers =
+            vec![crate::config::OpenAiCompatibleProvider {
+                id: "local".to_string(),
+                name: "Local".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                api_key_env: Some("LOCAL_MODEL_KEY".to_string()),
+                models: vec![crate::config::OpenAiCompatibleModel {
+                    id: "model".to_string(),
+                    name: "Model".to_string(),
+                    reasoning: false,
+                    context_window: 8_192,
+                    max_tokens: 2_048,
+                }],
+            }];
+        let environment = gateway_environment(&runtime)?;
+        let environment = environment
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("JSCOUT_PI_AI_OPENAI_BASE_URL"),
+            Some(&"https://gateway.example.test/v1".to_string())
+        );
+        let providers: serde_json::Value = serde_json::from_str(
+            environment
+                .get("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS")
+                .expect("compatible providers"),
+        )?;
+        assert_eq!(providers[0]["apiKeyEnv"], "LOCAL_MODEL_KEY");
+        assert!(!environment.contains_key("OPENAI_API_KEY"));
+        Ok(())
+    }
 
     const READY: &str = r#"{"protocol":1,"id":"r1","kind":"ready","versions":{"gateway":"0.0.0","pi_ai":"0.0.0","node":"22.19.0","protocol":1}}"#;
 

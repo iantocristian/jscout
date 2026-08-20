@@ -15,6 +15,8 @@ use crate::{file_role, io_policy, parse, store, walk};
 pub struct IndexOptions {
     pub dependencies: Vec<String>,
     pub dependency_limits: DependencyLimits,
+    pub timing: bool,
+    pub debug: bool,
 }
 
 pub struct IndexOutcome {
@@ -405,7 +407,7 @@ fn index_repo_impl(
                 published.insert(rel);
                 continue;
             }
-            if std::env::var_os("JSCOUT_DEBUG").is_some() {
+            if options.debug {
                 eprintln!("extracting {rel}");
             }
             match extract_file(file, &rel, &source) {
@@ -526,19 +528,19 @@ fn index_repo_impl(
             }
         }
         outcome.projection_rebuilt = false;
-        if std::env::var_os("JSCOUT_TIMING").is_some() {
+        if options.timing {
             eprintln!("timing structural-projection=skipped (unchanged)");
         }
         crate::recon::reconcile_file_policy_after_index(&root, conn);
         return Ok(outcome);
     }
-    crate::structural::rebuild_projection(conn, &snapshot)?;
+    crate::structural::rebuild_projection_with_timing(conn, &snapshot, options.timing)?;
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [&resolution],
     )?;
-    if std::env::var_os("JSCOUT_TIMING").is_some() {
+    if options.timing {
         eprintln!(
             "timing structural-projection={:?}",
             projection_started.elapsed()

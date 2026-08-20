@@ -54,6 +54,7 @@ pub struct RepositoryPlanningOptions<'a> {
     pub max_depth: usize,
     pub checker_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
+    pub checker_node: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -381,7 +382,8 @@ fn discover_project_subjects(
         .cloned()
         .map(|file| (file.path.clone(), file))
         .collect::<BTreeMap<_, _>>();
-    let mut checker = crate::checker::launch(root, options.checker_sidecar)?;
+    let mut checker =
+        crate::checker::launch(root, options.checker_sidecar, None, options.checker_node)?;
     let capabilities = checker.capabilities(options.checker_timeout)?;
     let project_ids = capabilities
         .projects

@@ -1266,6 +1266,7 @@ mod tests {
                 vector: "disabled",
                 corpus_artifacts: 8,
                 vector_action: None,
+                vector_timings: None,
             }),
             semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
                 status: "connected",
@@ -1322,6 +1323,7 @@ mod tests {
                 vector: "degraded",
                 corpus_artifacts: 20,
                 vector_action: Some("start or repair the configured embedding service, then retry"),
+                vector_timings: None,
             }),
             semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
                 status: "no_connected_memory",
@@ -1361,6 +1363,7 @@ mod tests {
                 vector: "degraded",
                 corpus_artifacts: 20,
                 vector_action: Some("run jscout embed <root> --semantic-only"),
+                vector_timings: None,
             }),
             semantic_attachment: Some(crate::search::MemoryAttachmentStatus {
                 status: "connected",

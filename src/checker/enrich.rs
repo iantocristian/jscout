@@ -17,6 +17,7 @@ use super::protocol::{
 pub struct EnrichOptions<'a> {
     pub database: Option<&'a Path>,
     pub sidecar: Option<&'a Path>,
+    pub node: &'a str,
     pub timeout: Duration,
     pub files: Vec<String>,
     pub packages: Vec<String>,
@@ -343,7 +344,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     }
     super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
 
-    let mut planner = super::launch(&canonical_root, options.sidecar)?;
+    let mut planner = super::launch(&canonical_root, options.sidecar, None, options.node)?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
@@ -2160,7 +2161,7 @@ fn execute_project(
     const MAX_BATCH_ITEMS: usize = 128;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-    let mut checker = super::launch(root, options.sidecar)?;
+    let mut checker = super::launch(root, options.sidecar, None, options.node)?;
     checker
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
@@ -3088,6 +3089,7 @@ mod tests {
         EnrichOptions {
             database: None,
             sidecar: None,
+            node: "node",
             timeout: Duration::from_secs(1),
             files: Vec::new(),
             packages: Vec::new(),

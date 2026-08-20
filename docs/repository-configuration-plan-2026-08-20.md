@@ -1,7 +1,7 @@
 # Repository runtime configuration implementation plan
 
 - Date: 2026-08-20
-- Status: planned as G21
+- Status: implemented as G21
 - Scope: repository-local, non-secret operator configuration for CLI and MCP
 
 ## Why this exists
@@ -111,7 +111,7 @@ source_view = "full"
 
 [telemetry]
 file = ".jscout/telemetry.jsonl"
-request_log = false
+# request_log = ".jscout/requests.jsonl"
 ```
 
 This example deliberately disables reranking for a repository without changing
@@ -165,6 +165,9 @@ Evaluation-only variables such as `JSCOUT_BIN`, `JSCOUT_BENCH_REPO`,
 `JSCOUT_EVAL_*`, `JSCOUT_MEMORY_ARM`, `JSCOUT_PHASE`,
 `JSCOUT_MCP_FORWARDED_ENV`, and `JSCOUT_REPLAY_TEST_ENV` remain owned by the
 evaluation harness and do not enter the product schema.
+`JSCOUT_BUNDLED_GATEWAY` and `JSCOUT_BUNDLED_CHECKER` are private npm-launcher
+transport for installed sidecar discovery; they are not operator policy or
+legacy inputs and never trigger migration warnings.
 
 ### Secrets
 
@@ -198,9 +201,9 @@ configure the file, not a shell export list.
   missing explicit file, invalid TOML, unsupported version, unknown field, bad
   enum, unsafe endpoint, or contradictory setting fails before opening a
   database or starting a sidecar.
-- MCP loads and validates the file once at startup. Operators restart the MCP
-  process after changing it; hot reload is deferred until there is an observed
-  need.
+- MCP and watch load and validate the file once at startup. Operators restart
+  either long-running process after changing it; hot reload is deferred until
+  there is an observed need.
 
 ### Precedence
 
@@ -252,10 +255,12 @@ jscout config validate ROOT
 jscout config init ROOT
 ```
 
-`init` prints or creates a documented template and refuses to overwrite an
-existing file. `show` reports each effective value and its source (`cli`,
-`config`, `legacy-env`, or `builtin`) while redacting credentials. At minimum
-it reports the canonical root, config path/status, database path, active search
+`init` creates a documented template and refuses to overwrite an existing
+file. `show` reports the repository baseline and each durable value's source
+(`config`, `legacy-env`, or `builtin`) while redacting credentials. One-shot
+CLI and MCP overrides are visible in that command's behavior and telemetry;
+they do not mutate the baseline returned by `config show`. At minimum it
+reports the canonical root, config path/status, database path, active search
 posture, provider/model endpoints, MCP profile, and telemetry destinations.
 
 MCP telemetry gains:

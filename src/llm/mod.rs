@@ -124,8 +124,12 @@ pub trait LlmGateway {
 
 /// `jscout llm doctor`: report every layer needed for a model call. With no
 /// override it diagnoses the same plan-backed model scouting uses.
-pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let node = config::resolve_node()?;
+pub fn doctor(
+    model: Option<&str>,
+    gateway_path: Option<&std::path::Path>,
+    runtime: &crate::config::RuntimeConfig,
+) -> anyhow::Result<()> {
+    let node = config::resolve_node_setting(&runtime.effective.sidecars.node, "the pi-ai gateway")?;
     println!("node: {}", node.display());
     let version = config::verify_node_version(&node)?;
     println!(
@@ -133,10 +137,13 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
         config::MINIMUM_NODE_VERSION_TEXT
     );
 
-    let gateway_file = config::resolve_gateway(gateway_path)?;
+    let gateway_file = config::resolve_gateway_setting(
+        gateway_path,
+        runtime.effective.sidecars.gateway.as_deref(),
+    )?;
     println!("gateway: {}", gateway_file.display());
 
-    let mut gateway = process::ProcessGateway::spawn(&node, &gateway_file)?;
+    let mut gateway = process::ProcessGateway::launch(gateway_path, runtime)?;
     println!(
         "gateway version: {} (protocol {}), pi-ai {}, gateway node {}",
         gateway.versions.gateway,
@@ -145,7 +152,10 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
         gateway.versions.node
     );
 
-    let requested_model = Some(config::resolve_model(model)?);
+    let requested_model = Some(config::resolve_model_setting(
+        model,
+        &runtime.effective.llm.model,
+    )?);
     let (providers, capabilities) =
         gateway.capabilities(requested_model.as_ref().map(|spec| spec.spec.as_str()))?;
     println!(
@@ -216,8 +226,7 @@ pub fn doctor(model: Option<&str>, gateway_path: Option<&std::path::Path>) -> an
         }
         (None, _) => {
             println!(
-                "model: none selected (pass --model or set {}, e.g. {})",
-                config::MODEL_ENV,
+                "model: none selected (pass --model or set llm.model in .jscout.toml, e.g. {})",
                 config::MODEL_EXAMPLE
             );
         }
