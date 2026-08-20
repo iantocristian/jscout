@@ -78,3 +78,37 @@ correctly re-established its evidence boundary.
    into `definition`/search decorations (one fewer tool description paid in
    every session), or keep it and have the skill say when it beats search.
    The status quo pays its description cost for zero observed use.
+
+## Concrete skill amendment proposed (G14)
+
+Five lines, replacing posture-neutral guidance:
+
+1. Two postures. Inquiry: memory discovery first, at most one orientation
+   expansion, `include_memory` off once useful memory is known.
+   Investigation: narrow unexpanded search, then `definition` on the exact
+   anchor to prove mechanism.
+2. Expansion once per investigation, after localization — never in the first
+   parallel sweep.
+3. Big reads are sequential: expanded searches and artifact details one at a
+   time; parallel is fine only for small unexpanded searches.
+4. Copy anchors verbatim from responses — never retype or shorten them (the
+   invented-anchor failure class observed in evaluation).
+5. If the response snapshot changes mid-session, re-verify the evidence
+   boundary before continuing. The investigation agent discovered this by
+   accident; it should be taught.
+
+## Telemetry gap the traces expose
+
+Per-call MCP telemetry already exists (`JSCOUT_TELEMETRY_FILE` plus
+session/task/profile labels: tool, ok, elapsed, result bytes,
+source/expansion/semantic metrics, retrieval vector/reranker status,
+snapshot) and is what every evaluation used — but both production traces in
+this PR are agent-self-reported because the variable was not set. Two fixes:
+
+1. Make enablement one flag (or default-on for MCP sessions with a standard
+   output path), and document setting a session label so pid-based session
+   ids do not collide across weeks.
+2. Add the three fields the follow-up-evidence list needs that rows lack:
+   call arguments, a same-batch marker, and an outer/client truncation
+   indicator. Delivered-versus-selected follow-up measurement then comes
+   from the file instead of agent memory.
