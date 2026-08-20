@@ -434,11 +434,21 @@ is unchanged; any changed snapshot drops them. A deterministic extraction
 rejection or non-retryable read failure is reported and excluded; an old row
 for that path is not served as current. The refresh still succeeds over the
 indexable corpus.
-The classified workspace map is built first. First-party extraction,
-current-import dependency discovery, and every selected-dependency source read
-then complete in one rollbackable transaction before the old snapshot
-publication is invalidated. A retryable acquisition failure therefore leaves
-the previous snapshot queryable until a complete replacement can commit.
+The classified workspace map is built first. Workspace globs are expanded
+against the filesystem, so a declared package keeps first-party identity even
+when it contains only excluded build output or gitignored source. Indexed
+sources are an alias-target preference, not a membership gate; when no indexed
+source mapping exists, a classified manifest-entry lookup preserves the
+declared alias. First-party extraction, current-import dependency discovery,
+and every selected-dependency source read then complete in one rollbackable
+transaction before the old snapshot publication is invalidated. A retryable
+acquisition failure therefore leaves the previous snapshot queryable until a
+complete replacement can commit.
+
+Compatibility note: repositories indexed by the brief source-derived
+workspace-discovery implementation get a one-time resolution-identity change
+when source-less members return to the workspace map. The resulting snapshot
+change intentionally invalidates exact-snapshot checker batches once.
 The default two-second trailing quiet period coalesces edits; an event received
 during any phase advances the desired generation and cannot be consumed by the
 phase already running.
@@ -456,7 +466,7 @@ Repository traversal applies the same classifier at subtree granularity:
 retryable I/O aborts the phase, while a permanently inaccessible subtree is
 reported and excluded without losing accessible siblings. Attached
 `.gitignore`/`.ignore` errors are surfaced rather than discarded. Selected-
-dependency traversal remains a phase error because that explicitly requested
+dependency traversal is a phase error because that explicitly requested
 package inventory is planned as one bounded unit.
 Non-retryable file reads and deterministic extraction failures are rejected
 inputs. They do not degrade a refresh or trigger whole-repository retries, and
@@ -796,10 +806,10 @@ Retrieval and diagnostics:
 Indexing continues past non-retryable file reads, permanent subtree/boundary
 failures, and deterministic extraction errors. The final count is followed by
 every rejected path, its stage (`walk`, `ignore`, `workspace-manifest`,
-`workspace-canonicalize`, `read`, or `extract`), and the underlying error on
-stderr; `watch` prints the same detail on each cycle. A recognized transient read error
-fails the phase instead, so a reduced corpus is not published; watch retries it
-with bounded backoff.
+`workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `read`, or
+`extract`), and the underlying error on stderr; `watch` prints the same detail
+on each cycle. A recognized transient read error fails the phase instead, so a
+reduced corpus is not published; watch retries it with bounded backoff.
 
 ## Call-site queries
 

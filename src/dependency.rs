@@ -706,6 +706,11 @@ mod tests {
         Ok(())
     }
 
+    fn workspace(root: &Path) -> Result<WorkspaceMap> {
+        let inventory = crate::walk::source_inventory(root)?;
+        Ok(WorkspaceMap::discover(root, &inventory.files)?.map)
+    }
+
     #[test]
     fn dependency_traversal_errors_are_not_silently_dropped() -> Result<()> {
         let repo = tempfile::tempdir()?;
@@ -765,7 +770,7 @@ mod tests {
 
         let conn = store::open(root)?;
         importer(&conn, root, "src/main.ts", "left-pad")?;
-        let workspace = WorkspaceMap::build(root);
+        let workspace = workspace(root)?;
         let packages = discover(root, &conn, &["left-pad".into(), "work".into()], &workspace)?;
 
         assert_eq!(packages.len(), 2);
@@ -809,7 +814,7 @@ mod tests {
         importer(&conn, root, "src/root.ts", "dep")?;
         importer(&conn, root, "packages/app/src/app.ts", "dep")?;
 
-        let packages = discover(root, &conn, &["dep".into()], &WorkspaceMap::build(root))?;
+        let packages = discover(root, &conn, &["dep".into()], &workspace(root)?)?;
         let versions: BTreeSet<_> = packages
             .iter()
             .filter_map(|package| package.version.as_deref())
@@ -827,7 +832,7 @@ mod tests {
             repo.path(),
             &conn,
             &["left-pad".into()],
-            &WorkspaceMap::build(repo.path()),
+            &workspace(repo.path())?,
         )
         .unwrap_err();
         assert!(error.to_string().contains("Plug'n'Play"));

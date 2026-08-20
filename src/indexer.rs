@@ -234,8 +234,7 @@ fn index_repo_impl(
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory = walk::source_inventory(&root)?;
-    let workspace_discovery =
-        crate::workspace::WorkspaceMap::discover_for_index(&root, &inventory.files)?;
+    let workspace_discovery = crate::workspace::WorkspaceMap::discover(&root, &inventory.files)?;
     let workspace = workspace_discovery.map;
     let mut outcome = IndexOutcome {
         indexed: 0,
@@ -1336,6 +1335,49 @@ mod tests {
             rejection.path == "packages/broken/package.json"
                 && rejection.stage == "workspace-manifest"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn full_refresh_preserves_source_less_workspace_identities() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join(".git"))?;
+        fs::write(
+            repo.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )?;
+        fs::write(repo.path().join(".gitignore"), "packages/ignored/src/\n")?;
+        fs::create_dir_all(repo.path().join("packages/dist-only/dist"))?;
+        fs::write(
+            repo.path().join("packages/dist-only/package.json"),
+            r#"{"name":"dist-only","main":"dist/index.js"}"#,
+        )?;
+        fs::write(
+            repo.path().join("packages/dist-only/dist/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        fs::create_dir_all(repo.path().join("packages/ignored/src"))?;
+        fs::write(
+            repo.path().join("packages/ignored/package.json"),
+            r#"{"name":"ignored-source","main":"src/index.ts"}"#,
+        )?;
+        fs::write(
+            repo.path().join("packages/ignored/src/index.ts"),
+            "export const ignored = true;\n",
+        )?;
+        fs::write(repo.path().join("main.ts"), "export const main = true;\n")?;
+        let conn = store::open(repo.path())?;
+
+        refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+        let workspace_names = conn
+            .prepare(
+                "SELECT name FROM package_instances
+                 WHERE origin='workspace' ORDER BY name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(workspace_names, vec!["dist-only", "ignored-source"]);
         Ok(())
     }
 

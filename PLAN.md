@@ -1187,13 +1187,16 @@ Retryable reads roll back the active transaction and return `Err`; watch
 remains dirty and retries even when periodic reconciliation is disabled.
 Other database, transaction, discovery, and phase-level failures follow the
 same retry path.
-Selected-dependency traversal errors remain phase failures rather than partial
-inventories. One classified workspace map is built before mutation. First-party
-extraction, dependency discovery from the newly extracted importers, and every
-selected-dependency source read are then prepared in the same rollbackable
-transaction before the old snapshot publication is invalidated. A retryable
-acquisition failure therefore leaves the previous snapshot queryable instead
-of exposing an unpublished gap.
+Selected-dependency traversal errors are phase failures rather than partial
+inventories. One classified workspace map is built before mutation by expanding
+declared globs against the filesystem. Package manifests establish identity;
+the indexed source inventory only prefers alias targets, with classified
+manifest-entry fallback for source-less members. First-party extraction,
+dependency discovery from the newly extracted importers, and every selected-
+dependency source read are then prepared in the same rollbackable transaction
+before the old snapshot publication is invalidated. A retryable acquisition
+failure therefore leaves the previous snapshot queryable instead of exposing
+an unpublished gap.
 
 Phase-level failures use bounded exponential backoff. A parked retry gates
 fresh work for that generation and is consumed when it starts; attempts reset
