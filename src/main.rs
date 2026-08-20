@@ -1463,13 +1463,24 @@ fn cmd_embed(
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
     if !semantic_only {
-        let (done, total) =
-            embed::embed_missing_for_selection(&conn, &provider, batch, file_origins, product)?;
-        println!("embedded {done}/{total} chunks");
+        let report = embed::embed_missing_for_selection_report(
+            &conn,
+            &provider,
+            batch,
+            file_origins,
+            product,
+        )?;
+        println!(
+            "code embeddings: missing={} embedded={} cached_reused={} occurrences_synced={}",
+            report.missing, report.embedded, report.cached_reused, report.occurrences_synced
+        );
     }
     if semantic || semantic_only {
-        let (done, total) = embed::embed_semantic_missing(&conn, &provider, batch)?;
-        println!("embedded {done}/{total} semantic artifacts");
+        let report = embed::embed_semantic_missing_report(&conn, &provider, batch)?;
+        println!(
+            "semantic embeddings: missing={} embedded={} cached_reused={} occurrences_synced={}",
+            report.missing, report.embedded, report.cached_reused, report.occurrences_synced
+        );
     }
     Ok(())
 }

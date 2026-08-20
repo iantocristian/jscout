@@ -102,7 +102,7 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --all includes normally excluded roles/resolved calls
 jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
-                               # optional vector/checker phases
+                               # optional code-vector/checker/semantic-vector phases
                                #   --product keeps embedding to the effective product corpus
                                #   repeat --deps from index to retain that corpus
                                #   --database PATH isolates index/memory state
@@ -413,6 +413,23 @@ staged work stays non-public and the coordinator retries it without requiring a
 new filesystem event. Relevant edits that arrive during enrichment cancel or
 supersede that work and require a new structural generation. Plain `watch`
 never starts Node.
+
+Watch maintains structural state and, when explicitly enabled, checker facts
+plus code and semantic vector indexes. It does not generate semantic content:
+repository scouting, cards, workflows, summaries, and concepts remain explicit
+`jscout scout` operations. With both optional planes enabled, the phase order is
+`refresh -> embed(code) -> enrich -> embed(semantic)`; without `--enrich`, the
+semantic tail follows code embedding immediately. The tail absorbs artifacts
+written by prior manual scout or agent-annotation operations and repairs their
+semantic vector index from the durable cache. The complete manual enrichment
+sequence remains:
+
+```bash
+jscout index .
+jscout enrich .
+jscout scout repository . --max-calls all
+JSCOUT_EMBED_PROVIDER=local jscout embed . --product --semantic
+```
 
 ### Watcher lifecycle
 
@@ -919,8 +936,12 @@ refreshes with optional embedding/checker operations, debounce, retries, and
 periodic full reconciliation. `watch --embed` updates the default corpus;
 `watch --embed --product` applies the same fresh reconnaissance policy and
 neutral production fallback as `jscout embed --product`, so it does not widen a
-product-only vector cache. Manual `jscout index` always remains a full
-disposable-snapshot rebuild.
+product-only vector cache. Each embedding phase reports missing documents,
+newly embedded documents, durable-cache reuse, and current vector occurrences;
+a fully cached pass therefore reports reuse rather than `embedded=0/0`.
+`watch --embed` also repairs and tops up semantic-artifact vectors after the
+checker phase. Manual `jscout index` always remains a full disposable-snapshot
+rebuild.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

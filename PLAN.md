@@ -1095,6 +1095,7 @@ full or incremental structural refresh
   -> rematerialize vectors already present in the content cache
   -> optionally embed unseen content (`--embed`)
   -> optionally enrich the exact published snapshot (`--enrich`)
+  -> optionally embed/sync current semantic artifacts (`--embed`)
 ```
 
 Startup and reconciliation generations run a full disposable-plane refresh.
@@ -1137,6 +1138,16 @@ snapshot. It may reuse an active exact-snapshot batch when either refresh mode
 proves the snapshot unchanged. Dependency selectors remain authoritative and
 must be supplied to watch exactly as they are to index.
 
+Code embedding remains ahead of checker enrichment because its document and
+selection inputs are chunk content plus current repository policy; checker
+tables are not embedding inputs. When `--embed` is enabled, a separate semantic
+tail runs after enrichment, or immediately after code embedding when enrichment
+is disabled. It embeds missing current semantic documents through the durable
+cache and repairs the semantic vector index. Both embedding phases report
+missing, embedded, cached-reused, and current synced-occurrence counts.
+Repository scouting remains an explicit generative operation and is not hidden
+inside G12 watch.
+
 ### Generation state machine
 
 Filesystem notifications are wake-up hints, not proof that the index is
@@ -1155,8 +1166,9 @@ finished:
 clean
   -> dirty(generation, reasons, full|incremental)
   -> refreshing(generation)
-  -> embedding(generation, snapshot)   [only with --embed]
+  -> embedding-code(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
+  -> embedding-semantic(generation, snapshot)   [only with --embed]
   -> clean
 
 any phase + newer event -> dirty(newer generation)
@@ -1168,7 +1180,7 @@ the desired generation and force another structural refresh before the
 watcher can become clean. Structural work is allowed to finish rather than be
 cancelled mid-transaction; optional embedding work stops between batches and
 checker work terminates its bounded sidecar when superseded. Before starting
-either optional phase, the coordinator drains pending events and skips that
+each optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
 A structural refresh may return individual file rejections. `jscout index` and
@@ -1932,6 +1944,36 @@ G18 changes both generation selection and direct semantic retrieval:
   before returning a full semantic body;
 - useful-artifact precision improves without widening global generation or
   response budgets, and generated prose remains separate from code ranking.
+
+## Planned G19 — quiet-window repository scouting in watch
+
+G12 deliberately keeps semantic-content generation outside watch. A later
+opt-in `watch --scout` may close the full enrichment loop without turning
+ordinary watch into a background LLM job. Its phase order is fixed:
+
+```text
+refresh -> embed(code) -> enrich -> scout(stale delta) -> embed(semantic)
+```
+
+The phase is constrained by quiet time, not a hidden monetary throttle. It has
+the lowest priority and is superseded first by any relevant filesystem event.
+On a continuously changing checkout it may never finish; watch must report the
+lag and the exact manual scout command instead of queuing generations or
+silently widening work.
+
+G19 must be designed around stale-delta scoping before implementation. It uses
+semantic supports and reconnaissance subject fingerprints to select only
+subjects invalidated by recent successful generations. Full-repository
+scouting remains manual. Deterministic subject failures publish an explicit
+partial/terminal outcome and wait for a later generation; gateway transport
+failures use the existing retry path. Cancellation must retain completed
+subject-local work and never publish evidence against a superseded structural
+generation.
+
+Acceptance requires fixtures for quiet completion, continuous supersession,
+subject-local resume, partial failures, gateway retry, and semantic-vector tail
+convergence. Until those exist, no `--scout` flag is shipped and watch's README
+boundary remains structure/checker/vector maintenance only.
 
 ## Evaluation decisions already made
 

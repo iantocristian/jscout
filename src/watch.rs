@@ -37,6 +37,7 @@ enum Phase {
     Refresh,
     Embed,
     Enrich,
+    SemanticEmbed,
 }
 
 impl fmt::Display for Phase {
@@ -45,6 +46,7 @@ impl fmt::Display for Phase {
             Self::Refresh => "refresh",
             Self::Embed => "embed",
             Self::Enrich => "enrich",
+            Self::SemanticEmbed => "semantic-embed",
         })
     }
 }
@@ -112,6 +114,7 @@ struct Retry {
 enum FinishState {
     Continue,
     Complete,
+    Partial,
     Retry { after: Duration },
     Superseded,
 }
@@ -136,6 +139,7 @@ struct Coordinator {
     retry_max: Duration,
     embed: bool,
     enrich: bool,
+    partial_generation: bool,
 }
 
 impl Coordinator {
@@ -157,6 +161,7 @@ impl Coordinator {
             retry_max: DEFAULT_RETRY_MAX,
             embed,
             enrich,
+            partial_generation: false,
         };
         coordinator.mark_dirty(Duration::ZERO, DirtySignal::full("startup"));
         coordinator.refresh_immediate = true;
@@ -181,6 +186,7 @@ impl Coordinator {
                 .is_some_and(|retry| retry.work.generation == self.desired_generation);
         if self.desired_generation == self.completed_generation || current_generation_has_work {
             self.desired_generation += 1;
+            self.partial_generation = false;
             if !preserve_refresh_requirement {
                 self.dirty_reasons.clear();
                 self.dirty_source_paths.clear();
@@ -305,6 +311,16 @@ impl Coordinator {
         self.advance(work)
     }
 
+    fn finish_optional_partial(&mut self, work: Work) -> FinishState {
+        self.clear_active(work);
+        if work.generation != self.desired_generation {
+            return FinishState::Superseded;
+        }
+        self.retry_attempts.remove(&work.phase);
+        self.partial_generation = true;
+        self.advance(work)
+    }
+
     fn finish_error(&mut self, now: Duration, work: Work) -> FinishState {
         self.clear_active(work);
         if work.generation != self.desired_generation {
@@ -340,6 +356,8 @@ impl Coordinator {
             Phase::Refresh if self.embed => Some(Phase::Embed),
             Phase::Refresh if self.enrich => Some(Phase::Enrich),
             Phase::Embed if self.enrich => Some(Phase::Enrich),
+            Phase::Embed => Some(Phase::SemanticEmbed),
+            Phase::Enrich if self.embed => Some(Phase::SemanticEmbed),
             _ => None,
         };
         if let Some(phase) = next {
@@ -353,7 +371,11 @@ impl Coordinator {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
             self.dirty_source_paths.clear();
-            FinishState::Complete
+            if std::mem::take(&mut self.partial_generation) {
+                FinishState::Partial
+            } else {
+                FinishState::Complete
+            }
         }
     }
 
@@ -720,7 +742,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_refresh(work),
-                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -735,7 +756,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_error(started.elapsed(), work),
-                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -762,19 +782,26 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         )
                     };
                     match result {
-                        Ok((done, total, canceled)) => {
+                        Ok(report) => {
                             eprintln!(
-                                "watch generation={} phase=embed status={} embedded={done}/{total} elapsed_ms={}",
+                                "watch generation={} phase=embed status={} missing={} embedded={} cached_reused={} occurrences_synced={} elapsed_ms={}",
                                 work.generation,
-                                if canceled { "canceled" } else { "succeeded" },
+                                if report.canceled {
+                                    "canceled"
+                                } else {
+                                    "succeeded"
+                                },
+                                report.missing,
+                                report.embedded,
+                                report.cached_reused,
+                                report.occurrences_synced,
                                 phase_started.elapsed().as_millis()
                             );
-                            debug_assert!(!canceled || coordinator.is_superseded(work));
+                            debug_assert!(!report.canceled || coordinator.is_superseded(work));
                             let state = coordinator.finish_optional(work);
                             report_finish(
                                 work,
                                 state,
-                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -789,7 +816,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_error(started.elapsed(), work),
-                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -831,7 +857,6 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_optional(work),
-                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -860,14 +885,71 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 return Ok(());
                             }
                             let state = if terminal_partial {
-                                coordinator.finish_optional(work)
+                                coordinator.finish_optional_partial(work)
                             } else {
                                 coordinator.finish_error(started.elapsed(), work)
                             };
                             report_finish(
                                 work,
                                 state,
-                                terminal_partial,
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
+                        }
+                    }
+                }
+                Phase::SemanticEmbed => {
+                    let provider = Arc::clone(provider.as_ref().expect("provider validated"));
+                    let result = {
+                        let mut monitor = PhaseMonitor {
+                            receiver: &receiver,
+                            classifier: &classifier,
+                            coordinator: &mut coordinator,
+                            work,
+                            started,
+                        };
+                        run_semantic_embedding_interruptible(
+                            &root,
+                            &database,
+                            provider,
+                            &mut monitor,
+                        )
+                    };
+                    match result {
+                        Ok(report) => {
+                            eprintln!(
+                                "watch generation={} phase=semantic-embed status={} missing={} embedded={} cached_reused={} occurrences_synced={} elapsed_ms={}",
+                                work.generation,
+                                if report.canceled {
+                                    "canceled"
+                                } else {
+                                    "succeeded"
+                                },
+                                report.missing,
+                                report.embedded,
+                                report.cached_reused,
+                                report.occurrences_synced,
+                                phase_started.elapsed().as_millis()
+                            );
+                            debug_assert!(!report.canceled || coordinator.is_superseded(work));
+                            report_finish(
+                                work,
+                                coordinator.finish_optional(work),
+                                started.elapsed(),
+                                options.reconcile_interval,
+                                &mut next_reconcile,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "watch generation={} phase=semantic-embed status=failed elapsed_ms={} error={error:#}",
+                                work.generation,
+                                phase_started.elapsed().as_millis()
+                            );
+                            report_finish(
+                                work,
+                                coordinator.finish_error(started.elapsed(), work),
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -946,12 +1028,12 @@ fn run_embedding_interruptible(
     provider: Arc<embed::Provider>,
     product_only: bool,
     monitor: &mut PhaseMonitor<'_>,
-) -> Result<(usize, usize, bool)> {
+) -> Result<embed::EmbeddingPassReport> {
     let root = root.to_path_buf();
     let database = database.to_path_buf();
     let canceled = Arc::new(AtomicBool::new(false));
     let worker_canceled = Arc::clone(&canceled);
-    let worker = thread::spawn(move || -> Result<(usize, usize, bool)> {
+    let worker = thread::spawn(move || -> Result<embed::EmbeddingPassReport> {
         let conn = open_phase_database(&root, &database)?;
         embed::embed_missing_interruptible(&conn, &provider, 64, product_only, || {
             worker_canceled.load(Ordering::SeqCst)
@@ -967,6 +1049,34 @@ fn run_embedding_interruptible(
     worker
         .join()
         .map_err(|_| anyhow::anyhow!("embedding worker panicked"))?
+}
+
+fn run_semantic_embedding_interruptible(
+    root: &Path,
+    database: &Path,
+    provider: Arc<embed::Provider>,
+    monitor: &mut PhaseMonitor<'_>,
+) -> Result<embed::EmbeddingPassReport> {
+    let root = root.to_path_buf();
+    let database = database.to_path_buf();
+    let canceled = Arc::new(AtomicBool::new(false));
+    let worker_canceled = Arc::clone(&canceled);
+    let worker = thread::spawn(move || -> Result<embed::EmbeddingPassReport> {
+        let conn = open_phase_database(&root, &database)?;
+        embed::embed_semantic_missing_interruptible(&conn, &provider, 64, || {
+            worker_canceled.load(Ordering::SeqCst)
+        })
+    });
+    while !worker.is_finished() {
+        monitor.poll();
+        if monitor.is_superseded() {
+            canceled.store(true, Ordering::SeqCst);
+        }
+        thread::sleep(OPTIONAL_PHASE_POLL);
+    }
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("semantic embedding worker panicked"))?
 }
 
 fn run_enrichment_interruptible(
@@ -1069,7 +1179,6 @@ fn drain_events(
 fn report_finish(
     work: Work,
     state: FinishState,
-    partial_completion: bool,
     now: Duration,
     reconcile_interval: Duration,
     next_reconcile: &mut Option<Duration>,
@@ -1077,15 +1186,12 @@ fn report_finish(
     match state {
         FinishState::Continue => {}
         FinishState::Complete => {
-            eprintln!(
-                "watch generation={} status={}",
-                work.generation,
-                if partial_completion {
-                    "partial"
-                } else {
-                    "clean"
-                }
-            );
+            eprintln!("watch generation={} status=clean", work.generation);
+            *next_reconcile =
+                (!reconcile_interval.is_zero()).then(|| now.saturating_add(reconcile_interval));
+        }
+        FinishState::Partial => {
+            eprintln!("watch generation={} status=partial", work.generation);
             *next_reconcile =
                 (!reconcile_interval.is_zero()).then(|| now.saturating_add(reconcile_interval));
         }
@@ -1344,7 +1450,45 @@ mod tests {
         assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
         let enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
         assert_eq!(enrich.phase, Phase::Enrich);
-        assert_eq!(coordinator.finish_optional(enrich), FinishState::Complete);
+        assert_eq!(coordinator.finish_optional(enrich), FinishState::Continue);
+        let semantic = coordinator
+            .next_work(Duration::ZERO)
+            .expect("semantic embed");
+        assert_eq!(semantic.phase, Phase::SemanticEmbed);
+        assert_eq!(coordinator.finish_optional(semantic), FinishState::Complete);
+    }
+
+    #[test]
+    fn terminal_enrichment_partial_survives_the_semantic_embedding_tail() {
+        let mut coordinator = Coordinator::new(seconds(2), true, true);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+        let embed = coordinator.next_work(Duration::ZERO).expect("embed");
+        assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
+        let enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+        assert_eq!(
+            coordinator.finish_optional_partial(enrich),
+            FinishState::Continue
+        );
+        let semantic = coordinator
+            .next_work(Duration::ZERO)
+            .expect("semantic embed");
+        assert_eq!(coordinator.finish_optional(semantic), FinishState::Partial);
+    }
+
+    #[test]
+    fn semantic_embedding_immediately_follows_code_embedding_without_enrichment() {
+        let mut coordinator = Coordinator::new(seconds(2), true, false);
+        let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+        let embed = coordinator.next_work(Duration::ZERO).expect("embed");
+        assert_eq!(embed.phase, Phase::Embed);
+        assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
+        let semantic = coordinator
+            .next_work(Duration::ZERO)
+            .expect("semantic embed");
+        assert_eq!(semantic.phase, Phase::SemanticEmbed);
+        assert_eq!(coordinator.finish_optional(semantic), FinishState::Complete);
     }
 
     #[test]
