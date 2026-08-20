@@ -5,6 +5,7 @@ mod calls;
 mod checker;
 mod chunk;
 mod compact;
+mod config;
 mod dependency;
 mod embed;
 mod entity;
@@ -46,12 +47,20 @@ use clap::{Parser, Subcommand};
     version
 )]
 struct Cli {
+    /// Explicit configuration file; repository commands otherwise use ROOT/.jscout.toml
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect, validate, or initialize repository runtime configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Parse a repository and print structural statistics
     Stats {
         /// Repository root
@@ -519,6 +528,28 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the effective non-secret configuration and value sources
+    Show {
+        /// Repository root
+        root: PathBuf,
+        /// Emit structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate configuration without running another command
+    Validate {
+        /// Repository root
+        root: PathBuf,
+    },
+    /// Create a documented configuration template without overwriting
+    Init {
+        /// Repository root
+        root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum CheckerCommand {
     /// Report TypeScript version, projects, config problems, and readiness
     Doctor {
@@ -816,6 +847,102 @@ enum InferenceCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Config { command } => run_config_command(command, cli.config.as_deref()),
+        command => {
+            let runtime = config::RuntimeConfig::load(command.root(), cli.config.as_deref())?;
+            run_command(command, &runtime)
+        }
+    }
+}
+
+fn run_config_command(command: ConfigCommand, explicit: Option<&Path>) -> Result<()> {
+    match command {
+        ConfigCommand::Show { root, json } => {
+            let config = config::RuntimeConfig::load(Some(&root), explicit)?;
+            if json {
+                println!("{}", config.show_json()?);
+            } else {
+                println!("{}", config.show_text());
+            }
+            Ok(())
+        }
+        ConfigCommand::Validate { root } => {
+            let config = config::RuntimeConfig::load(Some(&root), explicit)?;
+            println!(
+                "configuration valid: {} ({})",
+                config
+                    .config_path
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                config.fingerprint
+            );
+            Ok(())
+        }
+        ConfigCommand::Init { root } => {
+            let path = config::init(&root, explicit)?;
+            println!("created {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+impl Command {
+    fn root(&self) -> Option<&Path> {
+        match self {
+            Self::Stats { root }
+            | Self::Chunks { root, .. }
+            | Self::Index { root, .. }
+            | Self::Embed { root, .. }
+            | Self::Search { root, .. }
+            | Self::Events { root, .. }
+            | Self::Calls { root, .. }
+            | Self::Mcp { root, .. }
+            | Self::Annotate { root, .. }
+            | Self::Memory { root, .. }
+            | Self::Overview { root, .. }
+            | Self::WorkflowCandidates { root, .. }
+            | Self::Watch { root, .. }
+            | Self::WhoUses { root, .. }
+            | Self::Neighborhood { root, .. }
+            | Self::Enrich { root, .. } => Some(root),
+            Self::Checker {
+                command: CheckerCommand::Doctor { root, .. },
+            } => Some(root),
+            Self::Scout { command } => Some(command.root()),
+            Self::AgentGuide {
+                install: Some(root),
+            } => Some(root),
+            Self::AgentGuide { install: None } | Self::Llm { .. } | Self::Inference { .. } => None,
+            Self::Config { command } => Some(command.root()),
+        }
+    }
+}
+
+impl ConfigCommand {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Show { root, .. } | Self::Validate { root } | Self::Init { root } => root,
+        }
+    }
+}
+
+impl ScoutCommand {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Repository { root, .. }
+            | Self::Workflows { root, .. }
+            | Self::Cards { root, .. }
+            | Self::Summaries { root, .. }
+            | Self::Concepts { root, .. }
+            | Self::Refresh { root, .. } => root,
+        }
+    }
+}
+
+fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()> {
+    match command {
+        Command::Config { .. } => unreachable!("configuration commands are dispatched first"),
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
         Command::Index {
@@ -2208,9 +2335,42 @@ mod main_tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{Cli, Command, ScoutCommand, render_semantic_memory_text};
+    use super::{Cli, Command, ConfigCommand, ScoutCommand, render_semantic_memory_text};
     use crate::semantic::SemanticArtifact;
     use clap::Parser;
+
+    #[test]
+    fn config_commands_and_global_selector_parse() {
+        let cli = Cli::try_parse_from([
+            "jscout",
+            "--config",
+            "/tmp/jscout.toml",
+            "config",
+            "show",
+            ".",
+            "--json",
+        ])
+        .expect("config show parses");
+
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/jscout.toml")));
+        let Command::Config {
+            command: ConfigCommand::Show { root, json },
+        } = cli.command
+        else {
+            panic!("expected config show")
+        };
+        assert_eq!(root, PathBuf::from("."));
+        assert!(json);
+
+        let Cli { command, .. } = Cli::try_parse_from(["jscout", "config", "validate", "."])
+            .expect("config validate parses");
+        assert!(matches!(
+            command,
+            Command::Config {
+                command: ConfigCommand::Validate { .. }
+            }
+        ));
+    }
 
     #[test]
     fn text_search_memory_is_renderable_without_code_hits() -> Result<()> {
@@ -2237,7 +2397,7 @@ mod main_tests {
 
     #[test]
     fn lexical_only_and_rerank_controls_parse_independently() {
-        let Cli { command } = Cli::try_parse_from([
+        let Cli { command, .. } = Cli::try_parse_from([
             "jscout",
             "search",
             ".",
@@ -2259,7 +2419,7 @@ mod main_tests {
         assert!(no_rerank);
         assert!(!lexical_only);
 
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "search", ".", "query", "--lexical-only"])
                 .expect("lexical shortcut parses");
         let Command::Search { lexical_only, .. } = command else {
@@ -2270,7 +2430,7 @@ mod main_tests {
 
     #[test]
     fn repository_scout_accepts_explicit_all_without_hiding_the_warning_threshold() {
-        let Cli { command } = Cli::try_parse_from([
+        let Cli { command, .. } = Cli::try_parse_from([
             "jscout",
             "scout",
             "repository",
@@ -2306,7 +2466,7 @@ mod main_tests {
 
     #[test]
     fn search_and_embed_accept_external_database_paths() {
-        let Cli { command } = Cli::try_parse_from([
+        let Cli { command, .. } = Cli::try_parse_from([
             "jscout",
             "search",
             ".",
@@ -2320,7 +2480,7 @@ mod main_tests {
         };
         assert_eq!(database, Some(PathBuf::from("/tmp/search.db")));
 
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "embed", ".", "--database", "/tmp/embed.db"])
                 .expect("external embed database parses");
         let Command::Embed { database, .. } = command else {
@@ -2328,7 +2488,7 @@ mod main_tests {
         };
         assert_eq!(database, Some(PathBuf::from("/tmp/embed.db")));
 
-        let Cli { command } = Cli::try_parse_from(["jscout", "embed", ".", "--semantic-only"])
+        let Cli { command, .. } = Cli::try_parse_from(["jscout", "embed", ".", "--semantic-only"])
             .expect("semantic-only embedding parses");
         let Command::Embed {
             semantic,
@@ -2344,7 +2504,7 @@ mod main_tests {
             Cli::try_parse_from(["jscout", "embed", ".", "--product", "--semantic-only"]).is_err()
         );
 
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "memory", ".", "rewrite behavior", "--no-vector"])
                 .expect("lexical semantic-memory query parses");
         let Command::Memory { no_vector, .. } = command else {
@@ -2355,7 +2515,7 @@ mod main_tests {
 
     #[test]
     fn compact_and_debug_json_modes_parse_without_ambiguity() {
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "search", ".", "query", "--debug-json"])
                 .expect("debug search output parses");
         let Command::Search {
@@ -2371,7 +2531,7 @@ mod main_tests {
                 .is_err()
         );
 
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "neighborhood", ".", "root", "--debug-json"])
                 .expect("debug neighborhood output parses");
         let Command::Neighborhood { debug_json, .. } = command else {
@@ -2382,7 +2542,7 @@ mod main_tests {
 
     #[test]
     fn watch_checker_enrichment_controls_parse_independently() {
-        let Cli { command } = Cli::try_parse_from([
+        let Cli { command, .. } = Cli::try_parse_from([
             "jscout",
             "watch",
             ".",
@@ -2429,7 +2589,7 @@ mod main_tests {
 
     #[test]
     fn enrichment_plan_controls_parse_without_implying_a_default_cap() {
-        let Cli { command } = Cli::try_parse_from([
+        let Cli { command, .. } = Cli::try_parse_from([
             "jscout",
             "enrich",
             ".",
@@ -2471,7 +2631,7 @@ mod main_tests {
         assert!(dry_run);
         assert!(full);
 
-        let Cli { command } =
+        let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "enrich", "."]).expect("default enrich parses");
         let Command::Enrich {
             max_occurrences, ..
