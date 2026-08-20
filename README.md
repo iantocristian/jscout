@@ -454,14 +454,14 @@ during any phase advances the desired generation and cannot be consumed by the
 phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
-busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
-backoff without waiting for another edit. Recognized transient read failures
-such as descriptor exhaustion, interrupted/network I/O, or stale handles are
-phase errors: the transaction rolls back and watch retries instead of
-publishing a reduced corpus. A path that disappears or changes between file and
-directory after inventory is ordinary checkout churn, not evidence of an
-atomic-snapshot violation; its old row is removed and later events or
-reconciliation converge on the next state.
+busy timeout. Fatal refresh, embedding, and checker errors retry indefinitely
+without waiting for another edit, with an exponential delay capped at 30
+seconds. Recognized transient read failures such as descriptor exhaustion,
+interrupted/network I/O, or stale handles are phase errors: the transaction
+rolls back and watch retries instead of publishing a reduced corpus. A path
+that disappears or changes between file and directory after inventory is
+ordinary checkout churn, not evidence of an atomic-snapshot violation; its old
+row is removed and later events or reconciliation converge on the next state.
 Repository traversal applies the same classifier at subtree granularity:
 retryable I/O aborts the phase, while a permanently inaccessible subtree is
 reported and excluded without losing accessible siblings. Attached
@@ -804,12 +804,14 @@ Retrieval and diagnostics:
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
 Indexing continues past non-retryable file reads, permanent subtree/boundary
-failures, and deterministic extraction errors. The final count is followed by
-every rejected path, its stage (`walk`, `ignore`, `workspace-manifest`,
+failures, and deterministic extraction errors. The final summary reports both
+`removed=N` and `rejected=N`, followed by every rejected path, its stage
+(`walk`, `ignore`, `workspace-manifest`,
 `workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `read`, or
 `extract`), and the underlying error on stderr; `watch` prints the same detail
 on each cycle. A recognized transient read error fails the phase instead, so a
-reduced corpus is not published; watch retries it with bounded backoff.
+reduced corpus is not published; watch retries indefinitely with an
+exponential delay capped at 30 seconds.
 
 ## Call-site queries
 

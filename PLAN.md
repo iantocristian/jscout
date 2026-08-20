@@ -1069,10 +1069,11 @@ Acceptance checks:
 real repository remains pending.** The production watcher uses a pure
 generation coordinator, a typed full/incremental refresh scope, fresh per-phase
 connections, explicit optional embedding/checker phases, supersession and
-cancellation, bounded phase-error retry, exact self-output exclusions, dynamic
-external coverage, and periodic reconciliation. Unit and
-fixture coverage passes; the next operational step is to run it through branch
-switches and ordinary edits on the user's target repository.
+cancellation, uncapped phase-error retries with a capped exponential delay,
+exact self-output exclusions, dynamic external coverage, and periodic
+reconciliation. Unit and fixture coverage passes; the next operational step is
+to run it through branch switches and ordinary edits on the user's target
+repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
@@ -1198,11 +1199,12 @@ before the old snapshot publication is invalidated. A retryable acquisition
 failure therefore leaves the previous snapshot queryable instead of exposing
 an unpublished gap.
 
-Phase-level failures use bounded exponential backoff. A parked retry gates
-fresh work for that generation and is consumed when it starts; attempts reset
-on new input or a successful phase. Retry state lives in memory. Restarting
-watch always subscribes first and then performs a full refresh, so no persistent
-watcher journal or recovery schema is required.
+Phase-level failures retry without an attempt limit, using exponential delay
+capped at 30 seconds. A parked retry gates fresh work for that generation and
+is consumed when it starts; delay resets on new input or a successful phase.
+Retry state lives in memory. Restarting watch always subscribes first and then
+performs a full refresh, so no persistent watcher journal or recovery schema is
+required.
 
 ### Trigger and reconciliation policy
 
@@ -1320,9 +1322,9 @@ delete semantic memory or content-hash embedding rows.
    selected-dependency, and dynamically reported checker-input watches. Treat
    notification backend errors as full-refresh uncertainty and persistent
    registration failures as degraded timer-backed coverage.
-5. Add periodic reconciliation, bounded retry/backoff, concise generation and
-   phase logging, then remove assumptions that another repository event is
-   required to recover from failure.
+5. Add periodic reconciliation, uncapped retry with a capped exponential
+   delay, concise generation and phase logging, then remove assumptions that
+   another repository event is required to recover from failure.
 6. Update README operational guidance after the coordinator acceptance suite
    passes.
 7. **G12.1 amendment (2026-08-17):** promote the already parity-tested

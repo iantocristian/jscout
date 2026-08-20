@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_work_retries_without_a_new_event_with_bounded_backoff() {
+    fn failed_work_retries_without_a_new_event_with_capped_delay() {
         let mut coordinator = Coordinator::new(Duration::from_millis(100), false, false);
         let refresh = coordinator.next_work(Duration::ZERO).expect("refresh");
         assert_eq!(
