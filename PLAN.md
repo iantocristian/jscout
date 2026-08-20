@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-18.
+> Status: authoritative plan as of 2026-08-20.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -10,7 +10,17 @@
 > treatment preserved wrong design contracts on a real task. G16 remains an
 > independent conditional correction to G14 attached-memory delivery. G17
 > exact-identifier dominance and G18 task-directed semantic coverage and
-> selection are implemented.
+> selection are implemented. G13 has one planned extension: evidence-backed
+> generated-output boundary reconnaissance for unignored build artifacts.
+> Real-monorepo use has also registered syntax-aware and pure-identifier G17
+> corrections plus staged-use guidance for the existing G14/G18 surfaces. A
+> problem-solving investigation then confirmed that exact definitions are the
+> efficient drill-down surface while repeated expansion dominates response
+> volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
+> is the compact-transport and path-projection pass. G21 is the repository-local
+> runtime-configuration and retrieval-observability pass. None triggers G16 or
+> widens the semantic product surface, and no retrieval default changes without
+> a same-binary, same-snapshot comparison.
 
 ## Document policy
 
@@ -1598,6 +1608,79 @@ neutral inclusion only for the affected subject/ancestors; returning to an
 identical fingerprint reuses the prior classification; and depth, subject,
 call, and context limits terminate mixed subdivision deterministically.
 
+### Planned G13 extension — generated-output boundary reconnaissance
+
+The neutral walker must not treat an ambiguous directory noun such as `build`,
+`lib`, or `generated` as structural truth. A directory named `build` may contain
+authored product code, as it does in Next.js and Twenty, while an unignored
+directory with another name may be reproducible compiler output. L1 therefore
+continues to index every otherwise-indexable, non-ignored file. Repository
+scouting, not the walker, determines whether an indexed scope belongs in the
+default product corpus.
+
+The current reconnaissance input is insufficient for this case. It can classify
+packages, areas, and projects from bounded representatives, but a definite
+runtime parent need not subdivide. An unmarked output subtree can consequently
+inherit runtime treatment when its files have neither a high-precision
+generated path nor a generated header. The follow-up adds exact output-candidate
+subjects without requiring their parent to be `mixed`.
+
+Candidate discovery remains deterministic and treats path names only as weak
+labels. It assembles evidence from bounded, auditable signals such as:
+
+- `tsconfig`/`jsconfig` `outDir`, `declarationDir`, and project-reference output
+  relationships;
+- `package.json` `main`, `module`, `types`, `typings`, `exports`, `bin`, and
+  files/publication boundaries that point into a candidate directory;
+- explicit output paths recoverable from package build scripts and tool
+  configuration, retained as evidence rather than accepted as a verdict;
+- generated headers, source-map links, bundled/minified or transpiled shapes,
+  and bounded source/output correspondence;
+- indexed membership, import/export direction, and representative symbol and
+  entity surfaces for the exact candidate scope.
+
+Gitignored output remains outside L1 and needs no classification. Source-control
+tracked/untracked state may be recorded as supporting evidence when available,
+but cannot be required because history-free snapshots and exported source trees
+must behave coherently.
+
+The model classifies each exact candidate as `runtime`, `tooling`, `generated`,
+`mixed`, or `unknown`, with the existing citation, confidence, context, call,
+and freshness rules. A directory name alone cannot support `likely generated`.
+Fresh `likely generated` output policy is more specific than a runtime parent;
+it may set the child files' effective role to `generated` without requiring the
+parent to become `mixed`. `possible`, `unknown`, stale, invalid, or failed
+classifications remain neutral. A fresh authored/runtime result prevents a weak
+path-name suspicion from demoting the scope.
+
+This is product-corpus policy, not destructive compaction:
+
+- files remain in L1 and remain explicitly searchable;
+- default search retains them with the existing generated-surface penalty;
+- `embed --product` and automatic workflow/card/summary/concept scouting omit
+  fresh generated output by default;
+- overview and dry-run expose the exact boundary, decision, explanation,
+  citations, and downstream policy;
+- output evidence and exact membership participate in the subject fingerprint,
+  so an in-scope rebuild or branch change restores neutral behavior until the
+  matching classification is reused or refreshed.
+
+Acceptance requires at least these paired cases:
+
+1. a Next.js-like authored `src/build/**` scope remains runtime/tooling and in
+   the product corpus;
+2. an unignored compiler-output `build/**` scope is classified generated and
+   omitted from product embedding and automatic semantic scouting;
+3. generated output under a neutral name is discovered from explicit compiler
+   or package boundaries;
+4. a runtime package with a generated child receives the specific child policy
+   without classifying the whole package as mixed;
+5. a name-only suspicion and insufficient or conflicting evidence stay neutral;
+6. gitignored output is never indexed or submitted to the scout;
+7. changing only unrelated repository content reuses the classification, while
+   changing the candidate membership or its cited producer/output evidence
+   invalidates it.
+
 ## Implemented G14 — retrieval handoff and relevance discipline
 
 G14 is retrieval hygiene, not a claim that more retrieval will solve complex
@@ -1693,6 +1776,56 @@ reported in the attachment status.
   no connected artifact exists;
 - compact/debug representations remain fact-equivalent, and all tests use
   deterministic fixtures without model calls.
+
+### Operational interaction amendment (2026-08-19)
+
+Real use on a 7,000-plus-file monorepo confirmed that jscout's primary value is
+cross-package localization and copy-safe source drill-down. Broad conceptual
+ranking, concurrent expansions, and parallel full-artifact reads created noise,
+latency, and truncated client output without improving the verified workflow.
+The shipped skill and structural MCP instructions therefore standardize this
+staged interaction:
+
+1. use `repository_overview` once only when the repository is genuinely cold;
+   skip it when the task already supplies a package, exact symbols, files, or
+   stable anchors, and never use overview to rank semantic artifacts;
+2. split the task into distinct behaviors and issue narrow, unexpanded searches
+   sequentially, normally with limits of 4–6;
+3. refine with learned symbols and use the returned opaque `definition` or
+   `who_uses` arguments before broad source reads;
+4. enable expansion only after localizing an exact entry point, expand one
+   query at a time, and widen its independently reported bounds only when the
+   omitted context is relevant;
+5. retrieve one exact semantic artifact at a time; never fetch several full
+   bodies concurrently through one client output channel;
+6. after the useful artifacts are known, set `include_memory: false` on later
+   code searches rather than repeatedly attaching the same previews; and
+7. once a stable working set of files and symbols is known, stop broad
+   expansion. Re-enable it only for one named unresolved boundary; otherwise
+   use exact definitions/usages and unexpanded searches.
+
+This observation does not justify larger global response, expansion, or memory
+traversal budgets. Telemetry and reports must distinguish the returned
+`expand_nodes` context bound from the internal `memory_nodes` evidence-join
+bound before attributing a 2,000-node truncation to graph expansion. A degraded
+reranker with useful lexical/structural fallback remains a visible provider
+condition, not a reason to weaken deterministic retrieval.
+
+The later TargetsQueue problem-solving investigation validates the drill-down
+half of this contract: four naturally selected exact `definition` calls cost
+11.6 KB total and carried the decisive mechanism, while nine expanded searches
+cost 162.9 KB. G20 may make attached memory explicit and expansion path-shaped,
+but it must not collapse exact definition back into the discovery payload.
+
+MCP `tools/list` necessarily returns complete schemas; a client may present a
+names-only inventory, but jscout will not add a parallel discovery protocol or
+remove schema guidance solely to compensate for a client that prints every
+definition. Optional payload limits use zero consistently to mean omission when
+that interpretation is unambiguous. In particular, `source_limit: 0` is
+equivalent to `include_source: false` rather than an error; the architecture
+inquiry otherwise spent six parallel calls learning a constraint that provided
+no safety or retrieval value. Positive limits retain their declared bounds and
+invalid contradictory combinations still fail explicitly.
 
 ## Parked G15 — design-before-edit task memory
 
@@ -1862,7 +1995,7 @@ tool-using coding agent.
 - using more global card generation or larger response budgets as a substitute
   for hypothesis formation.
 
-## Conditional G16 — adaptive attached-memory delivery
+## Conditional G16 — independent G14 attached-memory fallback
 
 G14 deliberately changed search-attached memory from broad similarity previews
 to evidence-connected selection: direct support first, then bounded graph
@@ -1933,6 +2066,14 @@ The root-layout replay did not trigger G16: independent adjudication found no
 artifact describing the required causal chain, so there was no useful existing
 artifact for the attachment boundary to miss.
 
+The configuration-publish review also does not trigger G16. Useful artifacts
+were deliberately found through `semantic_memory`, attached previews were
+sometimes repeated after discovery, and no useful artifact was shown to be
+rejected solely by the G14 evidence-connection boundary. Its actionable issues
+are staged tool use, G17 occurrence ordering, possible workflow-overlap
+diversity, and consolidated write-back. Adding unconnected bodies or larger
+attachment budgets would worsen the observed noise.
+
 ## Implemented G17 — exact-identifier dominance
 
 Hybrid retrieval currently lets RRF, the cross-encoder, and repository policy
@@ -1962,6 +2103,48 @@ G17 adds an intent lane for identifier-shaped query tokens:
    `exact_occurrence`, or `hybrid`, while preserving existing score fields as
    diagnostics rather than calibrated relevance.
 
+### Planned G17 residual — syntax-aware exact occurrences
+
+The initial G17 tier treats every verified whole-token occurrence as the same
+kind of exactness. In a multi-identifier behavioral query, an import specifier
+can consequently consume the one reserved occurrence for an identifier ahead
+of the call, state transition, or implementation that gives the identifier
+runtime meaning. Exact text is not sufficient to establish equal navigational
+value.
+
+Occurrence ordering becomes deterministic and syntax-aware within the exact
+tier:
+
+```text
+exact definition
+  -> executable occurrence (call, read/write, condition, argument)
+  -> contract/type occurrence
+  -> import/export occurrence
+  -> hybrid candidate
+```
+
+Indexed structural occurrence kinds are authoritative where available. The
+bounded lexer fallback must at minimum recognize import/export-only lines so
+they cannot displace an available executable occurrence. Pure identifier
+lookups retain bounded import/export occurrences; mixed and multi-identifier
+queries use the strongest available occurrence for each identifier's reserved
+slot before returning weaker exact peers. This changes ordering, not recall,
+and does not infer runtime behavior from an import alone.
+
+The TargetsQueue investigation adds two bounded corrections. When a query is a
+single identifier and at least one exact definition or occurrence is admitted,
+the default response ends with the exact tier instead of filling spare result
+slots with hybrid analogs. The response exposes an explicit hybrid-widening
+action; a zero-exact-result query may still fall back to hybrid retrieval.
+Mixed prose/identifier queries keep the existing hybrid path. Exact retrieval
+must produce the same admitted tier when vector retrieval is degraded or
+disabled.
+
+Repeated import/export occurrences for one `(identifier, file, syntax kind)`
+collapse to one locator plus an omitted-occurrence count. Distinct executable
+occurrences in the same file remain separate: diversity must not erase the
+multiple state transitions or calls an investigation is trying to prove.
+
 ### G17 acceptance
 
 - exact definition or occurrence hits for `createRouteTypesManifest`,
@@ -1972,6 +2155,14 @@ G17 adds an intent lane for identifier-shaped query tokens:
   candidate;
 - same-named definitions remain separate candidates and multi-identifier
   queries cover each resolvable identifier within the requested limit;
+- a multi-identifier behavioral query containing `ExportJobPayload` returns an
+  available executable use before its import specifiers, while a pure
+  `ExportJobPayload` lookup still exposes those import sites;
+- a pure `TargetsQueue` query with exact results returns no hybrid filler unless
+  the caller explicitly widens, and its exact tier is unchanged when the vector
+  provider is degraded;
+- repeated imports collapse without collapsing two distinct executable
+  occurrences in the same file; and
 - prose-only queries retain the current hybrid path and complete response-byte
   budget.
 
@@ -2003,6 +2194,32 @@ G18 changes both generation selection and direct semantic retrieval:
 5. Return an explicit `no_supported_memory` result when no artifact is connected
    to supplied anchors/scopes. Do not fill the response with weak analogs merely
    to satisfy `limit`.
+
+### Observed G18 follow-up — overlap and verified consolidation
+
+Broad semantic discovery can still return several apparently duplicate or
+overlapping workflows. Before changing retrieval, diagnostics must distinguish
+true duplicate artifacts from legitimate narrower workflows that share an
+entry point. Any diversity correction uses current support/participant overlap,
+artifact relations, freshness, and supersession—not prose similarity alone—and
+must preserve separately useful stages.
+
+When an agent verifies a stable end-to-end workflow that existing memory splits
+across narrower artifacts, the intended correction is evidence-backed
+`annotate` write-back when the operator or task workflow authorizes persistent
+memory mutation. A read-only repository question does not implicitly authorize
+write-back. When authorized, it publishes the consolidated workflow with exact
+source participants rather than launching another broad speculative scouting
+batch.
+The configuration-publish review is the registered case: analysis/staging,
+queue dispatch, publish mutation, completion notification, and UI state form one
+verified larger skeleton while remaining individually inspectable stages.
+
+Semantic relevance is not architectural or product importance. Jscout may
+provide package boundaries, callers, acceptance/test surfaces, and workflow
+participation as evidence, but it does not convert retrieval scores into a
+universal importance ranking. The requesting agent must label such a ranking as
+judgment against stated criteria.
 
 ### G18 acceptance
 
@@ -2047,6 +2264,373 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
+## Planned G20 — session-efficient compact transport
+
+Real-monorepo use established a second bottleneck after localization quality:
+individually budgeted responses can still repeat enough metadata across an
+exploratory session to consume more context than the repository evidence. The
+[architecture-inquiry call report](eval/results/workflow-architecture-inquiry-2026-08-19.md)
+records the exact 42-call inventory. Twenty-seven responses with retained
+measurements totalled 358,334 inner JSON bytes. Extrapolation across 15
+truncated, omitted, or error responses put total jscout output near 460–510
+KiB, or roughly 115k–145k raw tokens before client-side truncation.
+Approximately 11.8k additional tool-discovery tokens were a client
+orchestration cost and are excluded from the jscout total.
+
+The later
+[TargetsQueue problem-solving investigation](eval/results/targets-queue-problem-investigation-2026-08-20.md)
+records 19 measured calls from a concrete mechanism/edge-case investigation.
+They returned 228.5 KB (223.1 KiB), estimated at 60k–65k tokens. Nine expanded
+searches generated 162.9 KB—about 71% of all jscout bytes—while four naturally
+selected exact definitions generated only 11.6 KB and carried the decisive
+mechanism. The agent judged 55–65% of the session payload avoidable.
+
+This is an architecture-inquiry workload: the agent was explicitly asked to
+discover and explain several product workflows. It is a valid primary jscout
+use case and a useful stress test for conceptual retrieval, but it is not an
+independent coding agent localizing evidence while implementing a story or
+fixing a bug. G20 may use it to optimize transport; claims about implementation
+behavior require later real-work evidence. The TargetsQueue trace supplies
+that missing problem-investigation evidence for natural exact-tool selection
+and marginal value after localization. It still does not establish a patch-
+outcome effect because it was not a controlled implementation comparison.
+
+The useful payload was much narrower: exact symbols and locations, short source
+snippets, opaque anchors, direct uses/call edges, one-sentence workflow meaning,
+defining participants, and freshness. G20 reduces repeated transport without
+removing those facts, weakening source verification, or raising the existing
+24 KB per-response default.
+
+### Confirmed serializer defects
+
+The current compact serializers already remove many diagnostic fields, but the
+review and code inspection confirm these remaining defects:
+
+- search emits the snapshot once at response level and repeats it inside every
+  symbol follow-up together with tool names and origins;
+- a generated follow-up restricts `origins` to the hit's single origin. For a
+  workspace hit this can omit root/unowned first-party usages, while a
+  dependency-only follow-up can omit the first-party callers that matter. This
+  is a correctness defect, not just duplicated bytes;
+- compact search still emits normal-path retrieval, candidate-pool, semantic
+  score, and successful memory-attachment traversal diagnostics whose primary
+  consumer is telemetry rather than the coding agent;
+- exact semantic-artifact detail always returns model/prompt/snapshot/timestamp
+  provenance and up to eight complete supports containing source/context hashes,
+  even when hash-verified source was not requested;
+- expanded search serializes a ranked induced neighborhood rather than the
+  smallest useful cross-file continuations, retaining unrelated graph nodes and
+  high-frequency framework edges;
+- compact graph edges copy raw checker `receiverTypes` verbatim, so a single
+  generic receiver can serialize an entire nested contract instead of the
+  useful bounded type head;
+- search labels repository-wide `refs.target_name` counts as `used_by` even
+  though they are not resolved to the hit's anchor. Common method names can
+  consequently claim hundreds of apparent callers that are only approximate
+  same-name occurrences; and
+- MCP serializes the JSON result inside `content[].text`. This is compatible
+  with existing clients but can appear as escaped JSON inside another captured
+  result and must be measured separately from the inner rendered-byte budget.
+
+Short source excerpts are retained: the review found them useful and estimated
+that they were less than one fifth of total payload. G20 targets metadata,
+diagnostics, repeated defaults, and graph shape before reducing source evidence.
+
+### Compact search and follow-up contract
+
+**Decision amendment to G14:** compact search no longer emits a complete
+arguments object for every eligible hit. The architecture-inquiry agent used
+none of the objects, but that does not establish that implementation agents
+will also ignore them. The highest-ranked uniquely anchored hit therefore keeps
+one complete copy-safe follow-up object by default. Lower hits keep their exact
+anchor and compatible tool names without repeating snapshot/default arguments.
+An explicit debug or widened-follow-up mode may return complete objects for more
+hits.
+
+Compact search also keeps one response-level snapshot. Exact-anchor tools accept
+an anchor without a snapshot and fail with candidates rather than guessing if
+current resolution is ambiguous; a caller that needs strict pinning may use the
+complete top-hit object or copy the one response-level snapshot. Later real
+implementation work must measure whether the top-hit handoff is selected before
+G20 removes or multiplies it.
+
+First-party follow-ups omit `origins`, preserving the normal combined
+`repository` plus `workspace` corpus. A dependency target carries an explicit
+non-default inclusion that permits the dependency definition and first-party
+callers instead of constraining the entire drill-down to `dependency`. Tests
+must cover repository-to-workspace, workspace-to-repository, and
+first-party-to-dependency usage edges.
+
+**Second decision amendment to G14:** `semantic_search` defaults
+`include_memory` to false in its CLI, MCP schema, implementation, and examples.
+Callers opt in when an evidence-connected preview is useful; direct
+`semantic_memory` remains the discovery surface for causal/workflow memory.
+This preserves G14's evidence-connection rules but stops paying their traversal
+and payload cost on every search. Both real-use traces repeatedly received weak
+or already-known previews, and the TargetsQueue investigation found no
+decisive claim in them. This default change does not trigger G16: no useful
+artifact was shown to be rejected solely by the evidence-connection boundary.
+
+Compact graph receiver types render a bounded top-level display such as
+`Errors`, preserve an explicit `truncated` marker, and keep the complete checker
+string only in debug output/telemetry. Compact hit decorations must not label a
+name-only count as `used_by`. A uniquely resolved hit may report bounded
+anchor-resolved incoming edges; otherwise it reports
+`name_occurrences_approx` or omits the count and directs the caller to exact
+`who_uses`. Exact usage semantics cannot be traded for a shorter misleading
+field.
+
+G20 does not initially add server-side short handles. Handles require session
+state, expiry, collision, replay, and reconnect semantics; removing repeated
+defaults captures most of the measured waste while anchors remain durable and
+copy-safe. A stateful handle enters consideration only if post-G20 measurement
+shows anchor strings, rather than bodies or graphs, remain a material share.
+
+The intended default shape is approximately:
+
+```json
+{
+  "snapshot": "...",
+  "hits": [
+    {
+      "anchor": "...",
+      "at": "file:line",
+      "symbol": "...",
+      "snippet": "...",
+      "tools": ["definition", "who_uses", "neighborhood"],
+      "followup": {
+        "arguments": {"anchor": "...", "snapshot": "..."}
+      },
+      "key_edges": ["calls X", "used by Y"]
+    }
+  ]
+}
+```
+
+Lower-ranked hits may lose snippets before identity, location, and key edges.
+Session-aware suppression of previously returned snippets is deferred; staged
+limits and `include_memory: false` avoid adding retrieval-session state for the
+first correction.
+
+### Progressive drill-down remains separate
+
+G20 does not add a generic `fields` selector or inline
+`include_definition`. A field selector multiplies response contracts and asks
+the agent to understand serializer internals before it has localized the task.
+Named compact/debug/artifact views plus strict byte budgets cover the measured
+need. In the problem-solving trace, four separate exact definitions cost only
+11.6 KB and were the highest-value responses; inlining them would move useful
+progressive disclosure back into the 162.9 KB expanded-search class. The
+copy-safe top-hit handoff is the intended round trip unless later latency data,
+not byte speculation, shows that it is the bottleneck.
+
+### Compact semantic-artifact views
+
+Exact `semantic_memory` drill-down gains an explicit view with a type-aware
+compact default:
+
+- `compact`: identity, freshness, one-sentence description or primary claim,
+  and, for workflows, defining participants only;
+- `body`: the complete artifact body plus one compact evidence locator by
+  default, without model/prompt/timestamp provenance or hashes;
+- `full`: the current diagnostic artifact, relations, complete selected
+  supports, provenance, and hashes.
+
+`include_source` remains explicit and hash verification remains mandatory
+internally. Its default returned evidence count becomes one and stays widenable.
+The compact/body response reports support and relation omission counts so a
+caller can request `full` deliberately. Supporting leaf helpers and related
+summaries do not accompany a defining-workflow request unless selected by the
+view or relation request.
+
+Broad semantic discovery continues to return compact handles. G18's
+support/participant-overlap investigation owns duplicate or overlapping
+workflow diversity; G20 does not deduplicate artifacts by prose similarity.
+
+### Agent diagnostics versus telemetry
+
+Default compact responses retain diagnostics only when they change the next
+action:
+
+- degraded/failed lexical, vector, or reranker stages;
+- truncation plus actionable omission counts;
+- `no_connected_memory` and `no_supported_memory` handoffs; and
+- artifact freshness and trust labels.
+
+Candidate-pool size, uncalibrated component scores, successful attachment graph
+depth/node counts, full byte accounting, model/prompt provenance, and evidence
+hashes move behind `debug: true` or the `full` artifact view. They remain in
+per-tool telemetry so G16 and retrieval evaluations do not lose observability.
+Search telemetry and debug output split canonical rendered bytes into at least
+`hits_bytes`, `graph_bytes`, `memory_bytes`, and `envelope_bytes`; the sum and
+accounting method are tested against the complete canonical response. Those
+section counters are not added to every normal response, where they would
+consume more of the budget they are intended to diagnose.
+`rendered_bytes` remains visible when a response truncates; normal-path byte
+measurements are available in telemetry and debug output rather than repeated
+in every agent response.
+
+### Path-shaped expansion
+
+Expanded search gains a path projection optimized for the product question:
+"how does this localized entry point reach another package, handler, state
+transition, or effect?" The compact default returns a ranked path forest rooted
+at the selected hit seeds. It retains the edges required to explain each
+cross-file continuation and gives nodes response-local short IDs while keeping
+the exact anchor at its first occurrence.
+
+The existing induced neighborhood remains an explicit diagnostic mode.
+High-frequency/common calls are suppressed through existing edge-kind weights,
+degree/hub damping, and path contribution—not a brittle blacklist of names such
+as `default`, `object`, or `string`. An edge on a selected connecting path is
+retained even when its display name is common. Omitted path/node/edge counts and
+truncation remain visible, and agents may widen every existing bound.
+With expansion depth one, the same projection is the requested compact one-hop
+caller/callee view; G20 does not add another overlapping expansion tool or mode
+solely for that shape.
+
+### MCP structured-content experiment
+
+The serializer first produces one canonical structured value so text and any
+future MCP `structuredContent` representation are fact-equivalent. G20 then
+tests Codex, Claude Code, and the supported pi/MCP clients before changing the
+wire shape. A client that ignores structured content must retain the JSON-text
+fallback; a client that exposes both forms must not receive two full copies in
+model context. Structured content ships only through a negotiated/profiled
+path that demonstrates lower client-visible bytes. It is not assumed to solve
+compression merely because the protocol can represent it.
+
+Measurement distinguishes:
+
+1. inner canonical JSON bytes;
+2. JSON-RPC wire bytes after escaping/envelopes; and
+3. client-visible model-context bytes after the client's MCP rendering.
+
+### Implementation order and acceptance
+
+1. Preserve both exact call inventories and any recoverable raw responses before
+   changing serializers; label the architecture inquiry's historical 460–510
+   KiB total as an estimate and the problem investigation's 228.5 KB as the
+   measured inner-response baseline.
+2. Fix cross-origin follow-up semantics and remove repeated first-party defaults.
+3. Make attached memory opt-in, bound receiver-type display, and replace or
+   relabel name-only `used_by` counts.
+4. Add compact artifact views, debug-gate routine diagnostics, and record
+   per-section byte accounting in telemetry/debug.
+5. Add path-shaped expansion while preserving explicit neighborhood mode.
+6. Run the structured-content compatibility experiment; ship it only where it
+   reduces client-visible context without a fallback regression.
+7. For each historical workload, run two separate replays:
+   - a fixed-call transport replay with the same valid queries, arguments, call
+     count, and ordering, measuring serializer changes only; and
+   - a staged-session replay with sequential 4–6-result queries, one artifact at
+     a time, delayed expansion, and explicit memory only when needed, measuring
+     skill/orchestration behavior.
+
+The architecture fixed replay excludes the six invalid historical requests
+from byte parity but tests their replacement (`source_limit: 0`) separately.
+The 42-call architecture and 19-call problem-solving workloads are reported
+separately rather than pooled. Each staged replay reports reduced calls and
+bytes independently; its savings cannot be credited to the serializer target.
+
+Acceptance requires:
+
+- all previously identified high-value facts—locations, anchors, snippets,
+  decisive edges, descriptions, defining participants, and freshness—remain
+  available without `debug` or `full`;
+- compact/default aggregate inner JSON bytes fall by at least 60% on the
+  fixed-call transport replay at equal fact coverage and call count. The two
+  workloads are evaluated separately so one cannot hide a regression in the
+  other. The reported 65–75% reduction remains a hypothesis until measured;
+- the staged-session replay reports call count, inner/wire/client-visible bytes,
+  and recovered high-value facts separately, without presenting strategy
+  savings as transport savings;
+- strict individual response-byte budgets and explicit omission reporting
+  remain intact;
+- `source_limit: 0` performs a successful no-source artifact read and a
+  positive source limit remains bounded and widenable;
+- copy-safe exact drill-down returns cross-origin usages rather than silently
+  applying the seed hit's origin as a global filter;
+- the top-hit complete follow-up still round-trips, while lower-hit compact
+  anchors remain sufficient for deliberate drill-down;
+- omitting `include_memory` performs no attachment traversal and returns no
+  preview, while `include_memory: true` remains fact-equivalent to G14's
+  evidence-connected selection;
+- compact receiver types remain bounded for a hostile deeply nested generic and
+  expose truncation, while debug retains the complete checker value;
+- no name-only occurrence count is labelled as exact `used_by`; exact incoming
+  edges and explicitly approximate name counts remain distinguishable;
+- per-section byte counters sum to the canonical response size under complete
+  and truncated responses without appearing in normal compact output;
+- `compact`, `body`, and `full` artifact views are deterministic, and `full` is
+  fact-equivalent to the pre-G20 diagnostic result;
+- path mode preserves the verified configuration-publish skeleton with fewer
+  returned nodes/edges than neighborhood mode and preserves the TargetsQueue
+  feedback-loop continuations, while explicitly requested neighborhood output
+  remains available;
+- the four exact definition responses in the problem-solving replay retain
+  their decisive source facts and remain separate drill-down calls;
+- normal compact responses omit successful-stage scores/pools/hashes, while
+  degraded/truncated responses and telemetry retain enough information to
+  diagnose the event; and
+- no client receives both complete text and structured copies in model context.
+
+This milestone is independent of G15 and does not trigger G16. The observed
+failure was excessive/repeated delivery of memory and graph metadata, not a
+useful artifact hidden solely by G14's evidence-connection boundary.
+
+## Planned G21 — repository runtime configuration
+
+Jscout's durable operator policy currently spans CLI flags, MCP arguments, and
+many `JSCOUT_*` environment variables. This makes one-off experiments possible
+but leaves no repository-level answer to basic operational questions: which
+database the MCP process opened, whether vector retrieval and reranking are
+enabled by default, which gateway/model is selected, and where telemetry is
+written.
+
+G21 adds one versioned `<repository>/.jscout.toml` for non-secret stable
+configuration. Every command resolves the canonical repository root first;
+MCP loads that exact file once at startup and remains one process serving one
+root/database. The default database remains `<root>/.jscout.db`, an explicit
+`--database` remains authoritative, and no parent-directory search,
+multi-repository MCP routing, or hot reload is introduced.
+
+Resolution is explicit invocation/MCP argument, then repository config, then a
+legacy environment fallback, then built-in behavior. API keys and tokens stay
+outside the file; config may name their environment variable or an auth file.
+MCP retrieval booleans become tri-state so omission uses repository policy and
+an explicit value can widen or narrow it. CLI keeps negative retrieval flags
+and gains corresponding positive overrides.
+
+The implementation must centralize database, search, embedding/reranker,
+inference, LLM/gateway, checker, MCP, and telemetry settings in one immutable
+resolved object rather than letting subsystems reread process environment.
+`jscout config show|validate|init` exposes effective values and their sources
+with secrets redacted. MCP initialization and privacy-minimal telemetry record
+the binary/build identity, a non-secret runtime-configuration fingerprint, the
+effective per-call retrieval posture, and stage-specific retrieval timings.
+Exact request arguments remain in the separate privacy-sensitive request log;
+client-side batching and outer-message truncation cannot be inferred by the MCP
+server unless the client supplies that metadata.
+
+The runtime fingerprint is observational, not a global invalidation key.
+Changing reranking, attached memory, expansion, or byte budgets must not alter
+the structural snapshot or embedding-profile identity. In particular, an
+operator can disable reranking for interactive speed and later re-enable it
+without re-embedding the repository.
+
+The current mixed production telemetry is insufficient to change the built-in
+reranker default: deployed rows combine different binaries and intentionally
+different retrieval postures, every ordinary vector-active row also has the
+reranker active, and no relevance labels were recorded. G21 therefore preserves
+existing built-in defaults. A repository may explicitly set `rerank = false`;
+a product-wide change requires a fixed-query comparison on one binary,
+database, snapshot, and embedding profile with only reranking toggled.
+
+The complete schema, migration boundary, phased implementation, tests, and
+acceptance criteria are in the
+[repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md).
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -2067,6 +2651,12 @@ consequences that still govern implementation.
 | Root-layout scouting spent 448 card calls without covering the relevant type-generation surface, while broad semantic-memory calls returned mostly unrelated artifacts | Implement G18 scope-stratified and targeted scouting plus support-aware compact semantic discovery; do not increase default budgets |
 | Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
 | Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
+| Architecture-inquiry use on a 7,000-plus-file monorepo localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and authorized evidence-backed consolidated workflow write-back; do not generalize tool-selection behavior to implementation tasks, trigger G16, or claim retrieval rank measures importance |
+| The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G20 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
+| A 19-call TargetsQueue problem-solving investigation naturally selected four exact definitions that carried the mechanism in 11.6 KB, while nine expansions produced 162.9 KB and weak attached memory | Preserve exact definition as progressive drill-down; make search-attached memory opt-in, stop broad expansion after localization, and replay G20 on this workload separately from the architecture inquiry |
+| The same investigation exposed an unbounded generic receiver string and `used_by` counts derived from unresolved repository-wide names | Bound compact receiver displays with full debug fidelity; replace those counts with anchor-resolved edges or label them as approximate name occurrences |
+| The first production telemetry window mixes binaries and intentionally different retrieval postures; vector-active rows also rerank and no relevance labels exist | Use it for incident discovery only; implement G21 configuration/build fingerprints and stage timings, preserve retrieval defaults, and compare reranking with one variable changed before any global flip |
+| Three 1.86 MB `who_uses` responses predate the current compact whole-response ceiling | Replay a high-fanout case on the current binary and measure follow-up value; do not schedule a duplicate cap implementation or treat historical bytes as current behavior |
 
 Relevant result summaries include:
 
@@ -2085,6 +2675,11 @@ Relevant result summaries include:
 - [AFFiNE contextual reranker smoke](eval/results/affine-reranker-context-2026-08-14.md)
 - [Next.js optimistic-prefetch campaign](eval/results/next-optimistic-prefetch-2026-08-15.md)
 - [Next.js root-layout parameter types](eval/results/next-root-params-types-2026-08-17.md)
+- [workflow architecture-inquiry call trace](eval/results/workflow-architecture-inquiry-2026-08-19.md)
+- [TargetsQueue problem-solving investigation](eval/results/targets-queue-problem-investigation-2026-08-20.md)
+- [cross-trace retrieval synthesis](eval/results/retrieval-cross-trace-synthesis-2026-08-20.md)
+- [first production MCP telemetry window](eval/results/mcp-telemetry-first-window-2026-08-20.md)
+- [repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md)
 
 ## Positioning versus tsserver/LSP
 
