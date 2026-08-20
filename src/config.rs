@@ -343,7 +343,9 @@ struct LlmFileConfig {
 struct OpenAiCompatibleProviderFileConfig {
     id: String,
     name: Option<String>,
+    #[serde(alias = "baseUrl")]
     base_url: String,
+    #[serde(alias = "apiKeyEnv")]
     api_key_env: Option<String>,
     models: Vec<OpenAiCompatibleModelFileConfig>,
 }
@@ -354,7 +356,9 @@ struct OpenAiCompatibleModelFileConfig {
     id: String,
     name: Option<String>,
     reasoning: Option<bool>,
+    #[serde(alias = "contextWindow")]
     context_window: Option<usize>,
+    #[serde(alias = "maxTokens")]
     max_tokens: Option<usize>,
 }
 
@@ -1403,32 +1407,15 @@ fn resolve_compatible_providers(
     configured: Option<Vec<OpenAiCompatibleProviderFileConfig>>,
 ) -> Result<Vec<OpenAiCompatibleProvider>> {
     let (providers, source) = if let Some(configured) = configured {
-        let providers = configured
-            .into_iter()
-            .map(|provider| OpenAiCompatibleProvider {
-                name: provider.name.unwrap_or_else(|| provider.id.clone()),
-                id: provider.id,
-                base_url: provider.base_url,
-                api_key_env: provider.api_key_env,
-                models: provider
-                    .models
-                    .into_iter()
-                    .map(|model| OpenAiCompatibleModel {
-                        name: model.name.unwrap_or_else(|| model.id.clone()),
-                        id: model.id,
-                        reasoning: model.reasoning.unwrap_or(false),
-                        context_window: model.context_window.unwrap_or(131_072),
-                        max_tokens: model.max_tokens.unwrap_or(32_768),
-                    })
-                    .collect(),
-            })
-            .collect();
-        (providers, ValueSource::Config)
+        (
+            normalize_compatible_provider_files(configured),
+            ValueSource::Config,
+        )
     } else if let Some(value) = nonempty_env("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS") {
-        let legacy: Vec<OpenAiCompatibleProvider> = serde_json::from_str(&value).context(
-            "JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS must contain the provider JSON array",
-        )?;
-        (legacy, ValueSource::LegacyEnv)
+        (
+            parse_legacy_compatible_providers(&value)?,
+            ValueSource::LegacyEnv,
+        )
     } else {
         (Vec::new(), ValueSource::Builtin)
     };
@@ -1437,6 +1424,37 @@ fn resolve_compatible_providers(
         .insert("llm.openai_compatible_providers".to_string(), source);
     validate_compatible_providers(&providers)?;
     Ok(providers)
+}
+
+fn parse_legacy_compatible_providers(value: &str) -> Result<Vec<OpenAiCompatibleProvider>> {
+    let legacy: Vec<OpenAiCompatibleProviderFileConfig> = serde_json::from_str(value)
+        .context("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS must contain the provider JSON array")?;
+    Ok(normalize_compatible_provider_files(legacy))
+}
+
+fn normalize_compatible_provider_files(
+    providers: Vec<OpenAiCompatibleProviderFileConfig>,
+) -> Vec<OpenAiCompatibleProvider> {
+    providers
+        .into_iter()
+        .map(|provider| OpenAiCompatibleProvider {
+            name: provider.name.unwrap_or_else(|| provider.id.clone()),
+            id: provider.id,
+            base_url: provider.base_url,
+            api_key_env: provider.api_key_env,
+            models: provider
+                .models
+                .into_iter()
+                .map(|model| OpenAiCompatibleModel {
+                    name: model.name.unwrap_or_else(|| model.id.clone()),
+                    id: model.id,
+                    reasoning: model.reasoning.unwrap_or(false),
+                    context_window: model.context_window.unwrap_or(131_072),
+                    max_tokens: model.max_tokens.unwrap_or(32_768),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn validate_compatible_providers(providers: &[OpenAiCompatibleProvider]) -> Result<()> {
@@ -1490,7 +1508,10 @@ fn validate_compatible_providers(providers: &[OpenAiCompatibleProvider]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{FILE_NAME, RuntimeConfig, SCHEMA_VERSION, TEMPLATE, ValueSource, init};
+    use super::{
+        FILE_NAME, RuntimeConfig, SCHEMA_VERSION, TEMPLATE, ValueSource, init,
+        parse_legacy_compatible_providers,
+    };
     use std::path::Path;
 
     fn write_config(root: &Path, text: &str) -> anyhow::Result<()> {
@@ -1695,6 +1716,21 @@ max_tokens = 10000
         let provider = &configured.effective.llm.openai_compatible_providers[0];
         assert_eq!(provider.name, "private");
         assert_eq!(provider.api_key_env.as_deref(), Some("PRIVATE_MODEL_KEY"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_compatible_provider_json_preserves_gateway_defaults() -> anyhow::Result<()> {
+        let providers = parse_legacy_compatible_providers(
+            r#"[{"id":"local","baseUrl":"http://127.0.0.1:11434/v1","models":[{"id":"smoke","contextWindow":131072,"maxTokens":32768}]}]"#,
+        )?;
+        let provider = &providers[0];
+        assert_eq!(provider.name, "local");
+        assert_eq!(provider.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(provider.models[0].name, "smoke");
+        assert!(!provider.models[0].reasoning);
+        assert_eq!(provider.models[0].context_window, 131_072);
+        assert_eq!(provider.models[0].max_tokens, 32_768);
         Ok(())
     }
 }
