@@ -174,19 +174,32 @@ function nearestPackageScripts(config) {
     if (fs.existsSync(manifest)) {
       try {
         const scripts = JSON.parse(fs.readFileSync(manifest, "utf8")).scripts;
-        return scripts && typeof scripts === "object" ? scripts : {};
+        return {
+          directory,
+          scripts: scripts && typeof scripts === "object" ? scripts : {},
+        };
       } catch {
-        return {};
+        return { directory, scripts: {} };
       }
     }
     if (directory === root) break;
     directory = path.dirname(directory);
   }
-  return {};
+  return { directory: root, scripts: {} };
+}
+
+function commandReferencesConfig(command, config, packageDirectory) {
+  const normalized = command.replaceAll("\\", "/");
+  const relative = path.relative(packageDirectory, config).split(path.sep).join("/");
+  if (relative.length === 0 || relative === ".." || relative.startsWith("../")) return false;
+  const escaped = relative.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(
+    `(?:^|[\\s"'=])(?:\\./)?${escaped}(?=$|[\\s"';&|)])`,
+    "u",
+  ).test(normalized);
 }
 
 function projectPurpose(config, rawConfig, parsed) {
-  const id = path.relative(root, config).split(path.sep).join("/");
   const basename = path.basename(config).toLowerCase();
   const filenameTokens = basename.replace(/\.json$/u, "").split(/[._-]+/u);
   const reasons = [];
@@ -204,8 +217,8 @@ function projectPurpose(config, rawConfig, parsed) {
     reasons.push("tooling-extends");
   }
 
-  const scripts = nearestPackageScripts(config);
-  const scriptReferences = Object.entries(scripts)
+  const packageScripts = nearestPackageScripts(config);
+  const scriptReferences = Object.entries(packageScripts.scripts)
     .filter(([name, command]) => {
       if (
         typeof command !== "string"
@@ -213,8 +226,7 @@ function projectPurpose(config, rawConfig, parsed) {
       ) {
         return false;
       }
-      const normalized = command.split(path.sep).join("/");
-      return normalized.includes(id) || normalized.includes(path.basename(config));
+      return commandReferencesConfig(command, config, packageScripts.directory);
     })
     .map(([name]) => name)
     .sort();

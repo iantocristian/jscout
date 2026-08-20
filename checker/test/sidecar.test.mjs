@@ -307,6 +307,94 @@ test("uses an explicit lint script to corroborate a noEmit tooling config", asyn
   await checker.close();
 });
 
+test("matches lint scripts to the exact package-relative config path", async (context) => {
+  const root = fixture({
+    "package.json": JSON.stringify({
+      scripts: { "lint:types": "tsc -p packages/one/tsconfig.json" },
+    }),
+    "packages/one/main.ts": "export const one = 1;\n",
+    "packages/one/tsconfig.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      files: ["main.ts"],
+    }),
+    "packages/two/main.ts": "export const two = 2;\n",
+    "packages/two/tsconfig.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      files: ["main.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", {
+    files: ["packages/one/main.ts", "packages/two/main.ts"],
+  });
+  const purposes = Object.fromEntries(plan.result.projects.map((project) => [
+    project.project_id,
+    { purpose: project.purpose, reasons: project.purpose_reasons },
+  ]));
+  assert.deepEqual(purposes["packages/one/tsconfig.json"], {
+    purpose: "tooling",
+    reasons: ["tooling-script:lint:types"],
+  });
+  assert.deepEqual(purposes["packages/two/tsconfig.json"], {
+    purpose: "general",
+    reasons: [],
+  });
+  await checker.close();
+});
+
+test("executes a noEmit main config promoted above an overlapping dist config", async (context) => {
+  const source = "declare const agent: { run(): void };\nagent.run()\n";
+  const root = fixture({
+    "package.json": JSON.stringify({
+      scripts: { "lint:types": "tsc -p tsconfig.json" },
+    }),
+    "src/core/agent/agent.ts": source,
+    "test/example.ts": "export const test = true;\n",
+    "vitest.config.ts": "export default {};\n",
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: { noEmit: true },
+      include: ["./src", "./test", "vitest.config.ts"],
+      exclude: ["dist", "node_modules"],
+    }),
+    "tsconfig.dist.json": JSON.stringify({
+      compilerOptions: { noEmit: false },
+      include: ["./src"],
+      exclude: ["dist", "node_modules"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plan = await checker.request("plan_members", {
+    files: ["src/core/agent/agent.ts"],
+  });
+  assert.deepEqual(plan.result.files[0], {
+    file: "src/core/agent/agent.ts",
+    project_ids: ["tsconfig.dist.json"],
+    excluded_project_ids: ["tsconfig.json"],
+    tooling_fallback: false,
+  });
+
+  // Repository reconnaissance may promote the excluded main config. Parsed
+  // TypeScript membership, not the bootstrap preference, is authoritative.
+  const promoted = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [{
+      ...queryFor(source, "agent.run()", "agent", "run"),
+      file: "src/core/agent/agent.ts",
+    }],
+  });
+  assert.equal(promoted.kind, "resolve_members_result", JSON.stringify(promoted));
+  assert.equal(promoted.result.results[0].answer.status, "resolved");
+  await checker.close();
+});
+
 test("does not borrow a lint signal from a neighboring compound command", async (context) => {
   const root = fixture({
     "package.json": JSON.stringify({
