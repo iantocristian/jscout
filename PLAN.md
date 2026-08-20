@@ -1166,8 +1166,9 @@ finished:
 clean
   -> dirty(generation, reasons, full|incremental)
   -> refreshing(generation)
-  -> embedding(generation, snapshot)   [only with --embed]
+  -> embedding-code(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
+  -> embedding-semantic(generation, snapshot)   [only with --embed]
   -> clean
 
 any phase + newer event -> dirty(newer generation)
@@ -1179,7 +1180,7 @@ the desired generation and force another structural refresh before the
 watcher can become clean. Structural work is allowed to finish rather than be
 cancelled mid-transaction; optional embedding work stops between batches and
 checker work terminates its bounded sidecar when superseded. Before starting
-either optional phase, the coordinator drains pending events and skips that
+each optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
 A structural refresh may return individual file rejections. `jscout index` and
