@@ -761,8 +761,10 @@ manifest-rehashing subsystem for them.
 
 ### Required G10 scale correction
 
-**Implementation status (2026-08-14).** The correction below is implemented in
-checker protocol v2 and schema v19: complete-by-default/manual planning,
+**Implementation status (2026-08-14, amended 2026-08-20).** The correction
+below is implemented in checker protocol v2 and schema v19: complete
+configured-project coverage by default, explicit inferred-project coverage
+under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
 per-project batches, one disposable Program worker per project, once-per-project
 source mapping, durable batch staging/resume, controlled partial activation,
@@ -818,6 +820,9 @@ The default plan:
   `certain` or `likely` structural edge (currently including namespace-member
   calls resolved through the module/export graph); line or name coincidence is
   never sufficient;
+- excludes synthetic inferred projects for files outside every configured
+  TypeScript project; those files remain fully available to deterministic
+  structure, FTS, embeddings, and retrieval;
 - requires at least one current property-hub target candidate;
 - ranks exported/entity/workflow boundaries and watcher-supplied changed files
   ahead of unanchored internal calls;
@@ -826,19 +831,20 @@ The default plan:
   final in-file order; lexicographic package, file, anchor, or property order
   must not let one prefix monopolize early staged progress or an explicitly
   capped run;
-- selects every eligible occurrence; batching, project-worker disposal, and
-  durable staging bound resources rather than discarding repository coverage.
+- selects every eligible occurrence with a configured project owner; batching,
+  project-worker disposal, and durable staging bound resources rather than
+  discarding configured-project coverage.
 
 Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
 plan. `--max-occurrences N` is an operator-requested runtime cap applied after
 the deterministic spread order; without it, manual `jscout enrich` has no
-occurrence-count cap. `--all` broadens eligibility to normally excluded roles
-and already `certain`/`likely` calls for audit or diagnostic runs; it is not
-required for ordinary complete repository enrichment. Hitting an explicit cap
-is successful partial enrichment only when the report and stored batch coverage
-expose the omitted count. An occurrence without a checker fact keeps the
-existing `possible` property-hub path, so bounded coverage cannot fabricate
-certainty or create a false negative.
+occurrence-count cap. `--all` broadens eligibility to normally excluded roles,
+already `certain`/`likely` calls, and synthetic inferred projects for audit or
+diagnostic runs. The inferred-project gate precedes this cap. Hitting an
+explicit cap is successful partial enrichment only when the report and stored
+batch coverage expose the omitted count. An occurrence without a checker fact
+keeps the existing `possible` property-hub path, so bounded coverage cannot
+fabricate certainty or create a false negative.
 
 Rust owns source-hash verification and caches it once per distinct file for the
 run. It also owns declaration-to-anchor mapping, selection coverage, budgets,
@@ -852,7 +858,8 @@ Project discovery builds one reverse file-to-owning-project index. Ownership is
 enumerated once for the planned file set, not rediscovered for each occurrence.
 Conflicting owners remain visible under the existing ambiguity rules.
 
-Rust schedules one configured project at a time by default. A project worker
+Rust schedules one selected project at a time, with configured projects before
+inferred projects when `--all` opts into the latter. A project worker
 constructs one TypeScript `Program`, resolves bounded batches grouped by source
 file, returns the results plus one project input manifest/fingerprint, and then
 exits. The host must not retain an unbounded `programCache`; any future
@@ -871,6 +878,29 @@ The project fingerprint is computed during the one program construction. After
 its final query batch, the worker rehashes the exact input manifest without
 rebuilding the `Program`; Rust rechecks the returned files before activation.
 The current destroy-everything-and-rebuild validation pass is removed.
+
+#### Inferred-project coverage amendment
+
+Files without a configured TypeScript-project owner are not missing from the
+repository index. They retain chunks, symbols, imports/references, heuristic
+member-call edges, FTS, embeddings, and every retrieval surface. The checker
+adds only occurrence-specific receiver-type evidence, so default enrichment
+does not construct one synthetic Program per such file. Reports expose files
+and eligible occurrences outside configured projects plus the occurrences
+skipped by this gate. `--all` is the explicit escape hatch, and configured
+projects execute first so inferred lexical IDs cannot monopolize visible
+progress.
+
+Two relaxations are reserved, in this order:
+
+1. Make the gate role-aware if production-role unconfigured files demonstrate
+   a typed-edge retrieval gap; tooling/script roles remain excluded.
+2. If inferred enrichment is then used enough to justify its cost, replace the
+   per-file fallback with bounded inferred scopes grouped first by package and
+   compatible compiler-option family, then deterministically subdivided by
+   directory. Grouping is both a resource optimization and the semantically
+   correct shape for connected plain-JS module graphs, but it is not built
+   before opt-in evidence requires it.
 
 #### Durable staging, resume, and partial coverage
 

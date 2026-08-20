@@ -99,7 +99,7 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage
-                               #   --all includes normally excluded roles/resolved calls
+                               #   --all also includes resolved calls and inferred projects
 jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
                                # optional code-vector/checker/semantic-vector phases
@@ -324,12 +324,20 @@ that still reach property candidates. Tests, fixtures, generated files,
 documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
 or `--role` to narrow that set. `--all` broadens it to the normally excluded
-cases; it is not needed for ordinary complete repository coverage.
+cases and explicitly includes synthetic inferred projects for files outside
+every configured TypeScript project. Those files remain first-class in chunks,
+symbols, structural edges, FTS, embeddings, and retrieval when checker
+enrichment skips them.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
-files within each priority tier. `--dry-run` reports discovered, eligible,
-selected, omitted, project, and configuration counts after a configuration-only
-ownership pass and does not construct a TypeScript Program.
+files within each priority tier; configured projects execute before inferred
+projects when `--all` is used. The inferred-project gate runs before the
+operator cap, so skipped files cannot consume a capped selection.
+`--dry-run` reports discovered, eligible, selected, omitted, project, and
+configuration counts after a configuration-only ownership pass and does not
+construct a TypeScript Program. Its coverage fields distinguish eligible files
+and occurrences without configured owners from occurrences actually skipped by
+the default inferred-project gate.
 
 The default plan excludes calls whose member name has indexed namesakes only
 outside effective-runtime files; `--all` bypasses that necessary anchorability
@@ -375,11 +383,12 @@ lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multipl
 targets or a declaration jscout cannot map — still makes every survivor
 `possible`.
 
-Rust schedules one configured project at a time. Its disposable Node worker
-constructs one TypeScript Program, resolves batches of at most 128 calls (the
-protocol accepts at most 512 and enforces 1 MiB request/response frames),
-rehashes the exact project input manifest without rebuilding the Program, and
-then exits so its heap is reclaimed before the next project starts.
+Rust schedules one selected project at a time, configured projects first. Its
+disposable Node worker constructs one TypeScript Program, resolves batches of
+at most 128 calls (the protocol accepts at most 512 and enforces 1 MiB
+request/response frames), rehashes the exact project input manifest without
+rebuilding the Program, and then exits so its heap is reclaimed before the next
+project starts.
 
 Results are committed to SQLite staging after every successful batch. The run
 key includes the structural snapshot, deterministic plan, TypeScript identity,
