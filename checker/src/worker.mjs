@@ -174,19 +174,32 @@ function nearestPackageScripts(config) {
     if (fs.existsSync(manifest)) {
       try {
         const scripts = JSON.parse(fs.readFileSync(manifest, "utf8")).scripts;
-        return scripts && typeof scripts === "object" ? scripts : {};
+        return {
+          directory,
+          scripts: scripts && typeof scripts === "object" ? scripts : {},
+        };
       } catch {
-        return {};
+        return { directory, scripts: {} };
       }
     }
     if (directory === root) break;
     directory = path.dirname(directory);
   }
-  return {};
+  return { directory: root, scripts: {} };
+}
+
+function commandReferencesConfig(command, config, packageDirectory) {
+  const normalized = command.replaceAll("\\", "/");
+  const relative = path.relative(packageDirectory, config).split(path.sep).join("/");
+  if (relative.length === 0 || relative === ".." || relative.startsWith("../")) return false;
+  const escaped = relative.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(
+    `(?:^|[\\s"'=])(?:\\./)?${escaped}(?=$|[\\s"';&|)])`,
+    "u",
+  ).test(normalized);
 }
 
 function projectPurpose(config, rawConfig, parsed) {
-  const id = path.relative(root, config).split(path.sep).join("/");
   const basename = path.basename(config).toLowerCase();
   const filenameTokens = basename.replace(/\.json$/u, "").split(/[._-]+/u);
   const reasons = [];
@@ -204,8 +217,8 @@ function projectPurpose(config, rawConfig, parsed) {
     reasons.push("tooling-extends");
   }
 
-  const scripts = nearestPackageScripts(config);
-  const scriptReferences = Object.entries(scripts)
+  const packageScripts = nearestPackageScripts(config);
+  const scriptReferences = Object.entries(packageScripts.scripts)
     .filter(([name, command]) => {
       if (
         typeof command !== "string"
@@ -213,8 +226,7 @@ function projectPurpose(config, rawConfig, parsed) {
       ) {
         return false;
       }
-      const normalized = command.split(path.sep).join("/");
-      return normalized.includes(id) || normalized.includes(path.basename(config));
+      return commandReferencesConfig(command, config, packageScripts.directory);
     })
     .map(([name]) => name)
     .sort();
@@ -673,9 +685,14 @@ function resolveMembers(projectId, queries) {
   const firstFile = resolveQueryFile(queries[0].file);
   const project = projectById(projectId, firstFile);
   if (!project) throw coded("project_not_found", `project not found: ${projectId}`);
+  const projectFiles = new Set(project.fileNames);
   for (const query of queries) {
     const queryFile = resolveQueryFile(query.file);
-    if (!owningProjects(queryFile).owners.some((owner) => owner.id === projectId)) {
+    // The Rust planner may deliberately promote an owner that this sidecar's
+    // coarse purpose heuristic put in excluded_project_ids. At execution time
+    // validate actual parsed TypeScript membership, not the heuristic owner
+    // preference a second time.
+    if (!projectFiles.has(queryFile)) {
       throw coded("project_mismatch", `${query.file} is not owned by ${projectId}`);
     }
   }
