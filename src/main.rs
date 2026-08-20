@@ -1612,8 +1612,9 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     // "unchanged" count would always read 0 and misreport the rebuild as failed
     // change detection. Watch reports reuse for its incremental generations.
     println!(
-        "indexed {} files ({} rejected) — {} chunks, {} refs in {:?}",
+        "indexed {} files (removed={}, rejected={}) — {} chunks, {} refs in {:?}",
         o.indexed,
+        o.removed,
         o.rejected,
         o.chunks,
         o.refs,

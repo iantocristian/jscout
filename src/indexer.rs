@@ -1287,25 +1287,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn permanently_unreadable_subtree_does_not_wedge_indexing() -> Result<()> {
+    fn previously_indexed_unreadable_subtree_reports_removal_magnitude() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let repo = tempfile::tempdir()?;
         let locked = repo.path().join("locked");
         fs::create_dir_all(&locked)?;
         fs::write(repo.path().join("good.ts"), "export const good = 1;\n")?;
-        fs::write(locked.join("hidden.ts"), "export const hidden = 1;\n")?;
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        fs::write(locked.join("first.ts"), "export const first = 1;\n")?;
+        fs::write(locked.join("second.ts"), "export const second = 2;\n")?;
         let conn = store::open(repo.path())?;
+        let initial = index_repo(repo.path(), &conn)?;
+        assert_eq!(
+            (initial.indexed, initial.removed, initial.rejected),
+            (3, 0, 0)
+        );
 
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
         let result = index_repo(repo.path(), &conn);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
         let outcome = result?;
 
-        assert_eq!(outcome.indexed, 1);
+        assert_eq!(outcome.indexed, 0);
+        assert_eq!(outcome.unchanged, 1);
+        assert_eq!(outcome.removed, 2);
         assert_eq!(outcome.rejected, 1);
         assert_eq!(outcome.rejections[0].path, "locked");
         assert_eq!(outcome.rejections[0].stage, "walk");
+        let paths = conn
+            .prepare("SELECT path FROM files ORDER BY path")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(paths, vec!["good.ts"]);
         assert!(!structural::current_snapshot(&conn)?.is_empty());
         Ok(())
     }
