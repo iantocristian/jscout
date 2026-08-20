@@ -317,7 +317,7 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
     let (roots, forced_entries, source_basis) = analysis_roots(package, &manifest);
     let mut candidates = Vec::new();
     for root in roots {
-        collect_indexable_files(&root, &mut candidates);
+        collect_indexable_files(&root, &mut candidates)?;
     }
     candidates.sort();
     candidates.dedup();
@@ -532,20 +532,21 @@ fn relative_files(package_root: &Path, targets: &[PathBuf]) -> BTreeSet<String> 
         .collect()
 }
 
-fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) {
+fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if root.is_file() {
         if walk::is_indexable(root) {
             out.push(root.to_path_buf());
         }
-        return;
+        return Ok(());
     }
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+    let entries = fs::read_dir(root)
+        .with_context(|| format!("read dependency directory {}", root.display()))?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("read dependency directory entry in {}", root.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read dependency file type {}", entry.path().display()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || name == "node_modules" {
@@ -553,11 +554,12 @@ fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) {
         }
         let path = entry.path();
         if file_type.is_dir() {
-            collect_indexable_files(&path, out);
+            collect_indexable_files(&path, out)?;
         } else if file_type.is_file() && walk::is_indexable(&path) {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 fn normalized_selectors(selectors: &[String]) -> Result<BTreeSet<String>> {
@@ -693,13 +695,28 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        DependencyLimits, DiscoveredPackage, discover, plan_packages, should_skip_minified,
+        DependencyLimits, DiscoveredPackage, collect_indexable_files, discover, plan_packages,
+        should_skip_minified,
     };
     use crate::{store, workspace::WorkspaceMap};
 
     fn write(path: &Path, content: &str) -> Result<()> {
         fs::create_dir_all(path.parent().expect("parent"))?;
         fs::write(path, content)?;
+        Ok(())
+    }
+
+    fn workspace(root: &Path) -> Result<WorkspaceMap> {
+        let inventory = crate::walk::source_inventory(root)?;
+        Ok(WorkspaceMap::discover(root, &inventory.files)?.map)
+    }
+
+    #[test]
+    fn dependency_traversal_errors_are_not_silently_dropped() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let mut files = Vec::new();
+
+        assert!(collect_indexable_files(&repo.path().join("missing"), &mut files).is_err());
         Ok(())
     }
 
@@ -753,7 +770,7 @@ mod tests {
 
         let conn = store::open(root)?;
         importer(&conn, root, "src/main.ts", "left-pad")?;
-        let workspace = WorkspaceMap::build(root);
+        let workspace = workspace(root)?;
         let packages = discover(root, &conn, &["left-pad".into(), "work".into()], &workspace)?;
 
         assert_eq!(packages.len(), 2);
@@ -797,7 +814,7 @@ mod tests {
         importer(&conn, root, "src/root.ts", "dep")?;
         importer(&conn, root, "packages/app/src/app.ts", "dep")?;
 
-        let packages = discover(root, &conn, &["dep".into()], &WorkspaceMap::build(root))?;
+        let packages = discover(root, &conn, &["dep".into()], &workspace(root)?)?;
         let versions: BTreeSet<_> = packages
             .iter()
             .filter_map(|package| package.version.as_deref())
@@ -815,7 +832,7 @@ mod tests {
             repo.path(),
             &conn,
             &["left-pad".into()],
-            &WorkspaceMap::build(repo.path()),
+            &workspace(repo.path())?,
         )
         .unwrap_err();
         assert!(error.to_string().contains("Plug'n'Play"));

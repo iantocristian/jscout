@@ -3,7 +3,7 @@ pub mod process;
 pub mod protocol;
 
 pub(crate) use enrich::target_fingerprint;
-pub use enrich::{EnrichOptions, EnrichReport, enrich};
+pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
 
 use std::env;
 use std::path::{Path, PathBuf};

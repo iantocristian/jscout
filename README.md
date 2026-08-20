@@ -99,10 +99,11 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage
-                               #   --all includes normally excluded roles/resolved calls
-jscout watch <root> [--embed] [--enrich]
+                               #   --all also includes resolved calls and inferred projects
+jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
-                               # optional vector/checker phases
+                               # optional code-vector/checker/semantic-vector phases
+                               #   --product keeps embedding to the effective product corpus
                                #   repeat --deps from index to retain that corpus
                                #   --database PATH isolates index/memory state
                                #   --debounce-ms 2000 waits for a trailing quiet point
@@ -323,12 +324,20 @@ that still reach property candidates. Tests, fixtures, generated files,
 documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
 or `--role` to narrow that set. `--all` broadens it to the normally excluded
-cases; it is not needed for ordinary complete repository coverage.
+cases and explicitly includes synthetic inferred projects for files outside
+every configured TypeScript project. Those files remain first-class in chunks,
+symbols, structural edges, FTS, embeddings, and retrieval when checker
+enrichment skips them.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
-files within each priority tier. `--dry-run` reports discovered, eligible,
-selected, omitted, project, and configuration counts after a configuration-only
-ownership pass and does not construct a TypeScript Program.
+files within each priority tier; configured projects execute before inferred
+projects when `--all` is used. The inferred-project gate runs before the
+operator cap, so skipped files cannot consume a capped selection.
+`--dry-run` reports discovered, eligible, selected, omitted, project, and
+configuration counts after a configuration-only ownership pass and does not
+construct a TypeScript Program. Its coverage fields distinguish eligible files
+and occurrences without configured owners from occurrences actually skipped by
+the default inferred-project gate.
 
 The default plan excludes calls whose member name has indexed namesakes only
 outside effective-runtime files; `--all` bypasses that necessary anchorability
@@ -374,11 +383,12 @@ lists aggregate `unknown_projects`. Ambiguity from a resolved answer — multipl
 targets or a declaration jscout cannot map — still makes every survivor
 `possible`.
 
-Rust schedules one configured project at a time. Its disposable Node worker
-constructs one TypeScript Program, resolves batches of at most 128 calls (the
-protocol accepts at most 512 and enforces 1 MiB request/response frames),
-rehashes the exact project input manifest without rebuilding the Program, and
-then exits so its heap is reclaimed before the next project starts.
+Rust schedules one selected project at a time, configured projects first. Its
+disposable Node worker constructs one TypeScript Program, resolves batches of
+at most 128 calls (the protocol accepts at most 512 and enforces 1 MiB
+request/response frames), rehashes the exact project input manifest without
+rebuilding the Program, and then exits so its heap is reclaimed before the next
+project starts.
 
 Results are committed to SQLite staging after every successful batch. The run
 key includes the structural snapshot, deterministic plan, TypeScript identity,
@@ -413,6 +423,23 @@ new filesystem event. Relevant edits that arrive during enrichment cancel or
 supersede that work and require a new structural generation. Plain `watch`
 never starts Node.
 
+Watch maintains structural state and, when explicitly enabled, checker facts
+plus code and semantic vector indexes. It does not generate semantic content:
+repository scouting, cards, workflows, summaries, and concepts remain explicit
+`jscout scout` operations. With both optional planes enabled, the phase order is
+`refresh -> embed(code) -> enrich -> embed(semantic)`; without `--enrich`, the
+semantic tail follows code embedding immediately. The tail absorbs artifacts
+written by prior manual scout or agent-annotation operations and repairs their
+semantic vector index from the durable cache. The complete manual enrichment
+sequence remains:
+
+```bash
+jscout index .
+jscout enrich .
+jscout scout repository . --max-calls all
+JSCOUT_EMBED_PROVIDER=local jscout embed . --product --semantic
+```
+
 ### Watcher lifecycle
 
 `jscout watch` subscribes before its startup pass and begins with the same full
@@ -429,25 +456,67 @@ coalesced generation.
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
 needed. Exact-snapshot checker facts may be reused when the resulting snapshot
-is unchanged; any changed snapshot drops them. A changed file that fails read
-or extraction is omitted from the visibly partial snapshot rather than served
-from its old row. The default two-second trailing quiet period coalesces edits;
-an event received during any phase advances the desired generation and cannot
-be consumed by the phase already running.
+is unchanged; any changed snapshot drops them. A deterministic extraction
+rejection or non-retryable read failure is reported and excluded; an old row
+for that path is not served as current. The refresh still succeeds over the
+indexable corpus.
+The classified workspace map is built first. Workspace globs are expanded
+against the filesystem, so a declared package keeps first-party identity even
+when it contains only excluded build output or gitignored source. Indexed
+sources are an alias-target preference, not a membership gate; when no indexed
+source mapping exists, a classified manifest-entry lookup preserves the
+declared alias. First-party extraction, current-import dependency discovery,
+and every selected-dependency source read then complete in one rollbackable
+transaction before the old snapshot publication is invalidated. A retryable
+acquisition failure therefore leaves the previous snapshot queryable until a
+complete replacement can commit.
+
+Compatibility note: repositories indexed by the brief source-derived
+workspace-discovery implementation get a one-time resolution-identity change
+when source-less members return to the workspace map. The resulting snapshot
+change intentionally invalidates exact-snapshot checker batches once.
+The default two-second trailing quiet period coalesces edits; an event received
+during any phase advances the desired generation and cannot be consumed by the
+phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
-busy timeout. Fatal refresh, embedding, and checker errors retry with bounded
-backoff without waiting for another edit. Three identical per-file extraction
-failure sets expose the same visibly partial snapshot as manual `index`, mark
-the generation degraded, and continue optional phases; the default ten-minute
-reconciliation pass retries that coverage and repairs missed notifications.
-Its interval is measured from completion of the previous generation, avoiding
-back-to-back refreshes when a cycle itself is slow; a nonzero interval must be
-greater than the debounce period. A previously degraded, identical failure set
-can degrade immediately in later generations instead of paying three known-
-futile retries each time.
+busy timeout. Fatal refresh, embedding, and checker errors retry indefinitely
+without waiting for another edit, with an exponential delay capped at 30
+seconds. Recognized transient read failures such as descriptor exhaustion,
+interrupted/network I/O, or stale handles are phase errors: the transaction
+rolls back and watch retries instead of publishing a reduced corpus. A path
+that disappears or changes between file and directory after inventory is
+ordinary checkout churn, not evidence of an atomic-snapshot violation; its old
+row is removed and later events or reconciliation converge on the next state.
+Checker enrichment may publish a partial batch when some projects fail. A
+transient project failure uses the phase retry loop; a partial batch containing
+only deterministic project failures completes the generation with
+`status=partial` and those projects are attempted again after the next source
+generation or periodic reconciliation. A checker worker or whole sidecar
+process crash/exit is project-terminal: successful project staging is retained
+and the crashed project follows that generation/reconciliation recovery path
+instead of an uncapped immediate crash loop. Recognized launch, request,
+transport, and resource failures remain immediately retryable.
+Repository traversal applies the same classifier at subtree granularity:
+retryable I/O aborts the phase, while a permanently inaccessible subtree is
+reported and excluded without losing accessible siblings. Attached
+`.gitignore`/`.ignore` errors are surfaced rather than discarded. Selected-
+dependency traversal is a phase error because that explicitly requested
+package inventory is planned as one bounded unit.
+Non-retryable file reads and deterministic extraction failures are rejected
+inputs. They do not degrade a refresh or trigger whole-repository retries, and
+their path, stage, and error remain visible in every index report. The default
+ten-minute reconciliation pass naturally attempts those paths again while also
+repairing missed notifications. Its interval is measured from completion of
+the previous generation, avoiding back-to-back refreshes when a cycle itself is
+slow; a nonzero interval must be greater than the debounce period.
 Set `--reconcile-seconds 0` only when giving up that bounded recovery is
-acceptable.
+acceptable; it does not disable phase-error retries.
+
+An external dependency/checker path that cannot be registered with the native
+filesystem watcher is marked as degraded coverage immediately. Registration is
+attempted again on later target reconciliation; it does not have a separate
+retry loop.
 
 Database/WAL/SHM writes are excluded by exact path. For long-running watch,
 prefer an external `--database` path (or ensure the selected database family is
@@ -769,9 +838,15 @@ Retrieval and diagnostics:
 | `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
 | `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
-Indexing continues past file-local read and extraction errors. The final count
-is followed by every failed path, its stage (`read` or `extract`), and the
-underlying error on stderr; `watch` prints the same detail on each cycle.
+Indexing continues past non-retryable file reads, permanent subtree/boundary
+failures, and deterministic extraction errors. The final summary reports both
+`removed=N` and `rejected=N`, followed by every rejected path, its stage
+(`walk`, `ignore`, `workspace-manifest`,
+`workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `read`, or
+`extract`), and the underlying error on stderr; `watch` prints the same detail
+on each cycle. A recognized transient read error fails the phase instead, so a
+reduced corpus is not published; watch retries indefinitely with an
+exponential delay capped at 30 seconds.
 
 ## Call-site queries
 
@@ -867,8 +942,15 @@ changed snapshot removes it. Run `jscout enrich` again when those
 occurrence-specific edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
-periodic full reconciliation. Manual `jscout index` always remains a full
-disposable-snapshot rebuild.
+periodic full reconciliation. `watch --embed` updates the default corpus;
+`watch --embed --product` applies the same fresh reconnaissance policy and
+neutral production fallback as `jscout embed --product`, so it does not widen a
+product-only vector cache. Each embedding phase reports missing documents,
+newly embedded documents, durable-cache reuse, and current vector occurrences;
+a fully cached pass therefore reports reuse rather than `embedded=0/0`.
+`watch --embed` also repairs and tops up semantic-artifact vectors after the
+checker phase. Manual `jscout index` always remains a full disposable-snapshot
+rebuild.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

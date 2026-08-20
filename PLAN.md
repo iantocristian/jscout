@@ -16,8 +16,9 @@
 > corrections plus staged-use guidance for the existing G14/G18 surfaces. A
 > problem-solving investigation then confirmed that exact definitions are the
 > efficient drill-down surface while repeated expansion dominates response
-> volume. G19 is planned as a compact-transport and path-projection pass; it
-> does not trigger G16 or widen the semantic product surface.
+> volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
+> is the compact-transport and path-projection pass. Neither triggers G16 or
+> widens the semantic product surface.
 
 ## Document policy
 
@@ -756,15 +757,22 @@ a different rebuilt structural snapshot.
 `jscout watch --enrich` makes replenishment automatic. Each relevant event is
 debounced, indexed first, then enriched. A checker failure leaves the current
 snapshot without checker edges unless the scale-corrected planner reaches a
-controlled partial activation with explicit coverage. Either condition remains
-retryable. External-input watching and generation cancellation belong to the
+controlled partial activation with explicit coverage. Transient failures remain
+phase-retryable. A partial activation containing only deterministic project
+failures completes that watch generation as partial and is attempted again on
+the next structural generation or periodic reconciliation. Worker and whole
+sidecar process crashes/exits use this project-terminal path; recognized
+launch/request/transport/resource failures remain phase-retryable. External-input
+watching and generation cancellation belong to the
 later watcher coordinator; the fixed-snapshot path does not retain a
 manifest-rehashing subsystem for them.
 
 ### Required G10 scale correction
 
-**Implementation status (2026-08-14).** The correction below is implemented in
-checker protocol v2 and schema v19: complete-by-default/manual planning,
+**Implementation status (2026-08-14, amended 2026-08-20).** The correction
+below is implemented in checker protocol v2 and schema v19: complete
+configured-project coverage by default, explicit inferred-project coverage
+under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
 per-project batches, one disposable Program worker per project, once-per-project
 source mapping, durable batch staging/resume, controlled partial activation,
@@ -820,6 +828,9 @@ The default plan:
   `certain` or `likely` structural edge (currently including namespace-member
   calls resolved through the module/export graph); line or name coincidence is
   never sufficient;
+- excludes synthetic inferred projects for files outside every configured
+  TypeScript project; those files remain fully available to deterministic
+  structure, FTS, embeddings, and retrieval;
 - requires at least one current property-hub target candidate;
 - ranks exported/entity/workflow boundaries and watcher-supplied changed files
   ahead of unanchored internal calls;
@@ -828,19 +839,20 @@ The default plan:
   final in-file order; lexicographic package, file, anchor, or property order
   must not let one prefix monopolize early staged progress or an explicitly
   capped run;
-- selects every eligible occurrence; batching, project-worker disposal, and
-  durable staging bound resources rather than discarding repository coverage.
+- selects every eligible occurrence with a configured project owner; batching,
+  project-worker disposal, and durable staging bound resources rather than
+  discarding configured-project coverage.
 
 Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
 plan. `--max-occurrences N` is an operator-requested runtime cap applied after
 the deterministic spread order; without it, manual `jscout enrich` has no
-occurrence-count cap. `--all` broadens eligibility to normally excluded roles
-and already `certain`/`likely` calls for audit or diagnostic runs; it is not
-required for ordinary complete repository enrichment. Hitting an explicit cap
-is successful partial enrichment only when the report and stored batch coverage
-expose the omitted count. An occurrence without a checker fact keeps the
-existing `possible` property-hub path, so bounded coverage cannot fabricate
-certainty or create a false negative.
+occurrence-count cap. `--all` broadens eligibility to normally excluded roles,
+already `certain`/`likely` calls, and synthetic inferred projects for audit or
+diagnostic runs. The inferred-project gate precedes this cap. Hitting an
+explicit cap is successful partial enrichment only when the report and stored
+batch coverage expose the omitted count. An occurrence without a checker fact
+keeps the existing `possible` property-hub path, so bounded coverage cannot
+fabricate certainty or create a false negative.
 
 Rust owns source-hash verification and caches it once per distinct file for the
 run. It also owns declaration-to-anchor mapping, selection coverage, budgets,
@@ -854,7 +866,8 @@ Project discovery builds one reverse file-to-owning-project index. Ownership is
 enumerated once for the planned file set, not rediscovered for each occurrence.
 Conflicting owners remain visible under the existing ambiguity rules.
 
-Rust schedules one configured project at a time by default. A project worker
+Rust schedules one selected project at a time, with configured projects before
+inferred projects when `--all` opts into the latter. A project worker
 constructs one TypeScript `Program`, resolves bounded batches grouped by source
 file, returns the results plus one project input manifest/fingerprint, and then
 exits. The host must not retain an unbounded `programCache`; any future
@@ -873,6 +886,29 @@ The project fingerprint is computed during the one program construction. After
 its final query batch, the worker rehashes the exact input manifest without
 rebuilding the `Program`; Rust rechecks the returned files before activation.
 The current destroy-everything-and-rebuild validation pass is removed.
+
+#### Inferred-project coverage amendment
+
+Files without a configured TypeScript-project owner are not missing from the
+repository index. They retain chunks, symbols, imports/references, heuristic
+member-call edges, FTS, embeddings, and every retrieval surface. The checker
+adds only occurrence-specific receiver-type evidence, so default enrichment
+does not construct one synthetic Program per such file. Reports expose files
+and eligible occurrences outside configured projects plus the occurrences
+skipped by this gate. `--all` is the explicit escape hatch, and configured
+projects execute first so inferred lexical IDs cannot monopolize visible
+progress.
+
+Two relaxations are reserved, in this order:
+
+1. Make the gate role-aware if production-role unconfigured files demonstrate
+   a typed-edge retrieval gap; tooling/script roles remain excluded.
+2. If inferred enrichment is then used enough to justify its cost, replace the
+   per-file fallback with bounded inferred scopes grouped first by package and
+   compatible compiler-option family, then deterministically subdivided by
+   directory. Grouping is both a resource optimization and the semantically
+   correct shape for connected plain-JS module graphs, but it is not built
+   before opt-in evidence requires it.
 
 #### Durable staging, resume, and partial coverage
 
@@ -1063,9 +1099,9 @@ Acceptance checks:
 - a genuine v15 embedding layout is rejected without mutation, while the v16
   durable floor preserves compatible embedding and semantic-memory rows;
 - a fatal required-phase failure never publishes a snapshot marker describing
-  new or partially rebuilt structural rows; individual file read/extraction
-  failures may publish the same visibly reported partial snapshot as
-  `jscout index`;
+  new or partially rebuilt structural rows; non-retryable file reads and
+  deterministic extraction rejections are reported and excluded from the
+  successfully published indexable corpus;
 - retrieval-only commands do not create or migrate a missing database;
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
@@ -1076,10 +1112,11 @@ Acceptance checks:
 real repository remains pending.** The production watcher uses a pure
 generation coordinator, a typed full/incremental refresh scope, fresh per-phase
 connections, explicit optional embedding/checker phases, supersession and
-cancellation, bounded retry and stable-failure degradation, exact self-output
-exclusions, dynamic external coverage, and periodic reconciliation. Unit and
-fixture coverage passes; the next operational step is to run it through branch
-switches and ordinary edits on the user's target repository.
+cancellation, uncapped phase-error retries with a capped exponential delay,
+exact self-output exclusions, dynamic external coverage, and periodic
+reconciliation. Unit and fixture coverage passes; the next operational step is
+to run it through branch switches and ordinary edits on the user's target
+repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
@@ -1096,6 +1133,7 @@ full or incremental structural refresh
   -> rematerialize vectors already present in the content cache
   -> optionally embed unseen content (`--embed`)
   -> optionally enrich the exact published snapshot (`--enrich`)
+  -> optionally embed/sync current semantic artifacts (`--embed`)
 ```
 
 Startup and reconciliation generations run a full disposable-plane refresh.
@@ -1114,9 +1152,11 @@ package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
 inputs, selected dependency roots, external checker inputs, directories,
 backend errors, and unclassifiable missing paths also require full refresh.
 Full scope is sticky within a generation, so a mixed event cannot be downgraded
-by later source notifications. A changed file that cannot be read or extracted
-is removed from the published partial snapshot rather than leaving its
-previous structural row live.
+by later source notifications. A changed file with a non-retryable read or
+deterministic extraction failure is reported and excluded rather than leaving
+its previous structural row live. The operation still publishes the indexable
+corpus successfully. A recognized transient read failure instead rolls back
+the transaction and fails the refresh for retry.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1127,12 +1167,24 @@ not a latency target. A query may report that no snapshot is published for the
 entire structural-refresh interval, and every cycle logs its actual phase
 durations.
 
-`--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
-does not start the TypeScript checker, and never serves checker facts from a
-different structural snapshot. It may reuse an active exact-snapshot batch
-when either refresh mode proves the snapshot unchanged. Dependency selectors
-remain authoritative and must be supplied to watch exactly as they are to
-index.
+`--embed` and `--enrich` remain explicit. `--product` is subordinate to
+`--embed` and applies the same effective-product selection as manual
+`jscout embed --product`; a product-only vector cache must not be silently
+widened by the watcher. Plain watch performs no model calls, does not start the
+TypeScript checker, and never serves checker facts from a different structural
+snapshot. It may reuse an active exact-snapshot batch when either refresh mode
+proves the snapshot unchanged. Dependency selectors remain authoritative and
+must be supplied to watch exactly as they are to index.
+
+Code embedding remains ahead of checker enrichment because its document and
+selection inputs are chunk content plus current repository policy; checker
+tables are not embedding inputs. When `--embed` is enabled, a separate semantic
+tail runs after enrichment, or immediately after code embedding when enrichment
+is disabled. It embeds missing current semantic documents through the durable
+cache and repairs the semantic vector index. Both embedding phases report
+missing, embedded, cached-reused, and current synced-occurrence counts.
+Repository scouting remains an explicit generative operation and is not hidden
+inside G12 watch.
 
 ### Generation state machine
 
@@ -1152,9 +1204,10 @@ finished:
 clean
   -> dirty(generation, reasons, full|incremental)
   -> refreshing(generation)
-  -> embedding(generation, snapshot)   [only with --embed]
+  -> embedding-code(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
-  -> clean | degraded(snapshot, warnings)
+  -> embedding-semantic(generation, snapshot)   [only with --embed]
+  -> clean
 
 any phase + newer event -> dirty(newer generation)
 any failed phase        -> retry-wait(same generation, phase) -> retry
@@ -1165,28 +1218,48 @@ the desired generation and force another structural refresh before the
 watcher can become clean. Structural work is allowed to finish rather than be
 cancelled mid-transaction; optional embedding work stops between batches and
 checker work terminates its bounded sidecar when superseded. Before starting
-either optional phase, the coordinator drains pending events and skips that
+each optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh that returns individual file failures may expose the
-same explicitly reported partial snapshot as `jscout index`. The watcher
-reports every path/stage/error and retries the generation without requiring
-another filesystem event. Three consecutive refreshes with the same failure
-fingerprint (path, stage, and error) make the snapshot `degraded` rather than
-permanently dirty: optional embedding and enrichment may then run against that
-exact partial snapshot, while the failed paths remain on the reconciliation
-retry set. The last degraded fingerprint survives later generations, so the
-same permanent failure can degrade immediately rather than paying three full
-retries every cycle. A changed failure fingerprint or successful read resets
-that stability; new input resets only the current retry timer. Fatal refresh
-errors never enter this bounded degradation path and remain dirty until a
-required phase succeeds.
+A structural refresh may return individual file rejections. `jscout index` and
+the watcher report every rejected path/stage/error and publish the indexable
+corpus as a successful, clean generation. Non-retryable read failures and
+deterministic parse rejections are subject-local: a whole-repository retry
+cannot repair binary media with a source-looking extension or a permanently
+protected file.
+A later file event or periodic reconciliation naturally tries the path again.
 
-Failures use bounded exponential backoff. A parked retry gates fresh work for
-that generation and is consumed when it starts; attempts reset on new input or
-a successful phase. Retry and stable-failure state live in memory. Restarting
-watch always subscribes first and then performs a full refresh, so no persistent
-watcher journal or recovery schema is required.
+Read-error disposition is one explicit rule. Descriptor exhaustion,
+interrupted or timed-out I/O, connection/network failures, stale handles,
+and temporary resource pressure are retryable phase errors. Unknown errors and
+permission denial are rejected inputs so a single permanently inaccessible
+file or subtree cannot wedge watch forever. A path that disappears or changes
+between file and directory after inventory is checkout churn: its old row is
+removed, and a later event or reconciliation converges on the next state. The
+walker applies the same classification to directory and ignore-file errors;
+retryable I/O aborts while permanent subtree failures remain visible
+rejections.
+Retryable reads roll back the active transaction and return `Err`; watch
+remains dirty and retries even when periodic reconciliation is disabled.
+Other database, transaction, discovery, and phase-level failures follow the
+same retry path.
+Selected-dependency traversal errors are phase failures rather than partial
+inventories. One classified workspace map is built before mutation by expanding
+declared globs against the filesystem. Package manifests establish identity;
+the indexed source inventory only prefers alias targets, with classified
+manifest-entry fallback for source-less members. First-party extraction,
+dependency discovery from the newly extracted importers, and every selected-
+dependency source read are then prepared in the same rollbackable transaction
+before the old snapshot publication is invalidated. A retryable acquisition
+failure therefore leaves the previous snapshot queryable instead of exposing
+an unpublished gap.
+
+Phase-level failures retry without an attempt limit, using exponential delay
+capped at 30 seconds. A parked retry gates fresh work for that generation and
+is consumed when it starts; delay resets on new input or a successful phase.
+Retry state lives in memory. Restarting watch always subscribes first and then
+performs a full refresh, so no persistent watcher journal or recovery schema is
+required.
 
 ### Trigger and reconciliation policy
 
@@ -1236,12 +1309,12 @@ external watches with the newly resolved package instances and checker input
 set. These paths are ephemeral coordinator state, not a cross-snapshot
 freshness manifest stored in SQLite.
 
-Failure to register a narrow external watch retries with backoff. Three
-consecutive failures for the same path move that path to `degraded` coverage:
-the coordinator logs it, relies on periodic reconciliation for that path, and
-retries registration on the next reconciliation tick or when the external
-path set changes. Persistent registration failure does not itself keep the
-structural generation dirty or cause a full-refresh loop.
+Failure to register a narrow external watch marks that path as `degraded`
+coverage immediately. Registration is attempted again whenever targets are
+reconciled: after a successful refresh or enrichment, on the next periodic
+reconciliation, or when the target set changes. It has no independent retry
+timer. Persistent registration failure does not itself keep the structural
+generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
 (default ten minutes) schedules a full refresh even when no event arrived.
@@ -1290,12 +1363,12 @@ delete semantic memory or content-hash embedding rows.
 
 1. Extract a coordinator with injectable event input, clock, and phase
    executor. Track desired/completed generations, dirty reasons, per-phase
-   retry state, debounce, degraded snapshots/coverage, and structured cycle
-   telemetry without timing-dependent tests.
+   retry state, debounce, degraded external-watch coverage, and structured
+   cycle telemetry without timing-dependent tests.
 2. Replace the pre-G12 watch loop with the normal full-refresh operation. Open
    a fresh connection per phase, configure `busy_timeout`, audit rollback
-   paths, implement bounded stable-file-failure degradation, and make fatal
-   failures retry automatically.
+   paths, report and skip file-local rejections, and make fatal phase failures
+   retry automatically.
 3. Invalidate cross-snapshot checker state through the structural refresh while
    retaining a reusable exact-snapshot batch; sequence optional embedding and
    exact-snapshot enrichment, and add generation checks plus cancellation
@@ -1304,9 +1377,9 @@ delete semantic memory or content-hash embedding rows.
    selected-dependency, and dynamically reported checker-input watches. Treat
    notification backend errors as full-refresh uncertainty and persistent
    registration failures as degraded timer-backed coverage.
-5. Add periodic reconciliation, bounded retry/backoff, concise generation and
-   phase logging, then remove assumptions that another repository event is
-   required to recover from failure.
+5. Add periodic reconciliation, uncapped retry with a capped exponential
+   delay, concise generation and phase logging, then remove assumptions that
+   another repository event is required to recover from failure.
 6. Update README operational guidance after the coordinator acceptance suite
    passes.
 7. **G12.1 amendment (2026-08-17):** promote the already parity-tested
@@ -1343,10 +1416,11 @@ delete semantic memory or content-hash embedding rows.
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
-- a transient failed-file result remains dirty initially, reports the exact
-  path/stage/error, and converges after the file becomes readable;
-- three identical failed-file generations publish a visibly degraded snapshot,
-  allow exact-snapshot enrichment, and retain periodic retry coverage;
+- a deterministically unindexable file reports the exact path/stage/error, is
+  excluded without failing or degrading the refresh, and remains covered by
+  later file events and periodic reconciliation;
+- a recognized transient read failure rolls back and retries without
+  publishing a reduced corpus;
 - the default ten-minute reconciliation repairs a deliberately dropped
   notification, while explicitly disabling it reports the lost guarantee;
 - repeated full generations reuse cached embeddings, embed only unseen
@@ -1696,7 +1770,7 @@ condition, not a reason to weaken deterministic retrieval.
 The later TargetsQueue problem-solving investigation validates the drill-down
 half of this contract: four naturally selected exact `definition` calls cost
 11.6 KB total and carried the decisive mechanism, while nine expanded searches
-cost 162.9 KB. G19 may make attached memory explicit and expansion path-shaped,
+cost 162.9 KB. G20 may make attached memory explicit and expansion path-shaped,
 but it must not collapse exact definition back into the discovery payload.
 
 MCP `tools/list` necessarily returns complete schemas; a client may present a
@@ -2116,7 +2190,37 @@ judgment against stated criteria.
 - useful-artifact precision improves without widening global generation or
   response budgets, and generated prose remains separate from code ranking.
 
-## Planned G19 — session-efficient compact transport
+## Planned G19 — quiet-window repository scouting in watch
+
+G12 deliberately keeps semantic-content generation outside watch. A later
+opt-in `watch --scout` may close the full enrichment loop without turning
+ordinary watch into a background LLM job. Its phase order is fixed:
+
+```text
+refresh -> embed(code) -> enrich -> scout(stale delta) -> embed(semantic)
+```
+
+The phase is constrained by quiet time, not a hidden monetary throttle. It has
+the lowest priority and is superseded first by any relevant filesystem event.
+On a continuously changing checkout it may never finish; watch must report the
+lag and the exact manual scout command instead of queuing generations or
+silently widening work.
+
+G19 must be designed around stale-delta scoping before implementation. It uses
+semantic supports and reconnaissance subject fingerprints to select only
+subjects invalidated by recent successful generations. Full-repository
+scouting remains manual. Deterministic subject failures publish an explicit
+partial/terminal outcome and wait for a later generation; gateway transport
+failures use the existing retry path. Cancellation must retain completed
+subject-local work and never publish evidence against a superseded structural
+generation.
+
+Acceptance requires fixtures for quiet completion, continuous supersession,
+subject-local resume, partial failures, gateway retry, and semantic-vector tail
+convergence. Until those exist, no `--scout` flag is shipped and watch's README
+boundary remains structure/checker/vector maintenance only.
+
+## Planned G20 — session-efficient compact transport
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
@@ -2141,7 +2245,7 @@ This is an architecture-inquiry workload: the agent was explicitly asked to
 discover and explain several product workflows. It is a valid primary jscout
 use case and a useful stress test for conceptual retrieval, but it is not an
 independent coding agent localizing evidence while implementing a story or
-fixing a bug. G19 may use it to optimize transport; claims about implementation
+fixing a bug. G20 may use it to optimize transport; claims about implementation
 behavior require later real-work evidence. The TargetsQueue trace supplies
 that missing problem-investigation evidence for natural exact-tool selection
 and marginal value after localization. It still does not establish a patch-
@@ -2149,7 +2253,7 @@ outcome effect because it was not a controlled implementation comparison.
 
 The useful payload was much narrower: exact symbols and locations, short source
 snippets, opaque anchors, direct uses/call edges, one-sentence workflow meaning,
-defining participants, and freshness. G19 reduces repeated transport without
+defining participants, and freshness. G20 reduces repeated transport without
 removing those facts, weakening source verification, or raising the existing
 24 KB per-response default.
 
@@ -2185,7 +2289,7 @@ review and code inspection confirm these remaining defects:
   result and must be measured separately from the inner rendered-byte budget.
 
 Short source excerpts are retained: the review found them useful and estimated
-that they were less than one fifth of total payload. G19 targets metadata,
+that they were less than one fifth of total payload. G20 targets metadata,
 diagnostics, repeated defaults, and graph shape before reducing source evidence.
 
 ### Compact search and follow-up contract
@@ -2204,7 +2308,7 @@ an anchor without a snapshot and fail with candidates rather than guessing if
 current resolution is ambiguous; a caller that needs strict pinning may use the
 complete top-hit object or copy the one response-level snapshot. Later real
 implementation work must measure whether the top-hit handoff is selected before
-G19 removes or multiplies it.
+G20 removes or multiplies it.
 
 First-party follow-ups omit `origins`, preserving the normal combined
 `repository` plus `workspace` corpus. A dependency target carries an explicit
@@ -2232,10 +2336,10 @@ anchor-resolved incoming edges; otherwise it reports
 `who_uses`. Exact usage semantics cannot be traded for a shorter misleading
 field.
 
-G19 does not initially add server-side short handles. Handles require session
+G20 does not initially add server-side short handles. Handles require session
 state, expiry, collision, replay, and reconnect semantics; removing repeated
 defaults captures most of the measured waste while anchors remain durable and
-copy-safe. A stateful handle enters consideration only if post-G19 measurement
+copy-safe. A stateful handle enters consideration only if post-G20 measurement
 shows anchor strings, rather than bodies or graphs, remain a material share.
 
 The intended default shape is approximately:
@@ -2266,7 +2370,7 @@ first correction.
 
 ### Progressive drill-down remains separate
 
-G19 does not add a generic `fields` selector or inline
+G20 does not add a generic `fields` selector or inline
 `include_definition`. A field selector multiplies response contracts and asks
 the agent to understand serializer internals before it has localized the task.
 Named compact/debug/artifact views plus strict byte budgets cover the measured
@@ -2297,7 +2401,7 @@ view or relation request.
 
 Broad semantic discovery continues to return compact handles. G18's
 support/participant-overlap investigation owns duplicate or overlapping
-workflow diversity; G19 does not deduplicate artifacts by prose similarity.
+workflow diversity; G20 does not deduplicate artifacts by prose similarity.
 
 ### Agent diagnostics versus telemetry
 
@@ -2338,13 +2442,13 @@ as `default`, `object`, or `string`. An edge on a selected connecting path is
 retained even when its display name is common. Omitted path/node/edge counts and
 truncation remain visible, and agents may widen every existing bound.
 With expansion depth one, the same projection is the requested compact one-hop
-caller/callee view; G19 does not add another overlapping expansion tool or mode
+caller/callee view; G20 does not add another overlapping expansion tool or mode
 solely for that shape.
 
 ### MCP structured-content experiment
 
 The serializer first produces one canonical structured value so text and any
-future MCP `structuredContent` representation are fact-equivalent. G19 then
+future MCP `structuredContent` representation are fact-equivalent. G20 then
 tests Codex, Claude Code, and the supported pi/MCP clients before changing the
 wire shape. A client that ignores structured content must retain the JSON-text
 fallback; a client that exposes both forms must not receive two full copies in
@@ -2415,7 +2519,7 @@ Acceptance requires:
 - per-section byte counters sum to the canonical response size under complete
   and truncated responses without appearing in normal compact output;
 - `compact`, `body`, and `full` artifact views are deterministic, and `full` is
-  fact-equivalent to the pre-G19 diagnostic result;
+  fact-equivalent to the pre-G20 diagnostic result;
 - path mode preserves the verified configuration-publish skeleton with fewer
   returned nodes/edges than neighborhood mode and preserves the TargetsQueue
   feedback-loop continuations, while explicitly requested neighborhood output
@@ -2452,8 +2556,8 @@ consequences that still govern implementation.
 | Two-phase root-layout arms cost more, passed less often, and preserved wrong design contracts | Park G15; retain two-phase design only as an optional evaluation treatment |
 | Checker/scout/vector passed the root-layout oracle in both counterbalanced trials while grep failed both; those passing arms received no semantic artifacts | Preserve the full deterministic/checker/vector substrate and fix ranking/selection; do not attribute the separation to semantic memory or flip defaults from one task |
 | Architecture-inquiry use on a 7,000-plus-file monorepo localized a verified cross-package workflow, while parallel expansion/full-artifact reads caused noise and import occurrences displaced behavior | Preserve jscout's localization/source-verification role; add staged sequential guidance, syntax-aware G17 occurrence ordering, and authorized evidence-backed consolidated workflow write-back; do not generalize tool-selection behavior to implementation tasks, trigger G16, or claim retrieval rank measures importance |
-| The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G19 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
-| A 19-call TargetsQueue problem-solving investigation naturally selected four exact definitions that carried the mechanism in 11.6 KB, while nine expansions produced 162.9 KB and weak attached memory | Preserve exact definition as progressive drill-down; make search-attached memory opt-in, stop broad expansion after localization, and replay G19 on this workload separately from the architecture inquiry |
+| The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G20 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
+| A 19-call TargetsQueue problem-solving investigation naturally selected four exact definitions that carried the mechanism in 11.6 KB, while nine expansions produced 162.9 KB and weak attached memory | Preserve exact definition as progressive drill-down; make search-attached memory opt-in, stop broad expansion after localization, and replay G20 on this workload separately from the architecture inquiry |
 | The same investigation exposed an unbounded generic receiver string and `used_by` counts derived from unresolved repository-wide names | Bound compact receiver displays with full debug fidelity; replace those counts with anchor-resolved edges or label them as approximate name occurrences |
 
 Relevant result summaries include:

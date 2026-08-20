@@ -1165,26 +1165,9 @@ fn execute_one(
                 RunOutcome::Failed
             };
             ledger::finish_run(conn, run_id, status, None, Some(&error.code()))?;
-            // Remote per-request timeouts are subject-local here exactly as
-            // in the four semantic executors; the batch continues and the
-            // subject stays classifiable on a later run. Local frame
-            // timeouts poison the connection and remain fatal.
-            if super::remote_timeout(&error) {
+            if super::subject_local_gateway_failure(&error) {
                 return Ok((
-                    ScoutReport {
-                        kind: "repository".into(),
-                        subject: item.subject_key,
-                        run_id,
-                        status: "failed".into(),
-                        started: None,
-                        artifact_id: None,
-                        candidate_count: 1,
-                        decisions: BTreeMap::new(),
-                        usage: None,
-                        billing_path: spec.billing_path.clone(),
-                        incomplete_reason: None,
-                        failure: Some(format!("gateway timeout: {error}")),
-                    },
+                    super::gateway_failure_report(run_id, &spec, item.subject_key, 1, error),
                     None,
                 ));
             }

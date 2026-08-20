@@ -1809,7 +1809,12 @@ pub(crate) fn package_prefixes(root: &Path) -> Vec<(String, String)> {
     // reached through a symlink strips nothing, and every module scope would
     // silently vanish.
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let workspace = crate::workspace::WorkspaceMap::build(root);
+    // Reconnaissance is read-only and may degrade to repository-wide scopes;
+    // indexing remains the strict caller that propagates discovery failures.
+    let Ok(discovery) = crate::workspace::WorkspaceMap::discover(root, &[]) else {
+        return Vec::new();
+    };
+    let workspace = discovery.map;
     let mut prefixes: Vec<(String, String)> = workspace
         .packages
         .iter()

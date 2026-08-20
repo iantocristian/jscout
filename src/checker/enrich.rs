@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,12 +51,73 @@ pub struct EnrichReport {
     pub projects: usize,
     pub configured_projects: usize,
     pub configuration_problems: usize,
+    /// Eligible source files whose member-call candidates have no configured
+    /// TypeScript-project owner. These files remain fully indexed; this is
+    /// only the checker-enrichment coverage boundary.
+    pub files_without_configured_project: usize,
+    pub occurrences_without_configured_project: usize,
+    pub occurrences_skipped_inferred_project: usize,
     pub occurrences_avoided_by_tooling_filter: usize,
     pub occurrences_using_tooling_fallback: usize,
     pub project_decisions: Vec<ProjectDecision>,
     pub dry_run: bool,
     pub peak_rss_bytes: u64,
     pub peak_heap_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ProjectFailure {
+    project_id: String,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+struct PartialEnrichmentError {
+    batch_id: i64,
+    facts_published: usize,
+    failures: Vec<ProjectFailure>,
+}
+
+impl PartialEnrichmentError {
+    fn retryable(&self) -> bool {
+        self.failures.iter().any(|failure| failure.retryable)
+    }
+}
+
+impl fmt::Display for PartialEnrichmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let failed = self
+            .failures
+            .iter()
+            .map(|failure| failure.project_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible",
+            self.batch_id,
+            self.facts_published,
+            self.failures.len(),
+            failed
+        )?;
+        if self.retryable() {
+            formatter.write_str("; transient failures may be resumed")
+        } else {
+            formatter.write_str("; deterministic failures wait for changed inputs")
+        }
+    }
+}
+
+impl std::error::Error for PartialEnrichmentError {}
+
+/// A partial batch with only deterministic per-project failures is usable and
+/// should not enter watch's tight phase-retry loop. A later structural
+/// generation or periodic reconciliation naturally attempts those projects
+/// again.
+pub fn is_terminal_partial_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PartialEnrichmentError>()
+        .is_some_and(|partial| !partial.retryable())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +136,13 @@ struct ProjectPlanning {
     decisions: Vec<ProjectDecision>,
     occurrences_avoided_by_tooling_filter: usize,
     occurrences_using_tooling_fallback: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InferredProjectCoverage {
+    files_without_configured_project: usize,
+    occurrences_without_configured_project: usize,
+    occurrences_skipped_inferred_project: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -167,12 +236,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let occurrences_discovered = discovered.len();
     let (eligible, selection) = select_eligible(discovered, options);
     let occurrences_eligible = eligible.len();
-    let ordered = spread_occurrences(eligible);
-    let selected = match options.max_occurrences {
-        Some(limit) => ordered.into_iter().take(limit).collect::<Vec<_>>(),
-        None => ordered,
-    };
-    if selected.is_empty() {
+    if eligible.is_empty() {
         return Ok(EnrichReport {
             snapshot,
             batch_id: 0,
@@ -195,6 +259,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: 0,
             configured_projects: 0,
             configuration_problems: 0,
+            files_without_configured_project: 0,
+            occurrences_without_configured_project: 0,
+            occurrences_skipped_inferred_project: 0,
             occurrences_avoided_by_tooling_filter: 0,
             occurrences_using_tooling_fallback: 0,
             project_decisions: Vec::new(),
@@ -204,14 +271,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         });
     }
     super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
-    verify_selected_sources(&canonical_root, &conn, &selected)?;
 
     let mut planner = super::launch(&canonical_root, options.sidecar)?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
     let mut ownership = planner.plan_members(
-        selected
+        eligible
             .iter()
             .map(|occurrence| occurrence.file.clone())
             .collect::<BTreeSet<_>>()
@@ -222,12 +288,61 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let protocol = planner.versions.protocol;
     drop(planner);
     apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
+    let (eligible, inferred_coverage) =
+        gate_inferred_projects(eligible, &ownership.files, options.include_all)?;
+    let ordered = spread_occurrences(eligible);
+    let selected = match options.max_occurrences {
+        Some(limit) => ordered.into_iter().take(limit).collect::<Vec<_>>(),
+        None => ordered,
+    };
+    if selected.is_empty() {
+        return Ok(EnrichReport {
+            snapshot,
+            batch_id: 0,
+            occurrences_queried: 0,
+            occurrences_discovered,
+            occurrences_eligible,
+            occurrences_selected: 0,
+            occurrences_omitted: occurrences_eligible,
+            occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
+            occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+            occurrences_resumed: 0,
+            request_batches: 0,
+            unknown_answers: 0,
+            unknown_projects: Vec::new(),
+            unmapped_declarations: 0,
+            unmapped_declaration_contexts: BTreeMap::new(),
+            facts_published: 0,
+            checker_version: ownership.typescript.version,
+            checker_source: ownership.typescript.source,
+            projects: 0,
+            configured_projects: ownership.projects.len(),
+            configuration_problems: ownership.configuration_problems.len(),
+            files_without_configured_project: inferred_coverage.files_without_configured_project,
+            occurrences_without_configured_project: inferred_coverage
+                .occurrences_without_configured_project,
+            occurrences_skipped_inferred_project: inferred_coverage
+                .occurrences_skipped_inferred_project,
+            occurrences_avoided_by_tooling_filter: 0,
+            occurrences_using_tooling_fallback: 0,
+            project_decisions: Vec::new(),
+            dry_run: options.dry_run,
+            peak_rss_bytes: 0,
+            peak_heap_bytes: 0,
+        });
+    }
+    verify_selected_sources(&canonical_root, &conn, &selected)?;
     let ProjectPlanning {
         projects: project_plan,
         decisions: project_decisions,
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
-    } = build_project_plan(&selected, &ownership.files, &ownership.projects)?;
+    } = build_project_plan(
+        &selected,
+        &ownership.files,
+        &ownership.projects,
+        options.include_all,
+    )?;
     let plan_fingerprint = plan_fingerprint(
         &snapshot,
         &selected,
@@ -260,6 +375,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
+            files_without_configured_project: inferred_coverage.files_without_configured_project,
+            occurrences_without_configured_project: inferred_coverage
+                .occurrences_without_configured_project,
+            occurrences_skipped_inferred_project: inferred_coverage
+                .occurrences_skipped_inferred_project,
             occurrences_avoided_by_tooling_filter,
             occurrences_using_tooling_fallback,
             project_decisions,
@@ -304,6 +424,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             configured_projects: ownership.projects.len(),
             configuration_problems: ownership.configuration_problems.len(),
+            files_without_configured_project: inferred_coverage.files_without_configured_project,
+            occurrences_without_configured_project: inferred_coverage
+                .occurrences_without_configured_project,
+            occurrences_skipped_inferred_project: inferred_coverage
+                .occurrences_skipped_inferred_project,
             occurrences_avoided_by_tooling_filter,
             occurrences_using_tooling_fallback,
             project_decisions,
@@ -333,9 +458,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut unmapped_declaration_contexts = BTreeMap::<String, usize>::new();
     let mut peak_rss_bytes = 0;
     let mut peak_heap_bytes = 0;
-    let mut failed_projects = Vec::new();
+    let mut failed_projects = Vec::<ProjectFailure>::new();
 
-    for (project_index, (project_id, occurrences)) in project_plan.iter().enumerate() {
+    for (project_index, (project_id, occurrences)) in projects_in_execution_order(&project_plan)
+        .into_iter()
+        .enumerate()
+    {
         if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
         }
@@ -385,9 +513,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                     "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
                 );
             }
-            mark_project_failed(&conn, batch_id, project_id, occurrences, &error.to_string())?;
-            eprintln!("checker enrichment: project {project_id} failed: {error:#}");
-            failed_projects.push(project_id.clone());
+            let message = error.to_string();
+            let retryable = project_failure_is_retryable(&error);
+            mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+            eprintln!(
+                "checker enrichment: project {project_id} failed disposition={}: {error:#}",
+                if retryable { "retryable" } else { "terminal" }
+            );
+            failed_projects.push(ProjectFailure {
+                project_id: project_id.clone(),
+                retryable,
+            });
         }
     }
 
@@ -399,11 +535,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         let facts_published =
             activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, true)?;
         crate::structural::rebuild_projection(&conn, &snapshot)?;
-        bail!(
-            "checker enrichment activated partial batch {batch_id} with {facts_published} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible; rerun the same command to resume",
-            failed_projects.len(),
-            failed_projects.join(", ")
-        );
+        return Err(PartialEnrichmentError {
+            batch_id,
+            facts_published,
+            failures: failed_projects,
+        }
+        .into());
     }
 
     let facts_published =
@@ -432,6 +569,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         projects: project_plan.len(),
         configured_projects: ownership.projects.len(),
         configuration_problems: ownership.configuration_problems.len(),
+        files_without_configured_project: inferred_coverage.files_without_configured_project,
+        occurrences_without_configured_project: inferred_coverage
+            .occurrences_without_configured_project,
+        occurrences_skipped_inferred_project: inferred_coverage
+            .occurrences_skipped_inferred_project,
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
         project_decisions,
@@ -449,6 +591,48 @@ fn canceled_checker_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<super::process::CheckerError>()
         .is_some_and(|error| matches!(error, super::process::CheckerError::Canceled(_)))
+}
+
+fn project_failure_is_retryable(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<super::process::CheckerError>() {
+        Some(super::process::CheckerError::Remote { code, .. }) => {
+            matches!(
+                code.as_str(),
+                "busy"
+                    | "EIO"
+                    | "EINTR"
+                    | "EAGAIN"
+                    | "ENOMEM"
+                    | "EBUSY"
+                    | "EMFILE"
+                    | "ENFILE"
+                    | "ETIMEDOUT"
+                    | "ENETDOWN"
+                    | "ENETUNREACH"
+                    | "ENETRESET"
+                    | "ECONNABORTED"
+                    | "ECONNRESET"
+                    | "ENOBUFS"
+                    | "ESTALE"
+            )
+        }
+        // Launch/request transport failures may heal without a new structural
+        // snapshot. A child exit is a crash (including V8 heap aborts), so it
+        // follows the project-terminal partial/resume path instead of the
+        // watcher's uncapped phase-retry loop. Protocol, cancellation, and
+        // unknown local errors also stay terminal.
+        Some(
+            super::process::CheckerError::Spawn(_)
+            | super::process::CheckerError::Io(_)
+            | super::process::CheckerError::Timeout(_),
+        ) => true,
+        Some(
+            super::process::CheckerError::Protocol(_)
+            | super::process::CheckerError::ChildExited(_)
+            | super::process::CheckerError::Canceled(_),
+        )
+        | None => false,
+    }
 }
 
 /// ECMAScript / host names that usually resolve into the TypeScript standard
@@ -783,10 +967,56 @@ fn verify_selected_sources(root: &Path, conn: &Connection, selected: &[Occurrenc
     Ok(())
 }
 
+fn is_inferred_project(project_id: &str) -> bool {
+    project_id.starts_with("inferred:")
+}
+
+/// Keep the checker boundary explicit without removing files from any other
+/// index plane. Ownership planning still sees every otherwise-eligible file so
+/// the report can distinguish an inferred-project skip from role, name, or
+/// operator-cap filtering. `--all` is the deliberate escape hatch.
+fn gate_inferred_projects(
+    occurrences: Vec<Occurrence>,
+    ownership: &[FileOwnership],
+    include_all: bool,
+) -> Result<(Vec<Occurrence>, InferredProjectCoverage)> {
+    let owners = ownership
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut files_without_configured_project = BTreeSet::new();
+    let mut kept = Vec::with_capacity(occurrences.len());
+    let mut coverage = InferredProjectCoverage::default();
+    for occurrence in occurrences {
+        let ownership = owners.get(occurrence.file.as_str()).with_context(|| {
+            format!("checker omitted project ownership for {}", occurrence.file)
+        })?;
+        if ownership.project_ids.is_empty() {
+            bail!("checker returned no owning project for {}", occurrence.file);
+        }
+        let without_configured_project = ownership
+            .project_ids
+            .iter()
+            .all(|project_id| is_inferred_project(project_id));
+        if without_configured_project {
+            files_without_configured_project.insert(occurrence.file.clone());
+            coverage.occurrences_without_configured_project += 1;
+            if !include_all {
+                coverage.occurrences_skipped_inferred_project += 1;
+                continue;
+            }
+        }
+        kept.push(occurrence);
+    }
+    coverage.files_without_configured_project = files_without_configured_project.len();
+    Ok((kept, coverage))
+}
+
 fn build_project_plan(
     selected: &[Occurrence],
     ownership: &[FileOwnership],
     projects: &[ProjectSummary],
+    include_inferred: bool,
 ) -> Result<ProjectPlanning> {
     let owners = ownership
         .iter()
@@ -821,6 +1051,9 @@ fn build_project_plan(
             occurrences_using_tooling_fallback += 1;
         }
         for project_id in &ownership.project_ids {
+            if is_inferred_project(project_id) && !include_inferred {
+                continue;
+            }
             plan.entry(project_id.clone())
                 .or_default()
                 .push(occurrence.clone());
@@ -929,6 +1162,18 @@ fn project_decision<'a>(
             fallback_occurrences: 0,
         }
     })
+}
+
+fn projects_in_execution_order(
+    projects: &BTreeMap<String, Vec<Occurrence>>,
+) -> Vec<(&String, &Vec<Occurrence>)> {
+    let mut ordered = projects.iter().collect::<Vec<_>>();
+    ordered.sort_by(|(left, _), (right, _)| {
+        is_inferred_project(left)
+            .cmp(&is_inferred_project(right))
+            .then_with(|| left.cmp(right))
+    });
+    ordered
 }
 
 fn plan_fingerprint(
@@ -2325,7 +2570,7 @@ mod tests {
             },
         ];
 
-        let planning = build_project_plan(&selected, &ownership, &projects)?;
+        let planning = build_project_plan(&selected, &ownership, &projects, false)?;
         assert_eq!(planning.occurrences_avoided_by_tooling_filter, 1);
         assert_eq!(planning.occurrences_using_tooling_fallback, 1);
         assert_eq!(planning.projects["tsconfig.json"][0].file, "shared.ts");
@@ -2341,6 +2586,83 @@ mod tests {
         assert_eq!(tooling.selected_occurrences, 1);
         assert_eq!(tooling.excluded_occurrences, 1);
         assert_eq!(tooling.fallback_occurrences, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Result<()> {
+        let configured = planned_occurrence(1, "alpha", "src/app.ts", "production", 0);
+        let inferred_a = planned_occurrence(2, "alpha", "scripts/tool.mjs", "production", 0);
+        let inferred_b = planned_occurrence(3, "alpha", "scripts/tool.mjs", "production", 0);
+        let occurrences = vec![inferred_a, inferred_b, configured.clone()];
+        let ownership = vec![
+            FileOwnership {
+                file: "scripts/tool.mjs".into(),
+                project_ids: vec!["inferred:scripts/tool.mjs".into()],
+                excluded_project_ids: Vec::new(),
+                tooling_fallback: false,
+            },
+            FileOwnership {
+                file: "src/app.ts".into(),
+                project_ids: vec!["tsconfig.json".into()],
+                excluded_project_ids: Vec::new(),
+                tooling_fallback: false,
+            },
+        ];
+        let projects = vec![ProjectSummary {
+            project_id: "tsconfig.json".into(),
+            file_count: 1,
+            purpose: "general".into(),
+            purpose_reasons: Vec::new(),
+            membership_fingerprint: String::new(),
+            config_fingerprint: String::new(),
+        }];
+
+        let (default, coverage) = gate_inferred_projects(occurrences.clone(), &ownership, false)?;
+        assert_eq!(default.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            coverage,
+            InferredProjectCoverage {
+                files_without_configured_project: 1,
+                occurrences_without_configured_project: 2,
+                occurrences_skipped_inferred_project: 2,
+            }
+        );
+        // The operator cap applies after the inferred gate, so an inferred
+        // lexical prefix cannot consume the only selected slot.
+        assert_eq!(
+            spread_occurrences(default)
+                .into_iter()
+                .take(1)
+                .next()
+                .unwrap()
+                .id,
+            1
+        );
+        let default_plan = build_project_plan(
+            std::slice::from_ref(&configured),
+            &ownership,
+            &projects,
+            false,
+        )?;
+        assert_eq!(
+            default_plan.projects.keys().collect::<Vec<_>>(),
+            ["tsconfig.json"]
+        );
+
+        let (all, coverage) = gate_inferred_projects(occurrences, &ownership, true)?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(coverage.files_without_configured_project, 1);
+        assert_eq!(coverage.occurrences_without_configured_project, 2);
+        assert_eq!(coverage.occurrences_skipped_inferred_project, 0);
+        let all_plan = build_project_plan(&all, &ownership, &projects, true)?;
+        assert_eq!(
+            projects_in_execution_order(&all_plan.projects)
+                .into_iter()
+                .map(|(project, _)| project.as_str())
+                .collect::<Vec<_>>(),
+            ["tsconfig.json", "inferred:scripts/tool.mjs"]
+        );
         Ok(())
     }
 
@@ -2488,6 +2810,81 @@ mod tests {
             message: "worker failed".into(),
         });
         assert!(!canceled_checker_error(&failed));
+    }
+
+    #[test]
+    fn partial_failure_retry_policy_separates_project_state_from_transport_failure() {
+        let mismatch = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "project_mismatch".into(),
+            message: "not an effective member".into(),
+        });
+        assert!(!project_failure_is_retryable(&mismatch));
+
+        let crash = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "checker_crash".into(),
+            message: "worker failed".into(),
+        });
+        assert!(!project_failure_is_retryable(&crash));
+
+        let worker_exit = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "checker_exit".into(),
+            message: "worker exited".into(),
+        });
+        assert!(!project_failure_is_retryable(&worker_exit));
+
+        let process_exit = anyhow::Error::new(super::super::process::CheckerError::ChildExited(
+            "checker aborted".into(),
+        ));
+        assert!(!project_failure_is_retryable(&process_exit));
+
+        let spawn = anyhow::Error::new(super::super::process::CheckerError::Spawn(
+            "temporarily unavailable".into(),
+        ));
+        assert!(project_failure_is_retryable(&spawn));
+
+        let transport = anyhow::Error::new(super::super::process::CheckerError::Io(
+            "temporary pipe failure".into(),
+        ));
+        assert!(project_failure_is_retryable(&transport));
+
+        let exhausted = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "EMFILE".into(),
+            message: "too many open files".into(),
+        });
+        assert!(project_failure_is_retryable(&exhausted));
+
+        let timeout = anyhow::Error::new(super::super::process::CheckerError::Timeout(
+            Duration::from_secs(1),
+        ));
+        assert!(project_failure_is_retryable(&timeout));
+
+        let protocol = anyhow::Error::new(super::super::process::CheckerError::Protocol(
+            "invalid response".into(),
+        ));
+        assert!(!project_failure_is_retryable(&protocol));
+
+        let unknown = anyhow::anyhow!("deterministic local failure");
+        assert!(!project_failure_is_retryable(&unknown));
+
+        let terminal_partial = anyhow::Error::new(PartialEnrichmentError {
+            batch_id: 1,
+            facts_published: 10,
+            failures: vec![ProjectFailure {
+                project_id: "tsconfig.json".into(),
+                retryable: false,
+            }],
+        });
+        assert!(is_terminal_partial_failure(&terminal_partial));
+
+        let retryable_partial = anyhow::Error::new(PartialEnrichmentError {
+            batch_id: 2,
+            facts_published: 10,
+            failures: vec![ProjectFailure {
+                project_id: "tsconfig.json".into(),
+                retryable: true,
+            }],
+        });
+        assert!(!is_terminal_partial_failure(&retryable_partial));
     }
 
     #[test]
