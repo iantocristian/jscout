@@ -1665,22 +1665,44 @@ fn carry_forward_projects(
             .or_default()
             .push(input);
     }
-    let external_inputs_fresh = |project: &str| {
-        previous_external_inputs
-            .get(project)
-            .into_iter()
-            .flatten()
-            .all(|input| {
-                fs::read(input_path(root, input))
-                    .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
-                    .unwrap_or(false)
-            })
-    };
+    // External declarations are shared both by every occurrence in a project
+    // and by many projects. Hash each distinct path once, then evaluate each
+    // project's expected hashes against that cache. Doing filesystem reads in
+    // the occurrence/owner loop turns a carry pass into
+    // O(occurrences * external input bytes).
+    let mut current_external_hashes = BTreeMap::<(String, String), Option<String>>::new();
+    for input in previous_external_inputs.values().flatten() {
+        let key = (input.kind.clone(), input.path.clone());
+        current_external_hashes.entry(key).or_insert_with(|| {
+            fs::read(input_path(root, input))
+                .ok()
+                .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        });
+    }
+    let external_inputs_fresh = projects
+        .keys()
+        .map(|project| {
+            let fresh = previous_external_inputs
+                .get(project)
+                .into_iter()
+                .flatten()
+                .all(|input| {
+                    current_external_hashes
+                        .get(&(input.kind.clone(), input.path.clone()))
+                        .and_then(Option::as_deref)
+                        .is_some_and(|hash| hash == input.source_hash)
+                });
+            (project.clone(), fresh)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut projects_requiring_check = projects
         .keys()
         .filter(|project| {
             previous_projects.get(*project) != project_fingerprints.get(*project)
-                || !external_inputs_fresh(project)
+                || !external_inputs_fresh
+                    .get(*project)
+                    .copied()
+                    .unwrap_or(false)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -1792,7 +1814,7 @@ fn carry_forward_projects(
                 can_carry = false;
                 break;
             }
-            if !external_inputs_fresh(project) {
+            if !external_inputs_fresh.get(project).copied().unwrap_or(false) {
                 can_carry = false;
                 break;
             }
@@ -4276,6 +4298,89 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )?,
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_external_input_prevents_project_carry() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      declare const card: CardTable; card.insert();\n";
+        let (conn, hash) = indexed(repo.path(), source)?;
+        let old_occurrence = occurrence(&conn)?;
+        let identity = TypeScriptIdentity {
+            version: "5.9.3".into(),
+            source: "bundled".into(),
+        };
+        let project_fingerprints =
+            BTreeMap::from([("tsconfig.json".to_string(), "stable-plan".to_string())]);
+        let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+        let old_batch = seed_active_checker_batch(
+            repo.path(),
+            &conn,
+            &hash,
+            &old_occurrence,
+            &declaration,
+            &project_fingerprints,
+        )?;
+        let external = tempfile::tempdir()?;
+        let external_input = external.path().join("ambient.d.ts");
+        fs::write(&external_input, "declare const ambient: string;\n")?;
+        let external_hash = blake3::hash(&fs::read(&external_input)?)
+            .to_hex()
+            .to_string();
+        conn.execute(
+            "INSERT INTO checker_project_inputs(
+               batch_id, project_id, input_kind, input_path, source_hash
+             ) VALUES(?1,'tsconfig.json','absolute',?2,?3)",
+            params![
+                old_batch,
+                external_input.to_string_lossy().as_ref(),
+                external_hash
+            ],
+        )?;
+        fs::write(&external_input, "declare const ambient: number;\n")?;
+        fs::write(
+            repo.path().join("unrelated.ts"),
+            "export const value = 1;\n",
+        )?;
+        crate::indexer::watch_full_refresh_repo_with_options(
+            repo.path(),
+            &conn,
+            &crate::indexer::IndexOptions::default(),
+        )?;
+
+        let current_occurrence = occurrence(&conn)?;
+        let projects = BTreeMap::from([("tsconfig.json".to_string(), vec![current_occurrence])]);
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: "next-plan",
+                checker: &identity,
+                protocol: 2,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &project_fingerprints,
+                force_new: false,
+            },
+        )?;
+        let carried = carry_forward_projects(
+            repo.path(),
+            &conn,
+            batch_id,
+            &identity,
+            2,
+            &projects,
+            &project_fingerprints,
+        )?;
+        assert_eq!(carried.projects_carried, 0);
+        assert_eq!(carried.occurrences_carried, 0);
+        assert_eq!(
+            carried.projects_requiring_check,
+            BTreeSet::from(["tsconfig.json".to_string()])
         );
         Ok(())
     }
