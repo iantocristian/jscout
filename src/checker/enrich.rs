@@ -522,8 +522,6 @@ fn project_failure_is_retryable(error: &anyhow::Error) -> bool {
             matches!(
                 code.as_str(),
                 "busy"
-                    | "checker_crash"
-                    | "checker_exit"
                     | "EIO"
                     | "EINTR"
                     | "EAGAIN"
@@ -2609,7 +2607,13 @@ mod tests {
             code: "checker_crash".into(),
             message: "worker failed".into(),
         });
-        assert!(project_failure_is_retryable(&crash));
+        assert!(!project_failure_is_retryable(&crash));
+
+        let worker_exit = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "checker_exit".into(),
+            message: "worker exited".into(),
+        });
+        assert!(!project_failure_is_retryable(&worker_exit));
 
         let exhausted = anyhow::Error::new(super::super::process::CheckerError::Remote {
             code: "EMFILE".into(),
