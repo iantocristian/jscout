@@ -959,10 +959,10 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
 /// Delete the cheap source-derived rows for one repository snapshot while
 /// preserving the content-addressed embedding cache, durable semantic memory,
 /// and temporarily hidden checker batches. After computing the rebuilt
-/// snapshot, the caller must remove checker batches for every other snapshot
-/// before projection. The caller owns the transaction and must not publish a
-/// new snapshot marker until extraction, resolution, projection, and cached-
-/// vector rematerialization have completed.
+/// snapshot, the caller applies its checker-retention policy before projection;
+/// projection accepts only the exact current-snapshot batch. The caller owns
+/// the transaction and must not publish a new snapshot marker until extraction,
+/// resolution, projection, and cached-vector rematerialization have completed.
 pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     reset_extraction_state(conn)?;
     conn.execute_batch(
