@@ -10,6 +10,7 @@ blake3 = "1.8.5"
 clap = { version = "4.6.5", features = ["derive"] }
 ctrlc = "3.5.2"
 ignore = "0.4.33"
+libc = "0.2.189"
 notify = "8.2.0"
 oxc_allocator = "0.143.0"
 oxc_ast = "0.143.0"

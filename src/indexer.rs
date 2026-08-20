@@ -9,7 +9,7 @@ use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
-use crate::{file_role, parse, store, walk};
+use crate::{file_role, io_policy, parse, store, walk};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
@@ -21,10 +21,14 @@ pub struct IndexOutcome {
     pub indexed: usize,
     pub unchanged: usize,
     /// Previously indexed first-party files omitted from the resulting
-    /// snapshot because they disappeared or failed read/extraction.
+    /// snapshot because they disappeared or had a non-retryable
+    /// read/extraction failure.
     pub removed: usize,
-    pub failed: usize,
-    pub failures: Vec<IndexFailure>,
+    /// Inputs or repository boundaries omitted because they had a
+    /// non-retryable traversal, manifest, read, or extraction failure. These
+    /// are visible corpus exclusions, not phase failures.
+    pub rejected: usize,
+    pub rejections: Vec<IndexRejection>,
     pub chunks: usize,
     pub refs: usize,
     pub dependency_packages: usize,
@@ -43,21 +47,46 @@ pub struct IndexOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexFailure {
+pub struct IndexRejection {
     pub path: String,
     pub stage: &'static str,
     pub error: String,
 }
 
+fn retryable_read_failure(path: &str, error: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!("retryable read failure for `{path}`"))
+}
+
+fn read_source(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    if let Some(error) = TEST_READ_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
+        return Err(error);
+    }
+    std::fs::read_to_string(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READ_FAILURES: std::cell::RefCell<HashMap<PathBuf, std::io::Error>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn inject_read_failure(path: PathBuf, error: std::io::Error) {
+    TEST_READ_FAILURES.with(|failures| {
+        failures.borrow_mut().insert(path, error);
+    });
+}
+
 impl IndexOutcome {
-    fn record_failure(
+    fn record_rejection(
         &mut self,
         path: impl Into<String>,
         stage: &'static str,
         error: impl std::fmt::Display,
     ) {
-        self.failed += 1;
-        self.failures.push(IndexFailure {
+        self.rejected += 1;
+        self.rejections.push(IndexRejection {
             path: path.into(),
             stage,
             error: error.to_string(),
@@ -65,14 +94,14 @@ impl IndexOutcome {
     }
 }
 
-pub fn report_failures(outcome: &IndexOutcome) {
-    if outcome.failures.is_empty() {
+pub fn report_rejections(outcome: &IndexOutcome) {
+    if outcome.rejections.is_empty() {
         return;
     }
-    eprintln!("index failures ({}):", outcome.failures.len());
-    for failure in &outcome.failures {
-        let error = failure.error.replace('\n', "\n      ");
-        eprintln!("  [{}] {}: {error}", failure.stage, failure.path);
+    eprintln!("index inputs rejected ({}):", outcome.rejections.len());
+    for rejection in &outcome.rejections {
+        let error = rejection.error.replace('\n', "\n      ");
+        eprintln!("  [{}] {}: {error}", rejection.stage, rejection.path);
     }
 }
 
@@ -80,6 +109,16 @@ struct FileData {
     chunks: Vec<Chunk>,
     graph: FileGraph,
     lines: LineIndex,
+}
+
+struct PreparedDependencyFile {
+    package_root: PathBuf,
+    display: String,
+    source_path: PathBuf,
+    package_path: String,
+    source: String,
+    hash: String,
+    role: &'static str,
 }
 
 struct FileIdentity<'a> {
@@ -194,14 +233,15 @@ fn index_repo_impl(
     mode: IndexMode,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
-    ensure_extraction_version(conn)?;
-    let files = walk::source_files(&root);
+    let inventory = walk::source_inventory(&root)?;
+    let workspace_discovery = crate::workspace::WorkspaceMap::discover(&root, &inventory.files)?;
+    let workspace = workspace_discovery.map;
     let mut outcome = IndexOutcome {
         indexed: 0,
         unchanged: 0,
         removed: 0,
-        failed: 0,
-        failures: Vec::new(),
+        rejected: 0,
+        rejections: Vec::new(),
         chunks: 0,
         refs: 0,
         dependency_packages: 0,
@@ -213,159 +253,185 @@ fn index_repo_impl(
         projection_rebuilt: true,
         extraction_reset: false,
     };
-
-    let stored: HashMap<String, (i64, String, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                (
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ),
-            ))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    let previous_paths = stored
-        .keys()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    let mut existing = if mode == IndexMode::FullRefresh {
-        HashMap::new()
-    } else {
-        stored
-    };
-
-    // Extractor-version changes force re-extraction by clearing file hashes, and the
-    // first-party loop commits atomically, so a real database sits at ~100%
-    // or ~0% cleared; the half-way threshold only guards hand-edited state.
-    // At that scale, per-file replacement is pathological: every
-    // `store::delete_file` cascades through the large evidence tables and the
-    // FTS index while they are still fully populated. Truncate everything
-    // once and let the loop below insert like a fresh index instead.
-    let cleared = existing
-        .values()
-        .filter(|(_, hash, _)| hash.is_empty())
-        .count();
-    let extraction_reset = mode == IndexMode::FullRefresh
-        || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
-
-    let mut seen: std::collections::HashSet<String> = Default::default();
-    let mut published: std::collections::HashSet<String> = Default::default();
-    conn.execute_batch("BEGIN")?;
-    if extraction_reset {
-        if mode == IndexMode::FullRefresh {
-            store::reset_snapshot_state(conn)?;
-        } else {
-            store::reset_extraction_state(conn)?;
-        }
-        existing.clear();
-        outcome.extraction_reset = true;
+    for rejection in inventory.rejections {
+        outcome.record_rejection(
+            display_repository_path(&root, &rejection.path),
+            rejection.stage,
+            rejection.error,
+        );
     }
-    for file in &files {
-        let rel = file
-            .strip_prefix(&root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .into_owned();
-        seen.insert(rel.clone());
-        let source = match std::fs::read_to_string(file) {
-            Ok(source) => source,
-            Err(error) => {
-                if let Some((old_id, _, _)) = existing.get(&rel) {
-                    store::delete_file(conn, *old_id)?;
+    for rejection in workspace_discovery.rejections {
+        outcome.record_rejection(
+            display_repository_path(&root, &rejection.path),
+            rejection.stage,
+            rejection.error,
+        );
+    }
+
+    // Source extraction and every selected-dependency read happen before the
+    // publication boundary. A retryable corpus failure therefore rolls this
+    // transaction back and leaves the previously published snapshot intact.
+    conn.execute_batch("BEGIN")?;
+    let preparation = (|| -> Result<(_, _, _)> {
+        ensure_extraction_version(conn)?;
+        let stored: HashMap<String, (i64, String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let previous_paths = stored
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let mut existing = if mode == IndexMode::FullRefresh {
+            HashMap::new()
+        } else {
+            stored
+        };
+
+        // Extractor-version changes force re-extraction by clearing file
+        // hashes. At that scale, per-file replacement is pathological, so
+        // truncate the disposable plane once and insert like a fresh index.
+        let cleared = existing
+            .values()
+            .filter(|(_, hash, _)| hash.is_empty())
+            .count();
+        let extraction_reset = mode == IndexMode::FullRefresh
+            || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
+        if extraction_reset {
+            if mode == IndexMode::FullRefresh {
+                store::reset_snapshot_state(conn)?;
+            } else {
+                store::reset_extraction_state(conn)?;
+            }
+            existing.clear();
+            outcome.extraction_reset = true;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut published = std::collections::HashSet::new();
+        for file in &inventory.files {
+            let rel = display_repository_path(&root, file);
+            let source = match read_source(file) {
+                Ok(source) => {
+                    seen.insert(rel.clone());
+                    source
                 }
-                outcome.record_failure(rel, "read", error);
+                Err(error) if io_policy::is_inventory_race(&error) => continue,
+                Err(error) if io_policy::is_retryable(&error) => {
+                    return Err(retryable_read_failure(&rel, error));
+                }
+                Err(error) => {
+                    seen.insert(rel.clone());
+                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                        store::delete_file(conn, *old_id)?;
+                    }
+                    outcome.record_rejection(rel, "read", error);
+                    continue;
+                }
+            };
+            let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+            let role = file_role::classify(Path::new(&rel), &source);
+            if let Some((id, old_hash, old_role)) = existing.get(&rel)
+                && *old_hash == hash
+            {
+                if old_role != role {
+                    conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
+                }
+                outcome.unchanged += 1;
+                published.insert(rel);
                 continue;
             }
+            if std::env::var_os("JSCOUT_DEBUG").is_some() {
+                eprintln!("extracting {rel}");
+            }
+            match extract_file(file, &rel, &source) {
+                Ok(data) => {
+                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                        store::delete_file(conn, *old_id)?;
+                    }
+                    let identity = FileIdentity {
+                        path: &rel,
+                        hash: &hash,
+                        role,
+                        origin: "repository",
+                        package_instance_id: None,
+                        package_path: None,
+                    };
+                    let (chunks, refs) = insert_file(conn, &identity, &data)?;
+                    outcome.indexed += 1;
+                    outcome.chunks += chunks;
+                    outcome.refs += refs;
+                    published.insert(rel);
+                }
+                Err(error) => {
+                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                        store::delete_file(conn, *old_id)?;
+                    }
+                    outcome.record_rejection(rel, "extract", error);
+                }
+            }
+        }
+        for (path, (id, _, _)) in &existing {
+            if !seen.contains(path) {
+                store::delete_file(conn, *id)?;
+            }
+        }
+        outcome.removed = previous_paths.difference(&published).count();
+
+        let previous = if outcome.extraction_reset {
+            ProjectionIdentity {
+                snapshot: None,
+                projection_version: None,
+                resolution_hash: None,
+            }
+        } else {
+            ProjectionIdentity::read(conn)?
         };
-        let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-        let role = file_role::classify(Path::new(&rel), &source);
-        if let Some((id, old_hash, old_role)) = existing.get(&rel)
-            && *old_hash == hash
-        {
-            if old_role != role {
-                conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
-            }
-            outcome.unchanged += 1;
-            published.insert(rel);
-            continue;
-        }
-        if std::env::var_os("JSCOUT_DEBUG").is_some() {
-            eprintln!("extracting {rel}");
-        }
-        match extract_file(file, &rel, &source) {
-            Ok(data) => {
-                if let Some((old_id, _, _)) = existing.get(&rel) {
-                    store::delete_file(conn, *old_id)?;
-                }
-                let identity = FileIdentity {
-                    path: &rel,
-                    hash: &hash,
-                    role,
-                    origin: "repository",
-                    package_instance_id: None,
-                    package_path: None,
-                };
-                let (nchunks, nrefs) = insert_file(conn, &identity, &data)?;
-                outcome.indexed += 1;
-                outcome.chunks += nchunks;
-                outcome.refs += nrefs;
-                published.insert(rel);
-            }
-            Err(e) => {
-                if let Some((old_id, _, _)) = existing.get(&rel) {
-                    store::delete_file(conn, *old_id)?;
-                }
-                outcome.record_failure(rel, "extract", e);
-            }
-        }
-    }
-    // Remove files that disappeared from disk.
-    for (path, (id, _, _)) in &existing {
-        if !seen.contains(path) {
-            store::delete_file(conn, *id)?;
-        }
-    }
-    outcome.removed = previous_paths.difference(&published).count();
 
-    // Remember the published projection identity before invalidating it: if
-    // this run reproduces the exact same snapshot and module resolution, the
-    // existing projection rows are provably identical and can be republished
-    // without a rebuild. A wholesale reset wiped those rows, so nothing can
-    // be republished no matter what identity was left behind.
-    let previous = if outcome.extraction_reset {
-        ProjectionIdentity {
-            snapshot: None,
-            projection_version: None,
-            resolution_hash: None,
+        // Dependency discovery sees the just-extracted, uncommitted importer
+        // rows. Reading and parsing the selected corpus here closes the gap
+        // where one transient dependency file previously invalidated the old
+        // publication before failing.
+        let discovered = dependency::discover(&root, conn, &options.dependencies, &workspace)?;
+        let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
+        let prepared = prepare_dependency_files(&plans, &mut outcome)?;
+
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            [],
+        )?;
+        Ok((previous, plans, prepared))
+    })();
+    let (previous, plans, prepared) = match preparation {
+        Ok(preparation) => preparation,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
         }
-    } else {
-        ProjectionIdentity::read(conn)?
     };
+    if let Err(error) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(error.into());
+    }
 
-    // Commit canonical rows and snapshot invalidation atomically. Every
-    // following dependency/resolution step can fail, so the previous graph
-    // must stop being public before control enters that phase.
-    conn.execute(
-        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-        [],
-    )?;
-    conn.execute_batch("COMMIT")?;
-
-    let workspace = crate::workspace::WorkspaceMap::build(&root);
-    let discovered = dependency::discover(&root, conn, &options.dependencies, &workspace)?;
-    let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
     let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
-    index_dependency_files(conn, &plans, &instances, &mut outcome)?;
+    index_dependency_files(conn, &prepared, &instances, &mut outcome)?;
     if outcome.indexed > 0 {
         crate::embed::materialize_cached_embeddings(conn)?;
     }
 
-    resolve_module_edges(&root, conn)?;
+    resolve_module_edges(&root, conn, &workspace)?;
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('root', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -424,6 +490,13 @@ fn index_repo_impl(
     Ok(outcome)
 }
 
+fn display_repository_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The three meta values that must all match for the previous projection to
 /// be provably identical to what a rebuild would produce.
 #[derive(PartialEq, Eq)]
@@ -479,29 +552,21 @@ fn ensure_extraction_version(conn: &Connection) -> Result<()> {
     if current.as_deref() == Some(crate::entity::EXTRACTION_VERSION) {
         return Ok(());
     }
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<()> {
-        conn.execute("UPDATE files SET hash=''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [crate::entity::EXTRACTION_VERSION],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
+    // The caller owns the refresh transaction. Keeping this invalidation
+    // inside it ensures a later source/dependency acquisition failure restores
+    // the previously published extractor version and snapshot together.
+    conn.execute("UPDATE files SET hash=''", [])?;
+    conn.execute("DELETE FROM resolved_edges", [])?;
+    conn.execute("DELETE FROM graph_nodes", [])?;
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [crate::entity::EXTRACTION_VERSION],
+    )?;
     Ok(())
 }
 
@@ -747,9 +812,64 @@ fn insert_file(
     Ok((data.chunks.len(), data.graph.refs.len()))
 }
 
+fn prepare_dependency_files(
+    plans: &[dependency::PackagePlan],
+    outcome: &mut IndexOutcome,
+) -> Result<Vec<PreparedDependencyFile>> {
+    let mut prepared = Vec::new();
+    for plan in plans {
+        outcome.dependency_packages += 1;
+        outcome.dependency_skipped += plan.skipped_files;
+        outcome.dependency_skipped_bytes += plan.skipped_bytes;
+        outcome.dependency_plans.push(format!(
+            "{}@{}: {} ({})",
+            plan.package.name,
+            plan.package.version.as_deref().unwrap_or("unknown"),
+            plan.source_basis,
+            plan.status,
+        ));
+        for file in &plan.files {
+            let display = dependency_display_path(&plan.package, &file.package_path);
+            let source = match read_source(&file.source_path) {
+                Ok(source) => source,
+                Err(error) if io_policy::is_inventory_race(&error) => continue,
+                Err(error) if io_policy::is_retryable(&error) => {
+                    let path = format!("{display} ({})", file.source_path.display());
+                    return Err(retryable_read_failure(&path, error));
+                }
+                Err(error) => {
+                    outcome.record_rejection(
+                        display,
+                        "read",
+                        format!("{}: {error}", file.source_path.display()),
+                    );
+                    continue;
+                }
+            };
+            if dependency::should_skip_minified(&file.source_path, &source, file.forced_entry) {
+                outcome.dependency_skipped += 1;
+                continue;
+            }
+            outcome.dependency_bytes += file.bytes;
+            let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+            let role = file_role::classify(Path::new(&file.package_path), &source);
+            prepared.push(PreparedDependencyFile {
+                package_root: plan.package.canonical_root.clone(),
+                display,
+                source_path: file.source_path.clone(),
+                package_path: file.package_path.clone(),
+                source,
+                hash,
+                role,
+            });
+        }
+    }
+    Ok(prepared)
+}
+
 fn index_dependency_files(
     conn: &Connection,
-    plans: &[dependency::PackagePlan],
+    prepared: &[PreparedDependencyFile],
     instances: &std::collections::BTreeMap<PathBuf, i64>,
     outcome: &mut IndexOutcome,
 ) -> Result<()> {
@@ -775,83 +895,47 @@ fn index_dependency_files(
     let mut seen = std::collections::HashSet::new();
     conn.execute_batch("BEGIN")?;
     let result = (|| {
-        for plan in plans {
-            outcome.dependency_packages += 1;
-            outcome.dependency_skipped += plan.skipped_files;
-            outcome.dependency_skipped_bytes += plan.skipped_bytes;
-            outcome.dependency_plans.push(format!(
-                "{}@{}: {} ({})",
-                plan.package.name,
-                plan.package.version.as_deref().unwrap_or("unknown"),
-                plan.source_basis,
-                plan.status,
-            ));
-            let package_id = *instances.get(&plan.package.canonical_root).ok_or_else(|| {
+        for file in prepared {
+            let package_id = *instances.get(&file.package_root).ok_or_else(|| {
                 anyhow::anyhow!("dependency package instance was not synchronized")
             })?;
-            for file in &plan.files {
-                let display = dependency_display_path(&plan.package, &file.package_path);
-                let source = match std::fs::read_to_string(&file.source_path) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        // Preserve the last successfully indexed row on a
-                        // transient read failure; a later successful cycle can
-                        // replace it without first losing known-good data.
-                        seen.insert(display.clone());
-                        outcome.record_failure(
-                            display,
-                            "read",
-                            format!("{}: {error}", file.source_path.display()),
-                        );
-                        continue;
-                    }
-                };
-                if dependency::should_skip_minified(&file.source_path, &source, file.forced_entry) {
-                    // Policy exclusions are intentionally not seen: cleanup
-                    // below removes a row that no longer belongs in the corpus.
-                    outcome.dependency_skipped += 1;
-                    continue;
+            seen.insert(file.display.clone());
+            if let Some((id, old_hash, old_role, old_package, old_package_path)) =
+                existing.get(&file.display)
+                && *old_hash == file.hash
+                && *old_package == package_id
+                && *old_package_path == file.package_path
+            {
+                if old_role != file.role {
+                    conn.execute(
+                        "UPDATE files SET role=?1 WHERE id=?2",
+                        params![file.role, id],
+                    )?;
                 }
-                seen.insert(display.clone());
-                outcome.dependency_bytes += file.bytes;
-                let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
-                let role = file_role::classify(Path::new(&file.package_path), &source);
-                if let Some((id, old_hash, old_role, old_package, old_package_path)) =
-                    existing.get(&display)
-                    && *old_hash == hash
-                    && *old_package == package_id
-                    && *old_package_path == file.package_path
-                {
-                    if old_role != role {
-                        conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
-                    }
-                    outcome.unchanged += 1;
+                outcome.unchanged += 1;
+                outcome.dependency_files += 1;
+                continue;
+            }
+            if let Some((old_id, _, _, _, _)) = existing.get(&file.display) {
+                store::delete_file(conn, *old_id)?;
+            }
+            match extract_file(&file.source_path, &file.display, &file.source) {
+                Ok(data) => {
+                    let identity = FileIdentity {
+                        path: &file.display,
+                        hash: &file.hash,
+                        role: file.role,
+                        origin: "dependency",
+                        package_instance_id: Some(package_id),
+                        package_path: Some(&file.package_path),
+                    };
+                    let (chunks, refs) = insert_file(conn, &identity, &data)?;
+                    outcome.indexed += 1;
                     outcome.dependency_files += 1;
-                    continue;
+                    outcome.chunks += chunks;
+                    outcome.refs += refs;
                 }
-                match extract_file(&file.source_path, &display, &source) {
-                    Ok(data) => {
-                        if let Some((old_id, _, _, _, _)) = existing.get(&display) {
-                            store::delete_file(conn, *old_id)?;
-                        }
-                        let identity = FileIdentity {
-                            path: &display,
-                            hash: &hash,
-                            role,
-                            origin: "dependency",
-                            package_instance_id: Some(package_id),
-                            package_path: Some(&file.package_path),
-                        };
-                        let (chunks, refs) = insert_file(conn, &identity, &data)?;
-                        outcome.indexed += 1;
-                        outcome.dependency_files += 1;
-                        outcome.chunks += chunks;
-                        outcome.refs += refs;
-                    }
-                    Err(error) => {
-                        outcome.record_failure(display, "extract", error);
-                    }
-                }
+                Err(error) => outcome.record_rejection(file.display.clone(), "extract", error),
             }
         }
         for (path, (id, _, _, _, _)) in &existing {
@@ -885,8 +969,11 @@ fn dependency_display_path(package: &dependency::DiscoveredPackage, package_path
 }
 
 /// Resolve every (file, request) pair to an in-repo file or external package.
-pub fn resolve_module_edges(root: &Path, conn: &Connection) -> Result<()> {
-    let workspace = crate::workspace::WorkspaceMap::build(root);
+pub fn resolve_module_edges(
+    root: &Path,
+    conn: &Connection,
+    workspace: &crate::workspace::WorkspaceMap,
+) -> Result<()> {
     let resolver = Resolver::new(resolver_options(
         workspace.aliases.clone(),
         Some(TsconfigDiscovery::Auto),
@@ -1112,28 +1199,198 @@ pub(crate) fn package_name(request: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::ErrorKind;
 
     use anyhow::Result;
 
     use super::{
         IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_options,
-        index_repo_without_extraction_reset, refresh_repo_with_options,
+        index_repo_without_extraction_reset, inject_read_failure, refresh_repo_with_options,
     };
     use crate::{embed, origin, query, search, semantic, store, structural};
 
     #[test]
-    fn reports_the_file_and_stage_for_read_failures() -> Result<()> {
+    fn reports_the_file_and_stage_for_rejected_reads() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(repo.path().join("bad.ts"), [0xff, 0xfe])?;
         let conn = store::open(repo.path())?;
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!(outcome.failed, 1);
-        assert_eq!(outcome.failures.len(), 1);
-        assert_eq!(outcome.failures[0].path, "bad.ts");
-        assert_eq!(outcome.failures[0].stage, "read");
-        assert!(!outcome.failures[0].error.is_empty());
+        assert_eq!(outcome.rejected, 1);
+        assert_eq!(outcome.rejections.len(), 1);
+        assert_eq!(outcome.rejections[0].path, "bad.ts");
+        assert_eq!(outcome.rejections[0].stage, "read");
+        assert!(!outcome.rejections[0].error.is_empty());
+        assert!(!structural::current_snapshot(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn file_disappearance_after_inventory_is_a_removal_not_a_retry() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let retained = repo.path().join("retained.ts");
+        let vanished = repo.path().join("vanished.ts");
+        fs::write(&retained, "export const retained = 1;\n")?;
+        fs::write(&vanished, "export const vanished = 1;\n")?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+
+        inject_read_failure(
+            vanished.canonicalize()?,
+            std::io::Error::from(ErrorKind::NotFound),
+        );
+        let outcome = index_repo(repo.path(), &conn)?;
+
+        assert_eq!(outcome.rejected, 0);
+        assert_eq!(outcome.removed, 1);
+        let paths = conn
+            .prepare("SELECT path FROM files ORDER BY path")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(paths, vec!["retained.ts"]);
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_source_read_preserves_the_published_snapshot() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let source = repo.path().join("main.ts");
+        let before = "export const before = 1;\n";
+        fs::write(&source, before)?;
+        let conn = store::open(repo.path())?;
+        index_repo(repo.path(), &conn)?;
+        let old_snapshot = structural::current_snapshot(&conn)?;
+
+        fs::write(&source, "export const after = 2;\n")?;
+        #[cfg(unix)]
+        let transient_error = std::io::Error::from_raw_os_error(libc::EMFILE);
+        #[cfg(not(unix))]
+        let transient_error = std::io::Error::from(ErrorKind::Interrupted);
+        inject_read_failure(source.canonicalize()?, transient_error);
+        let error = index_repo(repo.path(), &conn)
+            .err()
+            .expect("retryable source read must abort preparation");
+
+        assert!(error.to_string().contains("retryable read failure"));
+        let retained_hash: String =
+            conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            retained_hash,
+            blake3::hash(before.as_bytes()).to_hex().to_string()
+        );
+        assert_eq!(structural::current_snapshot(&conn)?, old_snapshot);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previously_indexed_unreadable_subtree_reports_removal_magnitude() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir()?;
+        let locked = repo.path().join("locked");
+        fs::create_dir_all(&locked)?;
+        fs::write(repo.path().join("good.ts"), "export const good = 1;\n")?;
+        fs::write(locked.join("first.ts"), "export const first = 1;\n")?;
+        fs::write(locked.join("second.ts"), "export const second = 2;\n")?;
+        let conn = store::open(repo.path())?;
+        let initial = index_repo(repo.path(), &conn)?;
+        assert_eq!(
+            (initial.indexed, initial.removed, initial.rejected),
+            (3, 0, 0)
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+        let result = index_repo(repo.path(), &conn);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+        let outcome = result?;
+
+        assert_eq!(outcome.indexed, 0);
+        assert_eq!(outcome.unchanged, 1);
+        assert_eq!(outcome.removed, 2);
+        assert_eq!(outcome.rejected, 1);
+        assert_eq!(outcome.rejections[0].path, "locked");
+        assert_eq!(outcome.rejections[0].stage, "walk");
+        let paths = conn
+            .prepare("SELECT path FROM files ORDER BY path")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(paths, vec!["good.ts"]);
+        assert!(!structural::current_snapshot(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_boundary_rejections_remain_visible_while_sources_index() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )?;
+        fs::create_dir_all(repo.path().join("packages/broken/src"))?;
+        fs::write(
+            repo.path().join("packages/broken/package.json"),
+            "{ not-json",
+        )?;
+        fs::write(
+            repo.path().join("packages/broken/src/index.ts"),
+            "export const indexed = 1;\n",
+        )?;
+        let conn = store::open(repo.path())?;
+
+        let outcome = index_repo(repo.path(), &conn)?;
+
+        assert_eq!(outcome.indexed, 1);
+        assert!(outcome.rejections.iter().any(|rejection| {
+            rejection.path == "packages/broken/package.json"
+                && rejection.stage == "workspace-manifest"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn full_refresh_preserves_source_less_workspace_identities() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join(".git"))?;
+        fs::write(
+            repo.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )?;
+        fs::write(repo.path().join(".gitignore"), "packages/ignored/src/\n")?;
+        fs::create_dir_all(repo.path().join("packages/dist-only/dist"))?;
+        fs::write(
+            repo.path().join("packages/dist-only/package.json"),
+            r#"{"name":"dist-only","main":"dist/index.js"}"#,
+        )?;
+        fs::write(
+            repo.path().join("packages/dist-only/dist/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        fs::create_dir_all(repo.path().join("packages/ignored/src"))?;
+        fs::write(
+            repo.path().join("packages/ignored/package.json"),
+            r#"{"name":"ignored-source","main":"src/index.ts"}"#,
+        )?;
+        fs::write(
+            repo.path().join("packages/ignored/src/index.ts"),
+            "export const ignored = true;\n",
+        )?;
+        fs::write(repo.path().join("main.ts"), "export const main = true;\n")?;
+        let conn = store::open(repo.path())?;
+
+        refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+        let workspace_names = conn
+            .prepare(
+                "SELECT name FROM package_instances
+                 WHERE origin='workspace' ORDER BY name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(workspace_names, vec!["dist-only", "ignored-source"]);
         Ok(())
     }
 
@@ -1148,7 +1405,7 @@ mod tests {
 
         let outcome = index_repo(repo.path(), &conn)?;
 
-        assert_eq!((outcome.indexed, outcome.failed), (1, 0));
+        assert_eq!((outcome.indexed, outcome.rejected), (1, 0));
         let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
         assert!(chunks > 0);
         Ok(())
@@ -1690,6 +1947,71 @@ mod tests {
     }
 
     #[test]
+    fn non_retryable_dependency_rejections_remove_stale_rows() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(
+            repo.path().join("main.ts"),
+            "import value from 'selected-dep';\nexport const result = value;\n",
+        )?;
+        let dependency = repo.path().join("node_modules/selected-dep");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        let entry = dependency.join("index.js");
+        fs::write(
+            &entry,
+            "export const dependencyStaleMarker = true;\nexport default 1;\n",
+        )?;
+
+        let conn = store::open(repo.path())?;
+        let options = IndexOptions {
+            dependencies: vec!["selected-dep".into()],
+            ..Default::default()
+        };
+        index_repo_with_options(repo.path(), &conn, &options)?;
+
+        fs::write(&entry, [0xff, 0xfe])?;
+        let unreadable = index_repo_with_options(repo.path(), &conn, &options)?;
+        assert_eq!(unreadable.rejected, 1);
+        assert_eq!(unreadable.rejections[0].stage, "read");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE origin='dependency'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'dependencyStaleMarker'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+
+        fs::write(&entry, "export default 2;\n")?;
+        index_repo_with_options(repo.path(), &conn, &options)?;
+        fs::write(&entry, "export default function Broken() { return <main>")?;
+        let unparseable = index_repo_with_options(repo.path(), &conn, &options)?;
+        assert_eq!(unparseable.rejected, 1);
+        assert_eq!(unparseable.rejections[0].stage, "extract");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM files WHERE origin='dependency'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert!(!structural::current_snapshot(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn indexes_only_selected_dependency_files_and_removes_them_when_omitted() -> Result<()> {
         let repo = tempfile::tempdir()?;
         fs::write(
@@ -2194,7 +2516,7 @@ mod tests {
         let refreshed = refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
         assert!(refreshed.extraction_reset);
         assert_eq!(
-            (refreshed.indexed, refreshed.unchanged, refreshed.failed),
+            (refreshed.indexed, refreshed.unchanged, refreshed.rejected),
             (1, 0, 0)
         );
         assert_eq!(structural::current_snapshot(&conn)?, snapshot);
@@ -2284,7 +2606,7 @@ mod tests {
         let outcome =
             incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
-        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.rejected, 1);
         assert_eq!(outcome.removed, 1);
         assert_eq!(
             conn.query_row(
@@ -2614,8 +2936,8 @@ mod tests {
         let fast = index_repo_with_options(repo.path(), &reset, &options)?;
         assert!(fast.extraction_reset, "cleared hashes must take the reset");
         assert_eq!(
-            (fast.indexed, fast.unchanged, fast.failed),
-            (slow.indexed, slow.unchanged, slow.failed)
+            (fast.indexed, fast.unchanged, fast.rejected),
+            (slow.indexed, slow.unchanged, slow.rejected)
         );
 
         for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?
@@ -2684,13 +3006,11 @@ mod tests {
     }
 
     #[test]
-    fn dependency_failure_invalidates_snapshot_after_first_party_commit() -> Result<()> {
+    fn dependency_failure_rolls_back_before_snapshot_invalidation() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let main = repo.path().join("main.ts");
-        fs::write(
-            &main,
-            "import value from 'selected-dep';\nexport const before = value;\n",
-        )?;
+        let before = "import value from 'selected-dep';\nexport const before = value;\n";
+        fs::write(&main, before)?;
         let dependency = repo.path().join("node_modules/selected-dep");
         fs::create_dir_all(&dependency)?;
         fs::write(
@@ -2718,24 +3038,78 @@ mod tests {
             .expect("missing selected dependency must fail the run");
         assert!(error.to_string().contains("not installed or resolvable"));
 
-        let committed_hash: String =
+        let retained_hash: String =
             conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
                 row.get(0)
             })?;
         assert_eq!(
-            committed_hash,
-            blake3::hash(changed.as_bytes()).to_hex().to_string()
+            retained_hash,
+            blake3::hash(before.as_bytes()).to_hex().to_string(),
+            "failed dependency preparation committed first-party changes"
         );
-        let public_snapshot_rows: i64 = conn.query_row(
-            "SELECT count(*) FROM meta
-             WHERE key IN ('snapshot', 'projection_version')",
-            [],
-            |row| row.get(0),
-        )?;
+        let retained_snapshot: String =
+            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(
-            public_snapshot_rows, 0,
-            "stale snapshot remained public: {old_snapshot}"
+            retained_snapshot, old_snapshot,
+            "failed dependency preparation removed the published snapshot"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_dependency_read_preserves_the_published_snapshot() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let main = repo.path().join("main.ts");
+        let before = "import value from 'selected-dep';\nexport const before = value;\n";
+        fs::write(&main, before)?;
+        let dependency = repo.path().join("node_modules/selected-dep");
+        fs::create_dir_all(&dependency)?;
+        fs::write(
+            dependency.join("package.json"),
+            r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        let entry = dependency.join("index.js");
+        fs::write(&entry, "export default 1;\n")?;
+
+        let conn = store::open(repo.path())?;
+        let options = IndexOptions {
+            dependencies: vec!["selected-dep".into()],
+            ..Default::default()
+        };
+        index_repo_with_options(repo.path(), &conn, &options)?;
+        let old_snapshot: String =
+            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                row.get(0)
+            })?;
+
+        fs::write(
+            &main,
+            "import value from 'selected-dep';\nexport const after = value + 1;\n",
+        )?;
+        inject_read_failure(
+            entry.canonicalize()?,
+            std::io::Error::from(ErrorKind::Interrupted),
+        );
+        let error = index_repo_with_options(repo.path(), &conn, &options)
+            .err()
+            .expect("retryable dependency read must fail preparation");
+        assert!(error.to_string().contains("retryable read failure"));
+
+        let retained_hash: String =
+            conn.query_row("SELECT hash FROM files WHERE path='main.ts'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(
+            retained_hash,
+            blake3::hash(before.as_bytes()).to_hex().to_string()
+        );
+        let retained_snapshot: String =
+            conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(retained_snapshot, old_snapshot);
         Ok(())
     }
 }

@@ -13,6 +13,7 @@ mod graph;
 mod heur;
 mod indexer;
 mod inference;
+mod io_policy;
 mod llm;
 mod mcp;
 mod origin;
@@ -376,6 +377,9 @@ enum Command {
         /// Also embed new/changed chunks on each re-index (needs a provider)
         #[arg(long)]
         embed: bool,
+        /// Restrict watched embedding to the effective product corpus
+        #[arg(long, requires = "embed")]
+        product: bool,
         /// Keep these installed dependency packages in the watched index
         #[arg(long = "deps", value_delimiter = ',')]
         dependencies: Vec<String>,
@@ -1070,6 +1074,7 @@ fn main() -> Result<()> {
             root,
             database,
             embed,
+            product,
             dependencies,
             enrich,
             enrich_timeout,
@@ -1081,6 +1086,7 @@ fn main() -> Result<()> {
             &watch::WatchOptions {
                 database: database.as_deref(),
                 embed_on_change: embed,
+                embed_product_only: product,
                 dependencies: &dependencies,
                 enrich_on_change: enrich,
                 enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
@@ -1606,9 +1612,10 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     // "unchanged" count would always read 0 and misreport the rebuild as failed
     // change detection. Watch reports reuse for its incremental generations.
     println!(
-        "indexed {} files ({} failed) — {} chunks, {} refs in {:?}",
+        "indexed {} files (removed={}, rejected={}) — {} chunks, {} refs in {:?}",
         o.indexed,
-        o.failed,
+        o.removed,
+        o.rejected,
         o.chunks,
         o.refs,
         started.elapsed()
@@ -1616,7 +1623,7 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
     if o.extraction_reset {
         println!("snapshot refresh: rebuilt disposable structural state");
     }
-    indexer::report_failures(&o);
+    indexer::report_rejections(&o);
     if !dependencies.is_empty() {
         println!(
             "dependency corpus: {} packages, {} files / {} bytes, {} files / {} bytes skipped",
@@ -1770,7 +1777,7 @@ fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) ->
 }
 
 fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
-    let files = walk::source_files(root);
+    let files = walk::source_files(root)?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
@@ -1803,7 +1810,7 @@ fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
 
 fn cmd_stats(root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
-    let files = walk::source_files(root);
+    let files = walk::source_files(root)?;
     let mut total = stats::FileStats::default();
     let mut parsed_files = 0usize;
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
@@ -1837,7 +1844,7 @@ fn cmd_stats(root: &Path) -> Result<()> {
     let elapsed = started.elapsed();
     println!("root:            {}", root.display());
     println!(
-        "files:           {} ({} parsed, {} failed)",
+        "files:           {} ({} parsed, {} rejected)",
         files.len(),
         parsed_files,
         failed.len()
@@ -1862,7 +1869,7 @@ fn cmd_stats(root: &Path) -> Result<()> {
     println!("elapsed:         {:?}", elapsed);
     for (f, e) in failed.iter().take(5) {
         eprintln!(
-            "  fail: {}: {}",
+            "  reject: {}: {}",
             f.display(),
             e.lines().next().unwrap_or("")
         );
@@ -2362,6 +2369,7 @@ mod main_tests {
             "watch",
             ".",
             "--embed",
+            "--product",
             "--enrich",
             "--enrich-timeout",
             "45",
@@ -2377,6 +2385,7 @@ mod main_tests {
         .expect("watch enrichment controls parse");
         let Command::Watch {
             embed,
+            product,
             enrich,
             enrich_timeout,
             sidecar_path,
@@ -2389,12 +2398,15 @@ mod main_tests {
             panic!("expected watch")
         };
         assert!(embed);
+        assert!(product);
         assert!(enrich);
         assert_eq!(enrich_timeout, 45);
         assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
         assert_eq!(database, Some(PathBuf::from("watch.db")));
         assert_eq!(debounce_ms, 750);
         assert_eq!(reconcile_seconds, 30);
+
+        assert!(Cli::try_parse_from(["jscout", "watch", ".", "--product"]).is_err());
     }
 
     #[test]

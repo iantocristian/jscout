@@ -1056,9 +1056,9 @@ Acceptance checks:
 - a genuine v15 embedding layout is rejected without mutation, while the v16
   durable floor preserves compatible embedding and semantic-memory rows;
 - a fatal required-phase failure never publishes a snapshot marker describing
-  new or partially rebuilt structural rows; individual file read/extraction
-  failures may publish the same visibly reported partial snapshot as
-  `jscout index`;
+  new or partially rebuilt structural rows; non-retryable file reads and
+  deterministic extraction rejections are reported and excluded from the
+  successfully published indexable corpus;
 - retrieval-only commands do not create or migrate a missing database;
   semantic dry-run planners should follow the same rule after the noted
   command-authority cleanup.
@@ -1069,10 +1069,11 @@ Acceptance checks:
 real repository remains pending.** The production watcher uses a pure
 generation coordinator, a typed full/incremental refresh scope, fresh per-phase
 connections, explicit optional embedding/checker phases, supersession and
-cancellation, bounded retry and stable-failure degradation, exact self-output
-exclusions, dynamic external coverage, and periodic reconciliation. Unit and
-fixture coverage passes; the next operational step is to run it through branch
-switches and ordinary edits on the user's target repository.
+cancellation, uncapped phase-error retries with a capped exponential delay,
+exact self-output exclusions, dynamic external coverage, and periodic
+reconciliation. Unit and fixture coverage passes; the next operational step is
+to run it through branch switches and ordinary edits on the user's target
+repository.
 
 G12 brings `jscout watch` under the fixed-snapshot architecture. The watcher
 is an in-process coordinator over the same explicit operations used outside
@@ -1107,9 +1108,11 @@ package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
 inputs, selected dependency roots, external checker inputs, directories,
 backend errors, and unclassifiable missing paths also require full refresh.
 Full scope is sticky within a generation, so a mixed event cannot be downgraded
-by later source notifications. A changed file that cannot be read or extracted
-is removed from the published partial snapshot rather than leaving its
-previous structural row live.
+by later source notifications. A changed file with a non-retryable read or
+deterministic extraction failure is reported and excluded rather than leaving
+its previous structural row live. The operation still publishes the indexable
+corpus successfully. A recognized transient read failure instead rolls back
+the transaction and fails the refresh for retry.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1120,12 +1123,14 @@ not a latency target. A query may report that no snapshot is published for the
 entire structural-refresh interval, and every cycle logs its actual phase
 durations.
 
-`--embed` and `--enrich` remain explicit. Plain watch performs no model calls,
-does not start the TypeScript checker, and never serves checker facts from a
-different structural snapshot. It may reuse an active exact-snapshot batch
-when either refresh mode proves the snapshot unchanged. Dependency selectors
-remain authoritative and must be supplied to watch exactly as they are to
-index.
+`--embed` and `--enrich` remain explicit. `--product` is subordinate to
+`--embed` and applies the same effective-product selection as manual
+`jscout embed --product`; a product-only vector cache must not be silently
+widened by the watcher. Plain watch performs no model calls, does not start the
+TypeScript checker, and never serves checker facts from a different structural
+snapshot. It may reuse an active exact-snapshot batch when either refresh mode
+proves the snapshot unchanged. Dependency selectors remain authoritative and
+must be supplied to watch exactly as they are to index.
 
 ### Generation state machine
 
@@ -1147,7 +1152,7 @@ clean
   -> refreshing(generation)
   -> embedding(generation, snapshot)   [only with --embed]
   -> enriching(generation, snapshot)   [only with --enrich]
-  -> clean | degraded(snapshot, warnings)
+  -> clean
 
 any phase + newer event -> dirty(newer generation)
 any failed phase        -> retry-wait(same generation, phase) -> retry
@@ -1161,25 +1166,45 @@ checker work terminates its bounded sidecar when superseded. Before starting
 either optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh that returns individual file failures may expose the
-same explicitly reported partial snapshot as `jscout index`. The watcher
-reports every path/stage/error and retries the generation without requiring
-another filesystem event. Three consecutive refreshes with the same failure
-fingerprint (path, stage, and error) make the snapshot `degraded` rather than
-permanently dirty: optional embedding and enrichment may then run against that
-exact partial snapshot, while the failed paths remain on the reconciliation
-retry set. The last degraded fingerprint survives later generations, so the
-same permanent failure can degrade immediately rather than paying three full
-retries every cycle. A changed failure fingerprint or successful read resets
-that stability; new input resets only the current retry timer. Fatal refresh
-errors never enter this bounded degradation path and remain dirty until a
-required phase succeeds.
+A structural refresh may return individual file rejections. `jscout index` and
+the watcher report every rejected path/stage/error and publish the indexable
+corpus as a successful, clean generation. Non-retryable read failures and
+deterministic parse rejections are subject-local: a whole-repository retry
+cannot repair binary media with a source-looking extension or a permanently
+protected file.
+A later file event or periodic reconciliation naturally tries the path again.
 
-Failures use bounded exponential backoff. A parked retry gates fresh work for
-that generation and is consumed when it starts; attempts reset on new input or
-a successful phase. Retry and stable-failure state live in memory. Restarting
-watch always subscribes first and then performs a full refresh, so no persistent
-watcher journal or recovery schema is required.
+Read-error disposition is one explicit rule. Descriptor exhaustion,
+interrupted or timed-out I/O, connection/network failures, stale handles,
+and temporary resource pressure are retryable phase errors. Unknown errors and
+permission denial are rejected inputs so a single permanently inaccessible
+file or subtree cannot wedge watch forever. A path that disappears or changes
+between file and directory after inventory is checkout churn: its old row is
+removed, and a later event or reconciliation converges on the next state. The
+walker applies the same classification to directory and ignore-file errors;
+retryable I/O aborts while permanent subtree failures remain visible
+rejections.
+Retryable reads roll back the active transaction and return `Err`; watch
+remains dirty and retries even when periodic reconciliation is disabled.
+Other database, transaction, discovery, and phase-level failures follow the
+same retry path.
+Selected-dependency traversal errors are phase failures rather than partial
+inventories. One classified workspace map is built before mutation by expanding
+declared globs against the filesystem. Package manifests establish identity;
+the indexed source inventory only prefers alias targets, with classified
+manifest-entry fallback for source-less members. First-party extraction,
+dependency discovery from the newly extracted importers, and every selected-
+dependency source read are then prepared in the same rollbackable transaction
+before the old snapshot publication is invalidated. A retryable acquisition
+failure therefore leaves the previous snapshot queryable instead of exposing
+an unpublished gap.
+
+Phase-level failures retry without an attempt limit, using exponential delay
+capped at 30 seconds. A parked retry gates fresh work for that generation and
+is consumed when it starts; delay resets on new input or a successful phase.
+Retry state lives in memory. Restarting watch always subscribes first and then
+performs a full refresh, so no persistent watcher journal or recovery schema is
+required.
 
 ### Trigger and reconciliation policy
 
@@ -1229,12 +1254,12 @@ external watches with the newly resolved package instances and checker input
 set. These paths are ephemeral coordinator state, not a cross-snapshot
 freshness manifest stored in SQLite.
 
-Failure to register a narrow external watch retries with backoff. Three
-consecutive failures for the same path move that path to `degraded` coverage:
-the coordinator logs it, relies on periodic reconciliation for that path, and
-retries registration on the next reconciliation tick or when the external
-path set changes. Persistent registration failure does not itself keep the
-structural generation dirty or cause a full-refresh loop.
+Failure to register a narrow external watch marks that path as `degraded`
+coverage immediately. Registration is attempted again whenever targets are
+reconciled: after a successful refresh or enrichment, on the next periodic
+reconciliation, or when the target set changes. It has no independent retry
+timer. Persistent registration failure does not itself keep the structural
+generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
 (default ten minutes) schedules a full refresh even when no event arrived.
@@ -1283,12 +1308,12 @@ delete semantic memory or content-hash embedding rows.
 
 1. Extract a coordinator with injectable event input, clock, and phase
    executor. Track desired/completed generations, dirty reasons, per-phase
-   retry state, debounce, degraded snapshots/coverage, and structured cycle
-   telemetry without timing-dependent tests.
+   retry state, debounce, degraded external-watch coverage, and structured
+   cycle telemetry without timing-dependent tests.
 2. Replace the pre-G12 watch loop with the normal full-refresh operation. Open
    a fresh connection per phase, configure `busy_timeout`, audit rollback
-   paths, implement bounded stable-file-failure degradation, and make fatal
-   failures retry automatically.
+   paths, report and skip file-local rejections, and make fatal phase failures
+   retry automatically.
 3. Invalidate cross-snapshot checker state through the structural refresh while
    retaining a reusable exact-snapshot batch; sequence optional embedding and
    exact-snapshot enrichment, and add generation checks plus cancellation
@@ -1297,9 +1322,9 @@ delete semantic memory or content-hash embedding rows.
    selected-dependency, and dynamically reported checker-input watches. Treat
    notification backend errors as full-refresh uncertainty and persistent
    registration failures as degraded timer-backed coverage.
-5. Add periodic reconciliation, bounded retry/backoff, concise generation and
-   phase logging, then remove assumptions that another repository event is
-   required to recover from failure.
+5. Add periodic reconciliation, uncapped retry with a capped exponential
+   delay, concise generation and phase logging, then remove assumptions that
+   another repository event is required to recover from failure.
 6. Update README operational guidance after the coordinator acceptance suite
    passes.
 7. **G12.1 amendment (2026-08-17):** promote the already parity-tested
@@ -1336,10 +1361,11 @@ delete semantic memory or content-hash embedding rows.
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,
   and superseded checker work is cancelled or discarded;
-- a transient failed-file result remains dirty initially, reports the exact
-  path/stage/error, and converges after the file becomes readable;
-- three identical failed-file generations publish a visibly degraded snapshot,
-  allow exact-snapshot enrichment, and retain periodic retry coverage;
+- a deterministically unindexable file reports the exact path/stage/error, is
+  excluded without failing or degrading the refresh, and remains covered by
+  later file events and periodic reconciliation;
+- a recognized transient read failure rolls back and retries without
+  publishing a reduced corpus;
 - the default ten-minute reconciliation repairs a deliberately dropped
   notification, while explicitly disabling it reports the lost guarantee;
 - repeated full generations reuse cached embeddings, embed only unseen
