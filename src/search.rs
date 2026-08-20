@@ -2397,6 +2397,7 @@ struct PathReach {
 
 struct RankedExpansionPath {
     key: String,
+    roots: Vec<String>,
     edges: Vec<EdgeIdentity>,
     priority: u8,
     score: f64,
@@ -2515,6 +2516,7 @@ fn select_path_projection(
             let leaf = child_counts.get(key).copied().unwrap_or(0) == 0;
             (boundary || cross_file || direct || leaf).then_some(RankedExpansionPath {
                 key: key.clone(),
+                roots: vec![state.root.clone()],
                 edges: predecessor_path(key, &reach),
                 priority: if boundary || cross_file {
                     0
@@ -2537,6 +2539,7 @@ fn select_path_projection(
             .filter(|edge| seed_keys.contains(&edge.source) && seed_keys.contains(&edge.target))
             .map(|edge| RankedExpansionPath {
                 key: format!("{}>{}:{}", edge.source, edge.target, edge.kind),
+                roots: vec![edge.source.clone(), edge.target.clone()],
                 edges: vec![edge_identity(edge)],
                 priority: 0,
                 score: edge.relevance,
@@ -2550,6 +2553,20 @@ fn select_path_projection(
             .then_with(|| right.depth.cmp(&left.depth))
             .then_with(|| left.key.cmp(&right.key))
     });
+    // Preserve the best continuation from every returned search seed before
+    // spending the remaining path budget on a stronger seed's fan-out. This
+    // keeps a multi-symbol search from silently dropping one localized entry
+    // point merely because another has many high-scoring adjacent boundaries.
+    let mut covered_roots = HashSet::new();
+    let (mut coverage, remaining): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| {
+        let contributes = path.roots.iter().any(|root| !covered_roots.contains(root));
+        if contributes {
+            covered_roots.extend(path.roots.iter().cloned());
+        }
+        contributes
+    });
+    coverage.extend(remaining);
+    let paths = coverage;
 
     let candidate_paths = paths.len();
     let (mut nodes, mut selected_node_keys, mut truncated) =
@@ -3274,6 +3291,75 @@ mod tests {
         let neighborhood = select_neighborhood_projection(&seeds, &nodes, &edges, &options, true)?;
         assert_eq!(neighborhood.nodes.len(), 4);
         assert_eq!(neighborhood.edges.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn path_projection_covers_each_seed_before_repeating_one_seed() -> Result<()> {
+        let node = |key: &str, file: &str| GraphNode {
+            key: key.into(),
+            kind: "symbol".into(),
+            display_name: key.into(),
+            file: Some(file.into()),
+            file_role: Some("production".into()),
+            file_origin: Some("repository".into()),
+            line: Some(1),
+            meta: serde_json::json!({}),
+            relevance: 1.0,
+        };
+        let edge = |source: &str, target: &str, relevance: f64| GraphEdge {
+            source: source.into(),
+            target: target.into(),
+            kind: "call".into(),
+            confidence: "certain".into(),
+            provenance: "parser".into(),
+            file: Some("src/entry.ts".into()),
+            line: Some(1),
+            detail: serde_json::json!({}),
+            relevance,
+        };
+        let nodes = vec![
+            node("root-a", "src/a.ts"),
+            node("root-b", "src/b.ts"),
+            node("a-first", "src/a-first.ts"),
+            node("a-second", "src/a-second.ts"),
+            node("b-first", "src/b-first.ts"),
+        ];
+        let edges = vec![
+            edge("root-a", "a-first", 0.99),
+            edge("root-a", "a-second", 0.98),
+            edge("root-b", "b-first", 0.5),
+        ];
+        let seeds = vec!["root-a".to_string(), "root-b".to_string()];
+        let selection = select_path_projection(
+            &seeds,
+            &nodes,
+            &edges,
+            &ExpansionOptions {
+                projection: ExpansionProjection::Paths,
+                depth: 1,
+                seed_limit: 2,
+                path_limit: 2,
+                node_limit: 10,
+                edge_limit: 10,
+                byte_limit: 24_000,
+                min_confidence: "likely".into(),
+                file_roles: vec!["production".into()],
+                file_origins: origin::defaults(),
+            },
+            true,
+        )?;
+
+        let selected = selection
+            .nodes
+            .iter()
+            .map(|node| node.key.as_str())
+            .collect::<HashSet<_>>();
+        assert!(selected.contains("a-first"));
+        assert!(selected.contains("b-first"));
+        assert!(!selected.contains("a-second"));
+        assert_eq!(selection.selected_paths, 2);
+        assert_eq!(selection.candidate_paths, 3);
         Ok(())
     }
 

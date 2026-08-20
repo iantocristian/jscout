@@ -2540,6 +2540,16 @@ agent has no MCP client surface, while pi-ai is the LLM gateway rather than an
 MCP result consumer. This compatibility result does not satisfy the aggregate
 fixed-call replay gate.
 
+The path projection also has a separately labelled
+[`n8n real-corpus proxy`](eval/results/g20b-n8n-path-transport-proxy-2026-08-21.md).
+Across four fixed lexical expanded searches, it preserved the ordered hit
+anchors, emitted only edges present in the diagnostic neighborhood, reduced
+aggregate response bytes by 62.4%, nodes by 72.5%, and edges by 85.8%. The
+first pass exposed and fixed seed starvation by reserving one continuation per
+connected seed before global fill. This proxy does not satisfy the registered
+historical gate: the original private corpus is absent, raw responses were not
+retained, and abbreviated calls cannot be reconstructed honestly.
+
 ### Implementation order and acceptance
 
 1. Preserve both exact call inventories and any recoverable raw responses before
