@@ -3,52 +3,65 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-pub const DEFAULT_URL: &str = "http://127.0.0.1:8792";
-const PROJECT_ENV: &str = "JSCOUT_INFERENCE_PROJECT";
-
-pub fn base_url() -> String {
-    if let Ok(url) = std::env::var("JSCOUT_INFERENCE_URL") {
-        return url.trim_end_matches('/').to_string();
-    }
-    if std::env::var_os("JSCOUT_INFERENCE_HOST").is_none()
-        && std::env::var_os("JSCOUT_INFERENCE_PORT").is_none()
-    {
-        return DEFAULT_URL.to_string();
-    }
-    let host = std::env::var("JSCOUT_INFERENCE_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let client_host = match host.as_str() {
-        "0.0.0.0" => "127.0.0.1".to_string(),
-        "::" => "[::1]".to_string(),
-        value if value.contains(':') && !value.starts_with('[') => format!("[{value}]"),
-        value => value.to_string(),
-    };
-    let port = std::env::var("JSCOUT_INFERENCE_PORT").unwrap_or_else(|_| "8792".to_string());
-    format!("http://{client_host}:{port}")
+pub fn base_url(settings: &crate::config::InferenceSettings) -> String {
+    settings.url.trim_end_matches('/').to_string()
 }
 
-pub fn serve(project: Option<&Path>) -> Result<()> {
-    let project = resolve_project(project)?;
-    let uv = std::env::var("JSCOUT_UV").unwrap_or_else(|_| "uv".to_string());
+pub fn serve(
+    project: Option<&Path>,
+    inference: &crate::config::InferenceSettings,
+    embedding: &crate::config::EmbeddingSettings,
+    reranker: &crate::config::RerankerSettings,
+) -> Result<()> {
+    let project = resolve_project(project, inference.project.as_deref())?;
+    let uv = &inference.uv;
     let script = project.join("service.py");
-    let status = Command::new(&uv)
+    let mut command = Command::new(uv);
+    command
         .args(["run", "--project"])
         .arg(&project)
         .arg("python")
         .arg(&script)
-        .status()
-        .with_context(|| {
-            format!("failed to launch `{uv}`; install uv or set JSCOUT_UV to its absolute path")
-        })?;
+        .env("JSCOUT_INFERENCE_HOST", &inference.host)
+        .env("JSCOUT_INFERENCE_PORT", inference.port.to_string())
+        .env(
+            "JSCOUT_INFERENCE_ALLOW_REMOTE",
+            if inference.allow_remote { "1" } else { "0" },
+        )
+        .env(
+            "JSCOUT_INFERENCE_BATCH_SIZE",
+            inference.batch_size.to_string(),
+        )
+        .env(
+            "JSCOUT_INFERENCE_MAX_LENGTH",
+            inference.max_length.to_string(),
+        )
+        .env("JSCOUT_RERANK_MODEL", &reranker.model);
+    if let Some(model) = &embedding.model {
+        command.env("JSCOUT_EMBED_MODEL", model);
+    }
+    if let Some(revision) = &embedding.revision {
+        command.env("JSCOUT_EMBED_REVISION", revision);
+    }
+    if let Some(revision) = &reranker.revision {
+        command.env("JSCOUT_RERANK_REVISION", revision);
+    }
+    if let Some(cache) = &inference.model_cache_root {
+        command.env("JSCOUT_MODEL_CACHE_ROOT", cache);
+    }
+    let status = command.status().with_context(|| {
+        format!("failed to launch `{uv}`; install uv or configure inference.uv")
+    })?;
     if !status.success() {
         bail!("local inference service exited with {status}");
     }
     Ok(())
 }
 
-pub fn doctor(url: Option<&str>) -> Result<()> {
+pub fn doctor(url: Option<&str>, settings: &crate::config::InferenceSettings) -> Result<()> {
     let base = url
         .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(base_url);
+        .unwrap_or_else(|| base_url(settings));
     let health = get_json(&format!("{base}/health"))
         .with_context(|| format!("local inference is not reachable at {base}"))?;
     let configuration = get_json(&format!("{base}/configuration"))?;
@@ -101,12 +114,12 @@ pub fn get_json(url: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&text).with_context(|| format!("invalid JSON from {url}"))
 }
 
-fn resolve_project(explicit: Option<&Path>) -> Result<PathBuf> {
+fn resolve_project(explicit: Option<&Path>, configured: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return validate_project(path, "--project");
     }
-    if let Some(path) = std::env::var_os(PROJECT_ENV) {
-        return validate_project(Path::new(&path), PROJECT_ENV);
+    if let Some(path) = configured {
+        return validate_project(path, "inference.project");
     }
 
     let cwd = std::env::current_dir()?;
@@ -128,7 +141,7 @@ fn resolve_project(explicit: Option<&Path>) -> Result<PathBuf> {
         }
     }
     bail!(
-        "local inference project not found; run from the jscout checkout, pass --project, or set {PROJECT_ENV}"
+        "local inference project not found; run from the jscout checkout, pass --project, or configure inference.project"
     )
 }
 

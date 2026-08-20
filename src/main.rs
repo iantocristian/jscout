@@ -82,8 +82,15 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
         /// Index internals for these installed packages (comma-separated or repeatable)
-        #[arg(long = "deps", value_delimiter = ',')]
+        #[arg(
+            long = "deps",
+            value_delimiter = ',',
+            conflicts_with = "no_dependencies"
+        )]
         dependencies: Vec<String>,
+        /// Ignore configured dependency packages for this index pass
+        #[arg(long = "no-deps", conflicts_with = "dependencies")]
+        no_dependencies: bool,
     },
     /// Embed code and/or semantic documents missing from the configured profile
     Embed {
@@ -93,10 +100,10 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
         /// Batch size per API call
-        #[arg(long, default_value_t = 64)]
-        batch: usize,
+        #[arg(long)]
+        batch: Option<usize>,
         /// Restrict embeddings to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        #[arg(long = "origin", value_delimiter = ',')]
         file_origins: Vec<String>,
         /// Embed only the effective product corpus after fresh reconnaissance policy
         #[arg(long)]
@@ -270,8 +277,11 @@ enum Command {
         #[arg(default_value = "")]
         query: String,
         /// Disable semantic-artifact vector retrieval even when configured
-        #[arg(long)]
+        #[arg(long, conflicts_with = "vector")]
         no_vector: bool,
+        /// Enable semantic-artifact vector retrieval, overriding repository configuration
+        #[arg(long, conflicts_with = "no_vector")]
+        vector: bool,
         /// Maximum returned artifacts
         #[arg(short = 'k', long, default_value_t = 20)]
         limit: usize,
@@ -396,29 +406,45 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
         /// Also embed new/changed chunks on each re-index (needs a provider)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_embed")]
         embed: bool,
+        /// Disable watched embedding configured for this repository
+        #[arg(long, conflicts_with = "embed")]
+        no_embed: bool,
         /// Restrict watched embedding to the effective product corpus
-        #[arg(long, requires = "embed")]
+        #[arg(long, conflicts_with = "no_product")]
         product: bool,
+        /// Disable product-only embedding configured for this repository
+        #[arg(long, conflicts_with = "product")]
+        no_product: bool,
         /// Keep these installed dependency packages in the watched index
-        #[arg(long = "deps", value_delimiter = ',')]
+        #[arg(
+            long = "deps",
+            value_delimiter = ',',
+            conflicts_with = "no_dependencies"
+        )]
         dependencies: Vec<String>,
+        /// Ignore configured dependency packages while watching
+        #[arg(long = "no-deps", conflicts_with = "dependencies")]
+        no_dependencies: bool,
         /// Re-run TypeScript checker enrichment after relevant indexed changes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_enrich")]
         enrich: bool,
+        /// Disable watched checker enrichment configured for this repository
+        #[arg(long, conflicts_with = "enrich")]
+        no_enrich: bool,
         /// Hard deadline for each checker request in seconds
-        #[arg(long, default_value_t = 300)]
-        enrich_timeout: u64,
+        #[arg(long)]
+        enrich_timeout: Option<u64>,
         /// Checker sidecar entry file for development and diagnostics
         #[arg(long)]
         sidecar_path: Option<PathBuf>,
         /// Trailing quiet period before a change generation starts
-        #[arg(long, default_value_t = 2_000)]
-        debounce_ms: u64,
+        #[arg(long)]
+        debounce_ms: Option<u64>,
         /// Full-refresh interval for missed-event recovery; zero disables it
-        #[arg(long, default_value_t = 600)]
-        reconcile_seconds: u64,
+        #[arg(long)]
+        reconcile_seconds: Option<u64>,
     },
     /// Show all usages of a symbol: NAME or path-substring:NAME
     WhoUses {
@@ -962,11 +988,22 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             root,
             database,
             dependencies,
-        } => cmd_index(
-            &root,
-            Some(database.as_deref().unwrap_or(configured_database)),
-            &dependencies,
-        ),
+            no_dependencies,
+        } => {
+            let dependencies = if no_dependencies {
+                Vec::new()
+            } else if dependencies.is_empty() {
+                runtime.effective.index.dependencies.clone()
+            } else {
+                dependencies
+            };
+            cmd_index(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+                &dependencies,
+                &runtime.effective.diagnostics,
+            )
+        }
         Command::Embed {
             root,
             database,
@@ -978,11 +1015,18 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
         } => cmd_embed(
             &root,
             Some(database.as_deref().unwrap_or(configured_database)),
-            batch,
-            &file_origins,
-            product,
-            semantic,
-            semantic_only,
+            EmbedCommandOptions {
+                batch: batch.unwrap_or(runtime.effective.embedding.batch),
+                file_origins: if file_origins.is_empty() {
+                    &runtime.effective.embedding.origins
+                } else {
+                    &file_origins
+                },
+                product,
+                semantic,
+                semantic_only,
+            },
+            runtime,
         ),
         Command::Search {
             root,
@@ -1058,11 +1102,19 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             } else {
                 expand_file_roles
             };
+            let provider = if vector {
+                embed::Provider::from_settings(
+                    &runtime.effective.embedding,
+                    &runtime.effective.inference,
+                )?
+            } else {
+                None
+            };
             cmd_search(
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
                 &query,
-                !vector,
+                provider.as_ref(),
                 json,
                 debug_json,
                 search::SearchOptions {
@@ -1075,6 +1127,12 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     memory_graph_depth: memory_depth.unwrap_or(configured.memory_depth),
                     memory_graph_node_limit: memory_nodes.unwrap_or(configured.memory_nodes),
                     rerank,
+                    reranker: search::Reranker::from_settings(
+                        &runtime.effective.reranker,
+                        &runtime.effective.embedding,
+                        &runtime.effective.inference,
+                    ),
+                    timing: runtime.effective.diagnostics.timing,
                     compact: json,
                     include_neighborhood_followups: true,
                     response_byte_limit: response_bytes.unwrap_or(configured.response_bytes),
@@ -1162,7 +1220,10 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 Some(database.as_deref().unwrap_or(configured_database)),
             )?;
             let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
-            let provider = embed::Provider::from_env()?;
+            let provider = embed::Provider::from_settings(
+                &runtime.effective.embedding,
+                &runtime.effective.inference,
+            )?;
             let publication =
                 semantic::annotate_request_with_provider(&root, &conn, provider.as_ref(), input)?;
             println!("{}", serde_json::to_string_pretty(&publication)?);
@@ -1172,6 +1233,7 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             root,
             query,
             no_vector,
+            vector,
             limit,
             artifact_types,
             freshness,
@@ -1196,10 +1258,20 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
             )?;
-            let provider = if no_vector {
+            let vector = if no_vector {
+                false
+            } else if vector {
+                true
+            } else {
+                runtime.effective.search.vector
+            };
+            let provider = if !vector {
                 None
             } else {
-                embed::Provider::from_env()?
+                embed::Provider::from_settings(
+                    &runtime.effective.embedding,
+                    &runtime.effective.inference,
+                )?
             };
             let result = semantic_query::query(
                 &root,
@@ -1295,27 +1367,84 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             root,
             database,
             embed,
+            no_embed,
             product,
+            no_product,
             dependencies,
+            no_dependencies,
             enrich,
+            no_enrich,
             enrich_timeout,
             sidecar_path,
             debounce_ms,
             reconcile_seconds,
-        } => watch::watch(
-            &root,
-            &watch::WatchOptions {
-                database: Some(database.as_deref().unwrap_or(configured_database)),
-                embed_on_change: embed,
-                embed_product_only: product,
-                dependencies: &dependencies,
-                enrich_on_change: enrich,
-                enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
-                checker_sidecar: sidecar_path.as_deref(),
-                debounce: std::time::Duration::from_millis(debounce_ms),
-                reconcile_interval: std::time::Duration::from_secs(reconcile_seconds),
-            },
-        ),
+        } => {
+            let configured = &runtime.effective.watch;
+            let embed = if no_embed {
+                false
+            } else if embed {
+                true
+            } else {
+                configured.embed
+            };
+            let product = if no_product {
+                false
+            } else if product {
+                true
+            } else {
+                configured.product
+            };
+            let enrich = if no_enrich {
+                false
+            } else if enrich {
+                true
+            } else {
+                configured.enrich
+            };
+            let dependencies = if no_dependencies {
+                Vec::new()
+            } else if dependencies.is_empty() {
+                configured.dependencies.clone()
+            } else {
+                dependencies
+            };
+            let provider = if embed {
+                embed::Provider::from_settings(
+                    &runtime.effective.embedding,
+                    &runtime.effective.inference,
+                )?
+            } else {
+                None
+            };
+            watch::watch(
+                &root,
+                &watch::WatchOptions {
+                    database: Some(database.as_deref().unwrap_or(configured_database)),
+                    embed_on_change: embed,
+                    provider: provider.as_ref(),
+                    embed_product_only: product,
+                    dependencies: &dependencies,
+                    enrich_on_change: enrich,
+                    enrich_timeout: std::time::Duration::from_secs(
+                        enrich_timeout.unwrap_or(configured.enrich_timeout_seconds),
+                    ),
+                    checker_sidecar: sidecar_path.as_deref().or(runtime
+                        .effective
+                        .sidecars
+                        .checker
+                        .as_deref()),
+                    checker_node: &runtime.effective.sidecars.node,
+                    timing: runtime.effective.diagnostics.timing,
+                    debug: runtime.effective.diagnostics.debug,
+                    debounce: std::time::Duration::from_millis(
+                        debounce_ms.unwrap_or(configured.debounce_ms),
+                    ),
+                    reconcile_interval: std::time::Duration::from_secs(
+                        reconcile_seconds.unwrap_or(configured.reconcile_seconds),
+                    ),
+                },
+            )
+        }
         Command::WhoUses {
             root,
             spec,
@@ -1382,7 +1511,12 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 &checker::EnrichOptions {
                     database: Some(database.as_deref().unwrap_or(configured_database)),
-                    sidecar: sidecar_path.as_deref(),
+                    sidecar: sidecar_path.as_deref().or(runtime
+                        .effective
+                        .sidecars
+                        .checker
+                        .as_deref()),
+                    node: &runtime.effective.sidecars.node,
                     timeout: std::time::Duration::from_secs(timeout),
                     files,
                     packages,
@@ -1407,6 +1541,8 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             } => checker::doctor(
                 &root,
                 sidecar_path.as_deref(),
+                runtime.effective.sidecars.checker.as_deref(),
+                &runtime.effective.sidecars.node,
                 std::time::Duration::from_secs(timeout),
             ),
         },
@@ -1414,11 +1550,18 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             LlmCommand::Doctor {
                 model,
                 gateway_path,
-            } => llm::doctor(model.as_deref(), gateway_path.as_deref()),
+            } => llm::doctor(model.as_deref(), gateway_path.as_deref(), runtime),
         },
         Command::Inference { command } => match command {
-            InferenceCommand::Serve { project } => inference::serve(project.as_deref()),
-            InferenceCommand::Doctor { url } => inference::doctor(url.as_deref()),
+            InferenceCommand::Serve { project } => inference::serve(
+                project.as_deref(),
+                &runtime.effective.inference,
+                &runtime.effective.embedding,
+                &runtime.effective.reranker,
+            ),
+            InferenceCommand::Doctor { url } => {
+                inference::doctor(url.as_deref(), &runtime.effective.inference)
+            }
         },
         Command::Scout { command } => match command {
             ScoutCommand::Repository {
@@ -1442,22 +1585,36 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
-                dry_run,
-                warn_subjects,
-                scouting::repository::RepositoryPlanningOptions {
-                    max_subjects,
-                    max_depth,
-                    checker_timeout: std::time::Duration::from_secs(checker_timeout),
-                    checker_sidecar: sidecar_path.as_deref(),
-                },
-                scouting::repository::RepositoryScoutOptions {
-                    model: llm::config::resolve_model(model.as_deref())?,
-                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
-                    service_tier,
-                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
-                    rebuild,
-                    max_subjects,
-                    max_depth,
+                runtime,
+                RepositoryScoutCommandOptions {
+                    dry_run,
+                    warn_subjects,
+                    planning: scouting::repository::RepositoryPlanningOptions {
+                        max_subjects,
+                        max_depth,
+                        checker_timeout: std::time::Duration::from_secs(checker_timeout),
+                        checker_sidecar: sidecar_path.as_deref().or(runtime
+                            .effective
+                            .sidecars
+                            .checker
+                            .as_deref()),
+                        checker_node: &runtime.effective.sidecars.node,
+                    },
+                    scout: scouting::repository::RepositoryScoutOptions {
+                        model: llm::config::resolve_model_setting(
+                            model.as_deref(),
+                            &runtime.effective.llm.model,
+                        )?,
+                        reasoning: llm::config::resolve_reasoning_setting(
+                            reasoning.as_deref(),
+                            runtime.effective.llm.reasoning.as_deref(),
+                        ),
+                        service_tier,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        rebuild,
+                        max_subjects,
+                        max_depth,
+                    },
                 },
             ),
             ScoutCommand::Workflows {
@@ -1487,13 +1644,20 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     &root,
                     Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
+                    runtime,
                     dry_run,
                     scouting::WorkflowScoutOptions {
                         seeds,
                         depth,
                         candidate_limit,
-                        model: llm::config::resolve_model(model.as_deref())?,
-                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        model: llm::config::resolve_model_setting(
+                            model.as_deref(),
+                            &runtime.effective.llm.model,
+                        )?,
+                        reasoning: llm::config::resolve_reasoning_setting(
+                            reasoning.as_deref(),
+                            runtime.effective.llm.reasoning.as_deref(),
+                        ),
                         service_tier,
                         policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
                         rebuild,
@@ -1534,13 +1698,20 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     &root,
                     Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
+                    runtime,
                     dry_run,
                     scouting::CardScoutOptions {
                         anchors,
                         files,
                         reconnaissance_subjects,
-                        model: llm::config::resolve_model(model.as_deref())?,
-                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        model: llm::config::resolve_model_setting(
+                            model.as_deref(),
+                            &runtime.effective.llm.model,
+                        )?,
+                        reasoning: llm::config::resolve_reasoning_setting(
+                            reasoning.as_deref(),
+                            runtime.effective.llm.reasoning.as_deref(),
+                        ),
                         service_tier,
                         policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
                         rebuild,
@@ -1566,12 +1737,19 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
+                runtime,
                 dry_run,
                 scouting::SummaryScoutOptions {
                     level,
                     scopes,
-                    model: llm::config::resolve_model(model.as_deref())?,
-                    reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                    model: llm::config::resolve_model_setting(
+                        model.as_deref(),
+                        &runtime.effective.llm.model,
+                    )?,
+                    reasoning: llm::config::resolve_reasoning_setting(
+                        reasoning.as_deref(),
+                        runtime.effective.llm.reasoning.as_deref(),
+                    ),
                     service_tier,
                     policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
                     rebuild,
@@ -1603,11 +1781,18 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     &root,
                     Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
+                    runtime,
                     dry_run,
                     scouting::ConceptScoutOptions {
                         terms,
-                        model: llm::config::resolve_model(model.as_deref())?,
-                        reasoning: llm::config::resolve_reasoning(reasoning.as_deref()),
+                        model: llm::config::resolve_model_setting(
+                            model.as_deref(),
+                            &runtime.effective.llm.model,
+                        )?,
+                        reasoning: llm::config::resolve_reasoning_setting(
+                            reasoning.as_deref(),
+                            runtime.effective.llm.reasoning.as_deref(),
+                        ),
                         service_tier,
                         policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
                         rebuild,
@@ -1628,6 +1813,7 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
+                runtime,
                 &artifacts,
                 dry_run,
                 llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
@@ -1673,37 +1859,42 @@ fn cmd_neighborhood(
     Ok(())
 }
 
-fn cmd_embed(
-    root: &Path,
-    database: Option<&Path>,
+struct EmbedCommandOptions<'a> {
     batch: usize,
-    file_origins: &[String],
+    file_origins: &'a [String],
     product: bool,
     semantic: bool,
     semantic_only: bool,
+}
+
+fn cmd_embed(
+    root: &Path,
+    database: Option<&Path>,
+    options: EmbedCommandOptions<'_>,
+    runtime: &config::RuntimeConfig,
 ) -> Result<()> {
     let conn = open_database_for_write(root, database)?;
-    let Some(provider) = embed::Provider::from_env()? else {
-        anyhow::bail!(
-            "no embedding provider configured — set JSCOUT_EMBED_PROVIDER to local, voyage, or openai"
-        );
+    let Some(provider) =
+        embed::Provider::from_settings(&runtime.effective.embedding, &runtime.effective.inference)?
+    else {
+        anyhow::bail!("no embedding provider configured — set embedding.provider in .jscout.toml");
     };
     eprintln!("provider: {} model: {}", provider.name, provider.model);
-    if !semantic_only {
+    if !options.semantic_only {
         let report = embed::embed_missing_for_selection_report(
             &conn,
             &provider,
-            batch,
-            file_origins,
-            product,
+            options.batch,
+            options.file_origins,
+            options.product,
         )?;
         println!(
             "code embeddings: missing={} embedded={} cached_reused={} occurrences_synced={}",
             report.missing, report.embedded, report.cached_reused, report.occurrences_synced
         );
     }
-    if semantic || semantic_only {
-        let report = embed::embed_semantic_missing_report(&conn, &provider, batch)?;
+    if options.semantic || options.semantic_only {
+        let report = embed::embed_semantic_missing_report(&conn, &provider, options.batch)?;
         println!(
             "semantic embeddings: missing={} embedded={} cached_reused={} occurrences_synced={}",
             report.missing, report.embedded, report.cached_reused, report.occurrences_synced
@@ -1716,18 +1907,13 @@ fn cmd_search(
     root: &Path,
     database: Option<&Path>,
     query: &str,
-    no_vector: bool,
+    provider: Option<&embed::Provider>,
     json: bool,
     debug_json: bool,
     options: search::SearchOptions,
 ) -> Result<()> {
     let conn = open_database_read_only(root, database)?;
-    let provider = if no_vector {
-        None
-    } else {
-        embed::Provider::from_env()?
-    };
-    let result = search::search(&conn, provider.as_ref(), query, &options)?;
+    let result = search::search(&conn, provider, query, &options)?;
     if json {
         println!("{}", compact::search_string(&result)?);
         return Ok(());
@@ -1835,7 +2021,12 @@ fn render_semantic_memory_text(artifacts: &[semantic::SemanticArtifact]) -> Resu
     Ok(rendered)
 }
 
-fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> Result<()> {
+fn cmd_index(
+    root: &Path,
+    database: Option<&Path>,
+    dependencies: &[String],
+    diagnostics: &config::DiagnosticsSettings,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let conn = open_database_for_write(root, database)?;
     let o = indexer::refresh_repo_with_options(
@@ -1843,6 +2034,8 @@ fn cmd_index(root: &Path, database: Option<&Path>, dependencies: &[String]) -> R
         &conn,
         &indexer::IndexOptions {
             dependencies: dependencies.to_vec(),
+            timing: diagnostics.timing,
+            debug: diagnostics.debug,
             ..Default::default()
         },
     )?;
@@ -2130,6 +2323,7 @@ fn cmd_scout_workflows(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
     dry_run: bool,
     options: scouting::WorkflowScoutOptions,
 ) -> Result<()> {
@@ -2148,50 +2342,57 @@ fn cmd_scout_workflows(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
     let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
+}
+
+struct RepositoryScoutCommandOptions<'a> {
+    dry_run: bool,
+    warn_subjects: usize,
+    planning: scouting::repository::RepositoryPlanningOptions<'a>,
+    scout: scouting::repository::RepositoryScoutOptions,
 }
 
 fn cmd_scout_repository(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
-    dry_run: bool,
-    warn_subjects: usize,
-    planning: scouting::repository::RepositoryPlanningOptions<'_>,
-    options: scouting::repository::RepositoryScoutOptions,
+    runtime: &config::RuntimeConfig,
+    options: RepositoryScoutCommandOptions<'_>,
 ) -> Result<()> {
     let conn = open_database_for_write(root, database)?;
-    let plan = scouting::repository::plan(root, &conn, &planning)?;
+    let plan = scouting::repository::plan(root, &conn, &options.planning)?;
     let initial_subjects = plan.items.len();
-    if initial_subjects > warn_subjects {
+    if initial_subjects > options.warn_subjects {
         eprintln!(
-            "warning: repository scout discovered {initial_subjects} initial subjects (warning threshold {warn_subjects}); no subjects will be truncated"
+            "warning: repository scout discovered {initial_subjects} initial subjects (warning threshold {}); no subjects will be truncated",
+            options.warn_subjects
         );
     }
-    if dry_run {
-        let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    if options.dry_run {
+        let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&scouting::repository::dry_run_report(
                 &conn,
                 &mut gateway,
                 &plan,
-                &options,
+                &options.scout,
             )?)?
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
-    let batch = scouting::repository::execute(root, &conn, &mut gateway, &options, plan)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let batch = scouting::repository::execute(root, &conn, &mut gateway, &options.scout, plan)?;
     if let Some(subjects) = batch.subjects_considered
-        && initial_subjects <= warn_subjects
-        && subjects > warn_subjects
+        && initial_subjects <= options.warn_subjects
+        && subjects > options.warn_subjects
     {
         eprintln!(
-            "warning: mixed-scope subdivision increased repository scouting to {subjects} subjects (warning threshold {warn_subjects}); no subjects were truncated"
+            "warning: mixed-scope subdivision increased repository scouting to {subjects} subjects (warning threshold {}); no subjects were truncated",
+            options.warn_subjects
         );
     }
     print_scout_batch(&batch);
@@ -2215,6 +2416,7 @@ fn cmd_scout_summaries(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
     dry_run: bool,
     options: scouting::SummaryScoutOptions,
 ) -> Result<()> {
@@ -2228,7 +2430,7 @@ fn cmd_scout_summaries(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
     let batch = scouting::scout_summaries(root, &conn, &mut gateway, &options)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -2238,6 +2440,7 @@ fn cmd_scout_cards(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
     dry_run: bool,
     options: scouting::CardScoutOptions,
 ) -> Result<()> {
@@ -2258,7 +2461,7 @@ fn cmd_scout_cards(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
     let batch = scouting::scout_card_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -2268,6 +2471,7 @@ fn cmd_scout_concepts(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
     dry_run: bool,
     options: scouting::ConceptScoutOptions,
 ) -> Result<()> {
@@ -2280,7 +2484,7 @@ fn cmd_scout_concepts(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
     let batch = scouting::scout_concept_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -2290,6 +2494,7 @@ fn cmd_scout_refresh(
     root: &Path,
     database: Option<&Path>,
     gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
     artifacts: &[i64],
     dry_run: bool,
     policy: llm::config::RequestPolicy,
@@ -2326,7 +2531,7 @@ fn cmd_scout_refresh(
         println!("no stale or degraded generated workflows, cards, or summaries to refresh");
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path)?;
+    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
     let batch = scouting::scout_refresh(root, &conn, &mut gateway, selection, policy)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -2715,13 +2920,14 @@ mod main_tests {
         assert!(embed);
         assert!(product);
         assert!(enrich);
-        assert_eq!(enrich_timeout, 45);
+        assert_eq!(enrich_timeout, Some(45));
         assert_eq!(sidecar_path, Some(PathBuf::from("checker.mjs")));
         assert_eq!(database, Some(PathBuf::from("watch.db")));
-        assert_eq!(debounce_ms, 750);
-        assert_eq!(reconcile_seconds, 30);
+        assert_eq!(debounce_ms, Some(750));
+        assert_eq!(reconcile_seconds, Some(30));
 
-        assert!(Cli::try_parse_from(["jscout", "watch", ".", "--product"]).is_err());
+        assert!(Cli::try_parse_from(["jscout", "watch", ".", "--product"]).is_ok());
+        assert!(Cli::try_parse_from(["jscout", "watch", ".", "--embed", "--no-embed"]).is_err());
     }
 
     #[test]

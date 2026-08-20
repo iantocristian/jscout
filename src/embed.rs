@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-const LOCAL_EMBED_MODEL: &str = "BAAI/bge-m3";
 const DEFAULT_LOCAL_DEADLINE_MS: u64 = 120_000;
 /// The document representation is part of cache identity. Versioning it keeps
 /// vectors produced from an older representation from being silently reused.
@@ -18,6 +17,7 @@ enum Protocol {
 
 /// Embedding provider selection is explicit. API keys never select a provider,
 /// and OPENAI_API_KEY is never forwarded to a custom endpoint.
+#[derive(Clone)]
 pub struct Provider {
     pub name: String,
     pub model: String,
@@ -25,6 +25,7 @@ pub struct Provider {
     key: Option<String>,
     protocol: Protocol,
     query_prefix: String,
+    revision: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,24 +151,24 @@ fn validate_endpoint(url: &str) -> Result<()> {
 }
 
 impl Provider {
-    pub fn from_env() -> Result<Option<Self>> {
-        let choice = std::env::var("JSCOUT_EMBED_PROVIDER")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if choice.is_empty() || choice == "none" {
+    pub fn from_settings(
+        embedding: &crate::config::EmbeddingSettings,
+        inference: &crate::config::InferenceSettings,
+    ) -> Result<Option<Self>> {
+        let Some(choice) = embedding.provider.as_deref() else {
             return Ok(None);
-        }
-
-        let model_override = std::env::var("JSCOUT_EMBED_MODEL").ok();
-        let query_prefix = |model: &str| {
-            std::env::var("JSCOUT_QUERY_PREFIX")
-                .unwrap_or_else(|_| default_query_prefix(model).to_string())
         };
-        match choice.as_str() {
+        let model = embedding
+            .model
+            .clone()
+            .with_context(|| format!("embedding.model is required for provider {choice}"))?;
+        let query_prefix = embedding
+            .query_prefix
+            .clone()
+            .unwrap_or_else(|| default_query_prefix(&model).to_string());
+        match choice {
             "local" => {
-                let model = model_override.unwrap_or_else(|| LOCAL_EMBED_MODEL.to_string());
-                let base = crate::inference::base_url();
+                let base = inference.url.trim_end_matches('/').to_string();
                 validate_endpoint(&base)?;
                 Ok(Some(Self {
                     name: "local".to_string(),
@@ -176,50 +177,59 @@ impl Provider {
                     key: None,
                     protocol: Protocol::Local,
                     query_prefix: String::new(),
+                    revision: embedding.revision.clone(),
                 }))
             }
             "voyage" => {
-                let key = std::env::var("VOYAGE_API_KEY")
-                    .context("JSCOUT_EMBED_PROVIDER=voyage requires VOYAGE_API_KEY")?;
-                let model = model_override.unwrap_or_else(|| "voyage-code-3".to_string());
+                let key_env = embedding.api_key_env.as_deref().unwrap_or("VOYAGE_API_KEY");
+                let key = std::env::var(key_env).with_context(|| {
+                    format!("embedding.provider=voyage requires secret environment {key_env}")
+                })?;
                 Ok(Some(Self {
                     name: "voyage".to_string(),
-                    query_prefix: query_prefix(&model),
+                    query_prefix,
                     model,
                     url: "https://api.voyageai.com/v1/embeddings".to_string(),
                     key: Some(key),
                     protocol: Protocol::Voyage,
+                    revision: embedding.revision.clone(),
                 }))
             }
             "openai" => {
-                let custom_url = std::env::var("JSCOUT_EMBED_URL").ok();
+                let custom_url = embedding.url.clone();
                 if let Some(url) = &custom_url {
                     validate_endpoint(url)?;
                 }
                 // A custom server has a separate credential namespace. This
                 // prevents an OpenAI secret from leaking to LM Studio, vLLM,
                 // a gateway, or a mistyped host.
+                let key_env = embedding.api_key_env.as_deref().unwrap_or_else(|| {
+                    if custom_url.is_some() {
+                        "JSCOUT_EMBED_KEY"
+                    } else {
+                        "OPENAI_API_KEY"
+                    }
+                });
                 let key = if custom_url.is_some() {
-                    std::env::var("JSCOUT_EMBED_KEY").ok()
+                    std::env::var(key_env).ok()
                 } else {
-                    Some(
-                        std::env::var("OPENAI_API_KEY")
-                            .context("OpenAI embeddings require OPENAI_API_KEY")?,
-                    )
+                    Some(std::env::var(key_env).with_context(|| {
+                        format!("OpenAI embeddings require secret environment {key_env}")
+                    })?)
                 };
-                let model = model_override.unwrap_or_else(|| "text-embedding-3-small".to_string());
                 Ok(Some(Self {
                     name: "openai-compatible".to_string(),
-                    query_prefix: query_prefix(&model),
+                    query_prefix,
                     model,
                     url: custom_url
                         .unwrap_or_else(|| "https://api.openai.com/v1/embeddings".to_string()),
                     key,
                     protocol: Protocol::OpenAi,
+                    revision: embedding.revision.clone(),
                 }))
             }
             _ => bail!(
-                "unsupported JSCOUT_EMBED_PROVIDER={choice}; expected local, voyage, openai, or none"
+                "unsupported embedding.provider={choice}; expected local, voyage, openai, or none"
             ),
         }
     }
@@ -243,6 +253,15 @@ impl Provider {
                         embedding["model"].as_str().unwrap_or("<missing>")
                     );
                 }
+                if let Some(revision) = &self.revision
+                    && embedding["revision"].as_str() != Some(revision)
+                {
+                    bail!(
+                        "local inference revision mismatch: jscout requested {}, service provides {}",
+                        revision,
+                        embedding["revision"].as_str().unwrap_or("<missing>")
+                    );
+                }
                 let dimensions = embedding["dimensions"]
                     .as_u64()
                     .context("local inference configuration has no embedding dimensions")?
@@ -262,6 +281,7 @@ impl Provider {
                     "document_text": DOCUMENT_TEXT_FORMAT,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
+                    "revision": self.revision,
                 }),
                 None,
             ),
@@ -271,6 +291,7 @@ impl Provider {
                     "document_text": DOCUMENT_TEXT_FORMAT,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
+                    "revision": self.revision,
                 }),
                 None,
             ),
@@ -1591,28 +1612,14 @@ pub fn vector_search(
     limit: usize,
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
-    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
-    let total_started = std::time::Instant::now();
-    let started = std::time::Instant::now();
     let spec = provider
         .profile()
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
-    if timing {
-        eprintln!("timing:     vector profile {:?}", started.elapsed());
-    }
-    let started = std::time::Instant::now();
     let profile = ready_search_profile(conn, &spec)
         .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
-    if timing {
-        eprintln!("timing:     vector index readiness {:?}", started.elapsed());
-    }
-    let started = std::time::Instant::now();
     let response = provider
         .embed_query(query)
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
-    if timing {
-        eprintln!("timing:     vector query embedding {:?}", started.elapsed());
-    }
     validate_response_profile(&spec, &response)
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
@@ -1625,9 +1632,6 @@ pub fn vector_search(
     }
     let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)
         .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
-    if timing {
-        eprintln!("timing:     vector total {:?}", total_started.elapsed());
-    }
     Ok(scores)
 }
 
@@ -1638,10 +1642,8 @@ fn exact_vector_search(
     limit: usize,
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
-    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
     let table = vector_table(profile.dimensions)?;
     let mut scores = Vec::new();
-    let started = std::time::Instant::now();
     for origin in file_origins {
         let mut statement = conn.prepare(&format!(
             "SELECT i.chunk_id, v.distance
@@ -1664,9 +1666,6 @@ fn exact_vector_search(
     }
     scores.sort_by(|left, right| right.1.total_cmp(&left.1));
     scores.truncate(limit);
-    if timing {
-        eprintln!("timing:     vector exact KNN {:?}", started.elapsed());
-    }
     Ok(scores)
 }
 
@@ -1738,6 +1737,41 @@ mod tests {
         sync_vector_index, validate_endpoint, vec_to_blob, vector_failure, vector_index_needs_sync,
         vector_table,
     };
+    use crate::config::{EmbeddingSettings, InferenceSettings};
+
+    #[test]
+    fn provider_is_constructed_from_resolved_settings_without_environment_reads()
+    -> anyhow::Result<()> {
+        let provider = Provider::from_settings(
+            &EmbeddingSettings {
+                provider: Some("local".to_string()),
+                model: Some("example/embed".to_string()),
+                revision: Some("immutable-revision".to_string()),
+                url: None,
+                api_key_env: None,
+                query_prefix: None,
+                batch: 64,
+                origins: crate::origin::defaults(),
+            },
+            &InferenceSettings {
+                url: "http://127.0.0.1:9876/".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 9876,
+                project: None,
+                uv: "uv".to_string(),
+                allow_remote: false,
+                batch_size: 16,
+                max_length: 4096,
+                model_cache_root: None,
+            },
+        )?
+        .expect("local provider");
+        assert_eq!(provider.name, "local");
+        assert_eq!(provider.model, "example/embed");
+        assert_eq!(provider.url, "http://127.0.0.1:9876/embed");
+        assert_eq!(provider.revision.as_deref(), Some("immutable-revision"));
+        Ok(())
+    }
 
     fn insert_policy(
         conn: &Connection,
@@ -2002,6 +2036,7 @@ mod tests {
             key: None,
             protocol: Protocol::OpenAi,
             query_prefix: String::new(),
+            revision: None,
         };
         let profile = provider.profile()?;
         let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
@@ -2072,6 +2107,7 @@ mod tests {
             key: None,
             protocol: Protocol::OpenAi,
             query_prefix: String::new(),
+            revision: None,
         };
         let profile = ensure_profile(&connection, &provider.profile()?, 2)?;
         for (path, hash, content) in [

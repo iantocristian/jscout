@@ -559,6 +559,36 @@ test("built-in OpenAI keeps its transport and API-key auth when its base URL is 
   assert.equal(auth.source, "OPENAI_API_KEY");
 });
 
+test("custom providers resolve an optional named API-key environment", async () => {
+  const registry = buildRegistry({
+    authFile: "/unused",
+    credentialStore: { read: async () => undefined, list: async () => [] },
+    env: { PRIVATE_GATEWAY_KEY: "configured-key" },
+    customProviders: [
+      {
+        id: "private-gateway",
+        name: "Private gateway",
+        baseUrl: "https://gateway.example.test/v1",
+        apiKeyEnv: "PRIVATE_GATEWAY_KEY",
+        models: [
+          {
+            id: "model",
+            name: "Model",
+            input: ["text"],
+            reasoning: false,
+            contextWindow: 8_192,
+            maxTokens: 2_048,
+          },
+        ],
+      },
+    ],
+  });
+  const model = registry.models.getModel("private-gateway", "model");
+  const auth = await registry.models.getAuth(model, { env: {} });
+  assert.equal(auth.auth.apiKey, "configured-key");
+  assert.equal(auth.source, "PRIVATE_GATEWAY_KEY");
+});
+
 test("OpenAI base URL environment setting reaches gateway capabilities", async () => {
   const state = createGatewayState({
     env: { JSCOUT_PI_AI_OPENAI_BASE_URL: "https://gateway.example.test/v1/" },

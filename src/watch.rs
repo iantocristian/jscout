@@ -24,11 +24,15 @@ const MAX_INCREMENTAL_SOURCE_PATHS: usize = 256;
 pub struct WatchOptions<'a> {
     pub database: Option<&'a Path>,
     pub embed_on_change: bool,
+    pub provider: Option<&'a embed::Provider>,
     pub embed_product_only: bool,
     pub dependencies: &'a [String],
     pub enrich_on_change: bool,
     pub enrich_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
+    pub checker_node: &'a str,
+    pub timing: bool,
+    pub debug: bool,
     pub debounce: Duration,
     pub reconcile_interval: Duration,
 }
@@ -646,9 +650,12 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     let root = root.canonicalize()?;
     let database = absolute_database_path(&root, options.database);
     let provider = if options.embed_on_change {
-        Some(Arc::new(embed::Provider::from_env()?.context(
-            "--embed requires JSCOUT_EMBED_PROVIDER=local, voyage, or openai",
-        )?))
+        Some(Arc::new(
+            options
+                .provider
+                .context("watch embedding requires embedding.provider in .jscout.toml")?
+                .clone(),
+        ))
     } else {
         None
     };
@@ -736,7 +743,14 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             );
             match work.phase {
                 Phase::Refresh => {
-                    match run_refresh(&root, &database, options.dependencies, work.refresh_scope) {
+                    match run_refresh(
+                        &root,
+                        &database,
+                        options.dependencies,
+                        work.refresh_scope,
+                        options.timing,
+                        options.debug,
+                    ) {
                         Ok(result) => {
                             indexer::report_rejections(&result.outcome);
                             eprintln!(
@@ -1064,10 +1078,14 @@ fn run_refresh(
     database: &Path,
     dependencies: &[String],
     scope: RefreshScope,
+    timing: bool,
+    debug: bool,
 ) -> Result<RefreshResult> {
     let conn = open_phase_database(root, database)?;
     let options = indexer::IndexOptions {
         dependencies: dependencies.to_vec(),
+        timing,
+        debug,
         ..Default::default()
     };
     let outcome = match scope {
@@ -1146,6 +1164,7 @@ fn run_enrichment_interruptible(
     let root = root.to_path_buf();
     let database = database.to_path_buf();
     let sidecar = options.checker_sidecar.map(Path::to_path_buf);
+    let node = options.checker_node.to_string();
     let timeout = options.enrich_timeout;
     let force_full = monitor.work.force_full_enrichment;
     let dirty_files = monitor
@@ -1160,6 +1179,7 @@ fn run_enrichment_interruptible(
             &checker::EnrichOptions {
                 database: Some(&database),
                 sidecar: sidecar.as_deref(),
+                node: &node,
                 timeout,
                 files: Vec::new(),
                 packages: Vec::new(),
@@ -1965,11 +1985,15 @@ mod tests {
         let options = WatchOptions {
             database: None,
             embed_on_change: false,
+            provider: None,
             embed_product_only: false,
             dependencies: &[],
             enrich_on_change: false,
             enrich_timeout: seconds(300),
             checker_sidecar: None,
+            checker_node: "node",
+            timing: false,
+            debug: false,
             debounce: seconds(2),
             reconcile_interval: seconds(2),
         };
@@ -1982,11 +2006,15 @@ mod tests {
         let options = WatchOptions {
             database: None,
             embed_on_change: false,
+            provider: None,
             embed_product_only: true,
             dependencies: &[],
             enrich_on_change: false,
             enrich_timeout: seconds(300),
             checker_sidecar: None,
+            checker_node: "node",
+            timing: false,
+            debug: false,
             debounce: seconds(2),
             reconcile_interval: seconds(600),
         };
@@ -1999,11 +2027,25 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
         let database = directory.path().join("watch.db");
-        let first = run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
+        let first = run_refresh(
+            directory.path(),
+            &database,
+            &[],
+            RefreshScope::Full,
+            false,
+            false,
+        )?;
         assert_eq!(first.outcome.indexed, 1);
         fs::remove_file(directory.path().join("a.ts"))?;
         fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
-        let second = run_refresh(directory.path(), &database, &[], RefreshScope::Incremental)?;
+        let second = run_refresh(
+            directory.path(),
+            &database,
+            &[],
+            RefreshScope::Incremental,
+            false,
+            false,
+        )?;
         assert_eq!(second.outcome.indexed, 1);
         assert_eq!(second.outcome.removed, 1);
         let conn = crate::store::open_path_read_only(&database)?;
@@ -2021,7 +2063,14 @@ mod tests {
         fs::write(directory.path().join("video.ts"), [0xff, 0xfe])?;
         let database = directory.path().join("watch.db");
 
-        let result = run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
+        let result = run_refresh(
+            directory.path(),
+            &database,
+            &[],
+            RefreshScope::Full,
+            false,
+            false,
+        )?;
 
         assert_eq!(result.outcome.rejected, 1);
         assert_eq!(result.outcome.rejections[0].path, "video.ts");
@@ -2035,10 +2084,24 @@ mod tests {
         fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
         fs::write(directory.path().join("b.ts"), "export const b = 2;\n")?;
         let database = directory.path().join("watch.db");
-        run_refresh(directory.path(), &database, &[], RefreshScope::Full)?;
+        run_refresh(
+            directory.path(),
+            &database,
+            &[],
+            RefreshScope::Full,
+            false,
+            false,
+        )?;
 
         fs::write(directory.path().join("a.ts"), "export const a = 3;\n")?;
-        let refreshed = run_refresh(directory.path(), &database, &[], RefreshScope::Incremental)?;
+        let refreshed = run_refresh(
+            directory.path(),
+            &database,
+            &[],
+            RefreshScope::Incremental,
+            false,
+            false,
+        )?;
 
         assert_eq!(
             (refreshed.outcome.indexed, refreshed.outcome.unchanged),

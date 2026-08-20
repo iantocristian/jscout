@@ -50,7 +50,13 @@ pub fn serve(
 ) -> Result<()> {
     let root = root.canonicalize()?;
     let conn = store::open_path_read_only(database_path)?;
-    let provider = embed::Provider::from_env()?;
+    let provider =
+        embed::Provider::from_settings(&runtime.effective.embedding, &runtime.effective.inference)?;
+    let reranker = search::Reranker::from_settings(
+        &runtime.effective.reranker,
+        &runtime.effective.embedding,
+        &runtime.effective.inference,
+    );
     let mut telemetry = match telemetry_path.map(Path::to_path_buf) {
         Some(path) => Some(
             OpenOptions::new()
@@ -140,9 +146,11 @@ pub fn serve(
                                 root: &root,
                                 conn: &write_conn,
                                 provider: provider.as_ref(),
+                                reranker: reranker.as_ref(),
                                 profile,
                                 source_view,
                                 search_defaults: &runtime.effective.search,
+                                timing: runtime.effective.diagnostics.timing,
                             },
                             name,
                             &args,
@@ -155,9 +163,11 @@ pub fn serve(
                             root: &root,
                             conn: &conn,
                             provider: provider.as_ref(),
+                            reranker: reranker.as_ref(),
                             profile,
                             source_view,
                             search_defaults: &runtime.effective.search,
+                            timing: runtime.effective.diagnostics.timing,
                         },
                         name,
                         &args,
@@ -298,7 +308,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "symbol": { "type": "string", "description": "NAME or path-substring:NAME, e.g. 'getUser' or 'services/user:getUser'" },
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency symbols require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency symbols require explicit inclusion unless configured" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
                     "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
@@ -317,7 +327,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "symbol": { "type": "string", "description": "NAME or path-substring:NAME" },
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency definitions require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency definitions require explicit inclusion unless configured" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
                     "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
@@ -336,7 +346,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Repo-relative path (or unique suffix)" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency files require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency files require explicit inclusion unless configured" },
                     "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum bytes in the complete rendered outline response" }
                 },
                 "required": ["path"]
@@ -349,7 +359,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Optional event name filter" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency sites require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency sites require explicit inclusion unless configured" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 1, "description": "Maximum bytes in the complete rendered event response; callers may widen it" }
                 }
             }
@@ -364,7 +374,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "args": { "type": "array", "items": { "type": "string" }, "description": "Option filters, each KEY or KEY=VALUE; all must match top-level properties of the same object-literal argument" },
                     "arg_position": { "type": "integer", "minimum": 1, "description": "Restrict the options object to this 1-based argument position" },
                     "receiver": { "type": "string", "description": "Dotted suffix the static receiver chain must end with, e.g. wave.card" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency calls require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency calls require explicit inclusion unless configured" },
                     "limit": { "type": "integer", "default": 200, "minimum": 1, "maximum": 1000 },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 1, "description": "Maximum bytes in the complete rendered call-site response" }
                 },
@@ -382,7 +392,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "types": { "type": "array", "items": { "type": "string" }, "description": "Optional entity-type allowlist" },
                     "roles": { "type": "array", "items": { "type": "string" }, "description": "Optional occurrence-role allowlist" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "default": ["production", "unknown"] },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned first-party files; repository alone is not the whole repository" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration; repository alone is not the whole repository" },
                     "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                     "occurrences_per_entity": { "type": "integer", "default": 8, "minimum": 1, "maximum": 50 },
                     "response_bytes": { "type": "integer", "default": 24000 }
@@ -406,7 +416,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
                     "kinds": { "type": "array", "items": { "type": "string" } },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "default": ["production", "unknown"] },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned first-party files; repository alone is not the whole repository" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration; repository alone is not the whole repository" },
                     "response_bytes": { "type": "integer", "default": 24000 }
                 },
                 "required": ["from", "to"]
@@ -418,7 +428,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned first-party files; repository alone is not the whole repository" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration; repository alone is not the whole repository" },
                     "area_limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                     "relation_limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 100 },
                     "include_semantic": { "type": "boolean", "default": false },
@@ -446,7 +456,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "types": { "type": "array", "items": { "type": "string", "enum": ["workflow", "card", "concept", "summary", "annotation"] } },
                     "freshness": { "type": "array", "items": { "type": "string", "enum": ["fresh", "degraded", "stale"] } },
                     "include_superseded": { "type": "boolean", "default": false },
-                    "vector": { "type": "boolean", "default": true, "description": "Use semantic-artifact embeddings when their index is materialized" },
+                    "vector": { "type": "boolean", "description": "Use semantic-artifact embeddings when materialized; omit to use repository configuration" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
                     "supports_per_artifact": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
                     "relation_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40 },
@@ -455,7 +465,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "source_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
                     "source_depth": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 },
                     "source_bytes": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 2000 },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned first-party files; repository alone is not the whole repository" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration; repository alone is not the whole repository" },
                     "response_bytes": { "type": "integer", "minimum": 1, "default": 24000 }
                 }
             }
@@ -544,7 +554,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"], "default": "likely" },
                     "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" },
-                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "default": ["repository", "workspace"], "description": "Normally omit. Default includes workspace owned-package files plus repository root/unowned files. Dependency-backed nodes require explicit inclusion" },
+                    "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency-backed nodes require explicit inclusion unless configured" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 1 },
                     "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
@@ -639,6 +649,8 @@ fn search_options_from_args(
                 .unwrap_or(defaults.memory_nodes as u64)
                 as usize,
             rerank: args["rerank"].as_bool().unwrap_or(defaults.rerank),
+            reranker: None,
+            timing: false,
             compact: !debug,
             include_neighborhood_followups: profile == ToolProfile::Structural,
             response_byte_limit: args["response_bytes"]
@@ -684,9 +696,11 @@ struct ToolContext<'a> {
     root: &'a Path,
     conn: &'a Connection,
     provider: Option<&'a embed::Provider>,
+    reranker: Option<&'a search::Reranker>,
     profile: ToolProfile,
     source_view: scout::SourceView,
     search_defaults: &'a config::SearchSettings,
+    timing: bool,
 }
 
 fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) -> Result<String> {
@@ -700,7 +714,10 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
         "semantic_search" => {
             let q = args["query"].as_str().unwrap_or("");
             let debug = args["debug"].as_bool().unwrap_or(false);
-            let (use_vector, options) = search_options_from_args(profile, args, search_defaults)?;
+            let (use_vector, mut options) =
+                search_options_from_args(profile, args, search_defaults)?;
+            options.reranker = context.reranker.cloned();
+            options.timing = context.timing;
             let result =
                 search::search(conn, if use_vector { provider } else { None }, q, &options)?;
             if debug {
@@ -716,7 +733,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
                 as usize;
             let graph = query::ModuleGraph::load(conn)?;
-            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let origins = configured_origins(args, search_defaults);
             let (targets, resolution) = symbol_targets(conn, args, &origins)?;
             let mut results = Vec::new();
             for t in &targets {
@@ -764,7 +781,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 .as_u64()
                 .unwrap_or(scout::DEFAULT_SOURCE_BYTE_LIMIT as u64)
                 as usize;
-            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let origins = configured_origins(args, search_defaults);
             let (targets, resolution) = symbol_targets(conn, args, &origins)?;
             let matched_targets = targets.len();
             let mut results = Vec::new();
@@ -842,7 +859,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
         }
         "file_outline" => {
             let path = args["path"].as_str().unwrap_or("");
-            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let origins = configured_origins(args, search_defaults);
             crate::origin::validate_all(&origins)?;
             let repository = origins.iter().any(|origin| origin == "repository");
             let workspace = origins.iter().any(|origin| origin == "workspace");
@@ -879,7 +896,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
         }
         "events" => {
             let filter = args["name"].as_str();
-            let origins = json_string_array_or(args, "origins", crate::origin::defaults);
+            let origins = configured_origins(args, search_defaults);
             let sites = query::events_in_origins(conn, filter, &origins)?;
             let sites = sites
                 .into_iter()
@@ -905,7 +922,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     args: filters,
                     arg_position: args["arg_position"].as_u64().map(|value| value as usize),
                     receiver_suffix: args["receiver"].as_str().map(str::to_string),
-                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    file_origins: configured_origins(args, search_defaults),
                     limit: (args["limit"].as_u64().unwrap_or(200) as usize).min(1000),
                 },
             )?;
@@ -932,7 +949,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                             .map(|role| (*role).to_string())
                             .collect()
                     }),
-                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    file_origins: configured_origins(args, search_defaults),
                     limit: (args["limit"].as_u64().unwrap_or(20) as usize).min(100),
                     occurrences_per_entity: (args["occurrences_per_entity"].as_u64().unwrap_or(8)
                         as usize)
@@ -979,7 +996,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                             .map(|role| (*role).to_string())
                             .collect()
                     }),
-                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    file_origins: configured_origins(args, search_defaults),
                 },
             )?;
             render_bounded_object_arrays(
@@ -995,7 +1012,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
             let result = surface::overview_response(
                 conn,
                 &surface::OverviewOptions {
-                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    file_origins: configured_origins(args, search_defaults),
                     area_limit: (args["area_limit"].as_u64().unwrap_or(20) as usize).min(100),
                     relation_limit: (args["relation_limit"].as_u64().unwrap_or(30) as usize)
                         .min(100),
@@ -1022,7 +1039,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
             let result = semantic_query::query(
                 root,
                 conn,
-                if args["vector"].as_bool().unwrap_or(true) {
+                if args["vector"].as_bool().unwrap_or(search_defaults.vector) {
                     provider
                 } else {
                     None
@@ -1053,7 +1070,11 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                         .min(32),
                     source_byte_limit: (args["source_bytes"].as_u64().unwrap_or(2_000) as usize)
                         .min(16_000),
-                    file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                    file_origins: if args.get("origins").is_some() {
+                        json_string_array(args, "origins")
+                    } else {
+                        search_defaults.origins.clone()
+                    },
                     response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
                 },
             )?;
@@ -1097,7 +1118,7 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     })
                     .unwrap_or_default(),
                 file_roles: json_string_array(args, "file_roles"),
-                file_origins: json_string_array_or(args, "origins", crate::origin::defaults),
+                file_origins: configured_origins(args, search_defaults),
                 penalize_file_roles: args["file_roles"]
                     .as_array()
                     .is_some_and(|roles| !roles.is_empty()),
@@ -1219,6 +1240,14 @@ fn json_string_array_or(
         json_string_array(args, key)
     } else {
         default()
+    }
+}
+
+fn configured_origins(args: &Value, defaults: &config::SearchSettings) -> Vec<String> {
+    if args.get("origins").is_some() {
+        json_string_array(args, "origins")
+    } else {
+        defaults.origins.clone()
     }
 }
 
@@ -1543,9 +1572,11 @@ fn call_tool(
             root,
             conn,
             provider,
+            reranker: None,
             profile,
             source_view,
             search_defaults: &config::SearchSettings::default(),
+            timing: false,
         },
         name,
         args,
@@ -1916,9 +1947,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "semantic_memory")
             .expect("semantic_memory definition");
-        assert_eq!(
-            memory["inputSchema"]["properties"]["vector"]["default"],
-            true
+        assert!(
+            memory["inputSchema"]["properties"]["vector"]
+                .get("default")
+                .is_none()
         );
         assert!(memory["inputSchema"]["properties"].get("file").is_some());
         assert!(

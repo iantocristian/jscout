@@ -68,6 +68,11 @@ pub struct SearchOptions {
     /// Apply the separately configured cross-encoder to the fused candidate
     /// pool. This is independent of whether vector retrieval is enabled.
     pub rerank: bool,
+    /// Resolved reranker service and pool policy. `rerank` remains the
+    /// per-request enable/disable switch.
+    pub reranker: Option<Reranker>,
+    /// Emit stage timing diagnostics to stderr.
+    pub timing: bool,
     /// Budget and render the agent-facing compact transport rather than the
     /// diagnostic representation.
     pub compact: bool,
@@ -91,6 +96,8 @@ impl Default for SearchOptions {
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
             memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
             rerank: true,
+            reranker: None,
+            timing: false,
             compact: false,
             include_neighborhood_followups: true,
             expansion: ExpansionOptions::default(),
@@ -835,12 +842,7 @@ fn vector_ranking(
     limit: usize,
     file_origins: &[String],
 ) -> Result<Vec<(i64, f64)>> {
-    let t = std::time::Instant::now();
-    let scored = embed::vector_search(conn, provider, q, limit, file_origins)?;
-    if std::env::var_os("JSCOUT_TIMING").is_some() {
-        eprintln!("timing:   embed-query+sqlite-vec {:?}", t.elapsed());
-    }
-    Ok(scored)
+    embed::vector_search(conn, provider, q, limit, file_origins)
 }
 
 fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
@@ -855,23 +857,29 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
 /// POST {model, query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
 /// Local embeddings use the bundled service automatically; an explicit
 /// JSCOUT_RERANK_URL overrides that endpoint.
+#[derive(Debug, Clone)]
 pub struct Reranker {
     url: String,
     model: String,
+    pool: usize,
+    max_chars: usize,
 }
 
 impl Reranker {
-    pub fn from_env() -> Option<Self> {
-        let url = std::env::var("JSCOUT_RERANK_URL").ok().or_else(|| {
-            std::env::var("JSCOUT_EMBED_PROVIDER")
-                .ok()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("local"))
-                .then(|| format!("{}/rerank", crate::inference::base_url()))
+    pub fn from_settings(
+        reranker: &crate::config::RerankerSettings,
+        embedding: &crate::config::EmbeddingSettings,
+        inference: &crate::config::InferenceSettings,
+    ) -> Option<Self> {
+        let url = reranker.url.clone().or_else(|| {
+            (embedding.provider.as_deref() == Some("local"))
+                .then(|| format!("{}/rerank", inference.url.trim_end_matches('/')))
         })?;
         Some(Self {
             url,
-            model: std::env::var("JSCOUT_RERANK_MODEL")
-                .unwrap_or_else(|_| "BAAI/bge-reranker-v2-m3".to_string()),
+            model: reranker.model.clone(),
+            pool: reranker.top.min(100),
+            max_chars: reranker.max_chars,
         })
     }
 
@@ -952,15 +960,7 @@ pub fn search(
     }
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let (mut hits, retrieval) = ranked_hits(
-            conn,
-            provider,
-            q,
-            options.limit,
-            &options.file_roles,
-            &options.file_origins,
-            options.rerank,
-        )?;
+        let (mut hits, retrieval) = ranked_hits(conn, provider, q, options)?;
         if !options.include_neighborhood_followups {
             for hit in &mut hits {
                 hit.include_neighborhood_followup = false;
@@ -1319,16 +1319,25 @@ fn ranked_hits(
     conn: &Connection,
     provider: Option<&embed::Provider>,
     q: &str,
-    limit: usize,
-    file_roles: &[String],
-    file_origins: &[String],
-    rerank: bool,
+    options: &SearchOptions,
 ) -> Result<(Vec<Hit>, RetrievalStatus)> {
-    let timing = std::env::var_os("JSCOUT_TIMING").is_some();
-    let (pool, vector_pool) = candidate_pool_limits(limit, !file_roles.is_empty());
-    let exact = exact_intent_candidates(conn, q, limit, file_roles, file_origins)?;
+    let timing = options.timing;
+    let (pool, vector_pool) = candidate_pool_limits(options.limit, !options.file_roles.is_empty());
+    let exact = exact_intent_candidates(
+        conn,
+        q,
+        options.limit,
+        &options.file_roles,
+        &options.file_origins,
+    )?;
     let t0 = std::time::Instant::now();
-    let mut rankings = vec![bm25_ranking(conn, q, pool, file_roles, file_origins)?];
+    let mut rankings = vec![bm25_ranking(
+        conn,
+        q,
+        pool,
+        &options.file_roles,
+        &options.file_origins,
+    )?];
     let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
@@ -1337,35 +1346,26 @@ fn ranked_hits(
         let t = std::time::Instant::now();
         retrieval = record_vector_ranking(
             &mut rankings,
-            vector_ranking(conn, p, q, vector_pool, file_origins),
+            vector_ranking(conn, p, q, vector_pool, &options.file_origins),
         );
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
         }
     }
     for ranking in &mut rankings {
-        prefilter_ranking_by_role(conn, ranking, file_roles)?;
+        prefilter_ranking_by_role(conn, ranking, &options.file_roles)?;
         ranking.truncate(pool);
     }
     let mut fused = rrf(&rankings, 60.0);
 
-    // Cross-encoder rerank of the candidate pool, when a service is configured.
-    // Pool size and per-candidate truncation trade quality for latency:
-    // JSCOUT_RERANK_TOP (default 50), JSCOUT_RERANK_CHARS (default 4000).
-    if rerank && let Some(reranker) = Reranker::from_env() {
-        let pool_n: usize = std::env::var("JSCOUT_RERANK_TOP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50)
-            .min(100);
-        let max_chars: usize = std::env::var("JSCOUT_RERANK_CHARS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4000);
+    // Cross-encoder rerank of the configured candidate prefix.
+    if options.rerank
+        && let Some(reranker) = options.reranker.as_ref()
+    {
         let top: Vec<(i64, String)> = fused
             .iter()
-            .take(pool_n)
-            .map(|(id, _)| reranker_document(conn, *id, max_chars))
+            .take(reranker.pool)
+            .map(|(id, _)| reranker_document(conn, *id, reranker.max_chars))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
@@ -1388,13 +1388,13 @@ fn ranked_hits(
             }
         }
     }
-    if file_roles.is_empty() {
+    if options.file_roles.is_empty() {
         apply_repository_policy_penalty(conn, &mut fused)?;
     }
     let ranked = tiered_candidates(exact, &fused);
 
     let mut hits = Vec::new();
-    let allowed_roles: HashSet<&str> = file_roles.iter().map(String::as_str).collect();
+    let allowed_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
     for candidate in ranked {
         if let Some(hit) = load_hit(
             conn,
@@ -1407,7 +1407,7 @@ fn ranked_hits(
                 continue;
             }
             hits.push(hit);
-            if hits.len() >= limit {
+            if hits.len() >= options.limit {
                 break;
             }
         }
@@ -2214,18 +2214,59 @@ mod tests {
 
     use super::{
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
-        ExpansionOptions, Hit, MatchReason, ResponseBudget, RetrievalStatus, SearchExpansion,
-        SearchOptions, SearchResult, apply_repository_policy_penalty, apply_response_budget,
-        candidate_pool_limits, contains_code_identifier, exact_intent_tokens,
-        merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-        search, select_attached_memory, tiered_candidates,
+        ExpansionOptions, Hit, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
+        SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
+        apply_response_budget, candidate_pool_limits, contains_code_identifier,
+        exact_intent_tokens, merge_reranked_prefix, prefilter_ranking_by_role,
+        record_vector_ranking, reranker_document, search, select_attached_memory,
+        tiered_candidates,
     };
+    use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
     use crate::{
         file_role, indexer, origin,
         semantic::{ArtifactRetrievalScore, SemanticArtifact, SemanticSupport},
         store,
         structural::{GraphEdge, GraphNode},
     };
+
+    #[test]
+    fn local_reranker_uses_resolved_inference_endpoint_and_pool_policy() {
+        let reranker = Reranker::from_settings(
+            &RerankerSettings {
+                url: None,
+                model: "example/reranker".to_string(),
+                revision: Some("revision".to_string()),
+                top: 27,
+                max_chars: 1234,
+            },
+            &EmbeddingSettings {
+                provider: Some("local".to_string()),
+                model: Some("example/embed".to_string()),
+                revision: None,
+                url: None,
+                api_key_env: None,
+                query_prefix: None,
+                batch: 64,
+                origins: origin::defaults(),
+            },
+            &InferenceSettings {
+                url: "http://127.0.0.1:9912/".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 9912,
+                project: None,
+                uv: "uv".to_string(),
+                allow_remote: false,
+                batch_size: 16,
+                max_length: 4096,
+                model_cache_root: None,
+            },
+        )
+        .expect("local reranker");
+        assert_eq!(reranker.url, "http://127.0.0.1:9912/rerank");
+        assert_eq!(reranker.model, "example/reranker");
+        assert_eq!(reranker.pool, 27);
+        assert_eq!(reranker.max_chars, 1234);
+    }
 
     fn insert_repository_policy(
         conn: &rusqlite::Connection,
@@ -2591,6 +2632,8 @@ mod tests {
                 memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
                 memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
                 rerank: true,
+                reranker: None,
+                timing: false,
                 compact: true,
                 include_neighborhood_followups: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
@@ -2633,6 +2676,8 @@ mod tests {
                 memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
                 memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
                 rerank: true,
+                reranker: None,
+                timing: false,
                 compact: false,
                 include_neighborhood_followups: true,
                 response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,

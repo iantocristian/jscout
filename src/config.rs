@@ -220,6 +220,8 @@ pub struct OpenAiCompatibleProvider {
     pub name: String,
     #[serde(rename = "baseUrl")]
     pub base_url: String,
+    #[serde(rename = "apiKeyEnv", skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     pub models: Vec<OpenAiCompatibleModel>,
 }
 
@@ -396,6 +398,7 @@ struct OpenAiCompatibleProviderFileConfig {
     id: String,
     name: Option<String>,
     base_url: String,
+    api_key_env: Option<String>,
     models: Vec<OpenAiCompatibleModelFileConfig>,
 }
 
@@ -750,6 +753,9 @@ impl RuntimeConfig {
         let embed_url =
             resolver.optional_string("embedding.url", raw.embedding.url, Some("JSCOUT_EMBED_URL"));
         validate_optional_endpoint("embedding.url", embed_url.as_deref())?;
+        if embed_url.is_some() && provider.as_deref() != Some("openai") {
+            bail!("embedding.url is supported only when embedding.provider = \"openai\"");
+        }
         let key_default = match provider.as_deref() {
             Some("voyage") => Some("VOYAGE_API_KEY"),
             Some("openai") if embed_url.is_some() => Some("JSCOUT_EMBED_KEY"),
@@ -1336,6 +1342,7 @@ fn resolve_compatible_providers(
                 name: provider.name.unwrap_or_else(|| provider.id.clone()),
                 id: provider.id,
                 base_url: provider.base_url,
+                api_key_env: provider.api_key_env,
                 models: provider
                     .models
                     .into_iter()
@@ -1374,6 +1381,13 @@ fn validate_compatible_providers(providers: &[OpenAiCompatibleProvider]) -> Resu
             "llm.openai_compatible_providers.base_url",
             &provider.base_url,
         )?;
+        if provider
+            .api_key_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            bail!("compatible-provider api_key_env must not be empty");
+        }
         if provider.models.is_empty() {
             bail!(
                 "llm.openai_compatible_providers `{}` must declare at least one model",

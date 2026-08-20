@@ -54,6 +54,7 @@ function registry(state) {
       customProviders: parseOpenAICompatibleProviders(state.env[CUSTOM_PROVIDERS_ENV], CUSTOM_PROVIDERS_ENV),
       credentialStore: state.credentialStore,
       openAIBaseUrl: state.env[OPENAI_BASE_URL_ENV],
+      env: state.env,
     });
     return state.registry;
   } catch (error) {
