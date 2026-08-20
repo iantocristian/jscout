@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,6 +57,61 @@ pub struct EnrichReport {
     pub dry_run: bool,
     pub peak_rss_bytes: u64,
     pub peak_heap_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ProjectFailure {
+    project_id: String,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+struct PartialEnrichmentError {
+    batch_id: i64,
+    facts_published: usize,
+    failures: Vec<ProjectFailure>,
+}
+
+impl PartialEnrichmentError {
+    fn retryable(&self) -> bool {
+        self.failures.iter().any(|failure| failure.retryable)
+    }
+}
+
+impl fmt::Display for PartialEnrichmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let failed = self
+            .failures
+            .iter()
+            .map(|failure| failure.project_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible",
+            self.batch_id,
+            self.facts_published,
+            self.failures.len(),
+            failed
+        )?;
+        if self.retryable() {
+            formatter.write_str("; transient failures may be resumed")
+        } else {
+            formatter.write_str("; deterministic failures wait for changed inputs")
+        }
+    }
+}
+
+impl std::error::Error for PartialEnrichmentError {}
+
+/// A partial batch with only deterministic per-project failures is usable and
+/// should not enter watch's tight phase-retry loop. A later structural
+/// generation or periodic reconciliation naturally attempts those projects
+/// again.
+pub fn is_terminal_partial_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PartialEnrichmentError>()
+        .is_some_and(|partial| !partial.retryable())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,7 +389,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut unmapped_declaration_contexts = BTreeMap::<String, usize>::new();
     let mut peak_rss_bytes = 0;
     let mut peak_heap_bytes = 0;
-    let mut failed_projects = Vec::new();
+    let mut failed_projects = Vec::<ProjectFailure>::new();
 
     for (project_index, (project_id, occurrences)) in project_plan.iter().enumerate() {
         if super::process::cancellation_pending() {
@@ -385,9 +441,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                     "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
                 );
             }
-            mark_project_failed(&conn, batch_id, project_id, occurrences, &error.to_string())?;
-            eprintln!("checker enrichment: project {project_id} failed: {error:#}");
-            failed_projects.push(project_id.clone());
+            let message = error.to_string();
+            let retryable = project_failure_is_retryable(&error);
+            mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+            eprintln!(
+                "checker enrichment: project {project_id} failed disposition={}: {error:#}",
+                if retryable { "retryable" } else { "terminal" }
+            );
+            failed_projects.push(ProjectFailure {
+                project_id: project_id.clone(),
+                retryable,
+            });
         }
     }
 
@@ -399,11 +463,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         let facts_published =
             activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, true)?;
         crate::structural::rebuild_projection(&conn, &snapshot)?;
-        bail!(
-            "checker enrichment activated partial batch {batch_id} with {facts_published} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible; rerun the same command to resume",
-            failed_projects.len(),
-            failed_projects.join(", ")
-        );
+        return Err(PartialEnrichmentError {
+            batch_id,
+            facts_published,
+            failures: failed_projects,
+        }
+        .into());
     }
 
     let facts_published =
@@ -449,6 +514,37 @@ fn canceled_checker_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<super::process::CheckerError>()
         .is_some_and(|error| matches!(error, super::process::CheckerError::Canceled(_)))
+}
+
+fn project_failure_is_retryable(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<super::process::CheckerError>() {
+        Some(super::process::CheckerError::Remote { code, .. }) => {
+            matches!(
+                code.as_str(),
+                "busy"
+                    | "checker_crash"
+                    | "checker_exit"
+                    | "EIO"
+                    | "EINTR"
+                    | "EAGAIN"
+                    | "ENOMEM"
+                    | "EBUSY"
+                    | "EMFILE"
+                    | "ENFILE"
+                    | "ETIMEDOUT"
+                    | "ENETDOWN"
+                    | "ENETUNREACH"
+                    | "ENETRESET"
+                    | "ECONNABORTED"
+                    | "ECONNRESET"
+                    | "ENOBUFS"
+                    | "ESTALE"
+            )
+        }
+        // Process/transport and local storage failures may heal without a new
+        // structural snapshot. Unknown local errors stay fail-closed.
+        _ => true,
+    }
 }
 
 /// ECMAScript / host names that usually resolve into the TypeScript standard
@@ -2488,6 +2584,52 @@ mod tests {
             message: "worker failed".into(),
         });
         assert!(!canceled_checker_error(&failed));
+    }
+
+    #[test]
+    fn partial_failure_retry_policy_separates_project_state_from_transport_failure() {
+        let mismatch = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "project_mismatch".into(),
+            message: "not an effective member".into(),
+        });
+        assert!(!project_failure_is_retryable(&mismatch));
+
+        let crash = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "checker_crash".into(),
+            message: "worker failed".into(),
+        });
+        assert!(project_failure_is_retryable(&crash));
+
+        let exhausted = anyhow::Error::new(super::super::process::CheckerError::Remote {
+            code: "EMFILE".into(),
+            message: "too many open files".into(),
+        });
+        assert!(project_failure_is_retryable(&exhausted));
+
+        let timeout = anyhow::Error::new(super::super::process::CheckerError::Timeout(
+            Duration::from_secs(1),
+        ));
+        assert!(project_failure_is_retryable(&timeout));
+
+        let terminal_partial = anyhow::Error::new(PartialEnrichmentError {
+            batch_id: 1,
+            facts_published: 10,
+            failures: vec![ProjectFailure {
+                project_id: "tsconfig.json".into(),
+                retryable: false,
+            }],
+        });
+        assert!(is_terminal_partial_failure(&terminal_partial));
+
+        let retryable_partial = anyhow::Error::new(PartialEnrichmentError {
+            batch_id: 2,
+            facts_published: 10,
+            failures: vec![ProjectFailure {
+                project_id: "tsconfig.json".into(),
+                retryable: true,
+            }],
+        });
+        assert!(!is_terminal_partial_failure(&retryable_partial));
     }
 
     #[test]

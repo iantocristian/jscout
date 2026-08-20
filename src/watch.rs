@@ -835,6 +835,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         Err(error) => {
                             let interrupted = checker::process::interrupt_pending();
                             let superseded = coordinator.is_superseded(work);
+                            let terminal_partial = checker::is_terminal_partial_failure(&error);
                             eprintln!(
                                 "watch generation={} phase=enrich status={} elapsed_ms={} error={error:#}",
                                 work.generation,
@@ -842,6 +843,8 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                     "interrupted"
                                 } else if superseded {
                                     "canceled"
+                                } else if terminal_partial {
+                                    "partial"
                                 } else {
                                     "failed"
                                 },
@@ -851,9 +854,14 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 eprintln!("watch status=stopped reason=interrupt");
                                 return Ok(());
                             }
+                            let state = if terminal_partial {
+                                coordinator.finish_optional(work)
+                            } else {
+                                coordinator.finish_error(started.elapsed(), work)
+                            };
                             report_finish(
                                 work,
-                                coordinator.finish_error(started.elapsed(), work),
+                                state,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,

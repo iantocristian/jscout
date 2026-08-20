@@ -462,6 +462,11 @@ rolls back and watch retries instead of publishing a reduced corpus. A path
 that disappears or changes between file and directory after inventory is
 ordinary checkout churn, not evidence of an atomic-snapshot violation; its old
 row is removed and later events or reconciliation converge on the next state.
+Checker enrichment may publish a partial batch when some projects fail. A
+transient project failure uses the phase retry loop; a partial batch containing
+only deterministic project failures completes the generation with
+`status=partial` and those projects are attempted again after the next source
+generation or periodic reconciliation.
 Repository traversal applies the same classifier at subtree granularity:
 retryable I/O aborts the phase, while a permanently inaccessible subtree is
 reported and excluded without losing accessible siblings. Attached
