@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ignore::{Error as IgnoreError, WalkBuilder};
+use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
 use crate::io_policy;
 
@@ -32,6 +32,65 @@ pub struct SourceInventory {
     pub rejections: Vec<WalkRejection>,
 }
 
+/// Path matcher configured from the same ignore policy as the source walker.
+/// The watcher rebuilds this after every successful refresh so edits to ignore
+/// files take effect at the same publication boundary as the new inventory.
+pub struct SourcePathPolicy {
+    root: PathBuf,
+    matcher: IncrementalIgnore,
+}
+
+impl SourcePathPolicy {
+    pub fn new(root: &Path) -> Self {
+        let mut matchers = source_walk_builder(root).build_matchers();
+        let matcher = matchers
+            .pop()
+            .expect("one ignore matcher for the source root");
+        Self {
+            root: root.to_path_buf(),
+            matcher,
+        }
+    }
+
+    /// Whether ignore files or hidden-file policy exclude this path. An ignore
+    /// loading error conservatively returns false so the watcher schedules a
+    /// refresh, whose inventory pass will classify and report the error.
+    pub fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let (matched, error) = self.matcher.matched_with_errors(relative, is_dir);
+        error.is_none() && matched.is_ignore()
+    }
+}
+
+/// Whether a path is under a directory the source walker excludes
+/// deterministically. Keep event filtering on this function instead of
+/// copying directory names into the watcher.
+pub fn is_in_skipped_directory(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
+    })
+}
+
+fn source_walk_builder(root: &Path) -> WalkBuilder {
+    let filter_root = root.to_path_buf();
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |entry| !is_in_skipped_directory(&filter_root, entry.path()));
+    builder
+}
+
 /// Walk a repository root, honoring ignore files. Retryable traversal and
 /// ignore-file I/O abort the inventory; permanent subtree failures are
 /// reported and excluded so one inaccessible directory cannot wedge the
@@ -39,16 +98,7 @@ pub struct SourceInventory {
 pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
     let mut files = Vec::new();
     let mut rejections = Vec::new();
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|e| {
-            let name = e.file_name().to_str().unwrap_or("");
-            !(e.file_type().is_some_and(|t| t.is_dir()) && SKIP_DIRS.contains(&name))
-        })
-        .build();
+    let walker = source_walk_builder(root).build();
     for entry in walker {
         let entry = match entry {
             Ok(entry) => entry,

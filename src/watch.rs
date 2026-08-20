@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -368,13 +369,13 @@ impl Coordinator {
     }
 }
 
-#[derive(Default)]
 struct EventClassifier {
     root: PathBuf,
     excluded: BTreeSet<PathBuf>,
     git_controls: BTreeSet<PathBuf>,
     external_exact: BTreeSet<PathBuf>,
     external_prefixes: BTreeSet<PathBuf>,
+    source_policy: RefCell<walk::SourcePathPolicy>,
 }
 
 impl EventClassifier {
@@ -390,7 +391,12 @@ impl EventClassifier {
             git_controls: git_control_paths(root),
             external_exact: BTreeSet::new(),
             external_prefixes: BTreeSet::new(),
+            source_policy: RefCell::new(walk::SourcePathPolicy::new(root)),
         }
+    }
+
+    fn reload_source_policy(&mut self) {
+        *self.source_policy.get_mut() = walk::SourcePathPolicy::new(&self.root);
     }
 
     fn set_external(&mut self, exact: BTreeSet<PathBuf>, prefixes: BTreeSet<PathBuf>) {
@@ -427,7 +433,11 @@ impl EventClassifier {
                 );
                 continue;
             }
-            if is_noise(&path) {
+            // Selected external roots were handled above. For repository
+            // paths, use the inventory walker's directory policy before
+            // boundary detection so package.json under node_modules/dist does
+            // not promote ordinary dependency noise to a full refresh.
+            if walk::is_in_skipped_directory(&self.root, &path) {
                 continue;
             }
             if is_refresh_boundary(&path) {
@@ -435,6 +445,13 @@ impl EventClassifier {
                     &mut signal,
                     DirtySignal::full(format!("boundary:{}", display_path(&self.root, &path))),
                 );
+                continue;
+            }
+            if self
+                .source_policy
+                .borrow_mut()
+                .is_ignored(&path, path.is_dir())
+            {
                 continue;
             }
             if path.is_dir() {
@@ -693,6 +710,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             normalize_targets(&mut targets);
                             update_classifier_targets(&mut classifier, &targets);
                             registry.reconcile(&mut watcher, &root, &targets);
+                            classifier.reload_source_policy();
                             drain_events(
                                 &receiver,
                                 &classifier,
@@ -1125,21 +1143,6 @@ fn is_refresh_boundary(path: &Path) -> bool {
         || name.ends_with(".d.cts")
 }
 
-fn is_noise(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some("node_modules")
-                | Some(".git")
-                | Some("dist")
-                | Some("build")
-                | Some(".next")
-                | Some("coverage")
-                | Some("out")
-        )
-    })
-}
-
 fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::from([root.join(".gitmodules")]);
     let dot_git = root.join(".git");
@@ -1294,7 +1297,7 @@ mod tests {
 
     use super::{
         Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS,
-        Phase, RefreshScope, WatchOptions, clear_reconciliation_deadline_if_dirty, is_noise,
+        Phase, RefreshScope, WatchOptions, clear_reconciliation_deadline_if_dirty,
         is_refresh_boundary, run_refresh, validate_options,
     };
 
@@ -1555,8 +1558,6 @@ mod tests {
         assert!(is_refresh_boundary(Path::new("types/ambient.d.ts")));
         assert!(is_refresh_boundary(Path::new(".gitignore")));
         assert!(is_refresh_boundary(Path::new(".ignore")));
-        assert!(is_noise(Path::new("node_modules/dep/index.js")));
-        assert!(!is_noise(Path::new("pnpm-lock.yaml")));
 
         let root = PathBuf::from("/repo");
         let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
@@ -1568,6 +1569,77 @@ mod tests {
                 "{boundary} must force a full refresh"
             );
         }
+    }
+
+    #[test]
+    fn event_filter_uses_walker_ignore_policy_without_excluding_authored_build_dirs() -> Result<()>
+    {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path();
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join(".gitignore"), "/build/\n")?;
+        fs::create_dir_all(root.join("build"))?;
+        fs::create_dir_all(root.join("src/build"))?;
+        fs::create_dir_all(root.join("node_modules/dep"))?;
+        fs::write(
+            root.join("build/generated.ts"),
+            "export const generated = 1;\n",
+        )?;
+        fs::write(
+            root.join("src/build/plugin.ts"),
+            "export const plugin = 1;\n",
+        )?;
+        fs::write(
+            root.join("node_modules/dep/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        let classifier = EventClassifier::new(root, &root.join("watch.db"));
+
+        assert!(
+            classifier
+                .classify(&[root.join("build/generated.ts")])
+                .is_none()
+        );
+        assert_eq!(
+            classifier.classify(&[root.join("src/build/plugin.ts")]),
+            Some(DirtySignal::source(
+                "source:src/build/plugin.ts",
+                "src/build/plugin.ts"
+            ))
+        );
+        assert!(
+            classifier
+                .classify(&[root.join("node_modules/dep/index.js")])
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path();
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir_all(root.join("generated"))?;
+        fs::write(
+            root.join("generated/output.ts"),
+            "export const output = 1;\n",
+        )?;
+        let mut classifier = EventClassifier::new(root, &root.join("watch.db"));
+
+        assert!(
+            classifier
+                .classify(&[root.join("generated/output.ts")])
+                .is_some()
+        );
+        fs::write(root.join(".gitignore"), "/generated/\n")?;
+        classifier.reload_source_policy();
+        assert!(
+            classifier
+                .classify(&[root.join("generated/output.ts")])
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]
