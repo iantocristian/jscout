@@ -484,7 +484,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
                     "relation_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40 },
                     "concept_tag_limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40, "description": "Maximum deterministic file/chunk tags derived from returned current fresh concepts" },
                     "include_source": { "type": "boolean", "default": false, "description": "Include hash-verified source evidence; requires an exact artifact id drill-down" },
-                    "source_limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 12 },
+                    "source_limit": { "type": "integer", "minimum": 0, "maximum": 100, "default": 12, "description": "Maximum source evidence rows; zero explicitly omits source evidence" },
                     "source_depth": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 },
                     "source_bytes": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 2000 },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration; repository alone is not the whole repository" },

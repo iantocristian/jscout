@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::{query, scout, search, structural};
+use crate::{origin, query, scout, search, structural};
 
 pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
     Ok(serde_json::to_string(&search_value(result))?)
@@ -190,37 +190,40 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
 }
 
 fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
-    let origins = [&hit.file_origin];
+    let origins = (hit.file_origin == "dependency").then(|| origin::ALL.to_vec());
     if anchor.starts_with("sym:") {
         let tools = if hit.include_neighborhood_followup {
             vec!["definition", "who_uses", "neighborhood"]
         } else {
             vec!["definition", "who_uses"]
         };
-        json!({
-            "tools": tools,
-            "arguments": {
-                "anchor": anchor,
-                "snapshot": snapshot,
-                "origins": origins,
-            }
-        })
+        let mut arguments = Map::new();
+        arguments.insert("anchor".into(), json!(anchor));
+        arguments.insert("snapshot".into(), json!(snapshot));
+        if let Some(origins) = origins {
+            arguments.insert("origins".into(), json!(origins));
+        }
+        json!({ "tools": tools, "arguments": arguments })
     } else {
+        let mut outline_arguments = Map::new();
+        outline_arguments.insert("path".into(), json!(hit.file));
+        if let Some(origins) = &origins {
+            outline_arguments.insert("origins".into(), json!(origins));
+        }
         let mut calls = vec![json!({
             "tool": "file_outline",
-            "arguments": {
-                "path": hit.file,
-                "origins": origins,
-            }
+            "arguments": outline_arguments,
         })];
         if hit.include_neighborhood_followup {
+            let mut neighborhood_arguments = Map::new();
+            neighborhood_arguments.insert("anchor".into(), json!(anchor));
+            neighborhood_arguments.insert("snapshot".into(), json!(snapshot));
+            if let Some(origins) = &origins {
+                neighborhood_arguments.insert("origins".into(), json!(origins));
+            }
             calls.push(json!({
                 "tool": "neighborhood",
-                "arguments": {
-                    "anchor": anchor,
-                    "snapshot": snapshot,
-                    "origins": origins,
-                }
+                "arguments": neighborhood_arguments,
             }));
         }
         json!({ "calls": calls })
@@ -750,7 +753,7 @@ fn graph_value(
                 .and_then(Value::as_array)
                 .filter(|values| !values.is_empty())
             {
-                tuple.push(json!({ "receiver_types": receiver_types }));
+                tuple.push(compact_receiver_types(receiver_types));
             }
             Some(Value::Array(tuple))
         })
@@ -765,6 +768,39 @@ fn graph_value(
         "edge_fields": ["source", "kind", "target", "confidence", "provenance", "at", "detail?"],
         "edges": edge_values,
     })
+}
+
+fn compact_receiver_types(receiver_types: &[Value]) -> Value {
+    const TYPE_LIMIT: usize = 4;
+    const DISPLAY_BYTE_LIMIT: usize = 120;
+
+    let mut displays = Vec::new();
+    let mut truncated = receiver_types.len() > TYPE_LIMIT;
+    for value in receiver_types.iter().take(TYPE_LIMIT) {
+        let Some(receiver_type) = value.as_str() else {
+            truncated = true;
+            continue;
+        };
+        let mut display = receiver_type.trim().to_string();
+        if let Some(generic) = display.find('<') {
+            display.truncate(generic);
+            display = display.trim().to_string();
+            truncated = true;
+        }
+        if display.len() > DISPLAY_BYTE_LIMIT {
+            display = truncate_utf8(&display, DISPLAY_BYTE_LIMIT).to_string();
+            truncated = true;
+        }
+        if !display.is_empty() && !displays.contains(&display) {
+            displays.push(display);
+        }
+    }
+    let mut detail = Map::new();
+    detail.insert("receiver_types".into(), json!(displays));
+    if truncated {
+        detail.insert("receiver_types_truncated".into(), json!(true));
+    }
+    Value::Object(detail)
 }
 
 pub(crate) fn render_neighborhood(
@@ -961,8 +997,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        compact_hit, definition_string, render_neighborhood, search_string, semantic_preview,
-        who_uses_string,
+        compact_hit, compact_receiver_types, definition_string, render_neighborhood, search_string,
+        semantic_preview, who_uses_string,
     };
     use crate::{
         origin,
@@ -1090,6 +1126,11 @@ mod tests {
             value["hits"][0]["followups"]["arguments"]["snapshot"],
             "s".repeat(64)
         );
+        assert!(
+            value["hits"][0]["followups"]["arguments"]
+                .get("origins")
+                .is_none()
+        );
         assert!(value["hits"][0].get("chunk_id").is_none());
         assert_eq!(value["graph"]["edges"][0][3], "likely");
         assert_eq!(value["graph"]["edges"][0][4], "typescript-checker");
@@ -1135,6 +1176,60 @@ mod tests {
                 .iter()
                 .all(|call| call["tool"] != "definition" && call["tool"] != "who_uses")
         );
+        assert!(
+            value["followups"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|call| call["arguments"].get("origins").is_none())
+        );
+    }
+
+    #[test]
+    fn dependency_followups_include_dependency_and_first_party_origins() {
+        let hit = Hit {
+            chunk_id: 1,
+            file: "node_modules/pkg/index.ts".into(),
+            file_role: "production".into(),
+            repository_role: None,
+            file_origin: "dependency".into(),
+            kind: "function".into(),
+            name: Some("runDependency".into()),
+            start_line: 1,
+            end_line: 2,
+            score: 1.0,
+            match_reason: MatchReason::ExactDefinition,
+            matched_identifiers: vec!["runDependency".into()],
+            snippet: "export function runDependency() {}".into(),
+            snippet_truncated: false,
+            anchors: vec!["sym:node_modules/pkg/index.ts#::runDependency@1".into()],
+            file_anchor: "file:node_modules/pkg/index.ts".into(),
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: true,
+            include_neighborhood_followup: true,
+        };
+        let value = compact_hit(&hit, "snapshot");
+        assert_eq!(
+            value["followups"]["arguments"]["origins"],
+            json!(["repository", "workspace", "dependency"])
+        );
+    }
+
+    #[test]
+    fn compact_receiver_types_keep_bounded_heads_and_mark_truncation() {
+        let receiver_types = vec![
+            json!(format!("Errors<{}>", "Nested<".repeat(200))),
+            json!("QueueService"),
+            json!("Third"),
+            json!("Fourth"),
+            json!("Fifth"),
+        ];
+        let compact = compact_receiver_types(&receiver_types);
+        assert_eq!(compact["receiver_types"][0], "Errors");
+        assert_eq!(compact["receiver_types"][1], "QueueService");
+        assert_eq!(compact["receiver_types_truncated"], true);
+        assert!(serde_json::to_string(&compact).unwrap().len() < 160);
     }
 
     #[test]

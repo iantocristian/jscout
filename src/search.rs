@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, file_role, origin, semantic, store, structural};
+use crate::{embed, file_role, origin, query, semantic, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -1414,6 +1414,7 @@ fn ranked_hits(
             candidate.score,
             candidate.match_reason,
             candidate.matched_identifiers,
+            &options.file_origins,
         )? {
             if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
                 continue;
@@ -1596,11 +1597,12 @@ fn load_hit(
     score: f64,
     match_reason: MatchReason,
     matched_identifiers: Vec<String>,
+    file_origins: &[String],
 ) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
-                    c.content, c.symbols, c.file_id, policy.effective_role
+                    c.content, policy.effective_role
              FROM chunks c
              JOIN files f ON c.file_id = f.id
              LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
@@ -1616,26 +1618,13 @@ fn load_hit(
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, String>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, i64>(9)?,
-                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .ok();
-    let Some((
-        file,
-        role,
-        file_origin,
-        kind,
-        name,
-        start_line,
-        end_line,
-        content,
-        symbols,
-        _file_id,
-        repository_role,
-    )) = row
+    let Some((file, role, file_origin, kind, name, start_line, end_line, content, repository_role)) =
+        row
     else {
         return Ok(None);
     };
@@ -1653,18 +1642,25 @@ fn load_hit(
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // Incoming: usages of symbols declared in this chunk, from other files.
-    let mut used_by = Vec::new();
-    for sym in symbols.split_whitespace().take(3) {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM refs WHERE target_name = ?1 AND chunk_id != ?2",
-            rusqlite::params![sym, chunk_id],
-            |r| r.get(0),
-        )?;
-        if n > 0 {
-            used_by.push(format!("{sym}: {n} sites"));
+    // Only label anchor-resolved incoming edges as `used_by`. Repository-wide
+    // same-name reference counts are not callers of this exact declaration.
+    let used_by = match anchors.as_slice() {
+        [anchor] if anchor.starts_with("sym:") => {
+            let count = query::who_uses_anchor_in_origins(conn, anchor, file_origins)?
+                .into_iter()
+                .filter(|usage| usage.file != file)
+                .count();
+            if count == 0 {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "{}: {count} sites",
+                    name.as_deref().unwrap_or(anchor)
+                )]
+            }
         }
-    }
+        _ => Vec::new(),
+    };
 
     let snippet: String = content.lines().take(4).collect::<Vec<_>>().join("\n");
     Ok(Some(Hit {
@@ -2622,6 +2618,7 @@ mod tests {
             .expect("greet definition hit");
         assert_eq!(definition.file_anchor, "file:a.ts");
         assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
+        assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
         assert!(result.expansion.is_none());
         Ok(())
     }

@@ -373,7 +373,7 @@ pub fn query(
         } else {
             (Vec::new(), 0)
         };
-        let source_result = if detail_mode && options.include_source {
+        let source_result = if detail_mode && options.include_source && options.source_limit > 0 {
             source_evidence(root, conn, &selected_ids, options)?
         } else {
             SourceEvidenceResult::default()
@@ -511,8 +511,8 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     if options.concept_tag_limit == 0 || options.concept_tag_limit > MAX_CONCEPT_TAG_LIMIT {
         bail!("concept tag limit must be between 1 and {MAX_CONCEPT_TAG_LIMIT}");
     }
-    if options.source_limit == 0 || options.source_limit > MAX_SOURCE_LIMIT {
-        bail!("semantic source limit must be between 1 and {MAX_SOURCE_LIMIT}");
+    if options.source_limit > MAX_SOURCE_LIMIT {
+        bail!("semantic source limit must be between 0 and {MAX_SOURCE_LIMIT}");
     }
     if options.source_byte_limit == 0 || options.source_byte_limit > MAX_SOURCE_BYTE_LIMIT {
         bail!("source byte limit must be between 1 and {MAX_SOURCE_BYTE_LIMIT}");
@@ -1665,6 +1665,20 @@ mod tests {
                 .as_deref()
                 .is_some_and(|source| source.contains("function start"))
         );
+        let no_source = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                include_source: true,
+                source_limit: 0,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(no_source.mode, "artifact_detail");
+        assert_eq!(no_source.semantic_artifacts[0].id, card.id);
+        assert!(no_source.source_evidence.is_empty());
         assert!(result.response_budget.rendered_bytes <= 24_000);
         assert_eq!(
             result.response_budget.unbudgeted_bytes,
