@@ -539,18 +539,20 @@ fn project_failure_is_retryable(error: &anyhow::Error) -> bool {
                     | "ESTALE"
             )
         }
-        // Process/transport failures may heal without a new structural
-        // snapshot. Protocol, cancellation, and unknown local errors stay
-        // terminal so an unclassified deterministic failure cannot wedge the
-        // watcher in its uncapped phase-retry loop.
+        // Launch/request transport failures may heal without a new structural
+        // snapshot. A child exit is a crash (including V8 heap aborts), so it
+        // follows the project-terminal partial/resume path instead of the
+        // watcher's uncapped phase-retry loop. Protocol, cancellation, and
+        // unknown local errors also stay terminal.
         Some(
             super::process::CheckerError::Spawn(_)
             | super::process::CheckerError::Io(_)
-            | super::process::CheckerError::ChildExited(_)
             | super::process::CheckerError::Timeout(_),
         ) => true,
         Some(
-            super::process::CheckerError::Protocol(_) | super::process::CheckerError::Canceled(_),
+            super::process::CheckerError::Protocol(_)
+            | super::process::CheckerError::ChildExited(_)
+            | super::process::CheckerError::Canceled(_),
         )
         | None => false,
     }
@@ -2614,6 +2616,21 @@ mod tests {
             message: "worker exited".into(),
         });
         assert!(!project_failure_is_retryable(&worker_exit));
+
+        let process_exit = anyhow::Error::new(super::super::process::CheckerError::ChildExited(
+            "checker aborted".into(),
+        ));
+        assert!(!project_failure_is_retryable(&process_exit));
+
+        let spawn = anyhow::Error::new(super::super::process::CheckerError::Spawn(
+            "temporarily unavailable".into(),
+        ));
+        assert!(project_failure_is_retryable(&spawn));
+
+        let transport = anyhow::Error::new(super::super::process::CheckerError::Io(
+            "temporary pipe failure".into(),
+        ));
+        assert!(project_failure_is_retryable(&transport));
 
         let exhausted = anyhow::Error::new(super::super::process::CheckerError::Remote {
             code: "EMFILE".into(),

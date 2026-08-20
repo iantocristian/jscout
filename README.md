@@ -466,11 +466,11 @@ Checker enrichment may publish a partial batch when some projects fail. A
 transient project failure uses the phase retry loop; a partial batch containing
 only deterministic project failures completes the generation with
 `status=partial` and those projects are attempted again after the next source
-generation or periodic reconciliation. A checker worker crash or exit is
-project-terminal: successful project staging is retained and the crashed
-project follows that generation/reconciliation recovery path instead of an
-uncapped immediate crash loop. Recognized request and resource failures remain
-immediately retryable.
+generation or periodic reconciliation. A checker worker or whole sidecar
+process crash/exit is project-terminal: successful project staging is retained
+and the crashed project follows that generation/reconciliation recovery path
+instead of an uncapped immediate crash loop. Recognized launch, request,
+transport, and resource failures remain immediately retryable.
 Repository traversal applies the same classifier at subtree granularity:
 retryable I/O aborts the phase, while a permanently inaccessible subtree is
 reported and excluded without losing accessible siblings. Attached

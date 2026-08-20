@@ -752,9 +752,9 @@ snapshot without checker edges unless the scale-corrected planner reaches a
 controlled partial activation with explicit coverage. Transient failures remain
 phase-retryable. A partial activation containing only deterministic project
 failures completes that watch generation as partial and is attempted again on
-the next structural generation or periodic reconciliation. Worker crashes and
-exits use this project-terminal path; recognized request/transport/resource
-failures remain phase-retryable. External-input
+the next structural generation or periodic reconciliation. Worker and whole
+sidecar process crashes/exits use this project-terminal path; recognized
+launch/request/transport/resource failures remain phase-retryable. External-input
 watching and generation cancellation belong to the
 later watcher coordinator; the fixed-snapshot path does not retain a
 manifest-rehashing subsystem for them.
