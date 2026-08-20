@@ -720,6 +720,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_refresh(work),
+                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -734,6 +735,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_error(started.elapsed(), work),
+                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -772,6 +774,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 state,
+                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -786,6 +789,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_error(started.elapsed(), work),
+                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -827,6 +831,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 coordinator.finish_optional(work),
+                                false,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -862,6 +867,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             report_finish(
                                 work,
                                 state,
+                                terminal_partial,
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -1063,6 +1069,7 @@ fn drain_events(
 fn report_finish(
     work: Work,
     state: FinishState,
+    partial_completion: bool,
     now: Duration,
     reconcile_interval: Duration,
     next_reconcile: &mut Option<Duration>,
@@ -1070,7 +1077,15 @@ fn report_finish(
     match state {
         FinishState::Continue => {}
         FinishState::Complete => {
-            eprintln!("watch generation={} status=clean", work.generation);
+            eprintln!(
+                "watch generation={} status={}",
+                work.generation,
+                if partial_completion {
+                    "partial"
+                } else {
+                    "clean"
+                }
+            );
             *next_reconcile =
                 (!reconcile_interval.is_zero()).then(|| now.saturating_add(reconcile_interval));
         }

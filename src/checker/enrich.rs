@@ -541,9 +541,20 @@ fn project_failure_is_retryable(error: &anyhow::Error) -> bool {
                     | "ESTALE"
             )
         }
-        // Process/transport and local storage failures may heal without a new
-        // structural snapshot. Unknown local errors stay fail-closed.
-        _ => true,
+        // Process/transport failures may heal without a new structural
+        // snapshot. Protocol, cancellation, and unknown local errors stay
+        // terminal so an unclassified deterministic failure cannot wedge the
+        // watcher in its uncapped phase-retry loop.
+        Some(
+            super::process::CheckerError::Spawn(_)
+            | super::process::CheckerError::Io(_)
+            | super::process::CheckerError::ChildExited(_)
+            | super::process::CheckerError::Timeout(_),
+        ) => true,
+        Some(
+            super::process::CheckerError::Protocol(_) | super::process::CheckerError::Canceled(_),
+        )
+        | None => false,
     }
 }
 
@@ -2610,6 +2621,14 @@ mod tests {
             Duration::from_secs(1),
         ));
         assert!(project_failure_is_retryable(&timeout));
+
+        let protocol = anyhow::Error::new(super::super::process::CheckerError::Protocol(
+            "invalid response".into(),
+        ));
+        assert!(!project_failure_is_retryable(&protocol));
+
+        let unknown = anyhow::anyhow!("deterministic local failure");
+        assert!(!project_failure_is_retryable(&unknown));
 
         let terminal_partial = anyhow::Error::new(PartialEnrichmentError {
             batch_id: 1,
