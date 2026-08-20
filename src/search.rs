@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, file_role, origin, semantic, store, structural};
+use crate::{embed, file_role, origin, query, semantic, store, structural};
 
 type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -91,7 +91,7 @@ impl Default for SearchOptions {
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
             file_origins: origin::defaults(),
-            include_memory: true,
+            include_memory: false,
             memory_limit: 4,
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
             memory_graph_node_limit: DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
@@ -118,10 +118,8 @@ pub struct SearchResult {
     pub semantic_attachment: Option<MemoryAttachmentStatus>,
     /// Ranked retrieval pool before the memory result limit. This is a
     /// candidate count, not a calibrated relevant-match count.
-    #[serde(skip)]
     pub semantic_candidates: usize,
     /// Memory previews selected before the whole-response byte budget.
-    #[serde(skip)]
     pub semantic_selected: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expansion: Option<SearchExpansion>,
@@ -206,6 +204,29 @@ pub struct ResponseBudget {
     pub omitted_edges: usize,
     pub omitted_followups: usize,
     pub truncated_snippets: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_sections: Option<SearchSectionBytes>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchSectionBytes {
+    pub hits_bytes: usize,
+    pub graph_bytes: usize,
+    pub memory_bytes: usize,
+    pub envelope_bytes: usize,
+    pub total_bytes: usize,
+}
+
+impl SearchSectionBytes {
+    fn reserved() -> Self {
+        Self {
+            hits_bytes: usize::MAX,
+            graph_bytes: usize::MAX,
+            memory_bytes: usize::MAX,
+            envelope_bytes: usize::MAX,
+            total_bytes: usize::MAX,
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -250,8 +271,9 @@ pub struct Hit {
     pub uses: Vec<String>,
     /// Symbols declared here that other files use, with usage counts.
     pub used_by: Vec<String>,
-    /// Compact transport may shed copy-safe follow-up arguments from lower
-    /// ranked hits before dropping the hit itself.
+    /// Whether this hit retains the one complete copy-safe argument object.
+    /// Every uniquely anchored compact hit still advertises compatible tools.
+    /// The response budget may shed these arguments before dropping the hit.
     #[serde(skip)]
     pub include_followups: bool,
     #[serde(skip)]
@@ -1012,12 +1034,36 @@ pub fn search(
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
+                transport_sections: (!options.compact).then(SearchSectionBytes::reserved),
                 ..Default::default()
             },
         };
         apply_response_budget(&mut result, options.compact)?;
         Ok(result)
     })
+}
+
+/// Count the repository-wide same-name reference occurrences that the compact
+/// search surface deliberately no longer labels as exact callers.
+///
+/// This reproduces the former top-three-symbol diagnostic for telemetry only.
+/// It is intentionally approximate: references are matched by name, not by a
+/// resolved declaration anchor, and the same reference may contribute to more
+/// than one returned hit. Callers should never render this as `used_by`.
+pub(crate) fn approximate_name_usage_occurrences(conn: &Connection, hits: &[Hit]) -> Result<usize> {
+    let mut symbols_stmt = conn.prepare_cached("SELECT symbols FROM chunks WHERE id = ?1")?;
+    let mut count_stmt =
+        conn.prepare_cached("SELECT COUNT(*) FROM refs WHERE target_name = ?1 AND chunk_id != ?2")?;
+    let mut total = 0_u64;
+    for hit in hits {
+        let symbols: String = symbols_stmt.query_row([hit.chunk_id], |row| row.get(0))?;
+        for symbol in symbols.split_whitespace().take(3) {
+            let count: i64 =
+                count_stmt.query_row(rusqlite::params![symbol, hit.chunk_id], |row| row.get(0))?;
+            total = total.saturating_add(count.max(0) as u64);
+        }
+    }
+    Ok(usize::try_from(total).unwrap_or(usize::MAX))
 }
 
 #[derive(Debug)]
@@ -1414,6 +1460,7 @@ fn ranked_hits(
             candidate.score,
             candidate.match_reason,
             candidate.matched_identifiers,
+            &options.file_origins,
         )? {
             if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
                 continue;
@@ -1423,6 +1470,9 @@ fn ranked_hits(
                 break;
             }
         }
+    }
+    if let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1) {
+        hit.include_followups = true;
     }
     Ok((hits, retrieval))
 }
@@ -1596,11 +1646,12 @@ fn load_hit(
     score: f64,
     match_reason: MatchReason,
     matched_identifiers: Vec<String>,
+    file_origins: &[String],
 ) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
-                    c.content, c.symbols, c.file_id, policy.effective_role
+                    c.content, policy.effective_role
              FROM chunks c
              JOIN files f ON c.file_id = f.id
              LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
@@ -1616,26 +1667,13 @@ fn load_hit(
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, String>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, i64>(9)?,
-                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .ok();
-    let Some((
-        file,
-        role,
-        file_origin,
-        kind,
-        name,
-        start_line,
-        end_line,
-        content,
-        symbols,
-        _file_id,
-        repository_role,
-    )) = row
+    let Some((file, role, file_origin, kind, name, start_line, end_line, content, repository_role)) =
+        row
     else {
         return Ok(None);
     };
@@ -1653,18 +1691,25 @@ fn load_hit(
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // Incoming: usages of symbols declared in this chunk, from other files.
-    let mut used_by = Vec::new();
-    for sym in symbols.split_whitespace().take(3) {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM refs WHERE target_name = ?1 AND chunk_id != ?2",
-            rusqlite::params![sym, chunk_id],
-            |r| r.get(0),
-        )?;
-        if n > 0 {
-            used_by.push(format!("{sym}: {n} sites"));
+    // Only label anchor-resolved incoming edges as `used_by`. Repository-wide
+    // same-name reference counts are not callers of this exact declaration.
+    let used_by = match anchors.as_slice() {
+        [anchor] if anchor.starts_with("sym:") => {
+            let count = query::who_uses_anchor_in_origins(conn, anchor, file_origins)?
+                .into_iter()
+                .filter(|usage| usage.file != file)
+                .count();
+            if count == 0 {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "{}: {count} sites",
+                    name.as_deref().unwrap_or(anchor)
+                )]
+            }
         }
-    }
+        _ => Vec::new(),
+    };
 
     let snippet: String = content.lines().take(4).collect::<Vec<_>>().join("\n");
     Ok(Some(Hit {
@@ -1686,7 +1731,7 @@ fn load_hit(
         file_anchor,
         uses,
         used_by,
-        include_followups: true,
+        include_followups: false,
         include_neighborhood_followup: true,
     }))
 }
@@ -1695,6 +1740,9 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
     let byte_limit = result.response_budget.byte_limit;
     if byte_limit == 0 {
         anyhow::bail!("response byte limit must be greater than zero");
+    }
+    if !compact && result.response_budget.transport_sections.is_none() {
+        result.response_budget.transport_sections = Some(SearchSectionBytes::reserved());
     }
 
     capture_unbudgeted_bytes(result, compact)?;
@@ -1832,6 +1880,16 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
         );
     }
 
+    if !compact {
+        for _ in 0..8 {
+            let sections = crate::compact::search_section_bytes(result)?;
+            if result.response_budget.transport_sections == Some(sections) {
+                break;
+            }
+            result.response_budget.transport_sections = Some(sections);
+            settle_rendered_bytes(result, compact)?;
+        }
+    }
     settle_rendered_bytes(result, compact)?;
     Ok(())
 }
@@ -2232,10 +2290,10 @@ mod tests {
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
         ExpansionOptions, Hit, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
         SearchExpansion, SearchOptions, SearchResult, apply_repository_policy_penalty,
-        apply_response_budget, candidate_pool_limits, contains_code_identifier,
-        exact_intent_tokens, merge_reranked_prefix, prefilter_ranking_by_role,
-        record_vector_ranking, reranker_document, search, select_attached_memory,
-        tiered_candidates,
+        apply_response_budget, approximate_name_usage_occurrences, candidate_pool_limits,
+        contains_code_identifier, exact_intent_tokens, merge_reranked_prefix,
+        prefilter_ranking_by_role, record_vector_ranking, reranker_document, search,
+        select_attached_memory, tiered_candidates,
     };
     use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
     use crate::{
@@ -2622,6 +2680,30 @@ mod tests {
             .expect("greet definition hit");
         assert_eq!(definition.file_anchor, "file:a.ts");
         assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
+        assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
+        assert!(approximate_name_usage_occurrences(&conn, &result.hits)? > 0);
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .filter(|hit| hit.include_followups)
+                .count(),
+            1
+        );
+        let compact = crate::compact::search_value(&result);
+        let compact_hits = compact["hits"].as_array().expect("compact hits");
+        assert_eq!(
+            compact_hits
+                .iter()
+                .filter(|hit| hit["followups"].get("arguments").is_some())
+                .count(),
+            1
+        );
+        assert!(compact_hits.iter().all(|hit| {
+            hit.get("anchors").is_some()
+                || hit["followups"]["tools"].is_array()
+                || hit["followups"]["calls"].is_array()
+        }));
         assert!(result.expansion.is_none());
         Ok(())
     }
@@ -2928,7 +3010,7 @@ mod tests {
                 truncated: false,
             }),
             response_budget: ResponseBudget {
-                byte_limit: 1_650,
+                byte_limit: 2_000,
                 ..Default::default()
             },
         };
@@ -2939,7 +3021,7 @@ mod tests {
         assert!(!expansion.nodes.iter().any(|node| node.key == "low"));
         assert_eq!(expansion.edges.len(), 1);
         assert_eq!(expansion.edges[0].target, "high");
-        assert!(result.response_budget.rendered_bytes <= 1_650);
+        assert!(result.response_budget.rendered_bytes <= 2_000);
         Ok(())
     }
 
@@ -3051,7 +3133,7 @@ mod tests {
             semantic_selected: 0,
             expansion: None,
             response_budget: ResponseBudget {
-                byte_limit: 500,
+                byte_limit: 425,
                 ..Default::default()
             },
         };
@@ -3060,7 +3142,19 @@ mod tests {
         assert_eq!(result.hits.len(), 1);
         assert!(!result.hits[0].include_followups);
         assert_eq!(result.response_budget.omitted_followups, 1);
-        assert!(result.response_budget.rendered_bytes <= 500);
+        let compact = crate::compact::search_value(&result);
+        assert!(compact["hits"][0]["followups"]["tools"].is_array());
+        assert!(compact["hits"][0]["followups"].get("arguments").is_none());
+        assert!(result.response_budget.rendered_bytes <= 425);
+        let sections = crate::compact::search_section_bytes(&result)?;
+        assert_eq!(
+            sections.hits_bytes
+                + sections.graph_bytes
+                + sections.memory_bytes
+                + sections.envelope_bytes,
+            sections.total_bytes
+        );
+        assert_eq!(sections.total_bytes, serde_json::to_vec(&compact)?.len());
         Ok(())
     }
 

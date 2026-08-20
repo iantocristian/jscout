@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::{query, scout, search, structural};
+use crate::{origin, query, scout, search, structural};
 
 pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
     Ok(serde_json::to_string(&search_value(result))?)
@@ -18,6 +18,35 @@ pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
 
 pub(crate) fn search_rendered_bytes(result: &search::SearchResult) -> Result<usize> {
     Ok(serde_json::to_string(&search_value(result))?.len())
+}
+
+pub(crate) fn search_section_bytes(
+    result: &search::SearchResult,
+) -> Result<search::SearchSectionBytes> {
+    let value = search_value(result);
+    let total_bytes = serde_json::to_vec(&value)?.len();
+    let hits_bytes = serde_json::to_vec(&value["hits"])?.len();
+    let graph_bytes = value
+        .get("graph")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let memory_bytes = value
+        .get("semantic_memory")
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map_or(0, |bytes| bytes.len());
+    let envelope_bytes = total_bytes
+        .saturating_sub(hits_bytes)
+        .saturating_sub(graph_bytes)
+        .saturating_sub(memory_bytes);
+    Ok(search::SearchSectionBytes {
+        hits_bytes,
+        graph_bytes,
+        memory_bytes,
+        envelope_bytes,
+        total_bytes,
+    })
 }
 
 pub(crate) fn search_value(result: &search::SearchResult) -> Value {
@@ -28,15 +57,20 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
-    response.insert("retrieval".into(), json!(result.retrieval));
+    if search_retrieval_is_actionable(&result.retrieval) {
+        response.insert("retrieval".into(), json!(result.retrieval));
+    }
     response.insert("default_match".into(), json!("hybrid"));
     response.insert("hits".into(), Value::Array(hits));
 
-    if result
-        .semantic_retrieval
-        .as_ref()
-        .is_some_and(|retrieval| retrieval.corpus_artifacts > 0)
-    {
+    if let Some(retrieval) = result.semantic_retrieval.as_ref().filter(|retrieval| {
+        retrieval.corpus_artifacts > 0
+            || semantic_retrieval_is_actionable(retrieval)
+            || result
+                .semantic_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.status != "connected")
+    }) {
         let artifacts = result
             .semantic_artifacts
             .iter()
@@ -52,9 +86,6 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 }
                 value.insert("confidence".into(), json!(artifact.confidence));
                 value.insert("freshness".into(), json!(artifact.freshness));
-                if let Some(score) = &artifact.retrieval_score {
-                    value.insert("score".into(), json!(score));
-                }
                 if let Some(support) = artifact.supports.first() {
                     value.insert(
                         "evidence".into(),
@@ -71,21 +102,25 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                 Value::Object(value)
             })
             .collect::<Vec<_>>();
-        response.insert(
-            "semantic_memory".into(),
-            json!({
-                "trust": "untrusted",
-                "retrieval": result.semantic_retrieval,
-                "attachment": result.semantic_attachment.as_ref().map(memory_attachment_value),
-                "candidate_pool": result.semantic_candidates,
-                "selected": result.semantic_selected,
-                "returned": artifacts.len(),
-                "budget_omitted": result.semantic_selected.saturating_sub(artifacts.len()),
-                "next_tool": "semantic_memory",
-                "detail": "preview; pool/scores are uncalibrated; use semantic_memory for bodies/evidence",
-                "artifacts": artifacts,
-            }),
-        );
+        let mut memory = Map::new();
+        memory.insert("trust".into(), json!("untrusted"));
+        if semantic_retrieval_is_actionable(retrieval) {
+            memory.insert("retrieval".into(), json!(retrieval));
+        }
+        if let Some(attachment) = result
+            .semantic_attachment
+            .as_ref()
+            .filter(|attachment| attachment.status != "connected" || attachment.graph_truncated)
+        {
+            memory.insert("attachment".into(), memory_attachment_value(attachment));
+        }
+        let omitted = result.semantic_selected.saturating_sub(artifacts.len());
+        if omitted > 0 {
+            memory.insert("omitted".into(), json!({ "artifacts": omitted }));
+        }
+        memory.insert("next_tool".into(), json!("semantic_memory"));
+        memory.insert("artifacts".into(), Value::Array(artifacts));
+        response.insert("semantic_memory".into(), Value::Object(memory));
     }
 
     if let Some(expansion) = &result.expansion {
@@ -95,24 +130,39 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         }
         response.insert("graph".into(), graph);
     }
-    response.insert(
-        "response".into(),
-        search_budget_value(&result.response_budget),
-    );
+    if result.response_budget.truncated {
+        response.insert(
+            "response".into(),
+            search_budget_value(&result.response_budget),
+        );
+    }
     Value::Object(response)
+}
+
+fn search_retrieval_is_actionable(retrieval: &search::RetrievalStatus) -> bool {
+    retrieval.lexical != "active"
+        || matches!(retrieval.vector, "degraded" | "failed")
+        || matches!(retrieval.reranker, "degraded" | "failed")
+        || retrieval.vector_action.is_some()
+}
+
+fn semantic_retrieval_is_actionable(retrieval: &crate::semantic::ArtifactRetrievalStatus) -> bool {
+    retrieval.lexical != "active"
+        || matches!(retrieval.vector, "degraded" | "failed")
+        || retrieval.vector_action.is_some()
 }
 
 fn memory_attachment_value(attachment: &search::MemoryAttachmentStatus) -> Value {
     let mut value = Map::new();
     value.insert("status".into(), json!(attachment.status));
-    value.insert("connected".into(), json!(attachment.connected_candidates));
-    let mut graph = Map::new();
-    graph.insert("depth".into(), json!(attachment.graph_depth));
-    graph.insert("nodes".into(), json!(attachment.graph_nodes));
     if attachment.graph_truncated {
+        value.insert("connected".into(), json!(attachment.connected_candidates));
+        let mut graph = Map::new();
+        graph.insert("depth".into(), json!(attachment.graph_depth));
+        graph.insert("nodes".into(), json!(attachment.graph_nodes));
         graph.insert("truncated".into(), json!(true));
+        value.insert("graph".into(), Value::Object(graph));
     }
-    value.insert("graph".into(), Value::Object(graph));
     Value::Object(value)
 }
 
@@ -169,7 +219,7 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
             value.insert("anchor".into(), json!(hit.file_anchor));
         }
     }
-    if hit.include_followups && hit.anchors.len() <= 1 {
+    if hit.anchors.len() <= 1 {
         let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
         value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
@@ -190,37 +240,53 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
 }
 
 fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
-    let origins = [&hit.file_origin];
+    let origins = (hit.file_origin == "dependency").then(|| origin::ALL.to_vec());
     if anchor.starts_with("sym:") {
         let tools = if hit.include_neighborhood_followup {
             vec!["definition", "who_uses", "neighborhood"]
         } else {
             vec!["definition", "who_uses"]
         };
-        json!({
-            "tools": tools,
-            "arguments": {
-                "anchor": anchor,
-                "snapshot": snapshot,
-                "origins": origins,
-            }
-        })
+        let mut arguments = Map::new();
+        arguments.insert("anchor".into(), json!(anchor));
+        arguments.insert("snapshot".into(), json!(snapshot));
+        if let Some(origins) = origins {
+            arguments.insert("origins".into(), json!(origins));
+        }
+        let mut followups = Map::new();
+        followups.insert("tools".into(), json!(tools));
+        if hit.include_followups {
+            followups.insert("arguments".into(), Value::Object(arguments));
+        }
+        Value::Object(followups)
     } else {
+        let tools = if hit.include_neighborhood_followup {
+            vec!["file_outline", "neighborhood"]
+        } else {
+            vec!["file_outline"]
+        };
+        if !hit.include_followups {
+            return json!({ "tools": tools });
+        }
+        let mut outline_arguments = Map::new();
+        outline_arguments.insert("path".into(), json!(hit.file));
+        if let Some(origins) = &origins {
+            outline_arguments.insert("origins".into(), json!(origins));
+        }
         let mut calls = vec![json!({
             "tool": "file_outline",
-            "arguments": {
-                "path": hit.file,
-                "origins": origins,
-            }
+            "arguments": outline_arguments,
         })];
         if hit.include_neighborhood_followup {
+            let mut neighborhood_arguments = Map::new();
+            neighborhood_arguments.insert("anchor".into(), json!(anchor));
+            neighborhood_arguments.insert("snapshot".into(), json!(snapshot));
+            if let Some(origins) = &origins {
+                neighborhood_arguments.insert("origins".into(), json!(origins));
+            }
             calls.push(json!({
                 "tool": "neighborhood",
-                "arguments": {
-                    "anchor": anchor,
-                    "snapshot": snapshot,
-                    "origins": origins,
-                }
+                "arguments": neighborhood_arguments,
             }));
         }
         json!({ "calls": calls })
@@ -229,11 +295,9 @@ fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
 
 fn search_budget_value(budget: &search::ResponseBudget) -> Value {
     let mut value = Map::new();
-    value.insert("byte_limit".into(), json!(budget.byte_limit));
     value.insert("rendered_bytes".into(), json!(budget.rendered_bytes));
     if budget.truncated {
         value.insert("truncated".into(), json!(true));
-        value.insert("unbudgeted_bytes".into(), json!(budget.unbudgeted_bytes));
         let mut omitted = Map::new();
         for (name, count) in [
             ("hits", budget.omitted_hits),
@@ -241,7 +305,7 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
             ("supports", budget.omitted_semantic_supports),
             ("nodes", budget.omitted_nodes),
             ("edges", budget.omitted_edges),
-            ("followups", budget.omitted_followups),
+            ("followup_arguments", budget.omitted_followups),
             ("snippets", budget.truncated_snippets),
         ] {
             if count > 0 {
@@ -750,7 +814,7 @@ fn graph_value(
                 .and_then(Value::as_array)
                 .filter(|values| !values.is_empty())
             {
-                tuple.push(json!({ "receiver_types": receiver_types }));
+                tuple.push(compact_receiver_types(receiver_types));
             }
             Some(Value::Array(tuple))
         })
@@ -765,6 +829,39 @@ fn graph_value(
         "edge_fields": ["source", "kind", "target", "confidence", "provenance", "at", "detail?"],
         "edges": edge_values,
     })
+}
+
+fn compact_receiver_types(receiver_types: &[Value]) -> Value {
+    const TYPE_LIMIT: usize = 4;
+    const DISPLAY_BYTE_LIMIT: usize = 120;
+
+    let mut displays = Vec::new();
+    let mut truncated = receiver_types.len() > TYPE_LIMIT;
+    for value in receiver_types.iter().take(TYPE_LIMIT) {
+        let Some(receiver_type) = value.as_str() else {
+            truncated = true;
+            continue;
+        };
+        let mut display = receiver_type.trim().to_string();
+        if let Some(generic) = display.find('<') {
+            display.truncate(generic);
+            display = display.trim().to_string();
+            truncated = true;
+        }
+        if display.len() > DISPLAY_BYTE_LIMIT {
+            display = truncate_utf8(&display, DISPLAY_BYTE_LIMIT).to_string();
+            truncated = true;
+        }
+        if !display.is_empty() && !displays.contains(&display) {
+            displays.push(display);
+        }
+    }
+    let mut detail = Map::new();
+    detail.insert("receiver_types".into(), json!(displays));
+    if truncated {
+        detail.insert("receiver_types_truncated".into(), json!(true));
+    }
+    Value::Object(detail)
 }
 
 pub(crate) fn render_neighborhood(
@@ -961,8 +1058,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        compact_hit, definition_string, render_neighborhood, search_string, semantic_preview,
-        who_uses_string,
+        compact_hit, compact_receiver_types, definition_string, render_neighborhood, search_string,
+        semantic_preview, who_uses_string,
     };
     use crate::{
         origin,
@@ -1075,9 +1172,7 @@ mod tests {
         let diagnostic = serde_json::to_string_pretty(&result)?;
         assert!(compact.len() * 2 < diagnostic.len());
         let value: serde_json::Value = serde_json::from_str(&compact)?;
-        assert_eq!(value["retrieval"]["lexical"], "active");
-        assert_eq!(value["retrieval"]["vector"], "disabled");
-        assert_eq!(value["retrieval"]["reranker"], "disabled");
+        assert!(value.get("retrieval").is_none());
         assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
         assert_eq!(value["hits"][0]["symbol"], "start");
         assert_eq!(value["hits"][0]["anchor"], root);
@@ -1090,12 +1185,26 @@ mod tests {
             value["hits"][0]["followups"]["arguments"]["snapshot"],
             "s".repeat(64)
         );
+        assert!(
+            value["hits"][0]["followups"]["arguments"]
+                .get("origins")
+                .is_none()
+        );
         assert!(value["hits"][0].get("chunk_id").is_none());
         assert_eq!(value["graph"]["edges"][0][3], "likely");
         assert_eq!(value["graph"]["edges"][0][4], "typescript-checker");
         assert_eq!(
             value["graph"]["edges"][0][6]["receiver_types"][0],
             "QueueService"
+        );
+        let sections = super::search_section_bytes(&result)?;
+        assert_eq!(sections.total_bytes, compact.len());
+        assert_eq!(
+            sections.hits_bytes
+                + sections.graph_bytes
+                + sections.memory_bytes
+                + sections.envelope_bytes,
+            sections.total_bytes
         );
         Ok(())
     }
@@ -1135,6 +1244,60 @@ mod tests {
                 .iter()
                 .all(|call| call["tool"] != "definition" && call["tool"] != "who_uses")
         );
+        assert!(
+            value["followups"]["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|call| call["arguments"].get("origins").is_none())
+        );
+    }
+
+    #[test]
+    fn dependency_followups_include_dependency_and_first_party_origins() {
+        let hit = Hit {
+            chunk_id: 1,
+            file: "node_modules/pkg/index.ts".into(),
+            file_role: "production".into(),
+            repository_role: None,
+            file_origin: "dependency".into(),
+            kind: "function".into(),
+            name: Some("runDependency".into()),
+            start_line: 1,
+            end_line: 2,
+            score: 1.0,
+            match_reason: MatchReason::ExactDefinition,
+            matched_identifiers: vec!["runDependency".into()],
+            snippet: "export function runDependency() {}".into(),
+            snippet_truncated: false,
+            anchors: vec!["sym:node_modules/pkg/index.ts#::runDependency@1".into()],
+            file_anchor: "file:node_modules/pkg/index.ts".into(),
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: true,
+            include_neighborhood_followup: true,
+        };
+        let value = compact_hit(&hit, "snapshot");
+        assert_eq!(
+            value["followups"]["arguments"]["origins"],
+            json!(["repository", "workspace", "dependency"])
+        );
+    }
+
+    #[test]
+    fn compact_receiver_types_keep_bounded_heads_and_mark_truncation() {
+        let receiver_types = vec![
+            json!(format!("Errors<{}>", "Nested<".repeat(200))),
+            json!("QueueService"),
+            json!("Third"),
+            json!("Fourth"),
+            json!("Fifth"),
+        ];
+        let compact = compact_receiver_types(&receiver_types);
+        assert_eq!(compact["receiver_types"][0], "Errors");
+        assert_eq!(compact["receiver_types"][1], "QueueService");
+        assert_eq!(compact["receiver_types_truncated"], true);
+        assert!(serde_json::to_string(&compact).unwrap().len() < 160);
     }
 
     #[test]
@@ -1286,10 +1449,11 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
         let memory = &value["semantic_memory"];
-        assert_eq!(memory["candidate_pool"], 8);
-        assert_eq!(memory["selected"], 1);
-        assert_eq!(memory["returned"], 1);
-        assert_eq!(memory["attachment"]["status"], "connected");
+        assert!(memory.get("candidate_pool").is_none());
+        assert!(memory.get("selected").is_none());
+        assert!(memory.get("returned").is_none());
+        assert!(memory.get("retrieval").is_none());
+        assert!(memory.get("attachment").is_none());
         assert_eq!(memory["next_tool"], "semantic_memory");
         assert_eq!(
             memory["artifacts"][0]["summary"],
@@ -1297,6 +1461,7 @@ mod tests {
         );
         assert!(memory["artifacts"][0].get("body").is_none());
         assert!(memory["artifacts"][0].get("supports").is_none());
+        assert!(memory["artifacts"][0].get("score").is_none());
         assert!(search_string(&result)?.len() < 1_000);
         Ok(())
     }
@@ -1341,8 +1506,8 @@ mod tests {
             },
         };
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
-        assert_eq!(value["semantic_memory"]["candidate_pool"], 0);
-        assert_eq!(value["semantic_memory"]["returned"], 0);
+        assert!(value["semantic_memory"].get("candidate_pool").is_none());
+        assert!(value["semantic_memory"].get("returned").is_none());
         assert_eq!(value["semantic_memory"]["retrieval"]["vector"], "degraded");
         assert_eq!(
             value["semantic_memory"]["attachment"]["status"],
@@ -1383,10 +1548,10 @@ mod tests {
             },
         };
         let value: serde_json::Value = serde_json::from_str(&search_string(&result)?)?;
-        assert_eq!(value["semantic_memory"]["candidate_pool"], 12);
-        assert_eq!(value["semantic_memory"]["selected"], 3);
-        assert_eq!(value["semantic_memory"]["returned"], 0);
-        assert_eq!(value["semantic_memory"]["budget_omitted"], 3);
+        assert!(value["semantic_memory"].get("candidate_pool").is_none());
+        assert!(value["semantic_memory"].get("selected").is_none());
+        assert!(value["semantic_memory"].get("returned").is_none());
+        assert_eq!(value["semantic_memory"]["omitted"]["artifacts"], 3);
         assert_eq!(value["semantic_memory"]["next_tool"], "semantic_memory");
         Ok(())
     }

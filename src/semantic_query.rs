@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
 
 use crate::{embed, origin, recon, semantic, store, structural};
@@ -25,6 +26,32 @@ pub const MAX_CONCEPT_TAG_LIMIT: usize = 200;
 const MAX_SOURCE_BYTE_LIMIT: usize = 16_000;
 const EVIDENCE_RELATION_DEPTH: usize = 8;
 const MAX_EVIDENCE_RELATION_PATHS: usize = 2_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactViewMode {
+    Compact,
+    Body,
+    Full,
+}
+
+impl ArtifactViewMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "body" => Ok(Self::Body),
+            "full" => Ok(Self::Full),
+            _ => bail!("semantic artifact view must be compact, body, or full"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Body => "body",
+            Self::Full => "full",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
@@ -47,6 +74,8 @@ pub struct QueryOptions {
     pub file_origins: Vec<String>,
     pub response_byte_limit: usize,
     pub evidence_relation_depth: usize,
+    pub artifact_view: ArtifactViewMode,
+    pub debug: bool,
 }
 
 impl Default for QueryOptions {
@@ -71,15 +100,19 @@ impl Default for QueryOptions {
             file_origins: origin::defaults(),
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             evidence_relation_depth: EVIDENCE_RELATION_DEPTH,
+            // Library callers retain the historical diagnostic projection.
+            // Agent-facing CLI/MCP surfaces explicitly select compact by
+            // default for exact artifact reads.
+            artifact_view: ArtifactViewMode::Full,
+            debug: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ArtifactView {
     pub id: i64,
     pub supersedes: Option<i64>,
-    #[serde(rename = "type")]
     pub artifact_type: String,
     pub name: Option<String>,
     pub current: bool,
@@ -92,11 +125,78 @@ pub struct ArtifactView {
     pub source_snapshot: String,
     pub created_at: String,
     pub freshness: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_score: Option<semantic::ArtifactRetrievalScore>,
     pub support_count: usize,
     pub supports: Vec<semantic::SemanticSupport>,
     pub supports_truncated: bool,
+    view: ArtifactViewMode,
+}
+
+impl Serialize for ArtifactView {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("id", &self.id)?;
+        if self.view == ArtifactViewMode::Full {
+            map.serialize_entry("supersedes", &self.supersedes)?;
+        }
+        map.serialize_entry("type", &self.artifact_type)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("current", &self.current)?;
+        map.serialize_entry("superseded_by", &self.superseded_by)?;
+        map.serialize_entry("trust", &self.trust)?;
+
+        match self.view {
+            ArtifactViewMode::Compact => {
+                if let Some((key, value)) = primary_artifact_claim(&self.artifact_type, &self.body)
+                {
+                    map.serialize_entry(key, &value)?;
+                }
+                if self.artifact_type == "workflow" {
+                    let participants = defining_participants(&self.body);
+                    if !participants.is_empty() {
+                        map.serialize_entry("defining_participants", &participants)?;
+                    }
+                }
+            }
+            ArtifactViewMode::Body | ArtifactViewMode::Full => {
+                map.serialize_entry("body", &self.body)?;
+            }
+        }
+
+        if self.view == ArtifactViewMode::Full {
+            map.serialize_entry("model", &self.model)?;
+            map.serialize_entry("prompt_version", &self.prompt_version)?;
+        }
+        map.serialize_entry("confidence", &self.confidence)?;
+        if self.view == ArtifactViewMode::Full {
+            map.serialize_entry("source_snapshot", &self.source_snapshot)?;
+            map.serialize_entry("created_at", &self.created_at)?;
+        }
+        map.serialize_entry("freshness", &self.freshness)?;
+        if self.view == ArtifactViewMode::Full
+            && let Some(score) = &self.retrieval_score
+        {
+            map.serialize_entry("retrieval_score", score)?;
+        }
+        map.serialize_entry("support_count", &self.support_count)?;
+        match self.view {
+            ArtifactViewMode::Compact => {}
+            ArtifactViewMode::Body => {
+                let evidence = self
+                    .supports
+                    .iter()
+                    .map(compact_support)
+                    .collect::<Vec<_>>();
+                map.serialize_entry("evidence", &evidence)?;
+            }
+            ArtifactViewMode::Full => map.serialize_entry("supports", &self.supports)?,
+        }
+        map.serialize_entry("supports_truncated", &self.supports_truncated)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,12 +227,12 @@ pub struct ArtifactFollowup {
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactFollowupArguments {
     pub artifact: i64,
+    pub view: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ArtifactHandle {
     pub id: i64,
-    #[serde(rename = "type")]
     pub artifact_type: String,
     pub name: Option<String>,
     pub current: bool,
@@ -142,9 +242,35 @@ pub struct ArtifactHandle {
     pub supports: Vec<ArtifactSupportHandle>,
     pub supports_truncated: bool,
     pub selection_reason: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval_score: Option<semantic::ArtifactRetrievalScore>,
     pub followup: ArtifactFollowup,
+    render_score: bool,
+}
+
+impl Serialize for ArtifactHandle {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("type", &self.artifact_type)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("current", &self.current)?;
+        map.serialize_entry("confidence", &self.confidence)?;
+        map.serialize_entry("freshness", &self.freshness)?;
+        map.serialize_entry("support_count", &self.support_count)?;
+        map.serialize_entry("supports", &self.supports)?;
+        map.serialize_entry("supports_truncated", &self.supports_truncated)?;
+        map.serialize_entry("selection_reason", &self.selection_reason)?;
+        if self.render_score
+            && let Some(score) = &self.retrieval_score
+        {
+            map.serialize_entry("retrieval_score", score)?;
+        }
+        map.serialize_entry("followup", &self.followup)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,7 +349,7 @@ pub struct ResponseBudget {
     pub relation_cycles_skipped: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub snapshot: String,
     /// `discovery` returns compact handles; `artifact_detail` is the only mode
@@ -232,7 +358,6 @@ pub struct QueryResult {
     /// `no_supported_memory` is a successful localized lookup with no direct
     /// evidence match. Unsupported analogies are never used as filler.
     pub status: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub resolved_evidence_scope: Vec<String>,
     pub retrieval: semantic::ArtifactRetrievalStatus,
     /// Ranked candidates after exact type/anchor/relation/freshness filters,
@@ -240,13 +365,119 @@ pub struct QueryResult {
     /// count of semantically relevant artifacts.
     pub candidate_artifacts: usize,
     pub matched_concept_tags: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub artifact_handles: Vec<ArtifactHandle>,
     pub semantic_artifacts: Vec<ArtifactView>,
     pub related_artifacts: Vec<RelatedArtifact>,
     pub concept_tags: Vec<ConceptTag>,
     pub source_evidence: Vec<SourceEvidence>,
     pub response_budget: ResponseBudget,
+    artifact_view: ArtifactViewMode,
+    debug: bool,
+}
+
+impl QueryResult {
+    fn render_diagnostics(&self) -> bool {
+        self.debug
+            || (self.mode == "artifact_detail" && self.artifact_view == ArtifactViewMode::Full)
+    }
+
+    fn retrieval_is_actionable(&self) -> bool {
+        self.retrieval.lexical != "active"
+            || matches!(self.retrieval.vector, "degraded" | "failed")
+            || self.retrieval.vector_action.is_some()
+    }
+}
+
+impl Serialize for QueryResult {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let diagnostic = self.render_diagnostics();
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("snapshot", &self.snapshot)?;
+        map.serialize_entry("mode", &self.mode)?;
+        map.serialize_entry("status", &self.status)?;
+        if self.mode == "artifact_detail" && !diagnostic {
+            map.serialize_entry("view", self.artifact_view.as_str())?;
+        }
+        if !self.resolved_evidence_scope.is_empty() {
+            map.serialize_entry("resolved_evidence_scope", &self.resolved_evidence_scope)?;
+        }
+        if diagnostic || self.retrieval_is_actionable() {
+            map.serialize_entry("retrieval", &self.retrieval)?;
+        }
+        if diagnostic {
+            map.serialize_entry("candidate_artifacts", &self.candidate_artifacts)?;
+            map.serialize_entry("matched_concept_tags", &self.matched_concept_tags)?;
+        }
+        if diagnostic || !self.artifact_handles.is_empty() {
+            map.serialize_entry("artifact_handles", &self.artifact_handles)?;
+        }
+        if diagnostic || !self.semantic_artifacts.is_empty() {
+            map.serialize_entry("semantic_artifacts", &self.semantic_artifacts)?;
+        }
+        if diagnostic || !self.related_artifacts.is_empty() {
+            map.serialize_entry("related_artifacts", &self.related_artifacts)?;
+        }
+        if diagnostic || !self.concept_tags.is_empty() {
+            map.serialize_entry("concept_tags", &self.concept_tags)?;
+        }
+        if diagnostic || !self.source_evidence.is_empty() {
+            map.serialize_entry("source_evidence", &self.source_evidence)?;
+        }
+        if diagnostic {
+            map.serialize_entry("response_budget", &self.response_budget)?;
+        } else if self.response_budget.truncated {
+            map.serialize_entry(
+                "response_budget",
+                &compact_response_budget(&self.response_budget),
+            )?;
+        }
+        map.end()
+    }
+}
+
+fn compact_response_budget(budget: &ResponseBudget) -> Value {
+    let mut value = serde_json::Map::new();
+    value.insert("rendered_bytes".into(), Value::from(budget.rendered_bytes));
+    value.insert("truncated".into(), Value::Bool(true));
+    let mut omitted = serde_json::Map::new();
+    for (name, count) in [
+        ("artifacts", budget.omitted_artifacts),
+        ("relations", budget.omitted_relations),
+        ("sources", budget.omitted_sources),
+        ("sources_by_origin", budget.omitted_sources_by_origin),
+        ("supports", budget.omitted_supports),
+        ("concept_tags", budget.omitted_concept_tags),
+        ("relation_branches", budget.omitted_relation_branches),
+    ] {
+        if count > 0 {
+            omitted.insert(name.into(), Value::from(count));
+        }
+    }
+    if !omitted.is_empty() {
+        value.insert("omitted".into(), Value::Object(omitted));
+    }
+    if budget.truncated_sources > 0 {
+        value.insert(
+            "truncated_sources".into(),
+            Value::from(budget.truncated_sources),
+        );
+    }
+    if budget.relation_depth_truncated {
+        value.insert("relation_depth_truncated".into(), Value::Bool(true));
+    }
+    if budget.relation_paths_truncated {
+        value.insert("relation_paths_truncated".into(), Value::Bool(true));
+    }
+    if budget.relation_cycles_skipped > 0 {
+        value.insert(
+            "relation_cycles_skipped".into(),
+            Value::from(budget.relation_cycles_skipped),
+        );
+    }
+    Value::Object(value)
 }
 
 #[derive(Debug)]
@@ -368,12 +599,21 @@ pub fn query(
             .iter()
             .map(|artifact| artifact.id)
             .collect::<Vec<_>>();
+        let full_artifact_view = detail_mode && options.artifact_view == ArtifactViewMode::Full;
         let (related_artifacts, omitted_relations) = if detail_mode {
-            related_artifacts(conn, &selected_ids, options.relation_limit)?
+            related_artifacts(
+                conn,
+                &selected_ids,
+                if full_artifact_view {
+                    options.relation_limit
+                } else {
+                    0
+                },
+            )?
         } else {
             (Vec::new(), 0)
         };
-        let source_result = if detail_mode && options.include_source {
+        let source_result = if detail_mode && options.include_source && options.source_limit > 0 {
             source_evidence(root, conn, &selected_ids, options)?
         } else {
             SourceEvidenceResult::default()
@@ -387,7 +627,7 @@ pub fn query(
             relation_paths_truncated,
             relation_cycles_skipped,
         } = source_result;
-        let mut concept_tags = if detail_mode {
+        let mut concept_tags = if full_artifact_view {
             concept_tags(conn, &loaded, &current, &options.file_origins)?
         } else {
             Vec::new()
@@ -406,6 +646,7 @@ pub fn query(
                             &current,
                             &superseded_by,
                             options.supports_per_artifact,
+                            options.artifact_view,
                         )
                     })
                     .collect(),
@@ -420,6 +661,7 @@ pub fn query(
                             &current,
                             &selection_reasons,
                             options.supports_per_artifact.min(2),
+                            options.debug,
                         )
                     })
                     .collect(),
@@ -492,6 +734,8 @@ pub fn query(
                 relation_cycles_skipped,
                 ..Default::default()
             },
+            artifact_view: options.artifact_view,
+            debug: options.debug,
         };
         apply_response_budget(&mut result)?;
         Ok(result)
@@ -511,8 +755,8 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     if options.concept_tag_limit == 0 || options.concept_tag_limit > MAX_CONCEPT_TAG_LIMIT {
         bail!("concept tag limit must be between 1 and {MAX_CONCEPT_TAG_LIMIT}");
     }
-    if options.source_limit == 0 || options.source_limit > MAX_SOURCE_LIMIT {
-        bail!("semantic source limit must be between 1 and {MAX_SOURCE_LIMIT}");
+    if options.source_limit > MAX_SOURCE_LIMIT {
+        bail!("semantic source limit must be between 0 and {MAX_SOURCE_LIMIT}");
     }
     if options.source_byte_limit == 0 || options.source_byte_limit > MAX_SOURCE_BYTE_LIMIT {
         bail!("source byte limit must be between 1 and {MAX_SOURCE_BYTE_LIMIT}");
@@ -783,6 +1027,7 @@ fn artifact_view(
     current: &HashMap<i64, bool>,
     superseded_by: &HashMap<i64, Option<i64>>,
     support_limit: usize,
+    view: ArtifactViewMode,
 ) -> ArtifactView {
     let support_count = artifact.supports.len();
     artifact.supports.truncate(support_limit);
@@ -805,6 +1050,50 @@ fn artifact_view(
         support_count,
         supports_truncated: support_count > artifact.supports.len(),
         supports: artifact.supports,
+        view,
+    }
+}
+
+fn primary_artifact_claim(artifact_type: &str, body: &Value) -> Option<(&'static str, Value)> {
+    for (source, rendered) in [
+        ("description", "description"),
+        ("purpose", "primary_claim"),
+        ("overview", "primary_claim"),
+        ("definition", "primary_claim"),
+        ("claim", "primary_claim"),
+        ("architectural_role", "primary_claim"),
+    ] {
+        if let Some(value) = body.get(source).filter(|value| value.is_string()) {
+            return Some((rendered, value.clone()));
+        }
+    }
+    if artifact_type == "workflow" {
+        let roles = defining_participants(body)
+            .into_iter()
+            .filter_map(|participant| participant["role"].as_str())
+            .collect::<Vec<_>>();
+        if !roles.is_empty() {
+            return Some(("primary_claim", Value::String(roles.join(" → "))));
+        }
+    }
+    None
+}
+
+fn defining_participants(body: &Value) -> Vec<&Value> {
+    body.get("participants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|participant| participant["scope"] == "defining")
+        .collect()
+}
+
+fn compact_support(support: &semantic::SemanticSupport) -> ArtifactSupportHandle {
+    ArtifactSupportHandle {
+        anchor: support.anchor.clone(),
+        file: support.evidence_file.clone(),
+        lines: [support.evidence_start_line, support.evidence_end_line],
+        freshness: support.freshness.clone(),
     }
 }
 
@@ -813,6 +1102,7 @@ fn artifact_handle(
     current: &HashMap<i64, bool>,
     selection_reasons: &HashMap<i64, String>,
     support_limit: usize,
+    debug: bool,
 ) -> ArtifactHandle {
     let support_count = artifact.supports.len();
     artifact.supports.truncate(support_limit);
@@ -844,8 +1134,10 @@ fn artifact_handle(
             tool: "semantic_memory",
             arguments: ArtifactFollowupArguments {
                 artifact: artifact.id,
+                view: "body",
             },
         },
+        render_score: debug,
     }
 }
 
@@ -1452,11 +1744,12 @@ fn apply_response_budget(result: &mut QueryResult) -> Result<()> {
             settle_rendered_bytes(result)?;
             continue;
         }
-        if let Some(artifact) = result
-            .semantic_artifacts
-            .iter_mut()
-            .rev()
-            .find(|artifact| !artifact.supports.is_empty())
+        if result.artifact_view != ArtifactViewMode::Compact
+            && let Some(artifact) = result
+                .semantic_artifacts
+                .iter_mut()
+                .rev()
+                .find(|artifact| !artifact.supports.is_empty())
         {
             artifact.supports.pop();
             artifact.supports_truncated = true;
@@ -1522,7 +1815,9 @@ mod tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{MAX_CONCEPT_TAG_LIMIT, QueryOptions, concept_tags, line_excerpt, query};
+    use super::{
+        ArtifactViewMode, MAX_CONCEPT_TAG_LIMIT, QueryOptions, concept_tags, line_excerpt, query,
+    };
     use crate::{indexer, semantic, store};
 
     fn concept_fixture(
@@ -1665,6 +1960,79 @@ mod tests {
                 .as_deref()
                 .is_some_and(|source| source.contains("function start"))
         );
+        let compact = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                supports_per_artifact: 1,
+                artifact_view: ArtifactViewMode::Compact,
+                debug: false,
+                ..Default::default()
+            },
+        )?;
+        let compact = serde_json::to_value(&compact)?;
+        assert_eq!(compact["view"], "compact");
+        assert_eq!(
+            compact["semantic_artifacts"][0]["primary_claim"],
+            "starts the settlement flow"
+        );
+        assert!(compact.get("retrieval").is_none());
+        assert!(compact["semantic_artifacts"][0].get("body").is_none());
+        assert!(compact["semantic_artifacts"][0].get("model").is_none());
+        assert!(compact["semantic_artifacts"][0].get("supports").is_none());
+
+        let body = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                supports_per_artifact: 1,
+                artifact_view: ArtifactViewMode::Body,
+                debug: false,
+                ..Default::default()
+            },
+        )?;
+        let body = serde_json::to_value(&body)?;
+        assert_eq!(body["view"], "body");
+        assert_eq!(
+            body["semantic_artifacts"][0]["body"]["purpose"],
+            "starts the settlement flow"
+        );
+        assert_eq!(
+            body["semantic_artifacts"][0]["evidence"][0]["file"],
+            "flow.ts"
+        );
+        assert!(body["semantic_artifacts"][0].get("model").is_none());
+        assert!(
+            body["semantic_artifacts"][0]["evidence"][0]
+                .get("source_hash")
+                .is_none()
+        );
+
+        let full = serde_json::to_value(&detail)?;
+        assert_eq!(
+            full["semantic_artifacts"][0]["body"]["purpose"],
+            "starts the settlement flow"
+        );
+        assert!(full["semantic_artifacts"][0]["model"].is_string());
+        assert!(full["semantic_artifacts"][0]["supports"][0]["source_hash"].is_string());
+        let no_source = query(
+            repo.path(),
+            &conn,
+            None,
+            &QueryOptions {
+                artifact_id: Some(card.id),
+                include_source: true,
+                source_limit: 0,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(no_source.mode, "artifact_detail");
+        assert_eq!(no_source.semantic_artifacts[0].id, card.id);
+        assert!(no_source.source_evidence.is_empty());
         assert!(result.response_budget.rendered_bytes <= 24_000);
         assert_eq!(
             result.response_budget.unbudgeted_bytes,

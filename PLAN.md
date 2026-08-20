@@ -2264,7 +2264,15 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
-## Planned G20 — session-efficient compact transport
+## In progress G20 — session-efficient compact transport
+
+G20a implements the correctness and compact-transport portion: cross-origin
+exact follow-ups, one complete top-hit handoff, opt-in search-attached memory,
+bounded checker receiver display, exact usage labels, compact/body/full artifact
+views, successful-diagnostic gating, and canonical section-byte telemetry.
+Path-shaped expansion, the structured-content compatibility experiment, and
+the registered fixed/staged replays remain G20b work; no aggregate byte claim
+is made before those replays run.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
@@ -2466,6 +2474,10 @@ Search telemetry and debug output split canonical rendered bytes into at least
 accounting method are tested against the complete canonical response. Those
 section counters are not added to every normal response, where they would
 consume more of the budget they are intended to diagnose.
+Telemetry also retains the repository-wide name-only usage-occurrence count
+that compact hits no longer present as exact `used_by`. This is an explicitly
+approximate diagnostic for detecting recall shifts in dynamic-dispatch-heavy
+corpora; it must not be rendered as declaration-resolved caller evidence.
 `rendered_bytes` remains visible when a response truncates; normal-path byte
 measurements are available in telemetry and debug output rather than repeated
 in every agent response.
@@ -2527,6 +2539,13 @@ Measurement distinguishes:
      a time, delayed expansion, and explicit memory only when needed, measuring
      skill/orchestration behavior.
 
+For every search in both replay forms, report memory attachment requested,
+selected, and delivered separately using the existing telemetry fields
+`requested_retrieval.memory`, `semantic_selected`, and
+`semantic_artifacts_returned`. The opt-in default makes request adoption a
+separate causal gate: a zero-delivery arm must not be interpreted as a memory
+ranking result when the agent never requested attachment.
+
 The architecture fixed replay excludes the six invalid historical requests
 from byte parity but tests their replacement (`source_limit: 0`) separately.
 The 42-call architecture and 19-call problem-solving workloads are reported
@@ -2559,7 +2578,8 @@ Acceptance requires:
 - compact receiver types remain bounded for a hostile deeply nested generic and
   expose truncation, while debug retains the complete checker value;
 - no name-only occurrence count is labelled as exact `used_by`; exact incoming
-  edges and explicitly approximate name counts remain distinguishable;
+  edges and the telemetry-only approximate occurrence count remain
+  distinguishable;
 - per-section byte counters sum to the canonical response size under complete
   and truncated responses without appearing in normal compact output;
 - `compact`, `body`, and `full` artifact views are deterministic, and `full` is

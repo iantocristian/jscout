@@ -126,8 +126,10 @@ jscout mcp <root>              # MCP stdio server: code, graph, entity, overview
                                #   semantic_memory, exact evidence, and annotate tools
 jscout memory <root> [query]   # compact semantic handles and freshness
   --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
-jscout memory <root> --artifact ID --source
-                               #   full body/relations + optional hash-verified source
+jscout memory <root> --artifact ID
+                               #   compact meaning/freshness; --view body gets the body + one locator
+  --view full                  #   diagnostic relations/supports/provenance/hashes
+  --source                     #   optional hash-verified source evidence (one row by default)
 jscout annotate <root> in.json # write a validated semantic artifact
 jscout llm doctor              # verify Node, pi-ai, plan auth, and default model capabilities
 jscout scout workflows R       # auto-select deterministic workflow entry surfaces
@@ -691,19 +693,25 @@ matching explicitly.
 
 Memory discovery filters by artifact type, computed freshness, direct relation,
 or historical artifact id. Broad calls return compact handles with bounded
-support summaries and a copy-safe exact-artifact follow-up. Supplying an exact
+support summaries and a copy-safe `view=body` exact-artifact follow-up. Exact
+artifact reads default to a type-aware compact projection: identity, trust,
+freshness, a description/primary claim, and defining workflow participants.
+`view=body` returns the complete body plus one compact evidence locator by
+default. `view=full` returns diagnostic provenance, relations, complete selected
+supports, hashes, and concept tags. Supplying an exact
 anchor, indexed file, or current reconnaissance subject creates a hard evidence
 scope: direct anchor support ranks before file support and scope-member support,
 and unsupported lexical/vector analogies are not used as filler. An empty
-localized result reports `no_supported_memory`. Full bodies, relations, concept
+localized result reports `no_supported_memory`. Bodies, relations, concept
 tags, and source evidence are returned only for an exact artifact-id drill-down.
 Current artifacts are the default; an exact historical id reports
 `current: false` and its `superseded_by` successor. The default complete response
 budget remains 24 KB.
 
-`semantic_search` attaches only compact, evidence-connected memory previews:
+`semantic_search` attaches compact, evidence-connected memory previews only
+when requested with `--memory` (MCP: `include_memory=true`):
 artifact identity, a short purpose/overview/description/claim, freshness,
-retrieval signals, and one evidence locator. An artifact is eligible only when
+and one evidence locator. An artifact is eligible only when
 its support is in a returned hit or enclosing file, within the bounded
 likely/certain memory graph path, or directly related to an artifact connected
 that way. Text/vector similarity ranks candidates inside those tiers; it cannot
@@ -713,16 +721,16 @@ widenable bounds. `attachment.status: "no_connected_memory"` means the broad
 semantic candidate pool had no evidence connection to the returned code; use
 `semantic_memory` for unconstrained discovery. Full bodies, relations, and
 evidence always belong to `semantic_memory`.
-Annotations preview their required `claim` field. The envelope reports the
-bounded `candidate_pool`, previews `selected` before the response budget,
-actual `returned`, and `budget_omitted`; the pool is not a count of relevant
-matches. Per-artifact rank, lexical-score, and vector-cosine values are
-diagnostic signals, not calibrated probabilities. A degraded vector status and
-the follow-up tool remain visible when memory exists even if the query has no
-lexical matches; the envelope also survives when the byte budget removes every
-selected preview.
+Annotations preview their required `claim` field. Normal compact transport omits
+successful retrieval stages, candidate-pool sizes, scores, and successful
+attachment traversal statistics. Degraded stages, `no_connected_memory`,
+truncation, actionable omission counts, and the follow-up tool remain visible.
+The complete diagnostics remain available with `debug=true` and in telemetry;
+rank, lexical-score, and vector-cosine values are diagnostic signals, not
+calibrated probabilities.
 
-Compact code hits include copy-safe follow-up arguments. Symbol anchors and
+Compact code hits advertise compatible follow-up tools. Only the highest-ranked
+eligible hit includes complete copy-safe arguments by default. Symbol anchors and
 their snapshot can be passed unchanged to `definition`, `who_uses`, or
 `neighborhood`; file-only hits expose only `file_outline` and `neighborhood`.
 Exact `definition`/`who_uses` anchor mode is mutually exclusive with their
@@ -1224,8 +1232,10 @@ Set
 included in each record; `JSCOUT_PROFILE_LABEL` overrides the recorded
 profile label. Expanded searches also record aggregate node totals
 and `expansion_role_counts`; no paths or source are added to telemetry.
-Semantic calls add only aggregate artifact returned/written counts and
-fresh/degraded/stale totals.
+Semantic calls add aggregate candidate/selected/returned/written counts and
+fresh/degraded/stale totals. Search calls also record the canonical compact
+`hits_bytes`, `graph_bytes`, `memory_bytes`, `envelope_bytes`, and total; these
+sections sum to the canonical response and stay out of normal agent payloads.
 
 For controlled evaluations that require a complete audit trail, additionally
 pass `--request-log PATH`. This separate JSONL records every incoming MCP
