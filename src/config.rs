@@ -198,6 +198,7 @@ pub struct SidecarSettings {
 pub struct McpSettings {
     pub profile: String,
     pub source_view: String,
+    pub result_transport: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -381,6 +382,7 @@ struct SidecarFileConfig {
 struct McpFileConfig {
     profile: Option<String>,
     source_view: Option<String>,
+    result_transport: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1011,9 +1013,19 @@ impl RuntimeConfig {
         if !matches!(source_view.as_str(), "full" | "elided") {
             bail!("mcp.source_view must be full or elided");
         }
+        let result_transport = resolver.string(
+            "mcp.result_transport",
+            raw.mcp.result_transport,
+            None,
+            "auto",
+        );
+        if !matches!(result_transport.as_str(), "auto" | "text" | "structured") {
+            bail!("mcp.result_transport must be auto, text, or structured");
+        }
         let mcp = McpSettings {
             profile,
             source_view,
+            result_transport,
         };
 
         let telemetry = TelemetrySettings {
@@ -1206,9 +1218,10 @@ impl RuntimeConfig {
                     .unwrap_or("<provider default>")
             ),
             format!(
-                "mcp: profile={} source_view={} telemetry={} request_log={}",
+                "mcp: profile={} source_view={} result_transport={} telemetry={} request_log={}",
                 self.effective.mcp.profile,
                 self.effective.mcp.source_view,
+                self.effective.mcp.result_transport,
                 display_optional_path(self.effective.telemetry.file.as_deref()),
                 display_optional_path(self.effective.telemetry.request_log.as_deref())
             ),
@@ -1729,8 +1742,21 @@ file = "logs/mcp.jsonl"
         let loaded = RuntimeConfig::load(Some(root.path()), None)?;
         assert!(loaded.config_loaded);
         assert_eq!(loaded.effective.mcp.profile, "structural");
+        assert_eq!(loaded.effective.mcp.result_transport, "auto");
         assert!(init(root.path(), None).is_err());
         assert!(TEMPLATE.contains("rerank = true"));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_result_transport_fails_closed() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        write_config(
+            root.path(),
+            "version = 1\n[mcp]\nresult_transport = \"both\"\n",
+        )?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(error.to_string().contains("mcp.result_transport"));
         Ok(())
     }
 

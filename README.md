@@ -124,6 +124,7 @@ jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
 jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
                                #   semantic_memory, exact evidence, and annotate tools
+                               #   --result-transport auto|text|structured overrides config
 jscout memory <root> [query]   # compact semantic handles and freshness
   --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
 jscout memory <root> --artifact ID
@@ -803,7 +804,7 @@ started.
 
 The file configures the database; retrieval defaults and budgets; embedding,
 reranker, and local-inference models; LLM/provider metadata; Node/gateway and
-checker paths; MCP profile/source view; telemetry; index dependencies; and
+checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
 watch defaults. Query text, exact targets, dry-run intent, temporary widened
 budgets, and model-call caps remain per invocation. Changing retrieval posture
 does not alter the structural snapshot or embedding profile, so disabling and
@@ -815,6 +816,15 @@ Initialization metadata reports the exact database, config path, binary/config
 fingerprints, and effective retrieval defaults. MCP and `watch` load policy
 once; restart either long-running process after editing the file. There is no
 hot reload or multi-repository routing.
+
+`mcp.result_transport = "auto"` emits native MCP `structuredContent` only for
+verified Codex client versions and retains the fact-equivalent JSON-text
+fallback. Unknown clients, including Claude Code in the current compatibility
+profile, remain text-only because structured results increased raw wire bytes
+without reducing measured client context. Set `text` for universal text-only
+behavior or `structured` for an explicit compatibility probe; errors always
+remain text-only. Transport selection and byte counts are recorded in MCP
+telemetry.
 
 Secrets never belong in `.jscout.toml`. The file may name an environment
 variable such as `OPENAI_API_KEY`, `VOYAGE_API_KEY`, or a private custom key;

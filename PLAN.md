@@ -2527,6 +2527,19 @@ Measurement distinguishes:
 2. JSON-RPC wire bytes after escaping/envelopes; and
 3. client-visible model-context bytes after the client's MCP rendering.
 
+The 2026-08-21 compatibility experiment is recorded in
+[`eval/results/g20b-mcp-structured-content-2026-08-21.md`](eval/results/g20b-mcp-structured-content-2026-08-21.md).
+Codex 0.147.0 preserved all 40 probe records and its verified result mapper
+reduced the deterministic client-visible representation by 11.31%, while raw
+MCP bytes increased by 88.9% because the fallback remains present. Claude Code
+2.1.238 also preserved all facts and did not expose two complete model copies,
+but showed no context reduction while raw bytes increased by 88.3%. Therefore
+`auto` is profiled to verified Codex versions; Claude and unknown clients stay
+text-only, with explicit `text` and `structured` overrides. The installed pi
+agent has no MCP client surface, while pi-ai is the LLM gateway rather than an
+MCP result consumer. This compatibility result does not satisfy the aggregate
+fixed-call replay gate.
+
 ### Implementation order and acceptance
 
 1. Preserve both exact call inventories and any recoverable raw responses before

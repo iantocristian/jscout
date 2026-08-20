@@ -40,15 +40,121 @@ impl ToolProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultTransportPolicy {
+    Auto,
+    Text,
+    Structured,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOptions {
+    pub profile: ToolProfile,
+    pub source_view: scout::SourceView,
+    pub result_transport: ResultTransportPolicy,
+}
+
+impl ResultTransportPolicy {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "text" => Ok(Self::Text),
+            "structured" => Ok(Self::Structured),
+            _ => anyhow::bail!("MCP result transport must be one of: auto, text, structured"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Text => "text",
+            Self::Structured => "structured",
+        }
+    }
+
+    fn resolve(self, client: &McpClientInfo) -> AppliedResultTransport {
+        match self {
+            Self::Text => AppliedResultTransport::Text,
+            Self::Structured => AppliedResultTransport::Structured,
+            Self::Auto if client.supports_structured_results() => {
+                AppliedResultTransport::Structured
+            }
+            Self::Auto => AppliedResultTransport::Text,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedResultTransport {
+    Text,
+    Structured,
+}
+
+impl AppliedResultTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Structured => "structured",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct McpClientInfo {
+    name: Option<String>,
+    version: Option<String>,
+}
+
+impl McpClientInfo {
+    fn from_initialize(params: &Value) -> Self {
+        let client = &params["clientInfo"];
+        Self {
+            name: client["name"].as_str().map(str::to_string),
+            version: client["version"].as_str().map(str::to_string),
+        }
+    }
+
+    /// Codex 0.147.0 was verified against an equal-fact paired live probe. MCP
+    /// has no structured-result capability bit, so auto mode is deliberately
+    /// profiled by client identity and keeps every unknown client on text.
+    fn supports_structured_results(&self) -> bool {
+        self.name.as_deref() == Some("codex-mcp-client")
+            && self
+                .version
+                .as_deref()
+                .is_some_and(|version| version_at_least(version, [0, 147, 0]))
+    }
+}
+
+fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
+    let mut parts = version.split('.');
+    let parsed = std::array::from_fn(|_| {
+        parts.next().and_then(|part| {
+            part.split_once('-')
+                .map_or(part, |(head, _)| head)
+                .parse()
+                .ok()
+        })
+    });
+    let [Some(major), Some(minor), Some(patch)] = parsed else {
+        return false;
+    };
+    [major, minor, patch] >= minimum
+}
+
 pub fn serve(
     root: &Path,
     database_path: &Path,
     telemetry_path: Option<&Path>,
     request_log_path: Option<&Path>,
-    profile: ToolProfile,
-    source_view: scout::SourceView,
+    options: ServeOptions,
     runtime: &config::RuntimeConfig,
 ) -> Result<()> {
+    let ServeOptions {
+        profile,
+        source_view,
+        result_transport,
+    } = options;
     let root = root.canonicalize()?;
     let binary_fingerprint = current_binary_fingerprint()?;
     let conn = store::open_path_read_only(database_path)?;
@@ -81,6 +187,7 @@ pub fn serve(
         None => None,
     };
     let mut request_sequence = 0_u64;
+    let mut client_info = McpClientInfo::default();
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -113,6 +220,7 @@ pub fn serve(
         }
         let response = match method {
             "initialize" => {
+                client_info = McpClientInfo::from_initialize(&params);
                 let requested = params
                     .get("protocolVersion")
                     .and_then(|v| v.as_str())
@@ -141,6 +249,11 @@ pub fn serve(
                                 "expansionMode": runtime.effective.search.expansion.mode,
                                 "limit": runtime.effective.search.limit,
                                 "responseBytes": runtime.effective.search.response_bytes,
+                            },
+                            "resultTransport": {
+                                "policy": result_transport.as_str(),
+                                "selected": result_transport.resolve(&client_info).as_str(),
+                                "textFallback": true,
                             },
                         },
                         "instructions": server_instructions(profile)
@@ -196,6 +309,11 @@ pub fn serve(
                         &args,
                     )
                 };
+                let (tool_result, mut result_metrics) =
+                    render_tool_result(&result, result_transport, &client_info);
+                let response = rpc_ok(id, tool_result);
+                result_metrics.rpc_response_wire_bytes =
+                    serde_json::to_vec(&response).map_or(0, |bytes| bytes.len());
                 log_tool_call(
                     &mut telemetry,
                     &ToolCallTelemetry {
@@ -210,20 +328,12 @@ pub fn serve(
                         retrieval_timings: *retrieval_timings.borrow(),
                         binary_fingerprint: &binary_fingerprint,
                         database_path,
+                        client: &client_info,
+                        result_transport,
+                        result_metrics,
                     },
                 );
-                match result {
-                    Ok(text) => {
-                        rpc_ok(id, json!({ "content": [{ "type": "text", "text": text }] }))
-                    }
-                    Err(e) => rpc_ok(
-                        id,
-                        json!({
-                            "content": [{ "type": "text", "text": format!("error: {e}") }],
-                            "isError": true
-                        }),
-                    ),
-                }
+                response
             }
             _ => rpc_error(id, -32601, &format!("method not found: {method}")),
         };
@@ -280,6 +390,83 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResultTransportMetrics {
+    applied: AppliedResultTransport,
+    fallback_text_bytes: usize,
+    structured_content_bytes: Option<usize>,
+    tool_result_wire_bytes: usize,
+    rpc_response_wire_bytes: usize,
+    structured_parse_failed: bool,
+}
+
+fn render_tool_result(
+    result: &Result<String>,
+    policy: ResultTransportPolicy,
+    client: &McpClientInfo,
+) -> (Value, ResultTransportMetrics) {
+    let requested = policy.resolve(client);
+    let (value, applied, fallback_text_bytes, structured_content_bytes, parse_failed) = match result
+    {
+        Ok(text) if requested == AppliedResultTransport::Structured => {
+            match serde_json::from_str::<Value>(text) {
+                Ok(structured) => {
+                    let structured_bytes =
+                        serde_json::to_vec(&structured).map_or(0, |bytes| bytes.len());
+                    (
+                        json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "structuredContent": structured,
+                        }),
+                        AppliedResultTransport::Structured,
+                        text.len(),
+                        Some(structured_bytes),
+                        false,
+                    )
+                }
+                Err(_) => (
+                    json!({ "content": [{ "type": "text", "text": text }] }),
+                    AppliedResultTransport::Text,
+                    text.len(),
+                    None,
+                    true,
+                ),
+            }
+        }
+        Ok(text) => (
+            json!({ "content": [{ "type": "text", "text": text }] }),
+            AppliedResultTransport::Text,
+            text.len(),
+            None,
+            false,
+        ),
+        Err(error) => {
+            let text = format!("error: {error}");
+            let bytes = text.len();
+            (
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": true,
+                }),
+                AppliedResultTransport::Text,
+                bytes,
+                None,
+                false,
+            )
+        }
+    };
+    let tool_result_wire_bytes = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+    let metrics = ResultTransportMetrics {
+        applied,
+        fallback_text_bytes,
+        structured_content_bytes,
+        tool_result_wire_bytes,
+        rpc_response_wire_bytes: 0,
+        structured_parse_failed: parse_failed,
+    };
+    (value, metrics)
 }
 
 fn server_instructions(profile: ToolProfile) -> &'static str {
@@ -1480,6 +1667,9 @@ struct ToolCallTelemetry<'a> {
     retrieval_timings: RetrievalStageMetrics,
     binary_fingerprint: &'a str,
     database_path: &'a Path,
+    client: &'a McpClientInfo,
+    result_transport: ResultTransportPolicy,
+    result_metrics: ResultTransportMetrics,
 }
 
 fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
@@ -1496,6 +1686,9 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         retrieval_timings,
         binary_fingerprint,
         database_path,
+        client,
+        result_transport,
+        result_metrics,
     } = call;
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1623,6 +1816,15 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         "profile": profile_label,
         "tool_profile": profile.as_str(),
         "source_view": source_view.as_str(),
+        "mcp_client_name": client.name,
+        "mcp_client_version": client.version,
+        "mcp_result_transport_policy": result_transport.as_str(),
+        "mcp_result_transport": result_metrics.applied.as_str(),
+        "mcp_fallback_text_bytes": result_metrics.fallback_text_bytes,
+        "mcp_structured_content_bytes": result_metrics.structured_content_bytes,
+        "mcp_tool_result_wire_bytes": result_metrics.tool_result_wire_bytes,
+        "mcp_rpc_response_wire_bytes": result_metrics.rpc_response_wire_bytes,
+        "mcp_structured_parse_failed": result_metrics.structured_parse_failed,
         "tool": tool,
         "ok": ok,
         "elapsed_ms": elapsed.as_millis(),
@@ -1859,9 +2061,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ToolProfile, call_tool, definition_source_metrics, duration_ms, expansion_role_metrics,
-        log_request, render_bounded_items, search_options_from_args, semantic_artifact_metrics,
-        server_instructions, sum_durations, tool_defs,
+        AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile, call_tool,
+        definition_source_metrics, duration_ms, expansion_role_metrics, log_request,
+        render_bounded_items, render_tool_result, search_options_from_args,
+        semantic_artifact_metrics, server_instructions, sum_durations, tool_defs,
     };
     use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -1969,6 +2172,92 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("not the whole repository"))
         );
+    }
+
+    #[test]
+    fn auto_structured_transport_is_scoped_to_verified_codex_versions() -> Result<()> {
+        let codex = McpClientInfo {
+            name: Some("codex-mcp-client".to_string()),
+            version: Some("0.147.0".to_string()),
+        };
+        let future_codex = McpClientInfo {
+            version: Some("0.148.0-dev.1".to_string()),
+            ..codex.clone()
+        };
+        let old_codex = McpClientInfo {
+            version: Some("0.146.9".to_string()),
+            ..codex.clone()
+        };
+        let unknown = McpClientInfo {
+            name: Some("claude-code".to_string()),
+            version: Some("2.1.220".to_string()),
+        };
+
+        assert_eq!(
+            ResultTransportPolicy::parse("auto")?.resolve(&codex),
+            AppliedResultTransport::Structured
+        );
+        assert_eq!(
+            ResultTransportPolicy::Auto.resolve(&future_codex),
+            AppliedResultTransport::Structured
+        );
+        assert_eq!(
+            ResultTransportPolicy::Auto.resolve(&old_codex),
+            AppliedResultTransport::Text
+        );
+        assert_eq!(
+            ResultTransportPolicy::Auto.resolve(&unknown),
+            AppliedResultTransport::Text
+        );
+        assert!(ResultTransportPolicy::parse("both").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn structured_transport_keeps_equal_json_text_fallback_without_double_encoding() {
+        let result = Ok(r#"{"snapshot":"abc","hits":[{"anchor":"sym:a"}]}"#.to_string());
+        let (wire, metrics) = render_tool_result(
+            &result,
+            ResultTransportPolicy::Structured,
+            &McpClientInfo::default(),
+        );
+
+        assert_eq!(metrics.applied, AppliedResultTransport::Structured);
+        assert_eq!(
+            wire["structuredContent"],
+            serde_json::from_str::<serde_json::Value>(result.as_ref().unwrap()).unwrap()
+        );
+        assert_eq!(
+            wire["content"][0]["text"].as_str(),
+            Some(result.as_ref().unwrap().as_str())
+        );
+        assert!(wire["structuredContent"].is_object());
+        assert!(!metrics.structured_parse_failed);
+        assert!(metrics.structured_content_bytes.is_some());
+        assert!(metrics.tool_result_wire_bytes > metrics.fallback_text_bytes);
+    }
+
+    #[test]
+    fn invalid_json_and_errors_fail_back_to_text_only() {
+        let invalid = Ok("plain output".to_string());
+        let (invalid_wire, invalid_metrics) = render_tool_result(
+            &invalid,
+            ResultTransportPolicy::Structured,
+            &McpClientInfo::default(),
+        );
+        assert_eq!(invalid_metrics.applied, AppliedResultTransport::Text);
+        assert!(invalid_metrics.structured_parse_failed);
+        assert!(invalid_wire.get("structuredContent").is_none());
+
+        let failure: anyhow::Result<String> = Err(anyhow::anyhow!("broken result"));
+        let (error_wire, error_metrics) = render_tool_result(
+            &failure,
+            ResultTransportPolicy::Structured,
+            &McpClientInfo::default(),
+        );
+        assert_eq!(error_metrics.applied, AppliedResultTransport::Text);
+        assert_eq!(error_wire["isError"], true);
+        assert!(error_wire.get("structuredContent").is_none());
     }
 
     #[test]

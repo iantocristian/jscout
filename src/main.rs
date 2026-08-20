@@ -264,6 +264,9 @@ enum Command {
         /// Definition source representation: full or deterministic elided source
         #[arg(long)]
         source_view: Option<String>,
+        /// MCP tool-result transport: auto, text, or structured
+        #[arg(long)]
+        result_transport: Option<String>,
     },
     /// Persist an evidence-backed workflow or repository annotation
     Annotate {
@@ -1218,11 +1221,15 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             request_log,
             profile,
             source_view,
+            result_transport,
         } => {
             let profile = profile.as_deref().unwrap_or(&runtime.effective.mcp.profile);
             let source_view = source_view
                 .as_deref()
                 .unwrap_or(&runtime.effective.mcp.source_view);
+            let result_transport = result_transport
+                .as_deref()
+                .unwrap_or(&runtime.effective.mcp.result_transport);
             mcp::serve(
                 &root,
                 database.as_deref().unwrap_or(configured_database),
@@ -1232,8 +1239,11 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 request_log
                     .as_deref()
                     .or(runtime.effective.telemetry.request_log.as_deref()),
-                mcp::ToolProfile::parse(profile)?,
-                scout::SourceView::parse(source_view)?,
+                mcp::ServeOptions {
+                    profile: mcp::ToolProfile::parse(profile)?,
+                    source_view: scout::SourceView::parse(source_view)?,
+                    result_transport: mcp::ResultTransportPolicy::parse(result_transport)?,
+                },
                 runtime,
             )
         }

@@ -108,6 +108,7 @@ node = "node"
 [mcp]
 profile = "structural"
 source_view = "full"
+result_transport = "auto"
 
 [telemetry]
 file = ".jscout/telemetry.jsonl"

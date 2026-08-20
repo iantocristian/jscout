@@ -91,6 +91,10 @@ node = "node"
 [mcp]
 profile = "structural"
 source_view = "full"
+# auto emits structuredContent only to clients verified by jscout while always
+# retaining the JSON-text fallback. Use text for universal compatibility or
+# structured to test/force the dual-form MCP response with another client.
+result_transport = "auto"
 
 [telemetry]
 # file = ".jscout/telemetry.jsonl"
