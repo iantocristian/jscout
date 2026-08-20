@@ -122,6 +122,24 @@ pub struct SearchSettings {
     pub expansion: ExpansionSettings,
 }
 
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            vector: true,
+            rerank: true,
+            attach_memory: true,
+            limit: search::DEFAULT_RESULT_LIMIT,
+            response_bytes: search::DEFAULT_RESPONSE_BYTE_LIMIT,
+            file_roles: Vec::new(),
+            origins: origin::defaults(),
+            memory_limit: 4,
+            memory_depth: search::DEFAULT_MEMORY_GRAPH_DEPTH,
+            memory_nodes: search::DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
+            expansion: ExpansionSettings::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpansionSettings {
     pub enabled: bool,
@@ -132,6 +150,24 @@ pub struct ExpansionSettings {
     pub bytes: usize,
     pub min_confidence: String,
     pub file_roles: Vec<String>,
+}
+
+impl Default for ExpansionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            depth: 1,
+            seeds: 3,
+            nodes: 40,
+            edges: 120,
+            bytes: 24_000,
+            min_confidence: "likely".to_string(),
+            file_roles: file_role::DEFAULT_EXPANSION
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

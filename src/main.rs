@@ -118,34 +118,43 @@ enum Command {
         #[arg(long)]
         database: Option<PathBuf>,
         /// Max results
-        #[arg(short = 'k', long, default_value_t = search::DEFAULT_RESULT_LIMIT)]
-        limit: usize,
+        #[arg(short = 'k', long)]
+        limit: Option<usize>,
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
         /// Restrict hits and expansion to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
+        #[arg(long = "origin", value_delimiter = ',')]
         file_origins: Vec<String>,
+        /// Attach matching persistent semantic memory, overriding repository configuration
+        #[arg(long = "memory", conflicts_with = "no_memory")]
+        memory: bool,
         /// Do not attach matching persistent semantic memory
-        #[arg(long)]
+        #[arg(long, conflicts_with = "memory")]
         no_memory: bool,
         /// Maximum matching semantic artifacts
-        #[arg(long, default_value_t = 4)]
-        memory_limit: usize,
+        #[arg(long)]
+        memory_limit: Option<usize>,
         /// Likely/certain graph hops allowed between hits and attached memory
-        #[arg(long, default_value_t = search::DEFAULT_MEMORY_GRAPH_DEPTH)]
-        memory_depth: usize,
+        #[arg(long)]
+        memory_depth: Option<usize>,
         /// Maximum graph nodes visited while connecting attached memory
-        #[arg(long, default_value_t = search::DEFAULT_MEMORY_GRAPH_NODE_LIMIT)]
-        memory_nodes: usize,
+        #[arg(long)]
+        memory_nodes: Option<usize>,
         /// Maximum bytes in the complete rendered JSON response
-        #[arg(long, default_value_t = search::DEFAULT_RESPONSE_BYTE_LIMIT)]
-        response_bytes: usize,
+        #[arg(long)]
+        response_bytes: Option<usize>,
+        /// Enable vector search, overriding repository configuration
+        #[arg(long, conflicts_with_all = ["no_vector", "lexical_only"])]
+        vector: bool,
         /// Skip vector search even if a provider is configured
-        #[arg(long)]
+        #[arg(long, conflicts_with = "vector")]
         no_vector: bool,
+        /// Enable cross-encoder reranking, overriding repository configuration
+        #[arg(long, conflicts_with_all = ["no_rerank", "lexical_only"])]
+        rerank: bool,
         /// Skip cross-encoder reranking even if it is configured
-        #[arg(long)]
+        #[arg(long, conflicts_with = "rerank")]
         no_rerank: bool,
         /// Use BM25 only (equivalent to --no-vector --no-rerank)
         #[arg(long)]
@@ -157,28 +166,31 @@ enum Command {
         #[arg(long, conflicts_with = "json")]
         debug_json: bool,
         /// Attach a separately labelled structural context pack (off by default)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_expand")]
         expand: bool,
+        /// Suppress structural expansion, overriding repository configuration
+        #[arg(long, conflicts_with = "expand")]
+        no_expand: bool,
         /// Structural expansion depth
-        #[arg(long, default_value_t = 1)]
-        expand_depth: usize,
+        #[arg(long)]
+        expand_depth: Option<usize>,
         /// Maximum search-hit anchors used as expansion seeds
-        #[arg(long, default_value_t = 3)]
-        expand_seeds: usize,
+        #[arg(long)]
+        expand_seeds: Option<usize>,
         /// Global expansion node budget
-        #[arg(long, default_value_t = 40)]
-        expand_nodes: usize,
+        #[arg(long)]
+        expand_nodes: Option<usize>,
         /// Global expansion edge budget
-        #[arg(long, default_value_t = 120)]
-        expand_edges: usize,
+        #[arg(long)]
+        expand_edges: Option<usize>,
         /// Global serialized node/edge payload budget
-        #[arg(long, default_value_t = 24_000)]
-        expand_bytes: usize,
+        #[arg(long)]
+        expand_bytes: Option<usize>,
         /// Lowest expansion confidence: certain, likely, or possible
-        #[arg(long, default_value = "likely")]
-        expand_min_confidence: String,
+        #[arg(long)]
+        expand_min_confidence: Option<String>,
         /// Restrict expansion to a file role (repeatable; defaults to production/unknown)
-        #[arg(long = "expand-file-role", default_values_t = [String::from("production"), String::from("unknown")])]
+        #[arg(long = "expand-file-role")]
         expand_file_roles: Vec<String>,
     },
     /// List string-keyed event wiring (emit/listen sites)
@@ -234,11 +246,11 @@ enum Command {
         #[arg(long)]
         request_log: Option<PathBuf>,
         /// Evaluation tool surface: baseline or structural
-        #[arg(long, default_value = "structural")]
-        profile: String,
+        #[arg(long)]
+        profile: Option<String>,
         /// Definition source representation: full or deterministic elided source
-        #[arg(long, default_value = "full")]
-        source_view: String,
+        #[arg(long)]
+        source_view: Option<String>,
     },
     /// Persist an evidence-backed workflow or repository annotation
     Annotate {
@@ -940,7 +952,8 @@ impl ScoutCommand {
     }
 }
 
-fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()> {
+fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> {
+    let configured_database = runtime.effective.database.path.as_path();
     match command {
         Command::Config { .. } => unreachable!("configuration commands are dispatched first"),
         Command::Stats { root } => cmd_stats(&root),
@@ -949,7 +962,11 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             root,
             database,
             dependencies,
-        } => cmd_index(&root, database.as_deref(), &dependencies),
+        } => cmd_index(
+            &root,
+            Some(database.as_deref().unwrap_or(configured_database)),
+            &dependencies,
+        ),
         Command::Embed {
             root,
             database,
@@ -960,7 +977,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             semantic_only,
         } => cmd_embed(
             &root,
-            database.as_deref(),
+            Some(database.as_deref().unwrap_or(configured_database)),
             batch,
             &file_origins,
             product,
@@ -974,17 +991,21 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             limit,
             file_roles,
             file_origins,
+            memory,
             no_memory,
             memory_limit,
             memory_depth,
             memory_nodes,
             response_bytes,
+            vector,
             no_vector,
+            rerank,
             no_rerank,
             lexical_only,
             json,
             debug_json,
             expand,
+            no_expand,
             expand_depth,
             expand_seeds,
             expand_nodes,
@@ -992,43 +1013,90 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             expand_bytes,
             expand_min_confidence,
             expand_file_roles,
-        } => cmd_search(
-            &root,
-            database.as_deref(),
-            &query,
-            no_vector || lexical_only,
-            json,
-            debug_json,
-            search::SearchOptions {
-                limit,
-                expand,
-                file_roles,
-                file_origins: file_origins.clone(),
-                include_memory: !no_memory,
-                memory_limit,
-                memory_graph_depth: memory_depth,
-                memory_graph_node_limit: memory_nodes,
-                rerank: !(no_rerank || lexical_only),
-                compact: json,
-                include_neighborhood_followups: true,
-                response_byte_limit: response_bytes,
-                expansion: search::ExpansionOptions {
-                    depth: expand_depth,
-                    seed_limit: expand_seeds,
-                    node_limit: expand_nodes,
-                    edge_limit: expand_edges,
-                    byte_limit: expand_bytes,
-                    min_confidence: expand_min_confidence,
-                    file_roles: expand_file_roles,
-                    file_origins,
+        } => {
+            let configured = &runtime.effective.search;
+            let vector = if lexical_only || no_vector {
+                false
+            } else if vector {
+                true
+            } else {
+                configured.vector
+            };
+            let rerank = if lexical_only || no_rerank {
+                false
+            } else if rerank {
+                true
+            } else {
+                configured.rerank
+            };
+            let include_memory = if no_memory {
+                false
+            } else if memory {
+                true
+            } else {
+                configured.attach_memory
+            };
+            let expand = if no_expand {
+                false
+            } else if expand {
+                true
+            } else {
+                configured.expansion.enabled
+            };
+            let file_roles = if file_roles.is_empty() {
+                configured.file_roles.clone()
+            } else {
+                file_roles
+            };
+            let file_origins = if file_origins.is_empty() {
+                configured.origins.clone()
+            } else {
+                file_origins
+            };
+            let expand_file_roles = if expand_file_roles.is_empty() {
+                configured.expansion.file_roles.clone()
+            } else {
+                expand_file_roles
+            };
+            cmd_search(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+                &query,
+                !vector,
+                json,
+                debug_json,
+                search::SearchOptions {
+                    limit: limit.unwrap_or(configured.limit),
+                    expand,
+                    file_roles,
+                    file_origins: file_origins.clone(),
+                    include_memory,
+                    memory_limit: memory_limit.unwrap_or(configured.memory_limit),
+                    memory_graph_depth: memory_depth.unwrap_or(configured.memory_depth),
+                    memory_graph_node_limit: memory_nodes.unwrap_or(configured.memory_nodes),
+                    rerank,
+                    compact: json,
+                    include_neighborhood_followups: true,
+                    response_byte_limit: response_bytes.unwrap_or(configured.response_bytes),
+                    expansion: search::ExpansionOptions {
+                        depth: expand_depth.unwrap_or(configured.expansion.depth),
+                        seed_limit: expand_seeds.unwrap_or(configured.expansion.seeds),
+                        node_limit: expand_nodes.unwrap_or(configured.expansion.nodes),
+                        edge_limit: expand_edges.unwrap_or(configured.expansion.edges),
+                        byte_limit: expand_bytes.unwrap_or(configured.expansion.bytes),
+                        min_confidence: expand_min_confidence
+                            .unwrap_or_else(|| configured.expansion.min_confidence.clone()),
+                        file_roles: expand_file_roles,
+                        file_origins,
+                    },
                 },
-            },
-        ),
+            )
+        }
         Command::Events {
             root,
             name,
             file_origins,
-        } => cmd_events(&root, name.as_deref(), &file_origins),
+        } => cmd_events(&root, configured_database, name.as_deref(), &file_origins),
         Command::Calls {
             root,
             method,
@@ -1046,7 +1114,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 .collect::<Result<Vec<_>>>()?;
             cmd_calls(
                 &root,
-                database.as_deref(),
+                Some(database.as_deref().unwrap_or(configured_database)),
                 &calls::CallQuery {
                     method,
                     args: filters,
@@ -1065,20 +1133,34 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             request_log,
             profile,
             source_view,
-        } => mcp::serve(
-            &root,
-            database.as_deref(),
-            telemetry.as_deref(),
-            request_log.as_deref(),
-            mcp::ToolProfile::parse(&profile)?,
-            scout::SourceView::parse(&source_view)?,
-        ),
+        } => {
+            let profile = profile.as_deref().unwrap_or(&runtime.effective.mcp.profile);
+            let source_view = source_view
+                .as_deref()
+                .unwrap_or(&runtime.effective.mcp.source_view);
+            mcp::serve(
+                &root,
+                database.as_deref().unwrap_or(configured_database),
+                telemetry
+                    .as_deref()
+                    .or(runtime.effective.telemetry.file.as_deref()),
+                request_log
+                    .as_deref()
+                    .or(runtime.effective.telemetry.request_log.as_deref()),
+                mcp::ToolProfile::parse(profile)?,
+                scout::SourceView::parse(source_view)?,
+                runtime,
+            )
+        }
         Command::Annotate {
             root,
             input,
             database,
         } => {
-            let conn = open_database_for_write(&root, database.as_deref())?;
+            let conn = open_database_for_write(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+            )?;
             let input: semantic::AnnotateRequest = serde_json::from_slice(&std::fs::read(&input)?)?;
             let provider = embed::Provider::from_env()?;
             let publication =
@@ -1110,7 +1192,10 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             concept_tag_limit,
             database,
         } => {
-            let conn = open_database_read_only(&root, database.as_deref())?;
+            let conn = open_database_read_only(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+            )?;
             let provider = if no_vector {
                 None
             } else {
@@ -1159,7 +1244,10 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             response_bytes,
             database,
         } => {
-            let conn = open_database_read_only(&root, database.as_deref())?;
+            let conn = open_database_read_only(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+            )?;
             let result = surface::overview_response(
                 &conn,
                 &surface::OverviewOptions {
@@ -1186,7 +1274,10 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             candidate_limit,
             database,
         } => {
-            let conn = open_database_read_only(&root, database.as_deref())?;
+            let conn = open_database_read_only(
+                &root,
+                Some(database.as_deref().unwrap_or(configured_database)),
+            )?;
             let candidates = semantic::workflow_candidates(
                 &root,
                 &conn,
@@ -1214,7 +1305,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
         } => watch::watch(
             &root,
             &watch::WatchOptions {
-                database: database.as_deref(),
+                database: Some(database.as_deref().unwrap_or(configured_database)),
                 embed_on_change: embed,
                 embed_product_only: product,
                 dependencies: &dependencies,
@@ -1230,7 +1321,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             spec,
             json,
             file_origins,
-        } => cmd_who_uses(&root, &spec, json, &file_origins),
+        } => cmd_who_uses(&root, configured_database, &spec, json, &file_origins),
         Command::Neighborhood {
             root,
             anchor,
@@ -1247,6 +1338,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             debug_json,
         } => cmd_neighborhood(
             &root,
+            configured_database,
             &anchor,
             response_bytes,
             debug_json,
@@ -1289,7 +1381,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
             let report = checker::enrich(
                 &root,
                 &checker::EnrichOptions {
-                    database: database.as_deref(),
+                    database: Some(database.as_deref().unwrap_or(configured_database)),
                     sidecar: sidecar_path.as_deref(),
                     timeout: std::time::Duration::from_secs(timeout),
                     files,
@@ -1348,7 +1440,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 gateway_path,
             } => cmd_scout_repository(
                 &root,
-                database.as_deref(),
+                Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
                 dry_run,
                 warn_subjects,
@@ -1393,7 +1485,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 };
                 cmd_scout_workflows(
                     &root,
-                    database.as_deref(),
+                    Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
                     dry_run,
                     scouting::WorkflowScoutOptions {
@@ -1440,7 +1532,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 };
                 cmd_scout_cards(
                     &root,
-                    database.as_deref(),
+                    Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
                     dry_run,
                     scouting::CardScoutOptions {
@@ -1472,7 +1564,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 gateway_path,
             } => cmd_scout_summaries(
                 &root,
-                database.as_deref(),
+                Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
                 dry_run,
                 scouting::SummaryScoutOptions {
@@ -1509,7 +1601,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 };
                 cmd_scout_concepts(
                     &root,
-                    database.as_deref(),
+                    Some(database.as_deref().unwrap_or(configured_database)),
                     gateway_path.as_deref(),
                     dry_run,
                     scouting::ConceptScoutOptions {
@@ -1534,7 +1626,7 @@ fn run_command(command: Command, _runtime: &config::RuntimeConfig) -> Result<()>
                 gateway_path,
             } => cmd_scout_refresh(
                 &root,
-                database.as_deref(),
+                Some(database.as_deref().unwrap_or(configured_database)),
                 gateway_path.as_deref(),
                 &artifacts,
                 dry_run,
@@ -1560,12 +1652,13 @@ fn open_database_read_only(root: &Path, database: Option<&Path>) -> Result<rusql
 
 fn cmd_neighborhood(
     root: &Path,
+    database: &Path,
     anchor: &str,
     response_bytes: usize,
     debug_json: bool,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
-    let conn = store::open_read_only(root)?;
+    let conn = open_database_read_only(root, Some(database))?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
     let rendered = if debug_json {
         mcp::render_bounded_object_arrays(
@@ -1842,8 +1935,13 @@ fn cmd_calls(
     Ok(())
 }
 
-fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Result<()> {
-    let conn = store::open_read_only(root)?;
+fn cmd_events(
+    root: &Path,
+    database: &Path,
+    name: Option<&str>,
+    file_origins: &[String],
+) -> Result<()> {
+    let conn = open_database_read_only(root, Some(database))?;
     let sites = query::events_in_origins(&conn, name, file_origins)?;
     if sites.is_empty() {
         println!("no event sites found");
@@ -1868,8 +1966,14 @@ fn cmd_events(root: &Path, name: Option<&str>, file_origins: &[String]) -> Resul
     Ok(())
 }
 
-fn cmd_who_uses(root: &Path, spec: &str, json: bool, file_origins: &[String]) -> Result<()> {
-    let conn = store::open_read_only(root)?;
+fn cmd_who_uses(
+    root: &Path,
+    database: &Path,
+    spec: &str,
+    json: bool,
+    file_origins: &[String],
+) -> Result<()> {
+    let conn = open_database_read_only(root, Some(database))?;
     let graph = query::ModuleGraph::load(&conn)?;
     let targets = query::find_symbols_in_origins(&conn, spec, file_origins)?;
     if targets.is_empty() {
@@ -2426,6 +2530,39 @@ mod main_tests {
             panic!("expected search")
         };
         assert!(lexical_only);
+
+        let Cli { command, .. } = Cli::try_parse_from([
+            "jscout",
+            "search",
+            ".",
+            "query",
+            "--vector",
+            "--rerank",
+            "--memory",
+            "--no-expand",
+        ])
+        .expect("positive repository-default overrides parse");
+        let Command::Search {
+            vector,
+            rerank,
+            memory,
+            no_expand,
+            limit,
+            ..
+        } = command
+        else {
+            panic!("expected search")
+        };
+        assert!(vector);
+        assert!(rerank);
+        assert!(memory);
+        assert!(no_expand);
+        assert_eq!(limit, None);
+
+        assert!(
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--vector", "--no-vector"])
+                .is_err()
+        );
     }
 
     #[test]
