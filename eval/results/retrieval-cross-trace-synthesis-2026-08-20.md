@@ -31,26 +31,29 @@ unexpanded searches plus `definition` to prove mechanism.
 verification. Investigation: search-plus-definition, memory once, decisive
 evidence from exact reads. One skill posture currently serves both modes.
 
-**Parallel batching is the largest single waste class, and it is
-interaction waste, not content waste.** Six identical `source_limit: 0`
+**Parallel batching was the largest interaction-waste class in the retained
+inquiry trace, not a general production conclusion.** Six identical `source_limit: 0`
 schema failures launched in one parallel batch (14% of the inquiry session);
 parallel expansions overflowing the client's outer message budget with later
 results omitted; interleaved parallel artifact fetches forcing four repeat
 reads. Roughly a quarter of the traced calls were retries or re-reads caused
 by the batching interaction rather than by response content. The structural
 mismatch: jscout budgets per response, the client budgets per combined
-message, and agents batch aggressively — per-response budgets do not know
-they have siblings.
+message, and that agent batched aggressively — per-response budgets do not know
+they have siblings. The wider telemetry window mostly did not batch large
+calls, so the frequency of this failure mode outside that session remains
+unknown.
 
-**The memory plane's demonstrated production niche is orientation, and it is
-entirely scout-fed.** `annotate` appears zero times in both traces; every
+**The two traces show an orientation use case for memory, not a settled product
+boundary.** `annotate` appears zero times in both traces; every
 artifact came from scout batches. Where the plane covered the domain, it
 structured the entire inquiry session and produced the source-verified
 publish-flow skeleton; in the investigation it contributed one weak preview.
 Set beside the evaluation record (corpus blind on fix surfaces, delivery
-events rare and ambiguous), the split is consistent from both directions:
-memory earns its keep for architecture inquiry and onboarding on a
-well-scouted repository, not (yet) for implementation acceleration.
+events rare and ambiguous), the evidence supports keeping memory available for
+architecture inquiry and onboarding on a well-scouted repository. It does not
+show that memory cannot help implementation, nor that attached memory caused an
+implementation outcome; corpus coverage and agent selection remain confounded.
 
 **Freshness surfacing earned its keep concretely**: the investigation agent
 detected a mid-session rebase purely from response-level snapshot signals and
@@ -58,12 +61,12 @@ correctly re-established its evidence boundary.
 
 ## Roadmap consequences proposed
 
-1. **G14 skill guidance: two postures, not one.** Inquiry mode — memory
+1. **G14 skill guidance hypothesis: two postures, not one.** Inquiry mode — memory
    discovery first, at most one orientation expansion, `include_memory` off
    after useful memory is known. Investigation mode — narrow unexpanded
    search → `definition` chains, one expansion after localization. The traces
-   show agents partially discovering this split themselves; the skill should
-   hand it to them instead.
+   show agents partially discovering this split themselves; the skill may hand
+   it to them, but later real work must determine whether it generalizes.
 2. **G20 addition: sibling-aware response budgets.** Per-response budgets
    should assume parallel siblings share one client message budget — a lower
    effective default under batching, or explicit skill guidance that large
@@ -73,13 +76,13 @@ correctly re-established its evidence boundary.
    skill text. The first expanded search per investigation earns its bytes;
    later expansions mostly repeat known graph context. G20's path-shaped
    expansion fixes the shape; the posture change removes the repetition.
-4. **`who_uses`: cap first, then decide.** The two traces here show zero
-   selection, but the wider telemetry window
+4. **`who_uses`: validate the current cap, then decide.** The two traces here
+   show zero selection, but the wider telemetry window
    (`mcp-telemetry-first-window-2026-08-20.md`) shows occasional use — and an
-   unguarded worst case: three byte-identical 1.86MB responses on a
-   high-fanout symbol, with no truncation ever firing. A response cap is
-   immediate; fold-vs-keep waits for delivered-vs-selected data once call
-   arguments are recorded.
+   historical pre-cap worst case: three byte-identical 1.86MB responses on a
+   high-fanout symbol. The complete compact response cap landed after that
+   incident. Replay the high-fanout case on the current binary; fold-vs-keep
+   waits for delivered-vs-selected evidence.
 
 ## Concrete skill amendment proposed (G14)
 
@@ -110,7 +113,16 @@ this PR are agent-self-reported because the variable was not set. Two fixes:
 1. Make enablement one flag (or default-on for MCP sessions with a standard
    output path), and document setting a session label so pid-based session
    ids do not collide across weeks.
-2. Add the three fields the follow-up-evidence list needs that rows lack:
-   call arguments, a same-batch marker, and an outer/client truncation
-   indicator. Delivered-versus-selected follow-up measurement then comes
-   from the file instead of agent memory.
+2. Record binary/build identity, an effective non-secret configuration
+   fingerprint, requested retrieval posture, and stage timings. Exact arguments
+   already belong in the explicit privacy-sensitive `--request-log`; adding
+   them to ordinary telemetry would violate its current privacy contract.
+   Same-batch membership and outer/client truncation require harness/client
+   instrumentation or an explicit client-supplied identifier because the MCP
+   server cannot observe them after returning a response.
+
+The mixed 145-row telemetry window does not justify a vector or reranker
+default change. Its active-vector rows also use the reranker, deployments were
+intentionally switched between retrieval postures, binaries differ, and no
+relevance labels exist. The G21 repository-configuration plan makes those
+postures explicit before another causal claim is attempted.

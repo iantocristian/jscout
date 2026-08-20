@@ -17,8 +17,10 @@
 > problem-solving investigation then confirmed that exact definitions are the
 > efficient drill-down surface while repeated expansion dominates response
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
-> is the compact-transport and path-projection pass. Neither triggers G16 or
-> widens the semantic product surface.
+> is the compact-transport and path-projection pass. G21 is the repository-local
+> runtime-configuration and retrieval-observability pass. None triggers G16 or
+> widens the semantic product surface, and no retrieval default changes without
+> a same-binary, same-snapshot comparison.
 
 ## Document policy
 
@@ -2577,6 +2579,58 @@ This milestone is independent of G15 and does not trigger G16. The observed
 failure was excessive/repeated delivery of memory and graph metadata, not a
 useful artifact hidden solely by G14's evidence-connection boundary.
 
+## Planned G21 — repository runtime configuration
+
+Jscout's durable operator policy currently spans CLI flags, MCP arguments, and
+many `JSCOUT_*` environment variables. This makes one-off experiments possible
+but leaves no repository-level answer to basic operational questions: which
+database the MCP process opened, whether vector retrieval and reranking are
+enabled by default, which gateway/model is selected, and where telemetry is
+written.
+
+G21 adds one versioned `<repository>/.jscout.toml` for non-secret stable
+configuration. Every command resolves the canonical repository root first;
+MCP loads that exact file once at startup and remains one process serving one
+root/database. The default database remains `<root>/.jscout.db`, an explicit
+`--database` remains authoritative, and no parent-directory search,
+multi-repository MCP routing, or hot reload is introduced.
+
+Resolution is explicit invocation/MCP argument, then repository config, then a
+legacy environment fallback, then built-in behavior. API keys and tokens stay
+outside the file; config may name their environment variable or an auth file.
+MCP retrieval booleans become tri-state so omission uses repository policy and
+an explicit value can widen or narrow it. CLI keeps negative retrieval flags
+and gains corresponding positive overrides.
+
+The implementation must centralize database, search, embedding/reranker,
+inference, LLM/gateway, checker, MCP, and telemetry settings in one immutable
+resolved object rather than letting subsystems reread process environment.
+`jscout config show|validate|init` exposes effective values and their sources
+with secrets redacted. MCP initialization and privacy-minimal telemetry record
+the binary/build identity, a non-secret runtime-configuration fingerprint, the
+effective per-call retrieval posture, and stage-specific retrieval timings.
+Exact request arguments remain in the separate privacy-sensitive request log;
+client-side batching and outer-message truncation cannot be inferred by the MCP
+server unless the client supplies that metadata.
+
+The runtime fingerprint is observational, not a global invalidation key.
+Changing reranking, attached memory, expansion, or byte budgets must not alter
+the structural snapshot or embedding-profile identity. In particular, an
+operator can disable reranking for interactive speed and later re-enable it
+without re-embedding the repository.
+
+The current mixed production telemetry is insufficient to change the built-in
+reranker default: deployed rows combine different binaries and intentionally
+different retrieval postures, every ordinary vector-active row also has the
+reranker active, and no relevance labels were recorded. G21 therefore preserves
+existing built-in defaults. A repository may explicitly set `rerank = false`;
+a product-wide change requires a fixed-query comparison on one binary,
+database, snapshot, and embedding profile with only reranking toggled.
+
+The complete schema, migration boundary, phased implementation, tests, and
+acceptance criteria are in the
+[repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md).
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
@@ -2601,6 +2655,8 @@ consequences that still govern implementation.
 | The same 42-call architecture inquiry produced an estimated 460–510 KiB of jscout output, while only 25–35% was judged decision-relevant | Implement G20 compact artifact views, routine-diagnostic gating, cross-origin-safe tiered follow-ups, and path-shaped expansion; separate fixed-call transport savings from staged-session savings and target at least 60% measured aggregate byte reduction at fact parity before considering larger budgets or session state |
 | A 19-call TargetsQueue problem-solving investigation naturally selected four exact definitions that carried the mechanism in 11.6 KB, while nine expansions produced 162.9 KB and weak attached memory | Preserve exact definition as progressive drill-down; make search-attached memory opt-in, stop broad expansion after localization, and replay G20 on this workload separately from the architecture inquiry |
 | The same investigation exposed an unbounded generic receiver string and `used_by` counts derived from unresolved repository-wide names | Bound compact receiver displays with full debug fidelity; replace those counts with anchor-resolved edges or label them as approximate name occurrences |
+| The first production telemetry window mixes binaries and intentionally different retrieval postures; vector-active rows also rerank and no relevance labels exist | Use it for incident discovery only; implement G21 configuration/build fingerprints and stage timings, preserve retrieval defaults, and compare reranking with one variable changed before any global flip |
+| Three 1.86 MB `who_uses` responses predate the current compact whole-response ceiling | Replay a high-fanout case on the current binary and measure follow-up value; do not schedule a duplicate cap implementation or treat historical bytes as current behavior |
 
 Relevant result summaries include:
 
@@ -2621,6 +2677,9 @@ Relevant result summaries include:
 - [Next.js root-layout parameter types](eval/results/next-root-params-types-2026-08-17.md)
 - [workflow architecture-inquiry call trace](eval/results/workflow-architecture-inquiry-2026-08-19.md)
 - [TargetsQueue problem-solving investigation](eval/results/targets-queue-problem-investigation-2026-08-20.md)
+- [cross-trace retrieval synthesis](eval/results/retrieval-cross-trace-synthesis-2026-08-20.md)
+- [first production MCP telemetry window](eval/results/mcp-telemetry-first-window-2026-08-20.md)
+- [repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md)
 
 ## Positioning versus tsserver/LSP
 
