@@ -2596,6 +2596,10 @@ Acceptance requires:
 - the staged-session replay reports call count, inner/wire/client-visible bytes,
   and recovered high-value facts separately, without presenting strategy
   savings as transport savings;
+- the prospective real-corpus path-projection workload includes at least one
+  full-posture arm with vectors, reranking, and attached semantic memory. The
+  lexical n8n proxy validates graph projection only and cannot establish byte
+  behavior for the richest response shape;
 - strict individual response-byte budgets and explicit omission reporting
   remain intact;
 - `source_limit: 0` performs a successful no-source artifact read and a

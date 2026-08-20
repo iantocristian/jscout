@@ -148,7 +148,7 @@ enum Command {
         /// Maximum graph nodes visited while connecting attached memory
         #[arg(long)]
         memory_nodes: Option<usize>,
-        /// Maximum bytes in the complete rendered JSON response
+        /// Maximum bytes in the complete rendered JSON response; debug JSON is unbounded when omitted
         #[arg(long)]
         response_bytes: Option<usize>,
         /// Enable vector search, overriding repository configuration
@@ -507,9 +507,9 @@ enum Command {
         /// Restrict traversal to backing-file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
-        /// Maximum bytes in the complete rendered JSON response
-        #[arg(long, default_value_t = 24_000)]
-        response_bytes: usize,
+        /// Maximum bytes in the complete rendered JSON response; debug JSON is unbounded when omitted
+        #[arg(long)]
+        response_bytes: Option<usize>,
         /// Output the full diagnostic JSON representation
         #[arg(long)]
         debug_json: bool,
@@ -1161,7 +1161,11 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                     timing: runtime.effective.diagnostics.timing,
                     compact: json,
                     include_neighborhood_followups: true,
-                    response_byte_limit: response_bytes.unwrap_or(configured.response_bytes),
+                    response_byte_limit: effective_search_response_byte_limit(
+                        response_bytes,
+                        configured.response_bytes,
+                        debug_json,
+                    ),
                     expansion: search::ExpansionOptions {
                         projection: search::ExpansionProjection::parse(
                             expand_mode.as_deref().unwrap_or(&configured.expansion.mode),
@@ -1904,23 +1908,46 @@ fn cmd_neighborhood(
     root: &Path,
     database: &Path,
     anchor: &str,
-    response_bytes: usize,
+    response_bytes: Option<usize>,
     debug_json: bool,
     options: structural::NeighborhoodOptions,
 ) -> Result<()> {
     let conn = open_database_read_only(root, Some(database))?;
     let neighborhood = structural::neighborhood(&conn, anchor, &options)?;
-    let rendered = if debug_json {
+    println!(
+        "{}",
+        render_cli_neighborhood(&neighborhood, response_bytes, debug_json)?
+    );
+    Ok(())
+}
+
+fn effective_search_response_byte_limit(
+    requested: Option<usize>,
+    configured: usize,
+    debug_json: bool,
+) -> usize {
+    requested.unwrap_or(if debug_json { usize::MAX } else { configured })
+}
+
+fn render_cli_neighborhood(
+    neighborhood: &structural::Neighborhood,
+    response_bytes: Option<usize>,
+    debug_json: bool,
+) -> Result<String> {
+    Ok(if debug_json && response_bytes.is_none() {
+        serde_json::to_string_pretty(&neighborhood)?
+    } else if debug_json {
         mcp::render_bounded_object_arrays(
             serde_json::to_value(neighborhood)?,
             &["edges", "nodes"],
-            response_bytes,
+            response_bytes.expect("checked above"),
         )?
     } else {
-        compact::render_neighborhood(&neighborhood, response_bytes)?
-    };
-    println!("{rendered}");
-    Ok(())
+        compact::render_neighborhood(
+            neighborhood,
+            response_bytes.unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT),
+        )?
+    })
 }
 
 struct EmbedCommandOptions<'a> {
@@ -2709,8 +2736,11 @@ mod main_tests {
     use anyhow::Result;
     use serde_json::json;
 
-    use super::{Cli, Command, ConfigCommand, ScoutCommand, render_semantic_memory_text};
-    use crate::semantic::SemanticArtifact;
+    use super::{
+        Cli, Command, ConfigCommand, ScoutCommand, effective_search_response_byte_limit,
+        render_cli_neighborhood, render_semantic_memory_text,
+    };
+    use crate::{semantic::SemanticArtifact, structural};
     use clap::Parser;
 
     #[test]
@@ -2978,13 +3008,17 @@ mod main_tests {
             Cli::try_parse_from(["jscout", "search", ".", "query", "--debug-json"])
                 .expect("debug search output parses");
         let Command::Search {
-            json, debug_json, ..
+            json,
+            debug_json,
+            response_bytes,
+            ..
         } = command
         else {
             panic!("expected search")
         };
         assert!(!json);
         assert!(debug_json);
+        assert_eq!(response_bytes, None);
         assert!(
             Cli::try_parse_from(["jscout", "search", ".", "query", "--json", "--debug-json"])
                 .is_err()
@@ -2993,10 +3027,63 @@ mod main_tests {
         let Cli { command, .. } =
             Cli::try_parse_from(["jscout", "neighborhood", ".", "root", "--debug-json"])
                 .expect("debug neighborhood output parses");
-        let Command::Neighborhood { debug_json, .. } = command else {
+        let Command::Neighborhood {
+            debug_json,
+            response_bytes,
+            ..
+        } = command
+        else {
             panic!("expected neighborhood")
         };
         assert!(debug_json);
+        assert_eq!(response_bytes, None);
+
+        let Cli { command, .. } = Cli::try_parse_from([
+            "jscout",
+            "neighborhood",
+            ".",
+            "root",
+            "--debug-json",
+            "--response-bytes",
+            "50000",
+        ])
+        .expect("explicit debug neighborhood budget parses");
+        let Command::Neighborhood { response_bytes, .. } = command else {
+            panic!("expected neighborhood")
+        };
+        assert_eq!(response_bytes, Some(50_000));
+    }
+
+    #[test]
+    fn debug_json_is_unbounded_unless_the_caller_sets_a_budget() {
+        assert_eq!(
+            effective_search_response_byte_limit(None, 24_000, true),
+            usize::MAX
+        );
+        assert_eq!(
+            effective_search_response_byte_limit(Some(50_000), 24_000, true),
+            50_000
+        );
+        assert_eq!(
+            effective_search_response_byte_limit(None, 12_000, false),
+            12_000
+        );
+
+        let neighborhood = structural::Neighborhood {
+            snapshot: "snapshot".into(),
+            requested_anchor: "sym:src/root.ts#::root@1".into(),
+            resolved_anchor: "sym:src/root.ts#::root@1".into(),
+            anchor_status: "current".into(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            truncated: false,
+        };
+        let rendered = render_cli_neighborhood(&neighborhood, None, true)
+            .expect("unbounded debug neighborhood renders");
+        assert_eq!(
+            rendered,
+            serde_json::to_string_pretty(&neighborhood).expect("fixture serializes")
+        );
     }
 
     #[test]

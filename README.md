@@ -961,6 +961,11 @@ diagnostic metadata, empty fields, and repeated defaults. Search
 `--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
 full diagnostic representation.
 
+CLI `--debug-json` is not outer-response-budgeted when `--response-bytes` is
+omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
+Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
+and MCP responses retain their configured complete-response budgets.
+
 Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
 `arguments` object accepted unchanged by `definition`, `who_uses`, and
 `neighborhood`; ambiguous multi-anchor chunks expose their anchors but no
@@ -969,7 +974,7 @@ follow-up object. A file-only hit returns per-tool call objects for
 arguments so stale anchors re-resolve by path/scope/name or fail closed instead
 of silently binding to a same-named declaration.
 
-`--response-bytes` caps whichever complete JSON representation was requested:
+An explicit `--response-bytes` caps whichever complete JSON representation was requested:
 hits, expansion, budget metadata, and serialization overhead. The result
 reports its actual `rendered_bytes`, original `unbudgeted_bytes`, and omitted
 content. Search semantic-memory previews share a global eight-support cap.

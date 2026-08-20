@@ -181,6 +181,13 @@ run. It is a bounded direction gate, not a general product benchmark.
 - Responses now record `model` and `reasoning`;
   `scripts/eval-pooled-report.mjs` refuses to pool mixed execution models
   unless `--allow-cross-model true` is passed and the result is labelled.
+- MCP result transport is also an execution treatment. `auto` currently selects
+  structured results for verified Codex clients and text results for Claude and
+  unknown clients. Cross-client comparisons must either force the same
+  `mcp.result_transport` in repository configuration or stratify results by the
+  telemetry fields `mcp_client_name`, `mcp_client_version`, and
+  `mcp_result_transport`; otherwise client-visible byte comparisons are
+  confounded by transport as well as model.
 - Retrieval changes re-run a recorded suite only with a pre-registration in
   `eval/prereg/` (first: [file-roles](prereg/file-roles-2026-08-09.md)).
 - File-role runs read `tool_profiles.<profile>.expansion_role_counts` and
