@@ -485,6 +485,15 @@ struct MissingEmbeddingDocument {
     content: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddingPassReport {
+    pub embedded: usize,
+    pub missing: usize,
+    pub cached_reused: usize,
+    pub occurrences_synced: usize,
+    pub canceled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SemanticEmbeddingDocument {
     artifact_id: i64,
@@ -625,22 +634,72 @@ fn missing_embedding_documents(
     Ok(documents)
 }
 
-pub fn embed_missing_for_selection(
+fn selected_embedding_document_count(
+    conn: &Connection,
+    file_origins: &[String],
+    product_only: bool,
+) -> Result<usize> {
+    let flags = origin_flags(file_origins);
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+           SELECT c.hash
+           FROM chunks c JOIN files f ON c.file_id=f.id
+           LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
+           WHERE ((?1 AND f.origin='repository')
+             OR (?2 AND f.origin='workspace')
+             OR (?3 AND f.origin='dependency'))
+             AND (NOT ?4 OR policy.effective_role='runtime'
+               OR (policy.file_id IS NULL AND f.role IN ('production','unknown')))
+           GROUP BY c.hash
+         )",
+        params![flags.0, flags.1, flags.2, product_only],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count as usize)
+    .map_err(Into::into)
+}
+
+fn selected_embedding_occurrence_count(
+    conn: &Connection,
+    profile_id: i64,
+    file_origins: &[String],
+    product_only: bool,
+) -> Result<usize> {
+    let flags = origin_flags(file_origins);
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM chunks c
+         JOIN files f ON c.file_id=f.id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
+         JOIN embedding_index_entries entry
+           ON entry.chunk_id=c.id AND entry.profile_id=?1
+         WHERE ((?2 AND f.origin='repository')
+           OR (?3 AND f.origin='workspace')
+           OR (?4 AND f.origin='dependency'))
+           AND (NOT ?5 OR policy.effective_role='runtime'
+             OR (policy.file_id IS NULL AND f.role IN ('production','unknown')))",
+        params![profile_id, flags.0, flags.1, flags.2, product_only],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count as usize)
+    .map_err(Into::into)
+}
+
+pub fn embed_missing_for_selection_report(
     conn: &Connection,
     provider: &Provider,
     batch_size: usize,
     file_origins: &[String],
     product_only: bool,
-) -> Result<(usize, usize)> {
-    let (done, total, _) = embed_missing_for_selection_interruptible(
+) -> Result<EmbeddingPassReport> {
+    embed_missing_for_selection_interruptible(
         conn,
         provider,
         batch_size,
         file_origins,
         product_only,
         || false,
-    )?;
-    Ok((done, total))
+    )
 }
 
 /// Embed missing default-origin chunks, stopping between provider batches when
@@ -653,7 +712,7 @@ pub fn embed_missing_interruptible(
     batch_size: usize,
     product_only: bool,
     should_cancel: impl FnMut() -> bool,
-) -> Result<(usize, usize, bool)> {
+) -> Result<EmbeddingPassReport> {
     embed_missing_for_selection_interruptible(
         conn,
         provider,
@@ -671,13 +730,16 @@ fn embed_missing_for_selection_interruptible(
     file_origins: &[String],
     product_only: bool,
     mut should_cancel: impl FnMut() -> bool,
-) -> Result<(usize, usize, bool)> {
+) -> Result<EmbeddingPassReport> {
     if batch_size == 0 {
         bail!("embedding batch size must be positive");
     }
     crate::origin::validate_all(file_origins)?;
     if should_cancel() {
-        return Ok((0, 0, true));
+        return Ok(EmbeddingPassReport {
+            canceled: true,
+            ..EmbeddingPassReport::default()
+        });
     }
     let profile = provider.profile()?;
     let mut resolved = existing_profile(conn, &profile)?;
@@ -690,7 +752,9 @@ fn embed_missing_for_selection_interruptible(
         product_only,
     )?;
 
+    let eligible = selected_embedding_document_count(conn, file_origins, product_only)?;
     let total = rows.len();
+    let cached_reused = eligible.saturating_sub(total);
     let mut done = 0usize;
     // The local HTTP boundary accepts at most 500k characters. Sixteen fully
     // expanded 24k-character chunks remain inside that limit and the 4 MiB
@@ -702,7 +766,13 @@ fn embed_missing_for_selection_interruptible(
     };
     for batch in rows.chunks(request_batch_size) {
         if should_cancel() {
-            return Ok((done, total, true));
+            return Ok(EmbeddingPassReport {
+                embedded: done,
+                missing: total,
+                cached_reused,
+                occurrences_synced: 0,
+                canceled: true,
+            });
         }
         let texts = batch
             .iter()
@@ -743,12 +813,27 @@ fn embed_missing_for_selection_interruptible(
         eprintln!("embedded {done}/{total}");
     }
     if should_cancel() {
-        return Ok((done, total, true));
+        return Ok(EmbeddingPassReport {
+            embedded: done,
+            missing: total,
+            cached_reused,
+            occurrences_synced: 0,
+            canceled: true,
+        });
     }
-    if let Some(profile) = resolved {
+    let occurrences_synced = if let Some(profile) = resolved {
         sync_vector_index(conn, Some(profile.id))?;
-    }
-    Ok((done, total, false))
+        selected_embedding_occurrence_count(conn, profile.id, file_origins, product_only)?
+    } else {
+        0
+    };
+    Ok(EmbeddingPassReport {
+        embedded: done,
+        missing: total,
+        cached_reused,
+        occurrences_synced,
+        canceled: false,
+    })
 }
 
 /// Embed current, non-superseded semantic artifacts and materialize their
@@ -760,8 +845,32 @@ pub fn embed_semantic_missing(
     provider: &Provider,
     batch_size: usize,
 ) -> Result<(usize, usize)> {
+    let report = embed_semantic_missing_interruptible(conn, provider, batch_size, || false)?;
+    Ok((report.embedded, report.missing))
+}
+
+pub fn embed_semantic_missing_report(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+) -> Result<EmbeddingPassReport> {
+    embed_semantic_missing_interruptible(conn, provider, batch_size, || false)
+}
+
+pub fn embed_semantic_missing_interruptible(
+    conn: &Connection,
+    provider: &Provider,
+    batch_size: usize,
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<EmbeddingPassReport> {
     if batch_size == 0 {
         bail!("embedding batch size must be positive");
+    }
+    if should_cancel() {
+        return Ok(EmbeddingPassReport {
+            canceled: true,
+            ..EmbeddingPassReport::default()
+        });
     }
     let profile = provider.profile()?;
     let mut resolved = existing_profile(conn, &profile)?;
@@ -771,7 +880,13 @@ pub fn embed_semantic_missing(
         resolved.as_ref().map(|profile| profile.id),
         &documents,
     )?;
+    let unique_documents = documents
+        .iter()
+        .map(|document| document.document_hash.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let total = rows.len();
+    let cached_reused = unique_documents.saturating_sub(total);
     let mut done = 0usize;
     let request_batch_size = if provider.protocol == Protocol::Local {
         batch_size.min(16)
@@ -779,6 +894,15 @@ pub fn embed_semantic_missing(
         batch_size
     };
     for batch in rows.chunks(request_batch_size) {
+        if should_cancel() {
+            return Ok(EmbeddingPassReport {
+                embedded: done,
+                missing: total,
+                cached_reused,
+                occurrences_synced: 0,
+                canceled: true,
+            });
+        }
         let texts = batch
             .iter()
             .map(|document| document.content.clone())
@@ -817,10 +941,27 @@ pub fn embed_semantic_missing(
         done += batch.len();
         eprintln!("embedded semantic memory {done}/{total}");
     }
+    if should_cancel() {
+        return Ok(EmbeddingPassReport {
+            embedded: done,
+            missing: total,
+            cached_reused,
+            occurrences_synced: 0,
+            canceled: true,
+        });
+    }
+    let mut occurrences_synced = 0;
     if let Some(profile) = resolved {
         sync_semantic_vector_index(conn, &profile, &documents)?;
+        occurrences_synced = documents.len();
     }
-    Ok((done, total))
+    Ok(EmbeddingPassReport {
+        embedded: done,
+        missing: total,
+        cached_reused,
+        occurrences_synced,
+        canceled: false,
+    })
 }
 
 fn existing_profile(conn: &Connection, profile: &ProfileSpec) -> Result<Option<ResolvedProfile>> {
@@ -1588,7 +1729,8 @@ mod tests {
 
     use super::{
         DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile, VectorFailureKind,
-        code_vector_failure_action, embed_text, ensure_profile, exact_semantic_vector_search,
+        code_vector_failure_action, embed_missing_for_selection_report,
+        embed_semantic_missing_report, embed_text, ensure_profile, exact_semantic_vector_search,
         exact_vector_search, existing_profile, materialize_cached_embeddings,
         missing_embedding_documents, profile_fingerprint, ready_search_profile,
         semantic_embedding_documents, semantic_vector_failure, semantic_vector_failure_action,
@@ -1916,6 +2058,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["other", "same"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = crate::store::open(directory.path())?;
+        let provider = Provider {
+            name: "openai-compatible".into(),
+            model: "tiny".into(),
+            url: "https://example.test/v1/embeddings".into(),
+            key: None,
+            protocol: Protocol::OpenAi,
+            query_prefix: String::new(),
+        };
+        let profile = ensure_profile(&connection, &provider.profile()?, 2)?;
+        for (path, hash, content) in [
+            ("a.ts", "same", "export const x = 1;"),
+            ("nested/a.ts", "same", "export const x = 1;"),
+            ("b.ts", "other", "export const y = 2;"),
+        ] {
+            connection.execute(
+                "INSERT INTO files(path, hash, role, origin)
+                 VALUES(?1, ?2, 'production', 'repository')",
+                rusqlite::params![path, format!("file-{path}")],
+            )?;
+            let file_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO chunks(
+                   file_id, kind, scope_chain, symbols, start, end,
+                   start_line, end_line, hash, content
+                 ) VALUES(?1, 'module', '', '', 0, 1, 1, 1, ?2, ?3)",
+                rusqlite::params![file_id, hash, content],
+            )?;
+        }
+        for hash in ["same", "other"] {
+            connection.execute(
+                "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES(?1, ?2, ?3)",
+                rusqlite::params![hash, profile.id, vec_to_blob(&[1.0, 0.0])],
+            )?;
+        }
+
+        let code = embed_missing_for_selection_report(
+            &connection,
+            &provider,
+            16,
+            &["repository".into()],
+            false,
+        )?;
+        assert_eq!(code.missing, 0);
+        assert_eq!(code.embedded, 0);
+        assert_eq!(code.cached_reused, 2);
+        assert_eq!(code.occurrences_synced, 3);
+        assert!(!code.canceled);
+
+        connection.execute(
+            "INSERT INTO semantic_artifacts(
+               artifact_type,canonical_name,body_json,model,prompt_version,
+               confidence,source_snapshot,created_at,artifact_fingerprint
+             ) VALUES('card','cache','{\"purpose\":\"cache\"}','test','card/v1',
+                      'likely','snapshot','now','semantic')",
+            [],
+        )?;
+        let documents = semantic_embedding_documents(&connection)?;
+        assert_eq!(documents.len(), 1);
+        connection.execute(
+            "INSERT INTO semantic_embeddings(document_hash, profile_id, vec)
+             VALUES(?1, ?2, ?3)",
+            rusqlite::params![
+                documents[0].document_hash,
+                profile.id,
+                vec_to_blob(&[1.0, 0.0])
+            ],
+        )?;
+
+        let semantic = embed_semantic_missing_report(&connection, &provider, 16)?;
+        assert_eq!(semantic.missing, 0);
+        assert_eq!(semantic.embedded, 0);
+        assert_eq!(semantic.cached_reused, 1);
+        assert_eq!(semantic.occurrences_synced, 1);
+        assert!(!semantic.canceled);
         Ok(())
     }
 
