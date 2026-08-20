@@ -12,60 +12,7 @@ use crate::{file_role, origin, search, store};
 pub const FILE_NAME: &str = ".jscout.toml";
 pub const SCHEMA_VERSION: u32 = 1;
 
-pub const TEMPLATE: &str = r#"version = 1
-
-[database]
-path = ".jscout.db"
-
-[search]
-vector = true
-rerank = true
-attach_memory = true
-limit = 10
-response_bytes = 24000
-origins = ["repository", "workspace"]
-
-[search.expansion]
-enabled = false
-depth = 1
-seeds = 3
-nodes = 40
-edges = 120
-bytes = 24000
-min_confidence = "likely"
-file_roles = ["production", "unknown"]
-
-# Provider selection is explicit. Uncomment one provider configuration.
-# [embedding]
-# provider = "local"
-# model = "BAAI/bge-m3"
-# revision = "5617a9f61b028005a4858fdac845db406aefb181"
-
-# [inference]
-# url = "http://127.0.0.1:8792"
-# model_cache_root = "~/.cache/jscout/models"
-
-# [reranker]
-# url = "http://127.0.0.1:8792/rerank"
-# model = "BAAI/bge-reranker-v2-m3"
-# top = 50
-# max_chars = 4000
-
-# [llm]
-# model = "openai-codex:gpt-5.6-terra"
-# reasoning = "high"
-# openai_base_url = "https://gateway.example.com/v1"
-# api_key_env = "OPENAI_API_KEY"
-# auth_file = "~/.pi-ai/auth.json"
-
-[mcp]
-profile = "structural"
-source_view = "full"
-
-# [telemetry]
-# file = ".jscout/telemetry.jsonl"
-# request_log = ".jscout/requests.jsonl"
-"#;
+pub const TEMPLATE: &str = include_str!("../.jscout.toml.example");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -388,8 +335,7 @@ struct LlmFileConfig {
     openai_base_url: Option<String>,
     api_key_env: Option<String>,
     auth_file: Option<String>,
-    #[serde(default)]
-    openai_compatible_providers: Vec<OpenAiCompatibleProviderFileConfig>,
+    openai_compatible_providers: Option<Vec<OpenAiCompatibleProviderFileConfig>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,18 +777,26 @@ impl RuntimeConfig {
             )
             .map(|value| resolve_path(root.as_deref(), &value, true))
             .transpose()?;
+        let inference_allow_remote = resolver.bool(
+            "inference.allow_remote",
+            raw.inference.allow_remote,
+            Some("JSCOUT_INFERENCE_ALLOW_REMOTE"),
+            false,
+        )?;
+        if !inference_allow_remote
+            && !matches!(inference_host.as_str(), "127.0.0.1" | "localhost" | "::1")
+        {
+            bail!(
+                "inference.host is non-loopback; set inference.allow_remote = true only on a trusted network"
+            );
+        }
         let inference = InferenceSettings {
             url: inference_url,
             host: inference_host,
             port: inference_port,
             project: inference_project,
             uv: resolver.string("inference.uv", raw.inference.uv, Some("JSCOUT_UV"), "uv"),
-            allow_remote: resolver.bool(
-                "inference.allow_remote",
-                raw.inference.allow_remote,
-                Some("JSCOUT_INFERENCE_ALLOW_REMOTE"),
-                false,
-            )?,
+            allow_remote: inference_allow_remote,
             batch_size: resolver.usize(
                 "inference.batch_size",
                 raw.inference.batch_size,
@@ -1155,6 +1109,16 @@ impl RuntimeConfig {
         }
         lines.join("\n")
     }
+
+    /// Stable non-secret settings still supplied by the compatibility
+    /// environment surface. Secret variables are resolved separately and are
+    /// deliberately absent from `sources`.
+    pub fn legacy_environment_keys(&self) -> Vec<&str> {
+        self.sources
+            .iter()
+            .filter_map(|(key, source)| (*source == ValueSource::LegacyEnv).then_some(key.as_str()))
+            .collect()
+    }
 }
 
 pub fn init(root: &Path, explicit_path: Option<&Path>) -> Result<PathBuf> {
@@ -1254,6 +1218,9 @@ fn normalize_provider(value: Option<String>) -> Result<Option<String>> {
 }
 
 fn validate_endpoint(name: &str, value: &str) -> Result<()> {
+    if value.contains('?') || value.contains('#') {
+        bail!("{name} cannot contain a query string or fragment");
+    }
     let Some((scheme, rest)) = value.split_once("://") else {
         bail!("{name} must be an absolute http(s) URL");
     };
@@ -1324,18 +1291,9 @@ fn absolute_from_cwd(path: &Path) -> Result<PathBuf> {
 
 fn resolve_compatible_providers(
     resolver: &mut Resolver,
-    configured: Vec<OpenAiCompatibleProviderFileConfig>,
+    configured: Option<Vec<OpenAiCompatibleProviderFileConfig>>,
 ) -> Result<Vec<OpenAiCompatibleProvider>> {
-    let (providers, source) = if configured.is_empty() {
-        if let Some(value) = nonempty_env("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS") {
-            let legacy: Vec<OpenAiCompatibleProvider> = serde_json::from_str(&value).context(
-                "JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS must contain the provider JSON array",
-            )?;
-            (legacy, ValueSource::LegacyEnv)
-        } else {
-            (Vec::new(), ValueSource::Builtin)
-        }
-    } else {
+    let (providers, source) = if let Some(configured) = configured {
         let providers = configured
             .into_iter()
             .map(|provider| OpenAiCompatibleProvider {
@@ -1357,6 +1315,13 @@ fn resolve_compatible_providers(
             })
             .collect();
         (providers, ValueSource::Config)
+    } else if let Some(value) = nonempty_env("JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS") {
+        let legacy: Vec<OpenAiCompatibleProvider> = serde_json::from_str(&value).context(
+            "JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS must contain the provider JSON array",
+        )?;
+        (legacy, ValueSource::LegacyEnv)
+    } else {
+        (Vec::new(), ValueSource::Builtin)
     };
     resolver
         .sources
@@ -1472,6 +1437,31 @@ file = "logs/mcp.jsonl"
     }
 
     #[test]
+    fn repository_roots_resolve_independent_database_and_provider_policy() -> anyhow::Result<()> {
+        let first_root = tempfile::tempdir()?;
+        let second_root = tempfile::tempdir()?;
+        write_config(
+            first_root.path(),
+            "version = 1\n[database]\npath = \"state/first.db\"\n[search]\nrerank = false\n",
+        )?;
+        write_config(
+            second_root.path(),
+            "version = 1\n[database]\npath = \"state/second.db\"\n[search]\nrerank = true\n",
+        )?;
+
+        let first = RuntimeConfig::load(Some(first_root.path()), None)?;
+        let second = RuntimeConfig::load(Some(second_root.path()), None)?;
+        assert_ne!(
+            first.effective.database.path,
+            second.effective.database.path
+        );
+        assert!(!first.effective.search.rerank);
+        assert!(second.effective.search.rerank);
+        assert_ne!(first.fingerprint, second.fingerprint);
+        Ok(())
+    }
+
+    #[test]
     fn unknown_fields_and_versions_fail_with_the_configuration_path() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         write_config(root.path(), "version = 1\n[search]\nrerak = false\n")?;
@@ -1484,6 +1474,33 @@ file = "logs/mcp.jsonl"
             error
                 .to_string()
                 .contains("unsupported jscout configuration version")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_endpoints_and_remote_binds_fail_during_configuration_load() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        write_config(
+            root.path(),
+            "version = 1\n[inference]\nurl = \"https://example.test/v1?token=x\"\n",
+        )?;
+        assert!(
+            RuntimeConfig::load(Some(root.path()), None)
+                .unwrap_err()
+                .to_string()
+                .contains("query string or fragment")
+        );
+
+        write_config(
+            root.path(),
+            "version = 1\n[inference]\nhost = \"0.0.0.0\"\n",
+        )?;
+        assert!(
+            RuntimeConfig::load(Some(root.path()), None)
+                .unwrap_err()
+                .to_string()
+                .contains("inference.allow_remote")
         );
         Ok(())
     }
@@ -1505,8 +1522,50 @@ file = "logs/mcp.jsonl"
         let path = init(root.path(), None)?;
         assert_eq!(path, root.path().canonicalize()?.join(FILE_NAME));
         assert!(std::fs::read_to_string(&path)?.contains(&format!("version = {SCHEMA_VERSION}")));
+        let loaded = RuntimeConfig::load(Some(root.path()), None)?;
+        assert!(loaded.config_loaded);
+        assert_eq!(loaded.effective.mcp.profile, "structural");
         assert!(init(root.path(), None).is_err());
         assert!(TEMPLATE.contains("rerank = true"));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_compatible_providers_keep_only_secret_variable_names() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        write_config(
+            root.path(),
+            r#"version = 1
+[llm]
+openai_compatible_providers = []
+"#,
+        )?;
+        let empty = RuntimeConfig::load(Some(root.path()), None)?;
+        assert!(empty.effective.llm.openai_compatible_providers.is_empty());
+        assert_eq!(
+            empty.sources["llm.openai_compatible_providers"],
+            ValueSource::Config
+        );
+
+        write_config(
+            root.path(),
+            r#"version = 1
+[[llm.openai_compatible_providers]]
+id = "private"
+base_url = "https://models.example.test/v1"
+api_key_env = "PRIVATE_MODEL_KEY"
+
+[[llm.openai_compatible_providers.models]]
+id = "model-1"
+reasoning = true
+context_window = 100000
+max_tokens = 10000
+"#,
+        )?;
+        let configured = RuntimeConfig::load(Some(root.path()), None)?;
+        let provider = &configured.effective.llm.openai_compatible_providers[0];
+        assert_eq!(provider.name, "private");
+        assert_eq!(provider.api_key_env.as_deref(), Some("PRIVATE_MODEL_KEY"));
         Ok(())
     }
 }

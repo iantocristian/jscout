@@ -135,6 +135,10 @@ pub struct RetrievalStatus {
     pub reranker: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_action: Option<&'static str>,
+    #[serde(skip)]
+    pub vector_timings: Option<embed::VectorSearchTimings>,
+    #[serde(skip)]
+    pub reranker_timing: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -153,6 +157,8 @@ impl RetrievalStatus {
             vector: "disabled",
             reranker: "disabled",
             vector_action: None,
+            vector_timings: None,
+            reranker_timing: None,
         }
     }
 
@@ -162,6 +168,8 @@ impl RetrievalStatus {
             vector: "active",
             reranker: "disabled",
             vector_action: None,
+            vector_timings: None,
+            reranker_timing: None,
         }
     }
 
@@ -171,6 +179,8 @@ impl RetrievalStatus {
             vector: "degraded",
             reranker: "disabled",
             vector_action: Some(action),
+            vector_timings: None,
+            reranker_timing: None,
         }
     }
 
@@ -841,7 +851,7 @@ fn vector_ranking(
     q: &str,
     limit: usize,
     file_origins: &[String],
-) -> Result<Vec<(i64, f64)>> {
+) -> Result<embed::VectorSearchResult> {
     embed::vector_search(conn, provider, q, limit, file_origins)
 }
 
@@ -856,7 +866,7 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
 /// Optional cross-encoder rerank stage (dms-style service:
 /// POST {model, query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
 /// Local embeddings use the bundled service automatically; an explicit
-/// JSCOUT_RERANK_URL overrides that endpoint.
+/// `reranker.url` overrides that endpoint.
 #[derive(Debug, Clone)]
 pub struct Reranker {
     url: String,
@@ -1386,6 +1396,7 @@ fn ranked_hits(
             if timing {
                 eprintln!("timing: rerank({}) {:?}", top.len(), t.elapsed());
             }
+            retrieval.reranker_timing = Some(t.elapsed());
         }
     }
     if options.file_roles.is_empty() {
@@ -1562,12 +1573,14 @@ fn reranker_document(
 
 fn record_vector_ranking(
     rankings: &mut Vec<Vec<(i64, f64)>>,
-    result: Result<Vec<(i64, f64)>>,
+    result: Result<embed::VectorSearchResult>,
 ) -> RetrievalStatus {
     match result {
-        Ok(ranking) => {
-            rankings.push(ranking);
-            RetrievalStatus::vector_active()
+        Ok(output) => {
+            rankings.push(output.ranking);
+            let mut retrieval = RetrievalStatus::vector_active();
+            retrieval.vector_timings = Some(output.timings);
+            retrieval
         }
         Err(error) => {
             eprintln!("vector search unavailable: {error}");
@@ -2212,6 +2225,8 @@ mod tests {
 
     use anyhow::Result;
 
+    use crate::embed;
+
     use super::{
         DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT, DEFAULT_RESPONSE_BYTE_LIMIT,
         ExpansionOptions, Hit, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
@@ -2312,7 +2327,13 @@ mod tests {
         assert!(disabled.vector_action.is_none());
 
         let mut rankings = Vec::new();
-        let active = record_vector_ranking(&mut rankings, Ok(vec![(7, 0.9)]));
+        let active = record_vector_ranking(
+            &mut rankings,
+            Ok(embed::VectorSearchResult {
+                ranking: vec![(7, 0.9)],
+                timings: embed::VectorSearchTimings::default(),
+            }),
+        );
         assert_eq!(active.vector, "active");
         assert_eq!(rankings, vec![vec![(7, 0.9)]]);
 

@@ -2579,7 +2579,7 @@ This milestone is independent of G15 and does not trigger G16. The observed
 failure was excessive/repeated delivery of memory and graph metadata, not a
 useful artifact hidden solely by G14's evidence-connection boundary.
 
-## Planned G21 — repository runtime configuration
+## Implemented G21 — repository runtime configuration
 
 Jscout's durable operator policy currently spans CLI flags, MCP arguments, and
 many `JSCOUT_*` environment variables. This makes one-off experiments possible
@@ -2627,8 +2627,11 @@ existing built-in defaults. A repository may explicitly set `rerank = false`;
 a product-wide change requires a fixed-query comparison on one binary,
 database, snapshot, and embedding profile with only reranking toggled.
 
-The complete schema, migration boundary, phased implementation, tests, and
-acceptance criteria are in the
+The typed loader, command/MCP precedence, provider and sidecar wiring, legacy
+fallback warning, non-secret fingerprints, retrieval-stage telemetry, operator
+commands, and operating template are implemented. The complete schema,
+migration boundary, phased implementation, tests, and acceptance criteria are
+in the
 [repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md).
 
 ## Evaluation decisions already made

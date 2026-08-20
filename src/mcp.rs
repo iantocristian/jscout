@@ -2,11 +2,12 @@
 //! Exposes the index to agents: semantic_search, who_uses, definition,
 //! file_outline, events, neighborhood.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -49,6 +50,7 @@ pub fn serve(
     runtime: &config::RuntimeConfig,
 ) -> Result<()> {
     let root = root.canonicalize()?;
+    let binary_fingerprint = current_binary_fingerprint()?;
     let conn = store::open_path_read_only(database_path)?;
     let provider =
         embed::Provider::from_settings(&runtime.effective.embedding, &runtime.effective.inference)?;
@@ -122,8 +124,22 @@ pub fn serve(
                         "serverInfo": {
                             "name": "jscout",
                             "version": env!("CARGO_PKG_VERSION"),
+                            "binaryFingerprint": binary_fingerprint,
                             "configurationFingerprint": runtime.fingerprint,
                             "database": database_path,
+                            "configuration": {
+                                "path": runtime.config_path,
+                                "loaded": runtime.config_loaded,
+                                "reload": "restart-required",
+                            },
+                            "retrievalDefaults": {
+                                "vector": runtime.effective.search.vector,
+                                "rerank": runtime.effective.search.rerank,
+                                "memory": runtime.effective.search.attach_memory,
+                                "expansion": runtime.effective.search.expansion.enabled,
+                                "limit": runtime.effective.search.limit,
+                                "responseBytes": runtime.effective.search.response_bytes,
+                            },
                         },
                         "instructions": server_instructions(profile)
                     }),
@@ -135,6 +151,7 @@ pub fn serve(
                 let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
+                let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
                 let result = if name == "annotate" && profile == ToolProfile::Structural {
                     // The server is read-only until the one write-capable tool
                     // is actually selected. Keep schema writes and writer locks
@@ -151,6 +168,7 @@ pub fn serve(
                                 source_view,
                                 search_defaults: &runtime.effective.search,
                                 timing: runtime.effective.diagnostics.timing,
+                                retrieval_timings: &retrieval_timings,
                             },
                             name,
                             &args,
@@ -168,6 +186,7 @@ pub fn serve(
                             source_view,
                             search_defaults: &runtime.effective.search,
                             timing: runtime.effective.diagnostics.timing,
+                            retrieval_timings: &retrieval_timings,
                         },
                         name,
                         &args,
@@ -184,6 +203,9 @@ pub fn serve(
                         result: &result,
                         elapsed: started.elapsed(),
                         runtime,
+                        retrieval_timings: *retrieval_timings.borrow(),
+                        binary_fingerprint: &binary_fingerprint,
+                        database_path,
                     },
                 );
                 match result {
@@ -701,6 +723,14 @@ struct ToolContext<'a> {
     source_view: scout::SourceView,
     search_defaults: &'a config::SearchSettings,
     timing: bool,
+    retrieval_timings: &'a RefCell<RetrievalStageMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RetrievalStageMetrics {
+    code_vector: Option<embed::VectorSearchTimings>,
+    semantic_vector: Option<embed::VectorSearchTimings>,
+    reranker: Option<Duration>,
 }
 
 fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) -> Result<String> {
@@ -720,6 +750,14 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
             options.timing = context.timing;
             let result =
                 search::search(conn, if use_vector { provider } else { None }, q, &options)?;
+            context.retrieval_timings.replace(RetrievalStageMetrics {
+                code_vector: result.retrieval.vector_timings,
+                semantic_vector: result
+                    .semantic_retrieval
+                    .as_ref()
+                    .and_then(|retrieval| retrieval.vector_timings),
+                reranker: result.retrieval.reranker_timing,
+            });
             if debug {
                 Ok(serde_json::to_string_pretty(&result)?)
             } else {
@@ -1078,6 +1116,10 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
                 },
             )?;
+            context.retrieval_timings.replace(RetrievalStageMetrics {
+                semantic_vector: result.retrieval.vector_timings,
+                ..Default::default()
+            });
             Ok(serde_json::to_string_pretty(&result)?)
         }
         "annotate" => {
@@ -1329,6 +1371,9 @@ struct ToolCallTelemetry<'a> {
     result: &'a Result<String>,
     elapsed: std::time::Duration,
     runtime: &'a config::RuntimeConfig,
+    retrieval_timings: RetrievalStageMetrics,
+    binary_fingerprint: &'a str,
+    database_path: &'a Path,
 }
 
 fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
@@ -1342,6 +1387,9 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         result,
         elapsed,
         runtime,
+        retrieval_timings,
+        binary_fingerprint,
+        database_path,
     } = call;
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1388,8 +1436,8 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let search_defaults = &runtime.effective.search;
-    let requested_retrieval = (*tool == "semantic_search").then(|| {
-        json!({
+    let requested_retrieval = match *tool {
+        "semantic_search" => Some(json!({
             "vector": args["vector"].as_bool().unwrap_or(search_defaults.vector),
             "rerank": args["rerank"].as_bool().unwrap_or(search_defaults.rerank),
             "memory": *profile == ToolProfile::Structural
@@ -1400,12 +1448,34 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
                 && args["expand"]
                     .as_bool()
                     .unwrap_or(search_defaults.expansion.enabled),
-        })
-    });
+        })),
+        "semantic_memory" => Some(json!({
+            "vector": args["vector"].as_bool().unwrap_or(search_defaults.vector),
+        })),
+        _ => None,
+    };
+    let embedding_query = sum_durations([
+        retrieval_timings
+            .code_vector
+            .map(|timings| timings.embedding_query),
+        retrieval_timings
+            .semantic_vector
+            .map(|timings| timings.embedding_query),
+    ]);
+    let vector_index = sum_durations([
+        retrieval_timings
+            .code_vector
+            .map(|timings| timings.vector_index),
+        retrieval_timings
+            .semantic_vector
+            .map(|timings| timings.vector_index),
+    ]);
     let record = json!({
         "timestamp_ms": timestamp_ms,
         "jscout_version": env!("CARGO_PKG_VERSION"),
+        "binary_fingerprint": binary_fingerprint,
         "config_fingerprint": runtime.fingerprint,
+        "database": database_path,
         "session": session,
         "task": task,
         "profile": profile_label,
@@ -1431,6 +1501,13 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         "retrieval_vector": retrieval_vector,
         "retrieval_reranker": retrieval_reranker,
         "requested_retrieval": requested_retrieval,
+        "embedding_query_ms": duration_ms(embedding_query),
+        "vector_index_ms": duration_ms(vector_index),
+        "reranker_ms": duration_ms(retrieval_timings.reranker),
+        "code_embedding_query_ms": duration_ms(retrieval_timings.code_vector.map(|timings| timings.embedding_query)),
+        "code_vector_index_ms": duration_ms(retrieval_timings.code_vector.map(|timings| timings.vector_index)),
+        "semantic_embedding_query_ms": duration_ms(retrieval_timings.semantic_vector.map(|timings| timings.embedding_query)),
+        "semantic_vector_index_ms": duration_ms(retrieval_timings.semantic_vector.map(|timings| timings.vector_index)),
         "snapshot": snapshot,
     });
     if serde_json::to_writer(&mut *file, &record).is_err()
@@ -1439,6 +1516,35 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     {
         eprintln!("warning: failed to write jscout MCP telemetry");
     }
+}
+
+fn current_binary_fingerprint() -> Result<String> {
+    let path = std::env::current_exe().context("locate current jscout executable")?;
+    let mut file = File::open(&path)
+        .with_context(|| format!("open current jscout executable {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read current jscout executable {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn sum_durations<const N: usize>(durations: [Option<Duration>; N]) -> Option<Duration> {
+    durations
+        .into_iter()
+        .flatten()
+        .reduce(|total, value| total + value)
+}
+
+fn duration_ms(duration: Option<Duration>) -> Option<f64> {
+    duration.map(|duration| duration.as_secs_f64() * 1_000.0)
 }
 
 fn definition_source_metrics(text: &str) -> (usize, u64, u64, usize) {
@@ -1567,6 +1673,7 @@ fn call_tool(
     name: &str,
     args: &Value,
 ) -> Result<String> {
+    let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
     call_tool_with_config(
         &ToolContext {
             root,
@@ -1577,6 +1684,7 @@ fn call_tool(
             source_view,
             search_defaults: &config::SearchSettings::default(),
             timing: false,
+            retrieval_timings: &retrieval_timings,
         },
         name,
         args,
@@ -1593,11 +1701,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ToolProfile, call_tool, definition_source_metrics, expansion_role_metrics, log_request,
-        render_bounded_items, search_options_from_args, semantic_artifact_metrics,
-        server_instructions, tool_defs,
+        ToolProfile, call_tool, definition_source_metrics, duration_ms, expansion_role_metrics,
+        log_request, render_bounded_items, search_options_from_args, semantic_artifact_metrics,
+        server_instructions, sum_durations, tool_defs,
     };
-    use crate::{config, indexer, scout::SourceView, store, structural};
+    use crate::{config, embed, indexer, scout::SourceView, store, structural};
 
     #[test]
     fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
@@ -2649,5 +2757,31 @@ mod tests {
         );
         assert_eq!(overlay.returned, 2);
         assert_eq!(overlay.fresh, 2);
+    }
+
+    #[test]
+    fn retrieval_stage_timings_are_aggregated_for_telemetry() {
+        let code = embed::VectorSearchTimings {
+            embedding_query: std::time::Duration::from_millis(7),
+            vector_index: std::time::Duration::from_millis(11),
+        };
+        let semantic = embed::VectorSearchTimings {
+            embedding_query: std::time::Duration::from_millis(3),
+            vector_index: std::time::Duration::from_millis(5),
+        };
+        assert_eq!(
+            duration_ms(sum_durations([
+                Some(code.embedding_query),
+                Some(semantic.embedding_query)
+            ])),
+            Some(10.0)
+        );
+        assert_eq!(
+            duration_ms(sum_durations([
+                Some(code.vector_index),
+                Some(semantic.vector_index)
+            ])),
+            Some(16.0)
+        );
     }
 }

@@ -43,6 +43,18 @@ pub struct ResolvedProfile {
     pub dimensions: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VectorSearchTimings {
+    pub embedding_query: std::time::Duration,
+    pub vector_index: std::time::Duration,
+}
+
+#[derive(Debug)]
+pub struct VectorSearchResult {
+    pub ranking: Vec<(i64, f64)>,
+    pub timings: VectorSearchTimings,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum VectorFailureKind {
     Inference,
@@ -1550,15 +1562,19 @@ pub fn semantic_vector_search(
     provider: &Provider,
     query: &str,
     limit: usize,
-) -> Result<Vec<(i64, f64)>> {
+) -> Result<VectorSearchResult> {
+    let index_started = std::time::Instant::now();
     let spec = provider
         .profile()
         .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
     let profile = ready_semantic_search_profile(conn, &spec)
         .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    let mut vector_index = index_started.elapsed();
+    let embedding_started = std::time::Instant::now();
     let response = provider
         .embed_query(query)
         .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
+    let embedding_query = embedding_started.elapsed();
     validate_response_profile(&spec, &response)
         .map_err(|error| semantic_vector_failure(VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
@@ -1568,8 +1584,17 @@ pub fn semantic_vector_search(
             anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
         ));
     }
-    exact_semantic_vector_search(conn, &profile, vector, limit)
-        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))
+    let index_started = std::time::Instant::now();
+    let ranking = exact_semantic_vector_search(conn, &profile, vector, limit)
+        .map_err(|error| semantic_vector_failure(VectorFailureKind::Index, error))?;
+    vector_index += index_started.elapsed();
+    Ok(VectorSearchResult {
+        ranking,
+        timings: VectorSearchTimings {
+            embedding_query,
+            vector_index,
+        },
+    })
 }
 
 fn exact_semantic_vector_search(
@@ -1611,15 +1636,19 @@ pub fn vector_search(
     query: &str,
     limit: usize,
     file_origins: &[String],
-) -> Result<Vec<(i64, f64)>> {
+) -> Result<VectorSearchResult> {
+    let index_started = std::time::Instant::now();
     let spec = provider
         .profile()
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     let profile = ready_search_profile(conn, &spec)
         .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
+    let mut vector_index = index_started.elapsed();
+    let embedding_started = std::time::Instant::now();
     let response = provider
         .embed_query(query)
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
+    let embedding_query = embedding_started.elapsed();
     validate_response_profile(&spec, &response)
         .map_err(|error| vector_failure("code", VectorFailureKind::Inference, error))?;
     let vector = &response.vectors[0];
@@ -1630,9 +1659,17 @@ pub fn vector_search(
             anyhow::anyhow!("stored embedding profile has incompatible dimensions"),
         ));
     }
-    let scores = exact_vector_search(conn, &profile, vector, limit, file_origins)
+    let index_started = std::time::Instant::now();
+    let ranking = exact_vector_search(conn, &profile, vector, limit, file_origins)
         .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
-    Ok(scores)
+    vector_index += index_started.elapsed();
+    Ok(VectorSearchResult {
+        ranking,
+        timings: VectorSearchTimings {
+            embedding_query,
+            vector_index,
+        },
+    })
 }
 
 fn exact_vector_search(

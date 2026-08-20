@@ -32,6 +32,8 @@ From a source checkout:
 
 ```bash
 cargo build --release            # binary at target/release/jscout
+jscout config init /path/to/repo # create repository-local runtime policy
+jscout config validate /path/to/repo
 jscout index /path/to/repo       # rebuild the current structural snapshot
 jscout search /path/to/repo "checkout inventory"
 ```
@@ -51,12 +53,12 @@ jscout checker doctor /path/to/repo
 
 The gateway and checker entries are discovered beside the jscout binary in an
 installed layout, or at the repository root when running
-`target/{debug,release}/jscout` in development. `JSCOUT_PI_AI_GATEWAY` and
-`JSCOUT_CHECKER_SIDECAR` override their respective entries explicitly. The
+`target/{debug,release}/jscout` in development. `sidecars.gateway` and
+`sidecars.checker` in `.jscout.toml` override their entries explicitly. The
 default model
 `openai-codex:gpt-5.6-terra` bills to a ChatGPT plan through pi-ai's OAuth
-credential store; see [Configuration](#configuration) for the complete
-environment surface and auth setup.
+credential store; see [Configuration](#configuration) for runtime policy and
+auth setup.
 
 Optional local semantic retrieval uses a separate Python 3.11/3.12 service
 with Hugging Face Transformers and PyTorch. Install [uv](https://docs.astral.sh/uv/),
@@ -64,10 +66,11 @@ then run the one service that owns both BGE-M3 embeddings and the BGE reranker:
 
 ```bash
 uv sync --project inference       # locked Python environment
+cd /path/to/repo                  # inference commands load ./.jscout.toml
 jscout inference serve            # http://127.0.0.1:8792 by default
 # in another shell:
 jscout inference doctor
-JSCOUT_EMBED_PROVIDER=local jscout embed /path/to/repo
+jscout embed /path/to/repo        # after embedding.provider = "local"
 ```
 
 The models download into `~/.cache/jscout/models` on first use. BM25-only
@@ -229,7 +232,7 @@ Run the deterministic inspection first:
 ```bash
 jscout scout repository /path/to/repo --max-calls all --max-subjects all --warn-subjects 512 --dry-run
 jscout scout repository /path/to/repo --max-calls all --max-subjects all --warn-subjects 512
-JSCOUT_EMBED_PROVIDER=local jscout embed /path/to/repo --product
+jscout embed /path/to/repo --product # with embedding.provider configured
 jscout enrich /path/to/repo
 ```
 
@@ -453,7 +456,7 @@ sequence remains:
 jscout index .
 jscout enrich .
 jscout scout repository . --max-calls all
-JSCOUT_EMBED_PROVIDER=local jscout embed . --product --semantic
+jscout embed . --product --semantic
 ```
 
 ### Watcher lifecycle
@@ -553,8 +556,10 @@ schema-constrained model calls through the bundled pi-ai gateway. Workflow and
 concept runs additionally require exhaustive candidate classification.
 Generative calls default to
 `openai-codex:gpt-5.6-terra`, which uses the ChatGPT-plan OAuth path; `--model`
-and `JSCOUT_LLM_MODEL` remain explicit overrides. Request policy is explicit
-per command: `--timeout` (default 300 s per request), `--max-calls` (a hard
+is the explicit per-call override and `llm.model` is the repository default.
+The old `JSCOUT_LLM_MODEL` remains a warned compatibility fallback. Request
+policy is explicit per command: `--timeout` (default 300 s per request),
+`--max-calls` (a hard
 command-level budget), `--context-bytes` (default 240 000 serialized evidence
 bytes, also checked against the selected model's context window),
 `--reasoning`, `--service-tier` (rejected where the provider API does not
@@ -677,7 +682,8 @@ persistent memory through a vector-plus-lexical ranking plane separate from
 code-chunk ranking. Semantic vectors are content-addressed by the bounded
 artifact description and exact support anchors; create or refresh them after
 workflow/card/summary/concept generation with
-`JSCOUT_EMBED_PROVIDER=local jscout embed <root> --semantic-only`. Without a
+`jscout embed <root> --semantic-only` after configuring an embedding provider.
+Without a
 materialized semantic index, retrieval reports `vector: degraded` and falls
 back to lexical matching. `--no-vector` (MCP: `vector=false`) requests lexical
 matching explicitly.
@@ -765,59 +771,76 @@ scores.
 
 ## Configuration
 
-jscout is configured through CLI flags and process environment variables; it
-never auto-loads a `.env` file. [.env.example](.env.example) is the safe
-copy-paste template. CLI flags always win over environment variables.
+jscout's stable non-secret policy lives in one versioned
+`<repository>/.jscout.toml`. It never searches parent directories. Use
+[.jscout.toml.example](.jscout.toml.example) as the complete operating
+reference, or create the same template without overwriting an existing file:
 
-Node sidecars and generative scouting (`jscout enrich`, `jscout scout …`,
-`jscout checker/llm doctor`):
+```bash
+jscout config init /path/to/repo
+jscout config validate /path/to/repo
+jscout config show /path/to/repo       # effective values and their sources
+jscout config show /path/to/repo --json
+```
 
-| Variable | Effect |
-|---|---|
-| `JSCOUT_LLM_MODEL` | Exact `provider:model` for generative calls; default `openai-codex:gpt-5.6-terra` (ChatGPT-plan OAuth). Overridden by `--model`. |
-| `JSCOUT_LLM_REASONING` | Provider-normalized reasoning effort; unset means provider default. Overridden by `--reasoning`. |
-| `JSCOUT_PI_AI_AUTH_FILE` | pi-ai OAuth credential store read by the gateway; default `~/.pi-ai/auth.json`. |
-| `JSCOUT_PI_AI_OPENAI_BASE_URL` | Replace only the built-in `openai` provider endpoint. The model catalog, Responses transport, and `OPENAI_API_KEY` auth remain intact. |
-| `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` | Validated JSON array of additional local OpenAI-compatible providers (see below). |
-| `JSCOUT_PI_AI_GATEWAY` | Path to the gateway entry file when it is not discoverable beside the binary. Overridden by `--gateway-path`. Names a file, never a shell command. |
-| `JSCOUT_CHECKER_SIDECAR` | Path to the checker entry file when it is not discoverable beside the binary. Overridden by `jscout enrich/checker doctor --sidecar-path`. |
-| `JSCOUT_NODE` | Node executable used to launch the gateway and checker; default is `node` on `PATH`. Names a file, never a shell command. |
+`--config PATH` is a global explicit selector for automation. Relative paths
+inside the file resolve from the canonical repository root, not the process
+working directory. Resolution order is an explicit CLI flag or MCP argument,
+then `.jscout.toml`, then a legacy `JSCOUT_*` compatibility value, then the
+built-in default. A legacy value emits a migration warning. Unknown fields,
+unsupported versions, invalid endpoints, missing configured sidecars, and
+contradictory watch settings fail before a database is opened or a sidecar is
+started.
 
-The plan-backed `openai-codex:*` default reads pi-ai's OAuth store; jscout
-never creates or writes credentials, so sign in with pi-ai's own tooling
-first. API-key providers use their standard environment variables through
-pi-ai's built-in registry (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`GEMINI_API_KEY`, …). `jscout llm doctor` reports exactly which provider,
-auth path, and billing path the selected model resolves to; plan, API, and
-custom billing paths are recorded distinctly and never pooled. Doctor performs
-no completion and spends no model tokens: it verifies the local runtime,
-gateway protocol, model catalog, and configured auth path, but it cannot prove
-that an account has remaining quota or that a remote endpoint is currently
-healthy.
+The file configures the database; retrieval defaults and budgets; embedding,
+reranker, and local-inference models; LLM/provider metadata; Node/gateway and
+checker paths; MCP profile/source view; telemetry; index dependencies; and
+watch defaults. Query text, exact targets, dry-run intent, temporary widened
+budgets, and model-call caps remain per invocation. Changing retrieval posture
+does not alter the structural snapshot or embedding profile, so disabling and
+later re-enabling reranking never causes a re-embed.
 
-For API-key Terra through a non-default OpenAI gateway, configure the built-in
-provider rather than declaring a custom provider:
+MCP remains one process for one root and one database. `jscout mcp
+/path/to/repo` loads `/path/to/repo/.jscout.toml` once at startup.
+Initialization metadata reports the exact database, config path, binary/config
+fingerprints, and effective retrieval defaults. Restart MCP after editing the
+file; there is no hot reload or multi-repository routing.
+
+Secrets never belong in `.jscout.toml`. The file may name an environment
+variable such as `OPENAI_API_KEY`, `VOYAGE_API_KEY`, or a private custom key;
+only the selected provider resolves it. jscout never auto-loads `.env`.
+[.env.example](.env.example) contains secret placeholders, invocation labels,
+and commented legacy migration examples only.
+
+The plan-backed `openai-codex:*` default reads pi-ai's OAuth store at
+`~/.pi-ai/auth.json`; jscout never creates or writes credentials. For API-key
+Terra through a non-default OpenAI Responses-compatible gateway:
+
+```toml
+[llm]
+model = "openai:gpt-5.6-terra"
+openai_base_url = "https://gateway.example.com/v1"
+api_key_env = "OPENAI_API_KEY"
+```
 
 ```bash
 export OPENAI_API_KEY='...'
-export JSCOUT_LLM_MODEL='openai:gpt-5.6-terra'
-export JSCOUT_PI_AI_OPENAI_BASE_URL='https://gateway.example.com/v1'
+cd /path/to/repo
 jscout llm doctor
 ```
 
-The endpoint must implement the OpenAI Responses API, streaming, and tool
-calls. `llm doctor` prints the resolved endpoint. URLs containing credentials
-are rejected, as are URL query strings and fragments; put the key only in
-`OPENAI_API_KEY`. `JSCOUT_PI_AI_GATEWAY` is unrelated: it names the local Node
-sidecar file, not the remote API endpoint.
+The remote endpoint must implement the OpenAI Responses API, streaming, and
+tool calls. URLs containing credentials are rejected. `sidecars.gateway`
+names the local Node entry file and is unrelated to the remote endpoint. Typed
+`[[llm.openai_compatible_providers]]` tables configure additional local or
+private providers without JSON-in-an-environment-variable; see the example for
+the nested model syntax and optional `api_key_env` reference.
 
-Custom OpenAI-compatible providers target local keyless servers (Ollama,
-LM Studio, vLLM); the gateway sends a placeholder API key:
-
-```json
-[{"id": "local", "baseUrl": "http://127.0.0.1:11434/v1",
-  "models": [{"id": "qwen3:32b", "contextWindow": 131072, "maxTokens": 32768}]}]
-```
+`jscout llm doctor` verifies Node, the gateway protocol, selected model,
+endpoint, auth source, and billing path without making a completion. It cannot
+prove that a remote account has quota. Generative scout commands start and
+stop the configured gateway automatically; there is no separate gateway
+daemon to launch.
 
 The gateway owns one visible retry layer: at most two retries with 500 ms then
 1,000 ms backoff, only for classified connection, timeout, rate-limit, overload, or
@@ -836,24 +859,10 @@ Do not enable third-party HTTP debug logging in a shell that contains secrets.
 jscout does not install a global proxy agent or reinterpret proxy variables;
 transport behavior remains provider-adapter specific. For a mandatory proxy,
 prefer an explicit compatible endpoint via
-`JSCOUT_PI_AI_OPENAI_BASE_URL`. Node reads `NODE_EXTRA_CA_CERTS` at process
+`llm.openai_base_url`. Node reads `NODE_EXTRA_CA_CERTS` at process
 startup for private certificate authorities. Standard public HTTPS needs no
 TLS configuration. Keep proxy credentials out of endpoint URLs and environment
 values likely to be printed by unrelated tooling.
-
-Retrieval and diagnostics:
-
-| Variable | Effect |
-|---|---|
-| `JSCOUT_EMBED_PROVIDER` | Explicit embedding selection: `local`, `voyage`, `openai`, or `none`/unset. API keys alone never enable a provider. |
-| `JSCOUT_INFERENCE_URL`, `JSCOUT_INFERENCE_HOST`, `JSCOUT_INFERENCE_PORT`, `JSCOUT_INFERENCE_PROJECT`, `JSCOUT_UV` | Local inference endpoint, bind address, project discovery, and uv executable overrides. |
-| `JSCOUT_INFERENCE_ALLOW_REMOTE` | Permit a non-loopback Python service bind. Off by default; enable only on a trusted network. |
-| `JSCOUT_EMBED_MODEL`, `JSCOUT_EMBED_REVISION`, `JSCOUT_RERANK_MODEL`, `JSCOUT_RERANK_REVISION`, `JSCOUT_MODEL_CACHE_ROOT` | Local/hosted model identity, optional immutable Hugging Face revisions, and model cache. |
-| `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `JSCOUT_EMBED_URL`, `JSCOUT_EMBED_KEY`, `JSCOUT_QUERY_PREFIX` | Hosted or OpenAI-compatible embedding transport. A custom URL receives only `JSCOUT_EMBED_KEY`, never `OPENAI_API_KEY`. |
-| `JSCOUT_RERANK_URL`, `JSCOUT_RERANK_TOP`, `JSCOUT_RERANK_CHARS` | Optional cross-encoder override and candidate limits; local reranking is automatic when the local embedding provider is selected unless `--no-rerank` or `--lexical-only` is passed. |
-| `JSCOUT_TIMING` | Print per-stage latency to stderr during search and indexing. |
-| `JSCOUT_DEBUG` | Print per-file extraction progress to stderr during indexing. |
-| `JSCOUT_TELEMETRY_FILE`, `JSCOUT_SESSION_ID`, `JSCOUT_TASK_ID`, `JSCOUT_PROFILE_LABEL` | Opt-in MCP telemetry and run labels; see [MCP integration](#mcp-integration). |
 
 Indexing continues past non-retryable file reads, permanent subtree/boundary
 failures, and deterministic extraction errors. The final summary reports both
@@ -1047,16 +1056,17 @@ code visible unless `dependency` is included in the caller's origin filter.
 
 Search works BM25-only out of the box. Provider selection is explicit:
 
-- `JSCOUT_EMBED_PROVIDER=local` — bundled BGE-M3 service at
-  `JSCOUT_INFERENCE_URL` (default `http://127.0.0.1:8792`)
-- `JSCOUT_EMBED_PROVIDER=voyage` + `VOYAGE_API_KEY` — `voyage-code-3`
-- `JSCOUT_EMBED_PROVIDER=openai` + `OPENAI_API_KEY` —
+- `embedding.provider = "local"` — bundled BGE-M3 service at `inference.url`
+  (default `http://127.0.0.1:8792`)
+- `embedding.provider = "voyage"` plus its configured secret variable —
+  `voyage-code-3`
+- `embedding.provider = "openai"` plus its configured secret variable —
   `text-embedding-3-small`
-- `JSCOUT_EMBED_PROVIDER=openai` + `JSCOUT_EMBED_URL` — an
+- `embedding.provider = "openai"` plus `embedding.url` — an
   OpenAI-compatible endpoint (LM Studio, Ollama, vLLM); optionally authenticate
-  with `JSCOUT_EMBED_KEY`
+  with the variable named by `embedding.api_key_env`
 
-An API key or URL without `JSCOUT_EMBED_PROVIDER` does nothing. When a custom
+An API key or URL without `embedding.provider` does nothing. When a custom
 embedding URL is configured, jscout never falls back to `OPENAI_API_KEY` for
 that request.
 
@@ -1065,24 +1075,24 @@ model is intentionally fixed to BGE-M3; use the OpenAI-compatible adapter for
 other embedding models. It selects MPS, then CUDA, then CPU; loads each model
 lazily; serializes inference to bound
 memory; and exposes `/health`, `/configuration`, `/embed`, and `/rerank`.
-Override its cache and model configuration through `.env.example`. Pin
-`JSCOUT_EMBED_REVISION` and `JSCOUT_RERANK_REVISION` to select different
-immutable commits; the bundled defaults are already pinned and their revisions
-are part of the embedding-profile fingerprint. Runtime device is diagnostic,
+Configure its cache and models in `.jscout.toml`. Pin `embedding.revision` and
+`reranker.revision` to select different immutable commits; the bundled defaults
+are already pinned and their revisions are part of the embedding-profile
+fingerprint. Runtime device is diagnostic,
 not cache identity: MPS and CUDA reuse the same float16 profile, while CPU uses
 a separate float32 profile because dtype changes the generated vectors.
 
 Asymmetric models: when the model name contains `nomic-embed-code` or `coderankembed`,
 queries are automatically prefixed with `"Represent this query for searching relevant
-code: "` (documents embed raw). Override with `JSCOUT_QUERY_PREFIX`.
+code: "` (documents embed raw). Override with `embedding.query_prefix`.
 
 LM Studio example (loads `nomic-embed-code` GGUF, serves OpenAI-compatible API):
 
-```bash
-JSCOUT_EMBED_URL=http://localhost:1234/v1/embeddings \
-JSCOUT_EMBED_MODEL=text-embedding-nomic-embed-code \
-JSCOUT_EMBED_PROVIDER=openai \
-jscout embed /path/to/repo
+```toml
+[embedding]
+provider = "openai"
+url = "http://localhost:1234/v1/embeddings"
+model = "text-embedding-nomic-embed-code"
 ```
 
 Embeddings are keyed by chunk content hash and a fingerprint of provider,
@@ -1121,9 +1131,9 @@ follow-up rather than a correctness dependency of this storage change.
 
 ## Reranking (optional)
 
-With `JSCOUT_EMBED_PROVIDER=local`, search automatically sends the top RRF
-candidates to the same service's BGE reranker. To use a separate service, set
-`JSCOUT_RERANK_URL` to an endpoint speaking
+With `embedding.provider = "local"`, search sends the top RRF candidates to
+the same service's BGE reranker when `search.rerank = true`. To use a separate
+service, set `reranker.url` to an endpoint speaking
 `POST {model,query,candidates:[{id,text}]}` → `{scores:[{id,score}]}`. A malformed
 or incomplete score set is rejected and search falls back to RRF ordering.
 File-role allowlists are applied before fusion and reranker pool construction,
@@ -1132,16 +1142,18 @@ Each reranker candidate includes an occurrence-specific header with path,
 scope, symbol, chunk kind, role, origin, and line range before the source body.
 Successful reranking preserves the unreranked RRF tail rather than discarding
 it. Search reports `retrieval.reranker` as `active`, `disabled`, or `degraded`.
-Tuning: `JSCOUT_RERANK_TOP` (candidate pool, default 50), `JSCOUT_RERANK_CHARS`
-(per-candidate truncation, default 4000), `JSCOUT_RERANK_MODEL`. `--no-vector`
+Tuning: `reranker.top` (candidate pool, default 50), `reranker.max_chars`
+(per-candidate truncation, default 4000), and `reranker.model`. `--no-vector`
 keeps BM25 plus reranking, `--no-rerank` disables only the cross-encoder, and
 `--lexical-only` disables both optional stages.
 These changes do not alter the current reranking default. Re-measure real
 queries with the contextual input before changing that default in either
 direction.
-Diagnostics: `JSCOUT_TIMING=1` prints per-stage latency (BM25 / embed-query +
-sqlite-vec / rerank) to stderr on search and structural-projection stage
-timings during indexing.
+Diagnostics: `diagnostics.timing = true` prints per-stage latency (BM25 /
+embed-query + sqlite-vec / rerank) to stderr on search and
+structural-projection stage timings during indexing. MCP telemetry records
+embedding-query, vector-index, and reranker timings separately without adding
+them to agent-facing responses.
 
 ## MCP integration
 
@@ -1199,10 +1211,12 @@ grep and structural answered 4/4 exactly, while structural inspected fewer
 files at substantially higher agent-token cost. See
 [eval/results/ai-pipe-discriminating-2026-08-07.md](eval/results/ai-pipe-discriminating-2026-08-07.md).
 
-For opt-in agent-behavior measurement, start MCP with
-`--telemetry .jscout-telemetry.jsonl` or set `JSCOUT_TELEMETRY_FILE`. The JSONL
-records tool name, latency, success, response size, session, and snapshot. It
-does not record queries, arguments, source, or results. Set
+For opt-in agent-behavior measurement, set `telemetry.file` in `.jscout.toml`
+or start MCP with `--telemetry .jscout-telemetry.jsonl`. The JSONL records tool
+name, total and retrieval-stage latency, success, response size, session,
+snapshot, binary fingerprint, configuration fingerprint, and requested
+retrieval posture. It does not record queries, arguments, source, or results.
+Set
 `JSCOUT_SESSION_ID` to correlate calls from one evaluation run and
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
 included in each record; `JSCOUT_PROFILE_LABEL` overrides the recorded

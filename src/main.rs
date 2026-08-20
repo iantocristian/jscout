@@ -611,7 +611,7 @@ enum ScoutCommand {
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
-        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        /// Provider-normalized reasoning effort; otherwise uses repository configuration
         #[arg(long)]
         reasoning: Option<String>,
         /// Explicit API billing/latency tier; rejected where unsupported
@@ -668,7 +668,7 @@ enum ScoutCommand {
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
-        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        /// Provider-normalized reasoning effort; otherwise uses repository configuration
         #[arg(long)]
         reasoning: Option<String>,
         /// Explicit API billing/latency tier; rejected where unsupported
@@ -718,7 +718,7 @@ enum ScoutCommand {
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
-        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        /// Provider-normalized reasoning effort; otherwise uses repository configuration
         #[arg(long)]
         reasoning: Option<String>,
         /// Explicit API billing/latency tier; rejected where unsupported
@@ -759,7 +759,7 @@ enum ScoutCommand {
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
-        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        /// Provider-normalized reasoning effort; otherwise uses repository configuration
         #[arg(long)]
         reasoning: Option<String>,
         /// Explicit API billing/latency tier; rejected where unsupported
@@ -797,7 +797,7 @@ enum ScoutCommand {
         /// Exact pi-ai model; defaults to openai-codex:gpt-5.6-terra (plan-backed)
         #[arg(long)]
         model: Option<String>,
-        /// Provider-normalized reasoning effort; falls back to JSCOUT_LLM_REASONING
+        /// Provider-normalized reasoning effort; otherwise uses repository configuration
         #[arg(long)]
         reasoning: Option<String>,
         /// Explicit API billing/latency tier; rejected where unsupported
@@ -876,7 +876,7 @@ enum InferenceCommand {
     },
     /// Check the sidecar and print its effective model configuration
     Doctor {
-        /// Service base URL; defaults to JSCOUT_INFERENCE_URL or loopback:8792
+        /// Service base URL; otherwise uses repository configuration or loopback:8792
         #[arg(long)]
         url: Option<String>,
     },
@@ -888,6 +888,14 @@ fn main() -> Result<()> {
         Command::Config { command } => run_config_command(command, cli.config.as_deref()),
         command => {
             let runtime = config::RuntimeConfig::load(command.root(), cli.config.as_deref())?;
+            let legacy_keys = runtime.legacy_environment_keys();
+            if !legacy_keys.is_empty() {
+                eprintln!(
+                    "warning: legacy environment configuration supplied {}; migrate these settings to {}",
+                    legacy_keys.join(", "),
+                    config::FILE_NAME,
+                );
+            }
             run_command(command, &runtime)
         }
     }
@@ -951,7 +959,8 @@ impl Command {
             Self::AgentGuide {
                 install: Some(root),
             } => Some(root),
-            Self::AgentGuide { install: None } | Self::Llm { .. } | Self::Inference { .. } => None,
+            Self::Llm { .. } | Self::Inference { .. } => Some(Path::new(".")),
+            Self::AgentGuide { install: None } => None,
             Self::Config { command } => Some(command.root()),
         }
     }

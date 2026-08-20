@@ -164,6 +164,8 @@ pub struct ArtifactRetrievalStatus {
     pub corpus_artifacts: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_action: Option<&'static str>,
+    #[serde(skip)]
+    pub vector_timings: Option<embed::VectorSearchTimings>,
 }
 
 impl ArtifactRetrievalStatus {
@@ -173,6 +175,7 @@ impl ArtifactRetrievalStatus {
             vector: "disabled",
             corpus_artifacts,
             vector_action: None,
+            vector_timings: None,
         }
     }
 
@@ -182,6 +185,7 @@ impl ArtifactRetrievalStatus {
             vector: "active",
             corpus_artifacts,
             vector_action: None,
+            vector_timings: None,
         }
     }
 
@@ -191,6 +195,7 @@ impl ArtifactRetrievalStatus {
             vector: "degraded",
             corpus_artifacts,
             vector_action: Some(action),
+            vector_timings: None,
         }
     }
 }
@@ -1042,9 +1047,10 @@ pub(crate) fn rank_artifacts(
     let mut retrieval = ArtifactRetrievalStatus::vector_disabled(corpus_artifacts);
     let vector = if let Some(provider) = provider {
         match embed::semantic_vector_search(conn, provider, query, vector_limit.clamp(100, 1_000)) {
-            Ok(ranking) => {
+            Ok(output) => {
                 retrieval = ArtifactRetrievalStatus::vector_active(corpus_artifacts);
-                ranking
+                retrieval.vector_timings = Some(output.timings);
+                output.ranking
             }
             Err(error) => {
                 retrieval = ArtifactRetrievalStatus::vector_degraded(

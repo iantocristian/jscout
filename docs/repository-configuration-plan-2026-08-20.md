@@ -1,7 +1,7 @@
 # Repository runtime configuration implementation plan
 
 - Date: 2026-08-20
-- Status: planned as G21
+- Status: implemented as G21
 - Scope: repository-local, non-secret operator configuration for CLI and MCP
 
 ## Why this exists
