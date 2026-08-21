@@ -1,8 +1,9 @@
 use serde_json::json;
 
 use super::{
-    compact_hit, compact_receiver_types, definition_string, render_neighborhood, search_string,
-    semantic_preview, who_uses_string,
+    compact_hit, compact_receiver_types, definition_string, neighborhood_value,
+    prune_unreferenced_nodes, render_neighborhood, search_string, semantic_preview,
+    settle_neighborhood_bytes, who_uses_string,
 };
 use crate::{
     origin,
@@ -537,6 +538,167 @@ fn ten_checker_edges_fit_under_eight_kibibytes() -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(&compact)?;
     assert_eq!(value["graph"]["edges"].as_array().map(Vec::len), Some(10));
     Ok(())
+}
+
+fn render_neighborhood_linearly(
+    neighborhood: &Neighborhood,
+    byte_limit: usize,
+) -> anyhow::Result<String> {
+    if byte_limit == 0 {
+        anyhow::bail!("response byte limit must be greater than zero");
+    }
+    let mut nodes = neighborhood.nodes.clone();
+    let mut edges = neighborhood.edges.clone();
+    let original_nodes = nodes.len();
+    let original_edges = edges.len();
+    let mut rendered_bytes = 0;
+    let mut unbudgeted_bytes = 0;
+    for _ in 0..8 {
+        let rendered = settle_neighborhood_bytes(
+            neighborhood,
+            &nodes,
+            &edges,
+            byte_limit,
+            unbudgeted_bytes,
+            original_nodes,
+            original_edges,
+            &mut rendered_bytes,
+        )?;
+        if rendered == unbudgeted_bytes {
+            break;
+        }
+        unbudgeted_bytes = rendered;
+    }
+
+    loop {
+        let rendered = settle_neighborhood_bytes(
+            neighborhood,
+            &nodes,
+            &edges,
+            byte_limit,
+            unbudgeted_bytes,
+            original_nodes,
+            original_edges,
+            &mut rendered_bytes,
+        )?;
+        if rendered <= byte_limit {
+            return Ok(serde_json::to_string(&neighborhood_value(
+                neighborhood,
+                &nodes,
+                &edges,
+                byte_limit,
+                unbudgeted_bytes,
+                rendered_bytes,
+                original_nodes,
+                original_edges,
+            ))?);
+        }
+        if edges.pop().is_some() {
+            prune_unreferenced_nodes(&mut nodes, &edges, &neighborhood.resolved_anchor);
+            continue;
+        }
+        if let Some(index) = nodes
+            .iter()
+            .rposition(|node| node.key != neighborhood.resolved_anchor)
+        {
+            nodes.remove(index);
+            continue;
+        }
+        anyhow::bail!(
+            "response byte limit {byte_limit} is below the minimum compact neighborhood envelope ({rendered} bytes)"
+        );
+    }
+}
+
+fn assert_budget_renderers_match(
+    neighborhood: &Neighborhood,
+    byte_limits: impl IntoIterator<Item = usize>,
+) -> anyhow::Result<()> {
+    for byte_limit in byte_limits {
+        let expected = render_neighborhood_linearly(neighborhood, byte_limit)
+            .map_err(|error| error.to_string());
+        let actual =
+            render_neighborhood(neighborhood, byte_limit).map_err(|error| error.to_string());
+        assert_eq!(actual, expected, "response differs at {byte_limit} bytes");
+        if let Ok(rendered) = actual {
+            assert!(rendered.len() <= byte_limit);
+            let value: serde_json::Value = serde_json::from_str(&rendered)?;
+            assert_eq!(
+                value["response"]["rendered_bytes"].as_u64(),
+                Some(rendered.len() as u64)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn neighborhood_prefix_search_matches_linear_budget_shedding() -> anyhow::Result<()> {
+    let root = "sym:src/workflow.ts#::step0@1";
+    let mut nodes = vec![node(root, 1)];
+    let mut edges = Vec::new();
+    for index in 1..=130 {
+        let target = format!("sym:src/workflow.ts#::step{index}@{}", index + 1);
+        nodes.push(node(&target, index + 1));
+        edges.push(edge(root, &target, index + 1));
+    }
+    let neighborhood = Neighborhood {
+        snapshot: "s".repeat(64),
+        requested_anchor: root.into(),
+        resolved_anchor: root.into(),
+        anchor_status: "current".into(),
+        nodes,
+        edges,
+        truncated: false,
+    };
+    let full = render_neighborhood_linearly(&neighborhood, usize::MAX)?.len();
+    let mut limits = vec![
+        1,
+        255,
+        256,
+        511,
+        512,
+        999,
+        1_000,
+        1_999,
+        2_000,
+        9_999,
+        10_000,
+        23_999,
+        24_000,
+        full.saturating_sub(1),
+        full,
+        full + 1,
+    ];
+    limits.extend((300..full).step_by((full / 24).max(1)));
+    limits.sort_unstable();
+    limits.dedup();
+    assert_budget_renderers_match(&neighborhood, limits)
+}
+
+#[test]
+fn neighborhood_prefix_search_matches_linear_isolated_node_shedding() -> anyhow::Result<()> {
+    let root = "sym:src/workflow.ts#::root@1";
+    let mut nodes = vec![node(root, 1)];
+    for index in 1..=25 {
+        nodes.push(node(
+            &format!("sym:src/workflow.ts#::isolated{index}@{}", index + 1),
+            index + 1,
+        ));
+    }
+    let neighborhood = Neighborhood {
+        snapshot: "s".repeat(64),
+        requested_anchor: root.into(),
+        resolved_anchor: root.into(),
+        anchor_status: "current".into(),
+        nodes,
+        edges: Vec::new(),
+        truncated: false,
+    };
+    assert_budget_renderers_match(
+        &neighborhood,
+        [1, 255, 256, 511, 512, 999, 1_000, 2_000, 4_000, 8_000],
+    )
 }
 
 #[test]
