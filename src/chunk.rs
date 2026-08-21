@@ -208,8 +208,7 @@ impl<'s> Chunker<'s> {
         let name = f.id.as_ref().map(|id| id.name.to_string());
         let kind = name
             .as_deref()
-            .map(|n| self.component_or_function(n))
-            .unwrap_or(ChunkKind::Function);
+            .map_or(ChunkKind::Function, |n| self.component_or_function(n));
         if est_tokens(full_span) <= MAX_TOKENS {
             out.push(Unit {
                 span: full_span,
@@ -290,8 +289,7 @@ impl<'s> Chunker<'s> {
             .body
             .body
             .first()
-            .map(|m| m.span().start)
-            .unwrap_or(full_span.end);
+            .map_or(full_span.end, |m| m.span().start);
         out.push(Unit {
             span: Span::new(full_span.start, body_start),
             kind: ChunkKind::ClassHeader,

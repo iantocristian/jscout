@@ -35,8 +35,7 @@ pub fn with_parsed<T>(
         let first = ret
             .diagnostics
             .first()
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "unknown parse error".into());
+            .map_or_else(|| "unknown parse error".into(), |d| d.to_string());
         // Callers already report the file path. Keep the parser diagnostic as
         // the outer error so Display does not collapse it to a path-only
         // anyhow context.

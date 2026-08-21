@@ -1046,9 +1046,7 @@ fn render_concept_pack(
             quoted(&source.artifact_type),
             source
                 .name
-                .as_deref()
-                .map(&quoted)
-                .unwrap_or_else(|| "null".into()),
+                .as_deref().map_or_else(|| "null".into(), &quoted),
             quoted(&source.fingerprint),
             quoted(&source.confidence),
         ));
@@ -1066,8 +1064,7 @@ fn render_concept_pack(
                     support
                         .role
                         .as_deref()
-                        .map(&quoted)
-                        .unwrap_or_else(|| "null".into()),
+                        .map_or_else(|| "null".into(), &quoted),
                     quoted(&support.evidence_file),
                     support.evidence_start_line,
                     support.evidence_end_line,

@@ -631,8 +631,8 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
         raw.push(row?);
     }
     raw.sort_by(|a, b| {
-        let a_path = files.get(&a.1).map(String::as_str).unwrap_or("");
-        let b_path = files.get(&b.1).map(String::as_str).unwrap_or("");
+        let a_path = files.get(&a.1).map_or("", String::as_str);
+        let b_path = files.get(&b.1).map_or("", String::as_str);
         (a_path, &a.3, &a.2, a.4, a.0).cmp(&(b_path, &b.3, &b.2, b.4, b.0))
     });
 
@@ -943,8 +943,7 @@ fn project_references(
             continue;
         };
         let source = owner_at(symbols_by_file.get(&file_id), start)
-            .map(|s| s.key.clone())
-            .unwrap_or_else(|| file_key(path));
+            .map_or_else(|| file_key(path), |s| s.key.clone());
 
         // References that reach their target across a heuristically resolved
         // module edge (workspace-inferred) must not project as certain.
@@ -2021,8 +2020,7 @@ fn project_member_calls(
         }
 
         let source = owner_at(symbols_by_file.get(&file_id), start)
-            .map(|symbol| symbol.key.clone())
-            .unwrap_or_else(|| file_key(path));
+            .map_or_else(|| file_key(path), |symbol| symbol.key.clone());
         insert_edge.execute(params![
             source,
             hub,
@@ -2234,8 +2232,7 @@ fn project_checker_enrichments(
             continue;
         }
         let source = owner_at(symbols_by_file.get(&file_id), call_start)
-            .map(|symbol| symbol.key.clone())
-            .unwrap_or_else(|| file_key(&path));
+            .map_or_else(|| file_key(&path), |symbol| symbol.key.clone());
         let projection = projected
             .entry((member_call_id, target.clone()))
             .or_insert_with(|| CheckerProjection {

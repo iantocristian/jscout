@@ -418,10 +418,7 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
             let mut effective_counts = BTreeMap::<String, usize>::new();
             let mut conflicts = 0;
             for member in members {
-                let deterministic = file_roles
-                    .get(&member.id)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
+                let deterministic = file_roles.get(&member.id).map_or("unknown", String::as_str);
                 *deterministic_counts
                     .entry(deterministic.into())
                     .or_default() += 1;
@@ -468,10 +465,7 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         let mut written = 0;
         for (classification, members) in &selected {
             for member in members {
-                let deterministic = file_roles
-                    .get(&member.id)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
+                let deterministic = file_roles.get(&member.id).map_or("unknown", String::as_str);
                 statement.execute(params![
                     member.id,
                     classification.id,

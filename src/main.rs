@@ -934,8 +934,7 @@ fn run_config_command(command: ConfigCommand, explicit: Option<&Path>) -> Result
                 config
                     .config_path
                     .as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<none>".to_string()),
+                    .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
                 config.fingerprint
             );
             Ok(())

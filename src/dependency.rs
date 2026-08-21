@@ -345,9 +345,7 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
             continue;
         };
         let package_path = package_path.to_string_lossy().replace('\\', "/");
-        let bytes = fs::metadata(&source_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let bytes = fs::metadata(&source_path).map_or(0, |meta| meta.len());
         if bytes > limits.max_file_bytes
             || files.len() >= limits.max_files
             || selected_bytes.saturating_add(bytes) > limits.max_bytes

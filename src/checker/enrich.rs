@@ -2027,8 +2027,7 @@ fn project_complete_and_fresh(
     }
     Ok(inputs.iter().all(|input| {
         fs::read(input_path(root, input))
-            .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
-            .unwrap_or(false)
+            .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
     }))
 }
 

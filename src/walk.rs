@@ -103,9 +103,8 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                let path = ignore_error_path(&error)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| root.to_path_buf());
+                let path =
+                    ignore_error_path(&error).map_or_else(|| root.to_path_buf(), Path::to_path_buf);
                 if retryable_ignore_error(&error) || error.depth() == Some(0) {
                     return Err(error)
                         .with_context(|| format!("walk source inventory at {}", path.display()));
@@ -129,8 +128,7 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
             if !only_inventory_races(error) {
                 rejections.push(WalkRejection {
                     path: ignore_error_path(error)
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| entry.path().to_path_buf()),
+                        .map_or_else(|| entry.path().to_path_buf(), Path::to_path_buf),
                     stage: "ignore",
                     error: error.to_string(),
                 });

@@ -401,8 +401,7 @@ fn literal_text(expr: &Expression<'_>) -> Option<String> {
             literal
                 .raw
                 .as_ref()
-                .map(|raw| raw.to_string())
-                .unwrap_or_else(|| literal.value.to_string()),
+                .map_or_else(|| literal.value.to_string(), |raw| raw.to_string()),
         ),
         Expression::BooleanLiteral(literal) => Some(literal.value.to_string()),
         Expression::NullLiteral(_) => Some("null".into()),

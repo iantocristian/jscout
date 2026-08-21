@@ -1119,22 +1119,24 @@ fn lexical_artifact_relevance(
             crate::scouting::concept::normalize(candidate.name.as_deref().unwrap_or_default());
         let body = serde_json::from_str::<Value>(&candidate.body_json)
             .ok()
-            .map(|body| {
-                let definition = body
-                    .get("definition")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let aliases = body
-                    .get("aliases")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
-            })
-            .unwrap_or_else(|| crate::scouting::concept::normalize(&candidate.body_json));
+            .map_or_else(
+                || crate::scouting::concept::normalize(&candidate.body_json),
+                |body| {
+                    let definition = body
+                        .get("definition")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let aliases = body
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
+                },
+            );
         let exact = !name.is_empty() && normalized_concept_query == name;
         (name, body, exact, concept_tokens)
     } else {
