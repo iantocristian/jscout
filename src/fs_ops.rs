@@ -2,11 +2,17 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Filesystem operations whose failures affect indexing publication policy.
+/// Filesystem operations injected across source publication and classified
+/// workspace discovery.
 ///
 /// The production implementation delegates directly to `std::fs`. Keeping
 /// this boundary explicit lets tests supply operation-local failures without
 /// installing thread-local state in production modules.
+///
+/// This boundary deliberately excludes path canonicalization, diagnostic
+/// `package_entry_paths` traversal, dependency planning, and repository
+/// walking through `ignore`; those operations retain their existing owners
+/// and error policies.
 pub(crate) trait FileSystem {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
