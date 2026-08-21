@@ -14,7 +14,7 @@ import {
   writeMessage,
 } from "./protocol.mjs";
 
-const SIDECAR_VERSION = "0.3.0";
+const SIDECAR_VERSION = "0.4.0";
 const root = path.resolve(process.argv[2] ?? ".");
 const workerUrl = new URL("./worker.mjs", import.meta.url);
 let worker;
