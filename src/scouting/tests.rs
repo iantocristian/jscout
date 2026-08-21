@@ -2090,7 +2090,7 @@ fn artifact_fingerprint(conn: &rusqlite::Connection, artifact_id: i64) -> Result
     )?)
 }
 
-/// (claim_path, relation, dst_artifact_id, dst_fingerprint, confidence).
+/// (`claim_path`, relation, `dst_artifact_id`, `dst_fingerprint`, confidence).
 type RelationRow = (String, String, i64, String, String);
 
 /// Every child relation of one artifact, in a deterministic order.

@@ -67,10 +67,10 @@ pub struct MatchedOption {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallSite {
     pub file: String,
-    /// Complete CallExpression line range, inclusive.
+    /// Complete `CallExpression` line range, inclusive.
     pub start_line: i64,
     pub end_line: i64,
-    /// Complete CallExpression byte span.
+    /// Complete `CallExpression` byte span.
     pub span: [u32; 2],
     pub receiver: Option<String>,
     pub method: String,

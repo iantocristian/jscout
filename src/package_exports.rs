@@ -7,7 +7,7 @@ pub(crate) const RESOLVE_CONDITIONS: &[&str] = &["import", "require", "node", "d
 
 /// Collect target strings from one export value using the resolver's active
 /// conditions. Arrays preserve fallback order; inactive-only objects and
-/// `null` produce no targets. Requires serde_json's `preserve_order` feature.
+/// `null` produce no targets. Requires `serde_json`'s `preserve_order` feature.
 pub(crate) fn collect_active_targets(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::String(value) => out.push(value.clone()),

@@ -16,7 +16,7 @@ enum Protocol {
 }
 
 /// Embedding provider selection is explicit. API keys never select a provider,
-/// and OPENAI_API_KEY is never forwarded to a custom endpoint.
+/// and `OPENAI_API_KEY` is never forwarded to a custom endpoint.
 #[derive(Clone)]
 pub struct Provider {
     pub name: String,

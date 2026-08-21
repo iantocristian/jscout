@@ -395,7 +395,7 @@ pub fn validate(
 }
 
 /// Applied only after every submitted range has passed the source-file
-/// check: retain the first MAX_RANGES_PER_CLAIM valid ranges.
+/// check: retain the first `MAX_RANGES_PER_CLAIM` valid ranges.
 fn repair_claim(mut claim: ValidatedClaim) -> ValidatedClaim {
     claim.evidence.truncate(MAX_RANGES_PER_CLAIM);
     claim

@@ -346,7 +346,7 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 }
 
 /// Deterministic digest of the module-resolution outcome. Resolution reads
-/// unindexed inputs such as tsconfigs, manifests, and node_modules, so this
+/// unindexed inputs such as tsconfigs, manifests, and `node_modules`, so this
 /// digest is part of the public structural snapshot as well as the no-op
 /// projection identity.
 pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {

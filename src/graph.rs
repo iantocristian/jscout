@@ -323,7 +323,7 @@ fn symbol_kind(flags: SymbolFlags) -> &'static str {
 }
 
 /// Classify how a reference is used by walking a few ancestors.
-/// Returns (kind, member_property_if_namespace_access).
+/// Returns (kind, `member_property_if_namespace_access`).
 fn classify_reference<'a>(
     nodes: &oxc_semantic::AstNodes<'a>,
     node_id: oxc_syntax::node::NodeId,

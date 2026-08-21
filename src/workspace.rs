@@ -89,7 +89,7 @@ pub struct WorkspacePackage {
 pub struct WorkspaceMap {
     pub aliases: Alias,
     /// Declared first-party package roots. Canonical roots, rather than the
-    /// path used to reach them through node_modules, establish ownership.
+    /// path used to reach them through `node_modules`, establish ownership.
     pub packages: Vec<WorkspacePackage>,
     /// Exact specifiers (bare names, declared subpaths) whose mapping came
     /// straight from manifest data.
@@ -916,7 +916,7 @@ fn classified_is_dir(path: &Path, rejections: &mut Vec<WorkspaceRejection>) -> R
 }
 
 /// On-disk paths a package.json field value could denote, in preference
-/// order. TS-first for `.js` values (mirrors the resolver's extension_alias);
+/// order. TS-first for `.js` values (mirrors the resolver's `extension_alias`);
 /// every source extension for extensionless values.
 fn entry_candidates(field: &str, allow_build_output: bool) -> Vec<String> {
     let path = field.trim_start_matches("./");

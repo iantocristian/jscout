@@ -1,6 +1,6 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
-//! Exposes the index to agents: semantic_search, who_uses, definition,
-//! file_outline, events, neighborhood.
+//! Exposes the index to agents: `semantic_search`, `who_uses`, definition,
+//! `file_outline`, events, neighborhood.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
