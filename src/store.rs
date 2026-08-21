@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "24";
+pub const SCHEMA_VERSION: &str = "26";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -217,7 +217,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='24' WHERE key='schema_version';",
+             UPDATE meta SET value='26' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +235,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '24')
+INSERT INTO meta(key, value) VALUES('schema_version', '26')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -388,7 +388,8 @@ CREATE TABLE IF NOT EXISTS member_calls(
   property_end INTEGER NOT NULL DEFAULT 0,
   receiver_unbound INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
+CREATE INDEX IF NOT EXISTS idx_member_calls_file
+  ON member_calls(file_id, receiver_start, prop);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
 
 -- Source-local deterministic evidence. Identifier identities remain raw here
@@ -513,6 +514,8 @@ CREATE TABLE IF NOT EXISTS graph_nodes(
 );
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_display ON graph_nodes(display_name);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_file ON graph_nodes(file_id);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_native
+  ON graph_nodes(native_id, native_table);
 
 CREATE TABLE IF NOT EXISTS resolved_edges(
   id INTEGER PRIMARY KEY,
@@ -1045,6 +1048,13 @@ mod tests {
         open_read_only,
     };
 
+    fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>> {
+        let mut statement =
+            conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+        let rows = statement.query_map([index], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     #[test]
     fn read_only_open_never_creates_or_migrates_an_index() -> Result<()> {
         let missing_root = tempfile::tempdir()?;
@@ -1283,17 +1293,65 @@ mod tests {
     }
 
     #[test]
+    fn v24_rebuild_installs_native_graph_lookup_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v24.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "DROP INDEX idx_graph_nodes_native;
+             UPDATE meta SET value='24' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let migrated = open_path(&database)?;
+        let version: String = migrated.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            index_columns(&migrated, "idx_graph_nodes_native")?,
+            ["native_id", "native_table"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v25_rebuild_replaces_member_call_file_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v25.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "DROP INDEX idx_member_calls_file;
+             CREATE INDEX idx_member_calls_file ON member_calls(file_id);
+             UPDATE meta SET value='25' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let migrated = open_path(&database)?;
+        let version: String = migrated.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            index_columns(&migrated, "idx_member_calls_file")?,
+            ["file_id", "receiver_start", "prop"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn indexes_high_volume_evidence_tables_by_file() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = open(repo.path())?;
-        for index in ["idx_events_file", "idx_member_calls_file"] {
-            let column: String = conn.query_row(
-                &format!("SELECT name FROM pragma_index_info('{index}') WHERE seqno=0"),
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(column, "file_id", "{index} must index file_id first");
-        }
+        assert_eq!(index_columns(&conn, "idx_events_file")?, ["file_id"]);
+        assert_eq!(
+            index_columns(&conn, "idx_member_calls_file")?,
+            ["file_id", "receiver_start", "prop"]
+        );
         Ok(())
     }
 
