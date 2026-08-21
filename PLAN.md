@@ -2550,6 +2550,19 @@ connected seed before global fill. This proxy does not satisfy the registered
 historical gate: the original private corpus is absent, raw responses were not
 retained, and abbreviated calls cannot be reconstructed honestly.
 
+The prospective
+[`Next.js full-posture check`](eval/results/g20b-next-full-posture-2026-08-21.md)
+then exercised product code vectors, the local reranker, 599 semantic vectors,
+evidence-connected memory attachment, and both projections together. Across
+four fixed query pairs, paths preserved ordered hits and delivered artifact IDs,
+reduced bytes by 55.1%, nodes by 70.0%, and edges by 85.6%. The first pass found
+that multi-seed path selection could retain a real cross-file continuation that
+the equally bounded diagnostic neighborhood omitted. Neighborhood now reserves
+the selected path forest before filling its remaining fan-out budget; the full
+rerun made every path node and edge a subset in all four pairs. This is the
+required rich-response corpus point, but its 55.1% result does not clear or
+replace the unavailable historical 60% fixed-call gate.
+
 ### Implementation order and acceptance
 
 1. Preserve both exact call inventories and any recoverable raw responses before
@@ -2597,9 +2610,9 @@ Acceptance requires:
   and recovered high-value facts separately, without presenting strategy
   savings as transport savings;
 - the prospective real-corpus path-projection workload includes at least one
-  full-posture arm with vectors, reranking, and attached semantic memory. The
-  lexical n8n proxy validates graph projection only and cannot establish byte
-  behavior for the richest response shape;
+  full-posture arm with vectors, reranking, and attached semantic memory.
+  **Complete:** the Next.js check above supplies that point; the lexical n8n
+  proxy remains graph-projection-only evidence;
 - strict individual response-byte budgets and explicit omission reporting
   remain intact;
 - `source_limit: 0` performs a successful no-source artifact read and a
