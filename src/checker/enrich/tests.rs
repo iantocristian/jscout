@@ -1128,6 +1128,49 @@ fn seed_active_checker_batch(
 }
 
 #[test]
+fn input_freshness_cache_pins_first_digest_per_invocation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("ambient.d.ts");
+    let initial = b"declare const ambient: string;\n";
+    let changed = b"declare const ambient: number;\n";
+    fs::write(&path, initial)?;
+    let initial_hash = blake3::hash(initial).to_hex().to_string();
+    let changed_hash = blake3::hash(changed).to_hex().to_string();
+    let repository_input = ValidatedInput {
+        kind: "repository".into(),
+        path: "ambient.d.ts".into(),
+        source_hash: initial_hash.clone(),
+    };
+    let absolute_input = ValidatedInput {
+        kind: "absolute".into(),
+        path: path.to_string_lossy().into_owned(),
+        source_hash: initial_hash.clone(),
+    };
+
+    let mut invocation = InputFreshnessCache::new(root.path());
+    assert!(invocation.matches(&repository_input));
+    assert!(invocation.matches(&absolute_input));
+    assert_eq!(
+        invocation.digests.len(),
+        1,
+        "equivalent resolved paths must share one read"
+    );
+
+    fs::write(&path, changed)?;
+    assert!(
+        invocation.matches(&repository_input),
+        "one invocation consistently uses the first observed digest"
+    );
+    let mut next_invocation = InputFreshnessCache::new(root.path());
+    assert!(!next_invocation.matches(&repository_input));
+    assert!(next_invocation.matches(&ValidatedInput {
+        source_hash: changed_hash,
+        ..absolute_input
+    }));
+    Ok(())
+}
+
+#[test]
 fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let source = "export class CardTable { insert(): void {} }\n\
@@ -1199,23 +1242,24 @@ fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<(
             force_new: false,
         },
     )?;
+    let mut input_freshness = InputFreshnessCache::new(repo.path());
     let carried = carry_forward_projects(
-        repo.path(),
         &conn,
         batch_id,
         &identity,
         2,
         &projects,
         &project_fingerprints,
+        &mut input_freshness,
     )?;
     assert_eq!(carried.projects_carried, 1);
     assert_eq!(carried.occurrences_carried, 1);
     assert!(carried.projects_requiring_check.is_empty());
     assert!(project_complete_and_fresh(
-        repo.path(),
         &conn,
         batch_id,
-        "tsconfig.json"
+        "tsconfig.json",
+        &mut input_freshness,
     )?);
     let rebound: i64 = conn.query_row(
         "SELECT member_call_id FROM checker_occurrence_projects
@@ -1316,13 +1360,13 @@ fn changed_external_input_prevents_project_carry() -> Result<()> {
         },
     )?;
     let carried = carry_forward_projects(
-        repo.path(),
         &conn,
         batch_id,
         &identity,
         2,
         &projects,
         &project_fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
     )?;
     assert_eq!(carried.projects_carried, 0);
     assert_eq!(carried.occurrences_carried, 0);
@@ -1393,13 +1437,13 @@ fn one_changed_owner_prevents_every_owner_from_carrying_an_occurrence() -> Resul
         },
     )?;
     let carried = carry_forward_projects(
-        repo.path(),
         &conn,
         batch_id,
         &identity,
         2,
         &projects,
         &current_fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
     )?;
     assert_eq!(carried.projects_carried, 0);
     assert_eq!(carried.occurrences_carried, 0);
@@ -1485,13 +1529,13 @@ fn changed_target_content_prevents_fact_carry_even_when_project_scope_is_stable(
         },
     )?;
     let carried = carry_forward_projects(
-        repo.path(),
         &conn,
         batch_id,
         &identity,
         2,
         &projects,
         &fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
     )?;
     assert_eq!(carried.occurrences_carried, 0);
     assert_eq!(
