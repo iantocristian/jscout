@@ -14,6 +14,7 @@ mod dependency;
 mod embed;
 mod entity;
 mod file_role;
+mod fs_ops;
 mod graph;
 mod heur;
 mod indexer;
@@ -35,6 +36,8 @@ mod stats;
 mod store;
 mod structural;
 mod surface;
+#[cfg(test)]
+mod test_fs;
 mod walk;
 mod watch;
 mod workspace;

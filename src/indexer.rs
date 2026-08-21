@@ -7,6 +7,7 @@ use rusqlite::{Connection, params};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
+use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
 use crate::{file_role, io_policy, parse, store, walk};
@@ -57,27 +58,6 @@ pub struct IndexRejection {
 
 fn retryable_read_failure(path: &str, error: std::io::Error) -> anyhow::Error {
     anyhow::Error::new(error).context(format!("retryable read failure for `{path}`"))
-}
-
-fn read_source(path: &Path) -> std::io::Result<String> {
-    #[cfg(test)]
-    if let Some(error) = TEST_READ_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
-        return Err(error);
-    }
-    std::fs::read_to_string(path)
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_READ_FAILURES: std::cell::RefCell<HashMap<PathBuf, std::io::Error>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-#[cfg(test)]
-fn inject_read_failure(path: PathBuf, error: std::io::Error) {
-    TEST_READ_FAILURES.with(|failures| {
-        failures.borrow_mut().insert(path, error);
-    });
 }
 
 impl IndexOutcome {
@@ -190,6 +170,34 @@ pub fn index_repo_with_options(
         true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
+        &OsFileSystem,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn index_repo_with_fs(
+    root: &Path,
+    conn: &Connection,
+    fs: &impl FileSystem,
+) -> Result<IndexOutcome> {
+    index_repo_with_options_and_fs(root, conn, &IndexOptions::default(), fs)
+}
+
+#[cfg(test)]
+pub(crate) fn index_repo_with_options_and_fs(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+    fs: &impl FileSystem,
+) -> Result<IndexOutcome> {
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::Incremental,
+        CheckerRetention::Drop,
+        fs,
     )
 }
 
@@ -210,6 +218,7 @@ pub fn incremental_refresh_repo_with_options(
         true,
         IndexMode::Incremental,
         CheckerRetention::PreserveActiveForWatch,
+        &OsFileSystem,
     )
 }
 
@@ -227,6 +236,7 @@ pub fn refresh_repo_with_options(
         true,
         IndexMode::FullRefresh,
         CheckerRetention::Drop,
+        &OsFileSystem,
     )
 }
 
@@ -245,6 +255,7 @@ pub fn watch_full_refresh_repo_with_options(
         true,
         IndexMode::FullRefresh,
         CheckerRetention::PreserveActiveForWatch,
+        &OsFileSystem,
     )
 }
 
@@ -276,6 +287,7 @@ pub(crate) fn index_repo_without_extraction_reset(
         false,
         IndexMode::Incremental,
         CheckerRetention::Drop,
+        &OsFileSystem,
     )
 }
 
@@ -286,10 +298,12 @@ fn index_repo_impl(
     allow_extraction_reset: bool,
     mode: IndexMode,
     checker_retention: CheckerRetention,
+    fs: &impl FileSystem,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory = walk::source_inventory(&root)?;
-    let workspace_discovery = crate::workspace::WorkspaceMap::discover(&root, &inventory.files)?;
+    let workspace_discovery =
+        crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, fs)?;
     let workspace = workspace_discovery.map;
     let mut outcome = IndexOutcome {
         indexed: 0,
@@ -377,7 +391,7 @@ fn index_repo_impl(
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {
             let rel = display_repository_path(&root, file);
-            let source = match read_source(file) {
+            let source = match fs.read_to_string(file) {
                 Ok(source) => {
                     seen.insert(rel.clone());
                     source
@@ -460,7 +474,7 @@ fn index_repo_impl(
         // publication before failing.
         let discovered = dependency::discover(&root, conn, &options.dependencies, &workspace)?;
         let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
-        let prepared = prepare_dependency_files(&plans, &mut outcome)?;
+        let prepared = prepare_dependency_files(&plans, &mut outcome, fs)?;
 
         conn.execute(
             "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
@@ -875,6 +889,7 @@ fn insert_file(
 fn prepare_dependency_files(
     plans: &[dependency::PackagePlan],
     outcome: &mut IndexOutcome,
+    fs: &impl FileSystem,
 ) -> Result<Vec<PreparedDependencyFile>> {
     let mut prepared = Vec::new();
     for plan in plans {
@@ -890,7 +905,7 @@ fn prepare_dependency_files(
         ));
         for file in &plan.files {
             let display = dependency_display_path(&plan.package, &file.package_path);
-            let source = match read_source(&file.source_path) {
+            let source = match fs.read_to_string(&file.source_path) {
                 Ok(source) => source,
                 Err(error) if io_policy::is_inventory_race(&error) => continue,
                 Err(error) if io_policy::is_retryable(&error) => {
