@@ -5,7 +5,6 @@
 //! package root, and then compares it with declared workspace roots.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +12,7 @@ use oxc_resolver::{Resolver, TsconfigDiscovery};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+use crate::fs_ops::FileSystem;
 use crate::indexer::{package_name, resolver_options};
 use crate::package_exports::collect_active_targets;
 use crate::store;
@@ -78,6 +78,7 @@ pub fn discover(
     conn: &Connection,
     selectors: &[String],
     workspace: &WorkspaceMap,
+    fs: &impl FileSystem,
 ) -> Result<Vec<DiscoveredPackage>> {
     let selectors = normalized_selectors(selectors)?;
     if selectors.is_empty() {
@@ -111,8 +112,8 @@ pub fn discover(
             else {
                 continue;
             };
-            if let Some(package_root) = owning_package_root(resolution.path(), &selector)? {
-                let discovered = read_instance(root, &package_root, workspace)?;
+            if let Some(package_root) = owning_package_root(resolution.path(), &selector, fs)? {
+                let discovered = read_instance(root, &package_root, workspace, fs)?;
                 found.insert(discovered.canonical_root.clone(), discovered);
             }
         }
@@ -123,7 +124,7 @@ pub fn discover(
         if !found.values().any(|package| package.name == selector) {
             let logical_root = root.join("node_modules").join(&selector);
             if logical_root.join("package.json").is_file() {
-                let discovered = read_instance(root, &logical_root, workspace)?;
+                let discovered = read_instance(root, &logical_root, workspace, fs)?;
                 found.insert(discovered.canonical_root.clone(), discovered);
             }
         }
@@ -144,6 +145,7 @@ pub fn discover(
 pub fn plan_packages(
     packages: &[DiscoveredPackage],
     limits: DependencyLimits,
+    fs: &impl FileSystem,
 ) -> Result<Vec<PackagePlan>> {
     if limits.max_files == 0 || limits.max_bytes == 0 || limits.max_file_bytes == 0 {
         bail!("dependency file and byte limits must be greater than zero");
@@ -151,7 +153,7 @@ pub fn plan_packages(
     packages
         .iter()
         .filter(|package| package.origin == "dependency")
-        .map(|package| plan_package(package, limits))
+        .map(|package| plan_package(package, limits, fs))
         .collect()
 }
 
@@ -308,16 +310,21 @@ pub fn should_skip_minified(path: &Path, source: &str, forced_entry: bool) -> bo
     first.len() > 4_000 && lines.take(4).all(|line| line.len() > 1_000)
 }
 
-fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result<PackagePlan> {
+fn plan_package(
+    package: &DiscoveredPackage,
+    limits: DependencyLimits,
+    fs: &impl FileSystem,
+) -> Result<PackagePlan> {
     let manifest_path = package.canonical_root.join("package.json");
-    let text = fs::read_to_string(&manifest_path)
+    let text = fs
+        .read_to_string(&manifest_path)
         .with_context(|| format!("read dependency manifest {}", manifest_path.display()))?;
     let manifest: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse dependency manifest {}", manifest_path.display()))?;
     let (roots, forced_entries, source_basis) = analysis_roots(package, &manifest);
     let mut candidates = Vec::new();
     for root in roots {
-        collect_indexable_files(&root, &mut candidates)?;
+        collect_indexable_files(&root, &mut candidates, fs)?;
     }
     candidates.sort();
     candidates.dedup();
@@ -345,7 +352,7 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
             continue;
         };
         let package_path = package_path.to_string_lossy().replace('\\', "/");
-        let bytes = fs::metadata(&source_path).map_or(0, |meta| meta.len());
+        let bytes = fs.metadata(&source_path).map_or(0, |meta| meta.len());
         if bytes > limits.max_file_bytes
             || files.len() >= limits.max_files
             || selected_bytes.saturating_add(bytes) > limits.max_bytes
@@ -530,20 +537,25 @@ fn relative_files(package_root: &Path, targets: &[PathBuf]) -> BTreeSet<String> 
         .collect()
 }
 
-fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_indexable_files(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    fs: &impl FileSystem,
+) -> Result<()> {
     if root.is_file() {
         if walk::is_indexable(root) {
             out.push(root.to_path_buf());
         }
         return Ok(());
     }
-    let entries = fs::read_dir(root)
+    let entries = fs
+        .read_dir(root)
         .with_context(|| format!("read dependency directory {}", root.display()))?;
     for entry in entries {
         let entry = entry
             .with_context(|| format!("read dependency directory entry in {}", root.display()))?;
-        let file_type = entry
-            .file_type()
+        let file_type = fs
+            .file_type(&entry)
             .with_context(|| format!("read dependency file type {}", entry.path().display()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -552,7 +564,7 @@ fn collect_indexable_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
         let path = entry.path();
         if file_type.is_dir() {
-            collect_indexable_files(&path, out)?;
+            collect_indexable_files(&path, out, fs)?;
         } else if file_type.is_file() && walk::is_indexable(&path) {
             out.push(path);
         }
@@ -604,7 +616,11 @@ fn importer_requests(root: &Path, conn: &Connection) -> Result<Vec<(PathBuf, Str
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-fn owning_package_root(resolved: &Path, expected_name: &str) -> Result<Option<PathBuf>> {
+fn owning_package_root(
+    resolved: &Path,
+    expected_name: &str,
+    fs: &impl FileSystem,
+) -> Result<Option<PathBuf>> {
     let resolved = resolved
         .canonicalize()
         .unwrap_or_else(|_| resolved.to_path_buf());
@@ -616,7 +632,8 @@ fn owning_package_root(resolved: &Path, expected_name: &str) -> Result<Option<Pa
     loop {
         let manifest = current.join("package.json");
         if manifest.is_file() {
-            let text = fs::read_to_string(&manifest)
+            let text = fs
+                .read_to_string(&manifest)
                 .with_context(|| format!("read dependency manifest {}", manifest.display()))?;
             let package: serde_json::Value = serde_json::from_str(&text)
                 .with_context(|| format!("parse dependency manifest {}", manifest.display()))?;
@@ -634,12 +651,14 @@ fn read_instance(
     root: &Path,
     package_root: &Path,
     workspace: &WorkspaceMap,
+    fs: &impl FileSystem,
 ) -> Result<DiscoveredPackage> {
     let canonical_root = package_root
         .canonicalize()
         .with_context(|| format!("canonicalize package root {}", package_root.display()))?;
     let manifest = canonical_root.join("package.json");
-    let text = fs::read_to_string(&manifest)
+    let text = fs
+        .read_to_string(&manifest)
         .with_context(|| format!("read dependency manifest {}", manifest.display()))?;
     let package: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse dependency manifest {}", manifest.display()))?;
@@ -688,14 +707,14 @@ fn display_locator(root: &Path, package_root: &Path) -> String {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
+    use std::io::ErrorKind;
     use std::path::Path;
 
     use anyhow::Result;
 
-    use super::{
-        DependencyLimits, DiscoveredPackage, collect_indexable_files, discover, plan_packages,
-        should_skip_minified,
-    };
+    use super::{DependencyLimits, DiscoveredPackage, PackagePlan, should_skip_minified};
+    use crate::fs_ops::OsFileSystem;
+    use crate::test_fs::{FaultFileSystem, FileOperation};
     use crate::{store, workspace::WorkspaceMap};
 
     fn write(path: &Path, content: &str) -> Result<()> {
@@ -709,12 +728,150 @@ mod tests {
         Ok(WorkspaceMap::discover(root, &inventory.files)?.map)
     }
 
+    fn discover(
+        root: &Path,
+        conn: &rusqlite::Connection,
+        selectors: &[String],
+        workspace: &WorkspaceMap,
+    ) -> Result<Vec<DiscoveredPackage>> {
+        super::discover(root, conn, selectors, workspace, &OsFileSystem)
+    }
+
+    fn plan_packages(
+        packages: &[DiscoveredPackage],
+        limits: DependencyLimits,
+    ) -> Result<Vec<PackagePlan>> {
+        super::plan_packages(packages, limits, &OsFileSystem)
+    }
+
+    fn discovered_dependency(root: &Path) -> Result<DiscoveredPackage> {
+        Ok(DiscoveredPackage {
+            origin: "dependency".into(),
+            name: "dep".into(),
+            version: Some("1.0.0".into()),
+            canonical_root: root.canonicalize()?,
+            locator: "node_modules/dep".into(),
+            manifest_hash: "hash".into(),
+        })
+    }
+
     #[test]
     fn dependency_traversal_errors_are_not_silently_dropped() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        let mut files = Vec::new();
+        let root = repo.path().canonicalize()?;
+        let manifest = root.join("package.json");
+        let source_root = root.join("src");
+        write(
+            &manifest,
+            r#"{"name":"dep","version":"1.0.0","source":"src/index.ts"}"#,
+        )?;
+        write(&source_root.join("index.ts"), "export default 1;\n")?;
+        let package = discovered_dependency(&root)?;
+        let fault_fs = FaultFileSystem::default();
+        fault_fs.fail_operation(
+            FileOperation::ReadDir,
+            source_root.clone(),
+            std::io::Error::new(ErrorKind::PermissionDenied, "injected traversal failure"),
+        );
 
-        assert!(collect_indexable_files(&repo.path().join("missing"), &mut files).is_err());
+        let error =
+            super::plan_packages(&[package], DependencyLimits::default(), &fault_fs).unwrap_err();
+
+        assert!(error.to_string().contains(&format!(
+            "read dependency directory {}",
+            source_root.display()
+        )));
+        assert!(format!("{error:#}").contains("injected traversal failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_planning_manifest_errors_are_not_silently_dropped() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        let manifest = root.join("package.json");
+        write(
+            &manifest,
+            r#"{"name":"dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        write(&root.join("index.js"), "module.exports = 1;\n")?;
+        let package = discovered_dependency(&root)?;
+        let fault_fs = FaultFileSystem::default();
+        fault_fs.fail_operation(
+            FileOperation::ReadToString,
+            manifest.clone(),
+            std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "injected planning manifest failure",
+            ),
+        );
+
+        let error =
+            super::plan_packages(&[package], DependencyLimits::default(), &fault_fs).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("read dependency manifest {}", manifest.display()))
+        );
+        assert!(format!("{error:#}").contains("injected planning manifest failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_metadata_errors_keep_the_existing_zero_byte_fallback() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        write(
+            &root.join("package.json"),
+            r#"{"name":"dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        let entry = root.join("index.js");
+        write(&entry, "module.exports = 1;\n")?;
+        let package = discovered_dependency(&root)?;
+        let fault_fs = FaultFileSystem::default();
+        fault_fs.fail_operation(
+            FileOperation::Metadata,
+            entry,
+            std::io::Error::new(ErrorKind::PermissionDenied, "injected metadata failure"),
+        );
+
+        let plans = super::plan_packages(&[package], DependencyLimits::default(), &fault_fs)?;
+
+        assert_eq!(plans[0].files.len(), 1);
+        assert_eq!(plans[0].files[0].bytes, 0);
+        assert_eq!(plans[0].status, "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_manifest_read_errors_use_the_operation_filesystem() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path();
+        let manifest = root.join("node_modules/dep/package.json");
+        write(
+            &manifest,
+            r#"{"name":"dep","version":"1.0.0","main":"index.js"}"#,
+        )?;
+        write(
+            &root.join("node_modules/dep/index.js"),
+            "module.exports = 1;\n",
+        )?;
+        let conn = store::open(root)?;
+        importer(&conn, root, "src/main.ts", "dep")?;
+        let workspace = workspace(root)?;
+        let fault_fs = FaultFileSystem::default();
+        fault_fs.fail_operation(
+            FileOperation::ReadToString,
+            manifest.canonicalize()?,
+            std::io::Error::new(ErrorKind::PermissionDenied, "injected manifest failure"),
+        );
+
+        let error =
+            super::discover(root, &conn, &["dep".into()], &workspace, &fault_fs).unwrap_err();
+
+        assert!(error.to_string().contains("read dependency manifest"));
+        assert!(format!("{error:#}").contains("injected manifest failure"));
         Ok(())
     }
 
@@ -856,14 +1013,7 @@ mod tests {
             &package_root.path().join("dist/index.js"),
             "exports.entry = 1;\n",
         )?;
-        let package = DiscoveredPackage {
-            origin: "dependency".into(),
-            name: "dep".into(),
-            version: Some("1.0.0".into()),
-            canonical_root: package_root.path().canonicalize()?,
-            locator: "node_modules/dep".into(),
-            manifest_hash: "hash".into(),
-        };
+        let package = discovered_dependency(package_root.path())?;
 
         let plans = plan_packages(
             &[package],
@@ -907,14 +1057,7 @@ mod tests {
                 .join("dist/node_modules/nested/index.js"),
             "module.exports = 1;\n",
         )?;
-        let package = DiscoveredPackage {
-            origin: "dependency".into(),
-            name: "dep".into(),
-            version: Some("1.0.0".into()),
-            canonical_root: package_root.path().canonicalize()?,
-            locator: "node_modules/dep".into(),
-            manifest_hash: "hash".into(),
-        };
+        let package = discovered_dependency(package_root.path())?;
 
         let plans = plan_packages(&[package], DependencyLimits::default())?;
         let paths: Vec<&str> = plans[0]
@@ -944,14 +1087,7 @@ mod tests {
             &package_root.path().join("esm/index.js"),
             "export const skipped = true;\n",
         )?;
-        let package = DiscoveredPackage {
-            origin: "dependency".into(),
-            name: "dep".into(),
-            version: Some("1.0.0".into()),
-            canonical_root: package_root.path().canonicalize()?,
-            locator: "node_modules/dep".into(),
-            manifest_hash: "hash".into(),
-        };
+        let package = discovered_dependency(package_root.path())?;
 
         let plans = plan_packages(&[package], DependencyLimits::default())?;
         let paths: Vec<&str> = plans[0]

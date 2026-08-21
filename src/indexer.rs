@@ -170,7 +170,7 @@ pub fn index_repo_with_options(
         true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
-        &OsFileSystem,
+        IndexOperation::new(&OsFileSystem),
     )
 }
 
@@ -197,7 +197,7 @@ pub(crate) fn index_repo_with_options_and_fs(
         true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
-        fs,
+        IndexOperation::new(fs),
     )
 }
 
@@ -218,7 +218,7 @@ pub fn incremental_refresh_repo_with_options(
         true,
         IndexMode::Incremental,
         CheckerRetention::PreserveActiveForWatch,
-        &OsFileSystem,
+        IndexOperation::new(&OsFileSystem),
     )
 }
 
@@ -236,7 +236,7 @@ pub fn refresh_repo_with_options(
         true,
         IndexMode::FullRefresh,
         CheckerRetention::Drop,
-        &OsFileSystem,
+        IndexOperation::new(&OsFileSystem),
     )
 }
 
@@ -255,7 +255,7 @@ pub fn watch_full_refresh_repo_with_options(
         true,
         IndexMode::FullRefresh,
         CheckerRetention::PreserveActiveForWatch,
-        &OsFileSystem,
+        IndexOperation::new(&OsFileSystem),
     )
 }
 
@@ -269,6 +269,19 @@ enum IndexMode {
 enum CheckerRetention {
     Drop,
     PreserveActiveForWatch,
+}
+
+/// Environment capabilities shared by every filesystem-sensitive phase of a
+/// single indexing operation. User policy remains plain data in
+/// `IndexOptions`; this private context carries the replaceable runtime seam.
+struct IndexOperation<'a, F: FileSystem> {
+    fs: &'a F,
+}
+
+impl<'a, F: FileSystem> IndexOperation<'a, F> {
+    const fn new(fs: &'a F) -> Self {
+        Self { fs }
+    }
 }
 
 /// The pre-reset code path: always replace files one at a time, even when
@@ -287,23 +300,23 @@ pub(crate) fn index_repo_without_extraction_reset(
         false,
         IndexMode::Incremental,
         CheckerRetention::Drop,
-        &OsFileSystem,
+        IndexOperation::new(&OsFileSystem),
     )
 }
 
-fn index_repo_impl(
+fn index_repo_impl<F: FileSystem>(
     root: &Path,
     conn: &Connection,
     options: &IndexOptions,
     allow_extraction_reset: bool,
     mode: IndexMode,
     checker_retention: CheckerRetention,
-    fs: &impl FileSystem,
+    operation: IndexOperation<'_, F>,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory = walk::source_inventory(&root)?;
     let workspace_discovery =
-        crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, fs)?;
+        crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
     let mut outcome = IndexOutcome {
         indexed: 0,
@@ -391,7 +404,7 @@ fn index_repo_impl(
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {
             let rel = display_repository_path(&root, file);
-            let source = match fs.read_to_string(file) {
+            let source = match operation.fs.read_to_string(file) {
                 Ok(source) => {
                     seen.insert(rel.clone());
                     source
@@ -472,9 +485,11 @@ fn index_repo_impl(
         // rows. Reading and parsing the selected corpus here closes the gap
         // where one transient dependency file previously invalidated the old
         // publication before failing.
-        let discovered = dependency::discover(&root, conn, &options.dependencies, &workspace)?;
-        let plans = dependency::plan_packages(&discovered, options.dependency_limits)?;
-        let prepared = prepare_dependency_files(&plans, &mut outcome, fs)?;
+        let discovered =
+            dependency::discover(&root, conn, &options.dependencies, &workspace, operation.fs)?;
+        let plans =
+            dependency::plan_packages(&discovered, options.dependency_limits, operation.fs)?;
+        let prepared = prepare_dependency_files(&plans, &mut outcome, operation.fs)?;
 
         conn.execute(
             "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
