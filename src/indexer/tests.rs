@@ -9,7 +9,7 @@ use super::{
     index_repo_with_options, index_repo_with_options_and_fs, index_repo_without_extraction_reset,
     refresh_repo_with_options,
 };
-use crate::test_fs::FaultFileSystem;
+use crate::test_fs::{FaultFileSystem, FileOperation};
 use crate::{embed, origin, query, search, semantic, store, structural};
 
 #[test]
@@ -1914,7 +1914,8 @@ fn retryable_dependency_read_preserves_the_published_snapshot() -> Result<()> {
         "import value from 'selected-dep';\nexport const after = value + 1;\n",
     )?;
     let fault_fs = FaultFileSystem::default();
-    fault_fs.fail(
+    fault_fs.fail_operation(
+        FileOperation::ReadToString,
         entry.canonicalize()?,
         std::io::Error::from(ErrorKind::Interrupted),
     );
