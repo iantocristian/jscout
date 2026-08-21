@@ -1,0 +1,753 @@
+<title>jscout Refactor Ladder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&amp;family=Newsreader:opsz,wght@6..72,400;6..72,500&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap">
+
+<style>
+  /* ---- light palette: the complete token set ---- */
+  :root {
+    --ground:      #F4F5F7;
+    --surface:     #FFFFFF;
+    --surface-alt: #EBEDF1;
+    --ink:         #16181D;
+    --ink-soft:    #3A4049;
+    --muted:       #5C636E;
+    --faint:       #878E99;
+    --rule:        #DFE2E7;
+    --rule-strong: #C6CBD3;
+    --accent:      #B4471F;
+    --accent-soft: #F3E3DC;
+
+    --safe:        #2F7D5D;
+    --safe-bg:     #E4F0EA;
+    --caution:     #9A6B12;
+    --caution-bg:  #F6EDDB;
+    --risk:        #A03A2E;
+    --risk-bg:     #F6E2DF;
+
+    --shadow: 0 1px 2px rgba(22, 24, 29, .05), 0 8px 24px -16px rgba(22, 24, 29, .25);
+
+    --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --serif: "Newsreader", Georgia, "Times New Roman", serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #14161A;
+      --surface:     #1C1F25;
+      --surface-alt: #23272E;
+      --ink:         #E6E8EC;
+      --ink-soft:    #C7CCD4;
+      --muted:       #9AA3AF;
+      --faint:       #6F7883;
+      --rule:        #2C313A;
+      --rule-strong: #3D444F;
+      --accent:      #E4703F;
+      --accent-soft: #38251D;
+
+      --safe:        #5FBF92;
+      --safe-bg:     #172B23;
+      --caution:     #D9A441;
+      --caution-bg:  #2E2617;
+      --risk:        #E07A6B;
+      --risk-bg:     #33201D;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .8);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #14161A;
+    --surface:     #1C1F25;
+    --surface-alt: #23272E;
+    --ink:         #E6E8EC;
+    --ink-soft:    #C7CCD4;
+    --muted:       #9AA3AF;
+    --faint:       #6F7883;
+    --rule:        #2C313A;
+    --rule-strong: #3D444F;
+    --accent:      #E4703F;
+    --accent-soft: #38251D;
+
+    --safe:        #5FBF92;
+    --safe-bg:     #172B23;
+    --caution:     #D9A441;
+    --caution-bg:  #2E2617;
+    --risk:        #E07A6B;
+    --risk-bg:     #33201D;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px -16px rgba(0, 0, 0, .8);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 18px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 60rem; margin: 0 auto; }
+
+  /* ---------- masthead ---------- */
+  .masthead {
+    padding: 4.5rem 0 2rem;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .7rem;
+    font-weight: 500;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: clamp(2.1rem, 5.5vw, 3.1rem);
+    line-height: 1.06;
+    letter-spacing: -.024em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 1.16rem;
+    color: var(--ink-soft);
+    max-width: 40rem;
+    margin: 0;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1.5rem;
+    font-family: var(--mono);
+    font-size: .74rem;
+    color: var(--muted);
+    letter-spacing: .01em;
+    padding-top: .4rem;
+  }
+  .meta b { color: var(--ink); font-weight: 500; }
+
+  /* ---------- typography ---------- */
+  h2 {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 1.62rem;
+    letter-spacing: -.018em;
+    line-height: 1.2;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 1.06rem;
+    letter-spacing: -.008em;
+    margin: 0 0 .1rem;
+    text-wrap: balance;
+  }
+  h4 {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: .72rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+  p { margin: 0; max-width: 40rem; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible,
+  summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  strong { font-weight: 500; color: var(--ink); }
+  code {
+    font-family: var(--mono);
+    font-size: .84em;
+    background: var(--surface-alt);
+    padding: .1em .34em;
+    border-radius: 3px;
+    color: var(--ink);
+  }
+
+  section { padding-top: 3.5rem; display: flex; flex-direction: column; gap: 1.15rem; }
+
+  .lede { font-size: 1.05rem; color: var(--ink-soft); }
+
+  /* ---------- tier chips ---------- */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    font-family: var(--mono);
+    font-size: .66rem;
+    font-weight: 500;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: .2rem .5rem;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .chip.safe    { background: var(--safe-bg);    color: var(--safe); }
+  .chip.caution { background: var(--caution-bg); color: var(--caution); }
+  .chip.risk    { background: var(--risk-bg);    color: var(--risk); }
+
+  /* ---------- legend ---------- */
+  .legend {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 0;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .legend-cell {
+    padding: 1rem 1.1rem;
+    border-right: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+  .legend-cell:last-child { border-right: none; }
+  .legend-cell p { font-size: .88rem; color: var(--muted); line-height: 1.45; }
+  .legend-cell .n {
+    font-family: var(--mono);
+    font-size: .72rem;
+    color: var(--faint);
+  }
+
+  /* ---------- phase blocks with numbered rail ---------- */
+  .phase {
+    display: grid;
+    grid-template-columns: 3.4rem 1fr;
+    gap: 0 1.4rem;
+    align-items: start;
+  }
+  .rail {
+    font-family: var(--mono);
+    font-size: .78rem;
+    font-weight: 700;
+    color: var(--accent);
+    padding-top: .34rem;
+    text-align: right;
+    letter-spacing: .02em;
+  }
+  .phase-body { display: flex; flex-direction: column; gap: .9rem; min-width: 0; }
+  .phase-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .7rem; }
+
+  /* ---------- steps ---------- */
+  ol.steps, ul.plain {
+    margin: 0;
+    padding-left: 1.15rem;
+    display: flex;
+    flex-direction: column;
+    gap: .55rem;
+    max-width: 40rem;
+  }
+  ol.steps li::marker { font-family: var(--mono); font-size: .82rem; color: var(--faint); }
+  ul.plain li::marker { color: var(--rule-strong); }
+  li { padding-left: .15rem; }
+
+  /* ---------- cards ---------- */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: 1.15rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: .7rem;
+    box-shadow: var(--shadow);
+  }
+  .card.flag { border-left: 3px solid var(--accent); }
+  .card.warn { border-left: 3px solid var(--risk); }
+  .card p, .card ul { font-size: .95rem; }
+
+  /* ---------- code ---------- */
+  pre {
+    font-family: var(--mono);
+    font-size: .78rem;
+    line-height: 1.6;
+    background: var(--surface-alt);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    margin: 0;
+    color: var(--ink);
+    tab-size: 2;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .cmt { color: var(--faint); }
+  .kw  { color: var(--accent); }
+  .ok  { color: var(--safe); }
+
+  /* ---------- tables ---------- */
+  .tw { overflow-x: auto; border: 1px solid var(--rule); border-radius: 5px; background: var(--surface); }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-family: var(--sans);
+    font-size: .84rem;
+    min-width: 34rem;
+  }
+  th {
+    text-align: left;
+    font-family: var(--mono);
+    font-size: .64rem;
+    font-weight: 500;
+    letter-spacing: .11em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: .7rem .85rem;
+    border-bottom: 1px solid var(--rule-strong);
+    white-space: nowrap;
+  }
+  td {
+    padding: .6rem .85rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-soft);
+    vertical-align: top;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.path { font-family: var(--mono); font-size: .78rem; color: var(--ink); white-space: nowrap; }
+  tfoot td {
+    border-top: 1px solid var(--rule-strong);
+    font-family: var(--mono);
+    font-size: .76rem;
+    color: var(--ink);
+    background: var(--surface-alt);
+  }
+
+  /* ---------- callout ---------- */
+  .note {
+    border-left: 2px solid var(--rule-strong);
+    padding: .1rem 0 .1rem 1.1rem;
+    color: var(--muted);
+    font-size: .95rem;
+    max-width: 40rem;
+  }
+  .note b { color: var(--ink); font-weight: 500; }
+
+  /* ---------- gate ---------- */
+  .gate {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent);
+    border-radius: 5px;
+    padding: 1.05rem 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: .7rem;
+  }
+  .gate h4 { color: var(--accent); }
+
+  details {
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--surface);
+    padding: .8rem 1rem;
+  }
+  summary {
+    cursor: pointer;
+    font-family: var(--sans);
+    font-weight: 500;
+    font-size: .95rem;
+  }
+  details > *:not(summary) { margin-top: .8rem; }
+
+  hr.sep { border: none; border-top: 1px solid var(--rule); margin: 0; }
+
+  footer {
+    padding-top: 3.5rem;
+    color: var(--faint);
+    font-family: var(--mono);
+    font-size: .72rem;
+    line-height: 1.7;
+  }
+
+  @media (max-width: 34rem) {
+    body { font-size: 17px; }
+    .phase { grid-template-columns: 1fr; gap: .5rem; }
+    .rail { text-align: left; padding-top: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">jscout · rust · 2026-08-21</div>
+    <h1>Refactor Ladder</h1>
+    <p class="standfirst">The first refactor ladder shipped in PRs #65–#68. The next work is production-module decomposition, kept separate from behavioral and performance changes.</p>
+    <div class="meta">
+      <span>current baseline <b>b0aa10b</b></span>
+      <span>PRs <b>#65–#68 merged</b></span>
+      <span>68 Rust files</span>
+      <span>397 tests</span>
+    </div>
+  </header>
+
+  <section>
+    <h4>Where things stand</h4>
+    <h2>The original ladder is complete</h2>
+    <p class="lede">PR #65 extracted 18 large test modules. PR #66 applied the reviewed mechanical fixes. PR #67 centralized the CLI flag and list-resolution rules and added direct truth-table coverage. PR #68 installed the lint ratchet and suppression policy. The resulting baseline has 397 tests, no source <code>#[allow]</code> attributes, and CI enforcement through <code>-D warnings</code>.</p>
+    <p>The next work is not a continuation of the mechanical cleanup. It is production-code decomposition, followed by separately measured behavioral and performance work.</p>
+
+    <div class="card flag">
+      <h3>Two constraints worth knowing before you buy any of it</h3>
+      <p><strong>There is still no Rust benchmark harness.</strong> No criterion, no <code>[[bench]]</code> target. Allocation removals can be established structurally, but a claimed speedup requires a reproducible release-mode baseline first.</p>
+      <p><strong>Import grouping cannot be enforced on stable.</strong> Verified against 1.97.1: <code>group_imports</code> and <code>imports_granularity</code> both refuse with <em>unstable features are only available in nightly channel</em>. A <code>rustfmt.toml</code> cannot tidy import blocks without a nightly fmt step in CI.</p>
+    </div>
+  </section>
+
+  <section>
+    <h4>The axis</h4>
+    <h2>Four tiers, ordered by what breaks if I am wrong</h2>
+
+    <div class="legend">
+      <div class="legend-cell">
+        <span class="chip safe">Tier 1</span>
+        <span class="n">shipped · #66</span>
+        <p>Reviewed mechanical lint fixes, including 19 production clone removals.</p>
+      </div>
+      <div class="legend-cell">
+        <span class="chip safe">Tier 2</span>
+        <span class="n">shipped · #67</span>
+        <p>CLI resolution helpers plus direct truth-table and fallback tests.</p>
+      </div>
+      <div class="legend-cell">
+        <span class="chip caution">Tier 3</span>
+        <span class="n">shipped · #65</span>
+        <p>18,864 test lines moved to sibling files without changing module paths.</p>
+      </div>
+      <div class="legend-cell">
+        <span class="chip safe">Ratchet</span>
+        <span class="n">shipped · #68</span>
+        <p>35 package-wide Clippy rules plus production-only <code>redundant_clone</code>.</p>
+      </div>
+    </div>
+
+    <p class="note"><b>Historical ordering.</b> The test extraction landed first so <code>blame -C</code> can track the pure moves. Mechanical edits and the lint ratchet followed only after the move was independently verified.</p>
+  </section>
+
+  <hr class="sep" style="margin-top:3.5rem">
+
+  <section>
+    <div class="phase">
+      <div class="rail">00</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Guardrails</h2></div>
+        <p>Before any file changes. The point is a check that fails loudly on the one thing a bulk move could silently break: a test that stops being compiled and therefore stops running.</p>
+
+        <ol class="steps">
+          <li>Capture the canonical test inventory: <code>cargo test -- --list</code>, sorted, written to a file outside the tree.</li>
+          <li>Record the baseline: 397 passing, 0 clippy warnings, 0 fmt diffs.</li>
+          <li>Write the gate script below and run it once against an unmodified tree to confirm it passes.</li>
+        </ol>
+
+        <div class="gate">
+          <h4>The gate — run between every commit, not once at the end</h4>
+          <pre><code><span class="cmt"># 1. formatting and lints stay at zero</span>
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+
+<span class="cmt"># 2. every test still compiles, runs, and passes</span>
+cargo test --all-targets --all-features
+
+<span class="cmt"># 3. the inventory is byte-identical to the baseline</span>
+cargo test -- --list | sort &gt; /tmp/after.txt
+diff /tmp/baseline.txt /tmp/after.txt <span class="kw">&amp;&amp;</span> echo <span class="ok">"inventory intact"</span></code></pre>
+          <p style="font-size:.9rem;color:var(--ink-soft);margin:0">Step 3 is the one that matters for Tier 3. A test module that fails to get wired up after a move still leaves a green <code>cargo test</code> — it just silently stops existing. Comparing the name list catches that; a passing suite does not.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="phase">
+      <div class="rail">01</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Tier 3 — test extraction</h2><span class="chip safe">shipped · PR #65</span></div>
+        <p><strong>18 modules, 18,864 moved lines</strong>, extracted from their parent files into sibling files. Each parent keeps <code>#[cfg(test)]</code> followed by <code>mod tests;</code>; the module stays a <em>child</em> of its parent, so private access and <code>cfg</code> gating are unchanged.</p>
+
+        <div class="card flag">
+          <h3>Why not <code>foo.test.rs</code>, and why not <code>tests/foo.rs</code></h3>
+          <p><strong><code>foo.test.rs</code> is not a Rust form.</strong> That is the TS/JS convention. Rust resolves <code>mod name;</code> to exactly <code>name.rs</code> or <code>name/mod.rs</code> — a dotted filename is unresolvable without a <code>#[path]</code> attribute, and nothing in the ecosystem uses that shape.</p>
+          <p><strong><code>tests/</code> means something categorically different.</strong> It is the <em>integration</em> test directory: every file there compiles as its own separate crate linking yours as an external dependency, so it sees only the <code>pub</code> API. These tests use <code>use super::*</code> and private items throughout — and jscout has no <code>src/lib.rs</code>, so there is nothing for <code>tests/</code> to link against in the first place.</p>
+        </div>
+
+        <h3>Which sibling form — settled by survey, not taste</h3>
+        <p>Two forms are plausible: <code>src/mcp.rs</code> + <code>src/mcp/tests.rs</code> with a plain <code>mod tests;</code>, or a flat <code>src/mcp_tests.rs</code> reached through a <code>#[path]</code> attribute. I surveyed all 1,091 crates unpacked in the local cargo registry to see which one the ecosystem actually uses.</p>
+
+        <div class="tw">
+          <table>
+            <thead><tr><th>Pattern</th><th class="num">Declarations</th><th class="num">Crates</th></tr></thead>
+            <tbody>
+              <tr><td>inline <code>mod tests { … }</code></td><td class="num">3,160</td><td class="num">542</td></tr>
+              <tr style="background:var(--accent-soft)"><td><strong>sibling <code>mod tests;</code> → <code>foo/tests.rs</code></strong></td><td class="num"><strong>225</strong></td><td class="num"><strong>132</strong></td></tr>
+              <tr><td><code>#[path = "foo_tests.rs"]</code></td><td class="num">1</td><td class="num">1</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The flat <code>#[path]</code> form appears <strong>once in 1,091 crates</strong>. The directory form is what real projects use — <strong>tokio</strong>, <strong>indexmap</strong>, <strong>ring</strong>, <strong>wasmparser</strong>, <strong>simd-json</strong>, <strong>libm</strong>, <strong>cranelift</strong>. indexmap carries <code>src/map.rs</code> beside <code>src/map/tests.rs</code> and <code>src/set.rs</code> beside <code>src/set/tests.rs</code>. And the objection that a directory holding one file is clutter does not survive contact with the evidence: tokio's <code>src/fs/file/</code> contains nothing but <code>tests.rs</code>, and it does the same for three more queue modules.</p>
+        <p class="note"><b>For reference:</b> <code>oxc</code> — jscout's own parser dependency — is 100% inline across 13 test modules. Inline remains the ecosystem default by roughly 14:1; the sibling form is the established exception for files that have outgrown it, which is exactly the case being made here.</p>
+
+        <pre><code><span class="cmt">// src/io_policy.rs — before</span>
+<span class="kw">#[cfg(test)]</span>
+mod tests {
+    use super::*;
+    <span class="kw">#[test]</span> fn inventory_races_are_not_phase_failures() { … }
+}
+
+<span class="cmt">// src/io_policy.rs — after (identical to tokio and indexmap)</span>
+<span class="kw">#[cfg(test)]</span>
+mod tests;
+
+<span class="cmt">// src/io_policy/tests.rs — the body, dedented one level</span>
+use super::*;
+<span class="kw">#[test]</span> fn inventory_races_are_not_phase_failures() { … }</code></pre>
+
+        <h3>Proven, not assumed</h3>
+        <p>I ran the extraction end-to-end on <code>src/io_policy.rs</code> before writing this plan. Parent and sibling coexist without complaint, tests still report under <code>io_policy::tests::*</code> — the module path is unchanged, which is the whole point — and fmt and clippy stayed at zero. The proof-of-concept was reverted; the tree is pristine.</p>
+
+        <h3>Only where the file was actually hard to navigate</h3>
+        <p>The shipped extraction covered the 18 high-value modules and left smaller inline test modules alone. The resulting sibling files currently contain 18,903 lines after the follow-up tests added in #66 and #67.</p>
+
+        <div class="card warn">
+          <h3>Two special cases that break the naive script</h3>
+          <p><strong>1. Not everything under <code>#[cfg(test)]</code> is a test.</strong> Eleven files gate <em>production</em> helpers on it — fault-injection hooks like <code>inject_read_failure</code> (<code>indexer.rs:77</code>) and test-only wrappers like <code>index_repo</code> (<code>indexer.rs:175</code>) and <code>compute_snapshot</code> (<code>structural.rs:343</code>). These are members of the parent module, not tests. They must stay exactly where they are. Only <code>mod tests { … }</code> blocks move.</p>
+          <p><strong>2. <code>main.rs</code> is the crate root, so paths resolve differently.</strong> Its test module is named <code>main_tests</code>, and <code>mod main_tests;</code> at the crate root resolves to <code>src/main_tests.rs</code> — not <code>src/main/main_tests.rs</code>. Every other file follows the <code>src/foo.rs</code> → <code>src/foo/tests.rs</code> rule.</p>
+          <p class="note" style="margin-top:.2rem"><b>Below the floor, and therefore out of scope:</b> <code>llm/process.rs</code> carries a second <code>#[cfg(test)] mod fake</code> test-double module at line 518. Its <code>mod tests</code> block is 233 lines, under the 300-line floor, so the file is not touched at all — and the judgement call about <code>fake</code> never has to be made.</p>
+        </div>
+
+        <h3>Order of operations</h3>
+        <ol class="steps">
+          <li>Script the move so it is reproducible, not hand-edited: locate the <code>mod tests { … }</code> block by brace matching, dedent the body one level, write the sibling, replace the block with <code>mod tests;</code>.</li>
+          <li>Run it <strong>one file at a time</strong>, gate after each. Eighteen clean gate passes beat one unverified bulk move.</li>
+          <li>Start with <code>scouting/mod.rs</code> and <code>main.rs</code> — the two that need no new directory, and the two largest wins.</li>
+          <li>Then the 16 files that need a sibling directory created.</li>
+          <li>Commit as one commit, message noting it is a pure move, so <code>blame -C</code> has a clean boundary.</li>
+        </ol>
+
+        <h4>The ten largest extraction targets</h4>
+        <div class="tw">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th><th class="num">Block</th><th class="num">Lines</th><th class="num">After</th><th>Target</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="path">scouting/mod.rs</td><td class="num">3346–6636</td><td class="num">3,291</td><td class="num">3,345</td><td class="path">scouting/tests.rs</td></tr>
+              <tr><td class="path">checker/enrich.rs</td><td class="num">3052–4837</td><td class="num">1,786</td><td class="num">3,051</td><td class="path">checker/enrich/tests.rs</td></tr>
+              <tr><td class="path">mcp.rs</td><td class="num">2054–3493</td><td class="num">1,440</td><td class="num">2,053</td><td class="path">mcp/tests.rs</td></tr>
+              <tr><td class="path">search.rs</td><td class="num">2729–4009</td><td class="num">1,281</td><td class="num">2,728</td><td class="path">search/tests.rs</td></tr>
+              <tr><td class="path">semantic_query.rs</td><td class="num">1813–2883</td><td class="num">1,071</td><td class="num">1,812</td><td class="path">semantic_query/tests.rs</td></tr>
+              <tr><td class="path">semantic.rs</td><td class="num">2039–3005</td><td class="num">967</td><td class="num">2,038</td><td class="path">semantic/tests.rs</td></tr>
+              <tr><td class="path">scouting/plan.rs</td><td class="num">1899–2683</td><td class="num">785</td><td class="num">1,898</td><td class="path">scouting/plan/tests.rs</td></tr>
+              <tr><td class="path">compact.rs</td><td class="num">1070–1718</td><td class="num">649</td><td class="num">1,069</td><td class="path">compact/tests.rs</td></tr>
+              <tr><td class="path">embed.rs</td><td class="num">1762–2403</td><td class="num">642</td><td class="num">1,761</td><td class="path">embed/tests.rs</td></tr>
+              <tr><td class="path">workspace.rs</td><td class="num">1267–1901</td><td class="num">635</td><td class="num">1,266</td><td class="path">workspace/tests.rs</td></tr>
+            </tbody>
+            <tfoot>
+              <tr><td>+ 8 more selected modules</td><td class="num">—</td><td class="num">18,864</td><td class="num">at extraction</td><td>18 modules</td></tr>
+            </tfoot>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="phase">
+      <div class="rail">02</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Tier 1 — mechanical fixes</h2><span class="chip safe">shipped · PR #66</span></div>
+        <p>The mechanical cleanup landed one lint class per commit, followed by review corrections. Test-fixture clones were restored so fixture maintenance does not depend on textual last use.</p>
+
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>Commit</th><th class="num">Sites</th><th>Change</th><th>Verified by</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="path">map family</td><td class="num">27</td><td><code>map_or</code>, <code>map_or_else</code>, <code>is_ok_and</code>, and two clearer <code>match</code> forms</td><td>clippy + branch audit</td></tr>
+              <tr><td class="path">write!</td><td class="num">18</td><td>Format directly into destination strings</td><td>byte accounting + clippy</td></tr>
+              <tr><td class="path">doc-backticks</td><td class="num">22</td><td>Rustdoc markup across 16 files</td><td><code>cargo doc</code></td></tr>
+              <tr><td class="path">expect-attr</td><td class="num">24</td><td>Audit existing suppressions and remove stale intent</td><td>compiler expectations + review</td></tr>
+              <tr><td class="path">clone-audit</td><td class="num">19</td><td>Production-only redundant clones, reviewed one at a time</td><td>ownership audit + full E2E</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="note"><b>The clone caveat.</b> Production moves at explicit return and ownership boundaries were retained. Eleven test-only removals were reverted because they coupled fixture maintenance to whichever use happened to be textually last.</p>
+
+        <p><code>#[expect]</code> is the genuinely modern piece. It behaves like <code>#[allow]</code> but warns when the suppressed lint no longer fires. The follow-up also removed an expired milestone justification and validated cancellation acknowledgements instead of merely suppressing their fields.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="phase">
+      <div class="rail">03</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Tier 2 — local helpers in <code>main.rs</code></h2><span class="chip safe">shipped · PR #67</span></div>
+        <p>Two repeated CLI-resolution rules were centralized and covered directly. The proposed LLM helper was rejected because its argument-passing overhead erased the readability gain.</p>
+
+        <ol class="steps">
+          <li><strong>Three-way flag resolution, 8 sites.</strong> <code>resolve_flag</code> now owns the disable / enable / configured-default precedence, with all eight truth-table rows tested.</li>
+          <li><strong>Empty-vec config fallback, 3 sites.</strong> <code>or_configured</code> owns the search-list fallback where the semantics are truly two-way.</li>
+          <li><strong>Deliberate exclusions.</strong> Dependency resolution retains its genuine three-way <code>--no-deps</code> behavior, embedding keeps a borrowed slice, and the four scouting arms keep their local LLM construction.</li>
+        </ol>
+
+        <details>
+          <summary>Deferred: selectively replace coherent <code>too_many_arguments</code> clusters</summary>
+          <p>PR #68 records specific reasons on all 18 retained function-level expectations. Future context structs should represent real domain state — refresh context, render-budget state, project execution metrics — rather than generic parameter bags created only to silence a lint.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="phase">
+      <div class="rail">04</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Lint baseline</h2><span class="chip safe">shipped · PR #68</span></div>
+        <p>The final PR locked in the clean tree with an explicit lint list rather than enabling all of <code>pedantic</code> and suppressing hundreds of SQLite-boundary casts.</p>
+
+        <pre><code><span class="cmt"># Cargo.toml</span>
+<span class="kw">[lints.clippy]</span>
+allow_attributes = <span class="ok">"warn"</span>
+allow_attributes_without_reason = <span class="ok">"warn"</span>
+<span class="cmt"># + 33 other individually selected lints</span></code></pre>
+
+        <p class="note"><b>Current policy:</b> 35 package-wide Clippy lints, production-only <code>redundant_clone</code>, zero source <code>#[allow]</code> attributes, and 25 narrowly scoped <code>#[expect]</code> attributes with machine-visible reasons.</p>
+
+        <p><code>clippy.toml</code> extends Clippy's default valid identifiers with SQLite, CommonJS, JavaScript, TypeScript, and WebAssembly, so those terms stay prose while <code>doc_markdown</code> remains enforced.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="phase">
+      <div class="rail">05–07</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Next — production module decomposition</h2><span class="chip caution">planned · move first</span></div>
+        <p class="lede">These changes improve navigation and ownership boundaries. File movement stays separate from option redesign, output changes, and optimization so each diff remains reviewable.</p>
+
+        <ol class="steps">
+          <li><strong><code>main.rs</code>, 2,696 lines.</strong> Keep the binary entry point small; extract CLI definitions, dispatch/config overlay, ordinary command handlers, and scouting handlers. Preserve private test access without making helpers crate-public.</li>
+          <li><strong><code>config.rs</code>, 1,816 lines.</strong> Keep <code>crate::config</code> as the stable facade; separate public models, TOML file models, load/resolution, display/init, and tests. Decomposing the 574-line load operation is a later behavioral PR because validation and source-attribution order are observable.</li>
+          <li><strong><code>structural.rs</code>, 3,709 lines.</strong> Retain the planned snapshot, projection, contracts, entities, checker, neighborhood, and paths boundaries. Visibility changes make this wider than the first two splits.</li>
+        </ol>
+
+        <p class="note"><b>Not a performance claim:</b> these splits change source organization only. Runtime work begins with a reproducible release-mode baseline and profiling on a fixed corpus.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="sep" style="margin-top:3.5rem">
+
+  <section>
+    <div class="phase">
+      <div class="rail">—</div>
+      <div class="phase-body">
+        <div class="phase-head"><h2>Behavioral work — written out, not scheduled</h2><span class="chip risk">core path</span></div>
+        <p class="lede">The remaining design refactor is not part of the move-only module work. It deserves its own stacked PRs and behavior-level verification.</p>
+
+        <h3>4a · The four scout executors</h3>
+        <p><code>scouting/mod.rs</code> carries four <code>prepare_*</code> / <code>execute_prepared_*</code> pairs — workflow, card, concept, summary. Roughly 1,100 lines, and a direct diff of the workflow and card executors shows about 60% byte-identical.</p>
+        <p>What actually differs between them is small and enumerable: the kind label string, the subject descriptor, the subject count, the submission type and its <code>SUBMIT_TOOL_NAME</code>, the <code>validate</code> call, and the reuse-report function. Everything else — ledger claim, gateway call, usage JSON, billing-path update, submission parsing, and all four error-report paths — is the same code written four times.</p>
+
+        <pre><code><span class="kw">trait</span> ScoutKind {
+    <span class="kw">type</span> Submission: DeserializeOwned;
+    <span class="kw">type</span> Prepared;
+    <span class="kw">const</span> KIND: &amp;<span class="ok">'static</span> str;
+    <span class="kw">const</span> SUBMIT_TOOL: &amp;<span class="ok">'static</span> str;
+
+    fn subject_label(prepared: &amp;Self::Prepared) -&gt; String;
+    fn subject_count(prepared: &amp;Self::Prepared) -&gt; usize;
+    fn validate(…) -&gt; Result&lt;Self::Validated&gt;;
+    fn reuse_report(…) -&gt; Result&lt;ScoutReport&gt;;
+}
+
+<span class="cmt">// one executor, four impls — roughly 1,100 lines becomes ~350</span>
+fn execute_prepared&lt;K: ScoutKind&gt;(…) -&gt; Result&lt;ScoutReport&gt;</code></pre>
+
+        <ol class="steps">
+          <li>Land Tier 3 first — <code>scouting/tests.rs</code> becomes a 3,291-line file whose test names are the specification this refactor must not break.</li>
+          <li>Write the trait against the <em>existing</em> four functions without changing them; confirm each of the four can be expressed by it. If any cannot, stop — the abstraction is wrong.</li>
+          <li>Convert one kind only. <code>card</code> is the best candidate: simplest subject shape, single-subject count, and the densest test coverage.</li>
+          <li>Gate. Then convert the remaining three one at a time, gating after each.</li>
+          <li>Delete the four originals only once all four impls are green.</li>
+        </ol>
+        <p class="note"><b>What makes this survivable:</b> 3,291 lines of behaviour-level tests with names that read as specifications — <code>card_publication_loses_the_snapshot_race_without_a_partial_write</code>, <code>gateway_failures_and_cancellation_are_terminal_ledger_states</code>. That is a real safety net. <b>What makes it risky anyway:</b> it is the core scout run path, and the tests cover behaviour, not every interleaving.</p>
+
+        <h3 style="margin-top:1rem">Former 4b · <code>structural.rs</code></h3>
+        <p>The test extraction reduced the production file to 3,709 lines. Its section boundaries remain:</p>
+        <ul class="plain">
+          <li><code>snapshot</code> — <code>compute_snapshot</code>, resolution hashing</li>
+          <li><code>projection</code> — <code>rebuild_projection</code>, module edges, references</li>
+          <li><code>contracts</code> — the <code>ContractCatalog</code> cluster</li>
+          <li><code>entities</code> — entity sites, identity, callers</li>
+          <li><code>checker</code> — enrichment projection</li>
+          <li><code>neighborhood</code> — <code>neighborhood</code>, <code>workflow_neighborhood</code></li>
+          <li><code>paths</code> — <code>PathSearch</code> and ranking</li>
+        </ul>
+        <p>This split now belongs to the move-first decomposition sequence above. It remains a wide diff because every cross-module item needs an explicit visibility decision, but it does not depend on executor unification.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h4>Summary</h4>
+    <h2>What lands, and in what order</h2>
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th class="num">#</th><th>Phase</th><th class="num">Commits</th><th>Risk</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">00</td><td>Guardrails — baseline + inventory gate</td><td class="num">—</td><td><span class="chip safe">none</span></td><td>complete</td></tr>
+          <tr><td class="num">01</td><td>18 test modules to siblings</td><td class="num">1</td><td><span class="chip caution">large diff</span></td><td>#65 merged</td></tr>
+          <tr><td class="num">02</td><td>Mechanical lint fixes</td><td class="num">6</td><td><span class="chip safe">verified</span></td><td>#66 merged</td></tr>
+          <tr><td class="num">03</td><td><code>main.rs</code> resolution helpers</td><td class="num">2</td><td><span class="chip safe">local</span></td><td>#67 merged</td></tr>
+          <tr><td class="num">04</td><td>Lint and suppression ratchet</td><td class="num">2</td><td><span class="chip safe">config</span></td><td>#68 merged</td></tr>
+          <tr><td class="num">05</td><td><code>main.rs</code> production split</td><td class="num">1</td><td><span class="chip caution">wide move</span></td><td>next</td></tr>
+          <tr><td class="num">06</td><td><code>config.rs</code> mechanical split</td><td class="num">1</td><td><span class="chip caution">visibility</span></td><td>next</td></tr>
+          <tr><td class="num">07</td><td><code>structural.rs</code> mechanical split</td><td class="num">staged</td><td><span class="chip risk">wide diff</span></td><td>planned</td></tr>
+          <tr><td class="num">later</td><td>Scout executor unification</td><td class="num">staged</td><td><span class="chip risk">core path</span></td><td>not scheduled</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">The gate runs after every structural commit. The exact 397-test inventory must remain unchanged; a passing suite alone would not catch a test module that quietly stopped being compiled.</p>
+  </section>
+
+  <footer>
+    Refreshed on b0aa10b · 68 Rust files · 69,151 Rust lines<br>
+    baseline: 397 tests · inventory SHA-256 e9697f1b40977f2129e4459f78d455d584b282657d5c219d8f29eb35a292e768<br>
+    ratchet: 35 package-wide Clippy lints · production-only redundant-clone · zero source allows<br>
+    convention survey: 1,091 crates in the local cargo registry · inline 3,160 · sibling 225 · <code>#[path]</code> 1
+  </footer>
+
+</div>
