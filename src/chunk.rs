@@ -245,7 +245,7 @@ impl<'s> Chunker<'s> {
                 kind,
                 name: name.clone(),
                 scope_chain: scope.to_vec(),
-                symbols: name.clone().into_iter().collect(),
+                symbols: name.into_iter().collect(),
                 atomic: true,
             });
             for s in &body.statements {
@@ -339,7 +339,7 @@ impl<'s> Chunker<'s> {
                         out.push(Unit {
                             span: full_span,
                             kind,
-                            name: Some(name.clone()),
+                            name: Some(name),
                             scope_chain: vec![],
                             symbols,
                             atomic: false,

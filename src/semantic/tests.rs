@@ -486,7 +486,7 @@ fn summaries_degrade_and_stale_with_their_children() -> Result<()> {
         }),
         supports: Vec::new(),
         confidence: "likely".into(),
-        snapshot: snapshot.clone(),
+        snapshot,
         supersedes: None,
     };
     let (current_snapshot, supports) =
@@ -854,7 +854,7 @@ fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Resu
             evidence_end_line: 99,
             ..support("/claim", alpha, "a.ts")
         }],
-        ..base.clone()
+        ..base
     };
     assert!(
         annotate(repo.path(), &conn, &bad_span)

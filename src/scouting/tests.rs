@@ -1278,7 +1278,7 @@ fn concept_publication_rechecks_new_matching_children() -> Result<()> {
                 },
                 crate::semantic::SupportInput {
                     claim_path: "/domain_terms/0".into(),
-                    anchor: start.clone(),
+                    anchor: start,
                     role: None,
                     evidence_file: "flow.ts".into(),
                     evidence_start_line: 2,
@@ -2994,7 +2994,7 @@ fn summary_publication_loses_the_child_race_without_a_partial_write() -> Result<
     let conn = fixture(repo.path())?;
     let card = seed_card(repo.path(), &conn)?;
     let card_id = card.artifact_id.expect("seeded card");
-    let subject = card.subject.clone();
+    let subject = card.subject;
 
     // Mid-flight the child card is superseded by an agent annotation on a
     // second connection. The repository itself does not change, so the
@@ -3192,7 +3192,7 @@ fn summary_refresh_replaces_a_child_stale_summary() -> Result<()> {
             body: json!({ "purpose": "revised entry point for the settlement flow" }),
             supports: vec![crate::semantic::SupportInput {
                 claim_path: "/purpose".into(),
-                anchor: card.subject.clone(),
+                anchor: card.subject,
                 role: None,
                 evidence_file: "flow.ts".into(),
                 evidence_start_line: 2,

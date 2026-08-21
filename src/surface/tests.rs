@@ -189,7 +189,7 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
     let bounded_detail = overview_response(
         &conn,
         &OverviewOptions {
-            reconnaissance_subject: Some(state.subject_key.clone()),
+            reconnaissance_subject: Some(state.subject_key),
             reconnaissance_detail: true,
             response_byte_limit: scoped_compact.response_budget.rendered_bytes + 32,
             ..Default::default()

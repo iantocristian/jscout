@@ -1171,7 +1171,7 @@ fn prepare_workflow(
         reasoning: options.reasoning.clone(),
         prompt_version: workflow::PROMPT_VERSION.into(),
         source_snapshot: candidate_set.snapshot.clone(),
-        input_fingerprint: input_fingerprint.clone(),
+        input_fingerprint,
         request_hash,
         config_json,
         supersedes_artifact_id: options.supersedes_artifact_id,
@@ -1331,7 +1331,7 @@ fn execute_prepared_workflow(
             &candidate_set,
             &validated.classifications,
             Some(outcome.usage),
-            Some(outcome.started.clone()),
+            Some(outcome.started),
             Some(reason.clone()),
         ));
     }
@@ -1534,7 +1534,7 @@ fn execute_prepared_card(
                 return Ok(gateway_failure_report(
                     run_id,
                     &spec,
-                    subject.anchor.clone(),
+                    subject.anchor,
                     1,
                     error,
                 ));
@@ -1568,7 +1568,7 @@ fn execute_prepared_card(
                 return Ok(failed_report(
                     run_id,
                     "card",
-                    subject.anchor.clone(),
+                    subject.anchor,
                     1,
                     outcome.usage,
                     outcome.started,
@@ -1589,7 +1589,7 @@ fn execute_prepared_card(
                 return Ok(failed_report(
                     run_id,
                     "card",
-                    subject.anchor.clone(),
+                    subject.anchor,
                     1,
                     outcome.usage,
                     outcome.started,
@@ -1636,7 +1636,7 @@ fn execute_prepared_card(
             &subject,
             &validated.classifications,
             Some(outcome.usage),
-            Some(outcome.started.clone()),
+            Some(outcome.started),
             Some(reason.clone()),
         ));
     }
@@ -1884,7 +1884,7 @@ fn execute_prepared_concept(
                 return Ok(gateway_failure_report(
                     run_id,
                     &spec,
-                    canonical_name.clone(),
+                    canonical_name,
                     sources.len(),
                     error,
                 ));
@@ -1987,7 +1987,7 @@ fn execute_prepared_concept(
             None,
             &validated.classifications,
             Some(outcome.usage),
-            Some(outcome.started.clone()),
+            Some(outcome.started),
             Some(reason.clone()),
         ));
     }
@@ -2410,7 +2410,7 @@ fn execute_prepared_summary(
                 conn,
                 run_id,
                 "summary",
-                scope.scope_key.clone(),
+                scope.scope_key,
                 children.len(),
                 &spec,
             );
@@ -2433,7 +2433,7 @@ fn execute_prepared_summary(
                 return Ok(gateway_failure_report(
                     run_id,
                     &spec,
-                    scope.scope_key.clone(),
+                    scope.scope_key,
                     children.len(),
                     error,
                 ));
@@ -2467,7 +2467,7 @@ fn execute_prepared_summary(
                 return Ok(failed_report(
                     run_id,
                     "summary",
-                    scope.scope_key.clone(),
+                    scope.scope_key,
                     children.len(),
                     outcome.usage,
                     outcome.started,
@@ -2488,7 +2488,7 @@ fn execute_prepared_summary(
                 return Ok(failed_report(
                     run_id,
                     "summary",
-                    scope.scope_key.clone(),
+                    scope.scope_key,
                     children.len(),
                     outcome.usage,
                     outcome.started,
@@ -2532,12 +2532,12 @@ fn execute_prepared_summary(
             run_id,
             "incomplete",
             "summary",
-            scope.scope_key.clone(),
+            scope.scope_key,
             children.len(),
             None,
             &validated.classifications,
             Some(outcome.usage),
-            Some(outcome.started.clone()),
+            Some(outcome.started),
             Some(reason.clone()),
         ));
     }
@@ -2672,7 +2672,7 @@ fn execute_prepared_summary(
         run_id,
         "completed",
         "summary",
-        scope.scope_key.clone(),
+        scope.scope_key,
         children.len(),
         Some(artifact_id),
         &validated.classifications,

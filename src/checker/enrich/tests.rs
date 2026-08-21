@@ -1612,10 +1612,7 @@ fn later_project_cannot_upgrade_an_earlier_ambiguous_answer() -> Result<()> {
         ],
         vec![
             project_answer("tsconfig.b.json", vec![class_member.clone()]),
-            project_answer(
-                "tsconfig.a.json",
-                vec![class_member.clone(), interface_member.clone()],
-            ),
+            project_answer("tsconfig.a.json", vec![class_member, interface_member]),
         ],
     ] {
         let outcome = map_occurrence(&conn, &occurrence, &answers)?;
