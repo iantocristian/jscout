@@ -489,7 +489,7 @@ fn index_repo_impl<F: FileSystem>(
             dependency::discover(&root, conn, &options.dependencies, &workspace, operation.fs)?;
         let plans =
             dependency::plan_packages(&discovered, options.dependency_limits, operation.fs)?;
-        let prepared = prepare_dependency_files(&plans, &mut outcome, &operation)?;
+        let prepared = prepare_dependency_files(&plans, &mut outcome, operation.fs)?;
 
         conn.execute(
             "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
@@ -901,10 +901,10 @@ fn insert_file(
     Ok((data.chunks.len(), data.graph.refs.len()))
 }
 
-fn prepare_dependency_files<F: FileSystem>(
+fn prepare_dependency_files(
     plans: &[dependency::PackagePlan],
     outcome: &mut IndexOutcome,
-    operation: &IndexOperation<'_, F>,
+    fs: &impl FileSystem,
 ) -> Result<Vec<PreparedDependencyFile>> {
     let mut prepared = Vec::new();
     for plan in plans {
@@ -920,7 +920,7 @@ fn prepare_dependency_files<F: FileSystem>(
         ));
         for file in &plan.files {
             let display = dependency_display_path(&plan.package, &file.package_path);
-            let source = match operation.fs.read_to_string(&file.source_path) {
+            let source = match fs.read_to_string(&file.source_path) {
                 Ok(source) => source,
                 Err(error) if io_policy::is_inventory_race(&error) => continue,
                 Err(error) if io_policy::is_retryable(&error) => {
