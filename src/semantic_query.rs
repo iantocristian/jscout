@@ -1598,7 +1598,10 @@ fn unavailable_source(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one evidence row needs lineage, support, file identity, and a per-source byte budget"
+)]
 fn render_source_evidence(
     root: &Path,
     conn: &Connection,

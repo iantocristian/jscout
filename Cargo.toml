@@ -39,13 +39,16 @@ tempfile = "3.23.0"
 # boundary, and silencing those wholesale hides the handful of real findings
 # among them. Adding a lint below means the tree is clean for it today.
 [lints.clippy]
+# lint policy
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
 # formatting and allocation
 assigning_clones = "warn"
 format_push_string = "warn"
 implicit_clone = "warn"
 inefficient_to_string = "warn"
 manual_string_new = "warn"
-redundant_clone = "warn"
 string_add_assign = "warn"
 uninlined_format_args = "warn"
 unnecessary_join = "warn"

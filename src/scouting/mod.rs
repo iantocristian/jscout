@@ -975,7 +975,10 @@ pub fn scout_refresh(
     })
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "refresh adapter combines shared preparation state with recorded workflow settings"
+)]
 fn prepare_workflow_refresh(
     root: &Path,
     conn: &Connection,
@@ -1016,7 +1019,10 @@ fn prepare_workflow_refresh(
     )))
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "refresh adapter combines shared preparation state with recorded card settings"
+)]
 fn prepare_card_refresh(
     root: &Path,
     conn: &Connection,
@@ -1055,7 +1061,10 @@ fn prepare_card_refresh(
 /// children that are current NOW rather than the ones the retired run cited.
 /// A scope whose children all disappeared no longer resolves and is reported
 /// unresolvable instead of aborting the batch.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "refresh adapter combines shared preparation state with recorded summary settings"
+)]
 fn prepare_summary_refresh(
     root: &Path,
     conn: &Connection,
@@ -1094,7 +1103,10 @@ fn prepare_summary_refresh(
     )))
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "refresh adapter combines shared preparation state with recorded concept settings"
+)]
 fn prepare_concept_refresh(
     conn: &Connection,
     gateway: &mut dyn LlmGateway,
@@ -3186,7 +3198,10 @@ fn reused(
     })
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "workflow adapter derives subject metadata while forwarding the terminal run outcome"
+)]
 fn report(
     run_id: i64,
     status: &str,
@@ -3211,7 +3226,10 @@ fn report(
     )
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "card adapter derives subject metadata while forwarding the terminal run outcome"
+)]
 fn card_report(
     run_id: i64,
     status: &str,
@@ -3236,7 +3254,10 @@ fn card_report(
     )
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat report schema requires run identity, outcome, classifications, usage, and timing"
+)]
 fn scout_report(
     run_id: i64,
     status: &str,

@@ -1646,7 +1646,10 @@ fn load_artifact_at_depth(
 /// itself no longer fresh degrades it — even when the parent's own text and
 /// direct supports are unchanged. Depth bounds recursion defensively while
 /// still covering a concept above repository -> module -> file -> card.
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recursive freshness keeps artifact inputs and shared memoization state explicit"
+)]
 fn child_adjusted_freshness(
     conn: &Connection,
     artifact_id: i64,

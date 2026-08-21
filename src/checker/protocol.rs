@@ -159,14 +159,29 @@ pub struct ConfigurationProblem {
 }
 
 #[cfg(test)]
-#[expect(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemberResult {
+    #[expect(
+        dead_code,
+        reason = "single-member protocol probe validates this wire field's type"
+    )]
     pub indexed_hash: String,
+    #[expect(
+        dead_code,
+        reason = "single-member protocol probe validates this wire field's type"
+    )]
     pub source_hash: String,
+    #[expect(
+        dead_code,
+        reason = "single-member protocol probe validates this wire field's type"
+    )]
     pub typescript: TypeScriptIdentity,
     pub projects: Vec<ProjectAnswer>,
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "single-member protocol probe validates this wire field's type"
+    )]
     pub configuration_problems: Vec<ConfigurationProblem>,
 }
 

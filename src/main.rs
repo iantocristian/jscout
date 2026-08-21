@@ -1,4 +1,6 @@
 #![recursion_limit = "256"]
+// Test fixtures favor reorderable inputs over last-use clone removal.
+#![cfg_attr(not(test), warn(clippy::redundant_clone))]
 
 mod agent;
 mod calls;
