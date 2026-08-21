@@ -947,6 +947,9 @@ number of ranked continuation endpoints. Depth one is the same compact one-hop
 caller/callee projection. Use `--expand-mode neighborhood` only when the full
 diagnostic neighborhood is actually needed. Both modes report omitted
 path/node/edge counts and retain the existing independently widenable limits.
+Under identical limits, diagnostic neighborhood reserves the selected compact
+path forest before filling the remaining budget with ranked fan-out, so it is a
+strict superset of the path projection rather than a competing bounded sample.
 
 Expansion defaults to `production` and `unknown` file-backed nodes while
 retaining structural hubs. Use repeatable `--expand-file-role` flags to opt

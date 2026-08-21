@@ -2268,7 +2268,19 @@ fn expand_hits(
             select_path_projection(&seeds, &ranked_nodes, &ranked_edges, options, compact)?
         }
         ExpansionProjection::Neighborhood => {
-            select_neighborhood_projection(&seeds, &ranked_nodes, &ranked_edges, options, compact)?
+            // Diagnostic mode is a strict superset of the compact projection
+            // under the same limits. Reserve the path forest first, then use
+            // the remaining node/edge/byte budget for ranked fan-out.
+            let paths =
+                select_path_projection(&seeds, &ranked_nodes, &ranked_edges, options, compact)?;
+            select_neighborhood_projection(
+                &seeds,
+                &ranked_nodes,
+                &ranked_edges,
+                options,
+                compact,
+                &paths,
+            )?
         }
     };
     let nodes = selection.nodes;
@@ -2315,16 +2327,30 @@ fn select_neighborhood_projection(
     ranked_edges: &[structural::GraphEdge],
     options: &ExpansionOptions,
     compact: bool,
+    required: &ExpansionSelection,
 ) -> Result<ExpansionSelection> {
     let nodes_by_key = ranked_nodes
         .iter()
         .map(|node| (node.key.clone(), node.clone()))
         .collect::<HashMap<_, _>>();
-    let (mut nodes, mut selected_node_keys, mut truncated) =
-        select_expansion_seeds(seeds, &nodes_by_key, options, compact)?;
-    let mut edges = Vec::new();
+    let mut nodes = required.nodes.clone();
+    let mut selected_node_keys = required
+        .nodes
+        .iter()
+        .map(|node| node.key.clone())
+        .collect::<HashSet<_>>();
+    let mut edges = required.edges.clone();
+    let mut selected_edge_keys = required
+        .edges
+        .iter()
+        .map(edge_identity)
+        .collect::<HashSet<_>>();
+    let mut truncated = false;
 
     for edge in ranked_edges {
+        if selected_edge_keys.contains(&edge_identity(edge)) {
+            continue;
+        }
         if edges.len() >= options.edge_limit {
             truncated = true;
             continue;
@@ -2357,6 +2383,7 @@ fn select_neighborhood_projection(
         }
         nodes = candidate_nodes;
         selected_node_keys = candidate_keys;
+        selected_edge_keys.insert(edge_identity(edge));
         edges = candidate_edges;
     }
 
@@ -2712,7 +2739,7 @@ mod tests {
         DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit, MatchReason,
         Reranker, ResponseBudget, RetrievalStatus, SearchExpansion, SearchOptions, SearchResult,
         apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
-        candidate_pool_limits, contains_code_identifier, exact_intent_tokens,
+        candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
         merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
         search, select_attached_memory, select_neighborhood_projection, select_path_projection,
         tiered_candidates,
@@ -3288,7 +3315,8 @@ mod tests {
         assert_eq!(paths.edges.len(), 2);
         assert!(paths.edges.iter().all(|edge| edge.target != "noise"));
 
-        let neighborhood = select_neighborhood_projection(&seeds, &nodes, &edges, &options, true)?;
+        let neighborhood =
+            select_neighborhood_projection(&seeds, &nodes, &edges, &options, true, &paths)?;
         assert_eq!(neighborhood.nodes.len(), 4);
         assert_eq!(neighborhood.edges.len(), 3);
         Ok(())
@@ -3331,24 +3359,19 @@ mod tests {
             edge("root-b", "b-first", 0.5),
         ];
         let seeds = vec!["root-a".to_string(), "root-b".to_string()];
-        let selection = select_path_projection(
-            &seeds,
-            &nodes,
-            &edges,
-            &ExpansionOptions {
-                projection: ExpansionProjection::Paths,
-                depth: 1,
-                seed_limit: 2,
-                path_limit: 2,
-                node_limit: 10,
-                edge_limit: 10,
-                byte_limit: 24_000,
-                min_confidence: "likely".into(),
-                file_roles: vec!["production".into()],
-                file_origins: origin::defaults(),
-            },
-            true,
-        )?;
+        let options = ExpansionOptions {
+            projection: ExpansionProjection::Paths,
+            depth: 1,
+            seed_limit: 2,
+            path_limit: 2,
+            node_limit: 4,
+            edge_limit: 10,
+            byte_limit: 24_000,
+            min_confidence: "likely".into(),
+            file_roles: vec!["production".into()],
+            file_origins: origin::defaults(),
+        };
+        let selection = select_path_projection(&seeds, &nodes, &edges, &options, true)?;
 
         let selected = selection
             .nodes
@@ -3360,6 +3383,35 @@ mod tests {
         assert!(!selected.contains("a-second"));
         assert_eq!(selection.selected_paths, 2);
         assert_eq!(selection.candidate_paths, 3);
+
+        // Without reserving the path forest, global edge order fills the last
+        // node slot from root-a and omits root-b's weaker continuation. The
+        // diagnostic projection must retain every compact path before adding
+        // any remaining fan-out.
+        let neighborhood =
+            select_neighborhood_projection(&seeds, &nodes, &edges, &options, true, &selection)?;
+        let neighborhood_nodes = neighborhood
+            .nodes
+            .iter()
+            .map(|node| node.key.as_str())
+            .collect::<HashSet<_>>();
+        assert!(
+            selection
+                .nodes
+                .iter()
+                .all(|node| neighborhood_nodes.contains(node.key.as_str()))
+        );
+        let neighborhood_edges = neighborhood
+            .edges
+            .iter()
+            .map(edge_identity)
+            .collect::<HashSet<_>>();
+        assert!(
+            selection
+                .edges
+                .iter()
+                .all(|edge| neighborhood_edges.contains(&edge_identity(edge)))
+        );
         Ok(())
     }
 
