@@ -1004,8 +1004,9 @@ impl ScoutCommand {
 
 /// Resolve a `--flag` / `--no-flag` pair against its configured default.
 ///
-/// Disabling wins over enabling, so `--vector --lexical-only` is lexical; with
-/// neither flag present the configured value stands.
+/// Disabling overrides a configured `true`, enabling overrides a configured
+/// `false`, and with neither flag present the configured value stands. Clap
+/// rejects passing both explicit forms together.
 const fn resolve_flag(enable: bool, disable: bool, configured: bool) -> bool {
     if disable { false } else { enable || configured }
 }

@@ -4,11 +4,44 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{
-    Cli, Command, ConfigCommand, ScoutCommand, effective_search_response_byte_limit,
-    render_cli_neighborhood, render_semantic_memory_text,
+    Cli, Command, ConfigCommand, ScoutCommand, effective_search_response_byte_limit, or_configured,
+    render_cli_neighborhood, render_semantic_memory_text, resolve_flag,
 };
 use crate::{semantic::SemanticArtifact, structural};
 use clap::Parser;
+
+#[test]
+fn flag_resolution_covers_every_truth_table_row() {
+    let cases = [
+        (false, false, false, false),
+        (false, false, true, true),
+        (true, false, false, true),
+        (true, false, true, true),
+        (false, true, false, false),
+        (false, true, true, false),
+        (true, true, false, false),
+        (true, true, true, false),
+    ];
+
+    for (enable, disable, configured, expected) in cases {
+        assert_eq!(
+            resolve_flag(enable, disable, configured),
+            expected,
+            "enable={enable}, disable={disable}, configured={configured}"
+        );
+    }
+}
+
+#[test]
+fn list_resolution_uses_config_only_when_cli_is_empty() {
+    let configured = vec!["configured".to_string()];
+
+    assert_eq!(or_configured(Vec::new(), &configured), configured);
+    assert_eq!(
+        or_configured(vec!["explicit".to_string()], &configured),
+        vec!["explicit".to_string()]
+    );
+}
 
 #[test]
 fn config_commands_and_global_selector_parse() {
