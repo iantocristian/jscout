@@ -1226,7 +1226,7 @@ fn apply_repository_project_policy(
         else {
             continue;
         };
-        project.purpose = policy.role.clone();
+        project.purpose.clone_from(&policy.role);
         project
             .purpose_reasons
             .push(format!("repository-recon:{}", policy.classification_id));
@@ -2140,7 +2140,10 @@ fn mark_project_failed(
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "project execution updates caller-owned progress and resource counters in place"
+)]
 fn execute_project(
     root: &Path,
     options: &EnrichOptions<'_>,
@@ -2392,7 +2395,10 @@ fn stage_batch(
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "completion transaction needs project identity, validated inputs, and resource peaks"
+)]
 fn complete_project(
     root: &Path,
     conn: &Connection,

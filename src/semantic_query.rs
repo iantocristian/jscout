@@ -1598,7 +1598,10 @@ fn unavailable_source(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one evidence row needs lineage, support, file identity, and a per-source byte budget"
+)]
 fn render_source_evidence(
     root: &Path,
     conn: &Connection,
@@ -1629,19 +1632,13 @@ fn render_source_evidence(
         source_rendered_bytes: 0,
         source_truncated: false,
     };
-    let path = match store::file_source_path(conn, root, file.id) {
-        Ok(path) => path,
-        Err(_) => {
-            result.source_status = "unavailable".into();
-            return result;
-        }
+    let Ok(path) = store::file_source_path(conn, root, file.id) else {
+        result.source_status = "unavailable".into();
+        return result;
     };
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(_) => {
-            result.source_status = "unavailable".into();
-            return result;
-        }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        result.source_status = "unavailable".into();
+        return result;
     };
     if blake3::hash(source.as_bytes()).to_hex().as_str() != file.indexed_hash {
         result.source_status = "index-stale".into();

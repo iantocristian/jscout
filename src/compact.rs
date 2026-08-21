@@ -475,7 +475,10 @@ fn settle_who_uses(
     Ok((value, rendered))
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "response builder keeps result selection and complete byte-budget accounting explicit"
+)]
 fn who_uses_value(
     results: &[(&query::SymbolTarget, Vec<query::Usage>)],
     returned_targets: usize,
@@ -947,7 +950,10 @@ pub(crate) fn render_neighborhood(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "fixed-point serialization needs the selected graph and current and original byte counts"
+)]
 fn settle_neighborhood_bytes(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
@@ -988,7 +994,10 @@ fn settle_neighborhood_bytes(
     .len())
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "response envelope keeps the selected graph and complete byte-budget metadata explicit"
+)]
 fn neighborhood_value(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],

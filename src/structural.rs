@@ -1419,7 +1419,10 @@ impl ContractCatalog {
     }
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "projection borrows caller-owned indexes, dedupe state, and five prepared statements"
+)]
 fn project_contract_site(
     conn: &Connection,
     site: &EntitySiteNode,
@@ -1872,7 +1875,10 @@ fn resolve_reference_at(
     ))
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "caller projection keeps occurrence provenance and shared edge dedupe state explicit"
+)]
 fn project_entity_callers(
     conn: &Connection,
     producer: &str,
@@ -1977,10 +1983,8 @@ fn project_member_calls(
         let Some(path) = files.get(&file_id) else {
             continue;
         };
-        let candidates: &[&SymbolNode] = candidates_by_name
-            .get(&property)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let candidates: &[&SymbolNode] =
+            candidates_by_name.get(&property).map_or(&[], Vec::as_slice);
         if candidates.is_empty() {
             continue;
         }
@@ -2804,7 +2808,10 @@ fn workflow_logical_steps(
     Ok(steps)
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "association expansion carries edge ranking inputs into a shared step accumulator"
+)]
 fn collect_general_workflow_steps(
     conn: &Connection,
     node: &str,
@@ -3174,7 +3181,10 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     })
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ranked traversal threads four score floors, filters, degree cache, and frontier"
+)]
 fn enqueue_ranked_steps(
     conn: &Connection,
     node: &str,

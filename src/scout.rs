@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn elided_source_keeps_control_flow_calls_and_types() -> Result<()> {
-        let source = r#"export async function checkout(
+        let source = r"export async function checkout(
   cart: Cart,
   inventory: Inventory,
 ): Promise<Order> {
@@ -387,7 +387,7 @@ mod tests {
   }
   return order;
 }
-"#;
+";
         let rendered = render_source(
             Path::new("checkout.ts"),
             source,

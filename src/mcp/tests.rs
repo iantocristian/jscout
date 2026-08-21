@@ -586,8 +586,8 @@ fn agent_surfaces_are_wired_and_response_bounded() -> Result<()> {
             "to": "flow.ts:finish",
             "direction": "out",
             "kinds": ["call"],
-            "node_limit": 100000,
-            "edge_limit": 100000,
+            "node_limit": 100_000,
+            "edge_limit": 100_000,
             "response_bytes": 4000
         }),
     )?;

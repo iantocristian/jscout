@@ -329,8 +329,9 @@ impl<'s> Chunker<'s> {
             if let BindingPattern::BindingIdentifier(id) = &d.id {
                 let is_fn_value = matches!(
                     d.init,
-                    Some(Expression::ArrowFunctionExpression(_))
-                        | Some(Expression::FunctionExpression(_))
+                    Some(
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
                 );
                 if is_fn_value {
                     let name = id.name.to_string();
@@ -533,6 +534,7 @@ fn prop_key_name(key: &PropertyKey<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::path::Path;
 
     fn chunks_of(name: &str, source: &str) -> Vec<Chunk> {
@@ -545,14 +547,14 @@ mod tests {
 
     #[test]
     fn erases_type_only_constructs() {
-        let src = r#"
+        let src = r"
 interface User { id: string }
 type Alias = User | null;
 declare function ambient(): void;
 import type { Foo } from './foo';
 export type { Alias };
 export function getUser(id: string): User { return { id }; }
-"#;
+";
         let chunks = chunks_of("a.ts", src);
         let all: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert!(!all.contains("interface User"));
@@ -586,7 +588,7 @@ export default function App() { return <UserCard id="1" />; }
         let filler = "    x = 1 + 1; // padding line to inflate method body\n".repeat(60);
         let mut src = String::from("export class Big {\n");
         for i in 0..8 {
-            src.push_str(&format!("  method{i}() {{\n{filler}  }}\n"));
+            let _ = write!(src, "  method{i}() {{\n{filler}  }}\n");
         }
         src.push_str("}\n");
         let chunks = chunks_of("big.ts", &src);

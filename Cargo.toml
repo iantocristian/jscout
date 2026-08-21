@@ -30,3 +30,60 @@ unicode-normalization = "0.1.24"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+# Lints the tree already passes, enabled so the cleanups cannot regress.
+#
+# This is deliberately an opt-in list rather than `pedantic = "warn"` with a
+# block of exceptions. Turning the whole group on would emit ~780 warnings
+# here, dominated by i64/usize casts that are inherent to the rusqlite
+# boundary, and silencing those wholesale hides the handful of real findings
+# among them. Adding a lint below means the tree is clean for it today.
+[lints.clippy]
+# lint policy
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# formatting and allocation
+assigning_clones = "warn"
+format_push_string = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+manual_string_new = "warn"
+string_add_assign = "warn"
+uninlined_format_args = "warn"
+unnecessary_join = "warn"
+
+# iteration and collections
+cloned_instead_of_copied = "warn"
+explicit_iter_loop = "warn"
+flat_map_option = "warn"
+naive_bytecount = "warn"
+stable_sort_primitive = "warn"
+zero_sized_map_values = "warn"
+
+# control flow and bindings
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+no_effect_underscore_binding = "warn"
+redundant_else = "warn"
+ref_binding_to_reference = "warn"
+unnested_or_patterns = "warn"
+
+# API shape
+inconsistent_struct_constructor = "warn"
+iter_without_into_iter = "warn"
+large_types_passed_by_value = "warn"
+return_self_not_must_use = "warn"
+trivially_copy_pass_by_ref = "warn"
+
+# style and correctness hazards
+if_not_else = "warn"
+mut_mut = "warn"
+needless_raw_string_hashes = "warn"
+path_buf_push_overwrite = "warn"
+semicolon_if_nothing_returned = "warn"
+unreadable_literal = "warn"
+verbose_bit_mask = "warn"
+
+# docs
+doc_markdown = "warn"

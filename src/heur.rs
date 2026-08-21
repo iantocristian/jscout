@@ -160,7 +160,7 @@ impl<'a> Visit<'a> for HeurVisitor<'_> {
             let obj_text = member_path(&target.object);
             let prop = target.property.name.to_string();
             match obj_text.as_deref() {
-                Some("module.exports") | Some("exports") => {
+                Some("module.exports" | "exports") => {
                     let local = match &expr.right {
                         Expression::Identifier(id) => Some(id.name.to_string()),
                         _ => None,
