@@ -1109,26 +1109,38 @@ fn vector_table(dimensions: usize) -> Result<String> {
 
 fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
     let table = vector_table(dimensions)?;
-    let existed = vector_table_exists(conn, dimensions)?;
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
-           embedding FLOAT[{dimensions}] distance_metric=cosine,
-           profile_id INTEGER PARTITION KEY,
-           origin TEXT PARTITION KEY
-         );"
-    ))?;
-    if !existed {
-        // A sqlite-vec table is shared by every profile with these dimensions.
-        // Recreating it invalidates every completion marker that referred to
-        // rows in the lost table, even if the current operation uses only one
-        // of those profiles.
-        conn.execute(
-            "DELETE FROM meta
-             WHERE key IN (
-               SELECT ?1 || id FROM embedding_profiles WHERE dimensions=?2
-             )",
-            params![VECTOR_SYNC_KEY_PREFIX, dimensions as i64],
-        )?;
+    conn.execute_batch("SAVEPOINT jscout_vector_table_ensure")?;
+    let result = (|| -> Result<()> {
+        let existed = vector_table_exists(conn, dimensions)?;
+        if !existed {
+            // A sqlite-vec table is shared by every profile with these dimensions.
+            // Invalidate every completion marker before publishing its replacement
+            // so readers can never observe an empty table as synchronized.
+            conn.execute(
+                "DELETE FROM meta
+                 WHERE key IN (
+                   SELECT ?1 || id FROM embedding_profiles WHERE dimensions=?2
+                 )",
+                params![VECTOR_SYNC_KEY_PREFIX, dimensions as i64],
+            )?;
+        }
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
+               embedding FLOAT[{dimensions}] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               origin TEXT PARTITION KEY
+             );"
+        ))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_table_ensure")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_vector_table_ensure; RELEASE jscout_vector_table_ensure",
+            );
+            return Err(error);
+        }
     }
     Ok(table)
 }

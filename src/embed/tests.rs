@@ -764,3 +764,59 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
     assert_eq!(results.first().map(|result| result.0), Some(chunk_id));
     Ok(())
 }
+
+#[test]
+fn failed_marker_invalidation_does_not_publish_an_empty_vector_table() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('a.ts', 'f', 'production', 'repository')",
+        [],
+    )?;
+    let file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end, start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [file_id],
+    )?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    connection.execute_batch(
+        "CREATE TRIGGER reject_vector_marker_delete
+         BEFORE DELETE ON meta
+         WHEN OLD.key LIKE 'embedding_index_synced_v1:%'
+         BEGIN SELECT RAISE(ABORT, 'marker delete rejected'); END;",
+    )?;
+
+    let failure = synchronize_vector_index(&connection, &profile, false)
+        .expect_err("forced marker invalidation failure");
+    assert!(failure.to_string().contains("marker delete rejected"));
+    assert!(
+        !vector_table_exists(&connection, profile.dimensions)?,
+        "a failed invalidation must not publish an empty table beside a stale ready marker"
+    );
+    let readiness = ready_search_profile(&connection, &spec)
+        .expect_err("the missing table must remain fail-closed");
+    assert!(
+        readiness
+            .to_string()
+            .contains("vector index table is missing")
+    );
+    Ok(())
+}
