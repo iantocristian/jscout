@@ -27,7 +27,7 @@ pub struct Chunk {
     pub kind: ChunkKind,
     /// Primary symbol name, if the chunk is a named declaration.
     pub name: Option<String>,
-    /// Enclosing names, outermost first (e.g. ["UserService"] for a method).
+    /// Enclosing names, outermost first (e.g. `["UserService"]` for a method).
     pub scope_chain: Vec<String>,
     /// All symbol names declared at the top level of this chunk.
     pub symbols: Vec<String>,
@@ -208,8 +208,7 @@ impl<'s> Chunker<'s> {
         let name = f.id.as_ref().map(|id| id.name.to_string());
         let kind = name
             .as_deref()
-            .map(|n| self.component_or_function(n))
-            .unwrap_or(ChunkKind::Function);
+            .map_or(ChunkKind::Function, |n| self.component_or_function(n));
         if est_tokens(full_span) <= MAX_TOKENS {
             out.push(Unit {
                 span: full_span,
@@ -246,7 +245,7 @@ impl<'s> Chunker<'s> {
                 kind,
                 name: name.clone(),
                 scope_chain: scope.to_vec(),
-                symbols: name.clone().into_iter().collect(),
+                symbols: name.into_iter().collect(),
                 atomic: true,
             });
             for s in &body.statements {
@@ -290,8 +289,7 @@ impl<'s> Chunker<'s> {
             .body
             .body
             .first()
-            .map(|m| m.span().start)
-            .unwrap_or(full_span.end);
+            .map_or(full_span.end, |m| m.span().start);
         out.push(Unit {
             span: Span::new(full_span.start, body_start),
             kind: ChunkKind::ClassHeader,
@@ -341,7 +339,7 @@ impl<'s> Chunker<'s> {
                         out.push(Unit {
                             span: full_span,
                             kind,
-                            name: Some(name.clone()),
+                            name: Some(name),
                             scope_chain: vec![],
                             symbols,
                             atomic: false,

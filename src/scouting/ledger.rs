@@ -1,5 +1,5 @@
 //! Run-ledger persistence. One row per model run; the partial unique index on
-//! (scout_kind, input_fingerprint) over running/completed rows guarantees a
+//! (`scout_kind`, `input_fingerprint`) over running/completed rows guarantees a
 //! single live claim per input across processes: concurrent scouts either
 //! reuse the completed run or fail loudly against the in-flight one.
 

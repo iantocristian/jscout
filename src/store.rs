@@ -921,8 +921,8 @@ pub(crate) fn artifact_fingerprint(
 /// extraction-derived table and the disposable projection outright keeps a
 /// forced re-index at fresh-index cost. The caller owns the surrounding
 /// transaction and must re-insert every file before committing. Semantic
-/// memory (scout_runs, scout_classifications, semantic_*), package identity
-/// (package_instances), checker facts, and the content-addressed embedding
+/// memory (`scout_runs`, `scout_classifications`, semantic_*), package identity
+/// (`package_instances`), checker facts, and the content-addressed embedding
 /// cache survive. [`reset_snapshot_state`] widens this to every
 /// snapshot-derived table for the normal fixed-snapshot refresh path.
 pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {

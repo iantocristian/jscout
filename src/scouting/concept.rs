@@ -301,7 +301,7 @@ pub fn validate(submission: &Submission, sources: &[ConceptSource]) -> Result<Va
             );
         }
         return Ok(ValidatedConcept {
-            canonical_name: canonical_name.clone(),
+            canonical_name,
             definition: None,
             aliases: Vec::new(),
             classifications: incomplete_classifications(sources, &reason)?,
@@ -455,7 +455,7 @@ pub fn validate(submission: &Submission, sources: &[ConceptSource]) -> Result<Va
     let classifications = validate_candidates(canonical_candidates.as_deref(), sources, &claims)?;
 
     let concept = ValidatedConcept {
-        canonical_name: canonical_name.clone(),
+        canonical_name,
         definition: Some(definition),
         aliases,
         classifications,

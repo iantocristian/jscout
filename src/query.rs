@@ -124,7 +124,7 @@ impl ModuleGraph {
     }
 
     /// Follow export chains (aliases, re-exports, barrels, stars) from
-    /// (file, export_name) to the defining (file, local_name).
+    /// (file, `export_name`) to the defining (file, `local_name`).
     pub fn resolve_export(&self, file: i64, name: &str) -> Option<(i64, String)> {
         self.resolve_export_traced(file, name)
             .map(|(f, n, _)| (f, n))

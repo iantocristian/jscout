@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -346,7 +347,7 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 }
 
 /// Deterministic digest of the module-resolution outcome. Resolution reads
-/// unindexed inputs such as tsconfigs, manifests, and node_modules, so this
+/// unindexed inputs such as tsconfigs, manifests, and `node_modules`, so this
 /// digest is part of the public structural snapshot as well as the no-op
 /// projection identity.
 pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
@@ -631,8 +632,8 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
         raw.push(row?);
     }
     raw.sort_by(|a, b| {
-        let a_path = files.get(&a.1).map(String::as_str).unwrap_or("");
-        let b_path = files.get(&b.1).map(String::as_str).unwrap_or("");
+        let a_path = files.get(&a.1).map_or("", String::as_str);
+        let b_path = files.get(&b.1).map_or("", String::as_str);
         (a_path, &a.3, &a.2, a.4, a.0).cmp(&(b_path, &b.3, &b.2, b.4, b.0))
     });
 
@@ -943,8 +944,7 @@ fn project_references(
             continue;
         };
         let source = owner_at(symbols_by_file.get(&file_id), start)
-            .map(|s| s.key.clone())
-            .unwrap_or_else(|| file_key(path));
+            .map_or_else(|| file_key(path), |s| s.key.clone());
 
         // References that reach their target across a heuristically resolved
         // module edge (workspace-inferred) must not project as certain.
@@ -1419,7 +1419,7 @@ impl ContractCatalog {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn project_contract_site(
     conn: &Connection,
     site: &EntitySiteNode,
@@ -1872,7 +1872,7 @@ fn resolve_reference_at(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn project_entity_callers(
     conn: &Connection,
     producer: &str,
@@ -2021,8 +2021,7 @@ fn project_member_calls(
         }
 
         let source = owner_at(symbols_by_file.get(&file_id), start)
-            .map(|symbol| symbol.key.clone())
-            .unwrap_or_else(|| file_key(path));
+            .map_or_else(|| file_key(path), |symbol| symbol.key.clone());
         insert_edge.execute(params![
             source,
             hub,
@@ -2234,8 +2233,7 @@ fn project_checker_enrichments(
             continue;
         }
         let source = owner_at(symbols_by_file.get(&file_id), call_start)
-            .map(|symbol| symbol.key.clone())
-            .unwrap_or_else(|| file_key(&path));
+            .map_or_else(|| file_key(&path), |symbol| symbol.key.clone());
         let projection = projected
             .entry((member_call_id, target.clone()))
             .or_insert_with(|| CheckerProjection {
@@ -2806,7 +2804,7 @@ fn workflow_logical_steps(
     Ok(steps)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn collect_general_workflow_steps(
     conn: &Connection,
     node: &str,
@@ -3176,7 +3174,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn enqueue_ranked_steps(
     conn: &Connection,
     node: &str,
@@ -3678,7 +3676,7 @@ fn encode_key_component(value: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'@') {
             encoded.push(byte as char);
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
     encoded

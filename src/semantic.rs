@@ -1117,9 +1117,8 @@ fn lexical_artifact_relevance(
     let (name, body, exact_name, tokens) = if candidate.artifact_type == "concept" {
         let name =
             crate::scouting::concept::normalize(candidate.name.as_deref().unwrap_or_default());
-        let body = serde_json::from_str::<Value>(&candidate.body_json)
-            .ok()
-            .map(|body| {
+        let body = match serde_json::from_str::<Value>(&candidate.body_json) {
+            Ok(body) => {
                 let definition = body
                     .get("definition")
                     .and_then(Value::as_str)
@@ -1133,8 +1132,9 @@ fn lexical_artifact_relevance(
                     .collect::<Vec<_>>()
                     .join(" ");
                 crate::scouting::concept::normalize(&format!("{definition} {aliases}"))
-            })
-            .unwrap_or_else(|| crate::scouting::concept::normalize(&candidate.body_json));
+            }
+            Err(_) => crate::scouting::concept::normalize(&candidate.body_json),
+        };
         let exact = !name.is_empty() && normalized_concept_query == name;
         (name, body, exact, concept_tokens)
     } else {
@@ -1646,7 +1646,7 @@ fn load_artifact_at_depth(
 /// itself no longer fresh degrades it — even when the parent's own text and
 /// direct supports are unchanged. Depth bounds recursion defensively while
 /// still covering a concept above repository -> module -> file -> card.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn child_adjusted_freshness(
     conn: &Connection,
     artifact_id: i64,

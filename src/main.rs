@@ -35,6 +35,7 @@ mod walk;
 mod watch;
 mod workspace;
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -934,8 +935,7 @@ fn run_config_command(command: ConfigCommand, explicit: Option<&Path>) -> Result
                 config
                     .config_path
                     .as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<none>".to_string()),
+                    .map_or_else(|| "<none>".to_string(), |path| path.display().to_string()),
                 config.fingerprint
             );
             Ok(())
@@ -2098,14 +2098,15 @@ fn cmd_search(
 fn render_semantic_memory_text(artifacts: &[semantic::SemanticArtifact]) -> Result<String> {
     let mut rendered = String::from("\nsemantic memory (untrusted; verify in source):\n");
     for artifact in artifacts {
-        rendered.push_str(&format!(
-            "  #{} {} {} [{}] confidence={}\n",
+        let _ = writeln!(
+            rendered,
+            "  #{} {} {} [{}] confidence={}",
             artifact.id,
             artifact.artifact_type,
             artifact.name.as_deref().unwrap_or("<unnamed>"),
             artifact.freshness,
             artifact.confidence,
-        ));
+        );
         rendered.push_str("      ");
         rendered.push_str(&serde_json::to_string(&artifact.body)?);
         rendered.push('\n');

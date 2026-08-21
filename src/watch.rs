@@ -1470,8 +1470,7 @@ fn normalize_targets(targets: &mut Vec<WatchTarget>) {
 fn exact_watch_target(path: PathBuf, source: TargetSource) -> WatchTarget {
     let watch_path = path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| path.clone());
+        .map_or_else(|| path.clone(), Path::to_path_buf);
     WatchTarget {
         watch_path,
         path,

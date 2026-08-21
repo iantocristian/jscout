@@ -109,7 +109,7 @@ pub struct SearchOptions {
     pub compact: bool,
     /// Emit neighborhood follow-ups when that structural tool is available.
     /// Baseline MCP search disables these while retaining exact definition and
-    /// who_uses hand-offs.
+    /// `who_uses` hand-offs.
     pub include_neighborhood_followups: bool,
     pub expansion: ExpansionOptions,
 }

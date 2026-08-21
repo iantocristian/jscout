@@ -4,7 +4,7 @@
 
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
-use oxc_span::{GetSpan, Span};
+use oxc_span::GetSpan;
 
 #[derive(Debug, Clone)]
 pub struct RequireBinding {
@@ -41,8 +41,8 @@ pub struct MemberCall {
     /// link is computed or a call result.
     pub receiver: Option<String>,
     pub span_start: u32,
-    /// End of the complete CallExpression: a multiline call's evidence lines
-    /// all fall inside [span_start, span_end].
+    /// End of the complete `CallExpression`: a multiline call's evidence lines
+    /// all fall inside [`span_start`, `span_end`].
     pub span_end: u32,
     /// Exact UTF-8 byte span of the receiver expression (`dbs.wave.card`).
     pub receiver_start: u32,
@@ -302,9 +302,4 @@ pub(crate) fn member_path(expr: &Expression<'_>) -> Option<String> {
         }
         _ => None,
     }
-}
-
-#[allow(unused)]
-fn span_of(expr: &Expression<'_>) -> Span {
-    expr.span()
 }

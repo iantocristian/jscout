@@ -59,9 +59,10 @@ pub fn serve(
 }
 
 pub fn doctor(url: Option<&str>, settings: &crate::config::InferenceSettings) -> Result<()> {
-    let base = url
-        .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| base_url(settings));
+    let base = url.map_or_else(
+        || base_url(settings),
+        |value| value.trim_end_matches('/').to_string(),
+    );
     let health = get_json(&format!("{base}/health"))
         .with_context(|| format!("local inference is not reachable at {base}"))?;
     let configuration = get_json(&format!("{base}/configuration"))?;
@@ -86,8 +87,7 @@ pub fn doctor(url: Option<&str>, settings: &crate::config::InferenceSettings) ->
             .unwrap_or("unresolved"),
         configuration["embedding"]["dimensions"]
             .as_u64()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
     );
     println!(
         "reranker: {} @ {}",

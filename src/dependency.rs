@@ -1,6 +1,6 @@
 //! Resolver-driven discovery of explicitly selected installed packages.
 //!
-//! Discovery never walks node_modules. It resolves requests from real
+//! Discovery never walks `node_modules`. It resolves requests from real
 //! importer locations, finds the owning package manifest, canonicalizes that
 //! package root, and then compares it with declared workspace roots.
 
@@ -71,7 +71,7 @@ pub struct PackagePlan {
 
 /// Find every installed instance of the selected package names that is used
 /// by indexed first-party importers. An unused root installation is also
-/// admitted through its logical node_modules path. Transitive packages are
+/// admitted through its logical `node_modules` path. Transitive packages are
 /// deliberately not discovered.
 pub fn discover(
     root: &Path,
@@ -345,9 +345,7 @@ fn plan_package(package: &DiscoveredPackage, limits: DependencyLimits) -> Result
             continue;
         };
         let package_path = package_path.to_string_lossy().replace('\\', "/");
-        let bytes = fs::metadata(&source_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let bytes = fs::metadata(&source_path).map_or(0, |meta| meta.len());
         if bytes > limits.max_file_bytes
             || files.len() >= limits.max_files
             || selected_bytes.saturating_add(bytes) > limits.max_bytes

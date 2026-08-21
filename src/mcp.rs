@@ -1,6 +1,6 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
-//! Exposes the index to agents: semantic_search, who_uses, definition,
-//! file_outline, events, neighborhood.
+//! Exposes the index to agents: `semantic_search`, `who_uses`, definition,
+//! `file_outline`, events, neighborhood.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -1350,10 +1350,9 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 }
                 None => semantic_query::ArtifactViewMode::Full,
             };
-            let supports_per_artifact = args["supports_per_artifact"]
-                .as_u64()
-                .map(|value| (value as usize).min(64))
-                .unwrap_or_else(|| {
+            let supports_per_artifact = match args["supports_per_artifact"].as_u64() {
+                Some(value) => (value as usize).min(64),
+                None => {
                     if artifact_id.is_some()
                         && artifact_view != semantic_query::ArtifactViewMode::Full
                     {
@@ -1361,7 +1360,8 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     } else {
                         8
                     }
-                });
+                }
+            };
             let artifact_limit = (args["limit"].as_u64().unwrap_or(20) as usize).min(100);
             let result = semantic_query::query(
                 root,

@@ -1136,13 +1136,11 @@ impl RuntimeConfig {
         let root = self
             .root
             .as_deref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string());
+            .map_or_else(|| "<none>".to_string(), |path| path.display().to_string());
         let path = self
             .config_path
             .as_deref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<none>".to_string());
+            .map_or_else(|| "<none>".to_string(), |path| path.display().to_string());
         let mut lines = vec![
             format!("root: {root}"),
             format!(
@@ -1282,8 +1280,10 @@ fn source_name(source: ValueSource) -> &'static str {
 }
 
 fn display_optional_path(path: Option<&Path>) -> String {
-    path.map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<disabled>".to_string())
+    path.map_or_else(
+        || "<disabled>".to_string(),
+        |path| path.display().to_string(),
+    )
 }
 
 fn nonempty_env(name: &str) -> Option<String> {

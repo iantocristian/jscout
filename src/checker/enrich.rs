@@ -2027,8 +2027,7 @@ fn project_complete_and_fresh(
     }
     Ok(inputs.iter().all(|input| {
         fs::read(input_path(root, input))
-            .map(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
-            .unwrap_or(false)
+            .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
     }))
 }
 
@@ -2141,7 +2140,7 @@ fn mark_project_failed(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn execute_project(
     root: &Path,
     options: &EnrichOptions<'_>,
@@ -2393,7 +2392,7 @@ fn stage_batch(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn complete_project(
     root: &Path,
     conn: &Connection,

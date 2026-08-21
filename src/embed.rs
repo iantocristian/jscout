@@ -16,7 +16,7 @@ enum Protocol {
 }
 
 /// Embedding provider selection is explicit. API keys never select a provider,
-/// and OPENAI_API_KEY is never forwarded to a custom endpoint.
+/// and `OPENAI_API_KEY` is never forwarded to a custom endpoint.
 #[derive(Clone)]
 pub struct Provider {
     pub name: String,
@@ -472,7 +472,7 @@ fn validate_vectors(expected: usize, vectors: &[Vec<f32>]) -> Result<()> {
             vectors.len()
         );
     }
-    let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
+    let dimensions = vectors.first().map_or(0, Vec::len);
     if dimensions == 0 || vectors.iter().any(|vector| vector.len() != dimensions) {
         bail!("embedding response has empty or inconsistent dimensions");
     }

@@ -67,10 +67,10 @@ pub struct MatchedOption {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallSite {
     pub file: String,
-    /// Complete CallExpression line range, inclusive.
+    /// Complete `CallExpression` line range, inclusive.
     pub start_line: i64,
     pub end_line: i64,
-    /// Complete CallExpression byte span.
+    /// Complete `CallExpression` byte span.
     pub span: [u32; 2],
     pub receiver: Option<String>,
     pub method: String,
@@ -401,8 +401,7 @@ fn literal_text(expr: &Expression<'_>) -> Option<String> {
             literal
                 .raw
                 .as_ref()
-                .map(|raw| raw.to_string())
-                .unwrap_or_else(|| literal.value.to_string()),
+                .map_or_else(|| literal.value.to_string(), |raw| raw.to_string()),
         ),
         Expression::BooleanLiteral(literal) => Some(literal.value.to_string()),
         Expression::NullLiteral(_) => Some("null".into()),

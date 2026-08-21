@@ -3,6 +3,7 @@
 //! deterministic so the pack can participate in the input fingerprint.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -78,31 +79,32 @@ pub fn build_titled(
     }
 
     let mut rendered = String::new();
-    rendered.push_str(&format!("## {section}\n\n"));
+    let _ = write!(rendered, "## {section}\n\n");
     for candidate in candidates {
-        rendered.push_str(&format!(
-            "- {} ({}) in {} lines {}-{}{}\n",
+        let _ = writeln!(
+            rendered,
+            "- {} ({}) in {} lines {}-{}{}",
             candidate.anchor,
             candidate.display_name,
             candidate.file,
             candidate.evidence_start_line,
             candidate.evidence_end_line,
             if candidate.seed { " [seed]" } else { "" },
-        ));
+        );
     }
 
     for (file, source) in &sources {
-        rendered.push_str(&format!("\n## File: {file}\n"));
+        let _ = writeln!(rendered, "\n## File: {file}");
         let annotations = entity_annotations(conn, file)?;
         if !annotations.is_empty() {
             rendered.push_str("Deterministic entities:\n");
             for annotation in annotations {
-                rendered.push_str(&format!("- {annotation}\n"));
+                let _ = writeln!(rendered, "- {annotation}");
             }
         }
         rendered.push_str("```\n");
         for (index, line) in source.lines().enumerate() {
-            rendered.push_str(&format!("{:>5} | {line}\n", index + 1));
+            let _ = writeln!(rendered, "{:>5} | {line}", index + 1);
         }
         rendered.push_str("```\n");
     }
@@ -165,15 +167,15 @@ pub fn structural_context(conn: &Connection, anchor: &str) -> Result<(String, us
     for (label, mut edges) in [("Outgoing", outgoing), ("Incoming", incoming)] {
         let omitted = edges.len().saturating_sub(CONTEXT_EDGES_PER_DIRECTION);
         edges.truncate(CONTEXT_EDGES_PER_DIRECTION);
-        rendered.push_str(&format!("\n{label}:\n"));
+        let _ = writeln!(rendered, "\n{label}:");
         if edges.is_empty() {
             rendered.push_str("- none\n");
         }
         for edge in edges {
-            rendered.push_str(&format!("- {edge}\n"));
+            let _ = writeln!(rendered, "- {edge}");
         }
         if omitted > 0 {
-            rendered.push_str(&format!("- ({omitted} further edges omitted)\n"));
+            let _ = writeln!(rendered, "- ({omitted} further edges omitted)");
         }
     }
     Ok((rendered, total))
