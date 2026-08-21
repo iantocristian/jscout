@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use rusqlite::params;
 use serde_json::json;
@@ -563,9 +565,10 @@ fn automatic_card_selection_reports_its_cap() -> Result<()> {
     for file in 0..files {
         let mut source = String::new();
         for index in 0..PER_FILE {
-            source.push_str(&format!(
-                "export function symbol{file}_{index}() {{ return {index}; }}\n"
-            ));
+            let _ = writeln!(
+                source,
+                "export function symbol{file}_{index}() {{ return {index}; }}"
+            );
         }
         std::fs::write(repo.path().join(format!("module{file}.ts")), source)?;
     }

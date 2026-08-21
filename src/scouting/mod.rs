@@ -1833,8 +1833,7 @@ fn execute_prepared_concept(
         && planned_predecessor != Some(explicit_predecessor)
     {
         bail!(
-            "concept `{canonical_name}` changed before refresh publication (expected artifact {explicit_predecessor}, current {:?})",
-            planned_predecessor
+            "concept `{canonical_name}` changed before refresh publication (expected artifact {explicit_predecessor}, current {planned_predecessor:?})"
         );
     }
     if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
@@ -1866,9 +1865,7 @@ fn execute_prepared_concept(
             Some("inputs_changed"),
         )?;
         bail!(
-            "concept `{canonical_name}` lineage changed while claiming the run (planned {:?}, ledger {:?})",
-            planned_predecessor,
-            supersedes_artifact_id
+            "concept `{canonical_name}` lineage changed while claiming the run (planned {planned_predecessor:?}, ledger {supersedes_artifact_id:?})"
         );
     }
 

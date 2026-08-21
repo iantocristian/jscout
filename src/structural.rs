@@ -1977,10 +1977,8 @@ fn project_member_calls(
         let Some(path) = files.get(&file_id) else {
             continue;
         };
-        let candidates: &[&SymbolNode] = candidates_by_name
-            .get(&property)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        let candidates: &[&SymbolNode] =
+            candidates_by_name.get(&property).map_or(&[], Vec::as_slice);
         if candidates.is_empty() {
             continue;
         }

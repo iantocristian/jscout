@@ -233,7 +233,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
 
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        r#"
+        r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 INSERT INTO meta(key, value) VALUES('schema_version', '24')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
@@ -820,7 +820,7 @@ CREATE TABLE IF NOT EXISTS semantic_embedding_index_entries(
 );
 CREATE INDEX IF NOT EXISTS idx_semantic_embedding_entries_profile
   ON semantic_embedding_index_entries(profile_id, artifact_id);
-"#,
+",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
     conn.execute_batch(

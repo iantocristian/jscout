@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
 
@@ -1069,7 +1070,9 @@ fn dump_section(conn: &rusqlite::Connection, sql: &str) -> Result<String> {
                 ValueRef::Integer(value) => out.push_str(&value.to_string()),
                 ValueRef::Real(value) => out.push_str(&value.to_string()),
                 ValueRef::Text(value) => out.push_str(&String::from_utf8_lossy(value)),
-                ValueRef::Blob(value) => out.push_str(&format!("<blob:{}>", value.len())),
+                ValueRef::Blob(value) => {
+                    let _ = write!(out, "<blob:{}>", value.len());
+                }
             }
             out.push('\x1f');
         }

@@ -289,6 +289,9 @@ pub struct SearchExpansion {
     pub truncated: bool,
 }
 
+// serde's skip_serializing_if predicates must take a reference, so this
+// cannot take usize by value however small the type is.
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }

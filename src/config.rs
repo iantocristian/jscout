@@ -1765,10 +1765,10 @@ file = "logs/mcp.jsonl"
         let root = tempfile::tempdir()?;
         write_config(
             root.path(),
-            r#"version = 1
+            r"version = 1
 [llm]
 openai_compatible_providers = []
-"#,
+",
         )?;
         let empty = RuntimeConfig::load(Some(root.path()), None)?;
         assert!(empty.effective.llm.openai_compatible_providers.is_empty());

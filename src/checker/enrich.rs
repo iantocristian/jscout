@@ -1226,7 +1226,7 @@ fn apply_repository_project_policy(
         else {
             continue;
         };
-        project.purpose = policy.role.clone();
+        project.purpose.clone_from(&policy.role);
         project
             .purpose_reasons
             .push(format!("repository-recon:{}", policy.classification_id));

@@ -1285,13 +1285,13 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 Some(database.as_deref().unwrap_or(configured_database)),
             )?;
             let vector = resolve_flag(vector, no_vector, runtime.effective.search.vector);
-            let provider = if !vector {
-                None
-            } else {
+            let provider = if vector {
                 embed::Provider::from_settings(
                     &runtime.effective.embedding,
                     &runtime.effective.inference,
                 )?
+            } else {
+                None
             };
             let artifact_view = match view.as_deref() {
                 Some(value) => semantic_query::ArtifactViewMode::parse(value)?,
@@ -2195,7 +2195,7 @@ fn cmd_events(
     let mut current = String::new();
     for s in &sites {
         if s.name != current {
-            current = s.name.clone();
+            current.clone_from(&s.name);
             println!("\nevent '{current}'");
         }
         let ctx = s
@@ -2360,7 +2360,7 @@ fn cmd_stats(root: &Path) -> Result<()> {
         "type-only nodes: {} (will be erased)",
         total.type_only_nodes
     );
-    println!("elapsed:         {:?}", elapsed);
+    println!("elapsed:         {elapsed:?}");
     for (f, e) in failed.iter().take(5) {
         eprintln!(
             "  reject: {}: {}",

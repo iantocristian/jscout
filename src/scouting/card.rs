@@ -432,7 +432,7 @@ fn claim(
     let evidence = evidence
         .iter()
         .filter(|range| seen.insert((range.start_line, range.end_line)))
-        .cloned()
+        .copied()
         .collect::<Vec<_>>();
     Ok(ValidatedClaim {
         text: text.to_string(),
