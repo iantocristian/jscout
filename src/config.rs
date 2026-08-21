@@ -90,8 +90,10 @@ impl Default for SearchSettings {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpansionSettings {
     pub enabled: bool,
+    pub mode: String,
     pub depth: usize,
     pub seeds: usize,
+    pub paths: usize,
     pub nodes: usize,
     pub edges: usize,
     pub bytes: usize,
@@ -103,8 +105,10 @@ impl Default for ExpansionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: "paths".to_string(),
             depth: 1,
             seeds: 3,
+            paths: search::DEFAULT_EXPANSION_PATH_LIMIT,
             nodes: 40,
             edges: 120,
             bytes: 24_000,
@@ -194,6 +198,7 @@ pub struct SidecarSettings {
 pub struct McpSettings {
     pub profile: String,
     pub source_view: String,
+    pub result_transport: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,8 +286,10 @@ struct SearchFileConfig {
 #[serde(deny_unknown_fields)]
 struct ExpansionFileConfig {
     enabled: Option<bool>,
+    mode: Option<String>,
     depth: Option<usize>,
     seeds: Option<usize>,
+    paths: Option<usize>,
     nodes: Option<usize>,
     edges: Option<usize>,
     bytes: Option<usize>,
@@ -375,6 +382,7 @@ struct SidecarFileConfig {
 struct McpFileConfig {
     profile: Option<String>,
     source_view: Option<String>,
+    result_transport: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -618,6 +626,14 @@ impl RuntimeConfig {
         if !matches!(min_confidence.as_str(), "certain" | "likely" | "possible") {
             bail!("search.expansion.min_confidence must be certain, likely, or possible");
         }
+        let expansion_mode = resolver.string(
+            "search.expansion.mode",
+            raw.search.expansion.mode,
+            None,
+            "paths",
+        );
+        search::ExpansionProjection::parse(&expansion_mode)
+            .context("validate search.expansion.mode")?;
         let search = SearchSettings {
             vector: resolver.bool("search.vector", raw.search.vector, None, true)?,
             rerank: resolver.bool("search.rerank", raw.search.rerank, None, true)?,
@@ -666,6 +682,7 @@ impl RuntimeConfig {
                     None,
                     false,
                 )?,
+                mode: expansion_mode,
                 depth: resolver.usize(
                     "search.expansion.depth",
                     raw.search.expansion.depth,
@@ -677,6 +694,12 @@ impl RuntimeConfig {
                     raw.search.expansion.seeds,
                     None,
                     3,
+                )?,
+                paths: resolver.usize(
+                    "search.expansion.paths",
+                    raw.search.expansion.paths,
+                    None,
+                    search::DEFAULT_EXPANSION_PATH_LIMIT,
                 )?,
                 nodes: resolver.usize(
                     "search.expansion.nodes",
@@ -702,6 +725,12 @@ impl RuntimeConfig {
         };
         if search.memory_limit > 100 {
             bail!("search.memory_limit must be at most 100");
+        }
+        if search.expansion.paths > search::MAX_EXPANSION_PATH_LIMIT {
+            bail!(
+                "search.expansion.paths must be at most {}",
+                search::MAX_EXPANSION_PATH_LIMIT
+            );
         }
         if search.memory_depth > search::MAX_MEMORY_GRAPH_DEPTH {
             bail!(
@@ -984,9 +1013,19 @@ impl RuntimeConfig {
         if !matches!(source_view.as_str(), "full" | "elided") {
             bail!("mcp.source_view must be full or elided");
         }
+        let result_transport = resolver.string(
+            "mcp.result_transport",
+            raw.mcp.result_transport,
+            None,
+            "auto",
+        );
+        if !matches!(result_transport.as_str(), "auto" | "text" | "structured") {
+            bail!("mcp.result_transport must be auto, text, or structured");
+        }
         let mcp = McpSettings {
             profile,
             source_view,
+            result_transport,
         };
 
         let telemetry = TelemetrySettings {
@@ -1117,11 +1156,12 @@ impl RuntimeConfig {
             format!("fingerprint: {}", self.fingerprint),
             format!("database: {}", self.effective.database.path.display()),
             format!(
-                "search: vector={} rerank={} memory={} expand={} limit={} response_bytes={}",
+                "search: vector={} rerank={} memory={} expand={} expansion_mode={} limit={} response_bytes={}",
                 self.effective.search.vector,
                 self.effective.search.rerank,
                 self.effective.search.attach_memory,
                 self.effective.search.expansion.enabled,
+                self.effective.search.expansion.mode,
                 self.effective.search.limit,
                 self.effective.search.response_bytes
             ),
@@ -1178,9 +1218,10 @@ impl RuntimeConfig {
                     .unwrap_or("<provider default>")
             ),
             format!(
-                "mcp: profile={} source_view={} telemetry={} request_log={}",
+                "mcp: profile={} source_view={} result_transport={} telemetry={} request_log={}",
                 self.effective.mcp.profile,
                 self.effective.mcp.source_view,
+                self.effective.mcp.result_transport,
                 display_optional_path(self.effective.telemetry.file.as_deref()),
                 display_optional_path(self.effective.telemetry.request_log.as_deref())
             ),
@@ -1531,6 +1572,8 @@ mod tests {
         assert!(config.effective.search.vector);
         assert!(config.effective.search.rerank);
         assert!(!config.effective.search.attach_memory);
+        assert_eq!(config.effective.search.expansion.mode, "paths");
+        assert_eq!(config.effective.search.expansion.paths, 8);
         assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
         Ok(())
     }
@@ -1609,6 +1652,30 @@ file = "logs/mcp.jsonl"
     }
 
     #[test]
+    fn expansion_projection_and_path_limit_fail_closed() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        write_config(
+            root.path(),
+            "version = 1\n[search.expansion]\nmode = \"dense\"\n",
+        )?;
+        assert!(
+            RuntimeConfig::load(Some(root.path()), None)
+                .unwrap_err()
+                .to_string()
+                .contains("search.expansion.mode")
+        );
+
+        write_config(root.path(), "version = 1\n[search.expansion]\npaths = 51\n")?;
+        assert!(
+            RuntimeConfig::load(Some(root.path()), None)
+                .unwrap_err()
+                .to_string()
+                .contains("search.expansion.paths must be at most 50")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unsafe_endpoints_and_remote_binds_fail_during_configuration_load() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         write_config(
@@ -1675,8 +1742,21 @@ file = "logs/mcp.jsonl"
         let loaded = RuntimeConfig::load(Some(root.path()), None)?;
         assert!(loaded.config_loaded);
         assert_eq!(loaded.effective.mcp.profile, "structural");
+        assert_eq!(loaded.effective.mcp.result_transport, "auto");
         assert!(init(root.path(), None).is_err());
         assert!(TEMPLATE.contains("rerank = true"));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_result_transport_fails_closed() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        write_config(
+            root.path(),
+            "version = 1\n[mcp]\nresult_transport = \"both\"\n",
+        )?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(error.to_string().contains("mcp.result_transport"));
         Ok(())
     }
 

@@ -124,6 +124,7 @@ jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
 jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
                                #   semantic_memory, exact evidence, and annotate tools
+                               #   --result-transport auto|text|structured overrides config
 jscout memory <root> [query]   # compact semantic handles and freshness
   --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
 jscout memory <root> --artifact ID
@@ -803,7 +804,7 @@ started.
 
 The file configures the database; retrieval defaults and budgets; embedding,
 reranker, and local-inference models; LLM/provider metadata; Node/gateway and
-checker paths; MCP profile/source view; telemetry; index dependencies; and
+checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
 watch defaults. Query text, exact targets, dry-run intent, temporary widened
 budgets, and model-call caps remain per invocation. Changing retrieval posture
 does not alter the structural snapshot or embedding profile, so disabling and
@@ -815,6 +816,15 @@ Initialization metadata reports the exact database, config path, binary/config
 fingerprints, and effective retrieval defaults. MCP and `watch` load policy
 once; restart either long-running process after editing the file. There is no
 hot reload or multi-repository routing.
+
+`mcp.result_transport = "auto"` emits native MCP `structuredContent` only for
+verified Codex client versions and retains the fact-equivalent JSON-text
+fallback. Unknown clients, including Claude Code in the current compatibility
+profile, remain text-only because structured results increased raw wire bytes
+without reducing measured client context. Set `text` for universal text-only
+behavior or `structured` for an explicit compatibility probe; errors always
+remain text-only. Transport selection and byte counts are recorded in MCP
+telemetry.
 
 Secrets never belong in `.jscout.toml`. The file may name an environment
 variable such as `OPENAI_API_KEY`, `VOYAGE_API_KEY`, or a private custom key;
@@ -925,9 +935,21 @@ Structural expansion is off by default and does not alter search scores. Add
 ```bash
 jscout search /path/to/repo "checkout inventory" --json --expand \
   --response-bytes 24000 \
-  --expand-depth 1 --expand-seeds 3 \
+  --expand-mode paths --expand-depth 1 --expand-seeds 3 --expand-paths 8 \
   --expand-nodes 40 --expand-edges 120 --expand-bytes 24000
 ```
+
+Compact expansion defaults to a ranked path forest rooted at the selected hit
+anchors. It keeps the shared prefixes needed to reach cross-file symbols,
+runtime hubs, handlers, state transitions, and effects instead of returning
+every incident edge in the induced neighborhood. `--expand-paths` bounds the
+number of ranked continuation endpoints. Depth one is the same compact one-hop
+caller/callee projection. Use `--expand-mode neighborhood` only when the full
+diagnostic neighborhood is actually needed. Both modes report omitted
+path/node/edge counts and retain the existing independently widenable limits.
+Under identical limits, diagnostic neighborhood reserves the selected compact
+path forest before filling the remaining budget with ranked fan-out, so it is a
+strict superset of the path projection rather than a competing bounded sample.
 
 Expansion defaults to `production` and `unknown` file-backed nodes while
 retaining structural hubs. Use repeatable `--expand-file-role` flags to opt
@@ -942,6 +964,11 @@ diagnostic metadata, empty fields, and repeated defaults. Search
 `--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
 full diagnostic representation.
 
+CLI `--debug-json` is not outer-response-budgeted when `--response-bytes` is
+omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
+Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
+and MCP responses retain their configured complete-response budgets.
+
 Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
 `arguments` object accepted unchanged by `definition`, `who_uses`, and
 `neighborhood`; ambiguous multi-anchor chunks expose their anchors but no
@@ -950,7 +977,7 @@ follow-up object. A file-only hit returns per-tool call objects for
 arguments so stale anchors re-resolve by path/scope/name or fail closed instead
 of silently binding to a same-named declaration.
 
-`--response-bytes` caps whichever complete JSON representation was requested:
+An explicit `--response-bytes` caps whichever complete JSON representation was requested:
 hits, expansion, budget metadata, and serialization overhead. The result
 reports its actual `rendered_bytes`, original `unbudgeted_bytes`, and omitted
 content. Search semantic-memory previews share a global eight-support cap.
@@ -962,8 +989,9 @@ expansion node, edge, and payload limits are subordinate budgets shared across
 all search-hit seeds. `--expand-min-confidence` defaults to `likely`;
 use `possible` only when explicit unresolved candidates are useful.
 
-Evidence-connected semantic memory is attached to CLI and structural-profile
-search by default; use `--no-memory` or `--memory-limit` to control it, and
+Evidence-connected semantic memory is opt-in for CLI and structural-profile
+search; use `--memory` when a preview connected to localized code would help,
+then use `--memory-limit` and
 `--memory-depth`/`--memory-nodes` to widen its reported structural join bounds.
 Every artifact carries evidence supports and a computed `fresh`, `degraded`,
 or `stale` label. The complete response-byte limit includes semantic artifacts.
@@ -1231,7 +1259,8 @@ Set
 `JSCOUT_TASK_ID` to join it to an evaluation task. Profile and task labels are
 included in each record; `JSCOUT_PROFILE_LABEL` overrides the recorded
 profile label. Expanded searches also record aggregate node totals
-and `expansion_role_counts`; no paths or source are added to telemetry.
+and `expansion_role_counts`, plus projection and candidate/selected/omitted path
+counts; no path bodies or source are added to telemetry.
 Semantic calls add aggregate candidate/selected/returned/written counts and
 fresh/degraded/stale totals. Search calls also record the canonical compact
 `hits_bytes`, `graph_bytes`, `memory_bytes`, `envelope_bytes`, and total; these

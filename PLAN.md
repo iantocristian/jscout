@@ -2264,15 +2264,15 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
-## In progress G20 — session-efficient compact transport
+## In progress G20b — path transport and measured compatibility
 
-G20a implements the correctness and compact-transport portion: cross-origin
+G20a merged in PR #60 and implements the correctness and compact-transport portion: cross-origin
 exact follow-ups, one complete top-hit handoff, opt-in search-attached memory,
 bounded checker receiver display, exact usage labels, compact/body/full artifact
 views, successful-diagnostic gating, and canonical section-byte telemetry.
-Path-shaped expansion, the structured-content compatibility experiment, and
-the registered fixed/staged replays remain G20b work; no aggregate byte claim
-is made before those replays run.
+G20b implements path-shaped expansion first, then runs the structured-content
+compatibility experiment and the registered fixed/staged replays. No aggregate
+byte claim is made before those replays run.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
@@ -2491,6 +2491,15 @@ at the selected hit seeds. It retains the edges required to explain each
 cross-file continuation and gives nodes response-local short IDs while keeping
 the exact anchor at its first occurrence.
 
+The repository default is `search.expansion.mode = "paths"`, with eight ranked
+continuation endpoints (`paths = 8`, widenable to 50) under the existing global
+seed/node/edge/byte bounds. Selection is a deterministic multi-source
+maximum-bottleneck forest over the already ranked neighborhood: cross-file and
+non-symbol boundaries lead same-file leaves, while direct relations between
+two search-hit seeds remain first-class paths. This changes only projection;
+confidence and relation weights, hub damping, role penalties, and origin policy
+remain owned by the structural traversal.
+
 The existing induced neighborhood remains an explicit diagnostic mode.
 High-frequency/common calls are suppressed through existing edge-kind weights,
 degree/hub damping, and path contribution—not a brittle blacklist of names such
@@ -2517,6 +2526,42 @@ Measurement distinguishes:
 1. inner canonical JSON bytes;
 2. JSON-RPC wire bytes after escaping/envelopes; and
 3. client-visible model-context bytes after the client's MCP rendering.
+
+The 2026-08-21 compatibility experiment is recorded in
+[`eval/results/g20b-mcp-structured-content-2026-08-21.md`](eval/results/g20b-mcp-structured-content-2026-08-21.md).
+Codex 0.147.0 preserved all 40 probe records and its verified result mapper
+reduced the deterministic client-visible representation by 11.31%, while raw
+MCP bytes increased by 88.9% because the fallback remains present. Claude Code
+2.1.238 also preserved all facts and did not expose two complete model copies,
+but showed no context reduction while raw bytes increased by 88.3%. Therefore
+`auto` is profiled to verified Codex versions; Claude and unknown clients stay
+text-only, with explicit `text` and `structured` overrides. The installed pi
+agent has no MCP client surface, while pi-ai is the LLM gateway rather than an
+MCP result consumer. This compatibility result does not satisfy the aggregate
+fixed-call replay gate.
+
+The path projection also has a separately labelled
+[`n8n real-corpus proxy`](eval/results/g20b-n8n-path-transport-proxy-2026-08-21.md).
+Across four fixed lexical expanded searches, it preserved the ordered hit
+anchors, emitted only edges present in the diagnostic neighborhood, reduced
+aggregate response bytes by 62.4%, nodes by 72.5%, and edges by 85.8%. The
+first pass exposed and fixed seed starvation by reserving one continuation per
+connected seed before global fill. This proxy does not satisfy the registered
+historical gate: the original private corpus is absent, raw responses were not
+retained, and abbreviated calls cannot be reconstructed honestly.
+
+The prospective
+[`Next.js full-posture check`](eval/results/g20b-next-full-posture-2026-08-21.md)
+then exercised product code vectors, the local reranker, 599 semantic vectors,
+evidence-connected memory attachment, and both projections together. Across
+four fixed query pairs, paths preserved ordered hits and delivered artifact IDs,
+reduced bytes by 55.1%, nodes by 70.0%, and edges by 85.6%. The first pass found
+that multi-seed path selection could retain a real cross-file continuation that
+the equally bounded diagnostic neighborhood omitted. Neighborhood now reserves
+the selected path forest before filling its remaining fan-out budget; the full
+rerun made every path node and edge a subset in all four pairs. This is the
+required rich-response corpus point, but its 55.1% result does not clear or
+replace the unavailable historical 60% fixed-call gate.
 
 ### Implementation order and acceptance
 
@@ -2564,6 +2609,10 @@ Acceptance requires:
 - the staged-session replay reports call count, inner/wire/client-visible bytes,
   and recovered high-value facts separately, without presenting strategy
   savings as transport savings;
+- the prospective real-corpus path-projection workload includes at least one
+  full-posture arm with vectors, reranking, and attached semantic memory.
+  **Complete:** the Next.js check above supplies that point; the lexical n8n
+  proxy remains graph-projection-only evidence;
 - strict individual response-byte budgets and explicit omission reporting
   remain intact;
 - `source_limit: 0` performs a successful no-source artifact read and a
