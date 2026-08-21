@@ -8,8 +8,8 @@ use super::{
     profile_fingerprint, ready_search_profile, semantic_embedding_documents,
     semantic_vector_failure, semantic_vector_failure_action, semantic_vector_index_has_gaps,
     semantic_vector_table, sync_semantic_vector_index, sync_vector_index, synchronize_vector_index,
-    validate_endpoint, vec_to_blob, vector_failure, vector_index_needs_sync, vector_search,
-    vector_table, vector_table_exists,
+    validate_endpoint, vec_to_blob, vector_failure, vector_index_has_completed_sync,
+    vector_index_needs_sync, vector_search, vector_table, vector_table_exists,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings};
 
@@ -590,6 +590,93 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
     let cache_rows: i64 =
         connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
     assert_eq!(cache_rows, 1, "content-addressed cache should survive");
+    Ok(())
+}
+
+#[test]
+fn incremental_vector_sync_materializes_a_reused_chunk_rowid() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('old.ts', 'old-file', 'production', 'repository')",
+        [],
+    )?;
+    let old_file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [old_file_id],
+    )?;
+    let old_chunk_id = connection.last_insert_rowid();
+
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+    assert!(vector_index_has_completed_sync(&connection, profile.id)?);
+
+    crate::store::delete_file(&connection, old_file_id)?;
+    assert!(
+        vector_index_has_completed_sync(&connection, profile.id)?,
+        "ordinary source deletion must preserve the completion marker"
+    );
+    let durable_rows: i64 = connection.query_row(
+        "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    let vector_rows: i64 =
+        connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!((durable_rows, vector_rows), (0, 0));
+
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('new.ts', 'new-file', 'production', 'repository')",
+        [],
+    )?;
+    let new_file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [new_file_id],
+    )?;
+    let new_chunk_id = connection.last_insert_rowid();
+    assert_eq!(
+        new_chunk_id, old_chunk_id,
+        "fixture must exercise SQLite rowid reuse"
+    );
+
+    synchronize_vector_index(&connection, &profile, false)?;
+    let materialized_chunk_id: i64 = connection.query_row(
+        &format!(
+            "SELECT entry.chunk_id
+             FROM embedding_index_entries entry
+             JOIN {table} vector ON vector.rowid=entry.id
+             WHERE entry.profile_id=?1"
+        ),
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(materialized_chunk_id, new_chunk_id);
+    assert!(!vector_index_needs_sync(&connection, profile.id)?);
     Ok(())
 }
 
