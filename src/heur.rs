@@ -304,7 +304,7 @@ pub(crate) fn member_path(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
-#[expect(unused)]
+#[expect(dead_code)]
 fn span_of(expr: &Expression<'_>) -> Span {
     expr.span()
 }

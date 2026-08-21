@@ -483,7 +483,7 @@ fn publication_rejects_changed_or_reordered_source_identity() -> Result<()> {
         })),
         &planned,
     )?;
-    let mut changed = planned;
+    let mut changed = planned.clone();
     changed[0].fingerprint = "changed".into();
     let error = super::annotate_input(&concept, &changed, "snapshot".into(), None)
         .expect_err("changed child identity");

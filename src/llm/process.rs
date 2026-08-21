@@ -374,8 +374,13 @@ impl ProcessGateway {
 
     /// A poisoned client saw a framing/timeout failure and can no longer
     /// trust request correlation; callers must discard it.
-    #[allow(dead_code)] // consumed by the sidecar restart policy (follow-up layer)
-    // not #[expect]: read by tests, so the lint fires only for the lib target
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the sidecar restart policy (follow-up layer)"
+        )
+    )]
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }

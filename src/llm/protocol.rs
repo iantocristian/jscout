@@ -190,15 +190,20 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // retryability/capacity are retained for ledger diagnostics
-// not #[expect]: these fields are read by tests, so the lint fires only for
-// the lib target and an expectation would go unfulfilled under --all-targets
 pub struct RemoteError {
     pub code: String,
     pub message: String,
     #[serde(default)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "retained for ledger diagnostics")
+    )]
     pub retryable: bool,
     #[serde(default)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "retained for ledger diagnostics")
+    )]
     pub capacity: bool,
 }
 
