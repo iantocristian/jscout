@@ -724,6 +724,7 @@ pub fn embed_missing_for_selection_report(
     batch_size: usize,
     file_origins: &[String],
     product_only: bool,
+    repair: bool,
 ) -> Result<EmbeddingPassReport> {
     embed_missing_for_selection_interruptible(
         conn,
@@ -731,6 +732,7 @@ pub fn embed_missing_for_selection_report(
         batch_size,
         file_origins,
         product_only,
+        repair,
         || false,
     )
 }
@@ -752,6 +754,7 @@ pub fn embed_missing_interruptible(
         batch_size,
         &crate::origin::defaults(),
         product_only,
+        false,
         should_cancel,
     )
 }
@@ -762,6 +765,7 @@ fn embed_missing_for_selection_interruptible(
     batch_size: usize,
     file_origins: &[String],
     product_only: bool,
+    repair: bool,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<EmbeddingPassReport> {
     if batch_size == 0 {
@@ -855,7 +859,7 @@ fn embed_missing_for_selection_interruptible(
         });
     }
     let occurrences_synced = if let Some(profile) = resolved {
-        sync_vector_index(conn, Some(profile.id))?;
+        synchronize_vector_index(conn, &profile, repair)?;
         selected_embedding_occurrence_count(conn, profile.id, file_origins, product_only)?
     } else {
         0
@@ -1254,6 +1258,35 @@ fn sync_semantic_vector_index(
     Ok(())
 }
 
+/// Use the cheap occurrence anti-join for normal embedding passes. A missing
+/// completion marker still falls back to the full audit, while `repair`
+/// deliberately verifies orphaned and missing sqlite-vec rows as well.
+fn synchronize_vector_index(
+    conn: &Connection,
+    profile: &ResolvedProfile,
+    repair: bool,
+) -> Result<()> {
+    if repair || !vector_index_has_completed_sync(conn, profile.id)? {
+        return sync_vector_index(conn, Some(profile.id));
+    }
+    if !vector_profile_has_unmaterialized_occurrences(conn, profile.id)? {
+        return Ok(());
+    }
+
+    let table = ensure_vector_table(conn, profile.dimensions)?;
+    conn.execute_batch("SAVEPOINT jscout_vector_incremental")?;
+    match materialize_profile(conn, profile.id, &table) {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_incremental")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_vector_incremental; RELEASE jscout_vector_incremental",
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result<()> {
     let profiles = {
         let mut statement = conn.prepare(
@@ -1415,19 +1448,19 @@ fn vector_sync_key(profile_id: i64) -> String {
     format!("embedding_index_synced_v1:{profile_id}")
 }
 
-/// The virtual index is transactionally maintained after its first complete
-/// repair. A regular-table anti-join cheaply detects newly indexed chunk
-/// occurrences that can reuse cached embeddings; it avoids auditing every
-/// sqlite-vec row on every search.
-fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
-    let has_completed_sync = conn.query_row(
+fn vector_index_has_completed_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
         [vector_sync_key(profile_id)],
         |row| row.get::<_, bool>(0),
-    )?;
-    if !has_completed_sync {
-        return Ok(true);
-    }
+    )
+    .map_err(Into::into)
+}
+
+fn vector_profile_has_unmaterialized_occurrences(
+    conn: &Connection,
+    profile_id: i64,
+) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
            SELECT 1
@@ -1442,6 +1475,17 @@ fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
         |row| row.get::<_, bool>(0),
     )
     .map_err(Into::into)
+}
+
+/// The virtual index is transactionally maintained after its first complete
+/// repair. A regular-table anti-join cheaply detects newly indexed chunk
+/// occurrences that can reuse cached embeddings; it avoids auditing every
+/// sqlite-vec row on every search.
+fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    if !vector_index_has_completed_sync(conn, profile_id)? {
+        return Ok(true);
+    }
+    vector_profile_has_unmaterialized_occurrences(conn, profile_id)
 }
 
 fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<ResolvedProfile> {
@@ -1461,7 +1505,7 @@ fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<Resolve
         |row| row.get::<_, bool>(0),
     )?;
     if !table_exists {
-        bail!("vector index table is missing; run `jscout embed <root>` to repair it")
+        bail!("vector index table is missing; run `jscout embed <root> --repair` to repair it")
     }
     Ok(profile)
 }

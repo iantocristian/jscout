@@ -7,8 +7,8 @@ use super::{
     existing_profile, materialize_cached_embeddings, missing_embedding_documents,
     profile_fingerprint, ready_search_profile, semantic_embedding_documents,
     semantic_vector_failure, semantic_vector_failure_action, semantic_vector_index_has_gaps,
-    semantic_vector_table, sync_semantic_vector_index, sync_vector_index, validate_endpoint,
-    vec_to_blob, vector_failure, vector_index_needs_sync, vector_table,
+    semantic_vector_table, sync_semantic_vector_index, sync_vector_index, synchronize_vector_index,
+    validate_endpoint, vec_to_blob, vector_failure, vector_index_needs_sync, vector_table,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings};
 
@@ -410,6 +410,7 @@ fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()
         16,
         &["repository".into()],
         false,
+        false,
     )?;
     assert_eq!(code.missing, 0);
     assert_eq!(code.embedded, 0);
@@ -588,6 +589,81 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
     let cache_rows: i64 =
         connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
     assert_eq!(cache_rows, 1, "content-addressed cache should survive");
+    Ok(())
+}
+
+#[test]
+fn incremental_vector_sync_leaves_full_audit_to_explicit_repair() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('a.ts', 'file-a', 'production', 'repository')",
+        [],
+    )?;
+    let file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [file_id],
+    )?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 2, 3, 2, 2, 'same', 'alpha')",
+        [file_id],
+    )?;
+    synchronize_vector_index(&connection, &profile, false)?;
+    let counts = || -> anyhow::Result<(i64, i64)> {
+        Ok((
+            connection.query_row(
+                "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
+                [profile.id],
+                |row| row.get(0),
+            )?,
+            connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?,
+        ))
+    };
+    assert_eq!(counts()?, (2, 2));
+
+    let missing_row: i64 = connection.query_row(
+        "SELECT min(id) FROM embedding_index_entries WHERE profile_id=?1",
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        &format!("DELETE FROM {table} WHERE rowid=?1"),
+        [missing_row],
+    )?;
+    synchronize_vector_index(&connection, &profile, false)?;
+    assert_eq!(
+        counts()?,
+        (2, 1),
+        "incremental synchronization must not pay for a full virtual-row audit"
+    );
+    synchronize_vector_index(&connection, &profile, true)?;
+    assert_eq!(counts()?, (2, 2));
     Ok(())
 }
 

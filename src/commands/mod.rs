@@ -184,6 +184,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             product,
             semantic,
             semantic_only,
+            repair,
         } => cmd_embed(
             &root,
             Some(database.as_deref().unwrap_or(configured_database)),
@@ -197,6 +198,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 product,
                 semantic,
                 semantic_only,
+                repair,
             },
             runtime,
         ),

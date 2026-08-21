@@ -116,6 +116,7 @@ jscout embed <root>            # embed code chunks missing embeddings (cached by
   --product                    #   fresh runtime recon + neutral production fallback only
   --semantic                   #   also embed current generated/agent semantic artifacts
   --semantic-only              #   update only the semantic-artifact vector index
+  --repair                     #   force a full code-vector consistency audit
 jscout inference serve         # run the optional local embedding/reranking service
 jscout inference doctor        # verify its endpoint, device, models, and dimensions
 jscout entities <root> [query] # runtime, contract, route, config, data, flag, host entities
@@ -1157,12 +1158,14 @@ profile and source origin, and keeps occurrence rows in the same SQLite file.
 This removes the Rust full-table cosine loop. The stable `vec0` implementation
 is native exact KNN, not an HNSW/approximate index.
 
-`jscout embed` owns profile creation and full consistency repair. Indexing
-materializes new chunk occurrences when their content hashes already have
-cached vectors. Search performs readiness checks only; it never creates a
-profile, table, or vector row inside its read snapshot. If vector state is
-missing or incomplete, the vector stage reports that `jscout embed` is needed
-and search continues with BM25. On the August 2026 n8n validation corpus
+`jscout embed` owns profile creation and incrementally materializes new chunk
+occurrences when their content hashes already have cached vectors. A profile
+without a completed synchronization marker automatically receives a full
+repair; `jscout embed <root> --repair` explicitly audits an already-synchronized
+profile for orphaned or missing sqlite-vec rows. Search performs readiness
+checks only; it never creates a profile, table, or vector row inside its read
+snapshot. If vector state is missing or incomplete, the vector stage reports
+that `jscout embed` is needed and search continues with BM25. On the August 2026 n8n validation corpus
 (92,215 vector occurrences), a warm release search measured 107 ms for exact
 KNN and 332 ms for the complete vector stage. ANN/HNSW remains a separate
 follow-up rather than a correctness dependency of this storage change.

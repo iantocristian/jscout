@@ -889,6 +889,8 @@ function parseEmbeddingReport(stdout) {
 async function runEmbeddingSuite(context) {
   console.error('benchmark: deterministic loopback embedding synchronization');
   const server = await startMockInference(context);
+  const repairArguments = run(context.binary, ['embed', '--help'], { env: context.env })
+    .stdout.includes('--repair') ? ['--repair'] : [];
   const config = join(context.workspace, 'embedding.toml');
   writeFileSync(config, `version = 1
 
@@ -906,11 +908,12 @@ url = "${server.url}"
 timing = true
 debug = false
 `);
-  const runEmbed = async (database) => {
+  const runEmbed = async (database, extraArguments = []) => {
     assertActive(context);
     await fetchJson(`${server.url}/reset`, { method: 'POST' });
     const result = run(context.binary, [
       '--config', config, 'embed', context.corpus, '--database', database,
+      ...extraArguments,
     ], { env: context.env, timeoutMs: 10 * 60_000 });
     const state = sqliteJson(context.sqlite, database, `
       SELECT
@@ -957,7 +960,7 @@ debug = false
       const database = join(context.workspace, `embedding-repair-${index + 1}.db`);
       backupDatabase(context.sqlite, canonical, database, context.env);
       run(context.sqlite, [database, 'DELETE FROM embedding_index_entries; PRAGMA wal_checkpoint(TRUNCATE);'], { env: context.env });
-      repair.push(await runEmbed(database));
+      repair.push(await runEmbed(database, repairArguments));
       removeDatabaseFamily(context, database);
     }
 

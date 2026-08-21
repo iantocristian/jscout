@@ -261,6 +261,14 @@ fn search_and_embed_accept_external_database_paths() {
     assert!(!semantic);
     assert!(semantic_only);
     assert!(Cli::try_parse_from(["jscout", "embed", ".", "--product", "--semantic-only"]).is_err());
+    assert!(Cli::try_parse_from(["jscout", "embed", ".", "--repair", "--semantic-only"]).is_err());
+
+    let Cli { command, .. } = Cli::try_parse_from(["jscout", "embed", ".", "--repair"])
+        .expect("explicit vector repair parses");
+    let Command::Embed { repair, .. } = command else {
+        panic!("expected embed")
+    };
+    assert!(repair);
 
     let Cli { command, .. } =
         Cli::try_parse_from(["jscout", "memory", ".", "rewrite behavior", "--no-vector"])
