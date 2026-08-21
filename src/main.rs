@@ -1002,6 +1002,24 @@ impl ScoutCommand {
     }
 }
 
+/// Resolve a `--flag` / `--no-flag` pair against its configured default.
+///
+/// Disabling wins over enabling, so `--vector --lexical-only` is lexical; with
+/// neither flag present the configured value stands.
+const fn resolve_flag(enable: bool, disable: bool, configured: bool) -> bool {
+    if disable { false } else { enable || configured }
+}
+
+/// Command-line list arguments replace their configured default wholesale
+/// rather than appending to it; an empty list means "not specified".
+fn or_configured<T: Clone>(explicit: Vec<T>, configured: &[T]) -> Vec<T> {
+    if explicit.is_empty() {
+        configured.to_vec()
+    } else {
+        explicit
+    }
+}
+
 fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> {
     let configured_database = runtime.effective.database.path.as_path();
     match command {
@@ -1085,49 +1103,14 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             expand_file_roles,
         } => {
             let configured = &runtime.effective.search;
-            let vector = if lexical_only || no_vector {
-                false
-            } else if vector {
-                true
-            } else {
-                configured.vector
-            };
-            let rerank = if lexical_only || no_rerank {
-                false
-            } else if rerank {
-                true
-            } else {
-                configured.rerank
-            };
-            let include_memory = if no_memory {
-                false
-            } else if memory {
-                true
-            } else {
-                configured.attach_memory
-            };
-            let expand = if no_expand {
-                false
-            } else if expand {
-                true
-            } else {
-                configured.expansion.enabled
-            };
-            let file_roles = if file_roles.is_empty() {
-                configured.file_roles.clone()
-            } else {
-                file_roles
-            };
-            let file_origins = if file_origins.is_empty() {
-                configured.origins.clone()
-            } else {
-                file_origins
-            };
-            let expand_file_roles = if expand_file_roles.is_empty() {
-                configured.expansion.file_roles.clone()
-            } else {
-                expand_file_roles
-            };
+            let vector = resolve_flag(vector, lexical_only || no_vector, configured.vector);
+            let rerank = resolve_flag(rerank, lexical_only || no_rerank, configured.rerank);
+            let include_memory = resolve_flag(memory, no_memory, configured.attach_memory);
+            let expand = resolve_flag(expand, no_expand, configured.expansion.enabled);
+            let file_roles = or_configured(file_roles, &configured.file_roles);
+            let file_origins = or_configured(file_origins, &configured.origins);
+            let expand_file_roles =
+                or_configured(expand_file_roles, &configured.expansion.file_roles);
             let provider = if vector {
                 embed::Provider::from_settings(
                     &runtime.effective.embedding,
@@ -1301,13 +1284,7 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
             )?;
-            let vector = if no_vector {
-                false
-            } else if vector {
-                true
-            } else {
-                runtime.effective.search.vector
-            };
+            let vector = resolve_flag(vector, no_vector, runtime.effective.search.vector);
             let provider = if !vector {
                 None
             } else {
@@ -1437,27 +1414,9 @@ fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> 
             reconcile_seconds,
         } => {
             let configured = &runtime.effective.watch;
-            let embed = if no_embed {
-                false
-            } else if embed {
-                true
-            } else {
-                configured.embed
-            };
-            let product = if no_product {
-                false
-            } else if product {
-                true
-            } else {
-                configured.product
-            };
-            let enrich = if no_enrich {
-                false
-            } else if enrich {
-                true
-            } else {
-                configured.enrich
-            };
+            let embed = resolve_flag(embed, no_embed, configured.embed);
+            let product = resolve_flag(product, no_product, configured.product);
+            let enrich = resolve_flag(enrich, no_enrich, configured.enrich);
             let dependencies = if no_dependencies {
                 Vec::new()
             } else if dependencies.is_empty() {
