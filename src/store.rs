@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "25";
+pub const SCHEMA_VERSION: &str = "26";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -217,7 +217,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='25' WHERE key='schema_version';",
+             UPDATE meta SET value='26' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +235,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '25')
+INSERT INTO meta(key, value) VALUES('schema_version', '26')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -388,7 +388,8 @@ CREATE TABLE IF NOT EXISTS member_calls(
   property_end INTEGER NOT NULL DEFAULT 0,
   receiver_unbound INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_member_calls_file ON member_calls(file_id);
+CREATE INDEX IF NOT EXISTS idx_member_calls_file
+  ON member_calls(file_id, receiver_start, prop);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
 
 -- Source-local deterministic evidence. Identifier identities remain raw here
@@ -1317,13 +1318,40 @@ mod tests {
     }
 
     #[test]
+    fn v25_rebuild_replaces_member_call_file_index() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v25.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "DROP INDEX idx_member_calls_file;
+             CREATE INDEX idx_member_calls_file ON member_calls(file_id);
+             UPDATE meta SET value='25' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let migrated = open_path(&database)?;
+        let version: String = migrated.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            index_columns(&migrated, "idx_member_calls_file")?,
+            ["file_id", "receiver_start", "prop"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn indexes_high_volume_evidence_tables_by_file() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = open(repo.path())?;
-        for index in ["idx_events_file", "idx_member_calls_file"] {
-            let columns = index_columns(&conn, index)?;
-            assert_eq!(columns[0], "file_id", "{index} must index file_id first");
-        }
+        assert_eq!(index_columns(&conn, "idx_events_file")?, ["file_id"]);
+        assert_eq!(
+            index_columns(&conn, "idx_member_calls_file")?,
+            ["file_id", "receiver_start", "prop"]
+        );
         Ok(())
     }
 
