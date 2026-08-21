@@ -336,7 +336,7 @@ fn localized_memory_never_backfills_unsupported_semantic_analogs() -> Result<()>
         &conn,
         None,
         &QueryOptions {
-            anchor: Some(target),
+            anchor: Some(target.clone()),
             file: Some("cms.ts".into()),
             limit: 2,
             ..Default::default()
@@ -667,7 +667,7 @@ fn relation_backed_concept_tags_follow_child_semantic_supports() -> Result<()> {
                 },
                 semantic::SupportInput {
                     claim_path: "/domain_terms/0".into(),
-                    anchor,
+                    anchor: anchor.clone(),
                     role: None,
                     evidence_file: "concept.ts".into(),
                     evidence_start_line: 1,

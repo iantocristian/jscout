@@ -27,7 +27,7 @@ pub struct Chunk {
     pub kind: ChunkKind,
     /// Primary symbol name, if the chunk is a named declaration.
     pub name: Option<String>,
-    /// Enclosing names, outermost first (e.g. ["`UserService`"] for a method).
+    /// Enclosing names, outermost first (e.g. `["UserService"]` for a method).
     pub scope_chain: Vec<String>,
     /// All symbol names declared at the top level of this chunk.
     pub symbols: Vec<String>,

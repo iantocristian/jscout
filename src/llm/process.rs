@@ -339,7 +339,20 @@ impl ProcessGateway {
                 Ok(Ok(message)) if message.id() == id => return Ok(message),
                 // Control handles do not wait on acknowledgements; consume
                 // them here while preserving the completion's total timeout.
-                Ok(Ok(Inbound::CancelResult { .. })) => continue,
+                // A positive acknowledgement can only name the completion
+                // currently awaited by this one-at-a-time client. Negative
+                // acknowledgements may be left over from a completion race.
+                Ok(Ok(Inbound::CancelResult {
+                    target_id, active, ..
+                })) => {
+                    if active && target_id != id {
+                        self.poisoned = true;
+                        return Err(GatewayError::Protocol(format!(
+                            "cancel acknowledgement activated request {target_id}, but the client is awaiting {id}"
+                        )));
+                    }
+                    continue;
+                }
                 Ok(Ok(message)) => {
                     self.poisoned = true;
                     return Err(GatewayError::Protocol(format!(
@@ -374,8 +387,7 @@ impl ProcessGateway {
 
     /// A poisoned client saw a framing/timeout failure and can no longer
     /// trust request correlation; callers must discard it.
-    #[allow(dead_code)] // consumed by the sidecar restart policy (follow-up layer)
-    // not #[expect]: read by tests, so the lint fires only for the lib target
+    #[cfg(test)]
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
@@ -700,6 +712,36 @@ done"#
         assert!(matches!(error, GatewayError::Canceled(_)), "got {error:?}");
         assert!(canceler.join().expect("cancel thread"));
         assert!(!gateway.poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_active_cancel_acknowledgement_fails_closed() -> anyhow::Result<()> {
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      ;;
+    *'"kind":"cancel"'*)
+      echo '{{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"wrong","active":true}}'
+      ;;
+  esac
+done"#
+        );
+        let mut gateway = spawn_with(&body)?;
+        let control = gateway.control();
+        let canceler = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            control.cancel_active()
+        });
+        let error = gateway
+            .complete(&complete_request(), Duration::from_secs(5))
+            .expect_err("mismatched active cancellation should fail");
+        assert!(matches!(error, GatewayError::Protocol(_)), "got {error:?}");
+        assert!(gateway.poisoned());
+        assert!(canceler.join().expect("cancel thread")?);
         Ok(())
     }
 
