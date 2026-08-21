@@ -128,6 +128,7 @@ pub struct GraphEdge {
 #[derive(Debug)]
 struct RankedStep {
     edge_id: i64,
+    detail_key: String,
     edge: GraphEdge,
     other: String,
     depth: usize,
@@ -145,12 +146,31 @@ struct OrderedGraphEdge {
     edge: GraphEdge,
 }
 
+fn graph_edge_content_cmp(
+    left: &GraphEdge,
+    left_detail_key: &str,
+    right: &GraphEdge,
+    right_detail_key: &str,
+) -> Ordering {
+    left.source
+        .cmp(&right.source)
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.target.cmp(&right.target))
+        .then_with(|| left.confidence.cmp(&right.confidence))
+        .then_with(|| left.provenance.cmp(&right.provenance))
+        .then_with(|| left.file.cmp(&right.file))
+        .then_with(|| left.line.cmp(&right.line))
+        .then_with(|| left_detail_key.cmp(right_detail_key))
+}
+
 impl PartialEq for RankedStep {
     fn eq(&self, other: &Self) -> bool {
         self.score.to_bits() == other.score.to_bits()
             && self.depth == other.depth
             && self.edge_id == other.edge_id
             && self.other == other.other
+            && graph_edge_content_cmp(&self.edge, &self.detail_key, &other.edge, &other.detail_key)
+                == Ordering::Equal
     }
 }
 
@@ -168,6 +188,9 @@ impl Ord for RankedStep {
             .total_cmp(&other.score)
             .then_with(|| other.depth.cmp(&self.depth))
             .then_with(|| other.other.cmp(&self.other))
+            .then_with(|| {
+                graph_edge_content_cmp(&other.edge, &other.detail_key, &self.edge, &self.detail_key)
+            })
             .then_with(|| other.edge_id.cmp(&self.edge_id))
     }
 }
@@ -2445,7 +2468,7 @@ fn neighborhood_in_snapshot(
     let mut node_relevance = HashMap::from([(resolved_anchor.clone(), 1.0_f64)]);
     let mut expanded = HashSet::from([resolved_anchor.clone()]);
     let mut frontier = BinaryHeap::new();
-    let mut edges_by_id: HashMap<i64, GraphEdge> = HashMap::new();
+    let mut edges_by_id: HashMap<i64, (String, GraphEdge)> = HashMap::new();
     let mut degree_cache = HashMap::new();
     let mut truncated = false;
 
@@ -2487,7 +2510,7 @@ fn neighborhood_in_snapshot(
             discovered.insert(step.other.clone());
             node_relevance.insert(step.other.clone(), step.score);
         }
-        edges_by_id.insert(step.edge_id, step.edge);
+        edges_by_id.insert(step.edge_id, (step.detail_key, step.edge));
 
         if step.depth < options.depth && expanded.insert(step.other.clone()) {
             enqueue_ranked_steps(
@@ -2523,9 +2546,9 @@ fn neighborhood_in_snapshot(
     });
     let mut edges = edges_by_id
         .into_iter()
-        .map(|(edge_id, edge)| OrderedGraphEdge {
+        .map(|(edge_id, (detail_key, edge))| OrderedGraphEdge {
             edge_id,
-            detail_key: edge.detail.to_string(),
+            detail_key,
             edge,
         })
         .collect::<Vec<_>>();
@@ -2533,14 +2556,7 @@ fn neighborhood_in_snapshot(
         b.edge
             .relevance
             .total_cmp(&a.edge.relevance)
-            .then_with(|| a.edge.source.cmp(&b.edge.source))
-            .then_with(|| a.edge.kind.cmp(&b.edge.kind))
-            .then_with(|| a.edge.target.cmp(&b.edge.target))
-            .then_with(|| a.edge.confidence.cmp(&b.edge.confidence))
-            .then_with(|| a.edge.provenance.cmp(&b.edge.provenance))
-            .then_with(|| a.edge.file.cmp(&b.edge.file))
-            .then_with(|| a.edge.line.cmp(&b.edge.line))
-            .then_with(|| a.detail_key.cmp(&b.detail_key))
+            .then_with(|| graph_edge_content_cmp(&a.edge, &a.detail_key, &b.edge, &b.detail_key))
             .then_with(|| a.edge_id.cmp(&b.edge_id))
     });
     let edges = edges.into_iter().map(|entry| entry.edge).collect();
@@ -3312,8 +3328,10 @@ fn enqueue_ranked_steps(
                     * role_floor,
             );
             edge.relevance = score;
+            let detail_key = edge.detail.to_string();
             frontier.push(RankedStep {
                 edge_id,
+                detail_key,
                 edge,
                 other,
                 depth: next_depth,

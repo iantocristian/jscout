@@ -103,6 +103,24 @@ fn neighborhood_orders_parallel_edges_deterministically() -> Result<()> {
             .map(|edge| edge.line.expect("parallel edge line"))
             .collect::<Vec<_>>();
         assert_eq!(lines, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let truncated = neighborhood(
+            &conn,
+            &source,
+            &NeighborhoodOptions {
+                direction: "out".into(),
+                node_limit: 10,
+                edge_limit: 4,
+                ..Default::default()
+            },
+        )?;
+        let retained_lines = truncated
+            .edges
+            .iter()
+            .map(|edge| edge.line.expect("parallel edge line"))
+            .collect::<Vec<_>>();
+        assert_eq!(retained_lines, vec![10, 20, 30, 40]);
+        assert!(truncated.truncated);
     }
     Ok(())
 }
