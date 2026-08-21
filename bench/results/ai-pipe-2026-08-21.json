@@ -1,0 +1,359 @@
+{
+  "schema_version": 1,
+  "kind": "jscout_local_performance_baseline",
+  "recorded_date": "2026-08-21",
+  "status": "descriptive_single_host_baseline",
+  "source": "normalized_from_retained_exploratory_artifacts_and_summaries",
+  "generated_by_checked_harness": false,
+  "future_harness_schema": "jscout.performance.v1",
+  "report_path": "bench/results/ai-pipe-2026-08-21.md",
+  "harness_path": "bench/perf/ai-pipe.mjs",
+  "provenance": {
+    "jscout_source_commit": "67ba1b2b7efd51ba6fd55f02f0945da22f85b412",
+    "jscout_merged_equivalent_commit": "b0aa10b5c80023c294859a2757cd32f202f1dd6f",
+    "jscout_tree": "d4c08d941551dcbd5ec822ebeb7eb81cec20762b",
+    "jscout_version": "0.4.0",
+    "measured_binary_sha256": "341855206253d61b7ddf07205f4d9a29a8cc5ca680b06e05f82954d500926cd4",
+    "measured_binary_source": "temporary PR worktree at the recorded source commit and tree",
+    "machine_local_binary_path_retained": false,
+    "ai_pipe_commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+    "build_profile": "release",
+    "profiling_build": "same source tree; release with debug symbols and frame pointers"
+  },
+  "environment": {
+    "os": "macOS 26.6.1",
+    "os_build": "25G76",
+    "architecture": "arm64",
+    "hardware": "Apple M5 Pro",
+    "cores": 18,
+    "memory_bytes": 68719476736,
+    "rustc": "1.97.1",
+    "node": "24.15.0"
+  },
+  "corpus": {
+    "construction": "git archive export",
+    "total_files": 930,
+    "indexed_js_ts_files": 690,
+    "index_dependencies": false,
+    "node_modules_symlink": {
+      "present_throughout_historical_run": true,
+      "traversed_by_indexing": false,
+      "used_by_enrichment_checker": true
+    },
+    "database_bytes": 38473728,
+    "database_counts": {
+      "files": 690,
+      "chunks": 5483,
+      "symbols": 4538,
+      "refs": 28527,
+      "member_calls": 25340,
+      "entity_sites": 907,
+      "graph_nodes": 5677,
+      "resolved_edges": 37202
+    }
+  },
+  "methodology": {
+    "timer": "monotonic wall clock",
+    "cli_includes_process_startup": true,
+    "persistent_mcp": "one process, sequential requests",
+    "filesystem_cache_flushed": false,
+    "host_load_controlled": false,
+    "thermal_state_controlled": false,
+    "remote_inference_used": false,
+    "remote_provider_used": false,
+    "profile_interpretation": "stack residency including blocked system calls; not pure CPU percentage",
+    "claims": "single-host, single-corpus descriptive measurements; not CI thresholds or cross-machine estimates"
+  },
+  "checked_harness_coverage": {
+    "generates_this_record": false,
+    "output_schema": "jscout.performance.v1",
+    "scenario_overlap": [
+      "first and repeated fresh-database indexing",
+      "same-content mtime watch reconciliation",
+      "enrichment planning, full run, and unchanged reuse",
+      "lexical CLI search",
+      "persistent MCP search round trips",
+      "seven fixed neighborhood cases",
+      "provider-free scout preparation and publication/reuse smoke",
+      "embedding population, synchronization, and occurrence-index repair"
+    ],
+    "historical_diagnostics_not_reproduced": [
+      "50-run --version process-startup control",
+      "three-query search limit and response-budget sweep",
+      "persistent-MCP integer telemetry and aggregate whole-process timing",
+      "platform-specific index, search, and enrichment stack profiles",
+      "neighborhood unbudgeted_bytes"
+    ],
+    "historical_followups_not_reproduced": [
+      "schema and index experiments",
+      "supplemental seeded semantic-memory and scouting measurements"
+    ],
+    "method_differences": {
+      "embedding": "historical fixture-v1 advertised normalization but did not normalize generated vectors; checked dense-unit-vector-v1 explicitly unit-normalizes",
+      "node_modules": "historical symlink was present throughout but ignored by --no-deps indexing; checked harness adds it only for enrichment"
+    }
+  },
+  "results": {
+    "indexing": {
+      "fresh_database_warm_filesystem": {
+        "unit": "ms",
+        "n": 5,
+        "samples": [521.6, 543.75, 535.32, 527.81, 546.57],
+        "median": 535.32,
+        "qualification": "new database and application state; operating-system filesystem cache remained warm"
+      },
+      "first_post_export_observation": {
+        "unit": "ms",
+        "n": 1,
+        "value": 776.95,
+        "qualification": "single observation; not a baseline estimate"
+      },
+      "instrumented_fresh_runs": {
+        "unit": "ms",
+        "n": 4,
+        "total_samples": [527.255, 535.997, 551.805, 554.373],
+        "reference_projection_samples": [148.27, 147.077, 148.127, 157.718],
+        "structural_projection_samples": [245.528, 247.563, 254.314, 266.961],
+        "qualification": "separate measurement set from fresh_database_warm_filesystem"
+      },
+      "unchanged_watch_generation": {
+        "unit": "ms",
+        "n": 11,
+        "samples": [63, 64, 56, 58, 64, 57, 59, 59, 57, 59, 65],
+        "median": 59,
+        "debounce_excluded_ms": 100,
+        "qualification": "same-content timestamp event; 690 files reported unchanged"
+      },
+      "member_call_index_experiments": {
+        "candidate_sql": "CREATE INDEX ... ON member_calls(file_id, receiver_start, prop)",
+        "fresh_database": {
+          "n_per_arm": 4,
+          "baseline_median_ms": 580.37,
+          "candidate_median_ms": 465.8,
+          "change_percent": -19.7
+        },
+        "populated_full_refresh": {
+          "n_per_arm": 12,
+          "baseline_median_ms": 647.11,
+          "candidate_median_ms": 579.74,
+          "change_percent": -10.4
+        },
+        "reference_projection": {
+          "n_per_arm": 4,
+          "baseline_median_ms": 163.87,
+          "candidate_median_ms": 96.68,
+          "change_percent": -41.0
+        },
+        "structural_projection": {
+          "n_per_arm": 4,
+          "baseline_median_ms": 257.34,
+          "candidate_median_ms": 191.45,
+          "change_percent": -25.6
+        },
+        "content_hash_parity": true,
+        "storage_bytes": {
+          "existing_file_only_index": 290816,
+          "composite_added_after_population": 499712,
+          "composite_maintained_during_indexing": 565248,
+          "observed_net_replacement_range": [208896, 274432]
+        }
+      }
+    },
+    "enrichment": {
+      "full_local_run": {
+        "unit": "s",
+        "n": 1,
+        "value": 330.76,
+        "projects_completed": 458,
+        "projects_total": 458,
+        "occurrences_selected": 5158,
+        "request_batches": 466,
+        "resolved_enrichment_rows": 1412,
+        "database_bytes_after": 86269952,
+        "qualification": "single run using real local checker; no remote provider"
+      },
+      "unchanged_resume": {
+        "unit": "s",
+        "n": 5,
+        "median": 4.52,
+        "observed_range": [4.48, 4.57],
+        "occurrences_resumed": 5158,
+        "checker_requests": 0
+      },
+      "stack_profile": {
+        "total_samples": 3173,
+        "freshness_reuse_path_samples": 3065,
+        "blake3_descendant_samples": 1824,
+        "qualification": "stack-residency counts may overlap and include blocked I/O"
+      },
+      "project_input_multiplicity": {
+        "rows": 122303,
+        "distinct_kind_path_expected_hash": 2093,
+        "qualification": "row-identity redundancy; not a measured filesystem-I/O reduction"
+      }
+    },
+    "lexical_search": {
+      "workload": {
+        "queries": 24,
+        "passes": 5,
+        "samples": 120,
+        "limit": 20,
+        "vector": false,
+        "memory": false,
+        "expansion": false
+      },
+      "process_startup_control": {
+        "n": 50,
+        "median_ms": 3.569,
+        "p95_ms": 3.969
+      },
+      "cli": {
+        "n": 120,
+        "median_ms": 36.165,
+        "p95_ms": 47.383
+      },
+      "bm25_stage": {
+        "n": 120,
+        "median_ms": 1.968,
+        "p95_ms": 2.987
+      },
+      "persistent_mcp": {
+        "n": 120,
+        "internal_median_ms": 30,
+        "internal_p95_ms": 35,
+        "aggregate_wall_ms_per_call": 32.205,
+        "qualification": "internal telemetry is integer milliseconds; wall value is one aggregate process run"
+      },
+      "stack_profile": {
+        "total_samples": 5748,
+        "project_chunk_anchors_descendant_samples": 2641,
+        "hit_loading_approx_descendant_samples": 2316,
+        "bm25_approx_descendant_samples": 301,
+        "pread_top_leaf_samples": 2279,
+        "response_budget_share_less_than": 0.01,
+        "qualification": "stack-residency counts, not pure or necessarily disjoint CPU shares"
+      },
+      "limit_budget_sweep": [
+        {"label": "limit_1_budget_24k", "n": 60, "wall_ms_per_call": 5.509, "internal_median_ms": 3, "median_result_bytes": 829},
+        {"label": "limit_5_budget_24k", "n": 60, "wall_ms_per_call": 10.911, "internal_median_ms": 9, "median_result_bytes": 2957},
+        {"label": "limit_10_budget_24k", "n": 60, "wall_ms_per_call": 16.7, "internal_median_ms": 15, "median_result_bytes": 5682},
+        {"label": "limit_20_budget_24k", "n": 60, "wall_ms_per_call": 29.729, "internal_median_ms": 28, "median_result_bytes": 12930},
+        {"label": "limit_50_budget_100k", "n": 60, "wall_ms_per_call": 72.657, "internal_median_ms": 69, "median_result_bytes": 32599},
+        {"label": "limit_20_budget_2k", "n": 60, "wall_ms_per_call": 30.262, "internal_median_ms": 28, "median_result_bytes": 1916},
+        {"label": "limit_20_budget_100k", "n": 60, "wall_ms_per_call": 29.841, "internal_median_ms": 28, "median_result_bytes": 12930},
+        {"label": "limit_20_debug_budget_100k", "n": 60, "wall_ms_per_call": 32.485, "internal_median_ms": 30, "median_result_bytes": 20092}
+      ],
+      "graph_native_index_experiment": {
+        "candidate_sql": "CREATE INDEX ... ON graph_nodes(native_id, native_table)",
+        "index_bytes": 106496,
+        "persistent_internal_median_ms_by_run": [11, 10, 10],
+        "persistent_wall_ms_per_call_by_run": [13.2, 12.28, 11.81],
+        "calls_per_run": 120,
+        "indexed_cli": {"n": 120, "median_ms": 16.621, "p95_ms": 20.039},
+        "equality_check": {
+          "queries": 3,
+          "byte_identical_excluding_initialize": true,
+          "sha256": "b6e1b6c36b8f25eb173cd01b093526141455fa701bc6434faccfb3b74510bf3a"
+        },
+        "qualification": "baseline and indexed timing runs were not interleaved; equality covered three fixed queries, not all timed calls"
+      }
+    },
+    "neighborhood": {
+      "method": "persistent MCP; five warmups and 50 timed round trips per case",
+      "anchors": {
+        "low": "sym:src/RunNodeInspectorModal.tsx#::inspectorTabs@1",
+        "medium": "sym:tradebook/api/src/domain/lifecycle-timeline.ts#::compareEvents@1",
+        "high": "sym:server/db.mjs#::openDatabase@1",
+        "extreme": "pkg:node:assert"
+      },
+      "cases": [
+        {"label": "low_default", "n": 50, "median_ms": 0.214583, "p95_ms": 0.439, "rendered_bytes": 688, "unbudgeted_bytes": 688},
+        {"label": "medium_default", "n": 50, "median_ms": 0.178167, "p95_ms": 0.269041, "rendered_bytes": 1250, "unbudgeted_bytes": 1250},
+        {"label": "high_default", "n": 50, "median_ms": 3.533375, "p95_ms": 4.017, "rendered_bytes": 11162, "unbudgeted_bytes": 11162},
+        {"label": "extreme_default", "n": 50, "median_ms": 19.054417, "p95_ms": 20.978792, "rendered_bytes": 23944, "unbudgeted_bytes": 24617, "omitted_edges": 8},
+        {"label": "high_budget_100k", "n": 50, "median_ms": 6.236125, "p95_ms": 6.93875, "rendered_bytes": 63639, "unbudgeted_bytes": 63639},
+        {"label": "high_budget_24k", "n": 50, "median_ms": 188.754583, "p95_ms": 200.112875, "rendered_bytes": 23949, "unbudgeted_bytes": 63638, "omitted_nodes": 58, "omitted_edges": 350},
+        {"label": "high_budget_2k", "n": 50, "median_ms": 208.198375, "p95_ms": 222.969667, "rendered_bytes": 1887, "unbudgeted_bytes": 63637, "omitted_nodes": 140, "omitted_edges": 469}
+      ],
+      "determinism": {
+        "identical_unbudgeted_calls": 10,
+        "unique_serialized_hashes": 10,
+        "compared_variant_edge_sets_equal": true,
+        "difference": "ordering of tied parallel edges",
+        "qualification": "exploratory summary retained; consolidated harness contains the reproduction check; original ten-hash output not retained; larger exploratory budgeted counts omitted"
+      }
+    },
+    "embedding": {
+      "fixture": {
+        "kind": "deterministic loopback HTTP provider",
+        "historical_revision": "fixture-v1",
+        "advertised_normalize": true,
+        "generator_actually_normalized": false,
+        "checked_harness_revision": "dense-unit-vector-v1",
+        "checked_harness_generator_normalized": true,
+        "dimensions": 1024,
+        "unique_embeddings": 5065,
+        "occurrence_entries": 5483
+      },
+      "population": {
+        "n": 5,
+        "approximate_median_ms": 2560,
+        "embed_requests": 317,
+        "qualification": "includes historical fixture-v1 vector construction, JSON, HTTP, and JScout work; excludes model inference; not method-identical to checked-harness dense-unit-vector-v1 population timing"
+      },
+      "fully_synchronized": {
+        "n": 15,
+        "approximate_median_ms": 966,
+        "embed_requests": 0
+      },
+      "occurrence_index_rematerialization": {
+        "n": 5,
+        "approximate_median_ms": 2230,
+        "qualification": "rebuilt embedding_index_entries/sqlite-vec materialization from cached vectors; did not re-embed"
+      }
+    },
+    "supplemental_seeded_semantic_scout": {
+      "supplemental": true,
+      "seed": {
+        "origin": "separate database created during PR66 validation",
+        "semantic_artifacts": 4,
+        "semantic_supports": 37,
+        "semantic_relations": 14,
+        "qualification": "not part of the primary repeatable baseline until seeded deterministically"
+      },
+      "semantic_memory": [
+        {"label": "recent_discovery", "n": 120, "median_ms": 14.193, "p95_ms": 17.079, "output_bytes": 3149},
+        {"label": "lexical_discovery", "n": 120, "median_ms": 14.181, "p95_ms": 16.53, "output_bytes": 3177},
+        {"label": "artifact_body", "n": 120, "median_ms": 7.497, "p95_ms": 8.512, "output_bytes": 4080},
+        {"label": "artifact_full", "n": 120, "median_ms": 11.756, "p95_ms": 14.869, "output_bytes": 13839},
+        {"label": "artifact_full_source", "n": 120, "median_ms": 13.488, "p95_ms": 16.603, "output_bytes": 23987}
+      ],
+      "automatic_preparation": [
+        {"label": "workflows", "n": 40, "median_ms": 43.747, "p95_ms": 59.479, "seed_count": 18, "planned_items": 17, "aggregate_evidence_bytes_approx": 2524000, "aggregate_request_bytes_approx": 2648000},
+        {"label": "cards", "n": 40, "median_ms": 175.688, "p95_ms": 224.647, "discovered_subjects": 1109, "planned_items": 1024, "aggregate_evidence_bytes_approx": 27705000, "aggregate_request_bytes": 33746721, "emitted_report_bytes_approx": 560000},
+        {"label": "summaries", "n": 40, "median_ms": 6.406, "p95_ms": 8.519},
+        {"label": "concepts", "n": 40, "median_ms": 10.159, "p95_ms": 13.862}
+      ],
+      "card_max_calls_sweep": [
+        {"max_calls": 1, "n": 30, "median_ms": 187.121, "p95_ms": 217.492, "planned_items": 1024, "aggregate_request_bytes": 33746721},
+        {"max_calls": 16, "n": 30, "median_ms": 181.472, "p95_ms": 210.541, "planned_items": 1024, "aggregate_request_bytes": 33746721},
+        {"max_calls": 128, "n": 30, "median_ms": 181.924, "p95_ms": 202.851, "planned_items": 1024, "aggregate_request_bytes": 33746721},
+        {"max_calls": 512, "n": 30, "median_ms": 181.245, "p95_ms": 210.601, "planned_items": 1024, "aggregate_request_bytes": 33746721}
+      ],
+      "one_card_paths": {
+        "reuse": {"n": 60, "median_ms": 64.957, "p95_ms": 69.346},
+        "fake_publication": {"n": 60, "median_ms": 65.966, "p95_ms": 70.693},
+        "median_difference_ms": 1.009,
+        "qualification": "path differential; does not isolate SQLite persistence"
+      }
+    }
+  },
+  "candidate_priorities": [
+    {"priority": "P0", "candidate": "deterministic neighborhood ordering", "status": "correctness defect measured"},
+    {"priority": "P1", "candidate": "graph_nodes(native_id, native_table) index", "status": "timing and query-plan improvement measured"},
+    {"priority": "P1", "candidate": "member_calls(file_id, receiver_start, prop) index", "status": "timing, parity, and storage measured"},
+    {"priority": "P1", "candidate": "sublinear neighborhood response-budget shedding", "status": "hotspot measured; replacement unmeasured"},
+    {"priority": "P1/P2", "candidate": "per-invocation enrichment freshness-hash cache", "status": "hotspot and multiplicity measured; replacement unmeasured"},
+    {"priority": "P2", "candidate": "fully synchronized embedding fast path with explicit repair", "status": "zero-request overhead measured; replacement unmeasured"}
+  ]
+}
