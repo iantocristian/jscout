@@ -2,9 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use super::{
-    IndexedSources, Origin, WorkspaceMap, inject_io_failure, package_entry_paths,
-    pnpm_workspace_globs, preferred_package_entry,
+    IndexedSources, Origin, WorkspaceMap, package_entry_paths, pnpm_workspace_globs,
+    preferred_package_entry,
 };
+use crate::fs_ops::OsFileSystem;
+use crate::test_fs::FaultFileSystem;
 use oxc_resolver::AliasValue;
 
 fn write(path: &Path, content: &str) {
@@ -76,9 +78,10 @@ fn checked_discovery_propagates_resource_exhaustion() {
     write(&manifest, r#"{"name":"app"}"#);
     let source = root.join("packages/app/src/index.ts");
     write(&source, "export const value = 1;\n");
-    inject_io_failure(manifest, std::io::Error::from_raw_os_error(libc::EMFILE));
+    let fault_fs = FaultFileSystem::default();
+    fault_fs.fail(manifest, std::io::Error::from_raw_os_error(libc::EMFILE));
 
-    let error = WorkspaceMap::discover(root, &[source])
+    let error = WorkspaceMap::discover_with_fs(root, &[source], &fault_fs)
         .err()
         .expect("resource exhaustion must abort workspace discovery");
 
@@ -276,10 +279,15 @@ fn package_entry_preference_matrix_preserves_source_and_manifest_semantics() {
         let manifest = serde_json::from_str(case.manifest).unwrap();
         let mut rejections = Vec::new();
 
-        let (entry, origin) =
-            preferred_package_entry(package.path(), &manifest, &sources, &mut rejections)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{} produced no entry", case.name));
+        let (entry, origin) = preferred_package_entry(
+            package.path(),
+            &manifest,
+            &sources,
+            &mut rejections,
+            &OsFileSystem,
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("{} produced no entry", case.name));
 
         assert_eq!(entry, package.path().join(case.expected), "{}", case.name);
         assert_eq!(origin, case.origin, "{}", case.name);
@@ -299,20 +307,21 @@ fn workspace_glob_expansion_applies_the_io_trichotomy() {
     write(&root.join("packages/app/package.json"), r#"{"name":"app"}"#);
     let packages = root.join("packages");
 
-    inject_io_failure(
+    let fault_fs = FaultFileSystem::default();
+    fault_fs.fail(
         packages.clone(),
         std::io::Error::from_raw_os_error(libc::EMFILE),
     );
-    let transient = WorkspaceMap::discover(root, &[])
+    let transient = WorkspaceMap::discover_with_fs(root, &[], &fault_fs)
         .err()
         .expect("resource exhaustion must abort glob expansion");
     assert!(transient.to_string().contains("workspace-walk"));
 
-    inject_io_failure(
+    fault_fs.fail(
         packages.clone(),
         std::io::Error::from(std::io::ErrorKind::PermissionDenied),
     );
-    let permanent = WorkspaceMap::discover(root, &[]).unwrap();
+    let permanent = WorkspaceMap::discover_with_fs(root, &[], &fault_fs).unwrap();
     assert!(permanent.map.packages.is_empty());
     assert!(
         permanent
@@ -321,8 +330,8 @@ fn workspace_glob_expansion_applies_the_io_trichotomy() {
             .any(|rejection| { rejection.path == packages && rejection.stage == "workspace-walk" })
     );
 
-    inject_io_failure(packages, std::io::Error::from(std::io::ErrorKind::NotFound));
-    let race = WorkspaceMap::discover(root, &[]).unwrap();
+    fault_fs.fail(packages, std::io::Error::from(std::io::ErrorKind::NotFound));
+    let race = WorkspaceMap::discover_with_fs(root, &[], &fault_fs).unwrap();
     assert!(race.map.packages.is_empty());
     assert!(race.rejections.is_empty());
 }

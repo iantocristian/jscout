@@ -16,56 +16,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use oxc_resolver::{Alias, AliasValue};
 
+use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::io_policy;
 use crate::package_exports::collect_active_targets;
 use crate::walk;
-
-fn read_workspace_file(path: &Path) -> io::Result<String> {
-    #[cfg(test)]
-    if let Some(error) = TEST_IO_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
-        return Err(error);
-    }
-    fs::read_to_string(path)
-}
-
-fn workspace_metadata(path: &Path) -> io::Result<fs::Metadata> {
-    #[cfg(test)]
-    if let Some(error) = TEST_IO_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
-        return Err(error);
-    }
-    fs::metadata(path)
-}
-
-fn read_workspace_dir(path: &Path) -> io::Result<fs::ReadDir> {
-    #[cfg(test)]
-    if let Some(error) = TEST_IO_FAILURES.with(|failures| failures.borrow_mut().remove(path)) {
-        return Err(error);
-    }
-    fs::read_dir(path)
-}
-
-fn workspace_file_type(entry: &fs::DirEntry) -> io::Result<fs::FileType> {
-    #[cfg(test)]
-    if let Some(error) =
-        TEST_IO_FAILURES.with(|failures| failures.borrow_mut().remove(&entry.path()))
-    {
-        return Err(error);
-    }
-    entry.file_type()
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_IO_FAILURES: std::cell::RefCell<std::collections::HashMap<PathBuf, io::Error>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-#[cfg(test)]
-fn inject_io_failure(path: PathBuf, error: io::Error) {
-    TEST_IO_FAILURES.with(|failures| {
-        failures.borrow_mut().insert(path, error);
-    });
-}
 
 /// How a workspace mapping was established. `Manifest` mappings use a target
 /// the package.json names directly (modulo TS extension aliasing, which the
@@ -116,10 +70,18 @@ impl WorkspaceMap {
     /// sources only influence alias-target preference; manifests establish
     /// package identity even when a member has no indexable source.
     pub fn discover(root: &Path, source_files: &[PathBuf]) -> Result<WorkspaceDiscovery> {
+        Self::discover_with_fs(root, source_files, &OsFileSystem)
+    }
+
+    pub(crate) fn discover_with_fs(
+        root: &Path,
+        source_files: &[PathBuf],
+        fs: &impl FileSystem,
+    ) -> Result<WorkspaceDiscovery> {
         let mut rejections = Vec::new();
         let indexed_sources = IndexedSources::new(source_files);
-        let globs = checked_workspace_globs(root, &mut rejections)?;
-        let dirs = checked_package_dirs(root, &globs, &mut rejections)?;
+        let globs = checked_workspace_globs(root, &mut rejections, fs)?;
+        let dirs = checked_package_dirs(root, &globs, &mut rejections, fs)?;
         let mut map = WorkspaceMap {
             aliases: Vec::new(),
             packages: Vec::new(),
@@ -131,7 +93,7 @@ impl WorkspaceMap {
             let Some(text) = classified_io(
                 &manifest,
                 "workspace-manifest",
-                read_workspace_file(&manifest),
+                fs.read_to_string(&manifest),
                 &mut rejections,
             )?
             else {
@@ -172,7 +134,7 @@ impl WorkspaceMap {
                 canonical_root,
                 manifest_hash: blake3::hash(text.as_bytes()).to_hex().to_string(),
             });
-            map.add_indexed_package(name, &dir, &pkg, &indexed_sources, &mut rejections)?;
+            map.add_indexed_package(name, &dir, &pkg, &indexed_sources, &mut rejections, fs)?;
         }
         map.aliases.sort_by(|left, right| right.0.cmp(&left.0));
         map.aliases.dedup_by(|left, right| left.0 == right.0);
@@ -197,20 +159,23 @@ impl WorkspaceMap {
         package: &serde_json::Value,
         sources: &IndexedSources,
         rejections: &mut Vec<WorkspaceRejection>,
+        fs: &impl FileSystem,
     ) -> Result<()> {
         self.package_names.insert(name.to_string());
-        self.subpath_export_aliases(name, dir, package, sources, rejections)?;
+        self.subpath_export_aliases(name, dir, package, sources, rejections, fs)?;
 
         let src = dir.join("src");
         let mut dist_values = Vec::new();
         let mut values = Vec::new();
-        if let Some((entry, origin)) = preferred_package_entry(dir, package, sources, rejections)? {
+        if let Some((entry, origin)) =
+            preferred_package_entry(dir, package, sources, rejections, fs)?
+        {
             if origin == Origin::Manifest {
                 self.manifest_specifiers.insert(name.to_string());
             }
             values.push(AliasValue::Path(entry.to_string_lossy().into_owned()));
         }
-        if sources.is_dir(&src) || classified_is_dir(&src, rejections)? {
+        if sources.is_dir(&src) || classified_is_dir(&src, rejections, fs)? {
             dist_values.push(AliasValue::Path(format!("{}/*", src.to_string_lossy())));
             values.push(AliasValue::Path(src.to_string_lossy().into_owned()));
         }
@@ -265,6 +230,7 @@ impl WorkspaceMap {
         pkg: &serde_json::Value,
         sources: &IndexedSources,
         rejections: &mut Vec<WorkspaceRejection>,
+        fs: &impl FileSystem,
     ) -> Result<()> {
         let Some(serde_json::Value::Object(map)) = pkg.get("exports") else {
             return Ok(());
@@ -283,13 +249,13 @@ impl WorkspaceMap {
             collect_active_targets(value, &mut targets);
             if sub.contains('*') {
                 if let Some(entry) =
-                    wildcard_subpath_alias(name, dir, sub, &targets, sources, rejections)?
+                    wildcard_subpath_alias(name, dir, sub, &targets, sources, rejections, fs)?
                 {
                     self.aliases.push(entry);
                 }
             } else {
                 let Some((source, origin)) =
-                    preferred_subpath_source(dir, sub, &targets, sources, rejections)?
+                    preferred_subpath_source(dir, sub, &targets, sources, rejections, fs)?
                 else {
                     continue;
                 };
@@ -394,12 +360,13 @@ fn classified_io<T>(
 fn checked_workspace_globs(
     root: &Path,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Vec<String>> {
     let pnpm = root.join("pnpm-workspace.yaml");
     if let Some(yaml) = classified_io(
         &pnpm,
         "workspace-manifest",
-        read_workspace_file(&pnpm),
+        fs.read_to_string(&pnpm),
         rejections,
     )? {
         let globs = pnpm_workspace_globs(&yaml);
@@ -412,7 +379,7 @@ fn checked_workspace_globs(
     let Some(text) = classified_io(
         &manifest,
         "workspace-manifest",
-        read_workspace_file(&manifest),
+        fs.read_to_string(&manifest),
         rejections,
     )?
     else {
@@ -455,6 +422,7 @@ fn checked_package_dirs(
     root: &Path,
     globs: &[String],
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Vec<PathBuf>> {
     let mut include = Vec::new();
     let mut exclude = Vec::new();
@@ -468,7 +436,7 @@ fn checked_package_dirs(
     }
     let mut dirs = Vec::new();
     for pattern in &include {
-        checked_expand_segments(root, pattern, &mut dirs, rejections)?;
+        checked_expand_segments(root, pattern, &mut dirs, rejections, fs)?;
     }
     dirs.sort();
     dirs.dedup();
@@ -490,7 +458,7 @@ fn checked_package_dirs(
         let Some(metadata) = classified_io(
             &manifest,
             "workspace-manifest",
-            workspace_metadata(&manifest),
+            fs.metadata(&manifest),
             rejections,
         )?
         else {
@@ -514,39 +482,36 @@ fn checked_expand_segments(
     pattern: &[String],
     out: &mut Vec<PathBuf>,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<()> {
     let Some(segment) = pattern.first() else {
         out.push(dir.to_path_buf());
         return Ok(());
     };
     if segment == "**" {
-        checked_expand_segments(dir, &pattern[1..], out, rejections)?;
-        for child in checked_child_dirs(dir, rejections)? {
-            checked_expand_segments(&child, pattern, out, rejections)?;
+        checked_expand_segments(dir, &pattern[1..], out, rejections, fs)?;
+        for child in checked_child_dirs(dir, rejections, fs)? {
+            checked_expand_segments(&child, pattern, out, rejections, fs)?;
         }
     } else if segment.contains('*') {
-        for child in checked_child_dirs(dir, rejections)? {
+        for child in checked_child_dirs(dir, rejections, fs)? {
             if child
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| segment_match(segment, name))
             {
-                checked_expand_segments(&child, &pattern[1..], out, rejections)?;
+                checked_expand_segments(&child, &pattern[1..], out, rejections, fs)?;
             }
         }
     } else {
         let child = dir.join(segment);
-        let Some(metadata) = classified_io(
-            &child,
-            "workspace-walk",
-            workspace_metadata(&child),
-            rejections,
-        )?
+        let Some(metadata) =
+            classified_io(&child, "workspace-walk", fs.metadata(&child), rejections)?
         else {
             return Ok(());
         };
         if metadata.is_dir() {
-            checked_expand_segments(&child, &pattern[1..], out, rejections)?;
+            checked_expand_segments(&child, &pattern[1..], out, rejections, fs)?;
         }
     }
     Ok(())
@@ -555,9 +520,9 @@ fn checked_expand_segments(
 fn checked_child_dirs(
     dir: &Path,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Vec<PathBuf>> {
-    let Some(entries) = classified_io(dir, "workspace-walk", read_workspace_dir(dir), rejections)?
-    else {
+    let Some(entries) = classified_io(dir, "workspace-walk", fs.read_dir(dir), rejections)? else {
         return Ok(Vec::new());
     };
     let mut dirs = Vec::new();
@@ -566,12 +531,8 @@ fn checked_child_dirs(
             continue;
         };
         let path = entry.path();
-        let Some(file_type) = classified_io(
-            &path,
-            "workspace-walk",
-            workspace_file_type(&entry),
-            rejections,
-        )?
+        let Some(file_type) =
+            classified_io(&path, "workspace-walk", fs.file_type(&entry), rejections)?
         else {
             continue;
         };
@@ -712,6 +673,7 @@ fn preferred_package_entry(
     pkg: &serde_json::Value,
     sources: &IndexedSources,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Option<(PathBuf, Origin)>> {
     let manifest_fields = manifest_entry_fields(pkg);
     for field in &manifest_fields {
@@ -720,7 +682,7 @@ fn preferred_package_entry(
         }
     }
     for field in &manifest_fields {
-        if let Some(path) = classified_first_existing(dir, field, false, rejections)? {
+        if let Some(path) = classified_first_existing(dir, field, false, rejections, fs)? {
             return Ok(Some((path, Origin::Manifest)));
         }
     }
@@ -731,12 +693,12 @@ fn preferred_package_entry(
         }
     }
     for field in &inferred_fields {
-        if let Some(path) = classified_first_existing(dir, field, false, rejections)? {
+        if let Some(path) = classified_first_existing(dir, field, false, rejections, fs)? {
             return Ok(Some((path, Origin::Inferred)));
         }
     }
     for field in &manifest_fields {
-        if let Some(path) = classified_first_existing(dir, field, true, rejections)? {
+        if let Some(path) = classified_first_existing(dir, field, true, rejections, fs)? {
             return Ok(Some((path, Origin::Manifest)));
         }
     }
@@ -886,15 +848,12 @@ fn classified_first_existing(
     field: &str,
     allow_build_output: bool,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Option<PathBuf>> {
     for candidate in entry_candidates(field, allow_build_output) {
         let path = dir.join(candidate);
-        let Some(metadata) = classified_io(
-            &path,
-            "workspace-alias",
-            workspace_metadata(&path),
-            rejections,
-        )?
+        let Some(metadata) =
+            classified_io(&path, "workspace-alias", fs.metadata(&path), rejections)?
         else {
             continue;
         };
@@ -905,14 +864,15 @@ fn classified_first_existing(
     Ok(None)
 }
 
-fn classified_is_dir(path: &Path, rejections: &mut Vec<WorkspaceRejection>) -> Result<bool> {
-    Ok(classified_io(
-        path,
-        "workspace-alias",
-        workspace_metadata(path),
-        rejections,
-    )?
-    .is_some_and(|metadata| metadata.is_dir()))
+fn classified_is_dir(
+    path: &Path,
+    rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
+) -> Result<bool> {
+    Ok(
+        classified_io(path, "workspace-alias", fs.metadata(path), rejections)?
+            .is_some_and(|metadata| metadata.is_dir()),
+    )
 }
 
 /// On-disk paths a package.json field value could denote, in preference
@@ -966,6 +926,7 @@ fn preferred_subpath_source(
     targets: &[String],
     sources: &IndexedSources,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Option<(PathBuf, Origin)>> {
     for target in targets {
         if let Some(path) = first_existing(dir, target, sources) {
@@ -985,7 +946,7 @@ fn preferred_subpath_source(
         return Ok(Some((path, Origin::Inferred)));
     }
     for target in targets {
-        if let Some(path) = classified_first_existing(dir, target, true, rejections)? {
+        if let Some(path) = classified_first_existing(dir, target, true, rejections, fs)? {
             return Ok(Some((path, Origin::Manifest)));
         }
     }
@@ -993,7 +954,7 @@ fn preferred_subpath_source(
         for tail in mirror_tails(target) {
             for base in ["src/", ""] {
                 if let Some(path) =
-                    classified_first_existing(dir, &format!("{base}{tail}"), false, rejections)?
+                    classified_first_existing(dir, &format!("{base}{tail}"), false, rejections, fs)?
                 {
                     return Ok(Some((path, Origin::Inferred)));
                 }
@@ -1001,7 +962,7 @@ fn preferred_subpath_source(
         }
     }
     Ok(
-        classified_unique_source_match(&dir.join("src"), sub, rejections)?
+        classified_unique_source_match(&dir.join("src"), sub, rejections, fs)?
             .map(|path| (path, Origin::Inferred)),
     )
 }
@@ -1039,6 +1000,7 @@ fn wildcard_subpath_alias(
     targets: &[String],
     sources: &IndexedSources,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Option<(String, Vec<AliasValue>)>> {
     if sub.matches('*').count() != 1 {
         return Ok(None);
@@ -1058,7 +1020,7 @@ fn wildcard_subpath_alias(
         }
     }
     let src = dir.join("src");
-    if sources.is_dir(&src) || classified_is_dir(&src, rejections)? {
+    if sources.is_dir(&src) || classified_is_dir(&src, rejections, fs)? {
         values.push(format!("{dir_str}/src/*"));
     }
     values.push(format!("{dir_str}/*"));
@@ -1182,9 +1144,10 @@ fn classified_unique_source_match(
     src: &Path,
     sub: &str,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<Option<PathBuf>> {
     let mut matches = Vec::new();
-    collect_classified_source_matches(src, src, sub, 0, &mut matches, rejections)?;
+    collect_classified_source_matches(src, src, sub, 0, &mut matches, rejections, fs)?;
     matches.sort();
     matches.dedup();
     Ok((matches.len() == 1).then(|| matches.remove(0)))
@@ -1197,12 +1160,12 @@ fn collect_classified_source_matches(
     depth: usize,
     out: &mut Vec<PathBuf>,
     rejections: &mut Vec<WorkspaceRejection>,
+    fs: &impl FileSystem,
 ) -> Result<()> {
     if depth > 4 {
         return Ok(());
     }
-    let Some(entries) = classified_io(dir, "workspace-alias", read_workspace_dir(dir), rejections)?
-    else {
+    let Some(entries) = classified_io(dir, "workspace-alias", fs.read_dir(dir), rejections)? else {
         return Ok(());
     };
     for entry in entries {
@@ -1210,12 +1173,8 @@ fn collect_classified_source_matches(
             continue;
         };
         let path = entry.path();
-        let Some(file_type) = classified_io(
-            &path,
-            "workspace-alias",
-            workspace_file_type(&entry),
-            rejections,
-        )?
+        let Some(file_type) =
+            classified_io(&path, "workspace-alias", fs.file_type(&entry), rejections)?
         else {
             continue;
         };
@@ -1237,12 +1196,8 @@ fn collect_classified_source_matches(
             if relative == sub || relative.ends_with(&format!("/{sub}")) {
                 for extension in ENTRY_EXTENSIONS {
                     let index = path.join(format!("index.{extension}"));
-                    let Some(metadata) = classified_io(
-                        &index,
-                        "workspace-alias",
-                        workspace_metadata(&index),
-                        rejections,
-                    )?
+                    let Some(metadata) =
+                        classified_io(&index, "workspace-alias", fs.metadata(&index), rejections)?
                     else {
                         continue;
                     };
@@ -1252,7 +1207,7 @@ fn collect_classified_source_matches(
                     }
                 }
             }
-            collect_classified_source_matches(base, &path, sub, depth + 1, out, rejections)?;
+            collect_classified_source_matches(base, &path, sub, depth + 1, out, rejections, fs)?;
         } else if file_type.is_file()
             && let Some((stem, extension)) = relative.rsplit_once('.')
             && ENTRY_EXTENSIONS.contains(&extension)

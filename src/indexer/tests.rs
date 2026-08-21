@@ -5,9 +5,11 @@ use std::io::ErrorKind;
 use anyhow::Result;
 
 use super::{
-    IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_options,
-    index_repo_without_extraction_reset, inject_read_failure, refresh_repo_with_options,
+    IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_fs,
+    index_repo_with_options, index_repo_with_options_and_fs, index_repo_without_extraction_reset,
+    refresh_repo_with_options,
 };
+use crate::test_fs::FaultFileSystem;
 use crate::{embed, origin, query, search, semantic, store, structural};
 
 #[test]
@@ -37,11 +39,12 @@ fn file_disappearance_after_inventory_is_a_removal_not_a_retry() -> Result<()> {
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
 
-    inject_read_failure(
+    let fault_fs = FaultFileSystem::default();
+    fault_fs.fail(
         vanished.canonicalize()?,
         std::io::Error::from(ErrorKind::NotFound),
     );
-    let outcome = index_repo(repo.path(), &conn)?;
+    let outcome = index_repo_with_fs(repo.path(), &conn, &fault_fs)?;
 
     assert_eq!(outcome.rejected, 0);
     assert_eq!(outcome.removed, 1);
@@ -68,8 +71,9 @@ fn retryable_source_read_preserves_the_published_snapshot() -> Result<()> {
     let transient_error = std::io::Error::from_raw_os_error(libc::EMFILE);
     #[cfg(not(unix))]
     let transient_error = std::io::Error::from(ErrorKind::Interrupted);
-    inject_read_failure(source.canonicalize()?, transient_error);
-    let error = index_repo(repo.path(), &conn)
+    let fault_fs = FaultFileSystem::default();
+    fault_fs.fail(source.canonicalize()?, transient_error);
+    let error = index_repo_with_fs(repo.path(), &conn, &fault_fs)
         .err()
         .expect("retryable source read must abort preparation");
 
@@ -1909,11 +1913,12 @@ fn retryable_dependency_read_preserves_the_published_snapshot() -> Result<()> {
         &main,
         "import value from 'selected-dep';\nexport const after = value + 1;\n",
     )?;
-    inject_read_failure(
+    let fault_fs = FaultFileSystem::default();
+    fault_fs.fail(
         entry.canonicalize()?,
         std::io::Error::from(ErrorKind::Interrupted),
     );
-    let error = index_repo_with_options(repo.path(), &conn, &options)
+    let error = index_repo_with_options_and_fs(repo.path(), &conn, &options, &fault_fs)
         .err()
         .expect("retryable dependency read must fail preparation");
     assert!(error.to_string().contains("retryable read failure"));
