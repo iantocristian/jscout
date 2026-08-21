@@ -53,6 +53,61 @@ fn projects_resolved_calls_and_returns_snapshot() -> Result<()> {
 }
 
 #[test]
+fn neighborhood_orders_parallel_edges_deterministically() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "parallel.ts",
+        "export function source() {}\nexport function target() {}\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let (source, target, file_id): (String, String, i64) = conn.query_row(
+        "SELECT source.node_key, target.node_key, source.file_id
+         FROM graph_nodes source
+         JOIN graph_nodes target ON target.file_id=source.file_id
+         WHERE source.display_name='source' AND target.display_name='target'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    for line in [80, 20, 60, 10, 70, 30, 50, 40] {
+        conn.execute(
+            "INSERT INTO resolved_edges(
+               src_key, dst_key, kind, confidence, provenance,
+               source_file_id, line, detail_json
+             ) VALUES(?1, ?2, 'call', 'certain', 'parallel-test', ?3, ?4, ?5)",
+            rusqlite::params![
+                source,
+                target,
+                file_id,
+                line,
+                serde_json::json!({ "line": line }).to_string()
+            ],
+        )?;
+    }
+
+    for _ in 0..16 {
+        let result = neighborhood(
+            &conn,
+            &source,
+            &NeighborhoodOptions {
+                direction: "out".into(),
+                node_limit: 10,
+                edge_limit: 20,
+                ..Default::default()
+            },
+        )?;
+        let lines = result
+            .edges
+            .iter()
+            .map(|edge| edge.line.expect("parallel edge line"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+    }
+    Ok(())
+}
+
+#[test]
 fn paths_returns_ranked_bounded_composed_routes() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(

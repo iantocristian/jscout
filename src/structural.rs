@@ -138,6 +138,13 @@ struct RankedStep {
     score: f64,
 }
 
+#[derive(Debug)]
+struct OrderedGraphEdge {
+    edge_id: i64,
+    detail_key: String,
+    edge: GraphEdge,
+}
+
 impl PartialEq for RankedStep {
     fn eq(&self, other: &Self) -> bool {
         self.score.to_bits() == other.score.to_bits()
@@ -2514,12 +2521,29 @@ fn neighborhood_in_snapshot(
             .total_cmp(&a.relevance)
             .then_with(|| a.key.cmp(&b.key))
     });
-    let mut edges: Vec<GraphEdge> = edges_by_id.into_values().collect();
+    let mut edges = edges_by_id
+        .into_iter()
+        .map(|(edge_id, edge)| OrderedGraphEdge {
+            edge_id,
+            detail_key: edge.detail.to_string(),
+            edge,
+        })
+        .collect::<Vec<_>>();
     edges.sort_by(|a, b| {
-        b.relevance
-            .total_cmp(&a.relevance)
-            .then_with(|| (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target)))
+        b.edge
+            .relevance
+            .total_cmp(&a.edge.relevance)
+            .then_with(|| a.edge.source.cmp(&b.edge.source))
+            .then_with(|| a.edge.kind.cmp(&b.edge.kind))
+            .then_with(|| a.edge.target.cmp(&b.edge.target))
+            .then_with(|| a.edge.confidence.cmp(&b.edge.confidence))
+            .then_with(|| a.edge.provenance.cmp(&b.edge.provenance))
+            .then_with(|| a.edge.file.cmp(&b.edge.file))
+            .then_with(|| a.edge.line.cmp(&b.edge.line))
+            .then_with(|| a.detail_key.cmp(&b.detail_key))
+            .then_with(|| a.edge_id.cmp(&b.edge_id))
     });
+    let edges = edges.into_iter().map(|entry| entry.edge).collect();
     Ok(Neighborhood {
         snapshot,
         requested_anchor: anchor.to_string(),
