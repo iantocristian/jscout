@@ -4,7 +4,7 @@
 
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
-use oxc_span::{GetSpan, Span};
+use oxc_span::GetSpan;
 
 #[derive(Debug, Clone)]
 pub struct RequireBinding {
@@ -302,9 +302,4 @@ pub(crate) fn member_path(expr: &Expression<'_>) -> Option<String> {
         }
         _ => None,
     }
-}
-
-#[expect(dead_code)]
-fn span_of(expr: &Expression<'_>) -> Span {
-    expr.span()
 }

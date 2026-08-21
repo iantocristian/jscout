@@ -62,7 +62,6 @@ pub struct ProviderOptions {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[expect(dead_code)] // cancel acknowledgement fields are consumed in G4
 pub enum Inbound {
     Ready {
         id: String,
@@ -196,13 +195,19 @@ pub struct RemoteError {
     #[serde(default)]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "retained for ledger diagnostics")
+        expect(
+            dead_code,
+            reason = "deserialized to validate the gateway field type when present"
+        )
     )]
     pub retryable: bool,
     #[serde(default)]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "retained for ledger diagnostics")
+        expect(
+            dead_code,
+            reason = "deserialized to validate the gateway field type when present"
+        )
     )]
     pub capacity: bool,
 }
