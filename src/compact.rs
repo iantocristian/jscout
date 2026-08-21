@@ -434,7 +434,6 @@ pub(crate) fn who_uses_string(
     Ok(serde_json::to_string(&value)?)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn settle_who_uses(
     results: &[(&query::SymbolTarget, Vec<query::Usage>)],
     returned_targets: usize,
@@ -476,7 +475,7 @@ fn settle_who_uses(
     Ok((value, rendered))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn who_uses_value(
     results: &[(&query::SymbolTarget, Vec<query::Usage>)],
     returned_targets: usize,
@@ -948,7 +947,7 @@ pub(crate) fn render_neighborhood(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn settle_neighborhood_bytes(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
@@ -989,7 +988,7 @@ fn settle_neighborhood_bytes(
     .len())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn neighborhood_value(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],

@@ -975,7 +975,7 @@ pub fn scout_refresh(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn prepare_workflow_refresh(
     root: &Path,
     conn: &Connection,
@@ -1016,7 +1016,7 @@ fn prepare_workflow_refresh(
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn prepare_card_refresh(
     root: &Path,
     conn: &Connection,
@@ -1055,7 +1055,7 @@ fn prepare_card_refresh(
 /// children that are current NOW rather than the ones the retired run cited.
 /// A scope whose children all disappeared no longer resolves and is reported
 /// unresolvable instead of aborting the batch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn prepare_summary_refresh(
     root: &Path,
     conn: &Connection,
@@ -1094,7 +1094,7 @@ fn prepare_summary_refresh(
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn prepare_concept_refresh(
     conn: &Connection,
     gateway: &mut dyn LlmGateway,
@@ -3189,7 +3189,7 @@ fn reused(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn report(
     run_id: i64,
     status: &str,
@@ -3214,7 +3214,7 @@ fn report(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn card_report(
     run_id: i64,
     status: &str,
@@ -3239,7 +3239,7 @@ fn card_report(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn scout_report(
     run_id: i64,
     status: &str,

@@ -62,7 +62,7 @@ pub struct ProviderOptions {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(dead_code)] // cancel acknowledgement fields are consumed in G4
+#[expect(dead_code)] // cancel acknowledgement fields are consumed in G4
 pub enum Inbound {
     Ready {
         id: String,
@@ -191,6 +191,8 @@ pub struct Usage {
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // retryability/capacity are retained for ledger diagnostics
+// not #[expect]: these fields are read by tests, so the lint fires only for
+// the lib target and an expectation would go unfulfilled under --all-targets
 pub struct RemoteError {
     pub code: String,
     pub message: String,

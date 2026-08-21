@@ -159,7 +159,7 @@ pub struct ConfigurationProblem {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemberResult {
     pub indexed_hash: String,

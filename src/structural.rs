@@ -1419,7 +1419,7 @@ impl ContractCatalog {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn project_contract_site(
     conn: &Connection,
     site: &EntitySiteNode,
@@ -1872,7 +1872,7 @@ fn resolve_reference_at(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn project_entity_callers(
     conn: &Connection,
     producer: &str,
@@ -2804,7 +2804,7 @@ fn workflow_logical_steps(
     Ok(steps)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn collect_general_workflow_steps(
     conn: &Connection,
     node: &str,
@@ -3174,7 +3174,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn enqueue_ranked_steps(
     conn: &Connection,
     node: &str,

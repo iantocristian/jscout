@@ -1598,7 +1598,7 @@ fn unavailable_source(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn render_source_evidence(
     root: &Path,
     conn: &Connection,

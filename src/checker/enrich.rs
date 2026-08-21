@@ -2140,7 +2140,7 @@ fn mark_project_failed(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn execute_project(
     root: &Path,
     options: &EnrichOptions<'_>,
@@ -2392,7 +2392,7 @@ fn stage_batch(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn complete_project(
     root: &Path,
     conn: &Connection,
