@@ -887,17 +887,15 @@ pub(crate) fn render_neighborhood(
     if byte_limit == 0 {
         anyhow::bail!("response byte limit must be greater than zero");
     }
-    let mut nodes = neighborhood.nodes.clone();
-    let mut edges = neighborhood.edges.clone();
-    let original_nodes = nodes.len();
-    let original_edges = edges.len();
+    let original_nodes = neighborhood.nodes.len();
+    let original_edges = neighborhood.edges.len();
     let mut rendered_bytes = 0;
     let mut unbudgeted_bytes = 0;
     for _ in 0..8 {
         let rendered = settle_neighborhood_bytes(
             neighborhood,
-            &nodes,
-            &edges,
+            &neighborhood.nodes,
+            &neighborhood.edges,
             byte_limit,
             unbudgeted_bytes,
             original_nodes,
@@ -910,44 +908,216 @@ pub(crate) fn render_neighborhood(
         unbudgeted_bytes = rendered;
     }
 
-    loop {
-        let rendered = settle_neighborhood_bytes(
+    if rendered_bytes <= byte_limit {
+        let rendered = serde_json::to_string(&neighborhood_value(
             neighborhood,
-            &nodes,
-            &edges,
+            &neighborhood.nodes,
+            &neighborhood.edges,
             byte_limit,
             unbudgeted_bytes,
+            rendered_bytes,
             original_nodes,
             original_edges,
-            &mut rendered_bytes,
-        )?;
-        if rendered <= byte_limit {
-            return Ok(serde_json::to_string(&neighborhood_value(
+        ))?;
+        debug_assert_eq!(rendered.len(), rendered_bytes);
+        return Ok(rendered);
+    }
+
+    if neighborhood.edges.is_empty() {
+        let non_anchor_nodes = neighborhood
+            .nodes
+            .iter()
+            .filter(|node| node.key != neighborhood.resolved_anchor)
+            .count();
+        if non_anchor_nodes > 0 {
+            let retained = largest_fitting_prefix(non_anchor_nodes, byte_limit, |count| {
+                let nodes = neighborhood_prefix_isolated_nodes(neighborhood, count);
+                settled_neighborhood_size(
+                    neighborhood,
+                    &nodes,
+                    &[],
+                    byte_limit,
+                    unbudgeted_bytes,
+                    original_nodes,
+                    original_edges,
+                )
+            })?;
+            if let Some(retained) = retained {
+                let nodes = neighborhood_prefix_isolated_nodes(neighborhood, retained);
+                return render_neighborhood_selection(
+                    neighborhood,
+                    &nodes,
+                    &[],
+                    byte_limit,
+                    unbudgeted_bytes,
+                    original_nodes,
+                    original_edges,
+                );
+            }
+        }
+    } else {
+        let retained = largest_fitting_prefix(neighborhood.edges.len(), byte_limit, |count| {
+            let nodes = neighborhood_prefix_nodes(neighborhood, count);
+            settled_neighborhood_size(
                 neighborhood,
                 &nodes,
-                &edges,
+                &neighborhood.edges[..count],
                 byte_limit,
                 unbudgeted_bytes,
-                rendered_bytes,
                 original_nodes,
                 original_edges,
-            ))?);
+            )
+        })?;
+        if let Some(retained) = retained {
+            let nodes = neighborhood_prefix_nodes(neighborhood, retained);
+            return render_neighborhood_selection(
+                neighborhood,
+                &nodes,
+                &neighborhood.edges[..retained],
+                byte_limit,
+                unbudgeted_bytes,
+                original_nodes,
+                original_edges,
+            );
         }
-        if edges.pop().is_some() {
-            prune_unreferenced_nodes(&mut nodes, &edges, &neighborhood.resolved_anchor);
-            continue;
+    }
+
+    let nodes = neighborhood_prefix_isolated_nodes(neighborhood, 0);
+    let rendered = settled_neighborhood_size(
+        neighborhood,
+        &nodes,
+        &[],
+        byte_limit,
+        unbudgeted_bytes,
+        original_nodes,
+        original_edges,
+    )?;
+    anyhow::bail!(
+        "response byte limit {byte_limit} is below the minimum compact neighborhood envelope ({rendered} bytes)"
+    );
+}
+
+fn largest_fitting_prefix(
+    failing_count: usize,
+    byte_limit: usize,
+    mut rendered_size: impl FnMut(usize) -> Result<usize>,
+) -> Result<Option<usize>> {
+    if rendered_size(0)? > byte_limit {
+        return Ok(None);
+    }
+    let mut fitting = 0;
+    let mut failing = failing_count;
+    while fitting + 1 < failing {
+        let candidate = fitting + (failing - fitting) / 2;
+        if rendered_size(candidate)? <= byte_limit {
+            fitting = candidate;
+        } else {
+            failing = candidate;
         }
-        if let Some(index) = nodes
-            .iter()
-            .rposition(|node| node.key != neighborhood.resolved_anchor)
-        {
-            nodes.remove(index);
-            continue;
-        }
-        anyhow::bail!(
-            "response byte limit {byte_limit} is below the minimum compact neighborhood envelope ({rendered} bytes)"
+    }
+
+    // Fixed-point metadata can change width at decimal boundaries. Recheck
+    // the selected boundary rather than relying on the binary-search probe.
+    while fitting > 0 && rendered_size(fitting)? > byte_limit {
+        fitting -= 1;
+    }
+    while fitting + 1 < failing_count && rendered_size(fitting + 1)? <= byte_limit {
+        fitting += 1;
+    }
+    Ok(Some(fitting))
+}
+
+fn neighborhood_prefix_nodes(
+    neighborhood: &structural::Neighborhood,
+    edge_count: usize,
+) -> Vec<structural::GraphNode> {
+    let mut nodes = neighborhood.nodes.clone();
+    if edge_count < neighborhood.edges.len() {
+        prune_unreferenced_nodes(
+            &mut nodes,
+            &neighborhood.edges[..edge_count],
+            &neighborhood.resolved_anchor,
         );
     }
+    nodes
+}
+
+fn neighborhood_prefix_isolated_nodes(
+    neighborhood: &structural::Neighborhood,
+    retained_non_anchor: usize,
+) -> Vec<structural::GraphNode> {
+    let mut retained = 0;
+    neighborhood
+        .nodes
+        .iter()
+        .filter(|node| {
+            if node.key == neighborhood.resolved_anchor {
+                true
+            } else if retained < retained_non_anchor {
+                retained += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn settled_neighborhood_size(
+    neighborhood: &structural::Neighborhood,
+    nodes: &[structural::GraphNode],
+    edges: &[structural::GraphEdge],
+    byte_limit: usize,
+    unbudgeted_bytes: usize,
+    original_nodes: usize,
+    original_edges: usize,
+) -> Result<usize> {
+    let mut rendered_bytes = 0;
+    settle_neighborhood_bytes(
+        neighborhood,
+        nodes,
+        edges,
+        byte_limit,
+        unbudgeted_bytes,
+        original_nodes,
+        original_edges,
+        &mut rendered_bytes,
+    )
+}
+
+fn render_neighborhood_selection(
+    neighborhood: &structural::Neighborhood,
+    nodes: &[structural::GraphNode],
+    edges: &[structural::GraphEdge],
+    byte_limit: usize,
+    unbudgeted_bytes: usize,
+    original_nodes: usize,
+    original_edges: usize,
+) -> Result<String> {
+    let mut rendered_bytes = 0;
+    settle_neighborhood_bytes(
+        neighborhood,
+        nodes,
+        edges,
+        byte_limit,
+        unbudgeted_bytes,
+        original_nodes,
+        original_edges,
+        &mut rendered_bytes,
+    )?;
+    let rendered = serde_json::to_string(&neighborhood_value(
+        neighborhood,
+        nodes,
+        edges,
+        byte_limit,
+        unbudgeted_bytes,
+        rendered_bytes,
+        original_nodes,
+        original_edges,
+    ))?;
+    debug_assert_eq!(rendered.len(), rendered_bytes);
+    Ok(rendered)
 }
 
 #[expect(

@@ -7,8 +7,9 @@ use super::{
     existing_profile, materialize_cached_embeddings, missing_embedding_documents,
     profile_fingerprint, ready_search_profile, semantic_embedding_documents,
     semantic_vector_failure, semantic_vector_failure_action, semantic_vector_index_has_gaps,
-    semantic_vector_table, sync_semantic_vector_index, sync_vector_index, validate_endpoint,
-    vec_to_blob, vector_failure, vector_index_needs_sync, vector_table,
+    semantic_vector_table, sync_semantic_vector_index, sync_vector_index, synchronize_vector_index,
+    validate_endpoint, vec_to_blob, vector_failure, vector_index_has_completed_sync,
+    vector_index_needs_sync, vector_search, vector_table, vector_table_exists,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings};
 
@@ -107,7 +108,7 @@ fn semantic_vector_failure_actions_distinguish_service_from_index() {
     );
     assert_eq!(
         code_vector_failure_action(&code_index),
-        "run jscout embed <root>"
+        "run jscout embed <root> --repair"
     );
 }
 
@@ -410,6 +411,7 @@ fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()
         16,
         &["repository".into()],
         false,
+        false,
     )?;
     assert_eq!(code.missing, 0);
     assert_eq!(code.embedded, 0);
@@ -592,7 +594,208 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
 }
 
 #[test]
-fn vector_search_database_path_is_read_only() -> anyhow::Result<()> {
+fn incremental_vector_sync_materializes_a_reused_chunk_rowid() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('old.ts', 'old-file', 'production', 'repository')",
+        [],
+    )?;
+    let old_file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [old_file_id],
+    )?;
+    let old_chunk_id = connection.last_insert_rowid();
+
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+    assert!(vector_index_has_completed_sync(&connection, profile.id)?);
+
+    crate::store::delete_file(&connection, old_file_id)?;
+    assert!(
+        vector_index_has_completed_sync(&connection, profile.id)?,
+        "ordinary source deletion must preserve the completion marker"
+    );
+    let durable_rows: i64 = connection.query_row(
+        "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    let vector_rows: i64 =
+        connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!((durable_rows, vector_rows), (0, 0));
+
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('new.ts', 'new-file', 'production', 'repository')",
+        [],
+    )?;
+    let new_file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [new_file_id],
+    )?;
+    let new_chunk_id = connection.last_insert_rowid();
+    assert_eq!(
+        new_chunk_id, old_chunk_id,
+        "fixture must exercise SQLite rowid reuse"
+    );
+
+    synchronize_vector_index(&connection, &profile, false)?;
+    let materialized_chunk_id: i64 = connection.query_row(
+        &format!(
+            "SELECT entry.chunk_id
+             FROM embedding_index_entries entry
+             JOIN {table} vector ON vector.rowid=entry.id
+             WHERE entry.profile_id=?1"
+        ),
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(materialized_chunk_id, new_chunk_id);
+    assert!(!vector_index_needs_sync(&connection, profile.id)?);
+    Ok(())
+}
+
+#[test]
+fn incremental_vector_sync_leaves_full_audit_to_explicit_repair() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('a.ts', 'file-a', 'production', 'repository')",
+        [],
+    )?;
+    let file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [file_id],
+    )?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 2, 3, 2, 2, 'same', 'alpha')",
+        [file_id],
+    )?;
+    synchronize_vector_index(&connection, &profile, false)?;
+    let counts = || -> anyhow::Result<(i64, i64)> {
+        Ok((
+            connection.query_row(
+                "SELECT count(*) FROM embedding_index_entries WHERE profile_id=?1",
+                [profile.id],
+                |row| row.get(0),
+            )?,
+            connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?,
+        ))
+    };
+    assert_eq!(counts()?, (2, 2));
+
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 4, 5, 3, 3, 'same', 'alpha')",
+        [file_id],
+    )?;
+    synchronize_vector_index(&connection, &profile, false)?;
+    assert_eq!(
+        counts()?,
+        (3, 3),
+        "a missing virtual table requires a complete rebuild before incremental publication"
+    );
+
+    let missing_row: i64 = connection.query_row(
+        "SELECT min(id) FROM embedding_index_entries WHERE profile_id=?1",
+        [profile.id],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        &format!("DELETE FROM {table} WHERE rowid=?1"),
+        [missing_row],
+    )?;
+    synchronize_vector_index(&connection, &profile, false)?;
+    assert_eq!(
+        counts()?,
+        (3, 2),
+        "incremental synchronization must not pay for a full virtual-row audit"
+    );
+    synchronize_vector_index(&connection, &profile, true)?;
+    assert_eq!(counts()?, (3, 3));
+
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    ensure_profile(&connection, &spec, profile.dimensions)?;
+    assert!(
+        !vector_table_exists(&connection, profile.dimensions)?,
+        "resolving an existing profile must not recreate an empty vector table"
+    );
+    synchronize_vector_index(&connection, &profile, false)?;
+    assert_eq!(counts()?, (3, 3));
+
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 6, 7, 4, 4, 'same', 'alpha')",
+        [file_id],
+    )?;
+    materialize_cached_embeddings(&connection)?;
+    assert_eq!(
+        counts()?,
+        (4, 4),
+        "index-time materialization must also rebuild a missing completed table"
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
@@ -609,14 +812,16 @@ fn vector_search_database_path_is_read_only() -> anyhow::Result<()> {
     )?;
     let chunk_id = connection.last_insert_rowid();
 
-    let config_json = r#"{"protocol":"openai-embeddings-v1"}"#.to_string();
-    let spec = ProfileSpec {
-        provider: "openai-compatible".into(),
+    let provider = Provider {
+        name: "openai-compatible".into(),
         model: "tiny".into(),
-        fingerprint: profile_fingerprint("openai-compatible", "tiny", &config_json),
-        config_json,
-        dimensions: None,
+        url: "https://example.test/v1/embeddings".into(),
+        key: None,
+        protocol: Protocol::OpenAi,
+        query_prefix: String::new(),
+        revision: None,
     };
+    let spec = provider.profile()?;
     let profile = ensure_profile(&connection, &spec, 2)?;
     connection.execute(
         "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
@@ -624,9 +829,81 @@ fn vector_search_database_path_is_read_only() -> anyhow::Result<()> {
     )?;
     sync_vector_index(&connection, Some(profile.id))?;
 
+    let table = vector_table(profile.dimensions)?;
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    let failure = vector_search(&connection, &provider, "alpha", 1, &["repository".into()])
+        .expect_err("search must fail closed when the vector table is missing");
+    assert!(
+        failure
+            .to_string()
+            .contains("vector index table is missing")
+    );
+    assert_eq!(
+        code_vector_failure_action(&failure),
+        "run jscout embed <root> --repair"
+    );
+
+    synchronize_vector_index(&connection, &profile, true)?;
+
     connection.pragma_update(None, "query_only", true)?;
     let ready = ready_search_profile(&connection, &spec)?;
     let results = exact_vector_search(&connection, &ready, &[1.0, 0.0], 1, &["repository".into()])?;
     assert_eq!(results.first().map(|result| result.0), Some(chunk_id));
+    Ok(())
+}
+
+#[test]
+fn failed_marker_invalidation_does_not_publish_an_empty_vector_table() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute(
+        "INSERT INTO files(path, hash, role, origin)
+         VALUES('a.ts', 'f', 'production', 'repository')",
+        [],
+    )?;
+    let file_id = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO chunks(
+           file_id, kind, scope_chain, symbols, start, end, start_line, end_line, hash, content
+         ) VALUES(?1, 'function', '', '', 0, 1, 1, 1, 'same', 'alpha')",
+        [file_id],
+    )?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash, profile_id, vec) VALUES('same', ?1, ?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    let table = vector_table(profile.dimensions)?;
+    connection.execute(&format!("DROP TABLE {table}"), [])?;
+    connection.execute_batch(
+        "CREATE TRIGGER reject_vector_marker_delete
+         BEFORE DELETE ON meta
+         WHEN OLD.key LIKE 'embedding_index_synced_v1:%'
+         BEGIN SELECT RAISE(ABORT, 'marker delete rejected'); END;",
+    )?;
+
+    let failure = synchronize_vector_index(&connection, &profile, false)
+        .expect_err("forced marker invalidation failure");
+    assert!(failure.to_string().contains("marker delete rejected"));
+    assert!(
+        !vector_table_exists(&connection, profile.dimensions)?,
+        "a failed invalidation must not publish an empty table beside a stale ready marker"
+    );
+    let readiness = ready_search_profile(&connection, &spec)
+        .expect_err("the missing table must remain fail-closed");
+    assert!(
+        readiness
+            .to_string()
+            .contains("vector index table is missing")
+    );
     Ok(())
 }

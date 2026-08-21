@@ -259,6 +259,36 @@ struct ValidatedInput {
     source_hash: String,
 }
 
+/// One enrichment invocation observes each checker input at most once. Shared
+/// TypeScript libraries appear in many project manifests; caching the first
+/// digest avoids re-reading and re-hashing the same bytes for every project.
+struct InputFreshnessCache<'a> {
+    root: &'a Path,
+    digests: HashMap<PathBuf, Option<String>>,
+}
+
+impl<'a> InputFreshnessCache<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            digests: HashMap::new(),
+        }
+    }
+
+    fn matches(&mut self, input: &ValidatedInput) -> bool {
+        let path = input_path(self.root, input);
+        self.digests
+            .entry(path.clone())
+            .or_insert_with(|| {
+                fs::read(path)
+                    .ok()
+                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+            })
+            .as_deref()
+            .is_some_and(|hash| hash == input.source_hash)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingProjectAnswer {
     occurrence: Occurrence,
@@ -471,13 +501,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         });
     }
 
+    let mut input_freshness = InputFreshnessCache::new(&canonical_root);
     if !options.force_full
         && let Some(batch_id) = reusable_active_batch(
-            &canonical_root,
             &conn,
             &snapshot,
             &plan_fingerprint,
             project_plan.keys(),
+            &mut input_freshness,
         )?
     {
         let facts_published = conn.query_row(
@@ -523,7 +554,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             peak_heap_bytes: 0,
         });
     }
-    if !options.carry_forward && deactivate_stale_active_batch(&canonical_root, &conn, &snapshot)? {
+    if !options.carry_forward
+        && deactivate_stale_active_batch(&conn, &snapshot, &mut input_freshness)?
+    {
         crate::structural::rebuild_projection(&conn, &snapshot)?;
     }
 
@@ -542,13 +575,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     )?;
     let carry = if options.carry_forward && !options.force_full {
         carry_forward_projects(
-            &canonical_root,
             &conn,
             batch_id,
             &ownership.typescript,
             protocol,
             &project_plan,
             &project_fingerprints,
+            &mut input_freshness,
         )?
     } else {
         CarryOutcome::default()
@@ -582,7 +615,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
         }
-        if project_complete_and_fresh(&canonical_root, &conn, batch_id, project_id)? {
+        if project_complete_and_fresh(&conn, batch_id, project_id, &mut input_freshness)? {
             occurrences_resumed += occurrences.len();
             continue;
         }
@@ -1432,11 +1465,11 @@ fn plan_fingerprint(
 }
 
 fn reusable_active_batch<'a>(
-    root: &Path,
     conn: &Connection,
     snapshot: &str,
     plan_fingerprint: &str,
     project_ids: impl Iterator<Item = &'a String>,
+    input_freshness: &mut InputFreshnessCache,
 ) -> Result<Option<i64>> {
     let project_ids = project_ids.collect::<Vec<_>>();
     let Some(batch_id) = conn
@@ -1461,14 +1494,18 @@ fn reusable_active_batch<'a>(
         return Ok(None);
     }
     for project_id in project_ids {
-        if !project_complete_and_fresh(root, conn, batch_id, project_id)? {
+        if !project_complete_and_fresh(conn, batch_id, project_id, input_freshness)? {
             return Ok(None);
         }
     }
     Ok(Some(batch_id))
 }
 
-fn deactivate_stale_active_batch(root: &Path, conn: &Connection, snapshot: &str) -> Result<bool> {
+fn deactivate_stale_active_batch(
+    conn: &Connection,
+    snapshot: &str,
+    input_freshness: &mut InputFreshnessCache,
+) -> Result<bool> {
     let Some(batch_id) = conn
         .query_row(
             "SELECT id FROM checker_enrichment_batches
@@ -1489,7 +1526,7 @@ fn deactivate_stale_active_batch(root: &Path, conn: &Connection, snapshot: &str)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut stale = false;
     for project_id in projects {
-        if !project_complete_and_fresh(root, conn, batch_id, &project_id)? {
+        if !project_complete_and_fresh(conn, batch_id, &project_id, input_freshness)? {
             stale = true;
             break;
         }
@@ -1600,13 +1637,13 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
 /// an occurrence cannot carry, every owner is re-queried so cross-project
 /// ambiguity can be recomputed from one coherent answer set.
 fn carry_forward_projects(
-    root: &Path,
     conn: &Connection,
     batch_id: i64,
     checker: &TypeScriptIdentity,
     protocol: u32,
     projects: &BTreeMap<String, Vec<Occurrence>>,
     project_fingerprints: &BTreeMap<String, String>,
+    input_freshness: &mut InputFreshnessCache,
 ) -> Result<CarryOutcome> {
     let already_staged: i64 = conn.query_row(
         "SELECT count(*) FROM checker_occurrence_projects WHERE batch_id=?1",
@@ -1666,20 +1703,6 @@ fn carry_forward_projects(
             .or_default()
             .push(input);
     }
-    // External declarations are shared both by every occurrence in a project
-    // and by many projects. Hash each distinct path once, then evaluate each
-    // project's expected hashes against that cache. Doing filesystem reads in
-    // the occurrence/owner loop turns a carry pass into
-    // O(occurrences * external input bytes).
-    let mut current_external_hashes = BTreeMap::<(String, String), Option<String>>::new();
-    for input in previous_external_inputs.values().flatten() {
-        let key = (input.kind.clone(), input.path.clone());
-        current_external_hashes.entry(key).or_insert_with(|| {
-            fs::read(input_path(root, input))
-                .ok()
-                .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        });
-    }
     let external_inputs_fresh = projects
         .keys()
         .map(|project| {
@@ -1687,12 +1710,7 @@ fn carry_forward_projects(
                 .get(project)
                 .into_iter()
                 .flatten()
-                .all(|input| {
-                    current_external_hashes
-                        .get(&(input.kind.clone(), input.path.clone()))
-                        .and_then(Option::as_deref)
-                        .is_some_and(|hash| hash == input.source_hash)
-                });
+                .all(|input| input_freshness.matches(input));
             (project.clone(), fresh)
         })
         .collect::<BTreeMap<_, _>>();
@@ -1990,10 +2008,10 @@ fn carry_forward_projects(
 }
 
 fn project_complete_and_fresh(
-    root: &Path,
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
+    input_freshness: &mut InputFreshnessCache,
 ) -> Result<bool> {
     let run = conn
         .query_row(
@@ -2025,10 +2043,7 @@ fn project_complete_and_fresh(
     if inputs.is_empty() {
         return Ok(execution_kind == "carried");
     }
-    Ok(inputs.iter().all(|input| {
-        fs::read(input_path(root, input))
-            .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == input.source_hash)
-    }))
+    Ok(inputs.iter().all(|input| input_freshness.matches(input)))
 }
 
 fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> Result<()> {

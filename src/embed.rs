@@ -3,6 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 const DEFAULT_LOCAL_DEADLINE_MS: u64 = 120_000;
+const VECTOR_SYNC_KEY_PREFIX: &str = "embedding_index_synced_v1:";
 /// The document representation is part of cache identity. Versioning it keeps
 /// vectors produced from an older representation from being silently reused.
 const DOCUMENT_TEXT_FORMAT: &str = "content-v2";
@@ -129,7 +130,7 @@ pub(crate) fn semantic_vector_failure_action(error: &anyhow::Error) -> &'static 
 }
 
 pub(crate) fn code_vector_failure_action(error: &anyhow::Error) -> &'static str {
-    vector_failure_action(error, "run jscout embed <root>")
+    vector_failure_action(error, "run jscout embed <root> --repair")
 }
 
 struct EmbeddingResponse {
@@ -724,6 +725,7 @@ pub fn embed_missing_for_selection_report(
     batch_size: usize,
     file_origins: &[String],
     product_only: bool,
+    repair: bool,
 ) -> Result<EmbeddingPassReport> {
     embed_missing_for_selection_interruptible(
         conn,
@@ -731,6 +733,7 @@ pub fn embed_missing_for_selection_report(
         batch_size,
         file_origins,
         product_only,
+        repair,
         || false,
     )
 }
@@ -752,6 +755,7 @@ pub fn embed_missing_interruptible(
         batch_size,
         &crate::origin::defaults(),
         product_only,
+        false,
         should_cancel,
     )
 }
@@ -762,6 +766,7 @@ fn embed_missing_for_selection_interruptible(
     batch_size: usize,
     file_origins: &[String],
     product_only: bool,
+    repair: bool,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<EmbeddingPassReport> {
     if batch_size == 0 {
@@ -855,7 +860,7 @@ fn embed_missing_for_selection_interruptible(
         });
     }
     let occurrences_synced = if let Some(profile) = resolved {
-        sync_vector_index(conn, Some(profile.id))?;
+        synchronize_vector_index(conn, &profile, repair)?;
         selected_embedding_occurrence_count(conn, profile.id, file_origins, product_only)?
     } else {
         0
@@ -1072,7 +1077,6 @@ fn ensure_profile(
         if resolved.dimensions != dimensions {
             bail!("stored embedding profile has incompatible dimensions");
         }
-        ensure_vector_table(conn, dimensions)?;
         return Ok(resolved);
     }
     conn.execute(
@@ -1105,14 +1109,50 @@ fn vector_table(dimensions: usize) -> Result<String> {
 
 fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
     let table = vector_table(dimensions)?;
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
-           embedding FLOAT[{dimensions}] distance_metric=cosine,
-           profile_id INTEGER PARTITION KEY,
-           origin TEXT PARTITION KEY
-         );"
-    ))?;
+    conn.execute_batch("SAVEPOINT jscout_vector_table_ensure")?;
+    let result = (|| -> Result<()> {
+        let existed = vector_table_exists(conn, dimensions)?;
+        if !existed {
+            // A sqlite-vec table is shared by every profile with these dimensions.
+            // Invalidate every completion marker before publishing its replacement
+            // so readers can never observe an empty table as synchronized.
+            conn.execute(
+                "DELETE FROM meta
+                 WHERE key IN (
+                   SELECT ?1 || id FROM embedding_profiles WHERE dimensions=?2
+                 )",
+                params![VECTOR_SYNC_KEY_PREFIX, dimensions as i64],
+            )?;
+        }
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
+               embedding FLOAT[{dimensions}] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               origin TEXT PARTITION KEY
+             );"
+        ))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_table_ensure")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_vector_table_ensure; RELEASE jscout_vector_table_ensure",
+            );
+            return Err(error);
+        }
+    }
     Ok(table)
+}
+
+fn vector_table_exists(conn: &Connection, dimensions: usize) -> Result<bool> {
+    let table = vector_table(dimensions)?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [&table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
 }
 
 fn semantic_vector_table(dimensions: usize) -> Result<String> {
@@ -1254,6 +1294,38 @@ fn sync_semantic_vector_index(
     Ok(())
 }
 
+/// Use the cheap occurrence anti-join for normal embedding passes. A missing
+/// completion marker or virtual table falls back to the full audit, while
+/// `repair` deliberately verifies orphaned and missing sqlite-vec rows as well.
+fn synchronize_vector_index(
+    conn: &Connection,
+    profile: &ResolvedProfile,
+    repair: bool,
+) -> Result<()> {
+    if repair
+        || !vector_index_has_completed_sync(conn, profile.id)?
+        || !vector_table_exists(conn, profile.dimensions)?
+    {
+        return sync_vector_index(conn, Some(profile.id));
+    }
+    if !vector_profile_has_unmaterialized_occurrences(conn, profile.id)? {
+        return Ok(());
+    }
+
+    let table = vector_table(profile.dimensions)?;
+    conn.execute_batch("SAVEPOINT jscout_vector_incremental")?;
+    match materialize_profile(conn, profile.id, &table) {
+        Ok(()) => conn.execute_batch("RELEASE jscout_vector_incremental")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_vector_incremental; RELEASE jscout_vector_incremental",
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result<()> {
     let profiles = {
         let mut statement = conn.prepare(
@@ -1388,13 +1460,16 @@ pub fn materialize_cached_embeddings(conn: &Connection) -> Result<()> {
     if profiles.is_empty() {
         return Ok(());
     }
-    let profiles = profiles
-        .into_iter()
-        .map(|(profile_id, dimensions)| Ok((profile_id, ensure_vector_table(conn, dimensions)?)))
-        .collect::<Result<Vec<_>>>()?;
     conn.execute_batch("SAVEPOINT jscout_vector_materialize")?;
     let result = (|| -> Result<()> {
-        for (profile_id, table) in profiles {
+        for (profile_id, dimensions) in profiles {
+            if vector_index_has_completed_sync(conn, profile_id)?
+                && !vector_table_exists(conn, dimensions)?
+            {
+                sync_vector_index(conn, Some(profile_id))?;
+                continue;
+            }
+            let table = ensure_vector_table(conn, dimensions)?;
             materialize_profile(conn, profile_id, &table)?;
         }
         Ok(())
@@ -1412,22 +1487,22 @@ pub fn materialize_cached_embeddings(conn: &Connection) -> Result<()> {
 }
 
 fn vector_sync_key(profile_id: i64) -> String {
-    format!("embedding_index_synced_v1:{profile_id}")
+    format!("{VECTOR_SYNC_KEY_PREFIX}{profile_id}")
 }
 
-/// The virtual index is transactionally maintained after its first complete
-/// repair. A regular-table anti-join cheaply detects newly indexed chunk
-/// occurrences that can reuse cached embeddings; it avoids auditing every
-/// sqlite-vec row on every search.
-fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
-    let has_completed_sync = conn.query_row(
+fn vector_index_has_completed_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
         [vector_sync_key(profile_id)],
         |row| row.get::<_, bool>(0),
-    )?;
-    if !has_completed_sync {
-        return Ok(true);
-    }
+    )
+    .map_err(Into::into)
+}
+
+fn vector_profile_has_unmaterialized_occurrences(
+    conn: &Connection,
+    profile_id: i64,
+) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
            SELECT 1
@@ -1444,6 +1519,17 @@ fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
     .map_err(Into::into)
 }
 
+/// The virtual index is transactionally maintained after its first complete
+/// repair. A regular-table anti-join cheaply detects newly indexed chunk
+/// occurrences that can reuse cached embeddings; it avoids auditing every
+/// sqlite-vec row on every search.
+fn vector_index_needs_sync(conn: &Connection, profile_id: i64) -> Result<bool> {
+    if !vector_index_has_completed_sync(conn, profile_id)? {
+        return Ok(true);
+    }
+    vector_profile_has_unmaterialized_occurrences(conn, profile_id)
+}
+
 fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<ResolvedProfile> {
     let profile = existing_profile(conn, spec)?.with_context(|| {
         format!(
@@ -1454,14 +1540,8 @@ fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<Resolve
     if vector_index_needs_sync(conn, profile.id)? {
         bail!("vector index is not ready; run `jscout embed <root>` after indexing")
     }
-    let table = vector_table(profile.dimensions)?;
-    let table_exists = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-        [&table],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !table_exists {
-        bail!("vector index table is missing; run `jscout embed <root>` to repair it")
+    if !vector_table_exists(conn, profile.dimensions)? {
+        bail!("vector index table is missing; run `jscout embed <root> --repair` to repair it")
     }
     Ok(profile)
 }

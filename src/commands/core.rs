@@ -72,6 +72,7 @@ pub(super) struct EmbedCommandOptions<'a> {
     pub(super) product: bool,
     pub(super) semantic: bool,
     pub(super) semantic_only: bool,
+    pub(super) repair: bool,
 }
 
 pub(super) fn cmd_embed(
@@ -94,6 +95,7 @@ pub(super) fn cmd_embed(
             options.batch,
             options.file_origins,
             options.product,
+            options.repair,
         )?;
         println!(
             "code embeddings: missing={} embedded={} cached_reused={} occurrences_synced={}",

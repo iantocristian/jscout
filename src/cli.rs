@@ -78,6 +78,9 @@ pub(super) enum Command {
         /// Embed only current semantic artifacts, without scanning code chunks
         #[arg(long, conflicts_with_all = ["product", "semantic"])]
         semantic_only: bool,
+        /// Force a full code-vector consistency audit instead of incremental synchronization
+        #[arg(long, conflicts_with = "semantic_only")]
+        repair: bool,
     },
     /// Hybrid search over the indexed repository
     Search {
