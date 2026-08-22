@@ -187,7 +187,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v23; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v27; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -235,6 +235,12 @@ never loses its exact source context.
 - Ambiguous root references fan out as `possible` candidate edges.
 - Unknown-receiver member calls use bounded property hubs rather than a
   call-site × symbol cross-product.
+- A binding-aware value-flow pass projects `this`, direct/const-bound `new`,
+  imported/exported const values, and closed synchronous or awaited factory
+  receivers at `likely`, with at most three targets and factory recursion
+  capped at depth two. Implicit fallthrough, unsupported returns or receiver
+  shapes, and own members that shadow an inherited method give up to the
+  existing property hub.
 - Events use receiver-qualified or unknown event hubs; jscout does not connect
   every emitter to every listener sharing a common string.
 - General-association edges are terminal and degree-bounded in workflow
@@ -593,13 +599,30 @@ and only then compare real agent work with and without it.
 
 ## Implemented post-v1 checker enrichment sidecar (G10)
 
-As implemented, schema v18 stores exact call/receiver/property byte spans and
+As implemented, schema v27 stores exact call/receiver/property byte spans and
 canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
 sidecar explicitly; `jscout checker doctor` reports project/configuration
 readiness. The protocol host isolates compiler work in a terminable worker,
-and the Rust client enforces a hard deadline. Projection v11 recreates only
-fresh occurrence-specific `checker` edges and retains the shared possible
-member hubs.
+and the Rust client enforces a hard deadline. Under projection v12 the checker
+stage recreates only fresh occurrence-specific `checker` edges and retains the
+shared possible member hubs.
+
+**Amendment — bounded receiver value flow (2026-08-22).** Deterministic
+indexing now records closed syntax-and-binding summaries for `this.m()`, direct
+or const-bound `new C()` receivers, imported/exported const values, and factory
+receivers whose every return is a construct, a const binding to one, or another
+summarized factory call, and block-bodied factories must terminate without
+implicit fallthrough. Awaited async factories are tracked separately from
+unawaited Promise receivers. Factory resolution follows the existing runtime
+import/export graph through depth two; one-hop inheritance is used only when
+the receiver class has no own method and no accessor or instance field shadows
+the requested member.
+The pass emits one to three occurrence-specific targets at `likely` with
+`receiver-value-flow` provenance and `candidateCount`. Parameters, mutable
+bindings, unsupported/conditional expressions, `this.field`, unresolved
+branches, deeper factories, and larger target sets emit nothing beyond the
+existing property hub. These resolved occurrences are excluded from checker
+planning even under `--all`.
 
 The original plan deferred checker-backed enrichment behind a revisit
 trigger. That trigger is now pulled deliberately: the call-site query work
@@ -840,9 +863,11 @@ The default plan:
 - includes `repository`/`workspace` production and unknown-role files;
 - excludes test, fixture, generated, and documentation roles unless selected;
 - excludes occurrences already explained by a direct, occurrence-bound
-  `certain` or `likely` structural edge (currently including namespace-member
-  calls resolved through the module/export graph); line or name coincidence is
-  never sufficient;
+  `certain` or `likely` structural edge (including namespace-member calls and
+  bounded receiver value-flow answers resolved through the module/export
+  graph); line or name coincidence is never sufficient. Receiver value-flow
+  answers remain excluded under `--all`; other deterministic answers may be
+  included for audit;
 - excludes synthetic inferred projects for files outside every configured
   TypeScript project; those files remain fully available to deterministic
   structure, FTS, embeddings, and retrieval;

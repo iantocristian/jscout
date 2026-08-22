@@ -72,11 +72,11 @@ export const NEIGHBORHOOD_CASES = Object.freeze([
   neighborhoodCase('anchor-high-default', 'high', 50, 200, 24_000,
     { nodes: 50, edges: 49, omitted_nodes: 0, omitted_edges: 0, truncated: true }),
   neighborhoodCase('anchor-extreme-default', 'extreme', 50, 200, 24_000,
-    { nodes: 43, edges: 192, omitted_nodes: 0, omitted_edges: 8, truncated: true }),
+    { nodes: 42, edges: 194, omitted_nodes: 1, omitted_edges: 6, truncated: true }),
   neighborhoodCase('budget-high-2k', 'high', 500, 1_000, 2_000,
     { nodes: 8, edges: 7, omitted_nodes: 140, omitted_edges: 469, truncated: true }),
   neighborhoodCase('budget-high-24k', 'high', 500, 1_000, 24_000,
-    { nodes: 90, edges: 126, omitted_nodes: 58, omitted_edges: 350, truncated: true }),
+    { nodes: 91, edges: 126, omitted_nodes: 57, omitted_edges: 350, truncated: true }),
   neighborhoodCase('budget-high-100k', 'high', 500, 1_000, 100_000,
     { nodes: 148, edges: 476, omitted_nodes: 0, omitted_edges: 0, truncated: false }),
 ]);
@@ -126,12 +126,13 @@ export const EMBEDDING_FIXTURE = Object.freeze({
 });
 
 export const ENRICHMENT_INVARIANTS = Object.freeze({
-  projects: 458,
-  occurrences_selected: 5_158,
-  request_batches: 466,
-  facts_published: 1_412,
-  unknown_answers: 1_689,
-  occurrences_resumed: 5_158,
+  projects: 12,
+  occurrences_selected: 4_489,
+  request_batches: 41,
+  facts_published: 163,
+  combined_projected_facts: 1_412,
+  unknown_answers: 1_101,
+  occurrences_resumed: 4_489,
 });
 
 // These values identify fixture drift. They are properties of the pinned
@@ -145,6 +146,8 @@ export const CORPUS_INVARIANTS = Object.freeze({
   references: 28_527,
   member_calls: 25_340,
   graph_nodes: 5_677,
-  graph_edges: 37_202,
+  graph_edges: 38_451,
+  receiver_value_flow_edges: 1_249,
+  receiver_value_flow_occurrences: 669,
   search_queries: SEARCH_QUERIES.length,
 });

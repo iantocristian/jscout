@@ -178,6 +178,7 @@ struct Occurrence {
     package: String,
     boundary_rank: i64,
     deterministically_resolved: bool,
+    value_flow_resolved: bool,
     builtin_receiver: bool,
     runtime_namesake: bool,
 }
@@ -948,6 +949,14 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
         )?
         .query_map([], |row| row.get::<_, i64>(0))?
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let value_flow_resolved = conn
+        .prepare(
+            "SELECT DISTINCT source_ref_id FROM resolved_edges
+             WHERE confidence='likely' AND provenance='receiver-value-flow'
+               AND source_ref_id IS NOT NULL",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
     let mut statement = conn.prepare(
         "SELECT call.rowid, file.id, file.path, file.hash,
                 call.start, call.end, call.receiver_start, call.receiver_end,
@@ -1013,6 +1022,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
             package: row.get(12)?,
             boundary_rank: row.get(13)?,
             deterministically_resolved: deterministically_resolved.contains(&row.get(0)?),
+            value_flow_resolved: value_flow_resolved.contains(&row.get(0)?),
             builtin_receiver: row.get::<_, i64>(14)? != 0,
             runtime_namesake: row.get::<_, i64>(15)? != 0,
         })
@@ -1034,7 +1044,8 @@ fn select_eligible(
     let eligible = occurrences
         .into_iter()
         .filter(|occurrence| {
-            let in_scope = (!occurrence.deterministically_resolved || options.include_all)
+            let in_scope = !occurrence.value_flow_resolved
+                && (!occurrence.deterministically_resolved || options.include_all)
                 && (if options.roles.is_empty() {
                     options.include_all
                         || matches!(occurrence.role.as_str(), "production" | "unknown")

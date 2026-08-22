@@ -27,6 +27,7 @@ fn planned_occurrence(
         package: package.into(),
         boundary_rank,
         deterministically_resolved: false,
+        value_flow_resolved: false,
         builtin_receiver: false,
         runtime_namesake: true,
     }
@@ -749,6 +750,36 @@ fn namespace_member_resolved_by_the_structural_graph_is_not_requeried() -> Resul
         |row| row.get(0),
     )?;
     assert_eq!(bound_edges, 1);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_answers_never_reach_the_checker() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "class Service { run(): void {} }\n\
+         const service = new Service();\n\
+         service.run();\n",
+    )?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+
+    let calls = load_occurrences(&conn)?;
+    let call = calls
+        .iter()
+        .find(|occurrence| occurrence.member == "run")
+        .expect("value-flow member call");
+    assert!(call.deterministically_resolved);
+    assert!(call.value_flow_resolved);
+    assert!(select_eligible(calls.clone(), &options()).0.is_empty());
+
+    let mut all = options();
+    all.include_all = true;
+    assert!(
+        select_eligible(calls, &all).0.is_empty(),
+        "--all audits other deterministic answers but must not repeat bounded value flow in TypeScript"
+    );
     Ok(())
 }
 

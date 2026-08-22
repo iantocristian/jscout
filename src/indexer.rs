@@ -846,6 +846,100 @@ fn insert_file(
         ])?;
     }
 
+    let mut ins_receiver_flow = conn.prepare_cached(
+        "INSERT INTO receiver_value_flows(
+           file_id, call_start, call_end, receiver_kind, class_name, class_start,
+           value_kind, target_name, target_start
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?;
+    for flow in &data.graph.receiver_flows {
+        ins_receiver_flow.execute(params![
+            file_id,
+            flow.call_start,
+            flow.call_end,
+            flow.kind,
+            flow.class_name,
+            flow.class_start,
+            flow.value.as_ref().map(|value| value.kind),
+            flow.value.as_ref().map(|value| &value.target.name),
+            flow.value.as_ref().map(|value| value.target.start),
+        ])?;
+    }
+
+    let mut ins_function_flow = conn.prepare_cached(
+        "INSERT INTO function_return_flows(
+           file_id, function_name, function_start, function_async, return_index,
+           value_kind, target_name, target_start
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+    )?;
+    for flow in &data.graph.function_flows {
+        for (return_index, value) in flow.returns.iter().enumerate() {
+            ins_function_flow.execute(params![
+                file_id,
+                flow.name,
+                flow.start,
+                flow.is_async,
+                return_index as i64,
+                value.kind,
+                value.target.name,
+                value.target.start,
+            ])?;
+        }
+    }
+
+    let mut ins_binding_flow = conn.prepare_cached(
+        "INSERT INTO value_binding_flows(
+           file_id, binding_name, binding_start,
+           value_kind, target_name, target_start
+         ) VALUES(?1,?2,?3,?4,?5,?6)",
+    )?;
+    for flow in &data.graph.binding_flows {
+        ins_binding_flow.execute(params![
+            file_id,
+            flow.name,
+            flow.start,
+            flow.value.kind,
+            flow.value.target.name,
+            flow.value.target.start,
+        ])?;
+    }
+
+    let mut ins_class_flow = conn.prepare_cached(
+        "INSERT INTO class_value_flows(
+           file_id, class_name, class_start, super_name, super_start
+         ) VALUES(?1,?2,?3,?4,?5)",
+    )?;
+    let mut ins_instance_method_flow = conn.prepare_cached(
+        "INSERT INTO instance_method_value_flows(
+           file_id, class_start, method_name, method_start
+         ) VALUES(?1,?2,?3,?4)",
+    )?;
+    let mut ins_class_member_blocker = conn.prepare_cached(
+        "INSERT INTO class_member_value_flow_blockers(
+           file_id, class_start, member_name
+         ) VALUES(?1,?2,?3)",
+    )?;
+    for flow in &data.graph.class_flows {
+        ins_class_flow.execute(params![
+            file_id,
+            flow.name,
+            flow.start,
+            flow.super_class.as_ref().map(|class| &class.name),
+            flow.super_class.as_ref().map(|class| class.start),
+        ])?;
+        for method in &flow.instance_methods {
+            ins_instance_method_flow.execute(params![
+                file_id,
+                flow.start,
+                method.name,
+                method.start,
+            ])?;
+        }
+        for member in &flow.blocked_instance_members {
+            ins_class_member_blocker.execute(params![file_id, flow.start, member])?;
+        }
+    }
+
     let mut ins_entity_site = conn.prepare_cached(
         "INSERT INTO entity_sites(
            file_id, chunk_id, start, end, line, end_line, plane, entity_type,

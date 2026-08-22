@@ -219,6 +219,18 @@ explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
 
+Indexing also performs a bounded receiver value-flow pass. It resolves
+`this.m()` to the enclosing class (or one resolved base class), direct or
+const-bound `new C()` receivers to `C.m`, and direct or const-bound factory
+receivers through closed returns at depth two. Awaited factories and
+imported/exported const values retain their value semantics. Every branch must
+be a construct, a const binding to one, or another bounded factory call, and a
+block body must not fall through. Parameters, conditional expressions, mutable
+bindings, unsupported async branches, `this.field`, and an accessor/field that
+shadows an inherited method give up to the property hub. These edges are
+occurrence-specific, always `likely` rather than `certain`, and capped at three
+targets.
+
 ## Repository reconnaissance
 
 `jscout scout repository <root> --max-calls N|all` is the explicit G13 pass between
@@ -331,8 +343,9 @@ Eligibility defaults to repository/workspace production and unknown-role calls
 that still reach property candidates. Tests, fixtures, generated files,
 documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
-or `--role` to narrow that set. `--all` broadens it to the normally excluded
-cases and explicitly includes synthetic inferred projects for files outside
+or `--role` to narrow that set. `--all` broadens other deterministic answers
+for audit, but receiver value-flow answers are never repeated through the
+checker. It also explicitly includes synthetic inferred projects for files outside
 every configured TypeScript project. Inferred roots are grouped by nearest
 package and compatible compiler family, then deterministically subdivided at a
 150-root cap; imported dependencies can therefore share one TypeScript Program
@@ -1035,6 +1048,7 @@ rejected; preserve such a file before creating a fresh current database.
 ## Confidence tiers
 
 - **certain** — resolved through binding analysis + Node module resolution (incl. package.json `exports`, tsconfig `paths`, barrel/star re-exports, CommonJS `require` with literals, dynamic `import('...')` literals).
+- **likely** — closed occurrence-specific receiver dispatch from bounded value flow or the TypeScript checker. Small candidate sets remain explicit and record `candidateCount`.
 - **possible** — name-matched member calls (`x.getUser()`): candidates listed, never silently dropped. This is the honest checker-less answer for calls through type annotations.
 
 When an otherwise-certain reference resolves to multiple same-named root

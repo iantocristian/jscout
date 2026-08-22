@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "26";
+pub const SCHEMA_VERSION: &str = "27";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -203,6 +203,12 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS module_edges;
              DROP TABLE IF EXISTS refs;
              DROP TABLE IF EXISTS events;
+             DROP TABLE IF EXISTS receiver_value_flows;
+             DROP TABLE IF EXISTS function_return_flows;
+             DROP TABLE IF EXISTS value_binding_flows;
+             DROP TABLE IF EXISTS instance_method_value_flows;
+             DROP TABLE IF EXISTS class_member_value_flow_blockers;
+             DROP TABLE IF EXISTS class_value_flows;
              DROP TABLE IF EXISTS member_calls;
              DROP TABLE IF EXISTS imports;
              DROP TABLE IF EXISTS exports;
@@ -217,7 +223,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='26' WHERE key='schema_version';",
+             UPDATE meta SET value='27' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +241,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '26')
+INSERT INTO meta(key, value) VALUES('schema_version', '27')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -391,6 +397,87 @@ CREATE TABLE IF NOT EXISTS member_calls(
 CREATE INDEX IF NOT EXISTS idx_member_calls_file
   ON member_calls(file_id, receiver_start, prop);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
+
+-- Closed syntax-and-binding facts for occurrence-specific receiver value flow.
+-- Absence means the extractor deliberately gave up; projection never fills a
+-- missing fact by name alone.
+CREATE TABLE IF NOT EXISTS receiver_value_flows(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  call_start INTEGER NOT NULL,
+  call_end INTEGER NOT NULL,
+  receiver_kind TEXT NOT NULL CHECK(receiver_kind IN ('this', 'value')),
+  class_name TEXT,
+  class_start INTEGER,
+  value_kind TEXT CHECK(value_kind IN ('construct', 'factory', 'await_factory', 'binding')),
+  target_name TEXT,
+  target_start INTEGER,
+  CHECK(
+    (receiver_kind='this' AND class_name IS NOT NULL AND class_start IS NOT NULL
+      AND value_kind IS NULL AND target_name IS NULL AND target_start IS NULL)
+    OR
+    (receiver_kind='value' AND class_name IS NULL AND class_start IS NULL
+      AND value_kind IS NOT NULL AND target_name IS NOT NULL AND target_start IS NOT NULL)
+  ),
+  UNIQUE(file_id, call_start, call_end)
+);
+CREATE INDEX IF NOT EXISTS idx_receiver_value_flows_call
+  ON receiver_value_flows(file_id, call_start, call_end);
+
+-- A function appears here only when it has at least one return and every
+-- return is a supported construct/binding/factory shape. One unsupported
+-- return suppresses the complete summary.
+CREATE TABLE IF NOT EXISTS function_return_flows(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  function_name TEXT NOT NULL,
+  function_start INTEGER NOT NULL,
+  function_async INTEGER NOT NULL CHECK(function_async IN (0, 1)),
+  return_index INTEGER NOT NULL,
+  value_kind TEXT NOT NULL CHECK(value_kind IN ('construct', 'factory', 'await_factory', 'binding')),
+  target_name TEXT NOT NULL,
+  target_start INTEGER NOT NULL,
+  UNIQUE(file_id, function_start, return_index)
+);
+CREATE INDEX IF NOT EXISTS idx_function_return_flows_binding
+  ON function_return_flows(file_id, function_start);
+
+CREATE TABLE IF NOT EXISTS value_binding_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  binding_name TEXT NOT NULL,
+  binding_start INTEGER NOT NULL,
+  value_kind TEXT NOT NULL CHECK(value_kind IN ('construct', 'factory', 'await_factory', 'binding')),
+  target_name TEXT NOT NULL,
+  target_start INTEGER NOT NULL,
+  PRIMARY KEY(file_id, binding_start)
+);
+
+CREATE TABLE IF NOT EXISTS class_value_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_name TEXT NOT NULL,
+  class_start INTEGER NOT NULL,
+  super_name TEXT,
+  super_start INTEGER,
+  CHECK((super_name IS NULL) = (super_start IS NULL)),
+  PRIMARY KEY(file_id, class_start)
+);
+CREATE INDEX IF NOT EXISTS idx_class_value_flows_name
+  ON class_value_flows(file_id, class_name);
+
+CREATE TABLE IF NOT EXISTS instance_method_value_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_start INTEGER NOT NULL,
+  method_name TEXT NOT NULL,
+  method_start INTEGER NOT NULL,
+  PRIMARY KEY(file_id, method_start)
+);
+
+CREATE TABLE IF NOT EXISTS class_member_value_flow_blockers(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_start INTEGER NOT NULL,
+  member_name TEXT NOT NULL,
+  PRIMARY KEY(file_id, class_start, member_name)
+);
 
 -- Source-local deterministic evidence. Identifier identities remain raw here
 -- until module resolution can group them under canonical entities.
@@ -943,6 +1030,12 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM entity_sites;
          DELETE FROM refs;
          DELETE FROM events;
+         DELETE FROM receiver_value_flows;
+         DELETE FROM function_return_flows;
+         DELETE FROM value_binding_flows;
+         DELETE FROM instance_method_value_flows;
+         DELETE FROM class_member_value_flow_blockers;
+         DELETE FROM class_value_flows;
          DELETE FROM member_calls;
          DELETE FROM imports;
          DELETE FROM exports;

@@ -220,7 +220,11 @@ function databaseCounters(sqlite, database, env) {
       (SELECT count(*) FROM refs) AS refs,
       (SELECT count(*) FROM member_calls) AS member_calls,
       (SELECT count(*) FROM graph_nodes) AS graph_nodes,
-      (SELECT count(*) FROM resolved_edges) AS resolved_edges;
+      (SELECT count(*) FROM resolved_edges) AS resolved_edges,
+      (SELECT count(*) FROM resolved_edges
+         WHERE provenance = 'receiver-value-flow') AS receiver_value_flow_edges,
+      (SELECT count(DISTINCT source_ref_id) FROM resolved_edges
+         WHERE provenance = 'receiver-value-flow') AS receiver_value_flow_occurrences;
   `, env);
   return row;
 }
@@ -234,6 +238,8 @@ function validateCorpusCounts(actual) {
     member_calls: 'member_calls',
     graph_nodes: 'graph_nodes',
     graph_edges: 'resolved_edges',
+    receiver_value_flow_edges: 'receiver_value_flow_edges',
+    receiver_value_flow_occurrences: 'receiver_value_flow_occurrences',
   };
   for (const [invariant, actualKey] of Object.entries(mappings)) {
     const expected = CORPUS_INVARIANTS[invariant];
@@ -1116,6 +1122,24 @@ function runEnrichmentSuite(context) {
     facts_published: ENRICHMENT_INVARIANTS.facts_published,
     dry_run: false,
   }, 'full enrichment');
+  const [fullProjection] = sqliteJson(context.sqlite, fullDatabase, `
+    SELECT
+      sum(provenance = 'receiver-value-flow') AS value_flow_facts,
+      sum(provenance = 'checker') AS checker_facts,
+      sum(provenance IN ('receiver-value-flow', 'checker')) AS combined_facts
+    FROM resolved_edges;
+  `, context.env);
+  assertEqual(
+    fullProjection.value_flow_facts,
+    CORPUS_INVARIANTS.receiver_value_flow_edges,
+    'projected value-flow facts',
+  );
+  assertEqual(fullProjection.checker_facts, fullReport.facts_published, 'projected checker facts');
+  assertEqual(
+    fullProjection.combined_facts,
+    ENRICHMENT_INVARIANTS.combined_projected_facts,
+    'combined occurrence-specific facts',
+  );
   const [fullProjectRuns] = sqliteJson(context.sqlite, fullDatabase, `
     SELECT
       count(*) AS projects,
@@ -1184,6 +1208,7 @@ function runEnrichmentSuite(context) {
         request_batches: fullReport.request_batches,
         projects: fullReport.projects,
         facts_published: fullReport.facts_published,
+        combined_projected_facts: fullProjection.combined_facts,
         unknown_answers: fullReport.unknown_answers,
         unknown_projects: fullReport.unknown_projects.length,
         configuration_problems: fullReport.configuration_problems,

@@ -38,6 +38,7 @@ mod structural;
 mod surface;
 #[cfg(test)]
 mod test_fs;
+mod value_flow;
 mod walk;
 mod watch;
 mod workspace;
