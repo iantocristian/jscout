@@ -1653,6 +1653,145 @@ fn a_declaration_that_cannot_map_keeps_every_surviving_edge_possible() -> Result
 }
 
 #[test]
+fn closed_checker_candidate_sets_are_likely_only_through_three_targets() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class A { insert(): void {} }\n\
+                  export class B { insert(): number { return 1; } }\n\
+                  export class C { insert(): string { return ''; } }\n\
+                  export class D { insert(): boolean { return true; } }\n\
+                  declare const target: A | B | C | D;\n\
+                  target.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let declarations = [
+        declaration_at(source, "insert(): void {}", "insert", &hash),
+        declaration_at(source, "insert(): number { return 1; }", "insert", &hash),
+        declaration_at(source, "insert(): string { return ''; }", "insert", &hash),
+        declaration_at(
+            source,
+            "insert(): boolean { return true; }",
+            "insert",
+            &hash,
+        ),
+    ];
+    let occurrence = occurrence(&conn)?;
+
+    for (count, expected) in [(1, "likely"), (2, "likely"), (3, "likely"), (4, "possible")] {
+        let outcome = map_occurrence(
+            &conn,
+            &occurrence,
+            &[answer(declarations[..count].to_vec())],
+        )?;
+        assert_eq!(outcome.facts.len(), count);
+        assert!(
+            outcome.facts.iter().all(|fact| fact.confidence == expected),
+            "{count} fully mapped candidates should be {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class A { insert(): void {} }\n\
+                  export class B { insert(): number { return 1; } }\n\
+                  export class C { insert(): string { return ''; } }\n\
+                  export class D { insert(): boolean { return true; } }\n\
+                  declare const target: A | B | C | D;\n\
+                  target.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let occurrence = occurrence(&conn)?;
+    let declarations = [
+        declaration_at(source, "insert(): void {}", "insert", &hash),
+        declaration_at(source, "insert(): number { return 1; }", "insert", &hash),
+        declaration_at(source, "insert(): string { return ''; }", "insert", &hash),
+        declaration_at(
+            source,
+            "insert(): boolean { return true; }",
+            "insert",
+            &hash,
+        ),
+    ];
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+
+    for (candidate_count, expected) in [(3, "likely"), (4, "possible")] {
+        let projects = (0..candidate_count)
+            .map(|index| (format!("tsconfig.{index}.json"), vec![occurrence.clone()]))
+            .collect::<BTreeMap<_, _>>();
+        let fingerprints = test_project_fingerprints(&projects);
+        let batch_id = open_staging_batch(
+            &conn,
+            &StagingPlan {
+                snapshot: &snapshot,
+                plan_fingerprint: &format!("closed-{candidate_count}"),
+                checker: &identity,
+                protocol: 3,
+                selected_occurrences: 1,
+                projects: &projects,
+                project_fingerprints: &fingerprints,
+                force_new: true,
+            },
+        )?;
+        for (index, declaration) in declarations[..candidate_count].iter().enumerate() {
+            let project = format!("tsconfig.{index}.json");
+            let outcome = map_occurrence(
+                &conn,
+                &occurrence,
+                &[project_answer(&project, vec![declaration.clone()])],
+            )?;
+            stage_batch(
+                &conn,
+                batch_id,
+                &project,
+                std::slice::from_ref(&occurrence),
+                &outcome.facts,
+                &outcome.projects,
+            )?;
+            complete_project(
+                repo.path(),
+                &conn,
+                batch_id,
+                &project,
+                &format!("{project}-inputs"),
+                &[super::super::protocol::CheckerInputFile {
+                    path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+                    source_hash: hash.clone(),
+                }],
+                1,
+                1,
+            )?;
+        }
+        assert_eq!(
+            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false)?,
+            candidate_count
+        );
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+        let mut statement = conn.prepare(
+            "SELECT confidence, detail_json FROM resolved_edges
+             WHERE provenance='checker' AND source_ref_id=?1 ORDER BY dst_key",
+        )?;
+        let edges = statement
+            .query_map([occurrence.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(edges.len(), candidate_count);
+        for (confidence, detail) in edges {
+            assert_eq!(confidence, expected);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&detail)?["candidateCount"],
+                candidate_count
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn later_project_cannot_upgrade_an_earlier_ambiguous_answer() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let source = "export class CardTable { insert(): void {} }\n\

@@ -2672,9 +2672,9 @@ fn activate_staging_batch(
             recheck_target(conn, &target?)?;
         }
 
-        // Cross-project ambiguity is known only after every owner has
-        // completed. A different mapped target in any owner demotes every
-        // surviving candidate for that occurrence.
+        // Cross-project candidate cardinality is known only after every owner
+        // has completed. A closed set of at most three mapped targets stays
+        // likely; larger or incomplete sets demote every surviving candidate.
         conn.execute(
             "UPDATE checker_enrichments
              SET confidence='possible'
@@ -2682,7 +2682,7 @@ fn activate_staging_batch(
                SELECT member_call_id FROM checker_enrichments
                WHERE batch_id=?1
                GROUP BY member_call_id
-               HAVING count(DISTINCT target_anchor)>1
+               HAVING count(DISTINCT target_anchor)>3
                   OR min(CASE confidence WHEN 'possible' THEN 0 ELSE 1 END)=0
              )",
             [batch_id],
@@ -2839,9 +2839,15 @@ fn map_occurrence(
         .map(|fact| fact.target.anchor.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let unambiguous = target_count == 1 && outcome.unmapped_declarations == 0;
+    let closed_candidate_set =
+        (1..=3).contains(&target_count) && outcome.unmapped_declarations == 0;
     for fact in &mut outcome.facts {
-        fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
+        fact.confidence = if closed_candidate_set {
+            "likely"
+        } else {
+            "possible"
+        }
+        .into();
     }
     Ok(outcome)
 }

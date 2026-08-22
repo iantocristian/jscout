@@ -688,17 +688,20 @@ or path mappings. Project discovery and selection must therefore be
 deterministic: enumerate every owning configured project (or one explicitly
 identified inferred project), attach a stable project ID and effective compiler
 options to each answer, and never choose a target by server load order. Equal
-answers may coalesce. Conflicting targets remain a visible `possible` candidate
-set, or `unknown` when they cannot be mapped safely; they never become one
-arbitrary `likely` edge.
+answers may coalesce. A fully mapped closed set of at most three targets remains
+visible as separate `likely` candidates; larger or incompletely mapped sets are
+`possible`, and an answer that cannot be mapped safely is `unknown`. Conflicts
+never collapse into one arbitrary edge.
 
 An owning project that returns `unknown` is incomplete coverage, not evidence
 against a clean resolution produced by another owning project. It therefore
 does not demote otherwise agreeing resolved answers. Canonical occurrence
 coverage retains its project ID, status, and input fingerprint; projected
-checker edges expose those IDs as `unknownProjects`. Multiple mapped targets or
-an unmappable declaration from a resolved answer still make every survivor
-`possible`. The complete answer for the selected plan, including explicit
+checker edges expose those IDs as `unknownProjects`. Projected edges also expose
+the closed set's `candidateCount`. One to three distinct mapped targets with no
+unmappable declaration remain `likely`; four or more targets, or any unmappable
+declaration from a resolved answer, make every survivor `possible`. The complete
+answer for the selected plan, including explicit
 omitted/failed coverage, is published as one batch bound to the current
 structural snapshot; it is never freshened project by project.
 
@@ -736,12 +739,12 @@ indexed symbol anchors.
 Enrichment is occurrence-specific. A single `dbs.wave.card.insert()` result may
 add an edge from that call's enclosing file/symbol to `CardTable.insert`; it
 must never promote or replace the shared `member:insert` hub edge, which would
-leak the answer into unrelated `.insert()` calls. One unambiguous mapped target
-is `likely` with provenance `checker`. Multiple valid declaration targets —
-from unions, overload ownership, inheritance, or disagreeing projects — remain
-separate `possible` candidates. Existing hubs are retained for unexplained
-dynamic calls. Contract-plane consumers may attach the receiver's declared type
-as documentary evidence under the same provenance.
+leak the answer into unrelated `.insert()` calls. A fully mapped closed set of
+one to three targets is `likely` with provenance `checker`; each edge records
+the set's `candidateCount`. Four or more targets, or any incompletely mapped
+answer, remain separate `possible` candidates. Existing hubs are retained for
+unexplained dynamic calls. Contract-plane consumers may attach the receiver's
+declared type as documentary evidence under the same provenance.
 
 Checker results are typed facts in the disposable snapshot plane, not writes
 made directly to the graph projection. A dedicated enrichment table records the
@@ -2772,10 +2775,10 @@ jscout provides a different repository-level surface:
 
 Do not reimplement general LSP machinery. Optional occurrence-scoped
 receiver/member enrichment is implemented as G10 (post-v1) — a deliberate
-pull of the original deferral trigger. Unambiguous
-answers are recorded at `likely` with `checker` provenance; ambiguous answers
-remain candidates. Everything else typed navigation offers remains the LSP's
-job.
+pull of the original deferral trigger. Closed answers with at most three fully
+mapped targets are recorded at `likely` with `checker` provenance; larger or
+incomplete answers remain `possible` candidates. Everything else typed
+navigation offers remains the LSP's job.
 
 ## Deferred or out of scope
 

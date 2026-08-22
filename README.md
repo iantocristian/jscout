@@ -366,6 +366,10 @@ labels every returned declaration's provenance (`repo`, `types`, `lib`,
 declarations skip the anchoring lookup but still count as unmapped, so
 confidences are unchanged and the report attributes refusals by provenance in
 `unmapped_declaration_contexts`.
+When every returned declaration maps, a closed set of one to three targets is
+published at `likely`; four or more targets, or any unmapped declaration, keeps
+the set at `possible`. Every projected checker edge records `candidateCount`
+for that occurrence.
 
 Configured projects start with a deterministic purpose classification. Explicit
 lint configurations such as `tsconfig.eslint.json` are removed from a file's
