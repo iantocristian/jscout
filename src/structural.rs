@@ -2142,7 +2142,7 @@ fn checker_occurrence_coverage(
         let entry = coverage
             .entry(member_call_id)
             .or_insert_with(CheckerOccurrenceCoverage::default);
-        if run_status == "failed" {
+        if run_status == "failed" || status == "failed" {
             entry.failed_projects.insert(project);
         } else if status == "unknown" {
             entry.unknown_projects.insert(project);
@@ -2189,7 +2189,7 @@ fn project_checker_enrichments(
          JOIN checker_project_runs run
            ON run.batch_id=enrichment.batch_id
           AND run.project_id=enrichment.project_id
-          AND run.status='completed'
+          AND run.status IN ('completed','partial')
          JOIN files source
            ON source.path=enrichment.source_file AND source.hash=enrichment.source_hash
          JOIN member_calls call
