@@ -343,6 +343,47 @@ test("invalidates an inferred program when a manifest symlink is retargeted", {
   await checker.close();
 });
 
+test("ignores a dangling manifest link until it becomes a package boundary", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const source = "class Store { save() {} }\nconst store = new Store();\nstore.save();\n";
+  const root = fixture({ "nested/tool.js": source });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const manifestTarget = path.join(root, "manifests/package.json");
+  const manifest = path.join(root, "nested/package.json");
+  fs.symlinkSync(manifestTarget, manifest);
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-cjs",
+    project_files: ["nested/tool.js"],
+    queries: [{
+      ...queryFor(source, "store.save()", "store", "save"),
+      file: "nested/tool.js",
+    }],
+  });
+  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
+  assert.ok(!resolved.result.results.some((result) => result.answer.status === "failed"));
+
+  const unchanged = await checker.request("validate_project", {
+    project_id: "inferred:.#node-cjs",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(unchanged.result.valid, true);
+  assert.ok(!unchanged.result.inputs.some((input) => input.path === manifest));
+
+  fs.mkdirSync(path.dirname(manifestTarget), { recursive: true });
+  fs.writeFileSync(manifestTarget, JSON.stringify({ type: "module" }));
+  const materialized = await checker.request("validate_project", {
+    project_id: "inferred:.#node-cjs",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(materialized.result.valid, false);
+  await checker.close();
+});
+
 test("invalidates inferred programs when a package boundary appears", async () => {
   const source = "class Store { save() {} }\nconst store = new Store();\nstore.save();\n";
   const runCase = async (files, createdManifest) => {

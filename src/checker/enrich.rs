@@ -18,6 +18,7 @@ use super::protocol::{
 /// would be classified differently.
 const CONFIDENCE_POLICY_FINGERPRINT: &[u8] = b"jscout-checker-confidence-policy-v2\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
+const INFERRED_ROOT_CAP: usize = 150;
 
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
@@ -98,6 +99,7 @@ struct FileFailure {
 #[derive(Debug, Default)]
 struct ProjectExecution {
     failed_files: BTreeMap<String, super::protocol::RemoteError>,
+    discarded_staging: bool,
 }
 
 #[derive(Debug)]
@@ -687,7 +689,6 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             .into_iter()
             .partition(|occurrence| dirty_files.contains(&occurrence.file));
         pending.extend(clean);
-        occurrences_resumed += completed.len();
         mark_project_pending(&conn, batch_id, project_id)?;
         eprintln!(
             "checker enrichment: project {}/{} {} ({} pending, {} resumed)",
@@ -715,9 +716,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut peak_rss_bytes,
             &mut peak_heap_bytes,
             true,
+            true,
         );
         match project_result {
             Ok(execution) if !execution.failed_files.is_empty() => {
+                if !execution.discarded_staging {
+                    occurrences_resumed += completed.len();
+                }
                 let files = execution
                     .failed_files
                     .into_iter()
@@ -738,7 +743,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                     retryable: false,
                 });
             }
-            Ok(_) => {}
+            Ok(execution) => {
+                if !execution.discarded_staging {
+                    occurrences_resumed += completed.len();
+                }
+            }
             Err(error) => {
                 if project_was_interrupted(&error) {
                     bail!(
@@ -1321,8 +1330,8 @@ fn build_project_plan(
         if roots.is_empty() {
             bail!("checker omitted inferred roots for {project_id}");
         }
-        if roots.len() > 150 {
-            bail!("checker inferred project {project_id} exceeds the 150-root cap");
+        if roots.len() > INFERRED_ROOT_CAP {
+            bail!("checker inferred project {project_id} exceeds the {INFERRED_ROOT_CAP}-root cap");
         }
         if let Some(summary) = summaries.get(project_id.as_str())
             && summary.file_count != roots.len()
@@ -2375,6 +2384,7 @@ fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> 
             "UPDATE checker_project_runs
              SET status='pending', completed_occurrences=0,
                  checker_input_fingerprint=NULL, execution_kind='checked',
+                 peak_rss_bytes=0, peak_heap_bytes=0,
                  error=NULL, updated_at=datetime('now')
              WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
@@ -2487,6 +2497,7 @@ fn execute_project(
     peak_rss_bytes: &mut u64,
     peak_heap_bytes: &mut u64,
     restart_available: bool,
+    register_interrupts: bool,
 ) -> Result<ProjectExecution> {
     const MAX_BATCH_ITEMS: usize = 128;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -2506,7 +2517,7 @@ fn execute_project(
             bail!("checker staging contains multiple input fingerprints for {project_id}");
         }
         reset_project_staging(conn, batch_id, project_id)?;
-        return execute_project(
+        let mut execution = execute_project(
             root,
             options,
             conn,
@@ -2524,20 +2535,45 @@ fn execute_project(
             peak_rss_bytes,
             peak_heap_bytes,
             false,
-        );
+            register_interrupts,
+        )?;
+        execution.discarded_staging = true;
+        return Ok(execution);
     }
     let mut checker = super::launch(root, options.sidecar, None, options.node)?;
-    checker
-        .register_interrupts()
-        .context("failed to install checker Ctrl-C handler")?;
+    if register_interrupts {
+        checker
+            .register_interrupts()
+            .context("failed to install checker Ctrl-C handler")?;
+    }
     let mut project_fingerprint = staged_fingerprints.into_iter().next();
     let resumed_fingerprint = project_fingerprint.clone();
     let mut execution = ProjectExecution::default();
     let mut project_peak_rss_bytes = 0;
     let mut project_peak_heap_bytes = 0;
+    let mut attempt_unknown_answers = 0;
+    let mut attempt_unmapped_declarations = 0;
+    let mut attempt_unmapped_declaration_contexts = BTreeMap::<String, usize>::new();
     let mut offset = 0;
     while offset < occurrences.len() {
+        while offset < occurrences.len()
+            && execution
+                .failed_files
+                .contains_key(&occurrences[offset].file)
+        {
+            offset += 1;
+        }
+        if offset == occurrences.len() {
+            break;
+        }
         let mut end = (offset + MAX_BATCH_ITEMS).min(occurrences.len());
+        if !execution.failed_files.is_empty()
+            && let Some(next_failed) = occurrences[offset..end]
+                .iter()
+                .position(|occurrence| execution.failed_files.contains_key(&occurrence.file))
+        {
+            end = offset + next_failed;
+        }
         while end > offset + 1 {
             let queries = occurrences[offset..end]
                 .iter()
@@ -2588,7 +2624,7 @@ fn execute_project(
                 if resumed_fingerprint.is_some() && restart_available {
                     drop(checker);
                     reset_project_staging(conn, batch_id, project_id)?;
-                    return execute_project(
+                    let mut execution = execute_project(
                         root,
                         options,
                         conn,
@@ -2606,7 +2642,10 @@ fn execute_project(
                         peak_rss_bytes,
                         peak_heap_bytes,
                         false,
-                    );
+                        register_interrupts,
+                    )?;
+                    execution.discarded_staging = true;
+                    return Ok(execution);
                 }
                 bail!("checker input fingerprint changed during project {project_id}");
             }
@@ -2679,10 +2718,12 @@ fn execute_project(
                 continue;
             }
             let outcome = map_occurrence(conn, occurrence, std::slice::from_ref(&item.answer))?;
-            *unknown_answers += outcome.unknown_answers;
-            *unmapped_declarations += outcome.unmapped_declarations;
+            attempt_unknown_answers += outcome.unknown_answers;
+            attempt_unmapped_declarations += outcome.unmapped_declarations;
             for (context, count) in outcome.unmapped_declaration_contexts {
-                *unmapped_declaration_contexts.entry(context).or_default() += count;
+                *attempt_unmapped_declaration_contexts
+                    .entry(context)
+                    .or_default() += count;
             }
             facts.extend(outcome.facts);
             projects.extend(outcome.projects);
@@ -2728,6 +2769,11 @@ fn execute_project(
         project_peak_rss_bytes,
         project_peak_heap_bytes,
     )?;
+    *unknown_answers += attempt_unknown_answers;
+    *unmapped_declarations += attempt_unmapped_declarations;
+    for (context, count) in attempt_unmapped_declaration_contexts {
+        *unmapped_declaration_contexts.entry(context).or_default() += count;
+    }
     Ok(execution)
 }
 

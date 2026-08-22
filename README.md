@@ -339,6 +339,11 @@ package and compatible compiler family, then deterministically subdivided at a
 without recreating the former one-Program-per-file cost. Those files remain
 first-class in chunks, symbols, structural edges, FTS, embeddings, and retrieval
 when checker enrichment skips them.
+Sharing a Program can expose ambient declarations loaded through one root to
+its siblings. On pinned ai-pipe, 587 occurrences moved from unknown to
+`@types/node` declarations while all 1,412 mapped repository fact payloads
+remained unchanged; on that corpus grouping was fact-neutral, not
+coverage-neutral.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
 files within each priority tier; configured projects execute before inferred

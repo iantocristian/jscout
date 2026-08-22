@@ -60,6 +60,619 @@ fn test_project_fingerprints(
         .collect()
 }
 
+#[cfg(unix)]
+struct FakeCheckerLaunch {
+    resolve_frames: Vec<String>,
+    validation_frame: Option<String>,
+}
+
+#[cfg(unix)]
+const FAKE_PROTOCOL_VERSION: u32 = super::super::protocol::PROTOCOL_VERSION;
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn write_fake_checker(root: &Path, launches: &[FakeCheckerLaunch]) -> Result<PathBuf> {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = root.join("fake-checker.sh");
+    let launch_state = root.join("fake-checker-launches");
+    let ready = serde_json::json!({
+        "protocol": FAKE_PROTOCOL_VERSION,
+        "id": "r1",
+        "kind": "ready",
+        "versions": { "sidecar": "fake", "node": "22.19.0", "protocol": FAKE_PROTOCOL_VERSION },
+    })
+    .to_string();
+    let mut resolve_cases = String::new();
+    let mut validation_cases = String::new();
+    for (launch_index, launch) in launches.iter().enumerate() {
+        for (resolve_index, frame) in launch.resolve_frames.iter().enumerate() {
+            writeln!(
+                resolve_cases,
+                "        {}:{}) printf '%s\\n' {} ;;",
+                launch_index + 1,
+                resolve_index + 1,
+                shell_quote(frame),
+            )?;
+        }
+        if let Some(frame) = &launch.validation_frame {
+            writeln!(
+                validation_cases,
+                "        {}) printf '%s\\n' {} ;;",
+                launch_index + 1,
+                shell_quote(frame),
+            )?;
+        }
+    }
+    let source = format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'v22.19.0'
+  exit 0
+fi
+state={state}
+launch=1
+if [ -f "$state" ]; then
+  IFS= read -r previous < "$state"
+  launch=$((previous + 1))
+fi
+printf '%s\n' "$launch" > "$state"
+resolve=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) printf '%s\n' {ready} ;;
+    *'"kind":"resolve_members"'*)
+      resolve=$((resolve + 1))
+      case "$launch:$resolve" in
+{resolve_cases}        *) exit 91 ;;
+      esac
+      ;;
+    *'"kind":"validate_project"'*)
+      case "$launch" in
+{validation_cases}        *) exit 92 ;;
+      esac
+      ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done
+"#,
+        state = shell_quote(&launch_state.to_string_lossy()),
+        ready = shell_quote(&ready),
+    );
+    fs::write(&executable, source)?;
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+    Ok(executable)
+}
+
+#[cfg(unix)]
+fn fake_resolve_frame(
+    id: &str,
+    project_id: &str,
+    fingerprint: &str,
+    occurrences: &[Occurrence],
+) -> String {
+    let results = occurrences
+        .iter()
+        .map(|occurrence| {
+            serde_json::json!({
+                "indexed_hash": occurrence.hash,
+                "source_hash": occurrence.hash,
+                "answer": {
+                    "project_id": project_id,
+                    "status": "unknown",
+                    "declarations": [],
+                    "checker_input_fingerprint": fingerprint,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "protocol": FAKE_PROTOCOL_VERSION,
+        "id": id,
+        "kind": "resolve_members_result",
+        "result": {
+            "project_id": project_id,
+            "typescript": { "version": "5.9.3", "source": "bundled" },
+            "checker_input_fingerprint": fingerprint,
+            "results": results,
+            "resources": { "rss_bytes": 0, "heap_used_bytes": 0, "heap_total_bytes": 0 },
+        },
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn fake_failed_frame(
+    id: &str,
+    project_id: &str,
+    fingerprint: &str,
+    occurrences: &[Occurrence],
+) -> String {
+    let results = occurrences
+        .iter()
+        .map(|occurrence| {
+            serde_json::json!({
+                "indexed_hash": occurrence.hash,
+                "source_hash": occurrence.hash,
+                "answer": {
+                    "project_id": project_id,
+                    "status": "failed",
+                    "declarations": [],
+                    "checker_input_fingerprint": fingerprint,
+                    "error": { "code": "span_mismatch", "message": "synthetic failure" },
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "protocol": FAKE_PROTOCOL_VERSION,
+        "id": id,
+        "kind": "resolve_members_result",
+        "result": {
+            "project_id": project_id,
+            "typescript": { "version": "5.9.3", "source": "bundled" },
+            "checker_input_fingerprint": fingerprint,
+            "results": results,
+            "resources": { "rss_bytes": 0, "heap_used_bytes": 0, "heap_total_bytes": 0 },
+        },
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn fake_error_frame(id: &str, code: &str) -> String {
+    serde_json::json!({
+        "protocol": FAKE_PROTOCOL_VERSION,
+        "id": id,
+        "kind": "error",
+        "error": { "code": code, "message": "synthetic checker error" },
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn fake_validation_frame(id: &str, project_id: &str, fingerprint: &str) -> String {
+    serde_json::json!({
+        "protocol": FAKE_PROTOCOL_VERSION,
+        "id": id,
+        "kind": "validate_project_result",
+        "result": {
+            "project_id": project_id,
+            "fingerprint": fingerprint,
+            "valid": true,
+            "inputs": [],
+        },
+    })
+    .to_string()
+}
+
+#[cfg(unix)]
+fn execution_fixture(
+    root: &Path,
+    occurrences: Vec<Occurrence>,
+) -> Result<(Connection, i64, Vec<Occurrence>)> {
+    let conn = crate::store::open(root)?;
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let project_id = "inferred:.#node-esm".to_string();
+    let projects = BTreeMap::from([(project_id.clone(), occurrences.clone())]);
+    let fingerprints = test_project_fingerprints(&projects);
+    let batch_id = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: "snapshot",
+            plan_fingerprint: "plan",
+            checker: &identity,
+            protocol: FAKE_PROTOCOL_VERSION,
+            selected_occurrences: occurrences.len(),
+            projects: &projects,
+            project_fingerprints: &fingerprints,
+            force_new: true,
+        },
+    )?;
+    Ok((conn, batch_id, occurrences))
+}
+
+#[cfg(unix)]
+fn stage_unknown(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrence: &Occurrence,
+    fingerprint: &str,
+) -> Result<()> {
+    stage_batch(
+        conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(occurrence),
+        &[],
+        &[PendingProjectAnswer {
+            occurrence: occurrence.clone(),
+            project_id: project_id.into(),
+            input_fingerprint: fingerprint.into(),
+            status: "unknown",
+        }],
+    )
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct TestExecutionCounters {
+    request_batches: usize,
+    occurrences_queried: usize,
+    unknown_answers: usize,
+}
+
+#[cfg(unix)]
+fn execute_with_fake(
+    root: &Path,
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrences: &[Occurrence],
+    pending: &[Occurrence],
+    executable: &Path,
+) -> (Result<ProjectExecution>, TestExecutionCounters) {
+    let execution_options = EnrichOptions {
+        sidecar: Some(executable),
+        node: executable.to_str().expect("UTF-8 fake checker path"),
+        timeout: Duration::from_secs(5),
+        ..options()
+    };
+    let project_files = occurrences
+        .iter()
+        .map(|occurrence| occurrence.file.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut counters = TestExecutionCounters::default();
+    let mut unmapped_declarations = 0;
+    let mut unmapped_contexts = BTreeMap::new();
+    let mut peak_rss_bytes = 0;
+    let mut peak_heap_bytes = 0;
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let result = execute_project(
+        root,
+        &execution_options,
+        conn,
+        batch_id,
+        project_id,
+        &project_files,
+        occurrences,
+        pending,
+        &identity,
+        &mut counters.request_batches,
+        &mut counters.occurrences_queried,
+        &mut counters.unknown_answers,
+        &mut unmapped_declarations,
+        &mut unmapped_contexts,
+        &mut peak_rss_bytes,
+        &mut peak_heap_bytes,
+        true,
+        false,
+    );
+    (result, counters)
+}
+
+#[cfg(unix)]
+fn fake_occurrences(files: &[&str]) -> Vec<Occurrence> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let mut occurrence =
+                planned_occurrence(index as i64 + 1, "root", file, "production", 0);
+            occurrence.hash = format!("hash-{index}");
+            occurrence
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_staged_fingerprints_reset_and_rerun_all_occurrences() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project_id = "inferred:.#node-esm";
+    let (conn, batch_id, occurrences) =
+        execution_fixture(root.path(), fake_occurrences(&["a.mjs", "b.mjs", "c.mjs"]))?;
+    stage_unknown(&conn, batch_id, project_id, &occurrences[0], "old-a")?;
+    stage_unknown(&conn, batch_id, project_id, &occurrences[1], "old-b")?;
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id, project_id, input_kind, input_path, source_hash
+         ) VALUES(?1,?2,'absolute','/stale-input','stale')",
+        params![batch_id, project_id],
+    )?;
+    conn.execute(
+        "UPDATE checker_project_runs SET peak_rss_bytes=41, peak_heap_bytes=17
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+    )?;
+
+    let executable = write_fake_checker(
+        root.path(),
+        &[FakeCheckerLaunch {
+            resolve_frames: vec![fake_resolve_frame("r2", project_id, "fresh", &occurrences)],
+            validation_frame: Some(fake_validation_frame("r3", project_id, "fresh")),
+        }],
+    )?;
+    let (result, counters) = execute_with_fake(
+        root.path(),
+        &conn,
+        batch_id,
+        project_id,
+        &occurrences,
+        &occurrences[2..],
+        &executable,
+    );
+    let execution = result?;
+
+    assert!(execution.discarded_staging);
+    assert_eq!(counters.request_batches, 1);
+    assert_eq!(counters.occurrences_queried, 3);
+    assert_eq!(counters.unknown_answers, 3);
+    let (coverage, fingerprints): (i64, i64) = conn.query_row(
+        "SELECT count(*), count(DISTINCT checker_input_fingerprint)
+         FROM checker_occurrence_projects WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((coverage, fingerprints), (3, 1));
+    assert_eq!(
+        conn.query_row(
+            "SELECT min(checker_input_fingerprint) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, String>(0),
+        )?,
+        "fresh"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_project_inputs
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("fake-checker-launches"))?.trim(),
+        "1",
+        "mixed staging must reset before launching a checker",
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn resumed_fingerprint_drift_resets_and_reruns_all_occurrences() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project_id = "inferred:.#node-esm";
+    let (conn, batch_id, occurrences) =
+        execution_fixture(root.path(), fake_occurrences(&["a.mjs", "b.mjs", "c.mjs"]))?;
+    stage_unknown(&conn, batch_id, project_id, &occurrences[0], "old")?;
+    let executable = write_fake_checker(
+        root.path(),
+        &[
+            FakeCheckerLaunch {
+                resolve_frames: vec![
+                    fake_error_frame("r2", "oversized_batch"),
+                    fake_resolve_frame("r3", project_id, "old", &occurrences[1..2]),
+                    fake_resolve_frame("r4", project_id, "fresh", &occurrences[2..]),
+                ],
+                validation_frame: None,
+            },
+            FakeCheckerLaunch {
+                resolve_frames: vec![fake_resolve_frame("r2", project_id, "fresh", &occurrences)],
+                validation_frame: Some(fake_validation_frame("r3", project_id, "fresh")),
+            },
+        ],
+    )?;
+    let (result, counters) = execute_with_fake(
+        root.path(),
+        &conn,
+        batch_id,
+        project_id,
+        &occurrences,
+        &occurrences[1..],
+        &executable,
+    );
+    let execution = result?;
+
+    assert!(execution.discarded_staging);
+    assert_eq!(counters.request_batches, 4);
+    assert_eq!(counters.occurrences_queried, 5);
+    assert_eq!(
+        counters.unknown_answers, 3,
+        "answers from the discarded attempt must not leak into the report",
+    );
+    let rows = conn
+        .prepare(
+            "SELECT member_call_id, checker_input_fingerprint
+             FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 ORDER BY member_call_id",
+        )?
+        .query_map(params![batch_id, project_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "fresh".into()),
+            (2, "fresh".into()),
+            (3, "fresh".into())
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("fake-checker-launches"))?.trim(),
+        "2"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_fingerprint_drift_after_restart_is_terminal() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project_id = "inferred:.#node-esm";
+    let (conn, batch_id, occurrences) =
+        execution_fixture(root.path(), fake_occurrences(&["a.mjs", "b.mjs"]))?;
+    stage_unknown(&conn, batch_id, project_id, &occurrences[0], "old")?;
+    conn.execute(
+        "UPDATE checker_project_runs SET peak_rss_bytes=41, peak_heap_bytes=17
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id, project_id, input_kind, input_path, source_hash
+         ) VALUES(?1,?2,'absolute','/stale-input','stale')",
+        params![batch_id, project_id],
+    )?;
+    let executable = write_fake_checker(
+        root.path(),
+        &[
+            FakeCheckerLaunch {
+                resolve_frames: vec![fake_resolve_frame(
+                    "r2",
+                    project_id,
+                    "fresh",
+                    &occurrences[1..],
+                )],
+                validation_frame: None,
+            },
+            FakeCheckerLaunch {
+                resolve_frames: vec![
+                    fake_error_frame("r2", "oversized_batch"),
+                    fake_resolve_frame("r3", project_id, "fresh", &occurrences[..1]),
+                    fake_resolve_frame("r4", project_id, "newer", &occurrences[1..]),
+                ],
+                validation_frame: None,
+            },
+        ],
+    )?;
+    let (result, counters) = execute_with_fake(
+        root.path(),
+        &conn,
+        batch_id,
+        project_id,
+        &occurrences,
+        &occurrences[1..],
+        &executable,
+    );
+    let error = result.expect_err("a second drift must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("checker input fingerprint changed during project")
+    );
+    assert_eq!(counters.request_batches, 4);
+    assert_eq!(counters.occurrences_queried, 3);
+    assert_eq!(counters.unknown_answers, 0);
+    assert_eq!(
+        fs::read_to_string(root.path().join("fake-checker-launches"))?.trim(),
+        "2",
+        "the clean rerun must not recurse again",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    let (rss, heap): (i64, i64) = conn.query_row(
+        "SELECT peak_rss_bytes, peak_heap_bytes FROM checker_project_runs
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((rss, heap), (0, 0));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_project_inputs
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "the clean restart must discard stale input rows before it runs",
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_inferred_file_is_not_queried_again_in_later_batches() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let project_id = "inferred:.#node-esm";
+    let occurrences = fake_occurrences(&["broken.mjs", "healthy.mjs", "broken.mjs"]);
+    let (conn, batch_id, occurrences) = execution_fixture(root.path(), occurrences)?;
+    let executable = write_fake_checker(
+        root.path(),
+        &[FakeCheckerLaunch {
+            resolve_frames: vec![
+                fake_error_frame("r2", "oversized_batch"),
+                fake_failed_frame("r3", project_id, "fresh", &occurrences[..1]),
+                fake_resolve_frame("r4", project_id, "fresh", &occurrences[1..2]),
+            ],
+            validation_frame: Some(fake_validation_frame("r5", project_id, "fresh")),
+        }],
+    )?;
+    let (result, counters) = execute_with_fake(
+        root.path(),
+        &conn,
+        batch_id,
+        project_id,
+        &occurrences,
+        &occurrences,
+        &executable,
+    );
+    let execution = result?;
+
+    assert_eq!(execution.failed_files.len(), 1);
+    assert_eq!(counters.request_batches, 3);
+    assert_eq!(counters.occurrences_queried, 2);
+    assert_eq!(counters.unknown_answers, 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 AND status='failed'",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        2,
+        "the first file failure stages complete coverage for that file",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 AND status='unknown'",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "the healthy occurrence after a failure hole must still be staged",
+    );
+    Ok(())
+}
+
 fn legacy_project_planning_fingerprint(
     project_id: &str,
     occurrences: &[Occurrence],
@@ -310,6 +923,52 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
         .collect::<Vec<_>>(),
         ["tsconfig.json", "inferred:.#node-esm"]
     );
+    Ok(())
+}
+
+#[test]
+fn rust_rechecks_the_inferred_scope_root_cap() -> Result<()> {
+    let project_id = "inferred:.#node-esm";
+    let make_plan = |root_count: usize| -> Result<ProjectPlanning> {
+        let selected = (0..root_count)
+            .map(|index| {
+                planned_occurrence(
+                    index as i64 + 1,
+                    "root",
+                    &format!("scripts/{index:03}.mjs"),
+                    "production",
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ownership = selected
+            .iter()
+            .map(|occurrence| FileOwnership {
+                file: occurrence.file.clone(),
+                project_ids: vec![project_id.into()],
+                excluded_project_ids: Vec::new(),
+                tooling_fallback: false,
+            })
+            .collect::<Vec<_>>();
+        let projects = vec![ProjectSummary {
+            project_id: project_id.into(),
+            file_count: root_count,
+            purpose: "inferred".into(),
+            purpose_reasons: vec!["no-configured-owner".into()],
+            membership_fingerprint: "members".into(),
+            config_fingerprint: "config".into(),
+        }];
+        build_project_plan(&selected, &ownership, &projects, true)
+    };
+
+    assert_eq!(
+        make_plan(INFERRED_ROOT_CAP)?.project_roots[project_id].len(),
+        INFERRED_ROOT_CAP
+    );
+    let error = make_plan(INFERRED_ROOT_CAP + 1)
+        .err()
+        .expect("151 roots must be rejected");
+    assert!(error.to_string().contains("exceeds the 150-root cap"));
     Ok(())
 }
 

@@ -301,8 +301,10 @@ function inferredFamily(file, packageType) {
 function inferredOptions(_family) {
   // Scope grouping is compiler-option neutral. Compiler-family labels separate
   // roots that will eventually need different semantics, but this layer keeps
-  // the former ESNext + Bundler options. Because several script roots now share
-  // one Program, fact parity is still verified on the pinned corpus.
+  // the former ESNext + Bundler options. Sharing one Program can still change
+  // coverage when one root's transitive declarations become visible to a
+  // sibling. The pinned-corpus parity check covers mapped repository fact
+  // payloads, not identical resolved/unknown coverage.
   return {
     allowJs: true,
     checkJs: false,
@@ -392,7 +394,13 @@ function inferredProject(id, family, packageRecord, records) {
     while (insideRoot(directory)) {
       const manifest = path.join(directory, "package.json");
       if (manifest === packageRecord.manifest) break;
-      absentManifests.add(manifest);
+      // A dangling symlink is not a TypeScript package boundary, but it is
+      // still a lexical directory entry. Do not record it as an absent probe:
+      // validation below re-runs nearestPackage and will invalidate the scope
+      // if the target later appears and makes the boundary effective.
+      if (fs.lstatSync(manifest, { throwIfNoEntry: false }) === undefined) {
+        absentManifests.add(manifest);
+      }
       if (directory === packageRecord.directory || directory === root) break;
       directory = path.dirname(directory);
     }

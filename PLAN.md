@@ -929,6 +929,10 @@ in this order:
    schedule dirty scopes first by earliest pending occurrence rank, and retain
    per-file failure attribution so one bad root cannot fail its whole scope.
    Logical checker facts must remain unchanged on the pinned parity corpus.
+   On ai-pipe, all 1,412 mapped repository fact payloads remained identical.
+   Coverage did not: 587 occurrences moved from `unknown` to external
+   `@types/node` declarations because a typed sibling's transitive declaration
+   graph became visible across the shared Program.
 3. Replace the binary inferred-project gate with a per-package decision. A
    package whose non-test indexed source is mostly unowned is JS-first and
    admits its unowned non-test scopes by default. A TS-first package admits an
@@ -977,6 +981,8 @@ manifest remain staged under a `partial` project run. Exact reuse and
 cross-snapshot carry accept only `completed` runs, so the next matching command
 retries the failed files. If the resumed worker reports a different Program
 fingerprint, Rust discards the whole scope staging and reruns it coherently.
+Discarded rows are not reported as resumed, and a second fingerprint drift in
+the clean rerun fails the project instead of entering a restart loop.
 Freshness includes the nearest manifest plus negative `package.json` probes
 between every root and that boundary, so a newly created closer manifest
 invalidates planning and execution even when no manifest existed originally.
