@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createRequire } from "node:module";
 import readline from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -18,13 +20,44 @@ import {
   encodeMessage,
   takePlanMemberResultPage,
 } from "../src/protocol.mjs";
+import { inferredOptions } from "../src/inferred-options.mjs";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
 const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
+const ts = createRequire(import.meta.url)(bundledTypeScript);
 
 function sourceHash(text) {
   return bytesToHex(blake3(new TextEncoder().encode(text)));
 }
+
+function sha256(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+test("assigns explicit compiler semantics to each inferred family", () => {
+  const shared = {
+    allowJs: true,
+    checkJs: false,
+    jsx: ts.JsxEmit.Preserve,
+    target: ts.ScriptTarget.ESNext,
+  };
+  assert.deepEqual(inferredOptions(ts, "node-esm"), {
+    ...shared,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  });
+  assert.deepEqual(inferredOptions(ts, "node-cjs"), {
+    ...shared,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  });
+  assert.deepEqual(inferredOptions(ts, "bundler-jsx"), {
+    ...shared,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+  });
+  assert.throws(() => inferredOptions(ts, "unknown"), /unsupported inferred compiler family/u);
+});
 
 function fixture(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-checker-"));
@@ -417,6 +450,167 @@ test("groups compatible inferred roots into one executable project", async (cont
   assert.equal(validation.result.valid, true);
   assert.ok(validation.result.inputs.some((input) => input.path.endsWith("package.json")));
   await checker.close();
+});
+
+test("fingerprints inferred family options without changing configured fingerprint shape", async (context) => {
+  const manifest = JSON.stringify({ type: "module" });
+  const config = JSON.stringify({ files: ["configured.ts"] });
+  const root = fixture({
+    "package.json": manifest,
+    "configured.ts": "export const configured = true;\n",
+    "main.mjs": "export const esm = true;\n",
+    "legacy.cjs": "exports.cjs = true;\n",
+    "view.tsx": "export const jsx = <div />;\n",
+    "tsconfig.json": config,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const files = ["configured.ts", "legacy.cjs", "main.mjs", "view.tsx"];
+  const first = await checker.request("plan_members", { files });
+  const second = await checker.request("plan_members", { files });
+  const fingerprints = (plan) => Object.fromEntries(
+    plan.result.projects.map((project) => [project.project_id, project.config_fingerprint]),
+  );
+  assert.deepEqual(fingerprints(second), fingerprints(first));
+
+  const firstFingerprints = fingerprints(first);
+  assert.equal(
+    firstFingerprints["inferred:.#node-esm"],
+    firstFingerprints["inferred:.#node-cjs"],
+    "NodeNext selects ESM or CommonJS from each root's extension and package context",
+  );
+  assert.notEqual(
+    firstFingerprints["inferred:.#node-esm"],
+    firstFingerprints["inferred:.#bundler-jsx"],
+  );
+  assert.equal(
+    firstFingerprints["tsconfig.json"],
+    sha256(JSON.stringify([{ identity: "tsconfig.json", source_hash: sourceHash(config) }])),
+    "configured projects must retain the pre-existing input-only fingerprint shape",
+  );
+  await checker.close();
+});
+
+test("uses family module resolution when producing inferred member facts", async (context) => {
+  const esmFactory = [
+    "export class ESMStore { save() {} }",
+    "export function makeStore() { return new ESMStore(); }",
+    "",
+  ].join("\n");
+  const esmExplicit = [
+    'import { makeStore } from "./factory.mjs";',
+    "const store = makeStore();",
+    "store.save();",
+    "",
+  ].join("\n");
+  const esmExtensionless = esmExplicit.replace("./factory.mjs", "./factory");
+  const bundlerFactory = [
+    "export class ViewStore { render() {} }",
+    "export function makeView() { return new ViewStore(); }",
+    "",
+  ].join("\n");
+  const bundlerMain = [
+    'import { makeView } from "./factory";',
+    "const view = makeView();",
+    "view.render();",
+    "",
+  ].join("\n");
+  const cjsFactory = [
+    "class CommonStore { flush() {} }",
+    "exports.makeCommon = () => new CommonStore();",
+    "",
+  ].join("\n");
+  const cjsMain = [
+    'const { makeCommon } = require("#common");',
+    "const common = makeCommon();",
+    "common.flush();",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "package.json": JSON.stringify({ type: "module" }),
+    "esm/factory.mts": esmFactory,
+    "esm/explicit.mts": esmExplicit,
+    "esm/extensionless.mts": esmExtensionless,
+    "bundler/factory.tsx": bundlerFactory,
+    "bundler/main.tsx": bundlerMain,
+    "cjs/package.json": JSON.stringify({
+      type: "commonjs",
+      imports: {
+        "#common": {
+          require: "./factory.js",
+          default: "./missing.js",
+        },
+      },
+    }),
+    "cjs/factory.js": cjsFactory,
+    "cjs/main.js": cjsMain,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const resolve = async ({ projectId, projectFiles, file, source, call, receiver, property }) => {
+    const checker = client(root);
+    context.after(() => checker.child.kill());
+    await checker.request("hello");
+    const response = await checker.request("resolve_members", {
+      project_id: projectId,
+      project_files: projectFiles,
+      queries: [{ ...queryFor(source, call, receiver, property), file }],
+    });
+    await checker.close();
+    assert.equal(response.kind, "resolve_members_result", JSON.stringify(response));
+    return response.result.results[0].answer;
+  };
+
+  const esmFiles = ["esm/factory.mts", "esm/explicit.mts", "esm/extensionless.mts"];
+  const explicit = await resolve({
+    projectId: "inferred:.#node-esm",
+    projectFiles: esmFiles,
+    file: "esm/explicit.mts",
+    source: esmExplicit,
+    call: "store.save()",
+    receiver: "store",
+    property: "save",
+  });
+  assert.equal(explicit.status, "resolved");
+  assert.equal(explicit.declarations[0].file, "esm/factory.mts");
+
+  const extensionless = await resolve({
+    projectId: "inferred:.#node-esm",
+    projectFiles: esmFiles,
+    file: "esm/extensionless.mts",
+    source: esmExtensionless,
+    call: "store.save()",
+    receiver: "store",
+    property: "save",
+  });
+  assert.equal(extensionless.status, "unknown", "NodeNext ESM must reject extensionless imports");
+
+  const bundler = await resolve({
+    projectId: "inferred:.#bundler-jsx",
+    projectFiles: ["bundler/factory.tsx", "bundler/main.tsx"],
+    file: "bundler/main.tsx",
+    source: bundlerMain,
+    call: "view.render()",
+    receiver: "view",
+    property: "render",
+  });
+  assert.equal(bundler.status, "resolved");
+  assert.equal(bundler.declarations[0].file, "bundler/factory.tsx");
+
+  const cjs = await resolve({
+    projectId: "inferred:cjs#node-cjs",
+    projectFiles: ["cjs/factory.js", "cjs/main.js"],
+    file: "cjs/main.js",
+    source: cjsMain,
+    call: "common.flush()",
+    receiver: "common",
+    property: "flush",
+  });
+  assert.equal(cjs.status, "resolved");
+  assert.equal(cjs.declarations[0].file, "cjs/factory.js");
 });
 
 test("fingerprints inferred package manifests for planning and execution refresh", async (context) => {

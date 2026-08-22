@@ -966,9 +966,20 @@ in this order:
    unowned file only when the import graph reaches it from a `main`, `exports`,
    `bin`, or `scripts` manifest target. Tests remain role-excluded, `--all`
    remains exhaustive, and watch uses the same decision.
-4. Change inferred compiler options only after measuring the logical-fact
-   delta on ai-pipe and n8n: `node-esm` uses NodeNext, `node-cjs` uses CommonJS
-   semantics, and `bundler-jsx` retains ESNext + Bundler.
+4. **Implemented and measured 2026-08-22.** `node-esm` uses NodeNext module and
+   resolution semantics. `node-cjs` uses the paired NodeNext mode so file and
+   package context supplies CommonJS semantics without losing modern package
+   `exports`/`imports` resolution. `bundler-jsx` retains ESNext plus Bundler.
+   Normalized effective options are part of inferred configuration fingerprints
+   without changing configured-project fingerprint identity, so pre-change
+   facts cannot be reused after
+   the switch. On ai-pipe, the default 116-edge plane and exhaustive 1,382-edge
+   inferred plane both had zero bidirectional logical-fact delta. On n8n, all
+   31 inferred scopes (2,524 occurrences) retained the same 39 stored and
+   projected facts. Coverage-only status changes were bounded to three
+   occurrences on exhaustive ai-pipe and two on n8n; SQLite integrity,
+   snapshots, selections, confidence, multiplicity, spans, receiver types, and
+   candidate counts matched.
 5. Add bounded structural receiver value flow for `this`, direct construction,
    immutable aliases, and closed factory-return sets to depth two. Emit closed
    sets of at most three targets at `likely`, keep every unsupported case on
