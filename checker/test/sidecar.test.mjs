@@ -46,7 +46,7 @@ function client(root) {
   const request = (kind, body = {}) => new Promise((resolve) => {
     const id = `t${sequence += 1}`;
     pending.set(id, resolve);
-    child.stdin.write(`${JSON.stringify({ protocol: 2, id, kind, ...body })}\n`);
+    child.stdin.write(`${JSON.stringify({ protocol: 3, id, kind, ...body })}\n`);
   });
   return {
     child,
@@ -195,10 +195,355 @@ test("reports a file outside configured projects as inferred ownership", async (
   const plan = await checker.request("plan_members", { files: ["orphan.mjs"] });
   assert.deepEqual(plan.result.files, [{
     file: "orphan.mjs",
-    project_ids: ["inferred:orphan.mjs"],
+    project_ids: ["inferred:.#node-esm"],
     excluded_project_ids: [],
     tooling_fallback: false,
   }]);
+  assert.equal(
+    plan.result.projects.find((project) => project.project_id === "inferred:.#node-esm")?.file_count,
+    1,
+  );
+  await checker.close();
+});
+
+test("groups compatible inferred roots into one executable project", async (context) => {
+  const source = [
+    'import { makeAlpha } from "./factory.mjs";',
+    "const alpha = makeAlpha();",
+    "alpha.save();",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "package.json": JSON.stringify({ type: "module" }),
+    "factory.mjs": [
+      "export class Alpha { save() {} }",
+      "export function makeAlpha() { return new Alpha(); }",
+      "",
+    ].join("\n"),
+    "main.mjs": source,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const projectFiles = ["factory.mjs", "main.mjs"];
+  const plan = await checker.request("plan_members", { files: projectFiles });
+  assert.deepEqual(
+    plan.result.files.map(({ file, project_ids }) => ({ file, project_ids })),
+    [
+      { file: "factory.mjs", project_ids: ["inferred:.#node-esm"] },
+      { file: "main.mjs", project_ids: ["inferred:.#node-esm"] },
+    ],
+  );
+  const summary = plan.result.projects.find(
+    (project) => project.project_id === "inferred:.#node-esm",
+  );
+  assert.equal(summary.file_count, 2);
+  assert.equal(summary.purpose, "inferred");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: projectFiles,
+    queries: [{ ...queryFor(source, "alpha.save()", "alpha", "save"), file: "main.mjs" }],
+  });
+  assert.equal(resolved.kind, "resolve_members_result");
+  assert.equal(resolved.result.results[0].answer.status, "resolved");
+  assert.equal(resolved.result.results[0].answer.declarations[0].file, "factory.mjs");
+
+  const changedMembership = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: ["main.mjs"],
+    queries: [{ ...queryFor(source, "alpha.save()", "alpha", "save"), file: "main.mjs" }],
+  });
+  assert.equal(changedMembership.kind, "error");
+  assert.equal(changedMembership.error.code, "project_mismatch");
+
+  const validation = await checker.request("validate_project", {
+    project_id: "inferred:.#node-esm",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, true);
+  assert.ok(validation.result.inputs.some((input) => input.path.endsWith("package.json")));
+  await checker.close();
+});
+
+test("fingerprints inferred package manifests for planning and execution refresh", async (context) => {
+  const source = "class Store { save() {} }\nconst store = new Store();\nstore.save();\n";
+  const root = fixture({
+    "package.json": JSON.stringify({ type: "module", version: "1.0.0" }),
+    "main.mjs": source,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const first = await checker.request("plan_members", { files: ["main.mjs"] });
+  const firstProject = first.result.projects.find(
+    (project) => project.project_id === "inferred:.#node-esm",
+  );
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ type: "module", version: "1.0.1" }),
+  );
+  const second = await checker.request("plan_members", { files: ["main.mjs"] });
+  const secondProject = second.result.projects.find(
+    (project) => project.project_id === "inferred:.#node-esm",
+  );
+  assert.notEqual(firstProject.config_fingerprint, secondProject.config_fingerprint);
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: ["main.mjs"],
+    queries: [{ ...queryFor(source, "store.save()", "store", "save"), file: "main.mjs" }],
+  });
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ type: "module", version: "1.0.2" }),
+  );
+  const validation = await checker.request("validate_project", {
+    project_id: "inferred:.#node-esm",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, false);
+  await checker.close();
+});
+
+test("invalidates an inferred program when a manifest symlink is retargeted", {
+  skip: process.platform === "win32",
+}, async (context) => {
+  const source = "class Store { save() {} }\nconst store = new Store();\nstore.save();\n";
+  const root = fixture({
+    "manifests/a.json": JSON.stringify({ type: "module", imports: { "#store": "./a.mjs" } }),
+    "manifests/b.json": JSON.stringify({ type: "module", imports: { "#store": "./b.mjs" } }),
+    "main.mjs": source,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const manifest = path.join(root, "package.json");
+  fs.symlinkSync(path.join(root, "manifests/a.json"), manifest);
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: ["main.mjs"],
+    queries: [{ ...queryFor(source, "store.save()", "store", "save"), file: "main.mjs" }],
+  });
+  assert.equal(resolved.kind, "resolve_members_result");
+  fs.unlinkSync(manifest);
+  fs.symlinkSync(path.join(root, "manifests/b.json"), manifest);
+
+  const validation = await checker.request("validate_project", {
+    project_id: "inferred:.#node-esm",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, false);
+  await checker.close();
+});
+
+test("invalidates inferred programs when a package boundary appears", async () => {
+  const source = "class Store { save() {} }\nconst store = new Store();\nstore.save();\n";
+  const runCase = async (files, createdManifest) => {
+    const root = fixture(files);
+    const checker = client(root);
+    await checker.request("hello");
+    const resolved = await checker.request("resolve_members", {
+      project_id: "inferred:.#node-cjs",
+      project_files: ["src/main.js"],
+      queries: [{
+        ...queryFor(source, "store.save()", "store", "save"),
+        file: "src/main.js",
+      }],
+    });
+    assert.equal(resolved.kind, "resolve_members_result");
+    const target = path.join(root, createdManifest);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify({ type: "module" }));
+    const validation = await checker.request("validate_project", {
+      project_id: "inferred:.#node-cjs",
+      fingerprint: resolved.result.checker_input_fingerprint,
+    });
+    assert.equal(validation.result.valid, false);
+    await checker.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  };
+
+  await runCase({ "src/main.js": source }, "package.json");
+  await runCase({
+    "package.json": JSON.stringify({ type: "commonjs" }),
+    "src/main.js": source,
+  }, "src/package.json");
+});
+
+test("isolates inferred file failures without weakening configured projects", async (context) => {
+  const good = "class Good { save() {} }\nconst good = new Good();\ngood.save();\n";
+  const bad = "class Bad { save() {} }\nconst bad = new Bad();\nbad.save();\nbad.save();\n";
+  const configured = "class Configured { save() {} }\nconst value = new Configured();\nvalue.save();\n";
+  const root = fixture({
+    "good.mjs": good,
+    "bad.mjs": bad,
+    "configured.ts": configured,
+    "tsconfig.json": JSON.stringify({ files: ["configured.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const firstBad = { ...queryFor(bad, "bad.save()", "bad", "save"), file: "bad.mjs" };
+  firstBad.property_start += 1;
+  const secondBad = {
+    ...queryFor(bad, "bad.save()", "bad", "save"),
+    file: "bad.mjs",
+  };
+  const inferred = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: ["bad.mjs", "good.mjs"],
+    queries: [
+      firstBad,
+      secondBad,
+      { ...queryFor(good, "good.save()", "good", "save"), file: "good.mjs" },
+    ],
+  });
+  assert.equal(inferred.kind, "resolve_members_result");
+  assert.equal(inferred.result.results[2].answer.status, "resolved");
+  assert.deepEqual(
+    inferred.result.results.slice(0, 2).map((item) => item.answer.status),
+    ["failed", "failed"],
+  );
+  assert.ok(inferred.result.results.slice(0, 2).every((item) =>
+    item.answer.error.code === "span_mismatch"));
+  assert.ok(inferred.result.results.slice(0, 2).every((item) =>
+    item.answer.declarations.length === 0
+      && item.answer.checker_input_fingerprint === inferred.result.checker_input_fingerprint));
+
+  const validation = await checker.request("validate_project", {
+    project_id: "inferred:.#node-esm",
+    fingerprint: inferred.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, true);
+  await checker.close();
+
+  const hashChecker = client(root);
+  context.after(() => hashChecker.child.kill());
+  await hashChecker.request("hello");
+  const hashFailure = await hashChecker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: ["bad.mjs", "good.mjs"],
+    queries: [{
+      ...queryFor(good, "good.save()", "good", "save"),
+      file: "good.mjs",
+      indexed_hash: "stale",
+    }],
+  });
+  assert.equal(hashFailure.kind, "error");
+  assert.equal(hashFailure.error.code, "hash_mismatch");
+  await hashChecker.close();
+
+  const configuredChecker = client(root);
+  context.after(() => configuredChecker.child.kill());
+  await configuredChecker.request("hello");
+  const configuredQuery = {
+    ...queryFor(configured, "value.save()", "value", "save"),
+    file: "configured.ts",
+  };
+  configuredQuery.property_start += 1;
+  const configuredFailure = await configuredChecker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    project_files: [],
+    queries: [configuredQuery],
+  });
+  assert.equal(configuredFailure.kind, "error");
+  assert.equal(configuredFailure.error.code, "span_mismatch");
+  await configuredChecker.close();
+});
+
+test("subdivides inferred roots by package, compiler family, and a 150-root cap", async (context) => {
+  const files = {
+    "package.json": JSON.stringify({ type: "module" }),
+    "root.js": "export const root = true;\n",
+    "legacy.cjs": "exports.legacy = true;\n",
+    "view.tsx": "export const view = <div />;\n",
+    "nested/package.json": JSON.stringify({}),
+    "nested/tool.js": "exports.tool = true;\n",
+    "tests-1/collision.mjs": "export const collision = true;\n",
+    "tests/helpers/freshDb.mjs": "export const fresh = true;\n",
+  };
+  for (let index = 0; index < 246; index += 1) {
+    files[`tests/${String(index).padStart(3, "0")}.test.mjs`] = index === 0
+      ? "export class Store { save() {} }\nconst store = new Store();\nstore.save();\n"
+      : `export const value${index} = ${index};\n`;
+  }
+  const root = fixture(files);
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plannedFiles = Object.keys(files).filter((file) => !file.endsWith("package.json"));
+  const plan = await checker.request("plan_members", { files: plannedFiles });
+  const owner = Object.fromEntries(
+    plan.result.files.map((file) => [file.file, file.project_ids[0]]),
+  );
+  assert.equal(owner["root.js"], "inferred:.#node-esm/@root~1");
+  assert.equal(owner["tests/000.test.mjs"], "inferred:.#node-esm/tests~1");
+  assert.equal(owner["tests/122.test.mjs"], "inferred:.#node-esm/tests~1");
+  assert.equal(owner["tests/123.test.mjs"], "inferred:.#node-esm/tests~2");
+  assert.equal(owner["tests/245.test.mjs"], "inferred:.#node-esm/tests~2");
+  assert.equal(owner["tests/helpers/freshDb.mjs"], "inferred:.#node-esm/tests~2");
+  assert.equal(owner["tests-1/collision.mjs"], "inferred:.#node-esm/tests-1~1");
+  assert.equal(owner["legacy.cjs"], "inferred:.#node-cjs");
+  assert.equal(owner["view.tsx"], "inferred:.#bundler-jsx");
+  assert.equal(owner["nested/tool.js"], "inferred:nested#node-cjs");
+
+  const inferred = plan.result.projects.filter((project) => project.purpose === "inferred");
+  assert.deepEqual(
+    Object.fromEntries(inferred.map((project) => [project.project_id, project.file_count])),
+    {
+      "inferred:.#bundler-jsx": 1,
+      "inferred:.#node-cjs": 1,
+      "inferred:.#node-esm/@root~1": 1,
+      "inferred:.#node-esm/tests-1~1": 1,
+      "inferred:.#node-esm/tests~1": 123,
+      "inferred:.#node-esm/tests~2": 124,
+      "inferred:nested#node-cjs": 1,
+    },
+  );
+  assert.equal(
+    new Set(inferred.map((project) => project.project_id)).size,
+    inferred.length,
+    "generated scope ids must not collide with literal directory names",
+  );
+  assert.ok(inferred.every((project) => project.file_count <= 150));
+
+  const firstScope = owner["tests/000.test.mjs"];
+  const firstScopeFiles = plan.result.files
+    .filter((file) => file.project_ids[0] === firstScope)
+    .map((file) => file.file);
+  const firstSource = files["tests/000.test.mjs"];
+  const query = {
+    ...queryFor(firstSource, "store.save()", "store", "save"),
+    file: "tests/000.test.mjs",
+  };
+  const executed = await checker.request("resolve_members", {
+    project_id: firstScope,
+    project_files: firstScopeFiles,
+    queries: [query],
+  });
+  assert.equal(executed.kind, "resolve_members_result");
+  assert.equal(executed.result.results[0].answer.status, "resolved");
+  const reordered = await checker.request("resolve_members", {
+    project_id: firstScope,
+    project_files: [...firstScopeFiles].reverse(),
+    queries: [query],
+  });
+  assert.equal(reordered.kind, "resolve_members_result");
+  assert.equal(
+    reordered.result.checker_input_fingerprint,
+    executed.result.checker_input_fingerprint,
+  );
   await checker.close();
 });
 

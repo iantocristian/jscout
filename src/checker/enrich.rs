@@ -10,13 +10,14 @@ use serde::Serialize;
 
 use super::protocol::{
     DeclarationSite, FileOwnership, InputValidation, MemberQuery, ProjectAnswer, ProjectSummary,
-    TypeScriptIdentity,
+    RemoteError, TypeScriptIdentity,
 };
 
 /// Stored confidence semantics participate in both exact-plan reuse and
 /// cross-snapshot project carry. Bump this whenever the same checker answer
 /// would be classified differently.
 const CONFIDENCE_POLICY_FINGERPRINT: &[u8] = b"jscout-checker-confidence-policy-v2\0";
+const ABSENT_INPUT_HASH: &str = "absent:v1";
 
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
@@ -84,7 +85,19 @@ pub struct EnrichReport {
 #[derive(Debug)]
 struct ProjectFailure {
     project_id: String,
+    files: Vec<FileFailure>,
     retryable: bool,
+}
+
+#[derive(Debug)]
+struct FileFailure {
+    file: String,
+    error: super::protocol::RemoteError,
+}
+
+#[derive(Debug, Default)]
+struct ProjectExecution {
+    failed_files: BTreeMap<String, super::protocol::RemoteError>,
 }
 
 #[derive(Debug)]
@@ -105,12 +118,29 @@ impl fmt::Display for PartialEnrichmentError {
         let failed = self
             .failures
             .iter()
-            .map(|failure| failure.project_id.as_str())
+            .map(|failure| {
+                if failure.files.is_empty() {
+                    failure.project_id.clone()
+                } else {
+                    let files = failure
+                        .files
+                        .iter()
+                        .map(|failure| {
+                            format!(
+                                "{} ({}: {})",
+                                failure.file, failure.error.code, failure.error.message
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} [{files}]", failure.project_id)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         write!(
             formatter,
-            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project(s) failed: {}; unresolved ownership remains possible",
+            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project scope(s) had failures: {}; unresolved ownership remains possible",
             self.batch_id,
             self.facts_published,
             self.failures.len(),
@@ -149,6 +179,11 @@ pub struct ProjectDecision {
 
 struct ProjectPlanning {
     projects: BTreeMap<String, Vec<Occurrence>>,
+    /// Complete root set assigned during configuration-only inferred grouping.
+    /// Configured projects reconstruct their roots from tsconfig and therefore
+    /// carry an empty list here.
+    project_roots: BTreeMap<String, Vec<String>>,
+    first_selected_rank: BTreeMap<String, usize>,
     decisions: Vec<ProjectDecision>,
     occurrences_avoided_by_tooling_filter: usize,
     occurrences_using_tooling_fallback: usize,
@@ -284,10 +319,14 @@ impl<'a> InputFreshnessCache<'a> {
         let path = input_path(self.root, input);
         self.digests
             .entry(path.clone())
-            .or_insert_with(|| {
-                fs::read(path)
+            .or_insert_with(|| match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Some(ABSENT_INPUT_HASH.into())
+                }
+                Err(_) => None,
+                Ok(_) => fs::read(path)
                     .ok()
-                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string()),
             })
             .as_deref()
             .is_some_and(|hash| hash == input.source_hash)
@@ -394,6 +433,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let protocol = planner.versions.protocol;
     drop(planner);
     apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
+    let configured_projects = ownership
+        .projects
+        .iter()
+        .filter(|project| !is_inferred_project(&project.project_id))
+        .count();
     let (eligible, inferred_coverage) =
         gate_inferred_projects(eligible, &ownership.files, options.include_all)?;
     let ordered = spread_occurrences(eligible);
@@ -424,7 +468,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: 0,
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -442,6 +486,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     verify_selected_sources(&canonical_root, &conn, &selected)?;
     let ProjectPlanning {
         projects: project_plan,
+        project_roots,
+        first_selected_rank,
         decisions: project_decisions,
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
@@ -451,19 +497,20 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         &ownership.projects,
         options.include_all,
     )?;
-    let plan_fingerprint = plan_fingerprint(
-        &snapshot,
-        &selected,
-        &project_plan,
-        &ownership.typescript,
-        protocol,
-        options,
-    );
     let project_fingerprints = project_planning_fingerprints(
         &project_plan,
         &ownership.projects,
         &ownership.typescript,
         protocol,
+    );
+    let plan_fingerprint = plan_fingerprint(
+        &snapshot,
+        &selected,
+        &project_plan,
+        &project_fingerprints,
+        &ownership.typescript,
+        protocol,
+        options,
     );
     let dirty_projects = dirty_projects(&ownership.files, &dirty_files, options.include_all);
 
@@ -490,7 +537,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -544,7 +591,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -613,7 +660,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
     for (project_index, (project_id, occurrences)) in
-        projects_in_execution_order(&project_plan, &priority_projects)
+        projects_in_execution_order(&project_plan, &priority_projects, &first_selected_rank)
             .into_iter()
             .enumerate()
     {
@@ -629,22 +676,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             reset_project_staging(&conn, batch_id, project_id)?;
             completed.clear();
         }
-        let mut pending = occurrences
+        let unchecked = occurrences
             .iter()
             .filter(|occurrence| !completed.contains(&occurrence.id))
             .cloned()
             .collect::<Vec<_>>();
-        pending.sort_by(|left, right| {
-            (!dirty_files.contains(&left.file))
-                .cmp(&(!dirty_files.contains(&right.file)))
-                .then_with(|| {
-                    (&left.file, left.call_start, left.id).cmp(&(
-                        &right.file,
-                        right.call_start,
-                        right.id,
-                    ))
-                })
-        });
+        // Stable partition: dirty occurrences lead, but both halves retain the
+        // global package/file spread order selected before project grouping.
+        let (mut pending, clean): (Vec<_>, Vec<_>) = unchecked
+            .into_iter()
+            .partition(|occurrence| dirty_files.contains(&occurrence.file));
+        pending.extend(clean);
         occurrences_resumed += completed.len();
         mark_project_pending(&conn, batch_id, project_id)?;
         eprintln!(
@@ -661,6 +703,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &conn,
             batch_id,
             project_id,
+            project_roots.get(project_id).map_or(&[][..], Vec::as_slice),
+            occurrences,
             &pending,
             &ownership.typescript,
             &mut request_batches,
@@ -670,24 +714,50 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut unmapped_declaration_contexts,
             &mut peak_rss_bytes,
             &mut peak_heap_bytes,
+            true,
         );
-        if let Err(error) = project_result {
-            if project_was_interrupted(&error) {
-                bail!(
-                    "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
+        match project_result {
+            Ok(execution) if !execution.failed_files.is_empty() => {
+                let files = execution
+                    .failed_files
+                    .into_iter()
+                    .map(|(file, error)| FileFailure { file, error })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "checker enrichment: project {project_id} retained healthy files but failed {} file(s): {}",
+                    files.len(),
+                    files
+                        .iter()
+                        .map(|failure| failure.file.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
+                failed_projects.push(ProjectFailure {
+                    project_id: project_id.clone(),
+                    files,
+                    retryable: false,
+                });
             }
-            let message = error.to_string();
-            let retryable = project_failure_is_retryable(&error);
-            mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
-            eprintln!(
-                "checker enrichment: project {project_id} failed disposition={}: {error:#}",
-                if retryable { "retryable" } else { "terminal" }
-            );
-            failed_projects.push(ProjectFailure {
-                project_id: project_id.clone(),
-                retryable,
-            });
+            Ok(_) => {}
+            Err(error) => {
+                if project_was_interrupted(&error) {
+                    bail!(
+                        "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
+                    );
+                }
+                let message = error.to_string();
+                let retryable = project_failure_is_retryable(&error);
+                mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+                eprintln!(
+                    "checker enrichment: project {project_id} failed disposition={}: {error:#}",
+                    if retryable { "retryable" } else { "terminal" }
+                );
+                failed_projects.push(ProjectFailure {
+                    project_id: project_id.clone(),
+                    files: Vec::new(),
+                    retryable,
+                });
+            }
         }
     }
 
@@ -733,7 +803,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         projects: project_plan.len(),
         projects_carried: carry.projects_carried,
         occurrences_carried: carry.occurrences_carried,
-        configured_projects: ownership.projects.len(),
+        configured_projects,
         configuration_problems: ownership.configuration_problems.len(),
         files_without_configured_project: inferred_coverage.files_without_configured_project,
         occurrences_without_configured_project: inferred_coverage
@@ -1193,10 +1263,11 @@ fn build_project_plan(
         .map(|project| (project.project_id.as_str(), project))
         .collect::<HashMap<_, _>>();
     let mut plan = BTreeMap::<String, Vec<Occurrence>>::new();
+    let mut first_selected_rank = BTreeMap::<String, usize>::new();
     let mut decisions = BTreeMap::<String, ProjectDecision>::new();
     let mut occurrences_avoided_by_tooling_filter = 0;
     let mut occurrences_using_tooling_fallback = 0;
-    for occurrence in selected {
+    for (rank, occurrence) in selected.iter().enumerate() {
         let ownership = owners.get(occurrence.file.as_str()).with_context(|| {
             format!("checker omitted project ownership for {}", occurrence.file)
         })?;
@@ -1223,6 +1294,9 @@ fn build_project_plan(
             plan.entry(project_id.clone())
                 .or_default()
                 .push(occurrence.clone());
+            first_selected_rank
+                .entry(project_id.clone())
+                .or_insert(rank);
             let decision = project_decision(&mut decisions, &summaries, project_id);
             decision.selected_occurrences += 1;
             if ownership.tooling_fallback {
@@ -1235,13 +1309,36 @@ fn build_project_plan(
             occurrences_avoided_by_tooling_filter += 1;
         }
     }
-    for occurrences in plan.values_mut() {
-        occurrences.sort_by(|left, right| {
-            (&left.file, left.call_start, left.id).cmp(&(&right.file, right.call_start, right.id))
-        });
+    let mut project_roots = BTreeMap::<String, Vec<String>>::new();
+    for project_id in plan.keys().filter(|project| is_inferred_project(project)) {
+        let roots = ownership
+            .iter()
+            .filter(|file| file.project_ids.contains(project_id))
+            .map(|file| file.file.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            bail!("checker omitted inferred roots for {project_id}");
+        }
+        if roots.len() > 150 {
+            bail!("checker inferred project {project_id} exceeds the 150-root cap");
+        }
+        if let Some(summary) = summaries.get(project_id.as_str())
+            && summary.file_count != roots.len()
+        {
+            bail!(
+                "checker inferred project {project_id} reported {} roots but assigned {}",
+                summary.file_count,
+                roots.len()
+            );
+        }
+        project_roots.insert(project_id.clone(), roots);
     }
     Ok(ProjectPlanning {
         projects: plan,
+        project_roots,
+        first_selected_rank,
         decisions: decisions.into_values().collect(),
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
@@ -1255,6 +1352,9 @@ fn apply_repository_project_policy(
 ) -> Result<()> {
     let mut policies = HashMap::<String, String>::new();
     for project in projects.iter_mut() {
+        if is_inferred_project(&project.project_id) {
+            continue;
+        }
         let Some(policy) = crate::recon::project_policy(
             conn,
             &project.project_id,
@@ -1368,6 +1468,7 @@ fn dirty_projects(
 fn projects_in_execution_order<'a>(
     projects: &'a BTreeMap<String, Vec<Occurrence>>,
     priority_projects: &BTreeSet<String>,
+    first_selected_rank: &BTreeMap<String, usize>,
 ) -> Vec<(&'a String, &'a Vec<Occurrence>)> {
     let mut ordered = projects.iter().collect::<Vec<_>>();
     ordered.sort_by(|(left, _), (right, _)| {
@@ -1376,6 +1477,11 @@ fn projects_in_execution_order<'a>(
             .then_with(|| {
                 is_inferred_project(left)
                     .cmp(&is_inferred_project(right))
+                    .then_with(|| {
+                        first_selected_rank
+                            .get(*left)
+                            .cmp(&first_selected_rank.get(*right))
+                    })
                     .then_with(|| left.cmp(right))
             })
     });
@@ -1432,6 +1538,7 @@ fn plan_fingerprint(
     snapshot: &str,
     selected: &[Occurrence],
     projects: &BTreeMap<String, Vec<Occurrence>>,
+    project_fingerprints: &BTreeMap<String, String>,
     checker: &TypeScriptIdentity,
     protocol: u32,
     options: &EnrichOptions<'_>,
@@ -1439,8 +1546,9 @@ fn plan_fingerprint(
     let mut hasher = blake3::Hasher::new();
     // Confidence policy is part of reuse identity: changing how a completed
     // checker answer projects must never revive a batch created under the
-    // previous single-target-only `likely` rule.
-    hasher.update(b"jscout-checker-plan-v3\0");
+    // previous single-target-only `likely` rule. Grouped inferred membership
+    // also changes the planning boundary independently of that policy.
+    hasher.update(b"jscout-checker-plan-v4\0");
     hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
     for value in [
         snapshot,
@@ -1466,6 +1574,10 @@ fn plan_fingerprint(
     for (project, occurrences) in projects {
         hasher.update(project.as_bytes());
         hasher.update(b"\0");
+        if let Some(fingerprint) = project_fingerprints.get(project) {
+            hasher.update(fingerprint.as_bytes());
+            hasher.update(b"\0");
+        }
         for occurrence in occurrences {
             hasher.update(occurrence.id.to_string().as_bytes());
             hasher.update(b"\0");
@@ -1530,13 +1642,14 @@ fn deactivate_stale_active_batch(
     let projects = conn
         .prepare(
             "SELECT project_id FROM checker_project_runs
-             WHERE batch_id=?1 AND status='completed' ORDER BY project_id",
+             WHERE batch_id=?1 AND status IN ('completed','partial')
+             ORDER BY project_id",
         )?
         .query_map([batch_id], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut stale = false;
     for project_id in projects {
-        if !project_complete_and_fresh(conn, batch_id, &project_id, input_freshness)? {
+        if !project_inputs_fresh(conn, batch_id, &project_id, input_freshness)? {
             stale = true;
             break;
         }
@@ -1564,9 +1677,9 @@ fn deactivate_stale_active_batch(
 
 fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> {
     if !plan.force_new
-        && let Some(batch_id) = conn
+        && let Some((batch_id, active)) = conn
             .query_row(
-                "SELECT id FROM checker_enrichment_batches
+                "SELECT id, active FROM checker_enrichment_batches
              WHERE source_snapshot=?1 AND plan_fingerprint=?2
                AND checker_version=?3 AND checker_source=?4
                AND sidecar_protocol=?5
@@ -1575,7 +1688,7 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
                  WHERE run.batch_id=checker_enrichment_batches.id
                    AND run.status!='completed'
                ))
-             ORDER BY active DESC, id DESC LIMIT 1",
+             ORDER BY active, id DESC LIMIT 1",
                 params![
                     plan.snapshot,
                     plan.plan_fingerprint,
@@ -1583,11 +1696,15 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
                     plan.checker.source,
                     plan.protocol
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()?
     {
-        return Ok(batch_id);
+        return if active {
+            clone_active_batch_for_resume(conn, batch_id)
+        } else {
+            Ok(batch_id)
+        };
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<i64> {
@@ -1627,6 +1744,172 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
                 fingerprint
             ])?;
         }
+        Ok(batch_id)
+    })();
+    match result {
+        Ok(batch_id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(batch_id)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// Active batches are immutable publication state. Resume incomplete work in a
+/// fresh inactive clone so a crash, input-fingerprint reset, or all-failed retry
+/// cannot make canonical checker rows diverge from the already projected graph.
+fn clone_active_batch_for_resume(conn: &Connection, source_batch: i64) -> Result<i64> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<i64> {
+        conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])?;
+        conn.execute(
+            "INSERT INTO checker_enrichment_batches(
+               source_snapshot, checker_version, checker_source,
+               checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+               selected_occurrences, total_projects, created_at, active
+             )
+             SELECT source_snapshot, checker_version, checker_source,
+                    '', sidecar_protocol, plan_fingerprint,
+                    selected_occurrences, total_projects, datetime('now'), 0
+             FROM checker_enrichment_batches WHERE id=?1 AND active=1",
+            [source_batch],
+        )?;
+        if conn.changes() != 1 {
+            bail!("active checker batch disappeared before resume cloning");
+        }
+        let batch_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO checker_project_runs(
+               batch_id, project_id, status, selected_occurrences,
+               completed_occurrences, planning_fingerprint,
+               checker_input_fingerprint, execution_kind,
+               peak_rss_bytes, peak_heap_bytes, error, updated_at
+             )
+             SELECT ?2, run.project_id,
+                    CASE WHEN run.status='completed' THEN 'completed' ELSE 'pending' END,
+                    run.selected_occurrences, 0,
+                    run.planning_fingerprint,
+                    CASE WHEN run.status IN ('completed','partial')
+                      THEN run.checker_input_fingerprint ELSE NULL END,
+                    CASE
+                      WHEN run.status='partial' THEN 'mixed'
+                      WHEN run.status='completed' THEN run.execution_kind
+                      ELSE 'checked'
+                    END,
+                    run.peak_rss_bytes, run.peak_heap_bytes, NULL, datetime('now')
+             FROM checker_project_runs run WHERE run.batch_id=?1",
+            params![source_batch, batch_id],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_project_inputs(
+               batch_id, project_id, input_kind, input_path, source_hash
+             )
+             SELECT ?2, input.project_id, input.input_kind,
+                    input.input_path, input.source_hash
+             FROM checker_project_inputs input
+             JOIN checker_project_runs run
+               ON run.batch_id=input.batch_id AND run.project_id=input.project_id
+             WHERE input.batch_id=?1 AND run.status IN ('completed','partial')",
+            params![source_batch, batch_id],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
+               checker_input_fingerprint, status
+             )
+             SELECT ?2, coverage.member_call_id, coverage.source_file,
+                    coverage.source_hash, coverage.call_start, coverage.call_end,
+                    coverage.receiver_start, coverage.receiver_end,
+                    coverage.property_start, coverage.property_end,
+                    coverage.project_id, coverage.checker_input_fingerprint,
+                    coverage.status
+             FROM checker_occurrence_projects coverage
+             JOIN checker_project_runs run
+               ON run.batch_id=coverage.batch_id AND run.project_id=coverage.project_id
+             WHERE coverage.batch_id=?1
+               AND run.status IN ('completed','partial')
+               AND coverage.status!='failed'
+               AND NOT EXISTS(
+                 SELECT 1 FROM checker_occurrence_projects failed_coverage
+                 JOIN checker_project_runs failed_run
+                   ON failed_run.batch_id=failed_coverage.batch_id
+                  AND failed_run.project_id=failed_coverage.project_id
+                 WHERE failed_coverage.batch_id=coverage.batch_id
+                   AND failed_coverage.member_call_id=coverage.member_call_id
+                   AND (failed_coverage.status='failed' OR failed_run.status='failed')
+               )",
+            params![source_batch, batch_id],
+        )?;
+        conn.execute(
+            "INSERT INTO checker_enrichments(
+               batch_id, member_call_id, source_file_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id, receiver_type,
+               target_anchor, target_fingerprint, confidence, provenance,
+               checker_input_fingerprint
+             )
+             SELECT ?2, enrichment.member_call_id, enrichment.source_file_id,
+                    enrichment.source_file, enrichment.source_hash,
+                    enrichment.call_start, enrichment.call_end,
+                    enrichment.receiver_start, enrichment.receiver_end,
+                    enrichment.property_start, enrichment.property_end,
+                    enrichment.project_id, enrichment.receiver_type,
+                    enrichment.target_anchor, enrichment.target_fingerprint,
+                    enrichment.confidence, enrichment.provenance,
+                    enrichment.checker_input_fingerprint
+             FROM checker_enrichments enrichment
+             JOIN checker_project_runs run
+               ON run.batch_id=enrichment.batch_id
+              AND run.project_id=enrichment.project_id
+             WHERE enrichment.batch_id=?1
+               AND run.status IN ('completed','partial')
+               AND NOT EXISTS(
+                 SELECT 1 FROM checker_occurrence_projects failed_coverage
+                 JOIN checker_project_runs failed_run
+                   ON failed_run.batch_id=failed_coverage.batch_id
+                  AND failed_run.project_id=failed_coverage.project_id
+                 WHERE failed_coverage.batch_id=enrichment.batch_id
+                   AND failed_coverage.member_call_id=enrichment.member_call_id
+                   AND (failed_coverage.status='failed' OR failed_run.status='failed')
+               )",
+            params![source_batch, batch_id],
+        )?;
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET completed_occurrences=(
+                   SELECT count(*) FROM checker_occurrence_projects coverage
+                   WHERE coverage.batch_id=checker_project_runs.batch_id
+                     AND coverage.project_id=checker_project_runs.project_id
+                 ),
+                 status=CASE
+                   WHEN status='completed' AND selected_occurrences=(
+                     SELECT count(*) FROM checker_occurrence_projects coverage
+                     WHERE coverage.batch_id=checker_project_runs.batch_id
+                       AND coverage.project_id=checker_project_runs.project_id
+                   ) THEN 'completed'
+                   ELSE 'pending'
+                 END,
+                 execution_kind=CASE
+                   WHEN selected_occurrences=(
+                     SELECT count(*) FROM checker_occurrence_projects coverage
+                     WHERE coverage.batch_id=checker_project_runs.batch_id
+                       AND coverage.project_id=checker_project_runs.project_id
+                   ) THEN execution_kind
+                   WHEN EXISTS(
+                     SELECT 1 FROM checker_occurrence_projects coverage
+                     WHERE coverage.batch_id=checker_project_runs.batch_id
+                       AND coverage.project_id=checker_project_runs.project_id
+                   ) THEN 'mixed'
+                   ELSE 'checked'
+                 END
+             WHERE batch_id=?1",
+            [batch_id],
+        )?;
         Ok(batch_id)
     })();
     match result {
@@ -2023,20 +2306,37 @@ fn project_complete_and_fresh(
     project_id: &str,
     input_freshness: &mut InputFreshnessCache,
 ) -> Result<bool> {
-    let run = conn
+    let status = conn
         .query_row(
-            "SELECT status, execution_kind FROM checker_project_runs
+            "SELECT status FROM checker_project_runs
              WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some((status, execution_kind)) = run else {
-        return Ok(false);
-    };
-    if status != "completed" {
+    if status.as_deref() != Some("completed") {
         return Ok(false);
     }
+    project_inputs_fresh(conn, batch_id, project_id, input_freshness)
+}
+
+fn project_inputs_fresh(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    input_freshness: &mut InputFreshnessCache,
+) -> Result<bool> {
+    let execution_kind = conn
+        .query_row(
+            "SELECT execution_kind FROM checker_project_runs
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(execution_kind) = execution_kind else {
+        return Ok(false);
+    };
     let mut statement = conn.prepare(
         "SELECT input_kind, input_path, source_hash FROM checker_project_inputs
          WHERE batch_id=?1 AND project_id=?2 ORDER BY input_kind, input_path",
@@ -2175,6 +2475,8 @@ fn execute_project(
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
+    project_files: &[String],
+    all_occurrences: &[Occurrence],
     occurrences: &[Occurrence],
     expected_identity: &TypeScriptIdentity,
     request_batches: &mut usize,
@@ -2184,15 +2486,53 @@ fn execute_project(
     unmapped_declaration_contexts: &mut BTreeMap<String, usize>,
     peak_rss_bytes: &mut u64,
     peak_heap_bytes: &mut u64,
-) -> Result<()> {
+    restart_available: bool,
+) -> Result<ProjectExecution> {
     const MAX_BATCH_ITEMS: usize = 128;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
+    let staged_fingerprints = conn
+        .prepare(
+            "SELECT DISTINCT checker_input_fingerprint
+             FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2
+               AND checker_input_fingerprint!=''
+             ORDER BY checker_input_fingerprint",
+        )?
+        .query_map(params![batch_id, project_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if staged_fingerprints.len() > 1 {
+        if !restart_available {
+            bail!("checker staging contains multiple input fingerprints for {project_id}");
+        }
+        reset_project_staging(conn, batch_id, project_id)?;
+        return execute_project(
+            root,
+            options,
+            conn,
+            batch_id,
+            project_id,
+            project_files,
+            all_occurrences,
+            all_occurrences,
+            expected_identity,
+            request_batches,
+            occurrences_queried,
+            unknown_answers,
+            unmapped_declarations,
+            unmapped_declaration_contexts,
+            peak_rss_bytes,
+            peak_heap_bytes,
+            false,
+        );
+    }
     let mut checker = super::launch(root, options.sidecar, None, options.node)?;
     checker
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let mut project_fingerprint: Option<String> = None;
+    let mut project_fingerprint = staged_fingerprints.into_iter().next();
+    let resumed_fingerprint = project_fingerprint.clone();
+    let mut execution = ProjectExecution::default();
     let mut project_peak_rss_bytes = 0;
     let mut project_peak_heap_bytes = 0;
     let mut offset = 0;
@@ -2207,6 +2547,7 @@ fn execute_project(
                 "size-check",
                 &super::protocol::Outbound::ResolveMembers {
                     project_id: project_id.to_string(),
+                    project_files: project_files.to_vec(),
                     queries,
                 },
             )?;
@@ -2220,6 +2561,7 @@ fn execute_project(
             *request_batches += 1;
             match checker.resolve_members(
                 project_id.to_string(),
+                project_files.to_vec(),
                 batch.iter().map(member_query).collect(),
                 options.timeout,
             ) {
@@ -2243,6 +2585,29 @@ fn execute_project(
         }
         if let Some(expected) = &project_fingerprint {
             if expected != &result.checker_input_fingerprint {
+                if resumed_fingerprint.is_some() && restart_available {
+                    drop(checker);
+                    reset_project_staging(conn, batch_id, project_id)?;
+                    return execute_project(
+                        root,
+                        options,
+                        conn,
+                        batch_id,
+                        project_id,
+                        project_files,
+                        all_occurrences,
+                        all_occurrences,
+                        expected_identity,
+                        request_batches,
+                        occurrences_queried,
+                        unknown_answers,
+                        unmapped_declarations,
+                        unmapped_declaration_contexts,
+                        peak_rss_bytes,
+                        peak_heap_bytes,
+                        false,
+                    );
+                }
                 bail!("checker input fingerprint changed during project {project_id}");
             }
         } else {
@@ -2252,8 +2617,8 @@ fn execute_project(
         project_peak_heap_bytes = project_peak_heap_bytes.max(result.resources.heap_used_bytes);
         *peak_rss_bytes = (*peak_rss_bytes).max(project_peak_rss_bytes);
         *peak_heap_bytes = (*peak_heap_bytes).max(project_peak_heap_bytes);
-        let mut facts = Vec::new();
-        let mut projects = Vec::new();
+        let mut newly_failed_files = BTreeMap::<String, RemoteError>::new();
+        let mut files_with_success = BTreeSet::new();
         for (occurrence, item) in batch.iter().zip(&result.results) {
             if item.indexed_hash != occurrence.hash || item.source_hash != occurrence.hash {
                 bail!(
@@ -2266,6 +2631,53 @@ fn execute_project(
             {
                 bail!("checker returned a mismatched answer for project {project_id}");
             }
+            validate_project_answer_shape(project_id, &item.answer)?;
+            if item.answer.status == "failed" {
+                if files_with_success.contains(&occurrence.file) {
+                    bail!("checker mixed failed and successful answers for one source file");
+                }
+                let error = sanitize_remote_error(
+                    root,
+                    item.answer
+                        .error
+                        .as_ref()
+                        .expect("validated failed answer has details"),
+                );
+                if let Some(previous) =
+                    newly_failed_files.insert(occurrence.file.clone(), error.clone())
+                    && previous != error
+                {
+                    bail!("checker returned inconsistent failures for one source file");
+                }
+            } else {
+                if newly_failed_files.contains_key(&occurrence.file) {
+                    bail!("checker mixed failed and successful answers for one source file");
+                }
+                files_with_success.insert(occurrence.file.clone());
+            }
+        }
+        for (file, error) in newly_failed_files {
+            let file_occurrences = all_occurrences
+                .iter()
+                .filter(|occurrence| occurrence.file == file)
+                .cloned()
+                .collect::<Vec<_>>();
+            stage_file_failed(
+                conn,
+                batch_id,
+                project_id,
+                &file_occurrences,
+                &result.checker_input_fingerprint,
+            )?;
+            execution.failed_files.entry(file).or_insert(error);
+        }
+        let mut facts = Vec::new();
+        let mut projects = Vec::new();
+        let mut staged_occurrences = Vec::new();
+        for (occurrence, item) in batch.iter().zip(&result.results) {
+            if execution.failed_files.contains_key(&occurrence.file) {
+                continue;
+            }
             let outcome = map_occurrence(conn, occurrence, std::slice::from_ref(&item.answer))?;
             *unknown_answers += outcome.unknown_answers;
             *unmapped_declarations += outcome.unmapped_declarations;
@@ -2274,8 +2686,18 @@ fn execute_project(
             }
             facts.extend(outcome.facts);
             projects.extend(outcome.projects);
+            staged_occurrences.push(occurrence.clone());
         }
-        stage_batch(conn, batch_id, project_id, batch, &facts, &projects)?;
+        if !staged_occurrences.is_empty() {
+            stage_batch(
+                conn,
+                batch_id,
+                project_id,
+                &staged_occurrences,
+                &facts,
+                &projects,
+            )?;
+        }
         offset = end;
         eprintln!(
             "checker enrichment: {project_id} staged {}/{} occurrences; rss={} MiB heap={}/{} MiB",
@@ -2305,7 +2727,8 @@ fn execute_project(
         &validation.inputs,
         project_peak_rss_bytes,
         project_peak_heap_bytes,
-    )
+    )?;
+    Ok(execution)
 }
 
 fn member_query(occurrence: &Occurrence) -> MemberQuery {
@@ -2318,6 +2741,43 @@ fn member_query(occurrence: &Occurrence) -> MemberQuery {
         receiver_end: occurrence.receiver_end,
         property_start: occurrence.property_start,
         property_end: occurrence.property_end,
+    }
+}
+
+fn validate_project_answer_shape(project_id: &str, answer: &ProjectAnswer) -> Result<()> {
+    match answer.status.as_str() {
+        "resolved"
+            if answer.error.is_none()
+                && answer.receiver_type.is_some()
+                && !answer.declarations.is_empty() =>
+        {
+            Ok(())
+        }
+        "unknown" if answer.error.is_none() && answer.declarations.is_empty() => Ok(()),
+        "failed"
+            if is_inferred_project(project_id)
+                && answer
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| !error.code.is_empty() && !error.message.is_empty())
+                && answer.receiver_type.is_none()
+                && answer.declarations.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => bail!("checker returned an invalid project answer status or shape"),
+    }
+}
+
+fn sanitize_remote_error(root: &Path, error: &RemoteError) -> RemoteError {
+    fn bounded(value: &str, limit: usize) -> String {
+        value.chars().take(limit).collect()
+    }
+
+    let root = root.to_string_lossy();
+    RemoteError {
+        code: bounded(&error.code, 64),
+        message: bounded(&error.message.replace(root.as_ref(), "<repository>"), 512),
     }
 }
 
@@ -2398,7 +2858,82 @@ fn stage_batch(
         }
         let completed: i64 = conn.query_row(
             "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 AND status!='failed'",
+            params![batch_id, project_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE checker_project_runs
+             SET completed_occurrences=?3, updated_at=datetime('now')
              WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id, completed],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn stage_file_failed(
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrences: &[Occurrence],
+    fingerprint: &str,
+) -> Result<()> {
+    let file = occurrences
+        .first()
+        .context("checker file failure omitted its occurrences")?
+        .file
+        .as_str();
+    if occurrences.iter().any(|occurrence| occurrence.file != file) {
+        bail!("checker file failure mixed source files");
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "DELETE FROM checker_enrichments
+             WHERE batch_id=?1 AND project_id=?2 AND source_file=?3",
+            params![batch_id, project_id, file],
+        )?;
+        conn.execute(
+            "DELETE FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 AND source_file=?3",
+            params![batch_id, project_id, file],
+        )?;
+        let mut insert = conn.prepare_cached(
+            "INSERT INTO checker_occurrence_projects(
+               batch_id, member_call_id, source_file, source_hash,
+               call_start, call_end, receiver_start, receiver_end,
+               property_start, property_end, project_id,
+               checker_input_fingerprint, status
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'failed')",
+        )?;
+        for occurrence in occurrences {
+            insert.execute(params![
+                batch_id,
+                occurrence.id,
+                occurrence.file,
+                occurrence.hash,
+                occurrence.call_start,
+                occurrence.call_end,
+                occurrence.receiver_start,
+                occurrence.receiver_end,
+                occurrence.property_start,
+                occurrence.property_end,
+                project_id,
+                fingerprint,
+            ])?;
+        }
+        let completed: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects
+             WHERE batch_id=?1 AND project_id=?2 AND status!='failed'",
             params![batch_id, project_id],
             |row| row.get(0),
         )?;
@@ -2485,22 +3020,53 @@ fn complete_project(
              WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id, fingerprint],
         )?;
+        let (selected, coverage, successful): (i64, i64, i64) = conn.query_row(
+            "SELECT run.selected_occurrences,
+                    count(project.member_call_id),
+                    sum(CASE WHEN project.status!='failed' THEN 1 ELSE 0 END)
+             FROM checker_project_runs run
+             LEFT JOIN checker_occurrence_projects project
+               ON project.batch_id=run.batch_id AND project.project_id=run.project_id
+             WHERE run.batch_id=?1 AND run.project_id=?2
+             GROUP BY run.selected_occurrences",
+            params![batch_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if coverage != selected {
+            bail!("project {project_id} did not stage every selected occurrence");
+        }
+        let (status, error) = if successful == selected {
+            ("completed", None)
+        } else if successful == 0 {
+            (
+                "failed",
+                Some("every selected source file failed during inferred checking"),
+            )
+        } else {
+            (
+                "partial",
+                Some("one or more source files failed during inferred checking"),
+            )
+        };
         conn.execute(
             "UPDATE checker_project_runs
-             SET status='completed', checker_input_fingerprint=?3,
+             SET status=?3, completed_occurrences=?4,
+                 checker_input_fingerprint=?5,
                  execution_kind=CASE
                    WHEN execution_kind='mixed' THEN 'mixed' ELSE 'checked' END,
-                 peak_rss_bytes=?4,
-                 peak_heap_bytes=?5, error=NULL,
+                 peak_rss_bytes=?6,
+                 peak_heap_bytes=?7, error=?8,
                  updated_at=datetime('now')
-             WHERE batch_id=?1 AND project_id=?2
-               AND completed_occurrences=selected_occurrences",
+             WHERE batch_id=?1 AND project_id=?2",
             params![
                 batch_id,
                 project_id,
+                status,
+                successful,
                 fingerprint,
                 peak_rss_bytes as i64,
-                peak_heap_bytes as i64
+                peak_heap_bytes as i64,
+                error,
             ],
         )?;
         if conn.changes() != 1 {
@@ -2543,12 +3109,20 @@ fn activate_staging_batch(
             [batch_id],
             |row| row.get(0),
         )?;
-        if pending != 0 || (!allow_failed_projects && failed != 0) {
-            bail!("checker staging batch has {pending} pending and {failed} failed project(s)");
+        let partial: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1 AND status='partial'",
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if pending != 0 || (!allow_failed_projects && (failed != 0 || partial != 0)) {
+            bail!(
+                "checker staging batch has {pending} pending, {partial} partial, and {failed} failed project(s)"
+            );
         }
         let completed: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
-             WHERE batch_id=?1 AND status='completed'",
+             WHERE batch_id=?1 AND status IN ('completed','partial')",
             [batch_id],
             |row| row.get(0),
         )?;
@@ -2575,8 +3149,18 @@ fn activate_staging_batch(
         }
         let malformed_completed: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
-             WHERE batch_id=?1 AND status='completed'
-               AND completed_occurrences!=selected_occurrences",
+             WHERE batch_id=?1 AND (
+               (status='completed' AND completed_occurrences!=selected_occurrences)
+               OR (status='partial' AND (
+                 completed_occurrences<=0
+                 OR completed_occurrences>=selected_occurrences
+               ))
+               OR (status IN ('completed','partial') AND (
+                 SELECT count(*) FROM checker_occurrence_projects coverage
+                 WHERE coverage.batch_id=checker_project_runs.batch_id
+                   AND coverage.project_id=checker_project_runs.project_id
+               )!=selected_occurrences)
+             )",
             [batch_id],
             |row| row.get(0),
         )?;
@@ -2635,12 +3219,18 @@ fn activate_staging_batch(
         conn.execute(
             "UPDATE checker_enrichments
              SET confidence='possible'
-             WHERE batch_id=?1 AND member_call_id IN (
-               SELECT member_call_id FROM checker_enrichments
-               WHERE batch_id=?1
-               GROUP BY member_call_id
-               HAVING count(DISTINCT target_anchor)>3
-                  OR min(CASE confidence WHEN 'possible' THEN 0 ELSE 1 END)=0
+             WHERE batch_id=?1 AND (
+               member_call_id IN (
+                 SELECT member_call_id FROM checker_enrichments
+                 WHERE batch_id=?1
+                 GROUP BY member_call_id
+                 HAVING count(DISTINCT target_anchor)>3
+                    OR min(CASE confidence WHEN 'possible' THEN 0 ELSE 1 END)=0
+               )
+               OR member_call_id IN (
+                 SELECT member_call_id FROM checker_occurrence_projects
+                 WHERE batch_id=?1 AND status='failed'
+               )
              )",
             [batch_id],
         )?;
@@ -2649,7 +3239,8 @@ fn activate_staging_batch(
             .prepare(
                 "SELECT project_id, checker_input_fingerprint
                  FROM checker_project_runs
-                 WHERE batch_id=?1 AND status='completed' ORDER BY project_id",
+                 WHERE batch_id=?1 AND status IN ('completed','partial')
+                 ORDER BY project_id",
             )?
             .query_map([batch_id], |row| {
                 Ok(InputValidation {
@@ -2706,6 +3297,15 @@ fn load_unknown_projects(conn: &Connection, batch_id: i64) -> Result<Vec<String>
 }
 
 fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> {
+    if expected == ABSENT_INPUT_HASH {
+        return match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("could not inspect checker input {display}"))
+            }
+            Ok(_) => bail!("checker input appeared after planning: {display}"),
+        };
+    }
     let bytes =
         fs::read(path).with_context(|| format!("could not read indexed source {display}"))?;
     let actual = blake3::hash(&bytes).to_hex().to_string();
@@ -2730,10 +3330,11 @@ fn map_occurrence(
 ) -> Result<OccurrenceOutcome> {
     let mut outcome = OccurrenceOutcome::default();
     for answer in answers {
-        let status = if answer.status == "resolved" {
-            "resolved"
-        } else {
-            "unknown"
+        let status = match answer.status.as_str() {
+            "resolved" if answer.error.is_none() => "resolved",
+            "unknown" if answer.error.is_none() => "unknown",
+            "failed" if answer.error.is_some() && answer.declarations.is_empty() => "failed",
+            _ => bail!("checker returned an invalid project answer status"),
         };
         outcome.projects.push(PendingProjectAnswer {
             occurrence: occurrence.clone(),
@@ -2741,6 +3342,9 @@ fn map_occurrence(
             input_fingerprint: answer.checker_input_fingerprint.clone(),
             status,
         });
+        if answer.status == "failed" {
+            continue;
+        }
         if answer.status != "resolved" {
             outcome.unknown_answers += 1;
             continue;

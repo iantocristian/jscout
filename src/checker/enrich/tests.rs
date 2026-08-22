@@ -227,7 +227,7 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     let ownership = vec![
         FileOwnership {
             file: "scripts/tool.mjs".into(),
-            project_ids: vec!["inferred:scripts/tool.mjs".into()],
+            project_ids: vec!["inferred:.#node-esm".into()],
             excluded_project_ids: Vec::new(),
             tooling_fallback: false,
         },
@@ -238,14 +238,24 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
             tooling_fallback: false,
         },
     ];
-    let projects = vec![ProjectSummary {
-        project_id: "tsconfig.json".into(),
-        file_count: 1,
-        purpose: "general".into(),
-        purpose_reasons: Vec::new(),
-        membership_fingerprint: String::new(),
-        config_fingerprint: String::new(),
-    }];
+    let projects = vec![
+        ProjectSummary {
+            project_id: "inferred:.#node-esm".into(),
+            file_count: 1,
+            purpose: "inferred".into(),
+            purpose_reasons: vec!["no-configured-owner".into()],
+            membership_fingerprint: "inferred-members".into(),
+            config_fingerprint: "package-type".into(),
+        },
+        ProjectSummary {
+            project_id: "tsconfig.json".into(),
+            file_count: 1,
+            purpose: "general".into(),
+            purpose_reasons: Vec::new(),
+            membership_fingerprint: String::new(),
+            config_fingerprint: String::new(),
+        },
+    ];
 
     let (default, coverage) = gate_inferred_projects(occurrences.clone(), &ownership, false)?;
     assert_eq!(default.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
@@ -286,11 +296,19 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     assert_eq!(coverage.occurrences_skipped_inferred_project, 0);
     let all_plan = build_project_plan(&all, &ownership, &projects, true)?;
     assert_eq!(
-        projects_in_execution_order(&all_plan.projects, &BTreeSet::new())
-            .into_iter()
-            .map(|(project, _)| project.as_str())
-            .collect::<Vec<_>>(),
-        ["tsconfig.json", "inferred:scripts/tool.mjs"]
+        all_plan.project_roots["inferred:.#node-esm"],
+        ["scripts/tool.mjs"]
+    );
+    assert_eq!(
+        projects_in_execution_order(
+            &all_plan.projects,
+            &BTreeSet::new(),
+            &all_plan.first_selected_rank,
+        )
+        .into_iter()
+        .map(|(project, _)| project.as_str())
+        .collect::<Vec<_>>(),
+        ["tsconfig.json", "inferred:.#node-esm"]
     );
     Ok(())
 }
@@ -495,14 +513,27 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
     let unknown = anyhow::anyhow!("deterministic local failure");
     assert!(!project_failure_is_retryable(&unknown));
 
-    let terminal_partial = anyhow::Error::new(PartialEnrichmentError {
+    let terminal_partial = PartialEnrichmentError {
         batch_id: 1,
         facts_published: 10,
         failures: vec![ProjectFailure {
-            project_id: "tsconfig.json".into(),
+            project_id: "inferred:.#node-esm".into(),
+            files: vec![FileFailure {
+                file: "broken.mjs".into(),
+                error: RemoteError {
+                    code: "span_mismatch".into(),
+                    message: "indexed occurrence moved".into(),
+                },
+            }],
             retryable: false,
         }],
-    });
+    };
+    assert!(
+        terminal_partial
+            .to_string()
+            .contains("broken.mjs (span_mismatch: indexed occurrence moved)")
+    );
+    let terminal_partial = anyhow::Error::new(terminal_partial);
     assert!(is_terminal_partial_failure(&terminal_partial));
 
     let retryable_partial = anyhow::Error::new(PartialEnrichmentError {
@@ -510,10 +541,39 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
         facts_published: 10,
         failures: vec![ProjectFailure {
             project_id: "tsconfig.json".into(),
+            files: Vec::new(),
             retryable: true,
         }],
     });
     assert!(!is_terminal_partial_failure(&retryable_partial));
+}
+
+#[test]
+fn file_local_failure_answers_are_inferred_only_and_shape_checked() {
+    let failed = ProjectAnswer {
+        project_id: "inferred:.#node-esm".into(),
+        status: "failed".into(),
+        receiver_type: None,
+        declarations: Vec::new(),
+        checker_input_fingerprint: "inputs".into(),
+        error: Some(RemoteError {
+            code: "span_mismatch".into(),
+            message: "indexed occurrence moved".into(),
+        }),
+    };
+    validate_project_answer_shape("inferred:.#node-esm", &failed).expect("valid inferred failure");
+    assert!(validate_project_answer_shape("tsconfig.json", &failed).is_err());
+
+    let mut malformed = failed;
+    malformed.declarations.push(DeclarationSite {
+        file: Some("main.ts".into()),
+        outside_root: false,
+        start: 0,
+        end: 1,
+        source_hash: "hash".into(),
+        context: Some("repo".into()),
+    });
+    assert!(validate_project_answer_shape("inferred:.#node-esm", &malformed).is_err());
 }
 
 #[test]
@@ -691,6 +751,7 @@ fn non_repo_declaration_contexts_skip_mapping_but_stay_unmapped() -> Result<()> 
             },
         ],
         checker_input_fingerprint: "inputs".into(),
+        error: None,
     };
     let outcome = map_occurrence(&conn, &occurrence, std::slice::from_ref(&answer))?;
     assert!(outcome.facts.is_empty());
@@ -715,6 +776,7 @@ fn non_repo_declaration_contexts_skip_mapping_but_stay_unmapped() -> Result<()> 
             context: None,
         }],
         checker_input_fingerprint: "inputs".into(),
+        error: None,
     };
     let outcome = map_occurrence(&conn, &occurrence, std::slice::from_ref(&legacy))?;
     assert!(outcome.facts.is_empty());
@@ -814,6 +876,7 @@ fn staged_batches_survive_connection_reopen_for_resume() -> Result<()> {
         receiver_type: None,
         declarations: Vec::new(),
         checker_input_fingerprint: "inputs".into(),
+        error: None,
     };
     let outcome = map_occurrence(&conn, &occurrence, &[answer])?;
     stage_batch(
@@ -837,6 +900,384 @@ fn staged_batches_survive_connection_reopen_for_resume() -> Result<()> {
         |row| row.get(0),
     )?;
     assert_eq!(active, 0, "staged progress must remain non-public");
+    Ok(())
+}
+
+#[test]
+fn inferred_file_failure_preserves_sibling_progress_and_retries_only_the_failed_file() -> Result<()>
+{
+    let repo = tempfile::tempdir()?;
+    let good_source = "export class Good { insert(): void {} }\n\
+                       declare const good: Good; good.insert();\n";
+    let bad_source = "export class Bad { insert(): void {} }\n\
+                      declare const bad: Bad; bad.insert();\n";
+    fs::write(repo.path().join("good.ts"), good_source)?;
+    fs::write(repo.path().join("bad.ts"), bad_source)?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let good = occurrence_in(&conn, "good.ts")?;
+    let bad = occurrence_in(&conn, "bad.ts")?;
+    let occurrences = vec![good.clone(), bad.clone()];
+    let project_id = "inferred:.#node-cjs";
+    let projects = BTreeMap::from([(project_id.into(), occurrences.clone())]);
+    let fingerprints = test_project_fingerprints(&projects);
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let batch_id = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "grouped-plan",
+            checker: &identity,
+            protocol: 3,
+            selected_occurrences: occurrences.len(),
+            projects: &projects,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    let declaration = |file: &str, source: &str, hash: &str| {
+        let start = source.find("insert(): void {}").expect("declaration") as i64;
+        DeclarationSite {
+            file: Some(file.into()),
+            outside_root: false,
+            start,
+            end: start + "insert".len() as i64,
+            source_hash: hash.into(),
+            context: Some("repo".into()),
+        }
+    };
+    let good_answer = ProjectAnswer {
+        project_id: project_id.into(),
+        status: "resolved".into(),
+        receiver_type: Some("Good".into()),
+        declarations: vec![declaration("good.ts", good_source, &good.hash)],
+        checker_input_fingerprint: "program-v1".into(),
+        error: None,
+    };
+    let good_outcome = map_occurrence(&conn, &good, &[good_answer])?;
+    stage_batch(
+        &conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(&good),
+        &good_outcome.facts,
+        &good_outcome.projects,
+    )?;
+    // Simulate a later query for the same source file failing after facts from
+    // that file were already staged. The file transition must purge them all.
+    let bad_answer = ProjectAnswer {
+        project_id: project_id.into(),
+        status: "resolved".into(),
+        receiver_type: Some("Bad".into()),
+        declarations: vec![declaration("bad.ts", bad_source, &bad.hash)],
+        checker_input_fingerprint: "program-v1".into(),
+        error: None,
+    };
+    let bad_outcome = map_occurrence(&conn, &bad, &[bad_answer])?;
+    stage_batch(
+        &conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(&bad),
+        &bad_outcome.facts,
+        &bad_outcome.projects,
+    )?;
+    stage_file_failed(
+        &conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(&bad),
+        "program-v1",
+    )?;
+    let inputs = [
+        super::super::protocol::CheckerInputFile {
+            path: repo.path().join("good.ts").to_string_lossy().into_owned(),
+            source_hash: good.hash.clone(),
+        },
+        super::super::protocol::CheckerInputFile {
+            path: repo.path().join("bad.ts").to_string_lossy().into_owned(),
+            source_hash: bad.hash.clone(),
+        },
+        super::super::protocol::CheckerInputFile {
+            path: repo
+                .path()
+                .join("package.json")
+                .to_string_lossy()
+                .into_owned(),
+            source_hash: ABSENT_INPUT_HASH.into(),
+        },
+    ];
+    complete_project(
+        repo.path(),
+        &conn,
+        batch_id,
+        project_id,
+        "program-v1",
+        &inputs,
+        1,
+        1,
+    )?;
+    let (status, completed): (String, i64) = conn.query_row(
+        "SELECT status, completed_occurrences FROM checker_project_runs
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((status.as_str(), completed), ("partial", 1));
+    assert_eq!(
+        completed_occurrences(&conn, batch_id, project_id)?,
+        BTreeSet::from([good.id])
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_enrichments
+             WHERE batch_id=?1 AND project_id=?2",
+            params![batch_id, project_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "a late file failure must remove that file's previously staged facts",
+    );
+    assert_eq!(
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)?,
+        1,
+    );
+    crate::structural::rebuild_projection(&conn, &snapshot)?;
+    let (confidence, detail): (String, String) = conn.query_row(
+        "SELECT confidence, detail_json FROM resolved_edges
+         WHERE provenance='checker' AND source_ref_id=?1",
+        [good.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(confidence, "likely");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&detail)?["failedProjects"],
+        serde_json::json!([]),
+        "one failed file must not demote a healthy sibling occurrence",
+    );
+
+    let resume_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "grouped-plan",
+            checker: &identity,
+            protocol: 3,
+            selected_occurrences: occurrences.len(),
+            projects: &projects,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    assert_ne!(
+        resume_batch, batch_id,
+        "published partial state must be cloned before retry"
+    );
+    assert_eq!(
+        completed_occurrences(&conn, resume_batch, project_id)?,
+        BTreeSet::from([good.id]),
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        batch_id,
+        "retry staging must not mutate publication state",
+    );
+
+    let repaired_answer = ProjectAnswer {
+        project_id: project_id.into(),
+        status: "resolved".into(),
+        receiver_type: Some("Bad".into()),
+        declarations: vec![declaration("bad.ts", bad_source, &bad.hash)],
+        checker_input_fingerprint: "program-v1".into(),
+        error: None,
+    };
+    let repaired = map_occurrence(&conn, &bad, &[repaired_answer])?;
+    stage_batch(
+        &conn,
+        resume_batch,
+        project_id,
+        std::slice::from_ref(&bad),
+        &repaired.facts,
+        &repaired.projects,
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        resume_batch,
+        project_id,
+        "program-v1",
+        &inputs,
+        1,
+        1,
+    )?;
+    let status: String = conn.query_row(
+        "SELECT status FROM checker_project_runs
+         WHERE batch_id=?1 AND project_id=?2",
+        params![resume_batch, project_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(status, "completed");
+    assert_eq!(
+        completed_occurrences(&conn, resume_batch, project_id)?,
+        BTreeSet::from([good.id, bad.id])
+    );
+    assert_eq!(
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false)?,
+        2,
+    );
+    crate::structural::rebuild_projection(&conn, &snapshot)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        resume_batch,
+    );
+    Ok(())
+}
+
+#[test]
+fn all_file_local_failures_mark_the_inferred_scope_failed() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let left_source = "declare const left: { run(): void }; left.run();\n";
+    let right_source = "declare const right: { run(): void }; right.run();\n";
+    fs::write(repo.path().join("left.mjs"), left_source)?;
+    fs::write(repo.path().join("right.mjs"), right_source)?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let mut left = planned_occurrence(1, "(root)", "left.mjs", "production", 0);
+    left.hash = blake3::hash(left_source.as_bytes()).to_hex().to_string();
+    let mut right = planned_occurrence(2, "(root)", "right.mjs", "production", 0);
+    right.hash = blake3::hash(right_source.as_bytes()).to_hex().to_string();
+    let project_id = "inferred:.#node-esm";
+    let occurrences = vec![left.clone(), right.clone()];
+    let projects = BTreeMap::from([(project_id.into(), occurrences.clone())]);
+    let fingerprints = test_project_fingerprints(&projects);
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let batch_id = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "all-files-failed",
+            checker: &identity,
+            protocol: 3,
+            selected_occurrences: occurrences.len(),
+            projects: &projects,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    stage_file_failed(
+        &conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(&left),
+        "program-v1",
+    )?;
+    stage_file_failed(
+        &conn,
+        batch_id,
+        project_id,
+        std::slice::from_ref(&right),
+        "program-v1",
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        batch_id,
+        project_id,
+        "program-v1",
+        &[
+            super::super::protocol::CheckerInputFile {
+                path: repo.path().join("left.mjs").to_string_lossy().into_owned(),
+                source_hash: left.hash,
+            },
+            super::super::protocol::CheckerInputFile {
+                path: repo.path().join("right.mjs").to_string_lossy().into_owned(),
+                source_hash: right.hash,
+            },
+        ],
+        1,
+        1,
+    )?;
+    let (status, completed): (String, i64) = conn.query_row(
+        "SELECT status, completed_occurrences FROM checker_project_runs
+         WHERE batch_id=?1 AND project_id=?2",
+        params![batch_id, project_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((status.as_str(), completed), ("failed", 0));
+    assert!(
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)
+            .expect_err("an all-failed scope cannot publish by itself")
+            .to_string()
+            .contains("no completed projects")
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_input_deactivates_an_active_partial_scope() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    conn.execute(
+        "INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           selected_occurrences, total_projects, created_at, active
+         ) VALUES(?1,'5.9.3','bundled','inputs',3,'plan',2,1,datetime('now'),1)",
+        [&snapshot],
+    )?;
+    let batch_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO checker_project_runs(
+           batch_id, project_id, status, selected_occurrences,
+           completed_occurrences, planning_fingerprint,
+           checker_input_fingerprint, updated_at
+         ) VALUES(?1,'inferred:.#node-esm','partial',2,1,'plan','inputs',datetime('now'))",
+        [batch_id],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id, project_id, input_kind, input_path, source_hash
+         ) VALUES(?1,'inferred:.#node-esm','repository','package.json',?2)",
+        params![batch_id, ABSENT_INPUT_HASH],
+    )?;
+
+    fs::write(
+        repo.path().join("package.json"),
+        "{\"type\":\"module\",\"version\":\"1.0.0\"}",
+    )?;
+    let mut freshness = InputFreshnessCache::new(repo.path());
+    assert!(deactivate_stale_active_batch(
+        &conn,
+        &snapshot,
+        &mut freshness,
+    )?);
+    assert_eq!(
+        conn.query_row(
+            "SELECT active FROM checker_enrichment_batches WHERE id=?1",
+            [batch_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+    );
     Ok(())
 }
 
@@ -873,7 +1314,7 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
     )?;
 
     let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
-    let good = project_answer("tsconfig.good.json", vec![declaration]);
+    let good = project_answer("tsconfig.good.json", vec![declaration.clone()]);
     let outcome = map_occurrence(&conn, &occurrence, &[good])?;
     stage_batch(
         &conn,
@@ -891,7 +1332,7 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
         "tsconfig.good.json-inputs",
         &[super::super::protocol::CheckerInputFile {
             path: repo.path().join("main.ts").to_string_lossy().into_owned(),
-            source_hash: hash,
+            source_hash: hash.clone(),
         }],
         1,
         1,
@@ -920,24 +1361,71 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
         serde_json::from_str::<serde_json::Value>(&detail)?["failedProjects"],
         serde_json::json!(["tsconfig.failed.json"])
     );
+    let resume_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "partial",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    assert_ne!(resume_batch, batch_id);
+    assert!(completed_occurrences(&conn, resume_batch, "tsconfig.good.json")?.is_empty());
+    assert!(completed_occurrences(&conn, resume_batch, "tsconfig.failed.json")?.is_empty());
     assert_eq!(
-        open_staging_batch(
-            &conn,
-            &StagingPlan {
-                snapshot: &snapshot,
-                plan_fingerprint: "partial",
-                checker: &identity,
-                protocol: 2,
-                selected_occurrences: 1,
-                projects: &projects,
-                project_fingerprints: &fingerprints,
-                force_new: false,
-            },
+        conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
         )?,
         batch_id,
-        "the partial active batch must remain the resume target"
+        "resuming failures must retain the published partial batch",
     );
-    assert!(completed_occurrences(&conn, batch_id, "tsconfig.failed.json")?.is_empty());
+    for project_id in ["tsconfig.good.json", "tsconfig.failed.json"] {
+        let answer = project_answer(project_id, vec![declaration.clone()]);
+        let outcome = map_occurrence(&conn, &occurrence, &[answer])?;
+        stage_batch(
+            &conn,
+            resume_batch,
+            project_id,
+            std::slice::from_ref(&occurrence),
+            &outcome.facts,
+            &outcome.projects,
+        )?;
+        complete_project(
+            repo.path(),
+            &conn,
+            resume_batch,
+            project_id,
+            &format!("{project_id}-inputs"),
+            &[super::super::protocol::CheckerInputFile {
+                path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+                source_hash: hash.clone(),
+            }],
+            1,
+            1,
+        )?;
+    }
+    assert_eq!(
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false)?,
+        2,
+    );
+    crate::structural::rebuild_projection(&conn, &snapshot)?;
+    let repaired_confidence: String = conn.query_row(
+        "SELECT confidence FROM resolved_edges
+         WHERE provenance='checker' AND source_ref_id=?1",
+        [occurrence.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        repaired_confidence, "likely",
+        "retry must recompute facts demoted by an incomplete owner set",
+    );
     Ok(())
 }
 
@@ -1074,6 +1562,7 @@ fn answer(declarations: Vec<DeclarationSite>) -> ProjectAnswer {
         receiver_type: Some("CardTable".into()),
         declarations,
         checker_input_fingerprint: "inputs".into(),
+        error: None,
     }
 }
 
@@ -1196,6 +1685,38 @@ fn input_freshness_cache_pins_first_digest_per_invocation() -> Result<()> {
         source_hash: changed_hash,
         ..absolute_input
     }));
+
+    let absent = ValidatedInput {
+        kind: "repository".into(),
+        path: "package.json".into(),
+        source_hash: ABSENT_INPUT_HASH.into(),
+    };
+    let mut absence_invocation = InputFreshnessCache::new(root.path());
+    assert!(absence_invocation.matches(&absent));
+    fs::write(root.path().join("package.json"), "{}")?;
+    assert!(
+        absence_invocation.matches(&absent),
+        "absence is pinned like a file digest within one invocation"
+    );
+    assert!(!InputFreshnessCache::new(root.path()).matches(&absent));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn input_freshness_cache_treats_a_dangling_symlink_as_present() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir()?;
+    let manifest = root.path().join("package.json");
+    symlink(root.path().join("missing-package.json"), &manifest)?;
+    let absent = ValidatedInput {
+        kind: "repository".into(),
+        path: "package.json".into(),
+        source_hash: ABSENT_INPUT_HASH.into(),
+    };
+
+    assert!(!InputFreshnessCache::new(root.path()).matches(&absent));
     Ok(())
 }
 
@@ -1991,6 +2512,7 @@ fn an_unknown_owning_project_is_visible_without_demoting_a_clean_resolution() ->
         receiver_type: None,
         declarations: Vec::new(),
         checker_input_fingerprint: "unknown-inputs".into(),
+        error: None,
     };
     let outcome = map_occurrence(
         &conn,

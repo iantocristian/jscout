@@ -783,13 +783,15 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 
 ### Required G10 scale correction
 
-**Implementation status (2026-08-14, amended 2026-08-20).** The correction
-below is implemented in checker protocol v2 and schema v19: complete
+**Implementation status (2026-08-14, amended 2026-08-22).** The correction
+below is implemented in checker protocol v3 and schema v27: complete
 configured-project coverage by default, explicit inferred-project coverage
 under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
-per-project batches, one disposable Program worker per project, once-per-project
-source mapping, durable batch staging/resume, controlled partial activation,
+per-project batches, grouped inferred scopes by nearest package/compiler family
+with deterministic 150-root subdivision, per-file inferred failure attribution,
+one disposable Program worker per project, once-per-project source mapping,
+durable batch staging/resume, controlled partial activation,
 input/target/snapshot rechecks, resource progress, and synchronous worker-crash
 details. Unit, protocol, projection, and small end-to-end gates pass. The
 n8n full-plan dry run selects all 121,060 eligible occurrences from 284,183
@@ -947,9 +949,14 @@ in this order:
 An enrichment run is keyed by structural snapshot, plan fingerprint, checker
 protocol/version, TypeScript identity, and execution policy. Rust commits
 bounded inactive staging rows after each successful query batch or project.
-Restarting the same command resumes the matching run; a changed snapshot or
-plan starts a new run and makes the old staging rows collectible. Staging has a
-bounded retention policy and never enters `resolved_edges`.
+Restarting the same command resumes the matching run. An already published
+partial batch is immutable: its reusable rows are cloned into a new inactive
+batch before retry, so interruption or a fingerprint reset cannot split
+canonical facts from `resolved_edges`. An occurrence with any failed owner is
+not cloned; every owner is re-queried so a repaired closed set can regain
+`likely`. A changed snapshot or plan starts a new run and makes old inactive
+staging rows collectible. Staging has a bounded retention policy and never
+enters `resolved_edges`.
 
 One failed project does not erase successful work from unrelated projects. Its
 occurrences publish no targeted edge, its coverage is recorded as failed, and
@@ -961,6 +968,22 @@ cancelled, or unprocessed project cannot receive a `likely` checker edge from a
 different owner; it remains on the `possible` fallback unless every owning
 project needed by the confidence decision completed. Malformed or internally
 inconsistent answers still reject the affected project atomically.
+
+Grouped inferred scopes additionally isolate a failure after source-hash
+validation to the affected source file. Every selected occurrence from that
+file receives explicit failed coverage; previously staged facts from the same
+file are removed, while sibling-file progress and the validated Program input
+manifest remain staged under a `partial` project run. Exact reuse and
+cross-snapshot carry accept only `completed` runs, so the next matching command
+retries the failed files. If the resumed worker reports a different Program
+fingerprint, Rust discards the whole scope staging and reruns it coherently.
+Freshness includes the nearest manifest plus negative `package.json` probes
+between every root and that boundary, so a newly created closer manifest
+invalidates planning and execution even when no manifest existed originally.
+Missing or changed inputs, Program construction, protocol/ownership failures,
+and configured-project failures remain project-atomic. A scope in which every
+file fails is `failed`, not `partial`, and retains the all-failed publication
+safeguard.
 
 Final activation is one short transaction. It rechecks the exact structural
 snapshot, selected occurrence/file hashes, mapped target fingerprints, and
@@ -1025,14 +1048,15 @@ new plan.
 - the same source file is read/hashed/walked once per owning project, not once
   per occurrence;
 - overlapping projects preserve ambiguity and a failed owner prevents an
-  unjustified `likely` edge;
+  unjustified `likely` edge, while repairing that owner re-queries the closed set
+  and can promote it back to `likely`;
 - an all-failed run and a zero-fact partial run preserve the previously active
   batch, while one Ctrl-C stops the project loop without activating partial
   coverage;
 - killing the checker after staged progress and rerunning resumes the exact
   snapshot/plan without redoing committed batches or exposing staging rows;
-- a source, target, config, ambient declaration, or TypeScript-runtime change
-  during the run cannot activate raced facts;
+- a source, target, config, ambient declaration, TypeScript-runtime change, or
+  newly appearing package boundary during the run cannot activate raced facts;
 - a project failure can publish explicitly incomplete coverage for unaffected
   projects while returning a non-zero/partial status;
 - an actual Node exception/OOM is visible in the command's final error even if

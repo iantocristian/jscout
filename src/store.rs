@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "26";
+pub const SCHEMA_VERSION: &str = "27";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -217,7 +217,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='26' WHERE key='schema_version';",
+             UPDATE meta SET value='27' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +235,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '26')
+INSERT INTO meta(key, value) VALUES('schema_version', '27')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -561,7 +561,7 @@ CREATE INDEX IF NOT EXISTS idx_checker_staging_plan
 CREATE TABLE IF NOT EXISTS checker_project_runs(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'partial', 'failed')),
   selected_occurrences INTEGER NOT NULL,
   completed_occurrences INTEGER NOT NULL DEFAULT 0,
   planning_fingerprint TEXT NOT NULL DEFAULT '',
