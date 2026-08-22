@@ -420,28 +420,78 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     }
     super::process::begin_interrupt_scope().context("failed to install checker Ctrl-C handler")?;
 
+    let dirty_files = current_dirty_source_files(&conn, &options.dirty_files)?;
+    let inventory_files = super::package_gate::inventory_paths(&conn)?;
     let mut planner = super::launch(&canonical_root, options.sidecar, None, options.node)?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let dirty_files = current_dirty_source_files(&conn, &options.dirty_files)?;
-    let mut planning_files = eligible
-        .iter()
-        .map(|occurrence| occurrence.file.clone())
-        .collect::<BTreeSet<_>>();
-    planning_files.extend(dirty_files.iter().cloned());
-    let mut ownership =
-        planner.plan_members(planning_files.into_iter().collect(), options.timeout)?;
     let protocol = planner.versions.protocol;
+    let (inventory_ownership, inventory_typescript) =
+        plan_inventory_ownership(&mut planner, &inventory_files, options.timeout)?;
+    let package_gate = super::package_gate::evaluate(
+        &canonical_root,
+        &conn,
+        &inventory_ownership,
+        options.include_all,
+    )?;
+    let (eligible, inferred_coverage) = gate_inferred_projects(
+        eligible,
+        &inventory_ownership,
+        &package_gate.admitted_orphans,
+    )?;
+
+    let inventory_by_file = inventory_ownership
+        .iter()
+        .map(|entry| (entry.file.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut planning_files = package_gate.admitted_orphans.clone();
+    planning_files.extend(eligible.iter().map(|occurrence| occurrence.file.clone()));
+    planning_files.extend(dirty_files.iter().filter_map(|file| {
+        let ownership = inventory_by_file.get(file.as_str())?;
+        (super::package_gate::has_configured_owner(ownership)
+            || package_gate.admitted_orphans.contains(file))
+        .then(|| file.clone())
+    }));
+
+    // Reuse the inventory pass's configured-project discovery for the
+    // immediately following admitted-scope plan. This makes both views one
+    // ownership snapshot while still regrouping the exact admitted roots.
+    let planning_files = planning_files.into_iter().collect::<Vec<_>>();
+    let mut ownership = planner.plan_members_cached(planning_files.clone(), options.timeout)?;
+    if ownership.typescript.version != inventory_typescript.version
+        || ownership.typescript.source != inventory_typescript.source
+    {
+        bail!("checker identity changed during final package ownership planning");
+    }
     drop(planner);
+    let returned_files = ownership
+        .files
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested_files = planning_files
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if returned_files != requested_files || returned_files.len() != ownership.files.len() {
+        bail!("checker returned incomplete or duplicate final ownership");
+    }
+    for final_ownership in &ownership.files {
+        let initial_ownership = inventory_by_file
+            .get(final_ownership.file.as_str())
+            .context("final checker ownership named a file outside the inventory")?;
+        if !super::package_gate::same_configured_ownership(initial_ownership, final_ownership) {
+            bail!("configured project ownership changed during package planning");
+        }
+    }
+    package_gate.validate_fresh()?;
     apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
     let configured_projects = ownership
         .projects
         .iter()
         .filter(|project| !is_inferred_project(&project.project_id))
         .count();
-    let (eligible, inferred_coverage) =
-        gate_inferred_projects(eligible, &ownership.files, options.include_all)?;
     let ordered = spread_occurrences(eligible);
     let selected = match options.max_occurrences {
         Some(limit) => ordered.into_iter().take(limit).collect::<Vec<_>>(),
@@ -493,12 +543,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         decisions: project_decisions,
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
-    } = build_project_plan(
-        &selected,
-        &ownership.files,
-        &ownership.projects,
-        options.include_all,
-    )?;
+    } = build_project_plan(&selected, &ownership.files, &ownership.projects)?;
     let project_fingerprints = project_planning_fingerprints(
         &project_plan,
         &ownership.projects,
@@ -512,9 +557,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         &project_fingerprints,
         &ownership.typescript,
         protocol,
+        &package_gate.fingerprint,
         options,
     );
-    let dirty_projects = dirty_projects(&ownership.files, &dirty_files, options.include_all);
+    let dirty_projects = dirty_projects(&ownership.files, &dirty_files);
 
     if options.dry_run {
         return Ok(EnrichReport {
@@ -555,6 +601,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         });
     }
 
+    package_gate.validate_fresh()?;
     let mut input_freshness = InputFreshnessCache::new(&canonical_root);
     if !options.force_full
         && let Some(batch_id) = reusable_active_batch(
@@ -565,6 +612,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut input_freshness,
         )?
     {
+        // The full inventory pass above produced this gate and no checker
+        // project work has run since. Replanning here would duplicate the
+        // expensive configuration-only discovery on every exact reuse.
         let facts_published = conn.query_row(
             "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
             [batch_id],
@@ -773,10 +823,25 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if super::process::cancellation_pending() {
         bail!("checker enrichment interrupted before activation; staged work retained");
     }
+    revalidate_package_gate(
+        &canonical_root,
+        &conn,
+        &inventory_files,
+        &package_gate,
+        &ownership.typescript,
+        protocol,
+        options,
+    )?;
 
     if !failed_projects.is_empty() {
-        let facts_published =
-            activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, true)?;
+        let facts_published = activate_staging_batch(
+            &canonical_root,
+            &conn,
+            batch_id,
+            &snapshot,
+            true,
+            Some(&package_gate),
+        )?;
         crate::structural::rebuild_projection(&conn, &snapshot)?;
         return Err(PartialEnrichmentError {
             batch_id,
@@ -786,8 +851,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         .into());
     }
 
-    let facts_published =
-        activate_staging_batch(&canonical_root, &conn, batch_id, &snapshot, false)?;
+    let facts_published = activate_staging_batch(
+        &canonical_root,
+        &conn,
+        batch_id,
+        &snapshot,
+        false,
+        Some(&package_gate),
+    )?;
     crate::structural::rebuild_projection(&conn, &snapshot)?;
 
     Ok(EnrichReport {
@@ -1223,7 +1294,7 @@ fn is_inferred_project(project_id: &str) -> bool {
 fn gate_inferred_projects(
     occurrences: Vec<Occurrence>,
     ownership: &[FileOwnership],
-    include_all: bool,
+    admitted_orphans: &BTreeSet<String>,
 ) -> Result<(Vec<Occurrence>, InferredProjectCoverage)> {
     let owners = ownership
         .iter()
@@ -1242,11 +1313,12 @@ fn gate_inferred_projects(
         let without_configured_project = ownership
             .project_ids
             .iter()
+            .chain(&ownership.excluded_project_ids)
             .all(|project_id| is_inferred_project(project_id));
         if without_configured_project {
             files_without_configured_project.insert(occurrence.file.clone());
             coverage.occurrences_without_configured_project += 1;
-            if !include_all {
+            if !admitted_orphans.contains(&occurrence.file) {
                 coverage.occurrences_skipped_inferred_project += 1;
                 continue;
             }
@@ -1261,7 +1333,6 @@ fn build_project_plan(
     selected: &[Occurrence],
     ownership: &[FileOwnership],
     projects: &[ProjectSummary],
-    include_inferred: bool,
 ) -> Result<ProjectPlanning> {
     let owners = ownership
         .iter()
@@ -1297,9 +1368,6 @@ fn build_project_plan(
             occurrences_using_tooling_fallback += 1;
         }
         for project_id in &ownership.project_ids {
-            if is_inferred_project(project_id) && !include_inferred {
-                continue;
-            }
             plan.entry(project_id.clone())
                 .or_default()
                 .push(occurrence.clone());
@@ -1460,16 +1528,75 @@ fn current_dirty_source_files(
         .collect())
 }
 
-fn dirty_projects(
-    ownership: &[FileOwnership],
-    dirty_files: &BTreeSet<String>,
-    include_inferred: bool,
-) -> BTreeSet<String> {
+/// The streaming protocol uploads this inventory in bounded frames but plans it
+/// as one finish-time snapshot. Rust must not split it into independent calls:
+/// that would make configured ownership and inferred grouping chunk-relative.
+fn plan_inventory_ownership(
+    planner: &mut super::process::ProcessChecker,
+    files: &[String],
+    timeout: Duration,
+) -> Result<(Vec<FileOwnership>, TypeScriptIdentity)> {
+    if files.is_empty() {
+        bail!("checker package planning requires a non-empty first-party inventory");
+    }
+    let expected = files.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if expected.len() != files.len() {
+        bail!("checker package inventory contains duplicate paths");
+    }
+    let result = planner
+        .plan_members(files.to_vec(), timeout)
+        .context("checker failed the configuration-only inventory pass")?;
+    let mut ownership = result.files;
+    ownership.sort_by(|left, right| left.file.cmp(&right.file));
+    let returned = ownership
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect::<BTreeSet<_>>();
+    if returned != expected || returned.len() != ownership.len() {
+        bail!("checker inventory ownership did not cover every first-party source");
+    }
+    Ok((ownership, result.typescript))
+}
+
+/// Recompute the complete package policy after project work but before the
+/// activation transaction. Selected project manifests already protect their
+/// own compiler inputs; this additional inventory check covers unselected
+/// configured files whose ownership still contributes to a package majority.
+fn revalidate_package_gate(
+    root: &Path,
+    conn: &Connection,
+    inventory_files: &[String],
+    expected: &super::package_gate::GatePlan,
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+    options: &EnrichOptions<'_>,
+) -> Result<()> {
+    let mut planner = super::launch(root, options.sidecar, None, options.node)?;
+    planner
+        .register_interrupts()
+        .context("failed to install checker Ctrl-C handler")?;
+    let (ownership, current_checker) =
+        plan_inventory_ownership(&mut planner, inventory_files, options.timeout)?;
+    if planner.versions.protocol != protocol
+        || current_checker.version != checker.version
+        || current_checker.source != checker.source
+    {
+        bail!("checker identity changed before package-policy activation");
+    }
+    drop(planner);
+    let current = super::package_gate::evaluate(root, conn, &ownership, options.include_all)?;
+    current.validate_fresh()?;
+    if current.fingerprint != expected.fingerprint {
+        bail!("package ownership policy changed before checker activation; staged work retained");
+    }
+    Ok(())
+}
+
+fn dirty_projects(ownership: &[FileOwnership], dirty_files: &BTreeSet<String>) -> BTreeSet<String> {
     ownership
         .iter()
         .filter(|entry| dirty_files.contains(&entry.file))
         .flat_map(|entry| entry.project_ids.iter())
-        .filter(|project| include_inferred || !is_inferred_project(project))
         .cloned()
         .collect()
 }
@@ -1543,6 +1670,10 @@ fn project_planning_fingerprints(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reuse identity covers selection, project, checker, gate, and operator policy planes"
+)]
 fn plan_fingerprint(
     snapshot: &str,
     selected: &[Occurrence],
@@ -1550,6 +1681,7 @@ fn plan_fingerprint(
     project_fingerprints: &BTreeMap<String, String>,
     checker: &TypeScriptIdentity,
     protocol: u32,
+    package_gate_fingerprint: &str,
     options: &EnrichOptions<'_>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -1557,13 +1689,14 @@ fn plan_fingerprint(
     // checker answer projects must never revive a batch created under the
     // previous single-target-only `likely` rule. Grouped inferred membership
     // also changes the planning boundary independently of that policy.
-    hasher.update(b"jscout-checker-plan-v4\0");
+    hasher.update(b"jscout-checker-plan-v5\0");
     hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
     for value in [
         snapshot,
         &checker.version,
         &checker.source,
         &protocol.to_string(),
+        package_gate_fingerprint,
         if options.include_all {
             "all"
         } else {
@@ -3136,9 +3269,13 @@ fn activate_staging_batch(
     batch_id: i64,
     snapshot: &str,
     allow_failed_projects: bool,
+    package_gate: Option<&super::package_gate::GatePlan>,
 ) -> Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<usize> {
+        if let Some(package_gate) = package_gate {
+            package_gate.validate_fresh()?;
+        }
         if crate::structural::current_snapshot(conn)? != snapshot {
             bail!("structural snapshot changed while enrichment was running; staged work retained");
         }
