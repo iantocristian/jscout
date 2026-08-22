@@ -144,6 +144,11 @@ pub struct ProjectDecision {
 
 struct ProjectPlanning {
     projects: BTreeMap<String, Vec<Occurrence>>,
+    /// Complete root set assigned during configuration-only inferred grouping.
+    /// Configured projects reconstruct their roots from tsconfig and therefore
+    /// carry an empty list here.
+    project_roots: BTreeMap<String, Vec<String>>,
+    first_selected_rank: BTreeMap<String, usize>,
     decisions: Vec<ProjectDecision>,
     occurrences_avoided_by_tooling_filter: usize,
     occurrences_using_tooling_fallback: usize,
@@ -389,6 +394,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let protocol = planner.versions.protocol;
     drop(planner);
     apply_repository_project_policy(&conn, &mut ownership.files, &mut ownership.projects)?;
+    let configured_projects = ownership
+        .projects
+        .iter()
+        .filter(|project| !is_inferred_project(&project.project_id))
+        .count();
     let (eligible, inferred_coverage) =
         gate_inferred_projects(eligible, &ownership.files, options.include_all)?;
     let ordered = spread_occurrences(eligible);
@@ -419,7 +429,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: 0,
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -437,6 +447,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     verify_selected_sources(&canonical_root, &conn, &selected)?;
     let ProjectPlanning {
         projects: project_plan,
+        project_roots,
+        first_selected_rank,
         decisions: project_decisions,
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
@@ -446,19 +458,20 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         &ownership.projects,
         options.include_all,
     )?;
-    let plan_fingerprint = plan_fingerprint(
-        &snapshot,
-        &selected,
-        &project_plan,
-        &ownership.typescript,
-        protocol,
-        options,
-    );
     let project_fingerprints = project_planning_fingerprints(
         &project_plan,
         &ownership.projects,
         &ownership.typescript,
         protocol,
+    );
+    let plan_fingerprint = plan_fingerprint(
+        &snapshot,
+        &selected,
+        &project_plan,
+        &project_fingerprints,
+        &ownership.typescript,
+        protocol,
+        options,
     );
     let dirty_projects = dirty_projects(&ownership.files, &dirty_files, options.include_all);
 
@@ -485,7 +498,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -539,7 +552,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             projects: project_plan.len(),
             projects_carried: 0,
             occurrences_carried: 0,
-            configured_projects: ownership.projects.len(),
+            configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
             occurrences_without_configured_project: inferred_coverage
@@ -608,7 +621,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
     for (project_index, (project_id, occurrences)) in
-        projects_in_execution_order(&project_plan, &priority_projects)
+        projects_in_execution_order(&project_plan, &priority_projects, &first_selected_rank)
             .into_iter()
             .enumerate()
     {
@@ -624,22 +637,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             reset_project_staging(&conn, batch_id, project_id)?;
             completed.clear();
         }
-        let mut pending = occurrences
+        let unchecked = occurrences
             .iter()
             .filter(|occurrence| !completed.contains(&occurrence.id))
             .cloned()
             .collect::<Vec<_>>();
-        pending.sort_by(|left, right| {
-            (!dirty_files.contains(&left.file))
-                .cmp(&(!dirty_files.contains(&right.file)))
-                .then_with(|| {
-                    (&left.file, left.call_start, left.id).cmp(&(
-                        &right.file,
-                        right.call_start,
-                        right.id,
-                    ))
-                })
-        });
+        // Stable partition: dirty occurrences lead, but both halves retain the
+        // global package/file spread order selected before project grouping.
+        let (mut pending, clean): (Vec<_>, Vec<_>) = unchecked
+            .into_iter()
+            .partition(|occurrence| dirty_files.contains(&occurrence.file));
+        pending.extend(clean);
         occurrences_resumed += completed.len();
         mark_project_pending(&conn, batch_id, project_id)?;
         eprintln!(
@@ -656,6 +664,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &conn,
             batch_id,
             project_id,
+            project_roots.get(project_id).map_or(&[][..], Vec::as_slice),
             &pending,
             &ownership.typescript,
             &mut request_batches,
@@ -728,7 +737,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         projects: project_plan.len(),
         projects_carried: carry.projects_carried,
         occurrences_carried: carry.occurrences_carried,
-        configured_projects: ownership.projects.len(),
+        configured_projects,
         configuration_problems: ownership.configuration_problems.len(),
         files_without_configured_project: inferred_coverage.files_without_configured_project,
         occurrences_without_configured_project: inferred_coverage
@@ -1188,10 +1197,11 @@ fn build_project_plan(
         .map(|project| (project.project_id.as_str(), project))
         .collect::<HashMap<_, _>>();
     let mut plan = BTreeMap::<String, Vec<Occurrence>>::new();
+    let mut first_selected_rank = BTreeMap::<String, usize>::new();
     let mut decisions = BTreeMap::<String, ProjectDecision>::new();
     let mut occurrences_avoided_by_tooling_filter = 0;
     let mut occurrences_using_tooling_fallback = 0;
-    for occurrence in selected {
+    for (rank, occurrence) in selected.iter().enumerate() {
         let ownership = owners.get(occurrence.file.as_str()).with_context(|| {
             format!("checker omitted project ownership for {}", occurrence.file)
         })?;
@@ -1218,6 +1228,9 @@ fn build_project_plan(
             plan.entry(project_id.clone())
                 .or_default()
                 .push(occurrence.clone());
+            first_selected_rank
+                .entry(project_id.clone())
+                .or_insert(rank);
             let decision = project_decision(&mut decisions, &summaries, project_id);
             decision.selected_occurrences += 1;
             if ownership.tooling_fallback {
@@ -1230,13 +1243,36 @@ fn build_project_plan(
             occurrences_avoided_by_tooling_filter += 1;
         }
     }
-    for occurrences in plan.values_mut() {
-        occurrences.sort_by(|left, right| {
-            (&left.file, left.call_start, left.id).cmp(&(&right.file, right.call_start, right.id))
-        });
+    let mut project_roots = BTreeMap::<String, Vec<String>>::new();
+    for project_id in plan.keys().filter(|project| is_inferred_project(project)) {
+        let roots = ownership
+            .iter()
+            .filter(|file| file.project_ids.contains(project_id))
+            .map(|file| file.file.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            bail!("checker omitted inferred roots for {project_id}");
+        }
+        if roots.len() > 150 {
+            bail!("checker inferred project {project_id} exceeds the 150-root cap");
+        }
+        if let Some(summary) = summaries.get(project_id.as_str())
+            && summary.file_count != roots.len()
+        {
+            bail!(
+                "checker inferred project {project_id} reported {} roots but assigned {}",
+                summary.file_count,
+                roots.len()
+            );
+        }
+        project_roots.insert(project_id.clone(), roots);
     }
     Ok(ProjectPlanning {
         projects: plan,
+        project_roots,
+        first_selected_rank,
         decisions: decisions.into_values().collect(),
         occurrences_avoided_by_tooling_filter,
         occurrences_using_tooling_fallback,
@@ -1250,6 +1286,9 @@ fn apply_repository_project_policy(
 ) -> Result<()> {
     let mut policies = HashMap::<String, String>::new();
     for project in projects.iter_mut() {
+        if is_inferred_project(&project.project_id) {
+            continue;
+        }
         let Some(policy) = crate::recon::project_policy(
             conn,
             &project.project_id,
@@ -1363,6 +1402,7 @@ fn dirty_projects(
 fn projects_in_execution_order<'a>(
     projects: &'a BTreeMap<String, Vec<Occurrence>>,
     priority_projects: &BTreeSet<String>,
+    first_selected_rank: &BTreeMap<String, usize>,
 ) -> Vec<(&'a String, &'a Vec<Occurrence>)> {
     let mut ordered = projects.iter().collect::<Vec<_>>();
     ordered.sort_by(|(left, _), (right, _)| {
@@ -1371,6 +1411,11 @@ fn projects_in_execution_order<'a>(
             .then_with(|| {
                 is_inferred_project(left)
                     .cmp(&is_inferred_project(right))
+                    .then_with(|| {
+                        first_selected_rank
+                            .get(*left)
+                            .cmp(&first_selected_rank.get(*right))
+                    })
                     .then_with(|| left.cmp(right))
             })
     });
@@ -1426,12 +1471,13 @@ fn plan_fingerprint(
     snapshot: &str,
     selected: &[Occurrence],
     projects: &BTreeMap<String, Vec<Occurrence>>,
+    project_fingerprints: &BTreeMap<String, String>,
     checker: &TypeScriptIdentity,
     protocol: u32,
     options: &EnrichOptions<'_>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-checker-plan-v2\0");
+    hasher.update(b"jscout-checker-plan-v3\0");
     for value in [
         snapshot,
         &checker.version,
@@ -1456,6 +1502,10 @@ fn plan_fingerprint(
     for (project, occurrences) in projects {
         hasher.update(project.as_bytes());
         hasher.update(b"\0");
+        if let Some(fingerprint) = project_fingerprints.get(project) {
+            hasher.update(fingerprint.as_bytes());
+            hasher.update(b"\0");
+        }
         for occurrence in occurrences {
             hasher.update(occurrence.id.to_string().as_bytes());
             hasher.update(b"\0");
@@ -2165,6 +2215,7 @@ fn execute_project(
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
+    project_files: &[String],
     occurrences: &[Occurrence],
     expected_identity: &TypeScriptIdentity,
     request_batches: &mut usize,
@@ -2197,6 +2248,7 @@ fn execute_project(
                 "size-check",
                 &super::protocol::Outbound::ResolveMembers {
                     project_id: project_id.to_string(),
+                    project_files: project_files.to_vec(),
                     queries,
                 },
             )?;
@@ -2210,6 +2262,7 @@ fn execute_project(
             *request_batches += 1;
             match checker.resolve_members(
                 project_id.to_string(),
+                project_files.to_vec(),
                 batch.iter().map(member_query).collect(),
                 options.timeout,
             ) {

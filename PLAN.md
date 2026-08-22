@@ -779,15 +779,17 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 
 ### Required G10 scale correction
 
-**Implementation status (2026-08-14, amended 2026-08-20).** The correction
-below is implemented in checker protocol v2 and schema v19: complete
+**Implementation status (2026-08-14, amended 2026-08-22).** The correction
+below is implemented in checker protocol v3 and schema v19: complete
 configured-project coverage by default, explicit inferred-project coverage
 under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
-per-project batches, one disposable Program worker per project, once-per-project
-source mapping, durable batch staging/resume, controlled partial activation,
-input/target/snapshot rechecks, resource progress, and synchronous worker-crash
-details. Unit, protocol, projection, and small end-to-end gates pass. The
+per-project batches, grouped inferred scopes by nearest package/compiler family
+with deterministic 150-root subdivision, one disposable Program worker per
+project, once-per-project source mapping, durable batch staging/resume,
+controlled partial activation, input/target/snapshot rechecks, resource
+progress, and synchronous worker-crash details. Unit, protocol, projection, and
+small end-to-end gates pass. The
 n8n full-plan dry run selects all 121,060 eligible occurrences from 284,183
 discovered across 234 owning/inferred projects in 5.6 seconds after excluding
 645 exact namespace-member calls already answered by the structural resolver; a real bounded
@@ -913,12 +915,12 @@ Two relaxations are reserved, in this order:
 
 1. Make the gate role-aware if production-role unconfigured files demonstrate
    a typed-edge retrieval gap; tooling/script roles remain excluded.
-2. If inferred enrichment is then used enough to justify its cost, replace the
-   per-file fallback with bounded inferred scopes grouped first by package and
-   compatible compiler-option family, then deterministically subdivided by
-   directory. Grouping is both a resource optimization and the semantically
-   correct shape for connected plain-JS module graphs, but it is not built
-   before opt-in evidence requires it.
+2. Implemented in protocol v3: inferred enrichment uses bounded scopes grouped
+   first by nearest package and compatible compiler-option family, then
+   deterministically subdivided by directory at 150 roots. Grouping is both a
+   resource optimization and the semantically correct shape for connected
+   plain-JS module graphs. The cap bounds explicit roots, not the transitive
+   module graph loaded by TypeScript.
 
 #### Durable staging, resume, and partial coverage
 

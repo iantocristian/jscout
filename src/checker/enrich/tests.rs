@@ -198,7 +198,7 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     let ownership = vec![
         FileOwnership {
             file: "scripts/tool.mjs".into(),
-            project_ids: vec!["inferred:scripts/tool.mjs".into()],
+            project_ids: vec!["inferred:.#node-esm".into()],
             excluded_project_ids: Vec::new(),
             tooling_fallback: false,
         },
@@ -209,14 +209,24 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
             tooling_fallback: false,
         },
     ];
-    let projects = vec![ProjectSummary {
-        project_id: "tsconfig.json".into(),
-        file_count: 1,
-        purpose: "general".into(),
-        purpose_reasons: Vec::new(),
-        membership_fingerprint: String::new(),
-        config_fingerprint: String::new(),
-    }];
+    let projects = vec![
+        ProjectSummary {
+            project_id: "inferred:.#node-esm".into(),
+            file_count: 1,
+            purpose: "inferred".into(),
+            purpose_reasons: vec!["no-configured-owner".into()],
+            membership_fingerprint: "inferred-members".into(),
+            config_fingerprint: "package-type".into(),
+        },
+        ProjectSummary {
+            project_id: "tsconfig.json".into(),
+            file_count: 1,
+            purpose: "general".into(),
+            purpose_reasons: Vec::new(),
+            membership_fingerprint: String::new(),
+            config_fingerprint: String::new(),
+        },
+    ];
 
     let (default, coverage) = gate_inferred_projects(occurrences.clone(), &ownership, false)?;
     assert_eq!(default.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
@@ -257,11 +267,19 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     assert_eq!(coverage.occurrences_skipped_inferred_project, 0);
     let all_plan = build_project_plan(&all, &ownership, &projects, true)?;
     assert_eq!(
-        projects_in_execution_order(&all_plan.projects, &BTreeSet::new())
-            .into_iter()
-            .map(|(project, _)| project.as_str())
-            .collect::<Vec<_>>(),
-        ["tsconfig.json", "inferred:scripts/tool.mjs"]
+        all_plan.project_roots["inferred:.#node-esm"],
+        ["scripts/tool.mjs"]
+    );
+    assert_eq!(
+        projects_in_execution_order(
+            &all_plan.projects,
+            &BTreeSet::new(),
+            &all_plan.first_selected_rank,
+        )
+        .into_iter()
+        .map(|(project, _)| project.as_str())
+        .collect::<Vec<_>>(),
+        ["tsconfig.json", "inferred:.#node-esm"]
     );
     Ok(())
 }

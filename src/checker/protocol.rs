@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -16,6 +16,7 @@ pub enum Outbound {
     },
     ResolveMembers {
         project_id: String,
+        project_files: Vec<String>,
         queries: Vec<MemberQuery>,
     },
     ValidateProject {
@@ -312,7 +313,7 @@ mod tests {
         )
         .expect("frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("json");
-        assert_eq!(frame["protocol"], 2);
+        assert_eq!(frame["protocol"], 3);
         assert_eq!(frame["query"]["receiver_start"], 10);
         assert_eq!(frame["query"]["property_end"], 27);
     }

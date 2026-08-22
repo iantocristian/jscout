@@ -46,7 +46,7 @@ function client(root) {
   const request = (kind, body = {}) => new Promise((resolve) => {
     const id = `t${sequence += 1}`;
     pending.set(id, resolve);
-    child.stdin.write(`${JSON.stringify({ protocol: 2, id, kind, ...body })}\n`);
+    child.stdin.write(`${JSON.stringify({ protocol: 3, id, kind, ...body })}\n`);
   });
   return {
     child,
@@ -195,10 +195,118 @@ test("reports a file outside configured projects as inferred ownership", async (
   const plan = await checker.request("plan_members", { files: ["orphan.mjs"] });
   assert.deepEqual(plan.result.files, [{
     file: "orphan.mjs",
-    project_ids: ["inferred:orphan.mjs"],
+    project_ids: ["inferred:.#node-esm"],
     excluded_project_ids: [],
     tooling_fallback: false,
   }]);
+  assert.equal(
+    plan.result.projects.find((project) => project.project_id === "inferred:.#node-esm")?.file_count,
+    1,
+  );
+  await checker.close();
+});
+
+test("groups compatible inferred roots into one executable project", async (context) => {
+  const source = [
+    'import { makeAlpha } from "./factory.mjs";',
+    "const alpha = makeAlpha();",
+    "alpha.save();",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "package.json": JSON.stringify({ type: "module" }),
+    "factory.mjs": [
+      "export class Alpha { save() {} }",
+      "export function makeAlpha() { return new Alpha(); }",
+      "",
+    ].join("\n"),
+    "main.mjs": source,
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const projectFiles = ["factory.mjs", "main.mjs"];
+  const plan = await checker.request("plan_members", { files: projectFiles });
+  assert.deepEqual(
+    plan.result.files.map(({ file, project_ids }) => ({ file, project_ids })),
+    [
+      { file: "factory.mjs", project_ids: ["inferred:.#node-esm"] },
+      { file: "main.mjs", project_ids: ["inferred:.#node-esm"] },
+    ],
+  );
+  const summary = plan.result.projects.find(
+    (project) => project.project_id === "inferred:.#node-esm",
+  );
+  assert.equal(summary.file_count, 2);
+  assert.equal(summary.purpose, "inferred");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "inferred:.#node-esm",
+    project_files: projectFiles,
+    queries: [{ ...queryFor(source, "alpha.save()", "alpha", "save"), file: "main.mjs" }],
+  });
+  assert.equal(resolved.kind, "resolve_members_result");
+  assert.equal(resolved.result.results[0].answer.status, "resolved");
+  assert.equal(resolved.result.results[0].answer.declarations[0].file, "factory.mjs");
+
+  const validation = await checker.request("validate_project", {
+    project_id: "inferred:.#node-esm",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, true);
+  assert.ok(validation.result.inputs.some((input) => input.path.endsWith("package.json")));
+  await checker.close();
+});
+
+test("subdivides inferred roots by package, compiler family, and a 150-root cap", async (context) => {
+  const files = {
+    "package.json": JSON.stringify({ type: "module" }),
+    "root.js": "export const root = true;\n",
+    "legacy.cjs": "exports.legacy = true;\n",
+    "view.tsx": "export const view = <div />;\n",
+    "nested/package.json": JSON.stringify({}),
+    "nested/tool.js": "exports.tool = true;\n",
+    "tests/helpers/freshDb.mjs": "export const fresh = true;\n",
+  };
+  for (let index = 0; index < 246; index += 1) {
+    files[`tests/${String(index).padStart(3, "0")}.test.mjs`] = `export const value${index} = ${index};\n`;
+  }
+  const root = fixture(files);
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const plannedFiles = Object.keys(files).filter((file) => !file.endsWith("package.json"));
+  const plan = await checker.request("plan_members", { files: plannedFiles });
+  const owner = Object.fromEntries(
+    plan.result.files.map((file) => [file.file, file.project_ids[0]]),
+  );
+  assert.equal(owner["root.js"], "inferred:.#node-esm/root");
+  assert.equal(owner["tests/000.test.mjs"], "inferred:.#node-esm/tests-1");
+  assert.equal(owner["tests/122.test.mjs"], "inferred:.#node-esm/tests-1");
+  assert.equal(owner["tests/123.test.mjs"], "inferred:.#node-esm/tests-2");
+  assert.equal(owner["tests/245.test.mjs"], "inferred:.#node-esm/tests-2");
+  assert.equal(owner["tests/helpers/freshDb.mjs"], "inferred:.#node-esm/tests-2");
+  assert.equal(owner["legacy.cjs"], "inferred:.#node-cjs");
+  assert.equal(owner["view.tsx"], "inferred:.#bundler-jsx");
+  assert.equal(owner["nested/tool.js"], "inferred:nested#node-cjs");
+
+  const inferred = plan.result.projects.filter((project) => project.purpose === "inferred");
+  assert.deepEqual(
+    Object.fromEntries(inferred.map((project) => [project.project_id, project.file_count])),
+    {
+      "inferred:.#bundler-jsx": 1,
+      "inferred:.#node-cjs": 1,
+      "inferred:.#node-esm/root": 1,
+      "inferred:.#node-esm/tests-1": 123,
+      "inferred:.#node-esm/tests-2": 124,
+      "inferred:nested#node-cjs": 1,
+    },
+  );
+  assert.ok(inferred.every((project) => project.file_count <= 150));
   await checker.close();
 });
 

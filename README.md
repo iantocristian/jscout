@@ -333,9 +333,12 @@ documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
 or `--role` to narrow that set. `--all` broadens it to the normally excluded
 cases and explicitly includes synthetic inferred projects for files outside
-every configured TypeScript project. Those files remain first-class in chunks,
-symbols, structural edges, FTS, embeddings, and retrieval when checker
-enrichment skips them.
+every configured TypeScript project. Inferred roots are grouped by nearest
+package and compatible compiler family, then deterministically subdivided at a
+150-root cap; imported dependencies can therefore share one TypeScript Program
+without recreating the former one-Program-per-file cost. Those files remain
+first-class in chunks, symbols, structural edges, FTS, embeddings, and retrieval
+when checker enrichment skips them.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
 files within each priority tier; configured projects execute before inferred
