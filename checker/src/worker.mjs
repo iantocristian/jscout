@@ -28,6 +28,10 @@ const ts = runtime.ts;
 let builtProject;
 const occurrenceCache = new WeakMap();
 let discoveryCache;
+const packageCache = new Map();
+const INFERRED_ROOT_CAP = 150;
+const INFERRED_FAMILIES = new Set(["node-esm", "node-cjs", "bundler-jsx"]);
+const ABSENT_INPUT_HASH = "absent:v1";
 
 function runtimeInputs() {
   const files = [runtime.resolved];
@@ -62,6 +66,16 @@ function stable(value) {
     return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
   }
   return value;
+}
+
+function compareText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function safeFailureMessage(failure, limit = 64 * 1024) {
+  return String(failure?.message ?? "checker request failed")
+    .replaceAll(root, "<repository>")
+    .slice(0, limit);
 }
 
 function normalizeOption(value) {
@@ -244,12 +258,286 @@ function projectPurpose(config, rawConfig, parsed) {
   };
 }
 
+function nearestPackage(file) {
+  let directory = path.dirname(file);
+  const visited = [];
+  while (insideRoot(directory)) {
+    const cached = packageCache.get(directory);
+    if (cached) {
+      for (const candidate of visited) packageCache.set(candidate, cached);
+      return cached;
+    }
+    visited.push(directory);
+    const manifest = path.join(directory, "package.json");
+    if (fs.existsSync(manifest) && fs.statSync(manifest).isFile()) {
+      let type = "commonjs";
+      try {
+        if (JSON.parse(fs.readFileSync(manifest, "utf8")).type === "module") type = "module";
+      } catch {
+        // TypeScript treats a malformed/absent package type as non-ESM for
+        // ordinary .js/.ts roots. The manifest remains a fingerprinted input,
+        // so repairing it invalidates the planned scope.
+      }
+      const record = { directory, manifest, type };
+      for (const candidate of visited) packageCache.set(candidate, record);
+      return record;
+    }
+    if (directory === root) break;
+    directory = path.dirname(directory);
+  }
+  const record = { directory: root, manifest: undefined, type: "commonjs" };
+  for (const candidate of visited) packageCache.set(candidate, record);
+  return record;
+}
+
+function inferredFamily(file, packageType) {
+  const lower = file.toLowerCase();
+  if (lower.endsWith(".jsx") || lower.endsWith(".tsx")) return "bundler-jsx";
+  if (lower.endsWith(".mjs") || lower.endsWith(".mts")) return "node-esm";
+  if (lower.endsWith(".cjs") || lower.endsWith(".cts")) return "node-cjs";
+  return packageType === "module" ? "node-esm" : "node-cjs";
+}
+
+function inferredOptions(_family) {
+  // Scope grouping is compiler-option neutral. Compiler-family labels separate
+  // roots that will eventually need different semantics, but this layer keeps
+  // the former ESNext + Bundler options. Sharing one Program can still change
+  // coverage when one root's transitive declarations become visible to a
+  // sibling. The pinned-corpus parity check covers mapped repository fact
+  // payloads, not identical resolved/unknown coverage.
+  return {
+    allowJs: true,
+    checkJs: false,
+    jsx: ts.JsxEmit.Preserve,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    target: ts.ScriptTarget.ESNext,
+  };
+}
+
+function packageIdentity(directory) {
+  const relative = path.relative(root, directory).split(path.sep).join("/");
+  return relative.length === 0 ? "." : relative;
+}
+
+function inferredPartIdentity(top, index) {
+  // Keep the root bucket distinct from a literal `root` directory, and encode
+  // the bin delimiter so directory names such as `tests-1` cannot collide with
+  // a generated second bin for `tests`.
+  const label = top === ""
+    ? "@root"
+    : encodeURIComponent(top).replaceAll("~", "%7E");
+  return `${label}~${index + 1}`;
+}
+
+function splitEvenly(values, cap = INFERRED_ROOT_CAP) {
+  if (values.length <= cap) return [values];
+  const partCount = Math.ceil(values.length / cap);
+  const minimum = Math.floor(values.length / partCount);
+  let extras = values.length % partCount;
+  const parts = [];
+  let offset = 0;
+  for (let index = 0; index < partCount; index += 1) {
+    const size = minimum + (extras > 0 ? 1 : 0);
+    extras -= extras > 0 ? 1 : 0;
+    parts.push(values.slice(offset, offset + size));
+    offset += size;
+  }
+  return parts;
+}
+
+function boundedDirectoryUnits(directory, records) {
+  const direct = [];
+  const children = new Map();
+  for (const record of records) {
+    const relative = path.relative(directory, record.file);
+    const [head, ...tail] = relative.split(path.sep);
+    if (tail.length === 0) {
+      direct.push(record);
+    } else {
+      const child = children.get(head) ?? [];
+      child.push(record);
+      children.set(head, child);
+    }
+  }
+  direct.sort((left, right) => compareText(left.file, right.file));
+  const units = direct.length > 0 ? splitEvenly(direct) : [];
+  for (const name of [...children.keys()].sort()) {
+    const child = children.get(name).sort((left, right) => compareText(left.file, right.file));
+    if (child.length <= INFERRED_ROOT_CAP) {
+      units.push(child);
+    } else {
+      units.push(...boundedDirectoryUnits(path.join(directory, name), child));
+    }
+  }
+  return units;
+}
+
+function packDirectory(records, directory) {
+  const bins = [];
+  let current = [];
+  for (const unit of boundedDirectoryUnits(directory, records)) {
+    if (current.length > 0 && current.length + unit.length > INFERRED_ROOT_CAP) {
+      bins.push(current);
+      current = [];
+    }
+    current.push(...unit);
+  }
+  if (current.length > 0) bins.push(current);
+  return bins;
+}
+
+function inferredProject(id, family, packageRecord, records) {
+  const absentManifests = new Set();
+  for (const record of records) {
+    let directory = path.dirname(record.file);
+    while (insideRoot(directory)) {
+      const manifest = path.join(directory, "package.json");
+      if (manifest === packageRecord.manifest) break;
+      // A dangling symlink is not a TypeScript package boundary, but it is
+      // still a lexical directory entry. Do not record it as an absent probe:
+      // validation below re-runs nearestPackage and will invalidate the scope
+      // if the target later appears and makes the boundary effective.
+      if (fs.lstatSync(manifest, { throwIfNoEntry: false }) === undefined) {
+        absentManifests.add(manifest);
+      }
+      if (directory === packageRecord.directory || directory === root) break;
+      directory = path.dirname(directory);
+    }
+  }
+  return {
+    id,
+    config: undefined,
+    manifest: packageRecord.manifest,
+    absentManifests: [...absentManifests].sort(),
+    packageDirectory: packageRecord.directory,
+    family,
+    options: inferredOptions(family),
+    fileNames: records.map((record) => record.file).sort(),
+    projectReferences: undefined,
+    purpose: "inferred",
+    purposeReasons: ["no-configured-owner", `compiler-family:${family}`],
+  };
+}
+
+function groupedInferredProjects(files) {
+  const groups = new Map();
+  for (const file of [...new Set(files)].sort()) {
+    const packageRecord = nearestPackage(file);
+    const family = inferredFamily(file, packageRecord.type);
+    const key = `${packageRecord.directory}\0${family}`;
+    const group = groups.get(key) ?? { packageRecord, family, records: [] };
+    group.records.push({ file });
+    groups.set(key, group);
+  }
+
+  const projects = [];
+  const projectByFile = new Map();
+  const orderedGroups = [...groups.values()].sort((left, right) => (
+    compareText(
+      packageIdentity(left.packageRecord.directory),
+      packageIdentity(right.packageRecord.directory),
+    ) || compareText(left.family, right.family)
+  ));
+  for (const group of orderedGroups) {
+    const prefix = `inferred:${packageIdentity(group.packageRecord.directory)}#${group.family}`;
+    group.records.sort((left, right) => compareText(left.file, right.file));
+    const scopes = [];
+    if (group.records.length <= INFERRED_ROOT_CAP) {
+      scopes.push({ id: prefix, records: group.records });
+    } else {
+      const byTopDirectory = new Map();
+      for (const record of group.records) {
+        const relative = path.relative(group.packageRecord.directory, record.file);
+        const parts = relative.split(path.sep);
+        const top = parts.length === 1 ? "" : parts[0];
+        const values = byTopDirectory.get(top) ?? [];
+        values.push(record);
+        byTopDirectory.set(top, values);
+      }
+      for (const top of [...byTopDirectory.keys()].sort()) {
+        const records = byTopDirectory.get(top);
+        const directory = top === ""
+          ? group.packageRecord.directory
+          : path.join(group.packageRecord.directory, top);
+        const bins = packDirectory(records, directory);
+        for (const [index, bin] of bins.entries()) {
+          const part = inferredPartIdentity(top, index);
+          scopes.push({ id: `${prefix}/${part}`, records: bin });
+        }
+      }
+    }
+    for (const scope of scopes) {
+      const project = inferredProject(scope.id, group.family, group.packageRecord, scope.records);
+      projects.push(project);
+      for (const record of scope.records) projectByFile.set(record.file, project);
+    }
+  }
+  projects.sort((left, right) => compareText(left.id, right.id));
+  return { projects, projectByFile };
+}
+
+function inferredProjectFromRequest(projectId, files) {
+  if (!projectId.startsWith("inferred:") || !Array.isArray(files) || files.length === 0) {
+    throw coded("protocol", "inferred resolve_members requires a non-empty project_files list");
+  }
+  if (files.length > INFERRED_ROOT_CAP) {
+    throw coded("protocol", `inferred project exceeds its ${INFERRED_ROOT_CAP}-root cap`);
+  }
+  const identity = projectId.slice("inferred:".length);
+  const separator = identity.lastIndexOf("#");
+  if (separator < 0) throw coded("project_not_found", `invalid inferred project id: ${projectId}`);
+  const packageId = identity.slice(0, separator);
+  const family = identity.slice(separator + 1).split("/", 1)[0];
+  if (!INFERRED_FAMILIES.has(family)) {
+    throw coded("project_not_found", `invalid inferred compiler family: ${projectId}`);
+  }
+  const canonical = [...new Set(files.map(resolveQueryFile))].sort();
+  if (canonical.length !== files.length) {
+    throw coded("protocol", "inferred project_files must be unique");
+  }
+  const packageRecords = canonical.map(nearestPackage);
+  for (const [index, file] of canonical.entries()) {
+    if (
+      packageIdentity(packageRecords[index].directory) !== packageId
+      || inferredFamily(file, packageRecords[index].type) !== family
+    ) {
+      throw coded("project_mismatch", `${path.relative(root, file)} is not compatible with ${projectId}`);
+    }
+  }
+  return inferredProject(projectId, family, packageRecords[0], canonical.map((file) => ({ file })));
+}
+
+function projectConfigInputs(project) {
+  const inputs = project.config ? configInputs(project.config) : [];
+  if (project.manifest) {
+    inputs.push({
+      // Preserve the lexical package boundary as the observed input. Hashing
+      // only its real target would miss a symlink retarget while the old target
+      // remained unchanged.
+      identity: relativeIdentity(project.manifest),
+      path: project.manifest,
+      source_hash: sourceHash(fs.readFileSync(project.manifest)),
+    });
+  }
+  for (const absent of project.absentManifests ?? []) {
+    inputs.push({
+      identity: `absent:${path.relative(root, absent).split(path.sep).join("/")}`,
+      path: absent,
+      source_hash: ABSENT_INPUT_HASH,
+    });
+  }
+  return inputs
+    .filter((value, index, all) => all.findIndex((other) => other.path === value.path) === index)
+    .sort((left, right) => compareText(left.identity, right.identity));
+}
+
 function projectSummary(project) {
   project.membershipFingerprint ??= digestText(
     [...project.fileNames].map((file) => projectMemberIdentity(file)).sort().join("\0"),
   );
   project.configFingerprint ??= digestText(JSON.stringify(
-    (project.config ? configInputs(project.config) : [])
+    projectConfigInputs(project)
       .map(({ identity, source_hash }) => ({ identity, source_hash })),
   ));
   return {
@@ -375,8 +663,7 @@ function configInputs(config, seen = new Set()) {
   return own.sort((left, right) => left.identity.localeCompare(right.identity));
 }
 
-function owningProjects(queryFile, force = false) {
-  const discovered = configuredProjects(force);
+function configuredOwnership(queryFile, discovered) {
   const discoveredOwners = discovered.ownersByFile.get(queryFile) ?? [];
   if (discoveredOwners.length > 0) {
     const primary = discoveredOwners.filter((project) => project.purpose !== "tooling");
@@ -395,43 +682,43 @@ function owningProjects(queryFile, force = false) {
       problems: discovered.problems,
     };
   }
-  const relative = path.relative(root, queryFile).split(path.sep).join("/");
+  return undefined;
+}
+
+function owningProjects(queryFile, force = false) {
+  const discovered = configuredProjects(force);
+  const configured = configuredOwnership(queryFile, discovered);
+  if (configured) return configured;
+  const grouped = groupedInferredProjects([queryFile]);
   return {
-    owners: [{
-      id: `inferred:${relative}`,
-      config: undefined,
-      options: {
-        allowJs: true,
-        checkJs: false,
-        jsx: ts.JsxEmit.Preserve,
-        module: ts.ModuleKind.ESNext,
-        moduleResolution: ts.ModuleResolutionKind.Bundler,
-        target: ts.ScriptTarget.ESNext,
-      },
-      fileNames: [queryFile],
-      projectReferences: undefined,
-      purpose: "inferred",
-      purposeReasons: ["no-configured-owner"],
-    }],
+    owners: grouped.projects,
     excludedOwners: [],
     toolingFallback: false,
     problems: discovered.problems,
   };
 }
 
-function projectById(projectId, queryFile) {
+function projectById(projectId, projectFiles) {
+  // `inferred:` is a reserved namespace (configured IDs are tsconfig paths).
+  // Resolve it first so each disposable inferred executor does not rescan and
+  // parse every repository config before constructing its supplied scope.
+  if (projectId.startsWith("inferred:")) {
+    return inferredProjectFromRequest(projectId, projectFiles);
+  }
   const discovered = configuredProjects();
   const configured = discovered.projects.find((project) => project.id === projectId);
   if (configured) return configured;
-  const relative = path.relative(root, queryFile).split(path.sep).join("/");
-  if (projectId !== `inferred:${relative}`) {
-    throw coded("project_not_found", `query file is not owned by project ${projectId}`);
-  }
-  return owningProjects(queryFile).owners.find((project) => project.id === projectId);
+  throw coded("project_not_found", `project not found: ${projectId}`);
 }
 
 function buildProject(project) {
-  if (builtProject?.project.id === project.id) return builtProject;
+  const membershipIdentity = [...project.fileNames].sort().join("\0");
+  if (builtProject?.project.id === project.id) {
+    if (builtProject.membershipIdentity !== membershipIdentity) {
+      throw coded("project_mismatch", "project membership changed within one checker worker");
+    }
+    return builtProject;
+  }
   if (builtProject) {
     throw coded("project_switch", "one checker worker may resolve only one configured project");
   }
@@ -459,13 +746,13 @@ function buildProject(project) {
     });
   }
   sourceInputs.sort((left, right) => left.identity.localeCompare(right.identity));
-  const configs = project.config ? configInputs(project.config) : [];
+  const configs = projectConfigInputs(project);
   const compilerInputs = runtimeInputs();
   const inputFiles = [...compilerInputs, ...configs, ...sourceInputs]
     .filter((value, index, all) => all.findIndex((other) => other.path === value.path) === index)
     .sort((left, right) => left.path.localeCompare(right.path));
   const fingerprint = digestText(JSON.stringify(stable({
-    protocol: 2,
+    protocol: 3,
     typescript: { version: ts.version, source: runtime.source },
     compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
@@ -473,7 +760,15 @@ function buildProject(project) {
     options: normalizeOption(project.options),
     inputs: sourceInputs.map(({ identity, source_hash }) => [identity, source_hash]),
   })));
-  builtProject = { project, program, checker, fingerprint, inputFiles, sourceFiles: new Map() };
+  builtProject = {
+    project,
+    program,
+    checker,
+    fingerprint,
+    inputFiles,
+    sourceFiles: new Map(),
+    membershipIdentity,
+  };
   return builtProject;
 }
 
@@ -591,10 +886,22 @@ function declarationResult(declaration) {
 
 function planMembers(files) {
   if (!Array.isArray(files)) throw coded("protocol", "plan_members requires files");
+  packageCache.clear();
   const unique = [...new Set(files)].sort();
-  const ownership = unique.map((file) => {
+  const discovered = configuredProjects();
+  const planned = unique.map((file) => {
     const queryFile = resolveQueryFile(file);
-    const decision = owningProjects(queryFile);
+    return { file, queryFile, decision: configuredOwnership(queryFile, discovered) };
+  });
+  const inferred = groupedInferredProjects(
+    planned.filter((entry) => !entry.decision).map((entry) => entry.queryFile),
+  );
+  const ownership = planned.map(({ file, queryFile, decision }) => {
+    decision ??= {
+      owners: [inferred.projectByFile.get(queryFile)],
+      excludedOwners: [],
+      toolingFallback: false,
+    };
     return {
       file,
       project_ids: decision.owners.map((project) => project.id).sort(),
@@ -602,16 +909,17 @@ function planMembers(files) {
       tooling_fallback: decision.toolingFallback,
     };
   });
-  const discovered = configuredProjects();
   return {
     typescript: { version: ts.version, source: runtime.source },
     files: ownership,
-    projects: discovered.projects.map(projectSummary),
+    projects: [...discovered.projects, ...inferred.projects]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map(projectSummary),
     configuration_problems: discovered.problems,
   };
 }
 
-function resolveInProject(built, query, buffers) {
+function sourceRecordForQuery(query, buffers) {
   const queryFile = resolveQueryFile(query.file);
   let sourceRecord = buffers.get(queryFile);
   if (!sourceRecord) {
@@ -625,6 +933,11 @@ function resolveInProject(built, query, buffers) {
   if (query.indexed_hash !== sourceRecord.hash) {
     throw coded("hash_mismatch", `query source changed after indexing: ${query.file}`);
   }
+  return { queryFile, sourceRecord };
+}
+
+function resolveInProject(built, query, buffers, prepared = sourceRecordForQuery(query, buffers)) {
+  const { queryFile, sourceRecord } = prepared;
   const spans = requestSpans(sourceRecord.buffer, query);
   const source = built.program.getSourceFile(queryFile);
   let answer;
@@ -666,6 +979,24 @@ function resolveInProject(built, query, buffers) {
   };
 }
 
+function failedFileResult(built, query, sourceRecord, failure) {
+  const message = safeFailureMessage(failure, 512);
+  return {
+    indexed_hash: query.indexed_hash,
+    source_hash: sourceRecord.hash,
+    answer: {
+      project_id: built.project.id,
+      status: "failed",
+      declarations: [],
+      checker_input_fingerprint: built.fingerprint,
+      error: {
+        code: failure?.code ?? "checker_failure",
+        message,
+      },
+    },
+  };
+}
+
 function resources() {
   const usage = process.memoryUsage();
   return {
@@ -675,29 +1006,63 @@ function resources() {
   };
 }
 
-function resolveMembers(projectId, queries) {
+function resolveMembers(projectId, projectFiles, queries) {
   if (typeof projectId !== "string" || projectId.length === 0) {
     throw coded("protocol", "resolve_members requires project_id");
   }
   if (!Array.isArray(queries) || queries.length === 0 || queries.length > 512) {
     throw coded("protocol", "resolve_members requires between 1 and 512 queries");
   }
-  const firstFile = resolveQueryFile(queries[0].file);
-  const project = projectById(projectId, firstFile);
+  const project = projectById(projectId, projectFiles);
   if (!project) throw coded("project_not_found", `project not found: ${projectId}`);
-  const projectFiles = new Set(project.fileNames);
+  const projectFileSet = new Set(project.fileNames);
   for (const query of queries) {
     const queryFile = resolveQueryFile(query.file);
     // The Rust planner may deliberately promote an owner that this sidecar's
     // coarse purpose heuristic put in excluded_project_ids. At execution time
     // validate actual parsed TypeScript membership, not the heuristic owner
     // preference a second time.
-    if (!projectFiles.has(queryFile)) {
+    if (!projectFileSet.has(queryFile)) {
       throw coded("project_mismatch", `${query.file} is not owned by ${projectId}`);
     }
   }
   const built = buildProject(project);
-  const results = queries.map((query) => resolveInProject(built, query, built.sourceFiles));
+  let results;
+  if (projectId.startsWith("inferred:")) {
+    results = Array(queries.length);
+    const queriesByFile = new Map();
+    for (const [index, query] of queries.entries()) {
+      const queryFile = resolveQueryFile(query.file);
+      const entries = queriesByFile.get(queryFile) ?? [];
+      entries.push({ index, query });
+      queriesByFile.set(queryFile, entries);
+    }
+    for (const entries of queriesByFile.values()) {
+      // Missing or changed bytes are a project-input race and remain
+      // project-atomic. Once source identity is proven, a span/checker fault is
+      // attributable to this file and must not discard sibling roots.
+      const prepared = entries.map(({ query }) => sourceRecordForQuery(query, built.sourceFiles));
+      try {
+        for (const [offset, { index, query }] of entries.entries()) {
+          results[index] = resolveInProject(built, query, built.sourceFiles, prepared[offset]);
+        }
+      } catch (failure) {
+        // TypeScript checker exceptions are ordinarily plain `Error` objects.
+        // Coded filesystem, protocol, and project races remain scope-atomic;
+        // an uncoded fault after every source hash was validated is local to
+        // this file and is reported as `checker_failure`.
+        if (failure?.code !== undefined
+          && !["invalid_span", "span_mismatch", "checker_failure"].includes(failure.code)) {
+          throw failure;
+        }
+        for (const [offset, { index, query }] of entries.entries()) {
+          results[index] = failedFileResult(built, query, prepared[offset].sourceRecord, failure);
+        }
+      }
+    }
+  } else {
+    results = queries.map((query) => resolveInProject(built, query, built.sourceFiles));
+  }
   const response = {
     project_id: projectId,
     typescript: { version: ts.version, source: runtime.source },
@@ -718,9 +1083,29 @@ function validateProject(projectId, fingerprint) {
   let inputsValid = true;
   for (const input of builtProject.inputFiles) {
     try {
-      if (sourceHash(fs.readFileSync(input.path)) !== input.source_hash) inputsValid = false;
-    } catch {
-      inputsValid = false;
+      if (input.source_hash === ABSENT_INPUT_HASH) {
+        fs.lstatSync(input.path);
+        inputsValid = false;
+      } else if (sourceHash(fs.readFileSync(input.path)) !== input.source_hash) {
+        inputsValid = false;
+      }
+    } catch (failure) {
+      if (input.source_hash !== ABSENT_INPUT_HASH || failure?.code !== "ENOENT") {
+        inputsValid = false;
+      }
+    }
+  }
+  if (builtProject.project.purpose === "inferred") {
+    packageCache.clear();
+    for (const file of builtProject.project.fileNames) {
+      const current = nearestPackage(file);
+      if (
+        current.directory !== builtProject.project.packageDirectory
+        || current.manifest !== builtProject.project.manifest
+        || inferredFamily(file, current.type) !== builtProject.project.family
+      ) {
+        inputsValid = false;
+      }
     }
   }
   return {
@@ -833,7 +1218,11 @@ parentPort.on("message", (message) => {
     } else if (message.kind === "resolve_members") {
       payload = {
         kind: "resolve_members_result",
-        result: resolveMembers(message.project_id, message.queries ?? []),
+        result: resolveMembers(
+          message.project_id,
+          message.project_files ?? [],
+          message.queries ?? [],
+        ),
       };
     } else if (message.kind === "validate_inputs") {
       payload = { kind: "validate_inputs_result", result: validateInputs(message.entries ?? []) };
@@ -853,7 +1242,7 @@ parentPort.on("message", (message) => {
         kind: "error",
         error: {
           code: failure?.code ?? "checker_failure",
-          message: failure?.message ?? "checker request failed",
+          message: safeFailureMessage(failure),
         },
       },
     });

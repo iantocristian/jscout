@@ -126,11 +126,11 @@ export const EMBEDDING_FIXTURE = Object.freeze({
 });
 
 export const ENRICHMENT_INVARIANTS = Object.freeze({
-  projects: 458,
+  projects: 12,
   occurrences_selected: 5_158,
-  request_batches: 466,
+  request_batches: 47,
   facts_published: 1_412,
-  unknown_answers: 1_689,
+  unknown_answers: 1_102,
   occurrences_resumed: 5_158,
 });
 

@@ -385,11 +385,13 @@ impl ProcessChecker {
     pub fn resolve_members(
         &mut self,
         project_id: String,
+        project_files: Vec<String>,
         queries: Vec<MemberQuery>,
         timeout: Duration,
     ) -> Result<MemberBatchResult, CheckerError> {
         let id = self.send_active(&Outbound::ResolveMembers {
             project_id,
+            project_files,
             queries,
         })?;
         let result = match self.receive_for(&id, timeout) {
@@ -545,13 +547,13 @@ mod tests {
     // Canned protocol frames. Request IDs are deterministic per process: the
     // client numbers from r1, so hello is r1, the one resolve_member is r2, and
     // the cancel that follows it is r3.
-    const READY: &str = r#"{"protocol":2,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":2}}"#;
-    const UNKNOWN_RESULT: &str = r#"{"protocol":2,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:a.ts","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
-    const OUTSIDE_ERROR: &str = r#"{"protocol":2,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
-    const CANCELED: &str = r#"{"protocol":2,"id":"r2","kind":"canceled","reason":"requested"}"#;
+    const READY: &str = r#"{"protocol":3,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":3}}"#;
+    const UNKNOWN_RESULT: &str = r#"{"protocol":3,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:.#node-cjs","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
+    const OUTSIDE_ERROR: &str = r#"{"protocol":3,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
+    const CANCELED: &str = r#"{"protocol":3,"id":"r2","kind":"canceled","reason":"requested"}"#;
     const CANCEL_RESULT: &str =
-        r#"{"protocol":2,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
-    const SHUTDOWN_RESULT: &str = r#"{"protocol":2,"id":"r3","kind":"shutdown_result"}"#;
+        r#"{"protocol":3,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
+    const SHUTDOWN_RESULT: &str = r#"{"protocol":3,"id":"r3","kind":"shutdown_result"}"#;
 
     /// Write an executable fake sidecar (a `/bin/sh` script) answering the
     /// protocol from canned case patterns, and return it as the "node" binary

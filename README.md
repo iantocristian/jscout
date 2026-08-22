@@ -333,9 +333,17 @@ documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
 or `--role` to narrow that set. `--all` broadens it to the normally excluded
 cases and explicitly includes synthetic inferred projects for files outside
-every configured TypeScript project. Those files remain first-class in chunks,
-symbols, structural edges, FTS, embeddings, and retrieval when checker
-enrichment skips them.
+every configured TypeScript project. Inferred roots are grouped by nearest
+package and compatible compiler family, then deterministically subdivided at a
+150-root cap; imported dependencies can therefore share one TypeScript Program
+without recreating the former one-Program-per-file cost. Those files remain
+first-class in chunks, symbols, structural edges, FTS, embeddings, and retrieval
+when checker enrichment skips them.
+Sharing a Program can expose ambient declarations loaded through one root to
+its siblings. On pinned ai-pipe, 587 occurrences moved from unknown to
+`@types/node` declarations while all 1,412 mapped repository fact payloads
+remained unchanged; on that corpus grouping was fact-neutral, not
+coverage-neutral.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
 files within each priority tier; configured projects execute before inferred
@@ -521,7 +529,9 @@ Checker enrichment may publish a partial batch when some projects fail. A
 transient project failure uses the phase retry loop; a partial batch containing
 only deterministic project failures completes the generation with
 `status=partial` and those projects are attempted again after the next source
-generation or periodic reconciliation. A checker worker or whole sidecar
+generation or periodic reconciliation. Published partial batches remain
+immutable; retryable rows are cloned into inactive staging before another
+checker is launched. A checker worker or whole sidecar
 process crash/exit is project-terminal: successful project staging is retained
 and the crashed project follows that generation/reconciliation recovery path
 instead of an uncapped immediate crash loop. Recognized launch, request,
