@@ -1604,6 +1604,736 @@ fn checker_batch_is_removed_after_snapshot_changes() -> Result<()> {
 }
 
 #[test]
+fn receiver_value_flow_resolves_this_new_and_one_hop_inheritance() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "base.ts",
+        "export class Base { inherited() {} staticOnly() {} shadowed() {} field() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import { Base } from './base';\n\
+         class Child extends Base {\n\
+           own() {}\n\
+           static staticOnly() {}\n\
+           get accessor() { return () => {}; }\n\
+           get shadowed() { return () => {}; }\n\
+           field = null;\n\
+           run() {\n\
+             this.own();\n\
+             this.inherited();\n\
+             const arrow = () => this.own();\n\
+             function nested() { this.own(); }\n\
+             arrow(); nested();\n\
+           }\n\
+         }\n\
+         const child = new Child();\n\
+         child.own();\n\
+         new Child().own();\n\
+         child.staticOnly();\n\
+         child.accessor();\n\
+         child.shadowed();\n\
+         child.field();\n\
+         let mutable = new Child();\n\
+         mutable.own();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let mut statement = conn.prepare(
+        "SELECT target.display_name, target.meta_json, edge.detail_json
+         FROM resolved_edges edge
+         JOIN graph_nodes target ON target.node_key=edge.dst_key
+         WHERE edge.provenance='receiver-value-flow'
+         ORDER BY edge.line, edge.id",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        rows.len(),
+        6,
+        "nested-function `this`, non-instance members, and `let` must give up"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+        ["own", "inherited", "own", "own", "own", "staticOnly"]
+    );
+    let inherited_meta: serde_json::Value = serde_json::from_str(&rows[1].1)?;
+    assert_eq!(inherited_meta["path"], "base.ts");
+    let inherited_static_name_meta: serde_json::Value = serde_json::from_str(&rows[5].1)?;
+    assert_eq!(inherited_static_name_meta["path"], "base.ts");
+    for (_, _, detail) in rows {
+        let detail: serde_json::Value = serde_json::from_str(&detail)?;
+        assert_eq!(detail["candidateCount"], 1);
+        assert_eq!(detail["occurrenceSpecific"], true);
+    }
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_closes_factory_returns_through_depth_two() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "adapters.ts",
+        "export class PgAdapter { save() {} }\n\
+         export class SqliteAdapter { save() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "factories.ts",
+        "import { PgAdapter, SqliteAdapter } from './adapters';\n\
+         export const createPg = () => new PgAdapter();\n\
+         export function createSqlite() { const db = new SqliteAdapter(); return db; }\n\
+         export function openDatabase(kind) {\n\
+           if (kind) return createPg();\n\
+           return createSqlite();\n\
+         }\n\
+         export function layerTwo() { return openDatabase('sqlite'); }\n\
+         export function layerThree() { return layerTwo(); }\n\
+         export async function freshDb() { return openDatabase('sqlite'); }\n\
+         export function conditional(kind) {\n\
+           return kind ? new PgAdapter() : new SqliteAdapter();\n\
+         }\n\
+         export function incomplete(kind, value) {\n\
+           if (kind) return new PgAdapter();\n\
+           return value;\n\
+         }\n\
+         export function fallthrough(kind) {\n\
+           if (kind) return new PgAdapter();\n\
+         }\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import { openDatabase, layerTwo, layerThree, freshDb, conditional, incomplete, fallthrough } from './factories';\n\
+         const direct = openDatabase('pg'); direct.save();\n\
+         const bounded = layerTwo(); bounded.save();\n\
+         const awaited = await freshDb(); awaited.save();\n\
+         const promise = freshDb(); promise.save();\n\
+         const deep = layerThree(); deep.save();\n\
+         const dynamic = conditional(true); dynamic.save();\n\
+         const partial = incomplete(true, null); partial.save();\n\
+         const missing = fallthrough(true); missing.save();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let mut statement = conn.prepare(
+        "SELECT edge.line, target.display_name, edge.confidence, edge.detail_json
+         FROM resolved_edges edge
+         JOIN graph_nodes target ON target.node_key=edge.dst_key
+         WHERE edge.provenance='receiver-value-flow'
+         ORDER BY edge.line, target.display_name",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        rows.len(),
+        4,
+        "only the two synchronous bounded calls have two targets each"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+        ["save", "save", "save", "save"]
+    );
+    assert!(rows.iter().all(|row| row.2 == "likely"));
+    let mut flows = Vec::new();
+    for (_, _, _, detail) in rows {
+        let detail: serde_json::Value = serde_json::from_str(&detail)?;
+        flows.push(detail["flow"].as_str().unwrap_or_default().to_string());
+        assert_eq!(detail["candidateCount"], 2);
+        assert_eq!(detail["receiverClasses"].as_array().map(Vec::len), Some(2));
+    }
+    assert_eq!(flows, ["factory", "factory", "factory", "factory"]);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_awaited_thenable_assimilation() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.ts",
+        "class Replacement { run() {} }\n\
+         class Thenable {\n\
+           run() {}\n\
+           then(resolve: (value: Replacement) => void) { resolve(new Replacement()); }\n\
+         }\n\
+         async function make() { return new Thenable(); }\n\
+         (await new Thenable()).run();\n\
+         (await make()).run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_dynamic_with_scope() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.js",
+        "class A { run() {} }\n\
+         class B { run() {} }\n\
+         with ({ A: B }) { new A().run(); }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_eval_scope_mutation() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.js",
+        "class A { run() {} }\n\
+         class B { run() {} }\n\
+         function make() { return new A(); }\n\
+         (0, eval)(\"make = function() { return new B(); }\");\n\
+         make().run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_sloppy_block_factory_redeclaration() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.js",
+        "class A { run() {} }\n\
+         class B { run() {} }\n\
+         function make() { return new A(); }\n\
+         if (true) { function make() { return new B(); } }\n\
+         make().run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_follows_exported_const_values() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "adapter.ts",
+        "export class Adapter { save() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "singleton.ts",
+        "import { Adapter } from './adapter';\n\
+         export const singleton = new Adapter();\n\
+         export function current() { return singleton; }\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import { singleton, current } from './singleton';\n\
+         singleton.save();\n\
+         const alias = singleton; alias.save();\n\
+         const fromFactory = current(); fromFactory.save();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rows = conn
+        .prepare(
+            "SELECT edge.confidence, edge.detail_json
+             FROM resolved_edges edge
+             WHERE edge.provenance='receiver-value-flow'
+             ORDER BY edge.line, edge.id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.0 == "likely"));
+    let flows = rows
+        .iter()
+        .map(|row| {
+            serde_json::from_str::<serde_json::Value>(&row.1)
+                .map(|detail| detail["flow"].as_str().unwrap_or_default().to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(flows, ["binding", "binding", "factory"]);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_accepts_three_classes_and_rejects_four() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "classes.ts",
+        "export class A { run() {} }\n\
+         export class B { run() {} }\n\
+         export class C { run() {} }\n\
+         export class D { run() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "factories.ts",
+        "import { A, B, C, D } from './classes';\n\
+         export function three(value) {\n\
+           if (value === 1) return new A();\n\
+           if (value === 2) return new B();\n\
+           return new C();\n\
+         }\n\
+         export function four(value) {\n\
+           if (value === 1) return new A();\n\
+           if (value === 2) return new B();\n\
+           if (value === 3) return new C();\n\
+           return new D();\n\
+         }\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import { three, four } from './factories';\n\
+         const accepted = three(1); accepted.run();\n\
+         const rejected = four(1); rejected.run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rows = conn
+        .prepare(
+            "SELECT target.display_name, edge.detail_json
+             FROM resolved_edges edge
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE edge.provenance='receiver-value-flow'
+             ORDER BY target.node_key",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 3, "the four-class receiver must give up");
+    assert!(rows.iter().all(|row| row.0 == "run"));
+    for (_, detail) in rows {
+        let detail: serde_json::Value = serde_json::from_str(&detail)?;
+        assert_eq!(detail["candidateCount"], 3);
+        assert_eq!(detail["receiverClasses"].as_array().map(Vec::len), Some(3));
+    }
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_unstable_or_non_identity_preserving_bindings() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.ts",
+        "class RootService { run() {} }\n\
+         class Replacement { run() {} }\n\
+         const service = new RootService();\n\
+         function parameter(service) { return service; }\n\
+         function localLet() { let service = new Replacement(); return service; }\n\
+         function localClass() { class RootService { run() {} } return new RootService(); }\n\
+         function make() { return new RootService(); }\n\
+         function nestedFactory() { function make() { return new Replacement(); } return make(); }\n\
+         function mutableFactory() { return new RootService(); }\n\
+         mutableFactory = () => new Replacement();\n\
+         class MutableClass { run() {} }\n\
+         MutableClass = Replacement;\n\
+         function makeContainer() { return new RootService(); }\n\
+         const { picked } = makeContainer();\n\
+         const [first] = makeContainer();\n\
+         function optionalFactory() { return new RootService(); }\n\
+         const optional = optionalFactory?.();\n\
+         const overwritten = new RootService();\n\
+         overwritten.run = () => {};\n\
+         parameter(service).run();\n\
+         localLet().run();\n\
+         localClass().run();\n\
+         nestedFactory().run();\n\
+         mutableFactory().run();\n\
+         new MutableClass().run();\n\
+         picked.run();\n\
+         first.run();\n\
+         optional.run();\n\
+         overwritten.run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let projected: i64 = conn.query_row(
+        "SELECT count(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        projected, 0,
+        "shadowing, reassignment, destructuring, and optional calls must remain on hubs"
+    );
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_constructor_decorator_and_static_property_mutation() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.ts",
+        "function decorate(value: unknown) { return value; }\n\
+         class Safe { run() {} }\n\
+         class Replacement { run() {} }\n\
+         class Base { run() {} }\n\
+         class Returning { constructor() { return new Replacement(); } run() {} }\n\
+         class ReturningBase { constructor() { return new Replacement(); } }\n\
+         class ReturningChild extends ReturningBase { run() {} }\n\
+         function dynamicBase() { return class { constructor() { return new Replacement(); } }; }\n\
+         class DynamicChild extends dynamicBase() { run() {} }\n\
+         @decorate class DecoratedClass { run() {} }\n\
+         class DecoratedMethod { @decorate run() {} }\n\
+         class DecoratedElsewhere { run() {} @decorate other() {} }\n\
+         class DecoratedParameter { run() {} constructor(@decorate value: unknown) {} }\n\
+         class DecoratedProperty { run() {} @decorate other = 1; }\n\
+         class ComputedWritten { run() {} constructor() { this['run'] = () => {}; } }\n\
+         class DynamicWritten { run() {} constructor(key: string) { this[key] = () => {}; } }\n\
+         class ParameterProperty extends Base { constructor(public run: () => void) { super(); } }\n\
+         class InitializingBase { constructor() { this.run = () => {}; } }\n\
+         class DerivedOwn extends InitializingBase { run() {} }\n\
+         class FieldBase { run = () => {}; }\n\
+         class DerivedFieldOwn extends FieldBase { run() {} }\n\
+         const computedKey = 'run'; class ComputedOverride extends Base { [computedKey]() {} }\n\
+         function duplicateFactory() { return new Safe(); }\n\
+         function duplicateFactory() { return new Replacement(); }\n\
+         function mixedFactory() { return new Safe(); }\n\
+         var mixedFactory = function() { return new Replacement(); };\n\
+         function destructuredFactory() { return new Safe(); }\n\
+         var { destructuredFactory } = { destructuredFactory: function() { return new Replacement(); } };\n\
+         const computed = new Safe(); computed['run'] = () => {};\n\
+         const dynamic = new Safe(); const key = 'run'; dynamic[key] = () => {};\n\
+         const deleted = new Safe(); delete deleted.run;\n\
+         const updated = new Safe(); updated.run++;\n\
+         const iterated = new Safe(); for (iterated.run of [() => {}]) {}\n\
+         const destructured = new Safe(); [destructured.run] = [() => {}];\n\
+         function overwrittenFactory() { const value = new Safe(); value.run = () => {}; return value; }\n\
+         new Safe().run();\n\
+         new Returning().run();\n\
+         new ReturningChild().run();\n\
+         new DynamicChild().run();\n\
+         new DecoratedClass().run();\n\
+         new DecoratedMethod().run();\n\
+         new DecoratedElsewhere().run();\n\
+         new DecoratedParameter(1).run();\n\
+         new DecoratedProperty().run();\n\
+         new ComputedWritten().run();\n\
+         new DynamicWritten('run').run();\n\
+         new ParameterProperty(() => {}).run();\n\
+         new DerivedOwn().run();\n\
+         new DerivedFieldOwn().run();\n\
+         new ComputedOverride().run();\n\
+         duplicateFactory().run();\n\
+         mixedFactory().run();\n\
+         destructuredFactory().run();\n\
+         computed.run();\n\
+         dynamic.run();\n\
+         deleted.run();\n\
+         updated.run();\n\
+         iterated.run();\n\
+         destructured.run();\n\
+         overwrittenFactory().run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rows = conn
+        .prepare(
+            "SELECT target.display_name, edge.detail_json
+             FROM resolved_edges edge
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE edge.provenance='receiver-value-flow'
+             ORDER BY edge.line, edge.id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "run");
+    let detail: serde_json::Value = serde_json::from_str(&rows[0].1)?;
+    assert_eq!(
+        detail["receiverClasses"],
+        serde_json::json!(["main.ts#Safe"])
+    );
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_accepts_namespace_factories_but_not_object_members() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "factory.ts",
+        "export class A { run() {} }\n\
+         export class B { run() {} }\n\
+         export function make() { return new A(); }\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import * as ns from './factory';\n\
+         import { A, B } from './factory';\n\
+         function holder() { return new A(); }\n\
+         holder.make = () => new B();\n\
+         const exact = ns.make();\n\
+         exact.run?.();\n\
+         const property = holder.make();\n\
+         property.run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let lines = conn
+        .prepare(
+            "SELECT line FROM resolved_edges
+             WHERE provenance='receiver-value-flow' ORDER BY line, id",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(lines, [6]);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_handles_instance_fields_and_respects_method_blockers() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.ts",
+        "class Service {\n\
+           run() {}\n\
+           direct = this.run();\n\
+           arrow = () => this.run();\n\
+           static bad = this.run();\n\
+           ['computed'] = this.run();\n\
+           nested = function () { this.run(); };\n\
+         }\n\
+         class Shadow { run() {} run = () => {}; }\n\
+         new Shadow().run();\n\
+         class Base { inherited() {} inherited = () => {}; }\n\
+         class Child extends Base {}\n\
+         new Child().inherited();\n\
+         class Written { run() {} constructor() { this.run = () => {}; } }\n\
+         new Written().run();\n\
+         class Overloaded {\n\
+           run(value: string): void;\n\
+           run(value: number): void;\n\
+           run(_value: string | number): void {}\n\
+         }\n\
+         new Overloaded().run('x');\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rows = conn
+        .prepare(
+            "SELECT line, json_extract(detail_json, '$.flow')
+             FROM resolved_edges WHERE provenance='receiver-value-flow'
+             ORDER BY line, id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        rows,
+        [
+            (3, "this".into()),
+            (4, "this".into()),
+            (21, "construct".into())
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_requires_exact_nonheuristic_export_resolution() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(repo.path(), "a.ts", "export class Service { run() {} }\n")?;
+    write(repo.path(), "b.ts", "export class Service { run() {} }\n")?;
+    write(repo.path(), "named.ts", "export { Service } from './a';\n")?;
+    write(
+        repo.path(),
+        "default.ts",
+        "export default class DefaultService { run() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "default-barrel.ts",
+        "export * from './default';\n",
+    )?;
+    write(
+        repo.path(),
+        "ambiguous.ts",
+        "export * from './a';\nexport * from './b';\n",
+    )?;
+    write(
+        repo.path(),
+        "main.ts",
+        "import { Service as Exact } from './named';\n\
+         import { Service as Ambiguous } from './ambiguous';\n\
+         import DefaultThroughStar from './default-barrel';\n\
+         new Exact().run();\n\
+         new Ambiguous().run();\n\
+         new DefaultThroughStar().run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let targets = conn
+        .prepare(
+            "SELECT target.display_name, json_extract(target.meta_json, '$.path')
+             FROM resolved_edges edge
+             JOIN graph_nodes target ON target.node_key=edge.dst_key
+             WHERE edge.provenance='receiver-value-flow'
+             ORDER BY edge.line, edge.id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(targets, [("run".into(), "a.ts".into())]);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_rejects_workspace_inferred_module_edges() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "pnpm-workspace.yaml",
+        "packages:\n  - packages/*\n",
+    )?;
+    write(
+        repo.path(),
+        "packages/lib/package.json",
+        r#"{"name":"@acme/lib"}"#,
+    )?;
+    write(
+        repo.path(),
+        "packages/lib/src/service.ts",
+        "export class Service { run() {} }\n",
+    )?;
+    write(
+        repo.path(),
+        "packages/app/package.json",
+        r#"{"name":"@acme/app"}"#,
+    )?;
+    write(
+        repo.path(),
+        "packages/app/src/main.ts",
+        "import { Service } from '@acme/lib/service';\nnew Service().run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let resolution: String = conn.query_row(
+        "SELECT resolution FROM module_edges edge
+         JOIN files file ON file.id=edge.from_file
+         WHERE file.path='packages/app/src/main.ts'
+           AND edge.request='@acme/lib/service'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(resolution, "workspace-inferred");
+    let projected: i64 = conn.query_row(
+        "SELECT count(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(projected, 0);
+    Ok(())
+}
+
+#[test]
+fn receiver_value_flow_is_removed_when_a_const_becomes_unsupported() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "main.ts",
+        "class Service { run() {} }\nconst service = new Service();\nservice.run();\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let count = |conn: &rusqlite::Connection| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM resolved_edges WHERE provenance='receiver-value-flow'",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    assert_eq!(count(&conn)?, 1);
+
+    write(
+        repo.path(),
+        "main.ts",
+        "class Service { run() {} }\n\
+         const service = Math.random() ? new Service() : null;\n\
+         service.run();\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    assert_eq!(count(&conn)?, 0);
+    Ok(())
+}
+
+#[test]
 fn rebuild_reroutes_barrel_reexports() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(repo.path(), "a.ts", "export function target() {}\n")?;

@@ -220,9 +220,45 @@ function databaseCounters(sqlite, database, env) {
       (SELECT count(*) FROM refs) AS refs,
       (SELECT count(*) FROM member_calls) AS member_calls,
       (SELECT count(*) FROM graph_nodes) AS graph_nodes,
-      (SELECT count(*) FROM resolved_edges) AS resolved_edges;
+      (SELECT count(*) FROM resolved_edges) AS resolved_edges,
+      (SELECT count(*) FROM resolved_edges
+         WHERE provenance = 'receiver-value-flow') AS receiver_value_flow_edges,
+      (SELECT count(DISTINCT source_ref_id) FROM resolved_edges
+         WHERE provenance = 'receiver-value-flow') AS receiver_value_flow_occurrences;
   `, env);
   return row;
+}
+
+function receiverValueFlowDigest(sqlite, database, env) {
+  const rows = sqliteJson(sqlite, database, `
+    SELECT file.path, file.hash AS source_hash,
+           call.start AS call_start, call.end AS call_end,
+           call.receiver_start, call.receiver_end,
+           call.property_start, call.property_end, call.prop,
+           json_extract(edge.detail_json, '$.flow') AS flow,
+           edge.dst_key
+    FROM resolved_edges edge
+    JOIN files file ON file.id=edge.source_file_id
+    JOIN member_calls call ON call.rowid=edge.source_ref_id
+    WHERE edge.provenance='receiver-value-flow'
+    ORDER BY file.path, file.hash, call.start, call.end,
+             call.receiver_start, call.receiver_end,
+             call.property_start, call.property_end, call.prop, flow, edge.dst_key;
+  `, env);
+  const normalized = rows.map((row) => JSON.stringify([
+    row.path,
+    row.source_hash,
+    row.call_start,
+    row.call_end,
+    row.receiver_start,
+    row.receiver_end,
+    row.property_start,
+    row.property_end,
+    row.prop,
+    row.flow,
+    row.dst_key,
+  ])).join('\n');
+  return sha256Bytes(`${normalized}\n`);
 }
 
 function validateCorpusCounts(actual) {
@@ -234,6 +270,8 @@ function validateCorpusCounts(actual) {
     member_calls: 'member_calls',
     graph_nodes: 'graph_nodes',
     graph_edges: 'resolved_edges',
+    receiver_value_flow_edges: 'receiver_value_flow_edges',
+    receiver_value_flow_occurrences: 'receiver_value_flow_occurrences',
   };
   for (const [invariant, actualKey] of Object.entries(mappings)) {
     const expected = CORPUS_INVARIANTS[invariant];
@@ -283,6 +321,16 @@ function runIndexSuite(context) {
   validateIndexReport(parseIndexReport(first.stdout));
   const firstCounts = databaseCounters(context.sqlite, firstDatabase, context.env);
   validateCorpusCounts(firstCounts);
+  const firstValueFlowDigest = receiverValueFlowDigest(
+    context.sqlite,
+    firstDatabase,
+    context.env,
+  );
+  assertEqual(
+    firstValueFlowDigest,
+    CORPUS_INVARIANTS.receiver_value_flow_digest,
+    'first receiver value-flow digest',
+  );
   const firstIntegrity = integrityCheck(context, firstDatabase);
 
   const samples = [];
@@ -297,8 +345,18 @@ function runIndexSuite(context) {
     databases.push(database);
     seedDatabase = database;
     validateCorpusCounts(databaseCounters(context.sqlite, database, context.env));
+    assertEqual(
+      receiverValueFlowDigest(context.sqlite, database, context.env),
+      CORPUS_INVARIANTS.receiver_value_flow_digest,
+      `receiver value-flow digest sample ${index + 1}`,
+    );
   }
   const counters = databaseCounters(context.sqlite, seedDatabase, context.env);
+  const seedValueFlowDigest = receiverValueFlowDigest(
+    context.sqlite,
+    seedDatabase,
+    context.env,
+  );
   const databaseBytes = fileMetadata(seedDatabase).bytes;
   context.seedDatabase = seedDatabase;
   const measurements = [
@@ -306,14 +364,18 @@ function runIndexSuite(context) {
       'index.first_post_archive',
       { database: 'new', filesystem_cache: 'uncontrolled' },
       { wall_ms: sampledMetric([first.elapsedMs], 'process wall, including startup') },
-      firstCounts,
+      { ...firstCounts, receiver_value_flow_digest: firstValueFlowDigest },
       { integrity_check: firstIntegrity, index_report_matches: true },
     ),
     measurement(
       'index.fresh_database_warm_filesystem',
       { database: 'new per sample', filesystem_cache: 'warm/uncontrolled' },
       { wall_ms: sampledMetric(samples, 'process wall, including startup') },
-      { ...counters, database_bytes: databaseBytes },
+      {
+        ...counters,
+        receiver_value_flow_digest: seedValueFlowDigest,
+        database_bytes: databaseBytes,
+      },
       { corpus_counts_match: true, index_reports_match: true },
     ),
   ];
@@ -1116,6 +1178,29 @@ function runEnrichmentSuite(context) {
     facts_published: ENRICHMENT_INVARIANTS.facts_published,
     dry_run: false,
   }, 'full enrichment');
+  const [fullProjection] = sqliteJson(context.sqlite, fullDatabase, `
+    SELECT
+      sum(provenance = 'receiver-value-flow') AS value_flow_facts,
+      sum(provenance = 'checker') AS checker_facts,
+      sum(provenance IN ('receiver-value-flow', 'checker')) AS combined_facts
+    FROM resolved_edges;
+  `, context.env);
+  assertEqual(
+    fullProjection.value_flow_facts,
+    CORPUS_INVARIANTS.receiver_value_flow_edges,
+    'projected value-flow facts',
+  );
+  assertEqual(fullProjection.checker_facts, fullReport.facts_published, 'projected checker facts');
+  assertEqual(
+    fullProjection.combined_facts,
+    ENRICHMENT_INVARIANTS.combined_projected_facts,
+    'combined occurrence-specific facts',
+  );
+  assertEqual(
+    receiverValueFlowDigest(context.sqlite, fullDatabase, context.env),
+    CORPUS_INVARIANTS.receiver_value_flow_digest,
+    'full enrichment receiver value-flow digest',
+  );
   const [fullProjectRuns] = sqliteJson(context.sqlite, fullDatabase, `
     SELECT
       count(*) AS projects,
@@ -1160,6 +1245,11 @@ function runEnrichmentSuite(context) {
       facts_published: ENRICHMENT_INVARIANTS.facts_published,
       dry_run: false,
     }, 'unchanged enrichment');
+    assertEqual(
+      receiverValueFlowDigest(context.sqlite, database, context.env),
+      CORPUS_INVARIANTS.receiver_value_flow_digest,
+      `unchanged enrichment receiver value-flow digest sample ${index + 1}`,
+    );
     integrityCheck(context, database);
     reuseSamples.push(result.elapsedMs);
     removeDatabaseFamily(context, database);
@@ -1184,6 +1274,7 @@ function runEnrichmentSuite(context) {
         request_batches: fullReport.request_batches,
         projects: fullReport.projects,
         facts_published: fullReport.facts_published,
+        combined_projected_facts: fullProjection.combined_facts,
         unknown_answers: fullReport.unknown_answers,
         unknown_projects: fullReport.unknown_projects.length,
         configuration_problems: fullReport.configuration_problems,

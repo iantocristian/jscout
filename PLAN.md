@@ -187,7 +187,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v23; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v28; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -235,6 +235,14 @@ never loses its exact source context.
 - Ambiguous root references fan out as `possible` candidate edges.
 - Unknown-receiver member calls use bounded property hubs rather than a
   call-site × symbol cross-product.
+- A binding-aware value-flow pass projects supported instance-context `this`,
+  direct/const-bound `new`, imported/exported const values, and closed
+  synchronous module-scope factory receivers at `likely`, with at
+  most three targets and factory recursion capped at depth two. Exact root or
+  imported binding identity is required. Awaited values, implicit fallthrough,
+  ambiguous or heuristic module resolution, unsupported returns or receiver
+  shapes, and method-shadowing fields, accessors, or direct property writes give
+  up to the existing property hub.
 - Events use receiver-qualified or unknown event hubs; jscout does not connect
   every emitter to every listener sharing a common string.
 - General-association edges are terminal and degree-bounded in workflow
@@ -593,13 +601,44 @@ and only then compare real agent work with and without it.
 
 ## Implemented post-v1 checker enrichment sidecar (G10)
 
-As implemented, schema v18 stores exact call/receiver/property byte spans and
+As implemented, schema v28 stores exact call/receiver/property byte spans and
 canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
 sidecar explicitly; `jscout checker doctor` reports project/configuration
 readiness. The protocol host isolates compiler work in a terminable worker,
-and the Rust client enforces a hard deadline. Projection v11 recreates only
-fresh occurrence-specific `checker` edges and retains the shared possible
-member hubs.
+and the Rust client enforces a hard deadline. Under projection v12 the checker
+stage recreates only fresh occurrence-specific `checker` edges and retains the
+shared possible member hubs.
+
+**Amendment — bounded receiver value flow (2026-08-22).** Deterministic
+indexing now records closed syntax-and-binding summaries for `this.m()` in
+instance methods and supported non-static initializers, direct or const-bound
+`new C()` receivers, imported/exported const values, and immutable module-scope
+factory receivers. Every factory return must be a construct, a const binding
+to one, or another summarized factory call, and block-bodied factories must
+terminate without implicit fallthrough. Awaited values and async factories are
+left to the checker because thenable assimilation can change receiver identity.
+Factory resolution is capped at depth two and requires one exact module root or
+imported binding at each hop; local immutable aliases are followed. It rejects
+heuristic workspace edges, unresolved or ambiguous exports, mutable
+declarations, destructuring, optional factory results, decorators, constructors
+with explicit returns, `eval` references, dynamic `with` scope, unresolved or
+dynamically computed base/member shapes, and TypeScript parameter properties.
+One-hop inheritance is used only when the receiver class has no own runtime
+method and no field, accessor, or direct `this.property` write anywhere in the
+exact superclass chain shadows the requested member, and the full superclass
+construction chain resolves exactly.
+
+The pass emits one to three occurrence-specific targets at `likely` with
+`receiver-value-flow` provenance and `candidateCount`. Optional member
+invocation is retained because it changes execution, not the target of an
+executed call. Parameters, unsupported/conditional expressions, `this.field`,
+unresolved branches, deeper factories, and larger target sets emit nothing
+beyond the existing property hub. Direct dot/bracket member assignments,
+updates, deletes, destructuring targets, and `for` targets block a binding.
+Alias-mediated writes, global-object rebinding, `Object.assign`/`defineProperty`,
+and prototype mutation remain outside this bounded proof, so the result is
+deliberately not `certain`.
+Resolved occurrences are excluded from checker planning even under `--all`.
 
 The original plan deferred checker-backed enrichment behind a revisit
 trigger. That trigger is now pulled deliberately: the call-site query work
@@ -784,7 +823,7 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 ### Required G10 scale correction
 
 **Implementation status (2026-08-14, amended 2026-08-22).** The correction
-below is implemented in checker protocol v4 and schema v27: complete
+below is implemented in checker protocol v4 and schema v28: complete
 configured-project coverage, package-policy admission of runtime orphan scopes
 by default, exhaustive inferred-project coverage under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
@@ -844,9 +883,11 @@ The default plan:
   explicit role selection can include configured files, while orphan files in
   those roles still require `--all`;
 - excludes occurrences already explained by a direct, occurrence-bound
-  `certain` or `likely` structural edge (currently including namespace-member
-  calls resolved through the module/export graph); line or name coincidence is
-  never sufficient;
+  `certain` or `likely` structural edge (including namespace-member calls and
+  bounded receiver value-flow answers resolved through the module/export
+  graph); line or name coincidence is never sufficient. Receiver value-flow
+  answers remain excluded under `--all`; other deterministic answers may be
+  included for audit;
 - admits unowned production/unknown-role files package by package: a strict
   unowned majority makes the package JS-first, while a TS-first package admits
   only files reachable over non-type module edges from package runtime targets;
@@ -948,43 +989,64 @@ in this order:
    batch reuse and per-project watch carry so rows produced by the former
    single-target rule cannot be resumed or carried.
 2. **Implemented 2026-08-22.** Replace per-file inferred projects with scopes
-   grouped by nearest
-   `package.json`, compiler family, and deterministic directory bins capped at
-   150 roots. Keep the existing ESNext + Bundler options in this layer, include
-   full scope membership and the nearest manifest in freshness identity,
-   schedule dirty scopes first by earliest pending occurrence rank, and retain
-   per-file failure attribution so one bad root cannot fail its whole scope.
-   Logical checker facts must remain unchanged on the pinned parity corpus.
+   grouped by nearest `package.json`, compiler family, and deterministic
+   directory bins capped at 150 roots. Keep the existing ESNext + Bundler
+   options in this layer, include full scope membership and the nearest manifest
+   in freshness identity, schedule dirty scopes first by earliest pending
+   occurrence rank, and retain per-file failure attribution so one bad root
+   cannot fail its whole scope. Logical checker facts must remain unchanged on
+   the pinned parity corpus.
    On ai-pipe, all 1,412 mapped repository fact payloads remained identical.
    Coverage did not: 587 occurrences moved from `unknown` to external
    `@types/node` declarations because a typed sibling's transitive declaration
    graph became visible across the shared Program.
 3. **Implemented 2026-08-22.** Replace the binary inferred-project gate with a
-   per-package decision. A
-   package whose non-test indexed source is mostly unowned is JS-first and
-   admits its unowned non-test scopes by default. A TS-first package admits an
-   unowned file only when the import graph reaches it from a `main`, `exports`,
-   `bin`, or `scripts` manifest target. Tests remain role-excluded, `--all`
-   remains exhaustive, and watch uses the same decision.
+   per-package decision. A package whose non-test indexed source is mostly
+   unowned is JS-first and admits its unowned non-test scopes by default. A
+   TS-first package admits an unowned file only when the import graph reaches it
+   from a `main`, `exports`, `bin`, or `scripts` manifest target. Tests remain
+   role-excluded, `--all` remains exhaustive, and watch uses the same decision.
 4. **Implemented and measured 2026-08-22.** `node-esm` uses NodeNext module and
    resolution semantics. `node-cjs` uses the paired NodeNext mode so file and
    package context supplies CommonJS semantics without losing modern package
    `exports`/`imports` resolution. `bundler-jsx` retains ESNext plus Bundler.
    Normalized effective options are part of inferred configuration fingerprints
    without changing configured-project fingerprint identity, so pre-change
-   facts cannot be reused after
-   the switch. On ai-pipe, the default 116-edge plane and exhaustive 1,382-edge
+   facts cannot be reused after the switch. On ai-pipe, the default 116-edge
+   plane and exhaustive 1,382-edge
    inferred plane both had zero bidirectional logical-fact delta. On n8n, all
    31 inferred scopes (2,524 occurrences) retained the same 39 stored and
    projected facts. Coverage-only status changes were bounded to three
    occurrences on exhaustive ai-pipe and two on n8n; SQLite integrity,
    snapshots, selections, confidence, multiplicity, spans, receiver types, and
    candidate counts matched.
-5. Add bounded structural receiver value flow for `this`, direct construction,
-   immutable aliases, and closed factory-return sets to depth two. Emit closed
-   sets of at most three targets at `likely`, keep every unsupported case on
-   the property hub, and exclude deterministically resolved occurrences from
-   checker selection.
+5. **Implemented and measured 2026-08-22.** Add bounded structural receiver
+   value flow for `this`, direct construction, immutable aliases, and closed
+   factory-return sets to depth two. Schema v28, extraction v6, and projection
+   v12 persist exact binding/reference shape and hard-exclude the resulting
+   occurrences from checker selection, including under `--all`. ai-pipe
+   produced 557 answered occurrences and 1,025 edges. All 557 are retained from
+   a 669/669 bidirectionally exact pre-pass checker oracle; awaited values and
+   other unsafe cases were subsequently removed without changing any retained
+   target set. Its exhaustive checker plan fell from 5,158 to 4,601 occurrences
+   exactly, and the full provider-free run completed 4,601 queries in 42
+   batches, published 387 checker facts (1,412 combined with value-flow facts),
+   then reused all 4,601 with zero checker requests. A normalized digest ratchet
+   covers the final 557 occurrences and 1,025 edges after indexing, enrichment,
+   and unchanged reuse. n8n produced 14,414 answered occurrences and 14,456
+   edges; exhaustive selection fell from 284,184 to 269,770 exactly. A fresh
+   stratified n8n sample covered 61 occurrences across every emitted
+   flow/cardinality class: all 27 closed mapped checker facts matched
+   bidirectionally, while the remaining 34 occurrences had no mapped checker
+   fact. Candidate, checker, and sample databases passed integrity and
+   foreign-key checks. Merging two full-AST scans and caching the exact-ref SQL
+   statement cut the isolated n8n receiver-flow projection from 906 ms to
+   380–385 ms without changing its normalized target-set digest. Three paired
+   release-mode n8n cold-index runs then averaged 19.150 seconds before and
+   19.536 seconds after (+2.0%, with noisy individual deltas from -3.2% to
+   +9.7%). Five direct ai-pipe runs averaged 0.466 seconds before and 0.497
+   seconds after (+6.6%, or 31 ms). Unsupported cases remain on the property
+   hub.
 
 #### Durable staging, resume, and partial coverage
 

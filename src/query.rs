@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
@@ -144,6 +144,108 @@ impl ModuleGraph {
         Some((file, name, inferred))
     }
 
+    /// Resolve one runtime export without accepting heuristic module edges or
+    /// choosing an arbitrary `export *` branch. This stricter form is used by
+    /// projections that suppress a later checker pass and therefore need a
+    /// closed binding, not merely the graph's best structural candidate.
+    pub(crate) fn resolve_export_exact(&self, file: i64, name: &str) -> Option<(i64, String)> {
+        match self.resolve_export_exact_inner(file, name, &mut HashSet::new()) {
+            ExactExportResolution::Candidates(candidates) if candidates.len() == 1 => {
+                candidates.into_iter().next()
+            }
+            ExactExportResolution::Missing
+            | ExactExportResolution::Unsafe
+            | ExactExportResolution::Candidates(_) => None,
+        }
+    }
+
+    fn resolve_export_exact_inner(
+        &self,
+        file: i64,
+        name: &str,
+        visited: &mut HashSet<(i64, String)>,
+    ) -> ExactExportResolution {
+        if !visited.insert((file, name.to_string())) {
+            return ExactExportResolution::Unsafe;
+        }
+        let Some(entries) = self.exports.get(&file) else {
+            return ExactExportResolution::Missing;
+        };
+
+        let exact = entries
+            .iter()
+            .filter(|entry| entry.export_name == name)
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            let mut candidates = BTreeSet::new();
+            for entry in exact {
+                let resolved = match (&entry.local_name, &entry.from_request, &entry.from_name) {
+                    (Some(local), _, _) => {
+                        ExactExportResolution::Candidates(BTreeSet::from([(file, local.clone())]))
+                    }
+                    (None, None, _) => ExactExportResolution::Candidates(BTreeSet::from([(
+                        file,
+                        "default".to_string(),
+                    )])),
+                    (None, Some(request), Some(from)) => {
+                        if self.edge_inferred(file, request) {
+                            return ExactExportResolution::Unsafe;
+                        }
+                        let Some(target) = self.edge(file, request) else {
+                            return ExactExportResolution::Unsafe;
+                        };
+                        if from == "*" {
+                            ExactExportResolution::Candidates(BTreeSet::from([(
+                                target,
+                                "*".to_string(),
+                            )]))
+                        } else {
+                            let mut branch = visited.clone();
+                            self.resolve_export_exact_inner(target, from, &mut branch)
+                        }
+                    }
+                    _ => ExactExportResolution::Unsafe,
+                };
+                let ExactExportResolution::Candidates(resolved) = resolved else {
+                    return ExactExportResolution::Unsafe;
+                };
+                candidates.extend(resolved);
+            }
+            return ExactExportResolution::Candidates(candidates);
+        }
+
+        // ECMAScript `export * from` never re-exports the target module's
+        // default binding. Only an explicit `export { default } from` may do
+        // that, and it would have appeared in the exact entries above.
+        if name == "default" {
+            return ExactExportResolution::Missing;
+        }
+
+        let mut candidates = BTreeSet::new();
+        for entry in entries.iter().filter(|entry| entry.export_name == "*") {
+            let Some(request) = entry.from_request.as_deref() else {
+                return ExactExportResolution::Unsafe;
+            };
+            if self.edge_inferred(file, request) {
+                return ExactExportResolution::Unsafe;
+            }
+            let Some(target) = self.edge(file, request) else {
+                return ExactExportResolution::Unsafe;
+            };
+            let mut branch = visited.clone();
+            match self.resolve_export_exact_inner(target, name, &mut branch) {
+                ExactExportResolution::Candidates(resolved) => candidates.extend(resolved),
+                ExactExportResolution::Missing => {}
+                ExactExportResolution::Unsafe => return ExactExportResolution::Unsafe,
+            }
+        }
+        if candidates.is_empty() {
+            ExactExportResolution::Missing
+        } else {
+            ExactExportResolution::Candidates(candidates)
+        }
+    }
+
     /// Resolve a documentary/type export chain without allowing type-only
     /// bindings to influence runtime reference projection.
     pub fn resolve_contract_export_traced(
@@ -217,6 +319,12 @@ impl ModuleGraph {
         }
         None
     }
+}
+
+enum ExactExportResolution {
+    Missing,
+    Unsafe,
+    Candidates(BTreeSet<(i64, String)>),
 }
 
 #[derive(Debug, serde::Serialize)]
