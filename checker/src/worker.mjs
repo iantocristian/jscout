@@ -5,6 +5,7 @@ import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import { PROTOCOL_VERSION } from "./protocol.mjs";
 
 const root = fs.realpathSync(workerData.root);
 const bundledRequire = createRequire(import.meta.url);
@@ -752,7 +753,7 @@ function buildProject(project) {
     .filter((value, index, all) => all.findIndex((other) => other.path === value.path) === index)
     .sort((left, right) => left.path.localeCompare(right.path));
   const fingerprint = digestText(JSON.stringify(stable({
-    protocol: 3,
+    protocol: PROTOCOL_VERSION,
     typescript: { version: ts.version, source: runtime.source },
     compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
@@ -884,11 +885,11 @@ function declarationResult(declaration) {
   };
 }
 
-function planMembers(files) {
+function planMembers(files, refreshConfig = true) {
   if (!Array.isArray(files)) throw coded("protocol", "plan_members requires files");
   packageCache.clear();
   const unique = [...new Set(files)].sort();
-  const discovered = configuredProjects();
+  const discovered = configuredProjects(refreshConfig);
   const planned = unique.map((file) => {
     const queryFile = resolveQueryFile(file);
     return { file, queryFile, decision: configuredOwnership(queryFile, discovered) };
@@ -1212,7 +1213,10 @@ parentPort.on("message", (message) => {
     if (message.kind === "capabilities") {
       payload = { kind: "capabilities_result", capabilities: capabilities() };
     } else if (message.kind === "plan_members") {
-      payload = { kind: "plan_members_result", result: planMembers(message.files ?? []) };
+      payload = {
+        kind: "plan_members_result",
+        result: planMembers(message.files ?? [], message.refresh_config !== false),
+      };
     } else if (message.kind === "resolve_member") {
       payload = { kind: "resolve_member_result", result: resolveMember(message.query ?? {}) };
     } else if (message.kind === "resolve_members") {

@@ -812,7 +812,7 @@ fn tooling_ownership_is_excluded_with_a_non_tooling_owner_and_retained_as_fallba
         },
     ];
 
-    let planning = build_project_plan(&selected, &ownership, &projects, false)?;
+    let planning = build_project_plan(&selected, &ownership, &projects)?;
     assert_eq!(planning.occurrences_avoided_by_tooling_filter, 1);
     assert_eq!(planning.occurrences_using_tooling_fallback, 1);
     assert_eq!(planning.projects["tsconfig.json"][0].file, "shared.ts");
@@ -832,7 +832,7 @@ fn tooling_ownership_is_excluded_with_a_non_tooling_owner_and_retained_as_fallba
 }
 
 #[test]
-fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Result<()> {
+fn inferred_project_policy_is_applied_before_caps() -> Result<()> {
     let configured = planned_occurrence(1, "alpha", "src/app.ts", "production", 0);
     let inferred_a = planned_occurrence(2, "alpha", "scripts/tool.mjs", "production", 0);
     let inferred_b = planned_occurrence(3, "alpha", "scripts/tool.mjs", "production", 0);
@@ -840,6 +840,18 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     let ownership = vec![
         FileOwnership {
             file: "scripts/tool.mjs".into(),
+            project_ids: vec!["inferred:.#node-esm".into()],
+            excluded_project_ids: Vec::new(),
+            tooling_fallback: false,
+        },
+        FileOwnership {
+            file: "scripts/helper.mjs".into(),
+            project_ids: vec!["inferred:.#node-esm".into()],
+            excluded_project_ids: Vec::new(),
+            tooling_fallback: false,
+        },
+        FileOwnership {
+            file: "scripts/worker.mjs".into(),
             project_ids: vec!["inferred:.#node-esm".into()],
             excluded_project_ids: Vec::new(),
             tooling_fallback: false,
@@ -854,7 +866,7 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
     let projects = vec![
         ProjectSummary {
             project_id: "inferred:.#node-esm".into(),
-            file_count: 1,
+            file_count: 3,
             purpose: "inferred".into(),
             purpose_reasons: vec!["no-configured-owner".into()],
             membership_fingerprint: "inferred-members".into(),
@@ -870,7 +882,8 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
         },
     ];
 
-    let (default, coverage) = gate_inferred_projects(occurrences.clone(), &ownership, false)?;
+    let (default, coverage) =
+        gate_inferred_projects(occurrences.clone(), &ownership, &BTreeSet::new())?;
     assert_eq!(default.iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
     assert_eq!(
         coverage,
@@ -891,26 +904,42 @@ fn inferred_projects_are_gated_before_caps_and_all_is_the_escape_hatch() -> Resu
             .id,
         1
     );
-    let default_plan = build_project_plan(
-        std::slice::from_ref(&configured),
-        &ownership,
-        &projects,
-        false,
-    )?;
+    let default_plan =
+        build_project_plan(std::slice::from_ref(&configured), &ownership, &projects)?;
     assert_eq!(
         default_plan.projects.keys().collect::<Vec<_>>(),
         ["tsconfig.json"]
     );
 
-    let (all, coverage) = gate_inferred_projects(occurrences, &ownership, true)?;
+    let admitted = BTreeSet::from([
+        "scripts/helper.mjs".to_string(),
+        "scripts/tool.mjs".to_string(),
+        "scripts/worker.mjs".to_string(),
+    ]);
+    let (all, coverage) = gate_inferred_projects(occurrences, &ownership, &admitted)?;
     assert_eq!(all.len(), 3);
     assert_eq!(coverage.files_without_configured_project, 1);
     assert_eq!(coverage.occurrences_without_configured_project, 2);
     assert_eq!(coverage.occurrences_skipped_inferred_project, 0);
-    let all_plan = build_project_plan(&all, &ownership, &projects, true)?;
+    let all_plan = build_project_plan(&all, &ownership, &projects)?;
     assert_eq!(
         all_plan.project_roots["inferred:.#node-esm"],
-        ["scripts/tool.mjs"]
+        [
+            "scripts/helper.mjs",
+            "scripts/tool.mjs",
+            "scripts/worker.mjs",
+        ]
+    );
+    let capped_plan = build_project_plan(std::slice::from_ref(&all[0]), &ownership, &projects)?;
+    assert_eq!(capped_plan.projects["inferred:.#node-esm"].len(), 1);
+    assert_eq!(
+        capped_plan.project_roots["inferred:.#node-esm"],
+        [
+            "scripts/helper.mjs",
+            "scripts/tool.mjs",
+            "scripts/worker.mjs",
+        ],
+        "the operator cap must not truncate inferred Program membership",
     );
     assert_eq!(
         projects_in_execution_order(
@@ -958,7 +987,7 @@ fn rust_rechecks_the_inferred_scope_root_cap() -> Result<()> {
             membership_fingerprint: "members".into(),
             config_fingerprint: "config".into(),
         }];
-        build_project_plan(&selected, &ownership, &projects, true)
+        build_project_plan(&selected, &ownership, &projects)
     };
 
     assert_eq!(
@@ -970,6 +999,65 @@ fn rust_rechecks_the_inferred_scope_root_cap() -> Result<()> {
         .expect("151 roots must be rejected");
     assert!(error.to_string().contains("exceeds the 150-root cap"));
     Ok(())
+}
+
+#[test]
+fn dirty_admitted_inferred_scopes_participate_in_default_watch_priority() {
+    let ownership = vec![
+        FileOwnership {
+            file: "dirty-configured.ts".into(),
+            project_ids: vec!["tsconfig.dirty.json".into()],
+            excluded_project_ids: Vec::new(),
+            tooling_fallback: false,
+        },
+        FileOwnership {
+            file: "dirty-orphan.js".into(),
+            project_ids: vec!["inferred:.#node-cjs".into()],
+            excluded_project_ids: Vec::new(),
+            tooling_fallback: false,
+        },
+    ];
+    let dirty = BTreeSet::from([
+        "dirty-configured.ts".to_string(),
+        "dirty-orphan.js".to_string(),
+    ]);
+    let priority = dirty_projects(&ownership, &dirty);
+    assert_eq!(
+        priority,
+        BTreeSet::from([
+            "inferred:.#node-cjs".to_string(),
+            "tsconfig.dirty.json".to_string(),
+        ])
+    );
+
+    let occurrence = planned_occurrence(1, "save", "file.ts", "production", 0);
+    let projects = [
+        "inferred:.#node-cjs",
+        "inferred:nested#node-esm",
+        "tsconfig.clean.json",
+        "tsconfig.dirty.json",
+    ]
+    .into_iter()
+    .map(|project| (project.to_string(), vec![occurrence.clone()]))
+    .collect::<BTreeMap<_, _>>();
+    let ranks = BTreeMap::from([
+        ("inferred:.#node-cjs".to_string(), 40),
+        ("inferred:nested#node-esm".to_string(), 10),
+        ("tsconfig.clean.json".to_string(), 20),
+        ("tsconfig.dirty.json".to_string(), 30),
+    ]);
+    assert_eq!(
+        projects_in_execution_order(&projects, &priority, &ranks)
+            .into_iter()
+            .map(|(project, _)| project.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "tsconfig.dirty.json",
+            "inferred:.#node-cjs",
+            "tsconfig.clean.json",
+            "inferred:nested#node-esm",
+        ]
+    );
 }
 
 #[test]
@@ -1702,7 +1790,7 @@ fn inferred_file_failure_preserves_sibling_progress_and_retries_only_the_failed_
         "a late file failure must remove that file's previously staged facts",
     );
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)?,
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?,
         1,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -1789,7 +1877,7 @@ fn inferred_file_failure_preserves_sibling_progress_and_retries_only_the_failed_
         BTreeSet::from([good.id, bad.id])
     );
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false)?,
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?,
         2,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -1880,7 +1968,7 @@ fn all_file_local_failures_mark_the_inferred_scope_failed() -> Result<()> {
     )?;
     assert_eq!((status.as_str(), completed), ("failed", 0));
     assert!(
-        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)
             .expect_err("an all-failed scope cannot publish by itself")
             .to_string()
             .contains("no completed projects")
@@ -2005,7 +2093,7 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
     )?;
 
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true)?,
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?,
         1
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2071,7 +2159,7 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
         )?;
     }
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false)?,
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?,
         2,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2142,7 +2230,7 @@ fn all_failed_batch_cannot_replace_a_healthy_active_batch() -> Result<()> {
         1,
     )?;
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, healthy_batch, &snapshot, false)?,
+        activate_staging_batch(repo.path(), &conn, healthy_batch, &snapshot, false, None)?,
         1
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2170,7 +2258,7 @@ fn all_failed_batch_cannot_replace_a_healthy_active_batch() -> Result<()> {
         std::slice::from_ref(&occurrence),
         "synthetic failure",
     )?;
-    let error = activate_staging_batch(repo.path(), &conn, failed_batch, &snapshot, true)
+    let error = activate_staging_batch(repo.path(), &conn, failed_batch, &snapshot, true, None)
         .expect_err("an all-failed batch must not activate");
     assert!(error.to_string().contains("no completed projects"));
 
@@ -2299,7 +2387,7 @@ fn seed_active_checker_batch(
             1,
         )?;
     }
-    activate_staging_batch(root, conn, batch_id, &snapshot, false)?;
+    activate_staging_batch(root, conn, batch_id, &snapshot, false, None)?;
     crate::structural::rebuild_projection(conn, &snapshot)?;
     Ok(batch_id)
 }
@@ -2489,7 +2577,7 @@ fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<(
         "carried projects retain external checker-input watch coverage"
     );
 
-    activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false)?;
+    activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)?;
     crate::structural::rebuild_projection(&conn, &snapshot)?;
     assert_eq!(
         conn.query_row(
@@ -3089,7 +3177,7 @@ fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result
             )?;
         }
         assert_eq!(
-            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false)?,
+            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)?,
             candidate_count
         );
         crate::structural::rebuild_projection(&conn, &snapshot)?;

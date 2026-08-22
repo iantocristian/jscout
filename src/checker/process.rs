@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -10,13 +11,19 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use super::protocol::MemberResult;
 use super::protocol::{
-    Capabilities, Inbound, MemberBatchResult, MemberPlanResult, MemberQuery, Outbound,
-    PROTOCOL_VERSION, ProjectValidationResult, Versions, encode,
+    Capabilities, ConfigurationProblem, FileOwnership, Inbound, MemberBatchResult, MemberPlanPage,
+    MemberPlanResult, MemberPlanTotals, MemberQuery, Outbound, PROTOCOL_VERSION, ProjectSummary,
+    ProjectValidationResult, TypeScriptIdentity, Versions, encode,
 };
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
+const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+const PLAN_FRAME_MAX_BYTES: usize = 1024 * 1024;
+// Leave ample room for the version/id/kind envelope and JSON escaping. The
+// completed frame is also measured before it is written.
+const PLAN_FILE_PAYLOAD_BYTES: usize = 900 * 1024;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
@@ -105,8 +112,19 @@ struct Writer {
 impl Writer {
     fn send(&self, message: &Outbound) -> Result<String, CheckerError> {
         let id = format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let frame = encode(&id, message)
+        self.send_with_id(&id, message)?;
+        Ok(id)
+    }
+
+    fn send_with_id(&self, id: &str, message: &Outbound) -> Result<(), CheckerError> {
+        let frame = encode(id, message)
             .map_err(|error| CheckerError::Protocol(format!("encode failure: {error}")))?;
+        if frame.len() > MAX_PROTOCOL_LINE_BYTES {
+            return Err(CheckerError::Protocol(format!(
+                "checker protocol frame is {} bytes; limit is {MAX_PROTOCOL_LINE_BYTES}",
+                frame.len()
+            )));
+        }
         let mut stdin = self
             .stdin
             .lock()
@@ -116,8 +134,61 @@ impl Writer {
             .and_then(|()| stdin.write_all(b"\n"))
             .and_then(|()| stdin.flush())
             .map_err(|error| CheckerError::ChildExited(format!("checker stdin closed: {error}")))?;
-        Ok(id)
+        Ok(())
     }
+}
+
+fn normalize_plan_files(mut files: Vec<String>) -> Result<Vec<String>, CheckerError> {
+    // The worker uses JavaScript's default string order. Match UTF-16 code
+    // units here so page-by-page membership verification also covers paths
+    // containing non-BMP characters.
+    files.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+    if let Some(duplicate) = files.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(CheckerError::Protocol(format!(
+            "plan_members input repeats file: {}",
+            duplicate[0]
+        )));
+    }
+    Ok(files)
+}
+
+fn chunk_plan_files(files: &[String]) -> Result<Vec<Vec<String>>, CheckerError> {
+    let mut chunks = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_bytes = 0_usize;
+    for file in files {
+        let encoded_bytes = serde_json::to_vec(file)
+            .map_err(|error| CheckerError::Protocol(format!("encode failure: {error}")))?
+            .len();
+        if encoded_bytes > PLAN_FILE_PAYLOAD_BYTES {
+            return Err(CheckerError::Protocol(format!(
+                "plan_members path is {encoded_bytes} encoded bytes; per-frame payload limit is {PLAN_FILE_PAYLOAD_BYTES}"
+            )));
+        }
+        let separator = usize::from(!chunk.is_empty());
+        if !chunk.is_empty() && chunk_bytes + separator + encoded_bytes > PLAN_FILE_PAYLOAD_BYTES {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_bytes = 0;
+        }
+        chunk_bytes += usize::from(!chunk.is_empty()) + encoded_bytes;
+        chunk.push(file.clone());
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    Ok(chunks)
+}
+
+fn validate_plan_frame(id: &str, message: &Outbound) -> Result<(), CheckerError> {
+    let frame = encode(id, message)
+        .map_err(|error| CheckerError::Protocol(format!("encode failure: {error}")))?;
+    if frame.len() > PLAN_FRAME_MAX_BYTES {
+        return Err(CheckerError::Protocol(format!(
+            "plan_members frame is {} bytes; limit is {PLAN_FRAME_MAX_BYTES}",
+            frame.len()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -342,19 +413,226 @@ impl ProcessChecker {
         files: Vec<String>,
         timeout: Duration,
     ) -> Result<MemberPlanResult, CheckerError> {
-        let id = self.send_active(&Outbound::PlanMembers { files })?;
-        let result = match self.receive_for(&id, timeout) {
-            Ok(Inbound::PlanMembersResult { result, .. }) => Ok(result),
-            Ok(Inbound::Error { error, .. }) => Err(CheckerError::Remote {
-                code: error.code,
-                message: error.message,
-            }),
-            Ok(Inbound::Canceled { reason, .. }) => {
-                Err(CheckerError::Canceled(reason.unwrap_or_default()))
-            }
-            Ok(other) => Err(unexpected("plan_members_result", &other)),
-            Err(error) => Err(error),
+        self.plan_members_with_refresh(files, timeout, true)
+    }
+
+    /// Reuse the configured-project discovery snapshot established by an
+    /// earlier plan in this process. Package-gate planning uses this only for
+    /// its immediately following admitted-scope plan, so both views describe
+    /// one ownership observation without paying for config discovery twice.
+    pub fn plan_members_cached(
+        &mut self,
+        files: Vec<String>,
+        timeout: Duration,
+    ) -> Result<MemberPlanResult, CheckerError> {
+        self.plan_members_with_refresh(files, timeout, false)
+    }
+
+    fn plan_members_with_refresh(
+        &mut self,
+        files: Vec<String>,
+        timeout: Duration,
+        refresh_config: bool,
+    ) -> Result<MemberPlanResult, CheckerError> {
+        let files = normalize_plan_files(files)?;
+        let chunks = chunk_plan_files(&files)?;
+        let begin = Outbound::PlanMembersBegin {
+            total_files: files.len(),
+            refresh_config,
         };
+        let id = self.send_active(&begin)?;
+        let result = (|| {
+            match self.receive_for(&id, timeout)? {
+                Inbound::PlanMembersReady { total_files, .. } if total_files == files.len() => {}
+                Inbound::PlanMembersReady { total_files, .. } => {
+                    return Err(CheckerError::Protocol(format!(
+                        "checker accepted {total_files} plan files; expected {}",
+                        files.len()
+                    )));
+                }
+                Inbound::Error { error, .. } => {
+                    return Err(CheckerError::Remote {
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+                Inbound::Canceled { reason, .. } => {
+                    return Err(CheckerError::Canceled(reason.unwrap_or_default()));
+                }
+                other => return Err(unexpected("plan_members_ready", &other)),
+            }
+
+            let mut received_files = 0_usize;
+            for chunk in chunks {
+                received_files += chunk.len();
+                let add = Outbound::PlanMembersAdd { files: chunk };
+                validate_plan_frame(&id, &add)?;
+                self.send_with_id(&id, &add)?;
+                match self.receive_for(&id, timeout)? {
+                    Inbound::PlanMembersAddResult {
+                        received_files: accepted,
+                        ..
+                    } if accepted == received_files => {}
+                    Inbound::PlanMembersAddResult {
+                        received_files: accepted,
+                        ..
+                    } => {
+                        return Err(CheckerError::Protocol(format!(
+                            "checker accepted {accepted} plan files; expected {received_files}"
+                        )));
+                    }
+                    Inbound::Error { error, .. } => {
+                        return Err(CheckerError::Remote {
+                            code: error.code,
+                            message: error.message,
+                        });
+                    }
+                    Inbound::Canceled { reason, .. } => {
+                        return Err(CheckerError::Canceled(reason.unwrap_or_default()));
+                    }
+                    other => return Err(unexpected("plan_members_add_result", &other)),
+                }
+            }
+
+            let finish = Outbound::PlanMembersFinish;
+            validate_plan_frame(&id, &finish)?;
+            self.send_with_id(&id, &finish)?;
+
+            let mut typescript: Option<TypeScriptIdentity> = None;
+            let mut totals: Option<MemberPlanTotals> = None;
+            let mut owned_files: Vec<FileOwnership> = Vec::new();
+            let mut projects: Vec<ProjectSummary> = Vec::new();
+            let mut configuration_problems: Vec<ConfigurationProblem> = Vec::new();
+            let mut cursors = HashSet::new();
+            let mut project_ids = HashSet::new();
+            let mut first_page = true;
+
+            loop {
+                let MemberPlanPage {
+                    typescript: page_typescript,
+                    totals: page_totals,
+                    files: page_files,
+                    projects: page_projects,
+                    configuration_problems: page_problems,
+                    next_cursor,
+                } = match self.receive_for(&id, timeout)? {
+                    Inbound::PlanMembersPage { page, .. } => page,
+                    Inbound::Error { error, .. } => {
+                        return Err(CheckerError::Remote {
+                            code: error.code,
+                            message: error.message,
+                        });
+                    }
+                    Inbound::Canceled { reason, .. } => {
+                        return Err(CheckerError::Canceled(reason.unwrap_or_default()));
+                    }
+                    other => return Err(unexpected("plan_members_page", &other)),
+                };
+
+                if first_page {
+                    typescript = Some(page_typescript.ok_or_else(|| {
+                        CheckerError::Protocol(
+                            "first plan_members page omitted TypeScript identity".into(),
+                        )
+                    })?);
+                    let first_totals = page_totals.ok_or_else(|| {
+                        CheckerError::Protocol("first plan_members page omitted totals".into())
+                    })?;
+                    if first_totals.files != files.len() {
+                        return Err(CheckerError::Protocol(format!(
+                            "checker planned {} files; expected {}",
+                            first_totals.files,
+                            files.len()
+                        )));
+                    }
+                    totals = Some(first_totals);
+                    first_page = false;
+                } else if page_typescript.is_some() || page_totals.is_some() {
+                    return Err(CheckerError::Protocol(
+                        "later plan_members page repeated first-page metadata".into(),
+                    ));
+                }
+
+                let expected_totals = totals.as_ref().expect("first page sets totals");
+                if owned_files.len() + page_files.len() > expected_totals.files
+                    || projects.len() + page_projects.len() > expected_totals.projects
+                    || configuration_problems.len() + page_problems.len()
+                        > expected_totals.configuration_problems
+                {
+                    return Err(CheckerError::Protocol(
+                        "plan_members pages exceeded declared totals".into(),
+                    ));
+                }
+                for (offset, ownership) in page_files.iter().enumerate() {
+                    if files.get(owned_files.len() + offset) != Some(&ownership.file) {
+                        return Err(CheckerError::Protocol(
+                            "plan_members pages did not return uploaded files in exact order"
+                                .into(),
+                        ));
+                    }
+                }
+                for project in &page_projects {
+                    if !project_ids.insert(project.project_id.clone()) {
+                        return Err(CheckerError::Protocol(
+                            "plan_members pages repeated a project".into(),
+                        ));
+                    }
+                }
+                let page_items = page_files.len() + page_projects.len() + page_problems.len();
+                owned_files.extend(page_files);
+                projects.extend(page_projects);
+                configuration_problems.extend(page_problems);
+
+                let Some(cursor) = next_cursor else {
+                    break;
+                };
+                if page_items == 0 {
+                    return Err(CheckerError::Protocol(
+                        "non-final plan_members page made no progress".into(),
+                    ));
+                }
+                if !cursors.insert(cursor.clone()) {
+                    return Err(CheckerError::Protocol(
+                        "plan_members result cursor repeated".into(),
+                    ));
+                }
+                let next = Outbound::PlanMembersNext { cursor };
+                validate_plan_frame(&id, &next)?;
+                self.send_with_id(&id, &next)?;
+            }
+
+            let totals = totals.expect("first page sets totals");
+            if owned_files.len() != totals.files
+                || projects.len() != totals.projects
+                || configuration_problems.len() != totals.configuration_problems
+            {
+                return Err(CheckerError::Protocol(format!(
+                    "plan_members pages returned {}/{}/{} items; expected {}/{}/{}",
+                    owned_files.len(),
+                    projects.len(),
+                    configuration_problems.len(),
+                    totals.files,
+                    totals.projects,
+                    totals.configuration_problems
+                )));
+            }
+            if owned_files
+                .iter()
+                .map(|ownership| ownership.file.as_str())
+                .ne(files.iter().map(String::as_str))
+            {
+                return Err(CheckerError::Protocol(
+                    "plan_members pages did not return the uploaded file membership exactly once"
+                        .into(),
+                ));
+            }
+            Ok(MemberPlanResult {
+                typescript: typescript.expect("first page sets TypeScript identity"),
+                files: owned_files,
+                projects,
+                configuration_problems,
+            })
+        })();
         self.clear_active();
         result
     }
@@ -439,6 +717,12 @@ impl ProcessChecker {
     fn send(&mut self, message: &Outbound) -> Result<String, CheckerError> {
         self.writer
             .send(message)
+            .inspect_err(|_| self.poisoned = true)
+    }
+
+    fn send_with_id(&mut self, id: &str, message: &Outbound) -> Result<(), CheckerError> {
+        self.writer
+            .send_with_id(id, message)
             .inspect_err(|_| self.poisoned = true)
     }
 
@@ -547,13 +831,18 @@ mod tests {
     // Canned protocol frames. Request IDs are deterministic per process: the
     // client numbers from r1, so hello is r1, the one resolve_member is r2, and
     // the cancel that follows it is r3.
-    const READY: &str = r#"{"protocol":3,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":3}}"#;
-    const UNKNOWN_RESULT: &str = r#"{"protocol":3,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:.#node-cjs","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
-    const OUTSIDE_ERROR: &str = r#"{"protocol":3,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
-    const CANCELED: &str = r#"{"protocol":3,"id":"r2","kind":"canceled","reason":"requested"}"#;
+    const READY: &str = r#"{"protocol":4,"id":"r1","kind":"ready","versions":{"sidecar":"fake","node":"22.19.0","protocol":4}}"#;
+    const UNKNOWN_RESULT: &str = r#"{"protocol":4,"id":"r2","kind":"resolve_member_result","result":{"indexed_hash":"hash","source_hash":"hash","typescript":{"version":"5.9.3","source":"bundled"},"projects":[{"project_id":"inferred:.#node-cjs","status":"unknown","declarations":[],"checker_input_fingerprint":"inputs"}],"configuration_problems":[]}}"#;
+    const OUTSIDE_ERROR: &str = r#"{"protocol":4,"id":"r2","kind":"error","error":{"code":"outside_root","message":"outside root"}}"#;
+    const CANCELED: &str = r#"{"protocol":4,"id":"r2","kind":"canceled","reason":"requested"}"#;
+    const PLAN_READY: &str =
+        r#"{"protocol":4,"id":"r2","kind":"plan_members_ready","total_files":1}"#;
+    const PLAN_ADDED: &str =
+        r#"{"protocol":4,"id":"r2","kind":"plan_members_add_result","received_files":1}"#;
+    const PLAN_PAGE: &str = r#"{"protocol":4,"id":"r2","kind":"plan_members_page","page":{"typescript":{"version":"5.9.3","source":"bundled"},"totals":{"files":1,"projects":1,"configuration_problems":0},"files":[{"file":"a.ts","project_ids":["inferred:.#node-cjs"],"excluded_project_ids":[],"tooling_fallback":false}],"projects":[{"project_id":"inferred:.#node-cjs","file_count":1,"purpose":"inferred","purpose_reasons":[],"membership_fingerprint":"members","config_fingerprint":"config"}],"configuration_problems":[],"next_cursor":null}}"#;
     const CANCEL_RESULT: &str =
-        r#"{"protocol":3,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
-    const SHUTDOWN_RESULT: &str = r#"{"protocol":3,"id":"r3","kind":"shutdown_result"}"#;
+        r#"{"protocol":4,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}"#;
+    const SHUTDOWN_RESULT: &str = r#"{"protocol":4,"id":"r3","kind":"shutdown_result"}"#;
 
     /// Write an executable fake sidecar (a `/bin/sh` script) answering the
     /// protocol from canned case patterns, and return it as the "node" binary
@@ -571,11 +860,23 @@ mod tests {
             "crash" => "exit 3".to_string(),
             _ => ":".to_string(),
         };
+        let (plan_begin, plan_add, plan_finish) = if mode == "plan" {
+            (
+                format!("echo '{PLAN_READY}'"),
+                format!("echo '{PLAN_ADDED}'"),
+                format!("echo '{PLAN_PAGE}'"),
+            )
+        } else {
+            (":".into(), ":".into(), ":".into())
+        };
         let source = format!(
             r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
     *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"plan_members_begin"'*) {plan_begin} ;;
+    *'"kind":"plan_members_add"'*) {plan_add} ;;
+    *'"kind":"plan_members_finish"'*) {plan_finish} ;;
     *'"kind":"resolve_member"'*) {resolve} ;;
     *'"kind":"cancel"'*) echo '{CANCELED}'; echo '{CANCEL_RESULT}' ;;
     *'"kind":"shutdown"'*) echo '{SHUTDOWN_RESULT}'; exit 0 ;;
@@ -627,6 +928,36 @@ done
     }
 
     #[test]
+    fn logical_multi_megabyte_plan_is_split_into_bounded_frames() {
+        let logical_files = (0..12_000)
+            .map(|index| format!("logical/{index:05}/{}.ts", "segment".repeat(55)))
+            .collect::<Vec<_>>();
+        let logical_bytes = logical_files
+            .iter()
+            .map(|file| serde_json::to_vec(file).expect("path json").len())
+            .sum::<usize>();
+        assert!(logical_bytes > MAX_PROTOCOL_LINE_BYTES);
+
+        let normalized = normalize_plan_files(logical_files).expect("unique logical files");
+        let chunks = chunk_plan_files(&normalized).expect("bounded chunks");
+        assert!(chunks.len() > 4);
+        assert_eq!(chunks.concat(), normalized);
+        for chunk in chunks {
+            let frame = Outbound::PlanMembersAdd { files: chunk };
+            let encoded = encode("r2", &frame).expect("frame json");
+            assert!(encoded.len() <= PLAN_FRAME_MAX_BYTES, "{}", encoded.len());
+        }
+    }
+
+    #[test]
+    fn plan_members_uses_the_workers_utf16_path_order() {
+        let normalized = normalize_plan_files(vec!["\u{e000}.ts".into(), "\u{10000}.ts".into()])
+            .expect("unique paths");
+        assert_eq!(normalized, ["\u{10000}.ts", "\u{e000}.ts"]);
+        assert!(normalize_plan_files(vec!["same.ts".into(), "same.ts".into()]).is_err());
+    }
+
+    #[test]
     fn fake_sidecar_preserves_unknown_and_stable_remote_errors() {
         let (_directory, mut checker) = spawn_fake("unknown");
         let answer = checker
@@ -640,6 +971,18 @@ done
             .resolve_member(query(), Duration::from_secs(1))
             .expect_err("outside root");
         assert!(matches!(error, CheckerError::Remote { code, .. } if code == "outside_root"));
+    }
+
+    #[test]
+    fn streamed_plan_session_assembles_the_verified_result() {
+        let (_directory, mut checker) = spawn_fake("plan");
+        let plan = checker
+            .plan_members(vec!["a.ts".into()], Duration::from_secs(1))
+            .expect("streamed plan");
+        assert_eq!(plan.typescript.version, "5.9.3");
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].file, "a.ts");
+        assert_eq!(plan.projects[0].project_id, "inferred:.#node-cjs");
     }
 
     #[test]
