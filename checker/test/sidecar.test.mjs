@@ -437,17 +437,23 @@ test("every planner-selected owner accepts a file shared by several configs", as
     "tsconfig.server.json",
   ]);
   assert.deepEqual(plan.result.files[0].excluded_project_ids, []);
+  const resolver = client(root);
+  context.after(() => resolver.child.kill());
+  await resolver.request("hello");
   for (const projectId of plan.result.files[0].project_ids) {
-    const resolver = client(root);
-    context.after(() => resolver.child.kill());
-    await resolver.request("hello");
     const result = await resolver.request("resolve_members", {
       project_id: projectId,
       queries: [queryFor(source, "shared.run()", "shared", "run")],
     });
     assert.equal(result.kind, "resolve_members_result", `${projectId}: ${JSON.stringify(result)}`);
-    await resolver.close();
+    const validation = await resolver.request("validate_project", {
+      project_id: projectId,
+      fingerprint: result.result.checker_input_fingerprint,
+    });
+    assert.equal(validation.kind, "validate_project_result");
+    assert.equal(validation.result.valid, true);
   }
+  await resolver.close();
 });
 
 test("keeps every tooling owner when no general project owns the file", async (context) => {

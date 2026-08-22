@@ -52,6 +52,9 @@ export function childEnvironment(workdir, additions = {}) {
     'LANG',
     'LC_ALL',
     'RUST_BACKTRACE',
+    'JSCOUT_EXPERIMENTAL_CHECKER_ORDER',
+    'JSCOUT_EXPERIMENTAL_CHECKER_RECYCLE_MIB',
+    'JSCOUT_EXPERIMENTAL_CHECKER_WORKERS',
     'SYSTEMROOT',
     'WINDIR',
   ];

@@ -723,7 +723,7 @@ function validateProject(projectId, fingerprint) {
       inputsValid = false;
     }
   }
-  return {
+  const result = {
     project_id: projectId,
     fingerprint: builtProject.fingerprint,
     valid: fingerprint === builtProject.fingerprint && inputsValid,
@@ -732,6 +732,13 @@ function validateProject(projectId, fingerprint) {
       source_hash,
     })),
   };
+  // A successful validation is the project isolation boundary for the
+  // sidecar-reuse experiment. Drop every strong project/discovery reference
+  // before another project may be dispatched; the occurrence cache is weak
+  // and therefore cannot keep the old Program alive.
+  builtProject = undefined;
+  discoveryCache = undefined;
+  return result;
 }
 
 function resolveMember(query) {

@@ -82,6 +82,31 @@ struct ProjectFailure {
     retryable: bool,
 }
 
+#[derive(Default)]
+struct ProjectExecutionCounters {
+    request_batches: usize,
+    occurrences_queried: usize,
+    unknown_answers: usize,
+    unmapped_declarations: usize,
+    unmapped_declaration_contexts: BTreeMap<String, usize>,
+    peak_rss_bytes: u64,
+    peak_heap_bytes: u64,
+}
+
+struct ProjectTask {
+    index: usize,
+    total: usize,
+    project_id: String,
+    occurrences: Vec<Occurrence>,
+    pending: Vec<Occurrence>,
+}
+
+struct ProjectTaskResult {
+    task: ProjectTask,
+    result: Result<()>,
+    counters: ProjectExecutionCounters,
+}
+
 #[derive(Debug)]
 struct PartialEnrichmentError {
     batch_id: i64,
@@ -607,57 +632,99 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut peak_heap_bytes = 0;
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
-    for (project_index, (project_id, occurrences)) in
-        projects_in_execution_order(&project_plan, &priority_projects)
-            .into_iter()
-            .enumerate()
-    {
-        if super::process::cancellation_pending() {
-            bail!("checker enrichment interrupted; staged work retained");
+    let experimental_workers = experimental_checker_workers()?;
+    if experimental_workers == 0 {
+        for (project_index, (project_id, occurrences)) in
+            projects_in_execution_order(&project_plan, &priority_projects)
+                .into_iter()
+                .enumerate()
+        {
+            if super::process::cancellation_pending() {
+                bail!("checker enrichment interrupted; staged work retained");
+            }
+            if project_complete_and_fresh(&conn, batch_id, project_id, &mut input_freshness)? {
+                occurrences_resumed += occurrences.len();
+                continue;
+            }
+            let mut completed = completed_occurrences(&conn, batch_id, project_id)?;
+            if completed.len() == occurrences.len() {
+                reset_project_staging(&conn, batch_id, project_id)?;
+                completed.clear();
+            }
+            let mut pending = occurrences
+                .iter()
+                .filter(|occurrence| !completed.contains(&occurrence.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            pending.sort_by(|left, right| {
+                (!dirty_files.contains(&left.file))
+                    .cmp(&(!dirty_files.contains(&right.file)))
+                    .then_with(|| {
+                        (&left.file, left.call_start, left.id).cmp(&(
+                            &right.file,
+                            right.call_start,
+                            right.id,
+                        ))
+                    })
+            });
+            occurrences_resumed += completed.len();
+            mark_project_pending(&conn, batch_id, project_id)?;
+            eprintln!(
+                "checker enrichment: project {}/{} {} ({} pending, {} resumed)",
+                project_index + 1,
+                project_plan.len(),
+                project_id,
+                pending.len(),
+                completed.len()
+            );
+            let project_result = execute_project(
+                &canonical_root,
+                options,
+                &conn,
+                batch_id,
+                project_id,
+                &pending,
+                &ownership.typescript,
+                &mut request_batches,
+                &mut occurrences_queried,
+                &mut unknown_answers,
+                &mut unmapped_declarations,
+                &mut unmapped_declaration_contexts,
+                &mut peak_rss_bytes,
+                &mut peak_heap_bytes,
+            );
+            if let Err(error) = project_result {
+                if project_was_interrupted(&error) {
+                    bail!(
+                        "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
+                    );
+                }
+                let message = error.to_string();
+                let retryable = project_failure_is_retryable(&error);
+                mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+                eprintln!(
+                    "checker enrichment: project {project_id} failed disposition={}: {error:#}",
+                    if retryable { "retryable" } else { "terminal" }
+                );
+                failed_projects.push(ProjectFailure {
+                    project_id: project_id.clone(),
+                    retryable,
+                });
+            }
         }
-        if project_complete_and_fresh(&conn, batch_id, project_id, &mut input_freshness)? {
-            occurrences_resumed += occurrences.len();
-            continue;
-        }
-        let mut completed = completed_occurrences(&conn, batch_id, project_id)?;
-        if completed.len() == occurrences.len() {
-            reset_project_staging(&conn, batch_id, project_id)?;
-            completed.clear();
-        }
-        let mut pending = occurrences
-            .iter()
-            .filter(|occurrence| !completed.contains(&occurrence.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        pending.sort_by(|left, right| {
-            (!dirty_files.contains(&left.file))
-                .cmp(&(!dirty_files.contains(&right.file)))
-                .then_with(|| {
-                    (&left.file, left.call_start, left.id).cmp(&(
-                        &right.file,
-                        right.call_start,
-                        right.id,
-                    ))
-                })
-        });
-        occurrences_resumed += completed.len();
-        mark_project_pending(&conn, batch_id, project_id)?;
-        eprintln!(
-            "checker enrichment: project {}/{} {} ({} pending, {} resumed)",
-            project_index + 1,
-            project_plan.len(),
-            project_id,
-            pending.len(),
-            completed.len()
-        );
-        let project_result = execute_project(
+    } else {
+        execute_projects_pooled(
             &canonical_root,
             options,
             &conn,
             batch_id,
-            project_id,
-            &pending,
+            &project_plan,
+            &priority_projects,
+            &dirty_files,
             &ownership.typescript,
+            &mut input_freshness,
+            experimental_workers,
+            &mut occurrences_resumed,
             &mut request_batches,
             &mut occurrences_queried,
             &mut unknown_answers,
@@ -665,25 +732,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut unmapped_declaration_contexts,
             &mut peak_rss_bytes,
             &mut peak_heap_bytes,
-        );
-        if let Err(error) = project_result {
-            if project_was_interrupted(&error) {
-                bail!(
-                    "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
-                );
-            }
-            let message = error.to_string();
-            let retryable = project_failure_is_retryable(&error);
-            mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
-            eprintln!(
-                "checker enrichment: project {project_id} failed disposition={}: {error:#}",
-                if retryable { "retryable" } else { "terminal" }
-            );
-            failed_projects.push(ProjectFailure {
-                project_id: project_id.clone(),
-                retryable,
-            });
-        }
+            &mut failed_projects,
+        )?;
     }
 
     if super::process::cancellation_pending() {
@@ -741,6 +791,267 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         dry_run: false,
         peak_rss_bytes,
         peak_heap_bytes,
+    })
+}
+
+fn experimental_checker_workers() -> Result<usize> {
+    let Ok(value) = std::env::var("JSCOUT_EXPERIMENTAL_CHECKER_WORKERS") else {
+        return Ok(0);
+    };
+    let workers = value.parse::<usize>().with_context(|| {
+        format!("JSCOUT_EXPERIMENTAL_CHECKER_WORKERS must be 1, 2, or 4; received {value:?}")
+    })?;
+    if !matches!(workers, 1 | 2 | 4) {
+        bail!("JSCOUT_EXPERIMENTAL_CHECKER_WORKERS must be 1, 2, or 4; received {workers}");
+    }
+    Ok(workers)
+}
+
+fn experimental_checker_recycle_bytes() -> Result<Option<u64>> {
+    let Ok(value) = std::env::var("JSCOUT_EXPERIMENTAL_CHECKER_RECYCLE_MIB") else {
+        return Ok(None);
+    };
+    let mebibytes = value.parse::<u64>().with_context(|| {
+        format!(
+            "JSCOUT_EXPERIMENTAL_CHECKER_RECYCLE_MIB must be a positive integer; received {value:?}"
+        )
+    })?;
+    if mebibytes == 0 {
+        bail!("JSCOUT_EXPERIMENTAL_CHECKER_RECYCLE_MIB must be greater than zero");
+    }
+    Ok(Some(mebibytes.saturating_mul(1024 * 1024)))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the temporary checker-pool experiment reports the same enrichment counters as the production loop"
+)]
+fn execute_projects_pooled(
+    root: &Path,
+    options: &EnrichOptions<'_>,
+    conn: &Connection,
+    batch_id: i64,
+    project_plan: &BTreeMap<String, Vec<Occurrence>>,
+    priority_projects: &BTreeSet<String>,
+    dirty_files: &BTreeSet<String>,
+    expected_identity: &TypeScriptIdentity,
+    input_freshness: &mut InputFreshnessCache<'_>,
+    workers: usize,
+    occurrences_resumed: &mut usize,
+    request_batches: &mut usize,
+    occurrences_queried: &mut usize,
+    unknown_answers: &mut usize,
+    unmapped_declarations: &mut usize,
+    unmapped_declaration_contexts: &mut BTreeMap<String, usize>,
+    peak_rss_bytes: &mut u64,
+    peak_heap_bytes: &mut u64,
+    failed_projects: &mut Vec<ProjectFailure>,
+) -> Result<()> {
+    let ordered = projects_in_execution_order(project_plan, priority_projects);
+    let mut tasks = VecDeque::new();
+    for (project_index, (project_id, occurrences)) in ordered.into_iter().enumerate() {
+        if super::process::cancellation_pending() {
+            bail!("checker enrichment interrupted; staged work retained");
+        }
+        if project_complete_and_fresh(conn, batch_id, project_id, input_freshness)? {
+            *occurrences_resumed += occurrences.len();
+            continue;
+        }
+        let mut completed = completed_occurrences(conn, batch_id, project_id)?;
+        if completed.len() == occurrences.len() {
+            reset_project_staging(conn, batch_id, project_id)?;
+            completed.clear();
+        }
+        let mut pending = occurrences
+            .iter()
+            .filter(|occurrence| !completed.contains(&occurrence.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            (!dirty_files.contains(&left.file))
+                .cmp(&(!dirty_files.contains(&right.file)))
+                .then_with(|| {
+                    (&left.file, left.call_start, left.id).cmp(&(
+                        &right.file,
+                        right.call_start,
+                        right.id,
+                    ))
+                })
+        });
+        *occurrences_resumed += completed.len();
+        mark_project_pending(conn, batch_id, project_id)?;
+        eprintln!(
+            "checker enrichment: queued project {}/{} {} ({} pending, {} resumed)",
+            project_index + 1,
+            project_plan.len(),
+            project_id,
+            pending.len(),
+            completed.len()
+        );
+        tasks.push_back(ProjectTask {
+            index: project_index + 1,
+            total: project_plan.len(),
+            project_id: project_id.clone(),
+            occurrences: occurrences.clone(),
+            pending,
+        });
+    }
+    if std::env::var("JSCOUT_EXPERIMENTAL_CHECKER_ORDER").as_deref() == Ok("reverse") {
+        tasks.make_contiguous().reverse();
+    }
+    if tasks.is_empty() {
+        return Ok(());
+    }
+
+    let database_path = options
+        .database
+        .map_or_else(|| crate::store::db_path(root), Path::to_path_buf);
+    let mut connections = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let worker_conn = crate::store::open_path(&database_path)?;
+        worker_conn.busy_timeout(Duration::from_secs(30))?;
+        connections.push(worker_conn);
+    }
+
+    let task_count = tasks.len();
+    let recycle_rss_bytes = experimental_checker_recycle_bytes()?;
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(tasks));
+    let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let (sender, receiver) = std::sync::mpsc::channel::<ProjectTaskResult>();
+    eprintln!(
+        "checker enrichment experiment: {workers} reusable sidecar worker(s), {task_count} project(s)"
+    );
+
+    std::thread::scope(|scope| -> Result<()> {
+        for worker_conn in connections {
+            let queue = std::sync::Arc::clone(&queue);
+            let write_lock = std::sync::Arc::clone(&write_lock);
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let mut checker = None;
+                loop {
+                    let task = match queue.lock() {
+                        Ok(mut queued) => queued.pop_front(),
+                        Err(_) => None,
+                    };
+                    let Some(task) = task else {
+                        break;
+                    };
+                    let mut counters = ProjectExecutionCounters::default();
+                    let result = (|| -> Result<()> {
+                        if super::process::cancellation_pending() {
+                            bail!("checker enrichment interrupted before project execution");
+                        }
+                        if checker.is_none() {
+                            let launched =
+                                super::launch(root, options.sidecar, None, options.node)?;
+                            launched
+                                .register_interrupts()
+                                .context("failed to install checker Ctrl-C handler")?;
+                            checker = Some(launched);
+                        }
+                        execute_project_with_checker(
+                            root,
+                            options,
+                            &worker_conn,
+                            batch_id,
+                            &task.project_id,
+                            &task.pending,
+                            expected_identity,
+                            checker
+                                .as_mut()
+                                .context("checker worker was not launched")?,
+                            Some(&write_lock),
+                            &mut counters.request_batches,
+                            &mut counters.occurrences_queried,
+                            &mut counters.unknown_answers,
+                            &mut counters.unmapped_declarations,
+                            &mut counters.unmapped_declaration_contexts,
+                            &mut counters.peak_rss_bytes,
+                            &mut counters.peak_heap_bytes,
+                        )
+                    })();
+                    let should_recycle = result.is_err()
+                        || recycle_rss_bytes.is_some_and(|limit| counters.peak_rss_bytes >= limit);
+                    if should_recycle {
+                        checker = None;
+                    }
+                    if sender
+                        .send(ProjectTaskResult {
+                            task,
+                            result,
+                            counters,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let mut interruption = None;
+        for _ in 0..task_count {
+            let ProjectTaskResult {
+                task,
+                result,
+                counters,
+            } = receiver
+                .recv()
+                .context("checker worker pool ended before every project reported")?;
+            *request_batches += counters.request_batches;
+            *occurrences_queried += counters.occurrences_queried;
+            *unknown_answers += counters.unknown_answers;
+            *unmapped_declarations += counters.unmapped_declarations;
+            for (context, count) in counters.unmapped_declaration_contexts {
+                *unmapped_declaration_contexts.entry(context).or_default() += count;
+            }
+            *peak_rss_bytes = (*peak_rss_bytes).max(counters.peak_rss_bytes);
+            *peak_heap_bytes = (*peak_heap_bytes).max(counters.peak_heap_bytes);
+
+            match result {
+                Ok(()) => eprintln!(
+                    "checker enrichment experiment: completed project {}/{} {}",
+                    task.index, task.total, task.project_id
+                ),
+                Err(error) if project_was_interrupted(&error) => {
+                    interruption.get_or_insert_with(|| {
+                        format!(
+                            "checker enrichment interrupted during project {}; staged work retained: {error:#}",
+                            task.project_id
+                        )
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let retryable = project_failure_is_retryable(&error);
+                    let _guard = write_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("checker failure staging lock poisoned"))?;
+                    mark_project_failed(
+                        conn,
+                        batch_id,
+                        &task.project_id,
+                        &task.occurrences,
+                        &message,
+                    )?;
+                    eprintln!(
+                        "checker enrichment: project {} failed disposition={}: {error:#}",
+                        task.project_id,
+                        if retryable { "retryable" } else { "terminal" }
+                    );
+                    failed_projects.push(ProjectFailure {
+                        project_id: task.project_id,
+                        retryable,
+                    });
+                }
+            }
+        }
+        if let Some(message) = interruption {
+            bail!(message);
+        }
+        Ok(())
     })
 }
 
@@ -2175,13 +2486,55 @@ fn execute_project(
     peak_rss_bytes: &mut u64,
     peak_heap_bytes: &mut u64,
 ) -> Result<()> {
-    const MAX_BATCH_ITEMS: usize = 128;
-    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-
     let mut checker = super::launch(root, options.sidecar, None, options.node)?;
     checker
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
+    execute_project_with_checker(
+        root,
+        options,
+        conn,
+        batch_id,
+        project_id,
+        occurrences,
+        expected_identity,
+        &mut checker,
+        None,
+        request_batches,
+        occurrences_queried,
+        unknown_answers,
+        unmapped_declarations,
+        unmapped_declaration_contexts,
+        peak_rss_bytes,
+        peak_heap_bytes,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "experimental pooled execution keeps checker, persistence, and resource counters explicit"
+)]
+fn execute_project_with_checker(
+    root: &Path,
+    options: &EnrichOptions<'_>,
+    conn: &Connection,
+    batch_id: i64,
+    project_id: &str,
+    occurrences: &[Occurrence],
+    expected_identity: &TypeScriptIdentity,
+    checker: &mut super::process::ProcessChecker,
+    write_lock: Option<&std::sync::Mutex<()>>,
+    request_batches: &mut usize,
+    occurrences_queried: &mut usize,
+    unknown_answers: &mut usize,
+    unmapped_declarations: &mut usize,
+    unmapped_declaration_contexts: &mut BTreeMap<String, usize>,
+    peak_rss_bytes: &mut u64,
+    peak_heap_bytes: &mut u64,
+) -> Result<()> {
+    const MAX_BATCH_ITEMS: usize = 128;
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
     let mut project_fingerprint: Option<String> = None;
     let mut project_peak_rss_bytes = 0;
     let mut project_peak_heap_bytes = 0;
@@ -2265,6 +2618,12 @@ fn execute_project(
             facts.extend(outcome.facts);
             projects.extend(outcome.projects);
         }
+        let _write_guard = write_lock
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| anyhow::anyhow!("checker staging lock poisoned"))
+            })
+            .transpose()?;
         stage_batch(conn, batch_id, project_id, batch, &facts, &projects)?;
         offset = end;
         eprintln!(
@@ -2286,6 +2645,12 @@ fn execute_project(
     {
         bail!("checker inputs changed while project {project_id} was running");
     }
+    let _write_guard = write_lock
+        .map(|lock| {
+            lock.lock()
+                .map_err(|_| anyhow::anyhow!("checker completion lock poisoned"))
+        })
+        .transpose()?;
     complete_project(
         root,
         conn,

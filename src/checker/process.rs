@@ -19,7 +19,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
-static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
+static INTERRUPT_CONTROLS: Mutex<Vec<CheckerControl>> = Mutex::new(Vec::new());
 static CANCELLATION_FLAGS: CancellationFlags = CancellationFlags::new();
 
 struct CancellationFlags {
@@ -166,14 +166,15 @@ fn request_interrupt_cancellation() -> bool {
 }
 
 fn cancel_active_request() -> bool {
-    let control = INTERRUPT_CONTROL
+    let controls = INTERRUPT_CONTROLS
         .lock()
         .ok()
-        .and_then(|registered| registered.clone());
-    control
-        .as_ref()
-        .and_then(|control| control.cancel_active().ok())
-        .unwrap_or(false)
+        .map(|registered| registered.clone())
+        .unwrap_or_default();
+    controls
+        .iter()
+        .filter_map(|control| control.cancel_active().ok())
+        .any(|active| active)
 }
 
 /// Cancel an in-process watcher generation without impersonating operator
@@ -210,19 +211,21 @@ pub(crate) fn cancellation_pending() -> bool {
 
 fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
     install_interrupt_handler()?;
-    *INTERRUPT_CONTROL
+    let mut registered = INTERRUPT_CONTROLS
         .lock()
-        .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+        .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))?;
+    if !registered
+        .iter()
+        .any(|current| Arc::ptr_eq(&current.writer, &control.writer))
+    {
+        registered.push(control);
+    }
     Ok(())
 }
 
 fn unregister_interrupt_control(writer: &Arc<Writer>) {
-    if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
-        && registered
-            .as_ref()
-            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
-    {
-        *registered = None;
+    if let Ok(mut registered) = INTERRUPT_CONTROLS.lock() {
+        registered.retain(|control| !Arc::ptr_eq(&control.writer, writer));
     }
 }
 

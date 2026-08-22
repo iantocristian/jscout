@@ -1054,6 +1054,47 @@ debug = false
   }
 }
 
+function enrichmentContentDigest(context, database, batchId) {
+  const state = {
+    enrichments: sqliteJson(context.sqlite, database, `
+      SELECT member_call_id, source_file_id, source_file, source_hash,
+             call_start, call_end, receiver_start, receiver_end,
+             property_start, property_end, project_id, receiver_type,
+             target_anchor, target_fingerprint, confidence, provenance,
+             checker_input_fingerprint
+      FROM checker_enrichments WHERE batch_id = ${Number(batchId)}
+      ORDER BY member_call_id, project_id, target_anchor;
+    `, context.env),
+    occurrence_projects: sqliteJson(context.sqlite, database, `
+      SELECT member_call_id, source_file, source_hash, call_start, call_end,
+             receiver_start, receiver_end, property_start, property_end,
+             project_id, checker_input_fingerprint, status
+      FROM checker_occurrence_projects WHERE batch_id = ${Number(batchId)}
+      ORDER BY member_call_id, project_id;
+    `, context.env),
+    project_inputs: sqliteJson(context.sqlite, database, `
+      SELECT project_id, input_kind, input_path, source_hash
+      FROM checker_project_inputs WHERE batch_id = ${Number(batchId)}
+      ORDER BY project_id, input_kind, input_path;
+    `, context.env),
+    project_runs: sqliteJson(context.sqlite, database, `
+      SELECT project_id, status, selected_occurrences, completed_occurrences,
+             planning_fingerprint, checker_input_fingerprint, execution_kind,
+             error
+      FROM checker_project_runs WHERE batch_id = ${Number(batchId)}
+      ORDER BY project_id;
+    `, context.env),
+    resolved_edges: sqliteJson(context.sqlite, database, `
+      SELECT src_key, dst_key, kind, confidence, provenance,
+             source_file_id, source_ref_id, line, detail_json
+      FROM resolved_edges
+      ORDER BY src_key, dst_key, kind, confidence, provenance,
+               source_file_id, source_ref_id, line, detail_json;
+    `, context.env),
+  };
+  return sha256Bytes(JSON.stringify(state));
+}
+
 function runEnrichmentSuite(context) {
   console.error('benchmark: checker enrichment and unchanged reuse');
   if (!context.nodeModules) throw new Error('--node-modules is required by the enrichment suite');
@@ -1132,6 +1173,7 @@ function runEnrichmentSuite(context) {
     'completed enrichment occurrences',
   );
   const fullIntegrity = integrityCheck(context, fullDatabase);
+  const fullContentDigest = enrichmentContentDigest(context, fullDatabase, fullReport.batch_id);
   const fullSeed = join(context.workspace, 'enrichment-complete.db');
   backupDatabase(context.sqlite, fullDatabase, fullSeed, context.env);
   removeDatabaseFamily(context, fullDatabase);
@@ -1187,6 +1229,7 @@ function runEnrichmentSuite(context) {
         unknown_answers: fullReport.unknown_answers,
         unknown_projects: fullReport.unknown_projects.length,
         configuration_problems: fullReport.configuration_problems,
+        logical_content_sha256: fullContentDigest,
         completed_project_runs: fullProjectRuns.completed_projects,
         completed_project_occurrences: fullProjectRuns.completed_occurrences,
       },
