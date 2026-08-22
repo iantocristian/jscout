@@ -102,7 +102,7 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage
-                               #   --all also includes resolved calls and inferred projects
+                               #   --all also includes resolved calls, excluded roles, and every orphan
 jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
                                # optional code-vector/checker/semantic-vector phases
@@ -332,13 +332,17 @@ that still reach property candidates. Tests, fixtures, generated files,
 documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
 or `--role` to narrow that set. `--all` broadens it to the normally excluded
-cases and explicitly includes synthetic inferred projects for files outside
-every configured TypeScript project. Inferred roots are grouped by nearest
-package and compatible compiler family, then deterministically subdivided at a
-150-root cap; imported dependencies can therefore share one TypeScript Program
-without recreating the former one-Program-per-file cost. Those files remain
-first-class in chunks, symbols, structural edges, FTS, embeddings, and retrieval
-when checker enrichment skips them.
+cases and includes every synthetic inferred project. By default, a package with
+a strict majority of unowned production/unknown-role source is JS-first and its
+unowned default-role roots are included. In a TS-first package, an orphan is
+included only when a non-type import path reaches it from a `main`, `exports`,
+`bin`, or script target. Tests, fixtures, generated files, and documentation
+remain excluded from orphan scopes unless `--all` is used. Inferred roots
+are grouped by nearest package and compatible compiler family, then
+deterministically subdivided at a 150-root cap; imported dependencies can
+therefore share one TypeScript Program without recreating the former
+one-Program-per-file cost. Skipped files remain first-class in chunks, symbols,
+structural edges, FTS, embeddings, and retrieval.
 Sharing a Program can expose ambient declarations loaded through one root to
 its siblings. On pinned ai-pipe, 587 occurrences moved from unknown to
 `@types/node` declarations while all 1,412 mapped repository fact payloads
@@ -347,13 +351,13 @@ coverage-neutral.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
 files within each priority tier; configured projects execute before inferred
-projects when `--all` is used. The inferred-project gate runs before the
-operator cap, so skipped files cannot consume a capped selection.
+projects within the same dirty/clean tier. The package-policy gate runs before
+the operator cap, so skipped files cannot consume a capped selection.
 `--dry-run` reports discovered, eligible, selected, omitted, project, and
-configuration counts after a configuration-only ownership pass and does not
-construct a TypeScript Program. Its coverage fields distinguish eligible files
-and occurrences without configured owners from occurrences actually skipped by
-the default inferred-project gate.
+configuration counts after one full-inventory configuration-only ownership
+snapshot and does not construct a TypeScript Program. Its coverage fields
+distinguish eligible files and occurrences without configured owners from
+occurrences actually skipped by the default package policy.
 `--full` bypasses exact-batch reuse and recomputes every selected project. It is
 the manual equivalent of the watcher's periodic carry-free checker drift flush.
 
