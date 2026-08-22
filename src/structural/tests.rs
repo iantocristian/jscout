@@ -1385,6 +1385,7 @@ fn checker_facts_project_per_occurrence_without_replacing_member_hubs() -> Resul
         serde_json::json!(["tsconfig.stray.json"]),
         "unknown owning projects stay visible without demoting the clean resolution"
     );
+    assert_eq!(checker_detail["candidateCount"], 1);
     conn.execute(
         "UPDATE checker_project_runs SET status='failed'
          WHERE batch_id=?1 AND project_id='tsconfig.stray.json'",
