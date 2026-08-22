@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "27";
+pub const SCHEMA_VERSION: &str = "28";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -81,19 +81,26 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
             path.display()
         );
     }
-    let published: bool = conn.query_row(
+    let (has_snapshot, projection_version): (bool, Option<String>) = conn.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM meta WHERE key='snapshot'
-         ) AND EXISTS(
-           SELECT 1 FROM meta WHERE key='projection_version'
+         ), (
+           SELECT value FROM meta WHERE key='projection_version'
          )",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if !published {
+    let Some(projection_version) = projection_version.filter(|_| has_snapshot) else {
         bail!(
             "index database `{}` has no published structural snapshot; run `jscout index`",
             path.display()
+        );
+    };
+    if projection_version != crate::structural::PROJECTION_VERSION {
+        bail!(
+            "index database `{}` uses structural projection v{projection_version}, but this jscout requires v{}; run `jscout index`",
+            path.display(),
+            crate::structural::PROJECTION_VERSION,
         );
     }
     Ok(conn)
@@ -203,6 +210,12 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS module_edges;
              DROP TABLE IF EXISTS refs;
              DROP TABLE IF EXISTS events;
+             DROP TABLE IF EXISTS receiver_value_flows;
+             DROP TABLE IF EXISTS function_return_flows;
+             DROP TABLE IF EXISTS value_binding_flows;
+             DROP TABLE IF EXISTS instance_method_value_flows;
+             DROP TABLE IF EXISTS class_member_value_flow_blockers;
+             DROP TABLE IF EXISTS class_value_flows;
              DROP TABLE IF EXISTS member_calls;
              DROP TABLE IF EXISTS imports;
              DROP TABLE IF EXISTS exports;
@@ -217,7 +230,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='27' WHERE key='schema_version';",
+             UPDATE meta SET value='28' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -235,7 +248,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '27')
+INSERT INTO meta(key, value) VALUES('schema_version', '28')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -358,7 +371,9 @@ CREATE TABLE IF NOT EXISTS refs(
   local INTEGER NOT NULL DEFAULT 0,
   detail TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
+-- Receiver-value projection resolves an extracted binding by its exact source
+-- span. The leading file_id column still serves existing file-only lookups.
+CREATE INDEX IF NOT EXISTS idx_refs_file_start ON refs(file_id, start);
 CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_name);
 
 CREATE TABLE IF NOT EXISTS events(
@@ -391,6 +406,94 @@ CREATE TABLE IF NOT EXISTS member_calls(
 CREATE INDEX IF NOT EXISTS idx_member_calls_file
   ON member_calls(file_id, receiver_start, prop);
 CREATE INDEX IF NOT EXISTS idx_member_calls_prop ON member_calls(prop);
+
+-- Closed syntax-and-binding facts for occurrence-specific receiver value flow.
+-- Absence means the extractor deliberately gave up; projection never fills a
+-- missing fact by name alone.
+CREATE TABLE IF NOT EXISTS receiver_value_flows(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  call_start INTEGER NOT NULL,
+  call_end INTEGER NOT NULL,
+  receiver_kind TEXT NOT NULL CHECK(receiver_kind IN ('this', 'value')),
+  class_name TEXT,
+  class_start INTEGER,
+  value_kind TEXT CHECK(value_kind IN ('construct', 'factory', 'binding')),
+  target_kind TEXT CHECK(target_kind IN ('identifier', 'member')),
+  target_name TEXT,
+  target_start INTEGER,
+  CHECK(
+    (receiver_kind='this' AND class_name IS NOT NULL AND class_start IS NOT NULL
+      AND value_kind IS NULL AND target_kind IS NULL
+      AND target_name IS NULL AND target_start IS NULL)
+    OR
+    (receiver_kind='value' AND class_name IS NULL AND class_start IS NULL
+      AND value_kind IS NOT NULL AND target_kind IS NOT NULL
+      AND target_name IS NOT NULL AND target_start IS NOT NULL)
+  ),
+  UNIQUE(file_id, call_start, call_end)
+);
+CREATE INDEX IF NOT EXISTS idx_receiver_value_flows_call
+  ON receiver_value_flows(file_id, call_start, call_end);
+
+-- A function appears here only when it has at least one return and every
+-- return is a supported construct/binding/factory shape. One unsupported
+-- return suppresses the complete summary.
+CREATE TABLE IF NOT EXISTS function_return_flows(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  function_name TEXT NOT NULL,
+  function_start INTEGER NOT NULL,
+  function_async INTEGER NOT NULL CHECK(function_async IN (0, 1)),
+  return_index INTEGER NOT NULL,
+  value_kind TEXT NOT NULL CHECK(value_kind IN ('construct', 'factory', 'binding')),
+  target_kind TEXT NOT NULL CHECK(target_kind IN ('identifier', 'member')),
+  target_name TEXT NOT NULL,
+  target_start INTEGER NOT NULL,
+  UNIQUE(file_id, function_start, return_index)
+);
+CREATE INDEX IF NOT EXISTS idx_function_return_flows_binding
+  ON function_return_flows(file_id, function_start);
+
+CREATE TABLE IF NOT EXISTS value_binding_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  binding_name TEXT NOT NULL,
+  binding_start INTEGER NOT NULL,
+  value_kind TEXT NOT NULL CHECK(value_kind IN ('construct', 'factory', 'binding')),
+  target_kind TEXT NOT NULL CHECK(target_kind IN ('identifier', 'member')),
+  target_name TEXT NOT NULL,
+  target_start INTEGER NOT NULL,
+  PRIMARY KEY(file_id, binding_start)
+);
+
+CREATE TABLE IF NOT EXISTS class_value_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_name TEXT NOT NULL,
+  class_start INTEGER NOT NULL,
+  super_name TEXT,
+  super_start INTEGER,
+  super_kind TEXT CHECK(super_kind IN ('identifier', 'member')),
+  CHECK((super_name IS NULL) = (super_start IS NULL)),
+  CHECK((super_name IS NULL) = (super_kind IS NULL)),
+  PRIMARY KEY(file_id, class_start)
+);
+CREATE INDEX IF NOT EXISTS idx_class_value_flows_name
+  ON class_value_flows(file_id, class_name);
+
+CREATE TABLE IF NOT EXISTS instance_method_value_flows(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_start INTEGER NOT NULL,
+  method_name TEXT NOT NULL,
+  method_start INTEGER NOT NULL,
+  PRIMARY KEY(file_id, method_start)
+);
+
+CREATE TABLE IF NOT EXISTS class_member_value_flow_blockers(
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  class_start INTEGER NOT NULL,
+  member_name TEXT NOT NULL,
+  PRIMARY KEY(file_id, class_start, member_name)
+);
 
 -- Source-local deterministic evidence. Identifier identities remain raw here
 -- until module resolution can group them under canonical entities.
@@ -943,6 +1046,12 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM entity_sites;
          DELETE FROM refs;
          DELETE FROM events;
+         DELETE FROM receiver_value_flows;
+         DELETE FROM function_return_flows;
+         DELETE FROM value_binding_flows;
+         DELETE FROM instance_method_value_flows;
+         DELETE FROM class_member_value_flow_blockers;
+         DELETE FROM class_value_flows;
          DELETE FROM member_calls;
          DELETE FROM imports;
          DELETE FROM exports;
@@ -1249,13 +1358,17 @@ mod tests {
     }
 
     #[test]
-    fn published_index_opens_query_only() -> Result<()> {
+    fn published_index_opens_query_only_and_rejects_stale_projection() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("published.db");
         let writer = open_path(&database)?;
-        writer.execute_batch(
-            "INSERT INTO meta(key, value) VALUES('snapshot', 'snapshot');
-             INSERT INTO meta(key, value) VALUES('projection_version', 'projection');",
+        writer.execute(
+            "INSERT INTO meta(key, value) VALUES('snapshot', 'snapshot')",
+            [],
+        )?;
+        writer.execute(
+            "INSERT INTO meta(key, value) VALUES('projection_version', ?1)",
+            [crate::structural::PROJECTION_VERSION],
         )?;
         drop(writer);
 
@@ -1274,6 +1387,76 @@ mod tests {
                 .is_err(),
             "query-only connection accepted a write"
         );
+        drop(reader);
+
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "UPDATE meta SET value='stale' WHERE key='projection_version'",
+            [],
+        )?;
+        drop(writer);
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must reject stale structural projections");
+        assert!(error.to_string().contains("structural projection vstale"));
+        let unchanged: String = Connection::open(&database)?.query_row(
+            "SELECT value FROM meta WHERE key='projection_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unchanged, "stale");
+        Ok(())
+    }
+
+    #[test]
+    fn v27_upgrade_installs_receiver_flow_tables_and_read_only_rejects_old_schema() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v27.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "DROP TABLE receiver_value_flows;
+             DROP TABLE function_return_flows;
+             DROP TABLE value_binding_flows;
+             DROP TABLE instance_method_value_flows;
+             DROP TABLE class_member_value_flow_blockers;
+             DROP TABLE class_value_flows;
+             DROP INDEX idx_refs_file_start;
+             CREATE INDEX idx_refs_file ON refs(file_id);
+             UPDATE meta SET value='27' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must not migrate schema v27");
+        assert!(error.to_string().contains("schema v27"));
+        let unchanged: String = Connection::open(&database)?.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unchanged, "27");
+
+        let upgraded = open_path(&database)?;
+        let installed: i64 = upgraded.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type='table' AND name IN (
+               'receiver_value_flows', 'function_return_flows',
+               'value_binding_flows', 'instance_method_value_flows',
+               'class_member_value_flow_blockers', 'class_value_flows'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(installed, 6);
+        assert_eq!(
+            index_columns(&upgraded, "idx_refs_file_start")?,
+            ["file_id", "start"]
+        );
+        let version: String = upgraded.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
         Ok(())
     }
 

@@ -219,6 +219,29 @@ explicit candidates. Unknown-receiver member calls are projected through
 property hubs; use depth two to traverse from a candidate symbol to possible
 callers without materializing every call-site × symbol pair.
 
+Indexing also performs a bounded receiver value-flow pass. It resolves
+`this.m()` inside instance methods and supported instance initializers to the
+enclosing class, direct or const-bound `new C()` receivers to `C.m`, and
+module-scope immutable factory receivers through closed returns at depth two.
+Imported/exported const values retain their value semantics. Awaited values and
+async factories are left to the checker because thenable assimilation can
+change their receiver identity. Every constructor, factory, or imported-value
+reference must resolve to one exact module root or imported binding; local
+immutable aliases are followed, while heuristic workspace edges and ambiguous
+re-exports are rejected. Every factory branch must be a construct, a const
+binding to one, or another bounded factory call, and a block body must not fall
+through. Parameters, destructuring, conditional expressions, mutable
+declarations, optional factory results, async/await values, decorators,
+constructors with explicit returns, `eval` references, dynamic `with` scope,
+unresolved or dynamically computed base/member shapes, TypeScript parameter
+properties, and an accessor, field, or direct binding-member write anywhere in
+the exact superclass chain that can shadow a method give up to the property
+hub. Optional member invocation is accepted because it changes whether a call
+runs, not the target when it runs. These occurrence-specific edges are
+`likely`, never `certain`, and capped at three targets. Alias-mediated writes,
+global-object rebinding, `Object.assign`/`defineProperty`, and prototype
+mutation remain outside the bounded proof.
+
 ## Repository reconnaissance
 
 `jscout scout repository <root> --max-calls N|all` is the explicit G13 pass between
@@ -331,10 +354,12 @@ Eligibility defaults to repository/workspace production and unknown-role calls
 that still reach property candidates. Tests, fixtures, generated files,
 documentation, and exact calls already explained by a direct deterministic
 `certain`/`likely` edge are excluded. Repeat `--file`, `--package`, `--member`,
-or `--role` to narrow that set. `--all` broadens it to the normally excluded
-cases and includes every synthetic inferred project. By default, a package with
-a strict majority of unowned production/unknown-role source is JS-first and its
-unowned default-role roots are included. In a TS-first package, an orphan is
+or `--role` to narrow that set. `--all` broadens other deterministic answers
+and includes every synthetic inferred project for audit, but receiver
+value-flow answers are never repeated through the checker. By default, a
+package with a strict majority of unowned production/unknown-role source is
+JS-first and its unowned default-role roots are included. In a TS-first
+package, an orphan is
 included only when a non-type import path reaches it from a `main`, `exports`,
 `bin`, or script target. Tests, fixtures, generated files, and documentation
 remain excluded from orphan scopes unless `--all` is used. Inferred roots
@@ -937,10 +962,11 @@ the innermost enclosing declaration anchor. All `--arg KEY[=VALUE]` filters
 must match top-level literal properties of the same object-literal argument;
 `--arg-position` pins which argument that is. Candidate files are
 hash-verified against disk, and drift fails the query instead of answering
-from a stale index. Receiver identity stays checker-less: which
-implementation actually handles the call remains an explicit candidate-set
-question (`who-uses`, property hubs), never a silent guess. The same query
-is exposed as the `calls` MCP tool.
+from a stale index. The calls matcher itself does not resolve receiver
+identity. Use graph queries or enrichment to inspect occurrence-specific
+receiver-value-flow/checker edges and property-hub candidates; the matcher
+never silently guesses an implementation. The same query is exposed as the
+`calls` MCP tool.
 
 ## Search anchors and expansion
 
@@ -1053,6 +1079,7 @@ rejected; preserve such a file before creating a fresh current database.
 ## Confidence tiers
 
 - **certain** — resolved through binding analysis + Node module resolution (incl. package.json `exports`, tsconfig `paths`, barrel/star re-exports, CommonJS `require` with literals, dynamic `import('...')` literals).
+- **likely** — bounded occurrence-specific receiver candidate sets from lexical value flow or complete mapped TypeScript-checker declaration sets. Small candidate sets remain explicit and record `candidateCount`.
 - **possible** — name-matched member calls (`x.getUser()`): candidates listed, never silently dropped. This is the honest checker-less answer for calls through type annotations.
 
 When an otherwise-certain reference resolves to multiple same-named root

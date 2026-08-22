@@ -61,6 +61,10 @@ pub struct FileGraph {
     pub requests: Vec<String>,
     pub events: Vec<crate::heur::EventSite>,
     pub member_calls: Vec<crate::heur::MemberCall>,
+    pub receiver_flows: Vec<crate::value_flow::ReceiverFlow>,
+    pub function_flows: Vec<crate::value_flow::FunctionFlow>,
+    pub binding_flows: Vec<crate::value_flow::BindingFlow>,
+    pub class_flows: Vec<crate::value_flow::ClassFlow>,
     pub entity_sites: Vec<crate::entity::EntitySite>,
 }
 
@@ -170,6 +174,11 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
         }
     }
     g.entity_sites = crate::entity::extract(&ret.program, &exported_contract_locals);
+    let value_flows = crate::value_flow::extract(semantic);
+    g.receiver_flows = value_flows.receivers;
+    g.function_flows = value_flows.functions;
+    g.binding_flows = value_flows.bindings;
+    g.class_flows = value_flows.classes;
     g.requests = record
         .requested_modules
         .keys()

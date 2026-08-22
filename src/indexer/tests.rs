@@ -1166,10 +1166,47 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
         (
             "member_calls",
             "SELECT f.path, c.start, m.start, m.end, m.line, m.end_line,
-                    m.prop, m.object, m.receiver
+                    m.prop, m.object, m.receiver, m.receiver_start, m.receiver_end,
+                    m.property_start, m.property_end, m.receiver_unbound
              FROM member_calls m
              JOIN files f ON f.id=m.file_id
              LEFT JOIN chunks c ON c.id=m.chunk_id",
+        ),
+        (
+            "receiver_value_flows",
+            "SELECT f.path, v.call_start, v.call_end, v.receiver_kind,
+                    v.class_name, v.class_start, v.value_kind, v.target_kind,
+                    v.target_name, v.target_start
+             FROM receiver_value_flows v JOIN files f ON f.id=v.file_id",
+        ),
+        (
+            "function_return_flows",
+            "SELECT f.path, v.function_name, v.function_start, v.function_async,
+                    v.return_index, v.value_kind, v.target_kind, v.target_name,
+                    v.target_start
+             FROM function_return_flows v JOIN files f ON f.id=v.file_id",
+        ),
+        (
+            "value_binding_flows",
+            "SELECT f.path, v.binding_name, v.binding_start, v.value_kind,
+                    v.target_kind, v.target_name, v.target_start
+             FROM value_binding_flows v JOIN files f ON f.id=v.file_id",
+        ),
+        (
+            "class_value_flows",
+            "SELECT f.path, v.class_name, v.class_start, v.super_name,
+                    v.super_start, v.super_kind
+             FROM class_value_flows v JOIN files f ON f.id=v.file_id",
+        ),
+        (
+            "instance_method_value_flows",
+            "SELECT f.path, v.class_start, v.method_name, v.method_start
+             FROM instance_method_value_flows v JOIN files f ON f.id=v.file_id",
+        ),
+        (
+            "class_member_value_flow_blockers",
+            "SELECT f.path, v.class_start, v.member_name
+             FROM class_member_value_flow_blockers v JOIN files f ON f.id=v.file_id",
         ),
         (
             "entity_sites",
