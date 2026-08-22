@@ -2658,7 +2658,7 @@ fn confidence_policy_change_prevents_carry_of_a_legacy_possible_set() -> Result<
         1,
     )?;
     let old_snapshot = crate::structural::current_snapshot(&conn)?;
-    activate_staging_batch(repo.path(), &conn, old_batch, &old_snapshot, false)?;
+    activate_staging_batch(repo.path(), &conn, old_batch, &old_snapshot, false, None)?;
     crate::structural::rebuild_projection(&conn, &old_snapshot)?;
     assert_eq!(
         conn.query_row(
