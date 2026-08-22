@@ -13,6 +13,11 @@ use super::protocol::{
     TypeScriptIdentity,
 };
 
+/// Stored confidence semantics participate in both exact-plan reuse and
+/// cross-snapshot project carry. Bump this whenever the same checker answer
+/// would be classified differently.
+const CONFIDENCE_POLICY_FINGERPRINT: &[u8] = b"jscout-checker-confidence-policy-v2\0";
+
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
     pub database: Option<&'a Path>,
@@ -1406,6 +1411,7 @@ fn project_planning_fingerprints(
             let config = summary.map_or("", |summary| summary.config_fingerprint.as_str());
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"jscout-checker-project-plan-v1\0");
+            hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
             for value in [
                 project_id.as_str(),
                 checker.version.as_str(),
@@ -1435,6 +1441,7 @@ fn plan_fingerprint(
     // checker answer projects must never revive a batch created under the
     // previous single-target-only `likely` rule.
     hasher.update(b"jscout-checker-plan-v3\0");
+    hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
     for value in [
         snapshot,
         &checker.version,

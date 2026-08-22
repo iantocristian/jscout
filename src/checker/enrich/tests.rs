@@ -60,6 +60,35 @@ fn test_project_fingerprints(
         .collect()
 }
 
+fn legacy_project_planning_fingerprint(
+    project_id: &str,
+    occurrences: &[Occurrence],
+    checker: &TypeScriptIdentity,
+    protocol: u32,
+) -> String {
+    let membership = occurrences
+        .iter()
+        .map(|occurrence| occurrence.file.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\0");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-checker-project-plan-v1\0");
+    for value in [
+        project_id,
+        checker.version.as_str(),
+        checker.source.as_str(),
+        &protocol.to_string(),
+        membership.as_str(),
+        "",
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 #[test]
 fn spread_order_covers_packages_and_files_before_repeating_a_prefix() {
     let occurrences = vec![
@@ -1290,6 +1319,138 @@ fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<(
             |row| row.get::<_, i64>(0),
         )?,
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn confidence_policy_change_prevents_carry_of_a_legacy_possible_set() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class A { insert(): void {} }\n\
+                  export class B { insert(): number { return 1; } }\n\
+                  declare const target: A | B; target.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let old_occurrence = occurrence(&conn)?;
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let project = "tsconfig.json";
+    let old_projects = BTreeMap::from([(project.to_string(), vec![old_occurrence.clone()])]);
+    let legacy_fingerprints = BTreeMap::from([(
+        project.to_string(),
+        legacy_project_planning_fingerprint(project, &old_projects[project], &identity, 2),
+    )]);
+    let old_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "legacy-confidence-policy",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &old_projects,
+            project_fingerprints: &legacy_fingerprints,
+            force_new: false,
+        },
+    )?;
+    let declarations = vec![
+        declaration_at(source, "insert(): void {}", "insert", &hash),
+        declaration_at(source, "insert(): number { return 1; }", "insert", &hash),
+    ];
+    let mut legacy_outcome = map_occurrence(&conn, &old_occurrence, &[answer(declarations)])?;
+    assert!(
+        legacy_outcome
+            .facts
+            .iter()
+            .all(|fact| fact.confidence == "likely")
+    );
+    for fact in &mut legacy_outcome.facts {
+        fact.confidence = "possible".into();
+    }
+    stage_batch(
+        &conn,
+        old_batch,
+        project,
+        std::slice::from_ref(&old_occurrence),
+        &legacy_outcome.facts,
+        &legacy_outcome.projects,
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        old_batch,
+        project,
+        "legacy-inputs",
+        &[super::super::protocol::CheckerInputFile {
+            path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+            source_hash: hash,
+        }],
+        1,
+        1,
+    )?;
+    let old_snapshot = crate::structural::current_snapshot(&conn)?;
+    activate_staging_batch(repo.path(), &conn, old_batch, &old_snapshot, false)?;
+    crate::structural::rebuild_projection(&conn, &old_snapshot)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE provenance='checker' AND confidence='possible'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        2
+    );
+
+    fs::write(
+        repo.path().join("unrelated.ts"),
+        "export const value = 1;\n",
+    )?;
+    crate::indexer::watch_full_refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &crate::indexer::IndexOptions::default(),
+    )?;
+    let current_occurrence = occurrence(&conn)?;
+    let projects = BTreeMap::from([(project.to_string(), vec![current_occurrence])]);
+    let current_fingerprints = project_planning_fingerprints(&projects, &[], &identity, 2);
+    assert_ne!(legacy_fingerprints, current_fingerprints);
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let batch_id = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "current-confidence-policy",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects,
+            project_fingerprints: &current_fingerprints,
+            force_new: false,
+        },
+    )?;
+    let carried = carry_forward_projects(
+        &conn,
+        batch_id,
+        &identity,
+        2,
+        &projects,
+        &current_fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
+    )?;
+    assert_eq!(carried.projects_carried, 0);
+    assert_eq!(carried.occurrences_carried, 0);
+    assert_eq!(
+        carried.projects_requiring_check,
+        BTreeSet::from([project.to_string()])
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects WHERE batch_id=?1",
+            [batch_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
     );
     Ok(())
 }

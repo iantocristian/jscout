@@ -688,10 +688,11 @@ or path mappings. Project discovery and selection must therefore be
 deterministic: enumerate every owning configured project (or one explicitly
 identified inferred project), attach a stable project ID and effective compiler
 options to each answer, and never choose a target by server load order. Equal
-answers may coalesce. A fully mapped closed set of at most three targets remains
-visible as separate `likely` candidates; larger or incompletely mapped sets are
-`possible`, and an answer that cannot be mapped safely is `unknown`. Conflicts
-never collapse into one arbitrary edge.
+answers may coalesce. Fresh owning projects that disagree contribute to one
+configuration-conditioned candidate set: a fully mapped closed union of at most
+three targets remains visible as separate `likely` candidates; larger or
+incompletely mapped sets are `possible`, and an answer that cannot be mapped
+safely is `unknown`. Conflicts never collapse into one arbitrary edge.
 
 An owning project that returns `unknown` is incomplete coverage, not evidence
 against a clean resolution produced by another owning project. It therefore
@@ -916,8 +917,9 @@ The follow-up lands through five independent cache and measurement boundaries,
 in this order:
 
 1. Keep a fully mapped closed checker set of one to three declarations at
-   `likely`, record `candidateCount`, and version the enrichment plan so rows
-   produced by the former single-target rule cannot be reused.
+   `likely`, record `candidateCount`, and version both batch reuse and
+   per-project watch carry so rows produced by the former single-target rule
+   cannot be resumed or carried.
 2. Replace per-file inferred projects with scopes grouped by nearest
    `package.json`, compiler family, and deterministic directory bins capped at
    150 roots. Keep the existing ESNext + Bundler options in this layer, include
