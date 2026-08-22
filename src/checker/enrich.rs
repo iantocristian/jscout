@@ -13,6 +13,11 @@ use super::protocol::{
     TypeScriptIdentity,
 };
 
+/// Stored confidence semantics participate in both exact-plan reuse and
+/// cross-snapshot project carry. Bump this whenever the same checker answer
+/// would be classified differently.
+const CONFIDENCE_POLICY_FINGERPRINT: &[u8] = b"jscout-checker-confidence-policy-v2\0";
+
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
     pub database: Option<&'a Path>,
@@ -1406,6 +1411,7 @@ fn project_planning_fingerprints(
             let config = summary.map_or("", |summary| summary.config_fingerprint.as_str());
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"jscout-checker-project-plan-v1\0");
+            hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
             for value in [
                 project_id.as_str(),
                 checker.version.as_str(),
@@ -1431,7 +1437,11 @@ fn plan_fingerprint(
     options: &EnrichOptions<'_>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-checker-plan-v2\0");
+    // Confidence policy is part of reuse identity: changing how a completed
+    // checker answer projects must never revive a batch created under the
+    // previous single-target-only `likely` rule.
+    hasher.update(b"jscout-checker-plan-v3\0");
+    hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
     for value in [
         snapshot,
         &checker.version,
@@ -2619,9 +2629,9 @@ fn activate_staging_batch(
             recheck_target(conn, &target?)?;
         }
 
-        // Cross-project ambiguity is known only after every owner has
-        // completed. A different mapped target in any owner demotes every
-        // surviving candidate for that occurrence.
+        // Cross-project candidate cardinality is known only after every owner
+        // has completed. A closed set of at most three mapped targets stays
+        // likely; larger or incomplete sets demote every surviving candidate.
         conn.execute(
             "UPDATE checker_enrichments
              SET confidence='possible'
@@ -2629,7 +2639,7 @@ fn activate_staging_batch(
                SELECT member_call_id FROM checker_enrichments
                WHERE batch_id=?1
                GROUP BY member_call_id
-               HAVING count(DISTINCT target_anchor)>1
+               HAVING count(DISTINCT target_anchor)>3
                   OR min(CASE confidence WHEN 'possible' THEN 0 ELSE 1 END)=0
              )",
             [batch_id],
@@ -2786,9 +2796,15 @@ fn map_occurrence(
         .map(|fact| fact.target.anchor.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    let unambiguous = target_count == 1 && outcome.unmapped_declarations == 0;
+    let closed_candidate_set =
+        (1..=3).contains(&target_count) && outcome.unmapped_declarations == 0;
     for fact in &mut outcome.facts {
-        fact.confidence = if unambiguous { "likely" } else { "possible" }.into();
+        fact.confidence = if closed_candidate_set {
+            "likely"
+        } else {
+            "possible"
+        }
+        .into();
     }
     Ok(outcome)
 }

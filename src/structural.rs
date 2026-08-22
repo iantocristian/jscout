@@ -2299,7 +2299,18 @@ fn project_checker_enrichments(
             projection.confidence = "possible".into();
         }
     }
+    let candidate_counts = projected.keys().fold(
+        BTreeMap::<i64, usize>::new(),
+        |mut counts, (occurrence, _)| {
+            *counts.entry(*occurrence).or_default() += 1;
+            counts
+        },
+    );
     for projection in projected.into_values() {
+        let candidate_count = candidate_counts
+            .get(&projection.member_call_id)
+            .copied()
+            .unwrap_or(1);
         insert_edge.execute(params![
             projection.source,
             projection.target,
@@ -2318,6 +2329,7 @@ fn project_checker_enrichments(
                 "unknownProjects": projection.unknown_projects,
                 "failedProjects": projection.failed_projects,
                 "receiverTypes": projection.receiver_types,
+                "candidateCount": candidate_count,
                 "occurrenceSpecific": true
             })
             .to_string(),
