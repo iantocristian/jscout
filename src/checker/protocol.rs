@@ -1,14 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outbound {
     Hello,
     Capabilities,
-    PlanMembers {
+    PlanMembersBegin {
+        total_files: usize,
+        refresh_config: bool,
+    },
+    PlanMembersAdd {
         files: Vec<String>,
+    },
+    PlanMembersFinish,
+    PlanMembersNext {
+        cursor: String,
     },
     #[cfg(test)]
     ResolveMember {
@@ -59,9 +67,17 @@ pub enum Inbound {
         id: String,
         capabilities: Capabilities,
     },
-    PlanMembersResult {
+    PlanMembersReady {
         id: String,
-        result: MemberPlanResult,
+        total_files: usize,
+    },
+    PlanMembersAddResult {
+        id: String,
+        received_files: usize,
+    },
+    PlanMembersPage {
+        id: String,
+        page: MemberPlanPage,
     },
     #[cfg(test)]
     ResolveMemberResult {
@@ -100,7 +116,9 @@ impl Inbound {
         match self {
             Self::Ready { id, .. }
             | Self::CapabilitiesResult { id, .. }
-            | Self::PlanMembersResult { id, .. }
+            | Self::PlanMembersReady { id, .. }
+            | Self::PlanMembersAddResult { id, .. }
+            | Self::PlanMembersPage { id, .. }
             | Self::ResolveMembersResult { id, .. }
             | Self::ValidateProjectResult { id, .. }
             | Self::Error { id, .. }
@@ -193,6 +211,29 @@ pub struct MemberPlanResult {
     pub projects: Vec<ProjectSummary>,
     #[serde(default)]
     pub configuration_problems: Vec<ConfigurationProblem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberPlanPage {
+    #[serde(default)]
+    pub typescript: Option<TypeScriptIdentity>,
+    #[serde(default)]
+    pub totals: Option<MemberPlanTotals>,
+    #[serde(default)]
+    pub files: Vec<FileOwnership>,
+    #[serde(default)]
+    pub projects: Vec<ProjectSummary>,
+    #[serde(default)]
+    pub configuration_problems: Vec<ConfigurationProblem>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberPlanTotals {
+    pub files: usize,
+    pub projects: usize,
+    pub configuration_problems: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -315,7 +356,7 @@ mod tests {
         )
         .expect("frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("json");
-        assert_eq!(frame["protocol"], 3);
+        assert_eq!(frame["protocol"], 4);
         assert_eq!(frame["query"]["receiver_start"], 10);
         assert_eq!(frame["query"]["property_end"], 27);
     }

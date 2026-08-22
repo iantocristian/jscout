@@ -10,6 +10,14 @@ import { fileURLToPath } from "node:url";
 
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import {
+  PLAN_FRAME_MAX_BYTES,
+  PROTOCOL_VERSION,
+  chunkPlanMemberFiles,
+  createPlanMemberResultPager,
+  encodeMessage,
+  takePlanMemberResultPage,
+} from "../src/protocol.mjs";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
 const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
@@ -43,14 +51,55 @@ function client(root) {
     pending.delete(message.id);
   });
   let sequence = 0;
-  const request = (kind, body = {}) => new Promise((resolve) => {
-    const id = `t${sequence += 1}`;
+  const nextId = () => `t${sequence += 1}`;
+  const requestWithId = (id, kind, body = {}) => new Promise((resolve) => {
     pending.set(id, resolve);
-    child.stdin.write(`${JSON.stringify({ protocol: 3, id, kind, ...body })}\n`);
+    child.stdin.write(encodeMessage({ id, kind, ...body }));
   });
+  const rawRequest = (kind, body = {}) => requestWithId(nextId(), kind, body);
+  const request = async (kind, body = {}) => {
+    if (kind !== "plan_members") return rawRequest(kind, body);
+    const files = [...(body.files ?? [])].sort();
+    const id = nextId();
+    const ready = await requestWithId(id, "plan_members_begin", {
+      total_files: files.length,
+      refresh_config: body.refresh_config !== false,
+    });
+    if (ready.kind !== "plan_members_ready") return ready;
+    for (const chunk of chunkPlanMemberFiles(files)) {
+      const added = await requestWithId(id, "plan_members_add", { files: chunk });
+      if (added.kind !== "plan_members_add_result") return added;
+    }
+    let response = await requestWithId(id, "plan_members_finish");
+    if (response.kind !== "plan_members_page") return response;
+    const result = {
+      typescript: response.page.typescript,
+      files: [],
+      projects: [],
+      configuration_problems: [],
+    };
+    const totals = response.page.totals;
+    for (;;) {
+      result.files.push(...response.page.files);
+      result.projects.push(...response.page.projects);
+      result.configuration_problems.push(...response.page.configuration_problems);
+      if (response.page.next_cursor === null) break;
+      response = await requestWithId(id, "plan_members_next", {
+        cursor: response.page.next_cursor,
+      });
+      if (response.kind !== "plan_members_page") return response;
+    }
+    assert.deepEqual(
+      [result.files.length, result.projects.length, result.configuration_problems.length],
+      [totals.files, totals.projects, totals.configuration_problems],
+    );
+    return { protocol: PROTOCOL_VERSION, id, kind: "plan_members_result", result };
+  };
   return {
     child,
     request,
+    requestWithId,
+    rawRequest,
     stderr: () => stderr,
     async close() {
       await request("shutdown");
@@ -59,6 +108,77 @@ function client(root) {
     },
   };
 }
+
+test("pages a logical multi-megabyte ownership result below the plan frame limit", () => {
+  const files = (length) => Array.from({ length }, (_, index) => ({
+    file: `logical/${index.toString().padStart(5, "0")}/${"segment".repeat(55)}.ts`,
+    project_ids: [`inferred:.#node-esm/${Math.floor(index / 150)}`],
+    excluded_project_ids: [],
+    tooling_fallback: false,
+  }));
+  const result = {
+    typescript: { version: "5.9.3", source: "bundled" },
+    files: files(12_000),
+    projects: [],
+    configuration_problems: [],
+  };
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) > 4 * 1024 * 1024);
+
+  const pager = createPlanMemberResultPager(result);
+  const reconstructed = [];
+  let pages = 0;
+  for (;;) {
+    const message = takePlanMemberResultPage(pager, "logical-plan");
+    assert.ok(Buffer.byteLength(encodeMessage(message)) <= PLAN_FRAME_MAX_BYTES);
+    reconstructed.push(...message.page.files);
+    pages += 1;
+    if (message.page.next_cursor === null) break;
+  }
+  assert.ok(pages > 4);
+  assert.deepEqual(reconstructed, result.files);
+});
+
+test("streams more than 4 MiB of logical paths and resets on cancel and upload errors", async (context) => {
+  const root = fixture({ "main.ts": "export const value = 1;\n" });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const files = Array.from({ length: 12_000 }, (_, index) => (
+    `logical/${index.toString().padStart(5, "0")}/${"segment".repeat(55)}.ts`
+  ));
+  assert.ok(Buffer.byteLength(JSON.stringify(files)) > 4 * 1024 * 1024);
+  const id = "logical-upload";
+  assert.equal(
+    (await checker.requestWithId(id, "plan_members_begin", { total_files: files.length })).kind,
+    "plan_members_ready",
+  );
+  for (const chunk of chunkPlanMemberFiles(files)) {
+    const frame = encodeMessage({ id, kind: "plan_members_add", files: chunk });
+    assert.ok(Buffer.byteLength(frame) <= PLAN_FRAME_MAX_BYTES);
+    assert.equal(
+      (await checker.requestWithId(id, "plan_members_add", { files: chunk })).kind,
+      "plan_members_add_result",
+    );
+  }
+  const canceled = await checker.requestWithId("cancel-logical", "cancel", { target_id: id });
+  assert.equal(canceled.kind, "cancel_result");
+  assert.equal(canceled.active, true);
+
+  const duplicateId = "duplicate-upload";
+  await checker.requestWithId(duplicateId, "plan_members_begin", { total_files: 2 });
+  const duplicate = await checker.requestWithId(duplicateId, "plan_members_add", {
+    files: ["main.ts", "main.ts"],
+  });
+  assert.equal(duplicate.kind, "error");
+  assert.equal(duplicate.error.code, "protocol");
+
+  const valid = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.equal(valid.kind, "plan_members_result");
+  assert.equal(valid.result.files[0].file, "main.ts");
+  await checker.close();
+});
 
 test("prints and returns the actual Node worker error", async () => {
   const root = fixture({ "main.ts": "export const value = 1;\n" });
@@ -148,7 +268,7 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   context.after(() => checker.child.kill());
   await checker.request("hello");
 
-  const plan = await checker.request("plan_members", { files: ["main.ts", "main.ts"] });
+  const plan = await checker.request("plan_members", { files: ["main.ts"] });
   assert.equal(plan.kind, "plan_members_result");
   assert.deepEqual(plan.result.files, [{
     file: "main.ts",
@@ -178,6 +298,37 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   assert.equal(validation.kind, "validate_project_result");
   assert.equal(validation.result.valid, true);
   assert.ok(validation.result.inputs.some((input) => input.path.endsWith("main.ts")));
+  await checker.close();
+});
+
+test("can reuse one configured discovery snapshot and refreshes the next independent plan", async (context) => {
+  const root = fixture({
+    "main.ts": "export const main = 1;\n",
+    "other.ts": "export const other = 2;\n",
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+  await checker.request("capabilities");
+
+  const first = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.deepEqual(first.result.files[0].project_ids, ["tsconfig.json"]);
+
+  fs.writeFileSync(
+    path.join(root, "tsconfig.json"),
+    JSON.stringify({ files: ["other.ts"] }),
+  );
+
+  const cached = await checker.request("plan_members", {
+    files: ["main.ts"],
+    refresh_config: false,
+  });
+  assert.deepEqual(cached.result.files[0].project_ids, ["tsconfig.json"]);
+
+  const second = await checker.request("plan_members", { files: ["main.ts"] });
+  assert.match(second.result.files[0].project_ids[0], /^inferred:/u);
   await checker.close();
 });
 

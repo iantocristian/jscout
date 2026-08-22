@@ -784,9 +784,9 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 ### Required G10 scale correction
 
 **Implementation status (2026-08-14, amended 2026-08-22).** The correction
-below is implemented in checker protocol v3 and schema v27: complete
-configured-project coverage by default, explicit inferred-project coverage
-under `--all`, manual planning,
+below is implemented in checker protocol v4 and schema v27: complete
+configured-project coverage, package-policy admission of runtime orphan scopes
+by default, exhaustive inferred-project coverage under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
 per-project batches, grouped inferred scopes by nearest package/compiler family
 with deterministic 150-root subdivision, per-file inferred failure attribution,
@@ -830,8 +830,9 @@ The current exhaustive path has five specific defects that must be removed:
 
 `jscout enrich --dry-run` must produce a deterministic plan before TypeScript
 program construction or type queries. Planning has a Rust candidate phase and
-a configuration-only sidecar phase that resolves file-to-project ownership;
-neither builds a project `Program`. The plan reports discovered, eligible,
+one full-inventory, configuration-only ownership observation followed by an
+admitted-scope plan that reuses the same configured-project discovery; neither
+builds a project `Program`. The plan reports discovered, eligible,
 selected, and skipped occurrences by file role, package/area, property, file,
 and planned project ownership. It pins the structural snapshot, selection
 policy, and ordered occurrence IDs in a plan fingerprint.
@@ -840,13 +841,17 @@ The default plan:
 
 - includes `repository`/`workspace` production and unknown-role files;
 - excludes test, fixture, generated, and documentation roles unless selected;
+  explicit role selection can include configured files, while orphan files in
+  those roles still require `--all`;
 - excludes occurrences already explained by a direct, occurrence-bound
   `certain` or `likely` structural edge (currently including namespace-member
   calls resolved through the module/export graph); line or name coincidence is
   never sufficient;
-- excludes synthetic inferred projects for files outside every configured
-  TypeScript project; those files remain fully available to deterministic
-  structure, FTS, embeddings, and retrieval;
+- admits unowned production/unknown-role files package by package: a strict
+  unowned majority makes the package JS-first, while a TS-first package admits
+  only files reachable over non-type module edges from package runtime targets;
+  other unowned files remain fully available to deterministic structure, FTS,
+  embeddings, and retrieval;
 - requires at least one current property-hub target candidate;
 - ranks exported/entity/workflow boundaries and watcher-supplied changed files
   ahead of unanchored internal calls;
@@ -863,8 +868,8 @@ Repeatable `--file`, `--package`, `--member`, and `--role` selectors narrow the
 plan. `--max-occurrences N` is an operator-requested runtime cap applied after
 the deterministic spread order; without it, manual `jscout enrich` has no
 occurrence-count cap. `--all` broadens eligibility to normally excluded roles,
-already `certain`/`likely` calls, and synthetic inferred projects for audit or
-diagnostic runs. The inferred-project gate precedes this cap. Hitting an
+already `certain`/`likely` calls, and every synthetic inferred project for audit
+or diagnostic runs. The package-policy gate precedes this cap. Hitting an
 explicit cap is successful partial enrichment only when the report and stored
 batch coverage expose the omitted count. An occurrence without a checker fact
 keeps the existing `possible` property-hub path, so bounded coverage cannot
@@ -882,8 +887,14 @@ Project discovery builds one reverse file-to-owning-project index. Ownership is
 enumerated once for the planned file set, not rediscovered for each occurrence.
 Conflicting owners remain visible under the existing ambiguity rules.
 
+Configuration-only planning uses a protocol session: Rust uploads
+repository-relative paths in byte-bounded frames, the worker performs one
+finish-time configuration discovery and global inferred-scope grouping, and
+Rust consumes byte-bounded result pages. Upload or result boundaries cannot
+change ownership, scope IDs, membership fingerprints, or the 150-root cap.
+
 Rust schedules one selected project at a time, with configured projects before
-inferred projects when `--all` opts into the latter. A project worker
+inferred projects inside each dirty/clean priority tier. A project worker
 constructs one TypeScript `Program`, resolves bounded batches grouped by source
 file, returns the results plus one project input manifest/fingerprint, and then
 exits. The host must not retain an unbounded `programCache`; any future
@@ -908,21 +919,36 @@ The current destroy-everything-and-rebuild validation pass is removed.
 Files without a configured TypeScript-project owner are not missing from the
 repository index. They retain chunks, symbols, imports/references, heuristic
 member-call edges, FTS, embeddings, and every retrieval surface. The checker
-adds only occurrence-specific receiver-type evidence, so default enrichment
-does not construct one synthetic Program per such file. Reports expose files
-and eligible occurrences outside configured projects plus the occurrences
-skipped by this gate. `--all` is the explicit escape hatch, and configured
-projects execute first so inferred lexical IDs cannot monopolize visible
-progress.
+adds only occurrence-specific receiver-type evidence. Default enrichment groups
+admitted orphans instead of constructing one synthetic Program per file. A
+package is JS-first only when more than half of its production/unknown-role
+indexed sources are unowned; all of its unowned default-role sources are then
+admitted. In a TS-first package, only unowned default-role sources reachable by
+non-type module edges from `main`, every non-type `exports` condition, `bin`, or
+script file targets are admitted. Package boundaries are independent, runtime
+reachability may cross them, and test/fixture/generated/documentation roles stay
+excluded by default. `--all` admits every orphan role.
+
+Admission and final scope planning share one complete configured-ownership
+snapshot. Its fingerprint records every source role and package, the selected
+and excluded configured-owner sets, tooling fallback, package majorities,
+resolved runtime seeds, admitted paths, manifest content, and each absent
+`package.json` probe between a source and its boundary. A fresh complete
+inventory is compared immediately before exact reuse or activation, while
+manifest content and absence are rechecked inside the activation transaction.
+Any ownership, boundary, or policy drift retains staging and requires a retry.
+Reports expose files and eligible occurrences outside configured projects plus
+the occurrences skipped by this gate.
 
 The follow-up lands through five independent cache and measurement boundaries,
 in this order:
 
-1. Keep a fully mapped closed checker set of one to three declarations at
-   `likely`, record `candidateCount`, and version both batch reuse and
-   per-project watch carry so rows produced by the former single-target rule
-   cannot be resumed or carried.
-2. Replace per-file inferred projects with scopes grouped by nearest
+1. **Implemented 2026-08-22.** Keep a fully mapped closed checker set of one to
+   three declarations at `likely`, record `candidateCount`, and version both
+   batch reuse and per-project watch carry so rows produced by the former
+   single-target rule cannot be resumed or carried.
+2. **Implemented 2026-08-22.** Replace per-file inferred projects with scopes
+   grouped by nearest
    `package.json`, compiler family, and deterministic directory bins capped at
    150 roots. Keep the existing ESNext + Bundler options in this layer, include
    full scope membership and the nearest manifest in freshness identity,
@@ -933,7 +959,8 @@ in this order:
    Coverage did not: 587 occurrences moved from `unknown` to external
    `@types/node` declarations because a typed sibling's transitive declaration
    graph became visible across the shared Program.
-3. Replace the binary inferred-project gate with a per-package decision. A
+3. **Implemented 2026-08-22.** Replace the binary inferred-project gate with a
+   per-package decision. A
    package whose non-test indexed source is mostly unowned is JS-first and
    admits its unowned non-test scopes by default. A TS-first package admits an
    unowned file only when the import graph reaches it from a `main`, `exports`,
