@@ -612,15 +612,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             &mut input_freshness,
         )?
     {
-        revalidate_package_gate(
-            &canonical_root,
-            &conn,
-            &inventory_files,
-            &package_gate,
-            &ownership.typescript,
-            protocol,
-            options,
-        )?;
+        // The full inventory pass above produced this gate and no checker
+        // project work has run since. Replanning here would duplicate the
+        // expensive configuration-only discovery on every exact reuse.
         let facts_published = conn.query_row(
             "SELECT count(*) FROM checker_enrichments WHERE batch_id=?1",
             [batch_id],
