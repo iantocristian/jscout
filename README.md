@@ -341,13 +341,20 @@ remain excluded from orphan scopes unless `--all` is used. Inferred roots
 are grouped by nearest package and compatible compiler family, then
 deterministically subdivided at a 150-root cap; imported dependencies can
 therefore share one TypeScript Program without recreating the former
-one-Program-per-file cost. Skipped files remain first-class in chunks, symbols,
-structural edges, FTS, embeddings, and retrieval.
-Sharing a Program can expose ambient declarations loaded through one root to
-its siblings. On pinned ai-pipe, 587 occurrences moved from unknown to
-`@types/node` declarations while all 1,412 mapped repository fact payloads
-remained unchanged; on that corpus grouping was fact-neutral, not
-coverage-neutral.
+one-Program-per-file cost. Sharing a Program can expose ambient declarations
+loaded through one root to its siblings. In the pinned grouping-only ai-pipe
+parity run, 587 occurrences moved from unknown to `@types/node` declarations
+while all 1,412 mapped repository fact payloads remained unchanged; on that
+corpus grouping was fact-neutral, not coverage-neutral.
+Node ESM scopes use NodeNext module and resolution
+semantics. Node CommonJS scopes use the same paired NodeNext mode, which applies
+CommonJS semantics from `.cjs`/`.cts` or `type: commonjs` while retaining modern
+package `exports`/`imports` resolution. JSX scopes retain ESNext plus Bundler
+resolution. Those effective options are part of each inferred scope's
+configuration fingerprint, so a semantics change
+cannot reuse facts produced under the previous family options. Skipped files
+remain first-class in chunks, symbols, structural edges, FTS, embeddings, and
+retrieval.
 `--max-occurrences N` is the only occurrence-count cap and deliberately creates
 partial coverage. Ordering is deterministic and spread across packages and
 files within each priority tier; configured projects execute before inferred

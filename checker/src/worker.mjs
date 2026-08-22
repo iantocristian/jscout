@@ -5,6 +5,7 @@ import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
+import { inferredOptions } from "./inferred-options.mjs";
 import { PROTOCOL_VERSION } from "./protocol.mjs";
 
 const root = fs.realpathSync(workerData.root);
@@ -299,23 +300,6 @@ function inferredFamily(file, packageType) {
   return packageType === "module" ? "node-esm" : "node-cjs";
 }
 
-function inferredOptions(_family) {
-  // Scope grouping is compiler-option neutral. Compiler-family labels separate
-  // roots that will eventually need different semantics, but this layer keeps
-  // the former ESNext + Bundler options. Sharing one Program can still change
-  // coverage when one root's transitive declarations become visible to a
-  // sibling. The pinned-corpus parity check covers mapped repository fact
-  // payloads, not identical resolved/unknown coverage.
-  return {
-    allowJs: true,
-    checkJs: false,
-    jsx: ts.JsxEmit.Preserve,
-    module: ts.ModuleKind.ESNext,
-    moduleResolution: ts.ModuleResolutionKind.Bundler,
-    target: ts.ScriptTarget.ESNext,
-  };
-}
-
 function packageIdentity(directory) {
   const relative = path.relative(root, directory).split(path.sep).join("/");
   return relative.length === 0 ? "." : relative;
@@ -413,7 +397,7 @@ function inferredProject(id, family, packageRecord, records) {
     absentManifests: [...absentManifests].sort(),
     packageDirectory: packageRecord.directory,
     family,
-    options: inferredOptions(family),
+    options: inferredOptions(ts, family),
     fileNames: records.map((record) => record.file).sort(),
     projectReferences: undefined,
     purpose: "inferred",
@@ -537,10 +521,16 @@ function projectSummary(project) {
   project.membershipFingerprint ??= digestText(
     [...project.fileNames].map((file) => projectMemberIdentity(file)).sort().join("\0"),
   );
-  project.configFingerprint ??= digestText(JSON.stringify(
-    projectConfigInputs(project)
-      .map(({ identity, source_hash }) => ({ identity, source_hash })),
-  ));
+  const inputs = projectConfigInputs(project)
+    .map(({ identity, source_hash }) => ({ identity, source_hash }));
+  // Configured-project fingerprints remain byte-compatible with the previous
+  // input-only shape. Inferred projects have no tsconfig, so their effective
+  // family options are themselves a configuration input and must invalidate
+  // cached enrichment when those semantics change.
+  const configIdentity = project.config
+    ? inputs
+    : stable({ inputs, options: normalizeOption(project.options) });
+  project.configFingerprint ??= digestText(JSON.stringify(configIdentity));
   return {
     project_id: project.id,
     file_count: project.fileNames.length,
