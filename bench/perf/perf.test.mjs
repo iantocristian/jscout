@@ -25,6 +25,11 @@ import {
   refusePathWithin,
   stopChild,
 } from './lib.mjs';
+import {
+  parseSemanticScales,
+  semanticFixtureShape,
+  semanticFixtureSql,
+} from './semantic-memory-fixture.mjs';
 
 test('statistics use one nearest-rank definition and omit tiny-sample p95', () => {
   assert.equal(nearestRank([9, 1, 5, 3], 0.5), 3);
@@ -36,6 +41,38 @@ test('statistics use one nearest-rank definition and omit tiny-sample p95', () =
   });
   const twenty = distribution(Array.from({ length: 20 }, (_, index) => index + 1));
   assert.equal(twenty.p95, 19);
+});
+
+test('semantic-memory fixture scales and history are deterministic', () => {
+  assert.deepEqual(parseSemanticScales('5000,1000,5000'), [1_000, 5_000]);
+  assert.throws(() => parseSemanticScales('255'), /at least 256/);
+  const shape = semanticFixtureShape({
+    currentArtifacts: 1_000,
+    templateArtifactId: 1,
+    templateRunId: 1,
+    templateSupports: 1,
+    supportTemplates: 32,
+  });
+  assert.equal(shape.generatedLineages, 999);
+  assert.equal(shape.historyArtifacts, 199);
+  assert.equal(shape.totalArtifacts, 1_199);
+  assert.equal(shape.totalSupports, 4_793);
+  assert.equal(shape.quartzArtifacts, 124);
+  assert.equal(shape.anchorScopedArtifacts, 126);
+  const supportTemplates = Array.from({ length: 32 }, (_, index) => ({
+    anchor_key: `sym:fixture-${index}`,
+    role: null,
+    evidence_file: `fixture-${index}.mjs`,
+    evidence_start_line: 1,
+    evidence_end_line: 1,
+    source_hash: `source-${index}`,
+    context_hash: `context-${index}`,
+    confidence: 'likely',
+  }));
+  const sql = semanticFixtureSql(shape, supportTemplates);
+  assert.match(sql, /BEGIN IMMEDIATE/);
+  assert.match(sql, /semantic-fixture-artifact-%08d-v2/);
+  assert.match(sql, /PRAGMA wal_checkpoint\(TRUNCATE\)/);
 });
 
 test('benchmark child environments do not inherit provider or auth settings', () => {

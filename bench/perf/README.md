@@ -141,3 +141,46 @@ make that cost visible.
 Do not run the full suite as a CI performance gate. Candidate schema/index
 experiments and platform-specific profilers are diagnostic follow-ups, not
 baseline scenarios.
+
+## Semantic-memory scale and persistence-index experiment
+
+`semantic-memory.mjs` is a separate, provider-free benchmark for the semantic
+tables. It exists because ai-pipe has no natural semantic history and a tiny
+hand-seeded database cannot support an index decision.
+
+```sh
+cargo build --release --locked
+node bench/perf/semantic-memory.mjs \
+  --repo /path/to/ai-pipe \
+  --binary target/release/jscout \
+  --scales 1000,5000,25000 \
+  --samples 20 \
+  --warmups 3 \
+  --output /tmp/ai-pipe-semantic-memory.json
+```
+
+The runner first publishes one real card through the deterministic fake
+gateway, then validates 31 more support anchors through the production
+annotation path. It rotates four supports per generated row across those 32
+distinct files and context hashes. It creates deterministic annotation
+lineages at each requested scale, including 20% superseded history and a
+40-edge exact-detail case. The anchor-scoped case selects one of the 32 support
+templates, so its cardinality grows predictably without matching the entire
+fixture.
+
+The scale suite measures recent discovery, common/selective/missing lexical
+queries, anchor and relation scopes, exact body reads, and full reads with
+source evidence through one persistent MCP process. Semantic vectors are
+disabled, so the result isolates local lexical ranking, freshness, SQLite, and
+serialization work.
+
+At the largest scale, the runner separately A/B tests the deferred
+`semantic_artifacts(scout_run_id)` candidate. It captures SQLite query plans,
+index size, batched run-ID lookup time, actual zero-model card reuse, and
+byte-identical semantic-memory responses. This distinction matters: the index
+serves scouting persistence/reuse joins; it is not an index over lexical
+artifact contents and should not be credited with semantic-query speedups.
+
+Use `--scales` to change corpus sizes. The fixture generator and query cases
+live in `semantic-memory-fixture.mjs`; no benchmark database, WAL, staged
+corpus, or absolute developer path belongs in a checked result.
