@@ -184,3 +184,6 @@ artifact contents and should not be credited with semantic-query speedups.
 Use `--scales` to change corpus sizes. The fixture generator and query cases
 live in `semantic-memory-fixture.mjs`; no benchmark database, WAL, staged
 corpus, or absolute developer path belongs in a checked result.
+
+The recorded 1k/5k/25k run and its index decision are in
+[`bench/results/semantic-memory-ai-pipe-2026-08-22.md`](../results/semantic-memory-ai-pipe-2026-08-22.md).

@@ -1,0 +1,3481 @@
+{
+  "schema": "jscout.semantic-memory-performance.v1",
+  "generated_at": "2026-08-22T07:55:38.487Z",
+  "provenance": {
+    "harness_source_commit": "6a2ede3a649590c456a258427b1dce3f6f044085",
+    "harness_source_tree": "b935a8d096429124d56020c87fa226976add9126",
+    "harness_source_dirty": false,
+    "harness_files": {
+      "orchestrator": {
+        "bytes": 39089,
+        "sha256": "f0195b9d2b3ee50d7cbf1e07730e1300f469bebb6da79ade180bf057b32d6e3c"
+      },
+      "fixture": {
+        "bytes": 13091,
+        "sha256": "ff290e91d3816bee55ff2369e373d6d31fe4e4d1b54ce3ae5471e08d3e425f5a"
+      },
+      "library": {
+        "bytes": 12453,
+        "sha256": "e5523d1ec2ddbecf5203c7680b3334a5b6b8046204d7468a8a32dabed5c22cca"
+      },
+      "ai_pipe_fixture": {
+        "bytes": 5591,
+        "sha256": "424da2fb459dc28ee811ace1d4c4dffade4684d186ce16f08201bf1f2edb2fd6"
+      },
+      "mock_gateway": {
+        "bytes": 3049,
+        "sha256": "b44f34da085c4bf752cdb8fbfaa1576e2c1165c06220a8dcce1bda685f1e47ec"
+      }
+    },
+    "binary": {
+      "bytes": 16700992,
+      "sha256": "e63cbdb6dfefc974891fd68c5048e7c4b600ebf3fe425066d06d64fd5b3e1b12",
+      "version": "jscout 0.4.0",
+      "stable_during_run": true,
+      "source_verification": "operator-built from harness_source_commit before the recorded run"
+    },
+    "corpus": "ai-pipe",
+    "corpus_commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+    "corpus_tracked_files": 930,
+    "source_checkout_dirty": true
+  },
+  "host": {
+    "os": "darwin",
+    "os_release": "25.6.0",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "logical_cpus": 18,
+    "total_memory_bytes": 68719476736,
+    "free_memory_bytes_at_report": 1262092288,
+    "node": "v24.15.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "sqlite": "3.51.0 2025-06-12 13:14:41 f0ca7bba1c5e232e5d279fad6338121ab55af0c8c68c84cdfb18ba5114dcaapl (64-bit)"
+  },
+  "methodology": {
+    "fixture_version": "semantic-memory-ai-pipe-v1",
+    "scales": [
+      1000,
+      5000,
+      25000
+    ],
+    "samples_per_semantic_case": 20,
+    "warmups_per_semantic_case": 3,
+    "requested_build_profile": "release",
+    "binary_build_profile_verified": false,
+    "remote_model_requests": 0,
+    "semantic_vector_retrieval": false,
+    "corpus_staging": "git archive of the pinned revision",
+    "filesystem_cache": "warm/uncontrolled",
+    "timing": "monotonic wall; MCP cases exclude process startup; CLI reuse includes it",
+    "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)"
+  },
+  "fixtures": [
+    {
+      "scale": 1000,
+      "shape": {
+        "currentArtifacts": 1000,
+        "generatedLineages": 999,
+        "historyArtifacts": 199,
+        "totalArtifacts": 1199,
+        "totalRuns": 1199,
+        "totalSupports": 4793,
+        "totalRelations": 40,
+        "quartzArtifacts": 124,
+        "templateArtifactId": 1,
+        "templateRunId": 1,
+        "templateSupports": 1,
+        "supportTemplates": 32,
+        "anchorScopedArtifacts": 126,
+        "detailArtifactId": 1199,
+        "lastGeneratedRunId": 1199
+      },
+      "counters": {
+        "files": 690,
+        "chunks": 5483,
+        "symbols": 4538,
+        "refs": 28527,
+        "graph_nodes": 5677,
+        "resolved_edges": 37202,
+        "scout_runs": 1199,
+        "semantic_artifacts": 1199,
+        "current_artifacts": 1000,
+        "semantic_supports": 4793,
+        "semantic_relations": 40,
+        "artifact_id_sum": 719400,
+        "run_id_sum": 719400
+      },
+      "pages": {
+        "page_count": 10178,
+        "page_size": 4096,
+        "freelist_count": 0,
+        "active_bytes": 41689088,
+        "file_bytes": 41689088
+      },
+      "integrity_check": "ok"
+    },
+    {
+      "scale": 5000,
+      "shape": {
+        "currentArtifacts": 5000,
+        "generatedLineages": 4999,
+        "historyArtifacts": 999,
+        "totalArtifacts": 5999,
+        "totalRuns": 5999,
+        "totalSupports": 23993,
+        "totalRelations": 40,
+        "quartzArtifacts": 624,
+        "templateArtifactId": 1,
+        "templateRunId": 1,
+        "templateSupports": 1,
+        "supportTemplates": 32,
+        "anchorScopedArtifacts": 626,
+        "detailArtifactId": 5999,
+        "lastGeneratedRunId": 5999
+      },
+      "counters": {
+        "files": 690,
+        "chunks": 5483,
+        "symbols": 4538,
+        "refs": 28527,
+        "graph_nodes": 5677,
+        "resolved_edges": 37202,
+        "scout_runs": 5999,
+        "semantic_artifacts": 5999,
+        "current_artifacts": 5000,
+        "semantic_supports": 23993,
+        "semantic_relations": 40,
+        "artifact_id_sum": 17997000,
+        "run_id_sum": 17997000
+      },
+      "pages": {
+        "page_count": 12954,
+        "page_size": 4096,
+        "freelist_count": 0,
+        "active_bytes": 53059584,
+        "file_bytes": 53059584
+      },
+      "integrity_check": "ok"
+    },
+    {
+      "scale": 25000,
+      "shape": {
+        "currentArtifacts": 25000,
+        "generatedLineages": 24999,
+        "historyArtifacts": 4999,
+        "totalArtifacts": 29999,
+        "totalRuns": 29999,
+        "totalSupports": 119993,
+        "totalRelations": 40,
+        "quartzArtifacts": 3124,
+        "templateArtifactId": 1,
+        "templateRunId": 1,
+        "templateSupports": 1,
+        "supportTemplates": 32,
+        "anchorScopedArtifacts": 3126,
+        "detailArtifactId": 29999,
+        "lastGeneratedRunId": 29999
+      },
+      "counters": {
+        "files": 690,
+        "chunks": 5483,
+        "symbols": 4538,
+        "refs": 28527,
+        "graph_nodes": 5677,
+        "resolved_edges": 37202,
+        "scout_runs": 29999,
+        "semantic_artifacts": 29999,
+        "current_artifacts": 25000,
+        "semantic_supports": 119993,
+        "semantic_relations": 40,
+        "artifact_id_sum": 449985000,
+        "run_id_sum": 449985000
+      },
+      "pages": {
+        "page_count": 26806,
+        "page_size": 4096,
+        "freelist_count": 0,
+        "active_bytes": 109797376,
+        "file_bytes": 109797376
+      },
+      "integrity_check": "ok"
+    }
+  ],
+  "measurements": [
+    {
+      "id": "semantic_fixture.index",
+      "parameters": {
+        "database": "new",
+        "corpus_revision": "ea13166c59cfc52574e96959413f5c54be20e8c8"
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "process wall, including startup",
+          "samples": [
+            556.2025420000001
+          ],
+          "summary": {
+            "n": 1,
+            "min": 556.2025420000001,
+            "median": 556.2025420000001,
+            "max": 556.2025420000001
+          }
+        }
+      },
+      "counters": {
+        "files": 690,
+        "chunks": 5483,
+        "symbols": 4538,
+        "refs": 28527,
+        "graph_nodes": 5677,
+        "resolved_edges": 37202,
+        "scout_runs": 0,
+        "semantic_artifacts": 0,
+        "current_artifacts": 0,
+        "semantic_supports": 0,
+        "semantic_relations": 0,
+        "artifact_id_sum": 0,
+        "run_id_sum": 0
+      },
+      "validation": {
+        "index_report_matches": true,
+        "integrity_check": "ok"
+      }
+    },
+    {
+      "id": "semantic_fixture.template_publication",
+      "parameters": {
+        "fake_gateway": true,
+        "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "process wall, including startup",
+          "samples": [
+            73.857708
+          ],
+          "summary": {
+            "n": 1,
+            "min": 73.857708,
+            "median": 73.857708,
+            "max": 73.857708
+          }
+        }
+      },
+      "counters": {
+        "model_calls": 1,
+        "supports": 1
+      },
+      "validation": {
+        "current_support_template": true,
+        "integrity_check": "ok"
+      }
+    },
+    {
+      "id": "semantic_fixture.support_templates",
+      "parameters": {
+        "annotation_validation": true
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "process wall, including startup",
+          "samples": [
+            11.95316600000001
+          ],
+          "summary": {
+            "n": 1,
+            "min": 11.95316600000001,
+            "median": 11.95316600000001,
+            "max": 11.95316600000001
+          }
+        }
+      },
+      "counters": {
+        "validated_support_templates": 32
+      },
+      "validation": {
+        "temporary_annotation_removed": true,
+        "integrity_check": "ok"
+      }
+    },
+    {
+      "id": "semantic_memory.recent.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": ""
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            131.74266600000055,
+            137.55366700000013,
+            126.7524999999996,
+            130.59608299999945,
+            139.02587500000027,
+            125.74974999999995,
+            128.35875000000033,
+            122.21524999999929,
+            117.56166699999994,
+            126.62708399999974,
+            119.77712499999961,
+            119.421292,
+            137.78058299999975,
+            136.14720800000032,
+            129.836041999999,
+            127.58004200000141,
+            116.66241600000103,
+            144.71991700000035,
+            133.54150000000118,
+            129.35583299999962
+          ],
+          "summary": {
+            "n": 20,
+            "min": 116.66241600000103,
+            "median": 128.35875000000033,
+            "max": 144.71991700000035,
+            "p95": 139.02587500000027
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882,
+            18882
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18882,
+            "median": 18882,
+            "max": 18882,
+            "p95": 18882
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-common.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "deterministic"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            119.50291599999946,
+            137.05216700000074,
+            127.12062499999956,
+            142.32416699999976,
+            130.01400000000012,
+            121.77629200000047,
+            122.50220800000079,
+            121.55525000000034,
+            114.90120799999931,
+            127.45116700000017,
+            124.70283300000028,
+            118.34975000000031,
+            127.92408299999988,
+            116.99741699999868,
+            122.18437499999891,
+            116.54437500000131,
+            123.26129199999923,
+            124.09037499999977,
+            127.68475000000035,
+            138.5020829999994
+          ],
+          "summary": {
+            "n": 20,
+            "min": 114.90120799999931,
+            "median": 123.26129199999923,
+            "max": 142.32416699999976,
+            "p95": 138.5020829999994
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022,
+            19022
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19022,
+            "median": 19022,
+            "max": 19022,
+            "p95": 19022
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-selective.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "quartz"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            14.556375000000116,
+            15.556166999999732,
+            15.188374999999724,
+            15.0707910000001,
+            14.372749999999542,
+            14.435499999999593,
+            15.052833000000646,
+            15.6997080000001,
+            13.914792000000489,
+            14.588332999999693,
+            13.968375000000378,
+            14.972625000000335,
+            16.262917000000016,
+            14.764999999999418,
+            14.166666999999507,
+            15.13433299999997,
+            15.100374999999985,
+            15.144207999999708,
+            15.768874999999753,
+            14.92462499999965
+          ],
+          "summary": {
+            "n": 20,
+            "min": 13.914792000000489,
+            "median": 14.972625000000335,
+            "max": 16.262917000000016,
+            "p95": 15.768874999999753
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18886,
+            "median": 18886,
+            "max": 18886,
+            "p95": 18886
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 124,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-miss.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "unfindablefixturetoken"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            0.9094169999998485,
+            0.7988330000007409,
+            0.8087919999998121,
+            0.8865829999995185,
+            0.9052499999997963,
+            0.8445830000000569,
+            0.8777500000005602,
+            1.4521669999994629,
+            0.9549589999996897,
+            0.8164590000005774,
+            0.9534169999997175,
+            0.812540999999328,
+            1.0747499999997672,
+            0.7938340000000608,
+            1.3175420000006852,
+            0.8284999999996217,
+            1.3651669999999285,
+            0.8586249999989377,
+            0.8099580000016431,
+            1.5854170000002341
+          ],
+          "summary": {
+            "n": 20,
+            "min": 0.7938340000000608,
+            "median": 0.8777500000005602,
+            "max": 1.5854170000002341,
+            "p95": 1.4521669999994629
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130
+          ],
+          "summary": {
+            "n": 20,
+            "min": 130,
+            "median": 130,
+            "max": 130,
+            "p95": 130
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 0,
+        "returned_handles": 0
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.anchor-scoped.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            29.353749999999764,
+            29.752124999999978,
+            29.368124999999964,
+            31.709332999999788,
+            30.082000000000335,
+            29.331500000000233,
+            29.581083000000035,
+            29.404708000000028,
+            26.959084000000075,
+            28.61566700000003,
+            28.229041999999936,
+            30.407625000000735,
+            32.162625000000844,
+            28.113624999999956,
+            33.06345799999872,
+            29.732458999998926,
+            28.11345799999981,
+            31.458667000000787,
+            29.80083300000115,
+            31.598374999999578
+          ],
+          "summary": {
+            "n": 20,
+            "min": 26.959084000000075,
+            "median": 29.581083000000035,
+            "max": 33.06345799999872,
+            "p95": 32.162625000000844
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19618,
+            "median": 19618,
+            "max": 19618,
+            "p95": 19618
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 126,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.related-to.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "related_to": 1199
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            6.155499999999847,
+            5.210750000000189,
+            6.424208999999792,
+            6.512416999999914,
+            6.052625000000262,
+            6.452667000000474,
+            6.577166000000034,
+            6.420540999999503,
+            5.717291999999361,
+            4.976916000000529,
+            5.6551250000002256,
+            6.611750000000029,
+            7.508583999999246,
+            5.570415999998659,
+            7.684792000000016,
+            5.167332999999417,
+            5.659541999999419,
+            5.544459000000643,
+            6.344417000000249,
+            6.960624999999709
+          ],
+          "summary": {
+            "n": 20,
+            "min": 4.976916000000529,
+            "median": 6.155499999999847,
+            "max": 7.684792000000016,
+            "p95": 7.508583999999246
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841,
+            18841
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18841,
+            "median": 18841,
+            "max": 18841,
+            "p95": 18841
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 40,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-body.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 1199,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "body"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            6.419832999999926,
+            6.372875000000022,
+            6.664042000000336,
+            5.414292000000387,
+            5.828708000000006,
+            6.338166000000456,
+            6.635041999999885,
+            6.149333000000297,
+            5.932667000000038,
+            5.8729999999995925,
+            5.898874999999862,
+            6.200707999999395,
+            10.204042000001209,
+            5.9444169999987935,
+            7.38970800000061,
+            6.279333999998926,
+            5.38287500000115,
+            7.808665999998993,
+            6.165625000001455,
+            5.553375000001324
+          ],
+          "summary": {
+            "n": 20,
+            "min": 5.38287500000115,
+            "median": 6.165625000001455,
+            "max": 10.204042000001209,
+            "p95": 7.808665999998993
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916
+          ],
+          "summary": {
+            "n": 20,
+            "min": 1916,
+            "median": 1916,
+            "max": 1916,
+            "p95": 1916
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-full-source.scale_1000",
+      "parameters": {
+        "current_artifacts": 1000,
+        "history_artifacts": 199,
+        "total_artifacts": 1199,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 1199,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "full",
+          "include_source": true,
+          "source_limit": 4,
+          "source_depth": 2,
+          "source_bytes": 2000,
+          "relation_limit": 40
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            17.50066700000025,
+            17.680209000000104,
+            17.036291999999776,
+            17.486499999999978,
+            17.41187499999978,
+            18.010208000000603,
+            17.14800000000014,
+            16.92816700000003,
+            14.797041999999237,
+            16.89154099999996,
+            15.622540999999728,
+            16.68133299999954,
+            18.13812499999949,
+            15.550000000001091,
+            19.00525000000016,
+            16.621375000000626,
+            16.127042000000074,
+            21.990749999999025,
+            16.78083300000071,
+            17.00733300000138
+          ],
+          "summary": {
+            "n": 20,
+            "min": 14.797041999999237,
+            "median": 17.00733300000138,
+            "max": 21.990749999999025,
+            "p95": 19.00525000000016
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390,
+            25390
+          ],
+          "summary": {
+            "n": 20,
+            "min": 25390,
+            "median": 25390,
+            "max": 25390,
+            "p95": 25390
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.recent.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": ""
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            676.2875000000022,
+            611.0030829999996,
+            603.0575420000023,
+            577.0000419999997,
+            597.7875000000022,
+            597.1355829999993,
+            578.2876249999972,
+            592.434707999997,
+            593.9864579999994,
+            601.6251250000023,
+            574.4902079999993,
+            594.7430410000015,
+            621.6857499999969,
+            581.411583000001,
+            602.257458,
+            591.9876249999943,
+            586.4893749999974,
+            568.3560409999991,
+            610.2502499999973,
+            577.486625000005
+          ],
+          "summary": {
+            "n": 20,
+            "min": 568.3560409999991,
+            "median": 593.9864579999994,
+            "max": 676.2875000000022,
+            "p95": 621.6857499999969
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883,
+            18883
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18883,
+            "median": 18883,
+            "max": 18883,
+            "p95": 18883
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 5000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-common.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "deterministic"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            628.9873750000006,
+            609.5593330000011,
+            591.4329590000016,
+            592.6290000000008,
+            592.7825410000005,
+            577.1799580000006,
+            586.9979999999996,
+            588.7718329999989,
+            605.5885409999973,
+            567.6732080000002,
+            590.0851249999978,
+            601.4098749999976,
+            582.615291999995,
+            593.1401669999977,
+            600.7013330000045,
+            600.4577910000007,
+            584.0413750000007,
+            579.8781250000029,
+            575.393250000001,
+            584.0938339999993
+          ],
+          "summary": {
+            "n": 20,
+            "min": 567.6732080000002,
+            "median": 590.0851249999978,
+            "max": 628.9873750000006,
+            "p95": 609.5593330000011
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023,
+            19023
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19023,
+            "median": 19023,
+            "max": 19023,
+            "p95": 19023
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 5000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-selective.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "quartz"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            72.79120899999907,
+            69.80545800000255,
+            72.98050000000148,
+            66.47687499999665,
+            66.57508299999972,
+            75.84308299999975,
+            84.12966700000106,
+            74.64212500000212,
+            69.25145899999916,
+            71.89591600000131,
+            70.56991699999344,
+            71.41483400000288,
+            69.07525000000169,
+            70.07304199999635,
+            68.14650000000256,
+            72.60941699999967,
+            70.52333299999736,
+            67.76266699999542,
+            74.39041700000234,
+            68.17616599999747
+          ],
+          "summary": {
+            "n": 20,
+            "min": 66.47687499999665,
+            "median": 70.52333299999736,
+            "max": 84.12966700000106,
+            "p95": 75.84308299999975
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886,
+            18886
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18886,
+            "median": 18886,
+            "max": 18886,
+            "p95": 18886
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 624,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-miss.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "unfindablefixturetoken"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            4.949832999998762,
+            4.548375000002125,
+            4.556791999999405,
+            4.545750000001135,
+            5.245999999999185,
+            5.689040999997815,
+            5.298707999998442,
+            5.419207999999344,
+            4.919708000001265,
+            5.557415999999648,
+            5.450541999998677,
+            5.197916000004625,
+            4.938000000001921,
+            4.614999999997963,
+            5.343499999995402,
+            4.93133300000045,
+            5.400999999998021,
+            4.543499999999767,
+            5.466415999995661,
+            4.494375000002037
+          ],
+          "summary": {
+            "n": 20,
+            "min": 4.494375000002037,
+            "median": 4.949832999998762,
+            "max": 5.689040999997815,
+            "p95": 5.557415999999648
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130
+          ],
+          "summary": {
+            "n": 20,
+            "min": 130,
+            "median": 130,
+            "max": 130,
+            "p95": 130
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 0,
+        "returned_handles": 0
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.anchor-scoped.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            182.73670800000036,
+            142.23941700000069,
+            146.2341669999987,
+            135.5828330000004,
+            135.47191700000258,
+            156.5335410000007,
+            147.41566699999748,
+            149.74829200000022,
+            136.08508300000176,
+            138.0205829999977,
+            136.94574999999895,
+            142.30691699999443,
+            151.72166699999798,
+            145.62675000000309,
+            136.45058399999834,
+            142.69287500000064,
+            135.7577089999977,
+            145.42579199999454,
+            145.2578749999957,
+            139.85370800000237
+          ],
+          "summary": {
+            "n": 20,
+            "min": 135.47191700000258,
+            "median": 142.30691699999443,
+            "max": 182.73670800000036,
+            "p95": 156.5335410000007
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618,
+            19618
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19618,
+            "median": 19618,
+            "max": 19618,
+            "p95": 19618
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 626,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.related-to.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "related_to": 5999
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            8.82079099999828,
+            10.131583999998838,
+            9.092250000001513,
+            7.791166999999405,
+            8.174332999999024,
+            8.141041999999288,
+            8.726957999999286,
+            8.938874999999825,
+            7.820666999999958,
+            8.228500000001077,
+            8.824375000000146,
+            9.40137500000128,
+            8.625458999995317,
+            8.650458999996772,
+            9.813833000000159,
+            7.951709000000847,
+            7.9571670000004815,
+            9.40495799999917,
+            8.374292000000423,
+            8.659790999998222
+          ],
+          "summary": {
+            "n": 20,
+            "min": 7.791166999999405,
+            "median": 8.650458999996772,
+            "max": 10.131583999998838,
+            "p95": 9.813833000000159
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18881,
+            "median": 18881,
+            "max": 18881,
+            "p95": 18881
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 40,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-body.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 5999,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "body"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            8.45812499999738,
+            9.0256249999984,
+            7.849333000001934,
+            9.051332999999431,
+            7.90599999999904,
+            8.356250000000728,
+            8.269541000001482,
+            8.680583000001207,
+            7.933499999999185,
+            8.515792000001966,
+            9.450124999999389,
+            8.415833000006387,
+            8.598958000002312,
+            8.809916999998677,
+            7.828792000000249,
+            8.67333299999882,
+            8.366332999998122,
+            8.877709000000323,
+            10.351041000001715,
+            8.238792000003741
+          ],
+          "summary": {
+            "n": 20,
+            "min": 7.828792000000249,
+            "median": 8.45812499999738,
+            "max": 10.351041000001715,
+            "p95": 9.450124999999389
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916,
+            1916
+          ],
+          "summary": {
+            "n": 20,
+            "min": 1916,
+            "median": 1916,
+            "max": 1916,
+            "p95": 1916
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-full-source.scale_5000",
+      "parameters": {
+        "current_artifacts": 5000,
+        "history_artifacts": 999,
+        "total_artifacts": 5999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 5999,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "full",
+          "include_source": true,
+          "source_limit": 4,
+          "source_depth": 2,
+          "source_bytes": 2000,
+          "relation_limit": 40
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            20.79899999999907,
+            18.771166999998968,
+            18.502667000000656,
+            17.71704099999988,
+            17.475375000001804,
+            19.34899999999834,
+            17.818208000000595,
+            19.378500000002532,
+            17.27533300000141,
+            18.315707999998267,
+            19.862042000000656,
+            19.130333000000974,
+            19.677167000001646,
+            17.6096250000046,
+            17.553749999999127,
+            18.034458000001905,
+            17.908416999998735,
+            19.751124999995227,
+            17.947832999998354,
+            18.524083000003884
+          ],
+          "summary": {
+            "n": 20,
+            "min": 17.27533300000141,
+            "median": 18.315707999998267,
+            "max": 20.79899999999907,
+            "p95": 19.862042000000656
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443,
+            25443
+          ],
+          "summary": {
+            "n": 20,
+            "min": 25443,
+            "median": 25443,
+            "max": 25443,
+            "p95": 25443
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.recent.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": ""
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            2961.112249999991,
+            2753.862125000014,
+            2735.8329999999987,
+            2732.133124999993,
+            2794.3843329999945,
+            2826.6280419999966,
+            2758.5398330000025,
+            2800.1719589999993,
+            2739.4767909999937,
+            2892.4067920000234,
+            2760.1670830000076,
+            2720.2989170000073,
+            2753.516417000006,
+            2885.1092499999795,
+            2708.507540999999,
+            2788.1589169999934,
+            2728.979833999998,
+            2762.852125000005,
+            2878.111249999987,
+            2791.3807919999817
+          ],
+          "summary": {
+            "n": 20,
+            "min": 2708.507540999999,
+            "median": 2760.1670830000076,
+            "max": 2961.112249999991,
+            "p95": 2892.4067920000234
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18924,
+            "median": 18924,
+            "max": 18924,
+            "p95": 18924
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 25000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-common.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "deterministic"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            2763.5000419999997,
+            2793.7782080000034,
+            2852.191749999998,
+            2787.3000829999946,
+            2756.1089159999974,
+            2790.4100000000035,
+            2766.0109999999986,
+            2757.707500000004,
+            2774.0191669999913,
+            2797.242750000005,
+            2747.3312910000095,
+            2781.177291,
+            2708.037875000009,
+            2877.8693750000093,
+            2805.5885000000126,
+            2736.8444169999857,
+            2804.7439579999773,
+            2762.9998339999875,
+            2790.1172500000102,
+            2761.689832999982
+          ],
+          "summary": {
+            "n": 20,
+            "min": 2708.037875000009,
+            "median": 2774.0191669999913,
+            "max": 2877.8693750000093,
+            "p95": 2852.191749999998
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064,
+            19064
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19064,
+            "median": 19064,
+            "max": 19064,
+            "p95": 19064
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 25000,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-selective.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "quartz"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            321.36999999999534,
+            330.17170800000895,
+            333.9360420000012,
+            340.18004200000723,
+            344.3849159999954,
+            339.65508399999817,
+            324.88370799999393,
+            340.3295829999988,
+            334.51195899999584,
+            349.16654199999175,
+            333.44108300001244,
+            355.56587500000023,
+            322.69458300000406,
+            327.6430420000106,
+            320.67674999998417,
+            333.9746659999946,
+            337.0277500000084,
+            343.8632079999952,
+            337.79779100001906,
+            350.5272910000058
+          ],
+          "summary": {
+            "n": 20,
+            "min": 320.67674999998417,
+            "median": 334.51195899999584,
+            "max": 355.56587500000023,
+            "p95": 350.5272910000058
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18927,
+            "median": 18927,
+            "max": 18927,
+            "p95": 18927
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 3124,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.lexical-miss.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "unfindablefixturetoken"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            24.457374999998137,
+            23.24704100000963,
+            23.64262499999313,
+            22.61470800000825,
+            25.48079100000905,
+            27.69083399999363,
+            23.275332999997772,
+            23.728291999999783,
+            22.861000000004424,
+            23.719499999977415,
+            22.89299999998184,
+            24.57774999999674,
+            25.358041999978013,
+            25.115291000023717,
+            22.892709000007017,
+            25.126833999995142,
+            23.08562499997788,
+            25.206624999991618,
+            23.987500000017462,
+            25.947916999983136
+          ],
+          "summary": {
+            "n": 20,
+            "min": 22.61470800000825,
+            "median": 23.728291999999783,
+            "max": 27.69083399999363,
+            "p95": 25.947916999983136
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130,
+            130
+          ],
+          "summary": {
+            "n": 20,
+            "min": 130,
+            "median": 130,
+            "max": 130,
+            "p95": 130
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 0,
+        "returned_handles": 0
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.anchor-scoped.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            707.6860000000015,
+            667.257666999998,
+            709.542042000001,
+            669.953708999994,
+            679.9717090000049,
+            666.1064999999944,
+            702.3062910000008,
+            674.3487909999967,
+            660.7116249999963,
+            692.0629159999953,
+            676.1569580000069,
+            694.334125000023,
+            680.0255000000179,
+            681.455667000002,
+            659.5009160000191,
+            653.3122089999961,
+            694.4240409999911,
+            663.0397499999963,
+            698.6811670000025,
+            663.2711249999993
+          ],
+          "summary": {
+            "n": 20,
+            "min": 653.3122089999961,
+            "median": 676.1569580000069,
+            "max": 709.542042000001,
+            "p95": 707.6860000000015
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19659,
+            "median": 19659,
+            "max": 19659,
+            "p95": 19659
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 3126,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.related-to.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "related_to": 29999
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            22.533583000011276,
+            19.80516699999862,
+            19.985207999998238,
+            20.180458000002545,
+            21.602708000005805,
+            21.08833300000697,
+            19.64175000000978,
+            23.547833000004175,
+            19.750708000006853,
+            20.035917000001064,
+            19.763334000017494,
+            22.17149999999674,
+            19.95937500000582,
+            19.79475000000093,
+            19.788541999994777,
+            22.1670420000155,
+            19.924167000019224,
+            22.00041599999531,
+            28.96074999999837,
+            22.55562500000815
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19.64175000000978,
+            "median": 20.035917000001064,
+            "max": 28.96074999999837,
+            "p95": 23.547833000004175
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881,
+            18881
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18881,
+            "median": 18881,
+            "max": 18881,
+            "p95": 18881
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 40,
+        "returned_handles": 20
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-body.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 29999,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "body"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            19.90449999998964,
+            18.514792000001762,
+            18.283250000007683,
+            18.245999999999185,
+            20.00662499999453,
+            20.81304100000125,
+            18.683333000008133,
+            19.51495799999975,
+            18.36662499999511,
+            18.156749999994645,
+            18.126583000004757,
+            18.304082999995444,
+            18.12912499997765,
+            20.539541000005556,
+            18.227458000008482,
+            20.02070800002548,
+            18.85000000000582,
+            18.464624999993248,
+            25.031290999992052,
+            19.664541999984067
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18.126583000004757,
+            "median": 18.514792000001762,
+            "max": 25.031290999992052,
+            "p95": 20.81304100000125
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917,
+            1917
+          ],
+          "summary": {
+            "n": 20,
+            "min": 1917,
+            "median": 1917,
+            "max": 1917,
+            "p95": 1917
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_memory.artifact-full-source.scale_25000",
+      "parameters": {
+        "current_artifacts": 25000,
+        "history_artifacts": 4999,
+        "total_artifacts": 29999,
+        "samples": 20,
+        "warmups": 3,
+        "arguments": {
+          "vector": false,
+          "artifact": 29999,
+          "supports_per_artifact": 4,
+          "response_bytes": 128000,
+          "debug": false,
+          "view": "full",
+          "include_source": true,
+          "source_limit": 4,
+          "source_depth": 2,
+          "source_bytes": 2000,
+          "relation_limit": 40
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            32.5557919999992,
+            28.356667000000016,
+            27.915207999991253,
+            27.496624999999767,
+            28.412665999989258,
+            30.465207999994163,
+            27.491125000000466,
+            29.68004099999962,
+            27.61204199999338,
+            27.610333000018727,
+            26.986667000019224,
+            27.108374999981606,
+            31.622417000005953,
+            32.17774999997346,
+            27.227167000004556,
+            30.72970900000655,
+            27.500709000014467,
+            27.278209000010975,
+            36.375417000002926,
+            28.877582999994047
+          ],
+          "summary": {
+            "n": 20,
+            "min": 26.986667000019224,
+            "median": 27.915207999991253,
+            "max": 36.375417000002926,
+            "p95": 32.5557919999992
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489,
+            25489
+          ],
+          "summary": {
+            "n": 20,
+            "min": 25489,
+            "median": 25489,
+            "max": 25489,
+            "p95": 25489
+          }
+        }
+      },
+      "counters": {
+        "expected_candidates": 1,
+        "returned_artifacts": 1
+      },
+      "validation": {
+        "stable_output": true,
+        "unique_response_hashes": 1
+      }
+    },
+    {
+      "id": "semantic_index.storage_and_plan",
+      "parameters": {
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999
+      },
+      "metrics": {},
+      "counters": {
+        "baseline_pages": {
+          "page_count": 26806,
+          "page_size": 4096,
+          "freelist_count": 0,
+          "active_bytes": 109797376,
+          "file_bytes": 109797376
+        },
+        "indexed_pages": {
+          "page_count": 26881,
+          "page_size": 4096,
+          "freelist_count": 0,
+          "active_bytes": 110104576,
+          "file_bytes": 110104576
+        },
+        "active_byte_delta": 307200,
+        "file_byte_delta": 307200
+      },
+      "validation": {
+        "logical_content_unchanged": true,
+        "integrity_check": "ok",
+        "query_plans": {
+          "baseline": {
+            "direct_run_lookup": [
+              {
+                "id": 2,
+                "parent": 0,
+                "notused": 216,
+                "detail": "SCAN semantic_artifacts"
+              }
+            ],
+            "reusable_run": [
+              {
+                "id": 4,
+                "parent": 0,
+                "notused": 61,
+                "detail": "SEARCH run USING INDEX idx_scout_runs_status (status=? AND scout_kind=?)"
+              },
+              {
+                "id": 12,
+                "parent": 0,
+                "notused": 216,
+                "detail": "SCAN artifact LEFT-JOIN"
+              },
+              {
+                "id": 22,
+                "parent": 0,
+                "notused": 0,
+                "detail": "CORRELATED SCALAR SUBQUERY 1"
+              },
+              {
+                "id": 26,
+                "parent": 22,
+                "notused": 43,
+                "detail": "SEARCH successor USING COVERING INDEX idx_semantic_artifacts_one_successor (supersedes_artifact_id=?)"
+              }
+            ]
+          },
+          "indexed": {
+            "direct_run_lookup": [
+              {
+                "id": 2,
+                "parent": 0,
+                "notused": 51,
+                "detail": "SEARCH semantic_artifacts USING COVERING INDEX candidate_semantic_artifacts_scout_run (scout_run_id=?)"
+              }
+            ],
+            "reusable_run": [
+              {
+                "id": 4,
+                "parent": 0,
+                "notused": 61,
+                "detail": "SEARCH run USING INDEX idx_scout_runs_status (status=? AND scout_kind=?)"
+              },
+              {
+                "id": 12,
+                "parent": 0,
+                "notused": 51,
+                "detail": "SEARCH artifact USING COVERING INDEX candidate_semantic_artifacts_scout_run (scout_run_id=?) LEFT-JOIN"
+              },
+              {
+                "id": 21,
+                "parent": 0,
+                "notused": 0,
+                "detail": "CORRELATED SCALAR SUBQUERY 1"
+              },
+              {
+                "id": 25,
+                "parent": 21,
+                "notused": 43,
+                "detail": "SEARCH successor USING COVERING INDEX idx_semantic_artifacts_one_successor (supersedes_artifact_id=?)"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "semantic_index.run_lookup.baseline",
+      "parameters": {
+        "arm": "baseline",
+        "candidate_index": null,
+        "artifact_rows": 29999,
+        "lookups_per_sample": 2000,
+        "samples": 20,
+        "warmups": 2
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "one sqlite3 process executing the lookup batch",
+          "samples": [
+            7127.266042000003,
+            7241.982958000008,
+            7639.495041999995,
+            7410.954708000005,
+            7312.33262500001,
+            7222.836582999997,
+            7238.285207999987,
+            7190.515249999997,
+            7110.500625000044,
+            7221.404374999984,
+            7206.571499999962,
+            7449.968792000029,
+            7308.798416999984,
+            7596.103166999994,
+            7178.420708999969,
+            7086.715625000012,
+            7104.519333000004,
+            7176.458125000005,
+            7054.677917000023,
+            7036.665042000008
+          ],
+          "summary": {
+            "n": 20,
+            "min": 7036.665042000008,
+            "median": 7206.571499999962,
+            "max": 7639.495041999995,
+            "p95": 7596.103166999994
+          }
+        }
+      },
+      "counters": {
+        "successful_lookups_per_sample": 2000
+      },
+      "validation": {
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.run_lookup.indexed",
+      "parameters": {
+        "arm": "indexed",
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999,
+        "lookups_per_sample": 2000,
+        "samples": 20,
+        "warmups": 2
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "one sqlite3 process executing the lookup batch",
+          "samples": [
+            13.034583000000566,
+            12.910875000001397,
+            13.821750000002794,
+            14.354583000007551,
+            14.967708000011044,
+            13.594624999997905,
+            12.454208000039216,
+            12.684333999990486,
+            13.391915999993216,
+            14.424542000051588,
+            14.07979200000409,
+            14.045749999990221,
+            14.581082999997307,
+            14.54183300002478,
+            13.243041999987327,
+            13.20274999999674,
+            12.392665999999736,
+            12.229791999969166,
+            13.282416999980342,
+            12.260624999995343
+          ],
+          "summary": {
+            "n": 20,
+            "min": 12.229791999969166,
+            "median": 13.282416999980342,
+            "max": 14.967708000011044,
+            "p95": 14.581082999997307
+          }
+        }
+      },
+      "counters": {
+        "successful_lookups_per_sample": 2000
+      },
+      "validation": {
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.card_reuse.baseline",
+      "parameters": {
+        "arm": "baseline",
+        "candidate_index": null,
+        "artifact_rows": 29999,
+        "samples": 40,
+        "warmups": 5
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "CLI process wall, including startup",
+          "samples": [
+            78.80879199999617,
+            74.96229200001108,
+            80.26379200001247,
+            76.73766699997941,
+            82.02491700003156,
+            81.56683299998986,
+            79.25033400004031,
+            80.52016700000968,
+            83.1383340000175,
+            80.58545800001593,
+            76.59958400001051,
+            79.84916599997086,
+            83.28358300001128,
+            83.40487500000745,
+            77.53699999995297,
+            79.22712499997579,
+            74.98841699998593,
+            76.03833399998257,
+            84.23991699999897,
+            83.61262500000885,
+            78.88362500001676,
+            77.66216700000223,
+            78.96945800003596,
+            79.79416699998546,
+            82.57412499998463,
+            80.57024999998976,
+            74.84512499999255,
+            77.62275000003865,
+            81.37662499997532,
+            85.84879199997522,
+            79.48066699999617,
+            80.62583400000585,
+            75.69479099998716,
+            77.77404099999694,
+            83.33570900000632,
+            83.35875000001397,
+            90.25383400003193,
+            80.21645800000988,
+            81.15662500000326,
+            79.0584159999853
+          ],
+          "summary": {
+            "n": 40,
+            "min": 74.84512499999255,
+            "median": 79.84916599997086,
+            "max": 90.25383400003193,
+            "p95": 84.23991699999897
+          }
+        }
+      },
+      "counters": {
+        "model_calls_per_sample": 0
+      },
+      "validation": {
+        "paired_arm_order_rotated": true,
+        "database_state_unchanged": true
+      }
+    },
+    {
+      "id": "semantic_index.card_reuse.indexed",
+      "parameters": {
+        "arm": "indexed",
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999,
+        "samples": 40,
+        "warmups": 5
+      },
+      "metrics": {
+        "wall_ms": {
+          "unit": "ms",
+          "timing": "CLI process wall, including startup",
+          "samples": [
+            79.41279200004647,
+            75.91083299997263,
+            77.28704199998174,
+            77.51183299999684,
+            79.12750000000233,
+            77.7510000000475,
+            75.89850000001024,
+            80.90570800000569,
+            77.88845900003798,
+            74.6219169999822,
+            75.56487499998184,
+            76.74637499998789,
+            75.0949589999509,
+            79.84812500001863,
+            78.44499999994878,
+            76.43066700000782,
+            74.7647500000312,
+            79.66795799997635,
+            77.84979200002272,
+            77.52404099999694,
+            75.99833400000352,
+            77.97837500000605,
+            76.7508749999688,
+            80.04200000001583,
+            78.25783299998147,
+            71.02724999998463,
+            75.03075000003446,
+            77.92366599995876,
+            76.72004099999322,
+            77.88833300000988,
+            78.14891699998407,
+            70.25099999998929,
+            79.16562499996508,
+            76.78554200002691,
+            78.9375,
+            78.51862500002608,
+            78.23975000000792,
+            76.31133300001966,
+            76.11208299995633,
+            76.51437499996973
+          ],
+          "summary": {
+            "n": 40,
+            "min": 70.25099999998929,
+            "median": 77.51183299999684,
+            "max": 80.90570800000569,
+            "p95": 79.84812500001863
+          }
+        }
+      },
+      "counters": {
+        "model_calls_per_sample": 0
+      },
+      "validation": {
+        "paired_arm_order_rotated": true,
+        "database_state_unchanged": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.recent.baseline",
+      "parameters": {
+        "arm": "baseline",
+        "candidate_index": null,
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": ""
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            2813.2442089999677,
+            2974.9146670000046,
+            3473.197542000038,
+            3392.313291999977,
+            3376.8621660000063,
+            3757.5872910000035,
+            3834.458042000013,
+            3840.8830000000307,
+            3678.471291999973,
+            3689.7102089999826,
+            3820.6942089999793,
+            3035.0448329999927,
+            3333.6276669999934,
+            3058.764749999973,
+            2884.0876250000438,
+            3051.6045830000658,
+            2990.053583000088,
+            2825.5109159999993,
+            2959.1398340000305,
+            2742.5625419999706
+          ],
+          "summary": {
+            "n": 20,
+            "min": 2742.5625419999706,
+            "median": 3058.764749999973,
+            "max": 3840.8830000000307,
+            "p95": 3834.458042000013
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18924,
+            "median": 18924,
+            "max": 18924,
+            "p95": 18924
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.recent.indexed",
+      "parameters": {
+        "arm": "indexed",
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": ""
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            2760.636499999964,
+            2757.0715419999906,
+            3239.1766669999924,
+            3370.1219580000034,
+            3534.105749999988,
+            3678.5386660000077,
+            3622.3378340000054,
+            3679.1871249999967,
+            3760.0024579999736,
+            3729.7113329999847,
+            3272.3391660000198,
+            3071.1090840000543,
+            3121.4541660000104,
+            3130.414584000013,
+            2881.6871670000255,
+            3313.9382500000065,
+            3129.2943749999395,
+            2880.11941699998,
+            2867.8369999999413,
+            2924.7677089999197
+          ],
+          "summary": {
+            "n": 20,
+            "min": 2757.0715419999906,
+            "median": 3130.414584000013,
+            "max": 3760.0024579999736,
+            "p95": 3729.7113329999847
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924,
+            18924
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18924,
+            "median": 18924,
+            "max": 18924,
+            "p95": 18924
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.lexical-selective.baseline",
+      "parameters": {
+        "arm": "baseline",
+        "candidate_index": null,
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "quartz"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            351.1362079999526,
+            388.38958300004015,
+            397.27175000001444,
+            390.97345900000073,
+            408.5872499999823,
+            414.8806249999907,
+            421.35808299999917,
+            419.71329200000037,
+            421.33608399995137,
+            404.4622920000111,
+            402.48629200004507,
+            379.5407090000226,
+            390.6576660000137,
+            348.4477500000503,
+            337.71629200002644,
+            399.92995899997186,
+            358.7642089999281,
+            367.40433299995493,
+            370.8420839998871,
+            349.23462499992456
+          ],
+          "summary": {
+            "n": 20,
+            "min": 337.71629200002644,
+            "median": 390.6576660000137,
+            "max": 421.35808299999917,
+            "p95": 421.33608399995137
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18927,
+            "median": 18927,
+            "max": 18927,
+            "p95": 18927
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.lexical-selective.indexed",
+      "parameters": {
+        "arm": "indexed",
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "quartz"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            318.4091249999474,
+            359.81070900004124,
+            409.383582999988,
+            408.9502920000232,
+            391.17225000000326,
+            411.89529199997196,
+            424.0493750000023,
+            448.677166999958,
+            435.961500000034,
+            461.89991700003156,
+            412.0282920000027,
+            391.42887499998324,
+            358.0202500000014,
+            348.7832079998916,
+            364.5890420000069,
+            385.35812500002794,
+            366.56200000003446,
+            322.7668340000091,
+            368.5581249999814,
+            343.36087500001304
+          ],
+          "summary": {
+            "n": 20,
+            "min": 318.4091249999474,
+            "median": 385.35812500002794,
+            "max": 461.89991700003156,
+            "p95": 448.677166999958
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927,
+            18927
+          ],
+          "summary": {
+            "n": 20,
+            "min": 18927,
+            "median": 18927,
+            "max": 18927,
+            "p95": 18927
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.anchor-scoped.baseline",
+      "parameters": {
+        "arm": "baseline",
+        "candidate_index": null,
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            736.0630839999649,
+            865.8683330000495,
+            743.703125,
+            828.0407920000143,
+            778.5410000000265,
+            810.0011669999803,
+            859.5820420000236,
+            819.329207999981,
+            872.8755829999573,
+            873.2956659999909,
+            820.9563750000088,
+            766.3259589999798,
+            779.3810419999645,
+            699.4393329999875,
+            695.4884999999776,
+            688.8228329999838,
+            699.6372919999994,
+            726.7245830000611,
+            747.1600000000326,
+            687.902541999938
+          ],
+          "summary": {
+            "n": 20,
+            "min": 687.902541999938,
+            "median": 766.3259589999798,
+            "max": 873.2956659999909,
+            "p95": 872.8755829999573
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19659,
+            "median": 19659,
+            "max": 19659,
+            "p95": 19659
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    },
+    {
+      "id": "semantic_index.semantic_memory.anchor-scoped.indexed",
+      "parameters": {
+        "arm": "indexed",
+        "candidate_index": "candidate_semantic_artifacts_scout_run(scout_run_id)",
+        "artifact_rows": 29999,
+        "samples": 20,
+        "warmups": 2,
+        "arguments": {
+          "vector": false,
+          "limit": 20,
+          "supports_per_artifact": 2,
+          "response_bytes": 24000,
+          "debug": false,
+          "query": "",
+          "anchor": "sym:server/brokers/riskPolicy.mjs#::evaluateBrokerRiskPolicy@1"
+        }
+      },
+      "metrics": {
+        "roundtrip_ms": {
+          "unit": "ms",
+          "timing": "persistent MCP round trip",
+          "samples": [
+            704.9891669999924,
+            798.3268750000279,
+            800.1427079999703,
+            784.5572919999831,
+            800.7688750000088,
+            893.3538339999504,
+            867.4950829999871,
+            826.5097079999978,
+            868.2671669999836,
+            888.4055000000517,
+            830.0279169999994,
+            778.7534579999628,
+            788.46875,
+            700.2076669998933,
+            703.5455420000944,
+            712.0737499999814,
+            708.403624999919,
+            701.3923330000835,
+            713.6300830000546,
+            673.6256250001024
+          ],
+          "summary": {
+            "n": 20,
+            "min": 673.6256250001024,
+            "median": 784.5572919999831,
+            "max": 893.3538339999504,
+            "p95": 888.4055000000517
+          }
+        },
+        "result_bytes": {
+          "unit": "bytes",
+          "timing": "serialized MCP text payload",
+          "samples": [
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659,
+            19659
+          ],
+          "summary": {
+            "n": 20,
+            "min": 19659,
+            "median": 19659,
+            "max": 19659,
+            "p95": 19659
+          }
+        }
+      },
+      "counters": {},
+      "validation": {
+        "byte_identical_across_index_arms": true,
+        "paired_arm_order_rotated": true
+      }
+    }
+  ]
+}
