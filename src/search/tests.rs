@@ -6,8 +6,9 @@ use crate::embed;
 
 use super::{
     DEFAULT_EXPANSION_PATH_LIMIT, DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
-    DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit, MatchReason, Reranker,
-    ResponseBudget, RetrievalStatus, SearchExpansion, SearchOptions, SearchResult,
+    DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit,
+    MAX_EXHAUSTIVE_PAGE_SIZE, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
+    SearchExpansion, SearchMode, SearchOptions, SearchResult, SearchScopeFileRoles,
     apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
     candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
     merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
@@ -369,6 +370,249 @@ fn exact_identifier_search_precedes_examples_and_preserves_ambiguity() -> Result
 }
 
 #[test]
+fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    for (path, name) in [("a.ts", "alpha"), ("b.ts", "beta"), ("c.ts", "gamma")] {
+        fs::write(
+            repo.path().join(path),
+            format!("export function {name}() {{ return pagingNeedle; }}\n"),
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let mut cursor = None;
+    let mut cursor_tokens = HashSet::new();
+    let mut chunk_ids = Vec::new();
+    let mut files = Vec::new();
+    let mut total_chunks = None;
+    loop {
+        let result = search(
+            &conn,
+            None,
+            "pagingNeedle",
+            &SearchOptions {
+                mode: SearchMode::Exhaustive {
+                    cursor: cursor.clone(),
+                },
+                limit: 2,
+                rerank: false,
+                compact: true,
+                include_neighborhood_followups: false,
+                response_byte_limit: 1_000_000,
+                file_origins: vec!["workspace".into(), "repository".into(), "workspace".into()],
+                ..Default::default()
+            },
+        )?;
+        let metadata = result.exhaustive.as_ref().expect("exhaustive metadata");
+        assert_eq!(metadata.returned, result.hits.len());
+        assert_eq!(metadata.effective.page_size, 2);
+        assert!(!metadata.effective.vector);
+        assert!(!metadata.effective.rerank);
+        assert!(!metadata.effective.expand);
+        assert!(!metadata.effective.include_memory);
+        assert_eq!(metadata.scope.corpus, "indexed_chunks");
+        assert_eq!(metadata.scope.file_roles, SearchScopeFileRoles::All);
+        assert_eq!(metadata.scope.origins, ["repository", "workspace"]);
+        assert_eq!(metadata.scope.snapshot, result.snapshot);
+        if let Some(expected) = total_chunks {
+            assert_eq!(metadata.total_chunks, expected);
+        } else {
+            assert!(metadata.total_chunks > 2);
+            total_chunks = Some(metadata.total_chunks);
+            let compact = crate::compact::search_value(&result);
+            assert_eq!(compact["default_match"], "lexical");
+            assert_eq!(compact["scope"]["file_roles"], "all");
+            assert_eq!(compact["effective"]["page_size"], 2);
+            assert_eq!(compact["total_chunks"], metadata.total_chunks);
+            assert_eq!(compact["returned"], metadata.returned);
+            assert_eq!(compact["truncated"], metadata.truncated);
+            assert!(
+                compact["hits"]
+                    .as_array()
+                    .is_some_and(|hits| { hits.iter().all(|hit| hit.get("match").is_none()) })
+            );
+        }
+        for hit in &result.hits {
+            assert!(chunk_ids.iter().all(|chunk_id| chunk_id != &hit.chunk_id));
+            chunk_ids.push(hit.chunk_id);
+            files.push(hit.file.clone());
+        }
+        let next = metadata.next_cursor.clone();
+        assert_eq!(metadata.truncated, next.is_some());
+        let Some(next) = next else {
+            break;
+        };
+        assert!(cursor_tokens.insert(next.clone()));
+        assert_ne!(cursor.as_deref(), Some(next.as_str()));
+        cursor = Some(next);
+    }
+    assert_eq!(chunk_ids.len(), total_chunks.expect("first page count"));
+    assert_eq!(files, ["a.ts", "b.ts", "c.ts"]);
+
+    let first = search(
+        &conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 1,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let first_cursor = first
+        .exhaustive
+        .as_ref()
+        .and_then(|metadata| metadata.next_cursor.clone())
+        .expect("continuation cursor");
+    let wrong_query = search(
+        &conn,
+        None,
+        "differentNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor.clone()),
+            },
+            limit: 1,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .expect_err("cursor must bind the query");
+    assert!(wrong_query.to_string().contains("query and scope"));
+    let wrong_scope = search(
+        &conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor.clone()),
+            },
+            limit: 1,
+            file_roles: vec!["production".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .expect_err("cursor must bind the normalized scope");
+    assert!(wrong_scope.to_string().contains("query and scope"));
+
+    fs::write(
+        repo.path().join("d.ts"),
+        "export function delta() { return pagingNeedle; }\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let stale = search(
+        &conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor),
+            },
+            limit: 1,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .expect_err("cursor must fail against a changed snapshot");
+    assert!(stale.to_string().contains("snapshot changed"));
+    Ok(())
+}
+
+#[test]
+fn exhaustive_search_normalizes_role_and_origin_scope_and_enforces_page_ceiling() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    for path in ["production.ts", "test.ts", "dependency.ts"] {
+        fs::write(
+            repo.path().join(path),
+            "export const scopedNeedle = true;\n",
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    conn.execute("UPDATE files SET role='test' WHERE path='test.ts'", [])?;
+    conn.execute(
+        "UPDATE files SET origin='dependency' WHERE path='dependency.ts'",
+        [],
+    )?;
+
+    let production = search(
+        &conn,
+        None,
+        "scopedNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            file_roles: vec!["production".into(), "production".into()],
+            file_origins: vec!["repository".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let diagnostic = serde_json::to_value(&production)?;
+    assert_eq!(diagnostic["total_chunks"], 1);
+    assert_eq!(diagnostic["returned"], 1);
+    assert_eq!(diagnostic["truncated"], false);
+    assert!(diagnostic["next_cursor"].is_null());
+    assert_eq!(diagnostic["effective"]["vector"], false);
+    assert_eq!(
+        diagnostic["scope"]["file_roles"],
+        serde_json::json!(["production"])
+    );
+    let metadata = production.exhaustive.expect("exhaustive metadata");
+    assert_eq!(metadata.total_chunks, 1);
+    assert_eq!(metadata.returned, 1);
+    assert!(!metadata.truncated);
+    assert_eq!(
+        metadata.scope.file_roles,
+        SearchScopeFileRoles::Selected(vec!["production".into()])
+    );
+    assert_eq!(metadata.scope.origins, ["repository"]);
+    assert_eq!(production.hits[0].file, "production.ts");
+
+    let dependency = search(
+        &conn,
+        None,
+        "scopedNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            file_origins: vec!["dependency".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let metadata = dependency.exhaustive.expect("exhaustive metadata");
+    assert_eq!(metadata.total_chunks, 1);
+    assert_eq!(metadata.scope.origins, ["dependency"]);
+    assert_eq!(dependency.hits[0].file, "dependency.ts");
+
+    let too_large = search(
+        &conn,
+        None,
+        "scopedNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: MAX_EXHAUSTIVE_PAGE_SIZE + 1,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .expect_err("exhaustive page size must have a hard ceiling");
+    assert!(too_large.to_string().contains("page size"));
+    Ok(())
+}
+
+#[test]
 fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -446,6 +690,7 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
         None,
         "greet run",
         &SearchOptions {
+            mode: super::SearchMode::Ranked,
             limit: 8,
             expand: true,
             file_roles: Vec::new(),
@@ -492,6 +737,7 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
         None,
         "greet",
         &SearchOptions {
+            mode: super::SearchMode::Ranked,
             limit: 8,
             expand: true,
             file_roles: Vec::new(),
@@ -874,6 +1120,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
     };
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
         semantic_artifacts: Vec::new(),
@@ -920,6 +1167,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
 fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
             chunk_id: 1,
@@ -994,6 +1242,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
 fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
             chunk_id: 1,
@@ -1091,6 +1340,7 @@ fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Re
     second_artifact.name = Some("second workflow".into());
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
         semantic_artifacts: vec![artifact, second_artifact],

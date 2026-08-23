@@ -207,6 +207,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             query,
             database,
             limit,
+            exhaustive,
+            cursor,
             file_roles,
             file_origins,
             memory,
@@ -235,10 +237,14 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             expand_file_roles,
         } => {
             let configured = &runtime.effective.search;
-            let vector = resolve_flag(vector, lexical_only || no_vector, configured.vector);
-            let rerank = resolve_flag(rerank, lexical_only || no_rerank, configured.rerank);
-            let include_memory = resolve_flag(memory, no_memory, configured.attach_memory);
-            let expand = resolve_flag(expand, no_expand, configured.expansion.enabled);
+            let vector =
+                !exhaustive && resolve_flag(vector, lexical_only || no_vector, configured.vector);
+            let rerank =
+                !exhaustive && resolve_flag(rerank, lexical_only || no_rerank, configured.rerank);
+            let include_memory =
+                !exhaustive && resolve_flag(memory, no_memory, configured.attach_memory);
+            let expand =
+                !exhaustive && resolve_flag(expand, no_expand, configured.expansion.enabled);
             let file_roles = or_configured(file_roles, &configured.file_roles);
             let file_origins = or_configured(file_origins, &configured.origins);
             let expand_file_roles =
@@ -259,6 +265,11 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 json,
                 debug_json,
                 search::SearchOptions {
+                    mode: if exhaustive {
+                        search::SearchMode::Exhaustive { cursor }
+                    } else {
+                        search::SearchMode::Ranked
+                    },
                     limit: limit.unwrap_or(configured.limit),
                     expand,
                     file_roles,

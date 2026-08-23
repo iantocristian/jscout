@@ -190,6 +190,46 @@ fn lexical_only_and_rerank_controls_parse_independently() {
 }
 
 #[test]
+fn exhaustive_search_parses_cursor_paging_and_rejects_explicit_stage_enables() {
+    let Cli { command, .. } = Cli::try_parse_from([
+        "jscout",
+        "search",
+        ".",
+        "query",
+        "--exhaustive",
+        "--cursor",
+        "opaque",
+        "--limit",
+        "25",
+        "--no-vector",
+        "--no-rerank",
+        "--no-memory",
+        "--no-expand",
+    ])
+    .expect("exhaustive continuation parses");
+    let Command::Search {
+        exhaustive,
+        cursor,
+        limit,
+        ..
+    } = command
+    else {
+        panic!("expected search")
+    };
+    assert!(exhaustive);
+    assert_eq!(cursor.as_deref(), Some("opaque"));
+    assert_eq!(limit, Some(25));
+
+    assert!(Cli::try_parse_from(["jscout", "search", ".", "query", "--cursor", "opaque"]).is_err());
+    for stage in ["--vector", "--rerank", "--memory", "--expand"] {
+        assert!(
+            Cli::try_parse_from(["jscout", "search", ".", "query", "--exhaustive", stage]).is_err(),
+            "{stage} must conflict with exhaustive mode",
+        );
+    }
+}
+
+#[test]
 fn repository_scout_accepts_explicit_all_without_hiding_the_warning_threshold() {
     let Cli { command, .. } = Cli::try_parse_from([
         "jscout",

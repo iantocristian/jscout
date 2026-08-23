@@ -75,6 +75,78 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
 }
 
 #[test]
+fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enables() -> Result<()> {
+    let defaults = config::SearchSettings {
+        vector: true,
+        rerank: true,
+        attach_memory: true,
+        limit: 7,
+        expansion: config::ExpansionSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (vector, options) = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({ "query": "dispatch", "exhaustive": true }),
+        &defaults,
+    )?;
+    assert!(!vector);
+    assert_eq!(
+        options.mode,
+        search::SearchMode::Exhaustive { cursor: None }
+    );
+    assert_eq!(options.limit, 7);
+    assert!(!options.rerank);
+    assert!(!options.include_memory);
+    assert!(!options.expand);
+
+    let (_, continued) = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({
+            "query": "dispatch",
+            "exhaustive": true,
+            "cursor": "opaque",
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "expand": false
+        }),
+        &defaults,
+    )?;
+    assert_eq!(
+        continued.mode,
+        search::SearchMode::Exhaustive {
+            cursor: Some("opaque".into())
+        }
+    );
+
+    for field in ["vector", "rerank", "include_memory", "expand"] {
+        let error = search_options_from_args(
+            ToolProfile::Structural,
+            &json!({ "query": "dispatch", "exhaustive": true, (field): true }),
+            &defaults,
+        )
+        .expect_err("explicitly enabled conflicting stage must fail");
+        assert!(error.to_string().contains(field));
+    }
+    let cursor_without_mode = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({ "query": "dispatch", "cursor": "opaque" }),
+        &defaults,
+    )
+    .expect_err("cursor without exhaustive mode must fail");
+    assert!(
+        cursor_without_mode
+            .to_string()
+            .contains("requires exhaustive")
+    );
+    Ok(())
+}
+
+#[test]
 fn profile_instructions_explain_when_to_use_structural_traversal() {
     let baseline = server_instructions(ToolProfile::Baseline);
     let structural = server_instructions(ToolProfile::Structural);
@@ -278,6 +350,11 @@ fn neighborhood_schema_has_a_whole_response_budget() {
             .is_none()
     );
     assert_eq!(
+        search["inputSchema"]["properties"]["exhaustive"]["default"],
+        false
+    );
+    assert!(search["inputSchema"]["properties"].get("cursor").is_some());
+    assert_eq!(
         search["inputSchema"]["properties"]["memory_depth"]["maximum"],
         crate::search::MAX_MEMORY_GRAPH_DEPTH
     );
@@ -385,6 +462,12 @@ fn baseline_profile_removes_structural_tools_and_expansion_controls() {
         .find(|tool| tool["name"] == "semantic_search")
         .expect("semantic_search definition");
     assert!(search["inputSchema"]["properties"].get("expand").is_none());
+    assert!(
+        search["inputSchema"]["properties"]
+            .get("exhaustive")
+            .is_some()
+    );
+    assert!(search["inputSchema"]["properties"].get("cursor").is_some());
     assert!(
         search["inputSchema"]["properties"]
             .get("include_memory")

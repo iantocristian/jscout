@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{embed, file_role, origin, query, semantic, store, structural};
 
@@ -10,6 +10,7 @@ pub(crate) type EdgeIdentity = (String, String, String, Option<String>, Option<i
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
+pub const MAX_EXHAUSTIVE_PAGE_SIZE: usize = 200;
 pub const DEFAULT_MEMORY_GRAPH_DEPTH: usize = 2;
 pub const DEFAULT_MEMORY_GRAPH_NODE_LIMIT: usize = 2_000;
 pub const MAX_MEMORY_GRAPH_DEPTH: usize = 8;
@@ -80,6 +81,7 @@ impl Default for ExpansionOptions {
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
+    pub mode: SearchMode,
     pub limit: usize,
     pub expand: bool,
     /// Maximum bytes in the pretty-printed JSON search envelope. This covers
@@ -117,6 +119,7 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
+            mode: SearchMode::Ranked,
             limit: DEFAULT_RESULT_LIMIT,
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
@@ -136,9 +139,71 @@ impl Default for SearchOptions {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Ranked,
+    Exhaustive {
+        cursor: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScopeFileRoles {
+    All,
+    Selected(Vec<String>),
+}
+
+impl serde::Serialize for SearchScopeFileRoles {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::All => serializer.serialize_str("all"),
+            Self::Selected(roles) => serde::Serialize::serialize(roles, serializer),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SearchScope {
+    pub corpus: &'static str,
+    pub file_roles: SearchScopeFileRoles,
+    pub origins: Vec<String>,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EffectiveSearchPosture {
+    pub vector: bool,
+    pub rerank: bool,
+    pub expand: bool,
+    pub include_memory: bool,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExhaustiveSearchMetadata {
+    pub total_chunks: usize,
+    pub returned: usize,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
+    pub effective: EffectiveSearchPosture,
+    pub scope: SearchScope,
+    #[serde(skip)]
+    request_fingerprint: String,
+    #[serde(skip)]
+    selected_hits: usize,
+    #[serde(skip)]
+    page_had_more: bool,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
+    #[serde(flatten)]
+    pub exhaustive: Option<ExhaustiveSearchMetadata>,
     pub retrieval: RetrievalStatus,
     pub hits: Vec<Hit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -339,6 +404,7 @@ pub struct Hit {
 pub enum MatchReason {
     ExactDefinition,
     ExactOccurrence,
+    Lexical,
     Hybrid,
 }
 
@@ -939,6 +1005,275 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
+const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v1";
+
+#[derive(Debug)]
+struct ExhaustivePageState {
+    total_chunks: usize,
+    selected_hits: usize,
+    has_more: bool,
+    request_fingerprint: String,
+    scope: SearchScope,
+}
+
+fn normalized_allowlist(values: &[String], allowed: &[&str]) -> Vec<String> {
+    allowed
+        .iter()
+        .filter(|candidate| values.iter().any(|value| value == **candidate))
+        .map(|value| (*value).to_string())
+        .collect()
+}
+
+fn exhaustive_scope(options: &SearchOptions, snapshot: &str) -> (Vec<String>, SearchScope) {
+    let selected_roles = normalized_allowlist(&options.file_roles, file_role::ALL);
+    let all_roles = selected_roles.len() == file_role::ALL.len();
+    let query_roles = if options.file_roles.is_empty() || all_roles {
+        Vec::new()
+    } else {
+        selected_roles.clone()
+    };
+    let file_roles = if query_roles.is_empty() {
+        SearchScopeFileRoles::All
+    } else {
+        SearchScopeFileRoles::Selected(selected_roles)
+    };
+    let origins = normalized_allowlist(&options.file_origins, origin::ALL);
+    (
+        query_roles,
+        SearchScope {
+            corpus: "indexed_chunks",
+            file_roles,
+            origins,
+            snapshot: snapshot.to_string(),
+        },
+    )
+}
+
+fn exhaustive_request_fingerprint(q: &str, file_roles: &[String], origins: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-exhaustive-request-v1\0");
+    hasher.update(q.as_bytes());
+    hasher.update(b"\0roles\0");
+    if file_roles.is_empty() {
+        hasher.update(b"all\0");
+    } else {
+        for role in file_roles {
+            hasher.update(role.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    hasher.update(b"origins\0");
+    for origin in origins {
+        hasher.update(origin.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn encode_exhaustive_cursor(snapshot: &str, fingerprint: &str, chunk_id: i64) -> String {
+    format!("{EXHAUSTIVE_CURSOR_PREFIX}.{snapshot}.{fingerprint}.{chunk_id:016x}")
+}
+
+fn decode_exhaustive_cursor(cursor: &str, snapshot: &str, fingerprint: &str) -> Result<i64> {
+    let mut parts = cursor.split('.');
+    let (Some(prefix), Some(cursor_snapshot), Some(cursor_fingerprint), Some(chunk_id)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        anyhow::bail!("invalid exhaustive search cursor");
+    };
+    if parts.next().is_some()
+        || prefix != EXHAUSTIVE_CURSOR_PREFIX
+        || cursor_snapshot.len() != 64
+        || cursor_fingerprint.len() != 64
+        || chunk_id.len() != 16
+        || !cursor_snapshot.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !cursor_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !chunk_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("invalid exhaustive search cursor");
+    }
+    if cursor_snapshot != snapshot {
+        anyhow::bail!(
+            "exhaustive search cursor snapshot changed: expected {cursor_snapshot}, current {snapshot}"
+        );
+    }
+    if cursor_fingerprint != fingerprint {
+        anyhow::bail!("exhaustive search cursor does not match the query and scope");
+    }
+    let chunk_id = i64::from_str_radix(chunk_id, 16)
+        .map_err(|_| anyhow::anyhow!("invalid exhaustive search cursor"))?;
+    if chunk_id <= 0 {
+        anyhow::bail!("invalid exhaustive search cursor");
+    }
+    Ok(chunk_id)
+}
+
+fn exhaustive_cursor_position(
+    conn: &Connection,
+    fts_query: &str,
+    chunk_id: i64,
+    file_roles: &[String],
+    file_origins: &[String],
+) -> Result<(String, i64)> {
+    let flags = origin_flags(file_origins);
+    let roles_json = serde_json::to_string(file_roles)?;
+    let position = conn
+        .query_row(
+            "SELECT file.path, chunk.start
+             FROM chunks_fts
+             JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+             JOIN files file ON file.id=chunk.file_id
+             WHERE chunks_fts MATCH ?1 AND chunk.id=?2
+               AND ((?3 AND file.origin='repository')
+                 OR (?4 AND file.origin='workspace')
+                 OR (?5 AND file.origin='dependency'))
+               AND (?6 OR file.role IN (SELECT value FROM json_each(?7)))",
+            rusqlite::params![
+                fts_query,
+                chunk_id,
+                flags.0,
+                flags.1,
+                flags.2,
+                file_roles.is_empty(),
+                roles_json,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    position.ok_or_else(|| {
+        anyhow::anyhow!("exhaustive search cursor does not identify a matching chunk in scope")
+    })
+}
+
+fn exhaustive_hits(
+    conn: &Connection,
+    q: &str,
+    options: &SearchOptions,
+    snapshot: &str,
+    cursor: Option<&str>,
+) -> Result<(Vec<Hit>, ExhaustivePageState)> {
+    let (file_roles, scope) = exhaustive_scope(options, snapshot);
+    let request_fingerprint = exhaustive_request_fingerprint(q, &file_roles, &scope.origins);
+    let query = fts_query(q);
+    let cursor_position = if let Some(cursor) = cursor {
+        let chunk_id = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
+        if query.is_empty() {
+            anyhow::bail!("exhaustive search cursor does not identify a matching chunk in scope");
+        }
+        let (path, start) =
+            exhaustive_cursor_position(conn, &query, chunk_id, &file_roles, &scope.origins)?;
+        Some((path, start, chunk_id))
+    } else {
+        None
+    };
+    if query.is_empty() {
+        return Ok((
+            Vec::new(),
+            ExhaustivePageState {
+                total_chunks: 0,
+                selected_hits: 0,
+                has_more: false,
+                request_fingerprint,
+                scope,
+            },
+        ));
+    }
+
+    let flags = origin_flags(&scope.origins);
+    let roles_json = serde_json::to_string(&file_roles)?;
+    let total: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE chunks_fts MATCH ?1
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))",
+        rusqlite::params![
+            query,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+        ],
+        |row| row.get(0),
+    )?;
+    let total_chunks = usize::try_from(total)
+        .map_err(|_| anyhow::anyhow!("exhaustive search match count exceeded this platform"))?;
+
+    let cursor_path = cursor_position.as_ref().map(|position| position.0.as_str());
+    let cursor_start = cursor_position.as_ref().map_or(0, |position| position.1);
+    let cursor_chunk_id = cursor_position.as_ref().map_or(0, |position| position.2);
+    let roles_json = serde_json::to_string(&file_roles)?;
+    let mut statement = conn.prepare(
+        "SELECT chunk.id
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE chunks_fts MATCH ?1
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           AND (?7 IS NULL OR (file.path,chunk.start,chunk.id)>(?7,?8,?9))
+         ORDER BY file.path,chunk.start,chunk.id
+         LIMIT ?10",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            query,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+            cursor_path,
+            cursor_start,
+            cursor_chunk_id,
+            (options.limit + 1) as i64,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut chunk_ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = chunk_ids.len() > options.limit;
+    chunk_ids.truncate(options.limit);
+
+    let mut hits = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        if let Some(hit) = load_hit(
+            conn,
+            chunk_id,
+            0.0,
+            MatchReason::Lexical,
+            Vec::new(),
+            &scope.origins,
+        )? {
+            hits.push(hit);
+        }
+    }
+    if cursor.is_none()
+        && let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1)
+    {
+        hit.include_followups = true;
+    }
+    let selected_hits = hits.len();
+    Ok((
+        hits,
+        ExhaustivePageState {
+            total_chunks,
+            selected_hits,
+            has_more,
+            request_fingerprint,
+            scope,
+        },
+    ))
+}
+
 /// Optional cross-encoder rerank stage (dms-style service:
 /// POST {model, query, candidates:[{id,text}]} -> {scores:[{id,score}]}).
 /// Local embeddings use the bundled service automatically; an explicit
@@ -1044,9 +1379,33 @@ pub fn search(
     if options.include_memory && (options.memory_limit == 0 || options.memory_limit > 100) {
         anyhow::bail!("memory limit must be between 1 and 100");
     }
+    let exhaustive_cursor = match &options.mode {
+        SearchMode::Ranked => None,
+        SearchMode::Exhaustive { cursor } => {
+            if options.limit == 0 || options.limit > MAX_EXHAUSTIVE_PAGE_SIZE {
+                anyhow::bail!(
+                    "exhaustive search page size must be between 1 and {MAX_EXHAUSTIVE_PAGE_SIZE}"
+                );
+            }
+            if provider.is_some() || options.rerank || options.expand || options.include_memory {
+                anyhow::bail!(
+                    "exhaustive search requires vector, rerank, expand, and include_memory to be disabled"
+                );
+            }
+            cursor.as_deref()
+        }
+    };
     store::with_read_snapshot(conn, "jscout_search", || {
         let snapshot = structural::current_snapshot(conn)?;
-        let (mut hits, retrieval) = ranked_hits(conn, provider, q, options)?;
+        let (mut hits, retrieval, exhaustive_state) =
+            if matches!(&options.mode, SearchMode::Exhaustive { .. }) {
+                let (hits, state) =
+                    exhaustive_hits(conn, q, options, &snapshot, exhaustive_cursor)?;
+                (hits, RetrievalStatus::vector_disabled(), Some(state))
+            } else {
+                let (hits, retrieval) = ranked_hits(conn, provider, q, options)?;
+                (hits, retrieval, None)
+            };
         if !options.include_neighborhood_followups {
             for hit in &mut hits {
                 hit.include_neighborhood_followup = false;
@@ -1076,8 +1435,28 @@ pub fn search(
             .expand
             .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
             .transpose()?;
+        let exhaustive = exhaustive_state
+            .as_ref()
+            .map(|state| ExhaustiveSearchMetadata {
+                total_chunks: state.total_chunks,
+                returned: hits.len(),
+                truncated: state.has_more,
+                next_cursor: None,
+                effective: EffectiveSearchPosture {
+                    vector: false,
+                    rerank: false,
+                    expand: false,
+                    include_memory: false,
+                    page_size: options.limit,
+                },
+                scope: state.scope.clone(),
+                request_fingerprint: state.request_fingerprint.clone(),
+                selected_hits: state.selected_hits,
+                page_had_more: state.has_more,
+            });
         let mut result = SearchResult {
             snapshot,
+            exhaustive,
             retrieval,
             hits,
             semantic_artifacts,
@@ -1790,6 +2169,32 @@ fn load_hit(
     }))
 }
 
+fn refresh_exhaustive_metadata(result: &mut SearchResult) {
+    let Some(metadata) = result.exhaustive.as_ref() else {
+        return;
+    };
+    let returned = result.hits.len();
+    let truncated = metadata.page_had_more || returned < metadata.selected_hits;
+    let next_cursor = if truncated {
+        result.hits.last().map(|hit| {
+            encode_exhaustive_cursor(
+                &result.snapshot,
+                &metadata.request_fingerprint,
+                hit.chunk_id,
+            )
+        })
+    } else {
+        None
+    };
+    let metadata = result
+        .exhaustive
+        .as_mut()
+        .expect("checked exhaustive metadata");
+    metadata.returned = returned;
+    metadata.truncated = truncated;
+    metadata.next_cursor = next_cursor;
+}
+
 fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()> {
     let byte_limit = result.response_budget.byte_limit;
     if byte_limit == 0 {
@@ -1799,6 +2204,7 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
         result.response_budget.transport_sections = Some(SearchSectionBytes::reserved());
     }
 
+    refresh_exhaustive_metadata(result);
     capture_unbudgeted_bytes(result, compact)?;
 
     // Search attaches semantic memory as secondary context. A stored artifact
@@ -1811,7 +2217,11 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
         cap_semantic_supports(result, DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT);
     }
 
-    while settle_rendered_bytes(result, compact)? > byte_limit {
+    loop {
+        refresh_exhaustive_metadata(result);
+        if settle_rendered_bytes(result, compact)? <= byte_limit {
+            break;
+        }
         result.response_budget.truncated = true;
 
         // Semantic memory is an untrusted, optional attachment to search. Shed
@@ -1949,6 +2359,7 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             settle_rendered_bytes(result, compact)?;
         }
     }
+    refresh_exhaustive_metadata(result);
     settle_rendered_bytes(result, compact)?;
     Ok(())
 }

@@ -50,17 +50,39 @@ pub(crate) fn search_section_bytes(
 }
 
 pub(crate) fn search_value(result: &search::SearchResult) -> Value {
+    let default_match = if result.exhaustive.is_some() {
+        search::MatchReason::Lexical
+    } else {
+        search::MatchReason::Hybrid
+    };
     let hits = result
         .hits
         .iter()
-        .map(|hit| compact_hit(hit, &result.snapshot))
+        .map(|hit| compact_hit(hit, &result.snapshot, default_match))
         .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
+    if let Some(exhaustive) = &result.exhaustive {
+        response.insert("effective".into(), json!(exhaustive.effective));
+        response.insert("scope".into(), json!(exhaustive.scope));
+        response.insert("total_chunks".into(), json!(exhaustive.total_chunks));
+        response.insert("returned".into(), json!(exhaustive.returned));
+        response.insert("truncated".into(), json!(exhaustive.truncated));
+        response.insert(
+            "next_cursor".into(),
+            json!(exhaustive.next_cursor.as_deref()),
+        );
+    }
     if search_retrieval_is_actionable(&result.retrieval) {
         response.insert("retrieval".into(), json!(result.retrieval));
     }
-    response.insert("default_match".into(), json!("hybrid"));
+    response.insert(
+        "default_match".into(),
+        json!(match default_match {
+            search::MatchReason::Lexical => "lexical",
+            _ => "hybrid",
+        }),
+    );
     response.insert("hits".into(), Value::Array(hits));
 
     if let Some(retrieval) = result.semantic_retrieval.as_ref().filter(|retrieval| {
@@ -198,7 +220,7 @@ fn semantic_preview(body: &Value) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
-fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
+fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchReason) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -211,7 +233,7 @@ fn compact_hit(hit: &search::Hit, snapshot: &str) -> Value {
     if let Some(name) = &hit.name {
         value.insert("symbol".into(), json!(name));
     }
-    if hit.match_reason != search::MatchReason::Hybrid {
+    if hit.match_reason != default_match {
         value.insert("match".into(), json!(hit.match_reason));
     }
     if !hit.matched_identifiers.is_empty() {

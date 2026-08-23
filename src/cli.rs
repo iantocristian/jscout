@@ -91,9 +91,15 @@ pub(super) enum Command {
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
-        /// Max results
+        /// Max ranked results, or page size in exhaustive mode
         #[arg(short = 'k', long)]
         limit: Option<usize>,
+        /// Traverse the complete lexical chunk match set in deterministic pages
+        #[arg(long, conflicts_with_all = ["vector", "rerank", "expand", "memory"])]
+        exhaustive: bool,
+        /// Opaque continuation token from a previous exhaustive page
+        #[arg(long, requires = "exhaustive")]
+        cursor: Option<String>,
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,

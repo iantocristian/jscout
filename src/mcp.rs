@@ -484,12 +484,14 @@ fn tool_defs(profile: ToolProfile) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Hybrid (BM25 + embedding) search over the indexed codebase. Returns compact ranked code chunks with copy-safe follow-ups, optional graph context, and opt-in evidence-connected semantic-memory previews. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
+            "description": "Search indexed code chunks. The default is ranked hybrid retrieval with copy-safe follow-ups, optional graph context, and opt-in evidence-connected memory; exhaustive=true instead traverses the complete lexical chunk match set in deterministic pages and echoes its scope. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
-                    "limit": { "type": "integer", "description": "Maximum hits; omit to use repository configuration" },
+                    "exhaustive": { "type": "boolean", "default": false, "description": "Traverse the complete lexical chunk match set in deterministic pages; overrides configured vector, rerank, expansion, and attached memory" },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum ranked hits, or exhaustive page size (maximum 200); omit to use repository configuration" },
+                    "cursor": { "type": "string", "description": "Opaque continuation token returned by a previous exhaustive page; valid only with exhaustive=true" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Primary-hit role allowlist; omit to use repository configuration" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. workspace = owned monorepo/package files; repository = root or unowned first-party files, not the whole repository" },
                     "include_memory": { "type": "boolean", "description": "Attach evidence-connected semantic artifacts; omit to use repository configuration" },
@@ -829,9 +831,29 @@ fn search_options_from_args(
     args: &Value,
     defaults: &config::SearchSettings,
 ) -> Result<(bool, search::SearchOptions)> {
-    let expand = args["expand"]
-        .as_bool()
-        .unwrap_or(defaults.expansion.enabled);
+    let exhaustive = args["exhaustive"].as_bool().unwrap_or(false);
+    let cursor = match args.get("cursor") {
+        None => None,
+        Some(Value::String(cursor)) => Some(cursor.clone()),
+        Some(_) => anyhow::bail!("search cursor must be a string"),
+    };
+    if cursor.is_some() && !exhaustive {
+        anyhow::bail!("search cursor requires exhaustive=true");
+    }
+    if exhaustive {
+        for field in ["vector", "rerank", "expand", "include_memory"] {
+            if args.get(field).and_then(Value::as_bool) == Some(true) {
+                anyhow::bail!("exhaustive search conflicts with explicitly enabled `{field}`");
+            }
+        }
+    }
+    let expand = if exhaustive {
+        false
+    } else {
+        args["expand"]
+            .as_bool()
+            .unwrap_or(defaults.expansion.enabled)
+    };
     if expand && profile == ToolProfile::Baseline {
         anyhow::bail!("structural expansion is unavailable in the baseline MCP profile");
     }
@@ -841,10 +863,19 @@ fn search_options_from_args(
     } else {
         defaults.origins.clone()
     };
-    let use_vector = args["vector"].as_bool().unwrap_or(defaults.vector);
+    let use_vector = if exhaustive {
+        false
+    } else {
+        args["vector"].as_bool().unwrap_or(defaults.vector)
+    };
     Ok((
         use_vector,
         search::SearchOptions {
+            mode: if exhaustive {
+                search::SearchMode::Exhaustive { cursor }
+            } else {
+                search::SearchMode::Ranked
+            },
             limit: args["limit"].as_u64().unwrap_or(defaults.limit as u64) as usize,
             expand,
             file_roles: if args.get("file_roles").is_some() {
@@ -853,7 +884,8 @@ fn search_options_from_args(
                 defaults.file_roles.clone()
             },
             file_origins: file_origins.clone(),
-            include_memory: profile == ToolProfile::Structural
+            include_memory: !exhaustive
+                && profile == ToolProfile::Structural
                 && args["include_memory"]
                     .as_bool()
                     .unwrap_or(defaults.attach_memory),
@@ -867,7 +899,7 @@ fn search_options_from_args(
                 .as_u64()
                 .unwrap_or(defaults.memory_nodes as u64)
                 as usize,
-            rerank: args["rerank"].as_bool().unwrap_or(defaults.rerank),
+            rerank: !exhaustive && args["rerank"].as_bool().unwrap_or(defaults.rerank),
             reranker: None,
             timing: false,
             compact: !debug,
