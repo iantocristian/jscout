@@ -1050,17 +1050,72 @@ struct ExhaustiveHitRow {
     start_line: i64,
     end_line: i64,
     repository_role: Option<String>,
-    highlighted_content: String,
+    content: String,
 }
 
 const EXHAUSTIVE_MATCH_START: &str = "\u{1e}jscout-match-start\u{1f}";
 const EXHAUSTIVE_MATCH_END: &str = "\u{1e}jscout-match-end\u{1f}";
 
-fn exhaustive_match_lines(highlighted_content: &str, start_line: i64) -> Vec<i64> {
+fn exhaustive_highlight_markers(rows: &[ExhaustiveHitRow]) -> (String, String) {
+    let mut suffix = String::new();
+    loop {
+        let (start, end) = if suffix.is_empty() {
+            (EXHAUSTIVE_MATCH_START.into(), EXHAUSTIVE_MATCH_END.into())
+        } else {
+            (
+                format!("\u{1e}jscout-match-start{suffix}\u{1f}"),
+                format!("\u{1e}jscout-match-end{suffix}\u{1f}"),
+            )
+        };
+        if rows
+            .iter()
+            .all(|row| !row.content.contains(&start) && !row.content.contains(&end))
+        {
+            return (start, end);
+        }
+        // Every page is finite, so eventually each candidate is longer than
+        // every source string and therefore cannot collide.
+        suffix.push('-');
+    }
+}
+
+fn exhaustive_highlights(
+    conn: &Connection,
+    query: &str,
+    rows: &[ExhaustiveHitRow],
+) -> Result<(HashMap<i64, String>, String)> {
+    if rows.is_empty() {
+        return Ok((HashMap::new(), String::new()));
+    }
+    let (start_marker, end_marker) = exhaustive_highlight_markers(rows);
+    let chunk_ids =
+        serde_json::to_string(&rows.iter().map(|row| row.chunk_id).collect::<Vec<_>>())?;
+    let mut statement = conn.prepare(
+        "SELECT chunks_fts.rowid, highlight(chunks_fts, 0, ?3, ?4)
+         FROM chunks_fts
+         WHERE chunks_fts MATCH ?1
+           AND chunks_fts.rowid IN (SELECT value FROM json_each(?2))",
+    )?;
+    let highlighted = statement.query_map(
+        rusqlite::params![query, chunk_ids, start_marker, end_marker],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let by_chunk = highlighted.collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    if by_chunk.len() != rows.len() {
+        anyhow::bail!("exhaustive search could not highlight every selected chunk");
+    }
+    Ok((by_chunk, start_marker))
+}
+
+fn exhaustive_match_lines(
+    highlighted_content: &str,
+    start_line: i64,
+    start_marker: &str,
+) -> Vec<i64> {
     let mut lines = Vec::new();
     let mut line = start_line;
     let mut remaining = highlighted_content;
-    while let Some(marker) = remaining.find(EXHAUSTIVE_MATCH_START) {
+    while let Some(marker) = remaining.find(start_marker) {
         line += remaining[..marker]
             .bytes()
             .filter(|byte| *byte == b'\n')
@@ -1068,7 +1123,7 @@ fn exhaustive_match_lines(highlighted_content: &str, start_line: i64) -> Vec<i64
         if lines.last().copied() != Some(line) {
             lines.push(line);
         }
-        remaining = &remaining[marker + EXHAUSTIVE_MATCH_START.len()..];
+        remaining = &remaining[marker + start_marker.len()..];
     }
     lines
 }
@@ -1331,7 +1386,7 @@ fn exhaustive_hits(
         "SELECT chunk.id, file.path, chunk.start, chunk.hash,
                 file.role, file.origin, chunk.kind, chunk.name,
                 chunk.start_line, chunk.end_line, policy.effective_role,
-                highlight(chunks_fts, 0, ?10, ?11)
+                chunk.content
          FROM chunks_fts
          JOIN chunks chunk ON chunk.id=chunks_fts.rowid
          JOIN files file ON file.id=chunk.file_id
@@ -1343,7 +1398,7 @@ fn exhaustive_hits(
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
            AND (?7 IS NULL OR (file.path,chunk.start,chunk.id)>(?7,?8,?9))
          ORDER BY file.path,chunk.start,chunk.id
-         LIMIT ?12",
+         LIMIT ?10",
     )?;
     let rows = statement.query_map(
         rusqlite::params![
@@ -1356,8 +1411,6 @@ fn exhaustive_hits(
             cursor_path,
             cursor_start,
             cursor_chunk_id,
-            EXHAUSTIVE_MATCH_START,
-            EXHAUSTIVE_MATCH_END,
             (options.limit + 1) as i64,
         ],
         |row| {
@@ -1375,7 +1428,7 @@ fn exhaustive_hits(
                 start_line: row.get(8)?,
                 end_line: row.get(9)?,
                 repository_role: row.get(10)?,
-                highlighted_content: row.get(11)?,
+                content: row.get(11)?,
             })
         },
     )?;
@@ -1383,12 +1436,17 @@ fn exhaustive_hits(
     let has_more = selected.len() > options.limit;
     selected.truncate(options.limit);
 
+    let (mut highlighted, start_marker) = exhaustive_highlights(conn, &query, &selected)?;
     let mut anchors = project_exhaustive_anchors(conn, &selected)?;
     let mut hits = Vec::with_capacity(selected.len());
     let mut selected_positions = Vec::with_capacity(selected.len());
     for row in selected {
         let file_anchor = format!("file:{}", row.position.path);
-        let match_lines = exhaustive_match_lines(&row.highlighted_content, row.start_line);
+        let highlighted_content = highlighted
+            .remove(&row.chunk_id)
+            .ok_or_else(|| anyhow::anyhow!("missing exhaustive highlight for selected chunk"))?;
+        let match_lines =
+            exhaustive_match_lines(&highlighted_content, row.start_line, &start_marker);
         let projected_anchors = anchors
             .remove(&row.chunk_id)
             .unwrap_or_else(|| vec![file_anchor.clone()]);

@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fs};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
 
 use anyhow::Result;
 
@@ -837,6 +840,68 @@ fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Re
     assert_eq!(path_only.hits.len(), 1);
     assert_eq!(path_only.hits[0].file, "pathOnlyNeedle.ts");
     assert_eq!(path_only.hits[0].match_lines.as_deref(), Some(&[][..]));
+    Ok(())
+}
+
+#[test]
+fn exhaustive_match_lines_survive_source_sentinels_and_nul_bytes() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("sentinel.ts"),
+        "// \u{1e}jscout-match-start\u{1f}\nexport const collisionNeedle = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("nul.ts"),
+        "export function wrapper() {\n  // prefix\0suffix\n  return collisionNeedle;\n}\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let (canonical_content, searchable_content): (String, String) = conn.query_row(
+        "SELECT chunk.content, chunks_fts.content
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='nul.ts'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(canonical_content.contains('\0'));
+    assert!(!searchable_content.contains('\0'));
+    assert_eq!(
+        canonical_content
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+        searchable_content
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+    );
+
+    let result = search(
+        &conn,
+        None,
+        "collisionNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let match_lines = result
+        .hits
+        .iter()
+        .map(|hit| {
+            (
+                hit.file.as_str(),
+                hit.match_lines.as_deref().unwrap_or_default(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(match_lines["sentinel.ts"], [2]);
+    assert_eq!(match_lines["nul.ts"], [3]);
     Ok(())
 }
 

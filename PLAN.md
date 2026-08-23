@@ -189,7 +189,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v28; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v29; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -603,7 +603,7 @@ and only then compare real agent work with and without it.
 
 ## Implemented post-v1 checker enrichment sidecar (G10)
 
-As implemented, schema v28 stores exact call/receiver/property byte spans and
+As implemented, schema v29 stores exact call/receiver/property byte spans and
 canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
 sidecar explicitly; `jscout checker doctor` reports project/configuration
 readiness. The protocol host isolates compiler work in a terminable worker,
@@ -825,7 +825,7 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 ### Required G10 scale correction
 
 **Implementation status (2026-08-14, amended 2026-08-22).** The correction
-below is implemented in checker protocol v4 and schema v28: complete
+below is implemented in checker protocol v4 and schema v29: complete
 configured-project coverage, package-policy admission of runtime orphan scopes
 by default, exhaustive inferred-project coverage under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
@@ -3080,6 +3080,10 @@ Contract:
    chunk coverage plus unique matching-line coverage; match multiplicity
    within a line and match spans are not represented, and the contract does
    not say that every literal occurrence is recovered from `match_lines`.
+   The disposable FTS mirror replaces embedded NUL bytes with one-byte token
+   boundaries so later line offsets remain intact, and highlight delimiters
+   are selected against the complete page text so source bytes cannot be
+   mistaken for match markers.
 4. **Paging.** `next_cursor` is opaque and binds the query, the normalized
    scope, and the snapshot; continuation against a changed snapshot fails
    with a snapshot error rather than skipping or duplicating hits. Whenever
