@@ -357,6 +357,41 @@ pub struct SymbolAnchorResolution {
     pub anchor_status: String,
 }
 
+/// Resolve one name-mode CLI target back to its canonical structural anchor.
+/// A declaration-line match wins; otherwise the target is exact only when its
+/// file and name identify one symbol node. Ambiguity deliberately falls back
+/// to the legacy name-based usage query.
+pub fn unique_anchor_for_symbol_target(
+    conn: &Connection,
+    target: &SymbolTarget,
+) -> Result<Option<String>> {
+    let candidates = conn
+        .prepare(
+            "SELECT node.node_key, symbol.line
+             FROM graph_nodes node
+             JOIN symbols symbol
+               ON node.native_table='symbols' AND node.native_id=symbol.id
+             WHERE symbol.file_id=?1 AND symbol.name=?2
+             ORDER BY symbol.line, symbol.decl_start, node.node_key",
+        )?
+        .query_map(rusqlite::params![target.file_id, target.name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let line_matches = candidates
+        .iter()
+        .filter(|(_, line)| *line == target.line)
+        .map(|(anchor, _)| anchor)
+        .collect::<Vec<_>>();
+    if let [anchor] = line_matches.as_slice() {
+        return Ok(Some((*anchor).clone()));
+    }
+    Ok(match candidates.as_slice() {
+        [(anchor, _)] => Some(anchor.clone()),
+        _ => None,
+    })
+}
+
 /// Resolve a snapshot-scoped structural symbol anchor to the exact canonical
 /// symbol row consumed by definition and usage queries. This deliberately does
 /// not accept file anchors or fall back to fuzzy name matching.
