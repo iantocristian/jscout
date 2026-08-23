@@ -3032,57 +3032,74 @@ reopened before G22.
 
 Contract:
 
-1. **A mode, not a limit value.** `semantic_search` accepts
-   `exhaustive: true`. It is lexical only and rejects `vector: true`,
-   `rerank: true`, `expand`, and `include_memory`: the cross-encoder runs over
-   the fused pool independently of vector retrieval today, and expansion and
-   attached memory change both membership and latency. The response then has
-   one meaning — the FTS match set for the query terms over indexed chunks in
-   the requested scope. `vector: false` without `exhaustive` keeps today's
-   ranked behaviour.
-2. **The unit of completeness is the chunk.** Search returns one hit per
+1. **A mode with precedence over configuration.** `semantic_search` accepts
+   `exhaustive: true`. After repository configuration is resolved, the mode
+   forces `vector`, `rerank`, `expand`, and `include_memory` off — the
+   built-in defaults turn vector and rerank on, so a bare `exhaustive: true`
+   must work on a normal repository. Only an explicitly supplied conflicting
+   `true` for one of those fields is rejected. The response echoes the
+   effective posture: `effective: { vector: false, rerank: false, expand:
+   false, include_memory: false, page_size }`. The cross-encoder runs over the
+   fused pool independently of vector retrieval today, and expansion and
+   attached memory change both membership and latency; forcing them off gives
+   the response one meaning — the FTS match set for the query terms over
+   indexed chunks in the requested scope. `vector: false` without `exhaustive`
+   keeps today's ranked behaviour.
+2. **Continuation fields.** In exhaustive mode the integer `limit` is the
+   page size, bounded by a hard ceiling, and `cursor` carries the opaque
+   continuation token from the previous page. There is no `offset`.
+3. **The unit of completeness is the chunk.** Search returns one hit per
    chunk, so the completeness fields are `total_chunks` (every matching chunk
    in scope, counted before paging and before byte shedding), `returned`,
-   `truncated`, and `next_cursor`. Several occurrences inside one chunk are
-   one hit; an exhaustive hit carries `match_lines`, the lines inside the
-   chunk where a query term matches, so occurrence-level coverage is checked
-   from the chunk representation without claiming a line-occurrence hit model
-   that does not exist.
-3. **Paging.** Page size is bounded by a hard ceiling. `next_cursor` is
-   opaque and binds the query, the normalized scope, and the snapshot;
-   continuation against a changed snapshot fails with a snapshot error rather
-   than skipping or duplicating hits. Exhaustive order is deterministic and
-   unranked — path, chunk start, chunk id — so traversal is stable and needs
-   no tie-breaker.
-4. **Byte shedding is part of completeness.** `response_bytes` still applies.
+   `truncated`, and `next_cursor`. An exhaustive hit carries `match_lines`,
+   the unique lines inside the chunk where a query term matches. The claim is
+   chunk coverage plus unique matching-line coverage; match multiplicity
+   within a line and match spans are not represented, and the contract does
+   not say that every literal occurrence is recovered from `match_lines`.
+4. **Paging.** `next_cursor` is opaque and binds the query, the normalized
+   scope, and the snapshot; continuation against a changed snapshot fails
+   with a snapshot error rather than skipping or duplicating hits. Whenever
+   `next_cursor` is returned it differs from the input cursor and resumes at
+   the first unrendered hit. Order is deterministic and unranked — path,
+   chunk start, chunk id — so traversal is stable and needs no tie-breaker.
+5. **Byte shedding with forward progress.** `response_bytes` still applies:
    `truncated` reflects the rendered prefix, and `next_cursor` advances from
    the last hit actually rendered, never from the pre-budget candidate count.
-5. **Scope is echoed as a normalized object, not raw arrays.**
+   The complete top-hit handoff is emitted once per traversal, on its first
+   page only. When the budget cannot fit the envelope plus one hit, the
+   handoff degrades to a locator first; if one locator hit still does not
+   fit, the response is a deterministic `response_budget_too_small` error
+   carrying the minimum byte size — never an unchanged cursor.
+6. **Scope is echoed as a normalized object, not raw arrays.**
    `scope: { corpus: "indexed_chunks", file_roles: "all" | [...], origins:
    [...], snapshot }`, because an empty roles filter means every indexed role
    and default origins mean both first-party classes. Completeness is a claim
-   about indexed files only; ignored, hidden (`.github/`), unsupported,
-   extensionless, and dependency files are outside it, and the scope object
-   says so.
-6. **Locator-heavy hits.** Exhaustive pages carry anchor, path, lines, kind,
-   and `match_lines`, with one complete top-hit handoff as today. They do not
-   run the per-hit `used_by` resolution that normal hits perform, so a
-   high-frequency identifier does not become thousands of exact-reference
-   lookups.
-7. No regex or pattern occurrence tool until G22 proves insufficient on a
+   about indexed chunks in the echoed scope: ignored, hidden (`.github/`),
+   unsupported, and extensionless files are never indexed and are outside it;
+   dependency files are outside the *default* origin set and inside the claim
+   only when `origins` explicitly includes `dependency`, which exhaustive mode
+   accepts.
+7. **Locator-heavy hits.** Exhaustive pages carry anchor, path, lines, kind,
+   and `match_lines`. They do not run the per-hit `used_by` resolution that
+   normal hits perform, so a high-frequency identifier does not become
+   thousands of exact-reference lookups.
+8. No regex or pattern occurrence tool until G22 proves insufficient on a
    real completeness question.
 
 Acceptance: a rare identifier (one page, `truncated: false`,
 `returned == total_chunks`); a high-frequency identifier traversed across
-pages with no duplicated or missing chunk; several occurrences inside one
-chunk recovered through `match_lines`; role and origin filters reflected in
-the scope object and the counts; the same traversal under a small
-`response_bytes` producing `truncated: true` and a cursor that resumes at the
-first unrendered hit; a snapshot change between pages failing the
-continuation. Replay the links-iteration investigation against a gold set
-built with `rg -w` over the indexed files in the same scope, compared at the
+pages with no duplicated or missing chunk; two occurrences on one line
+appearing as one `match_lines` entry, with the gold compared as unique
+`(path, line)` values; role and origin filters reflected in the scope object
+and the counts; an explicit `dependency` origin counted and paged; a small
+`response_bytes` producing `truncated: true`, a cursor that resumes at the
+first unrendered hit, and no repeated handoff; a zero-fit budget producing
+the locator degradation or `response_budget_too_small`; a snapshot change
+between pages failing the continuation. Replay the links-iteration
+investigation against a gold set built with `rg -w` over the indexed files in
+the same scope, as unique `(path, line)` values, compared at the
 representation the API returns — chunk plus `match_lines` — not at raw `rg`
-lines.
+output.
 
 ## Planned G23 — skill: investigation and inquiry loops
 
@@ -3112,9 +3129,9 @@ Skill text and server instructions only; no tool changes.
 2. Completeness answers state the scope object and separate convention from
    correctness: "other code does this" establishes a repository habit, not
    that the change is safe.
-3. Expanded searches and artifact details run sequentially; parallel only
-   for small lexical searches; expansion once per investigation, after
-   localization.
+3. The exhaustive cursor loop is sequential, as are expanded searches and
+   artifact details; independent small lexical queries may run in
+   parallel; expansion once per investigation, after localization.
 4. A changed response snapshot mid-session means re-verifying the evidence
    boundary before continuing.
 5. The skill is rewritten around the two loops rather than extended with
