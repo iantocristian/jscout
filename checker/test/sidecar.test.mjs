@@ -369,6 +369,51 @@ test("collapses overload signatures onto their implementation", async (context) 
   await checker.close();
 });
 
+test("groups declaration-only overloads by their resolved signature", async (context) => {
+  const source = [
+    'import type { DeclaredService } from "./types";',
+    "declare const service: DeclaredService;",
+    "service.execute('x');",
+    "",
+  ].join("\n");
+  const declarations = [
+    "export interface DeclaredService {",
+    "  execute(value: string): void;",
+    "  execute(value: number): void;",
+    "  execute(value: boolean): void;",
+    "  execute(value: Date): void;",
+    "}",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "main.ts": source,
+    "types.d.ts": declarations,
+    "tsconfig.json": JSON.stringify({
+      compilerOptions: { strict: true },
+      files: ["main.ts", "types.d.ts"],
+    }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "service.execute('x')", "service", "execute")],
+  });
+  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
+  const answer = resolved.result.results[0].answer;
+  assert.equal(answer.declarations.length, 1);
+  assert.equal(answer.declarations[0].file, "types.d.ts");
+  const stringSignatureStart = Buffer.byteLength(declarations.slice(
+    0,
+    declarations.indexOf("execute(value: string)"),
+  ));
+  assert.equal(answer.declarations[0].start, stringSignatureStart);
+  await checker.close();
+});
+
 test("can reuse one configured discovery snapshot and refreshes the next independent plan", async (context) => {
   const root = fixture({
     "main.ts": "export const main = 1;\n",
@@ -1490,7 +1535,7 @@ test("keeps overlapping projects visible and invalidates changed checker inputs"
   await checker.close();
 });
 
-test("keeps receiver identity, inheritance, overrides, and overload declarations distinct", async (context) => {
+test("keeps receiver identity, inheritance, and overrides distinct", async (context) => {
   const source = [
     "class Alpha { save(): void {} }",
     "class Beta { save(): void {} }",
@@ -1541,7 +1586,7 @@ test("keeps receiver identity, inheritance, overrides, and overload declarations
     answers["inherited.run()"].declarations[0].start,
     answers["overridden.run()"].declarations[0].start,
   );
-  assert.equal(answers["overloaded.execute('x')"].declarations.length, 2);
+  assert.equal(answers["overloaded.execute('x')"].declarations.length, 1);
   assert.ok(!("diagnostics" in answers["alpha.save()"]));
   await checker.close();
 });

@@ -828,7 +828,13 @@ function degradedType(type) {
     || type.intrinsicName === "error";
 }
 
-function symbolDeclarations(checker, receiverType, member) {
+function overloadDeclaration(declaration) {
+  return ts.isMethodSignature(declaration)
+    || ts.isMethodDeclaration(declaration)
+    || ts.isFunctionDeclaration(declaration);
+}
+
+function symbolDeclarations(checker, receiverType, member, call) {
   const property = member.name.text;
   const types = receiverType.isUnion() ? receiverType.types : [receiverType];
   const symbols = [];
@@ -844,7 +850,15 @@ function symbolDeclarations(checker, receiverType, member) {
       ts.isFunctionLike(declaration)
       && checker.isImplementationOfOverload(declaration) === true
     ));
-    return implementation ? [implementation] : declarations;
+    if (implementation) return [implementation];
+    // Interface and declaration-file overloads have no implementation node,
+    // but every signature here belongs to the same TypeScript symbol. Keep
+    // the signature selected for this call as its one logical candidate.
+    if (declarations.length > 1 && declarations.every(overloadDeclaration)) {
+      const resolved = checker.getResolvedSignature(call)?.getDeclaration();
+      return [resolved && declarations.includes(resolved) ? resolved : declarations[0]];
+    }
+    return declarations;
   });
 }
 
@@ -950,7 +964,12 @@ function resolveInProject(built, query, buffers, prepared = sourceRecordForQuery
     if (degradedType(receiverType)) {
       answer = { status: "unknown" };
     } else {
-      const declarations = symbolDeclarations(built.checker, receiverType, occurrence.member)
+      const declarations = symbolDeclarations(
+        built.checker,
+        receiverType,
+        occurrence.member,
+        occurrence.call,
+      )
         .map(declarationResult)
         .filter(Boolean)
         .filter((value, index, all) => all.findIndex((other) => JSON.stringify(other) === JSON.stringify(value)) === index)
@@ -1143,7 +1162,12 @@ function resolveMember(query) {
       answers.push({ project_id: project.id, status: "unknown", checker_input_fingerprint: built.fingerprint });
       continue;
     }
-    const declarations = symbolDeclarations(built.checker, receiverType, occurrence.member)
+    const declarations = symbolDeclarations(
+      built.checker,
+      receiverType,
+      occurrence.member,
+      occurrence.call,
+    )
       .map(declarationResult)
       .filter(Boolean)
       .filter((value, index, all) => all.findIndex((other) => JSON.stringify(other) === JSON.stringify(value)) === index)
