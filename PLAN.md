@@ -1110,18 +1110,33 @@ Findings, in product order, with the decision taken:
    declarations onto the implementation before counting targets. Small PR.
 4. **Multi-owner querying.** An occurrence is queried once per owning
    tsconfig: n8n selected 6,554 and queried 14,265, storing facts two to
-   three times. By design. Deduplicate only under an equivalent semantic
-   Program signature: the material `buildProject` already fingerprints,
-   minus only `project.id` — TypeScript runtime, normalized options, root
-   membership, project references (explicitly, where the manifest does not
-   represent them), config and compiler inputs, and the complete resolved
-   source-input manifest, which carries transitive, ambient, and
-   module-resolution effects. Two Programs can share roots and options and
-   still resolve different inputs (automatic `@types` lookup is relative to
-   the config directory), so options alone are not a key. Equivalence is
-   established from still-fresh recorded input manifests of a prior run,
-   or after building one owner's Program; a first run with no manifests
-   queries every owner. Cost only, and the strongest measured efficiency
+   three times. By design today. Two concepts replace it:
+   - a per-owner **freshness manifest** — config, package, compiler, and
+     source inputs plus the negative discovery probes needed to prove a
+     cached result current. It decides whether a cached answer may be
+     reused and is never a comparison key between owners;
+   - a **semantic Program signature** — TypeScript runtime identity,
+     normalized effective options, normalized roots and references, and
+     the complete resolved source-input identities and hashes, excluding
+     project and config labels. `tsconfig.json` and `tsconfig.build.json`
+     owners of the same files compare equal under it when their effective
+     Programs are identical, which is the case behind the 14,265 queries.
+     A positive-only manifest cannot prove that automatic `@types` or
+     ambient discovery gained no input, so the signature is computed from a
+     built Program, and reusing a recorded signature additionally
+     fingerprints the discovery directories (or negative probes) it
+     depended on.
+
+   Cold path: the worker computes the signature when it builds each
+   owner's Program, before `resolve_members` (the `validateInputs` path
+   already builds without resolving and can carry it). Owners with equal
+   signatures form a group; one representative is queried and its answers
+   are attributed to every owner in the group. Every owner still builds
+   once on the cold path; the saving is the queries and the duplicated
+   facts. Warm path: a recorded signature with a fresh manifest lets equal
+   owners skip the query without a build. Acceptance is a fresh n8n run,
+   not a reuse run: query count below 14,265 with facts identical to the
+   single-owner baseline. Cost only, and the strongest measured efficiency
    item in this record.
 5. **Zero-fact narrowed runs.** A plan-scoped run on a snapshot that already
    has an active batch and yields zero facts (`--file scripts` after a
@@ -1137,9 +1152,9 @@ interprocedural step and therefore the first that rests on an assumption the
 code cannot prove: that every caller of a function is visible. The choices
 and the recommended rule:
 
-- Non-escape is the admission condition: every runtime reference to the
-  function binding, local and through imports, must be an indexed direct
-  call. An alias, a callback or property value, a re-export to an
+- Non-escape is the admission condition: every in-scope
+  production/unknown-role runtime reference to the function binding, local
+  and through imports, must be an indexed direct call. An alias, a callback or property value, a re-export to an
   unresolved consumer, a dynamic import, or any reference the index cannot
   see (files outside the walk such as `.github/`, extensionless executables)
   leaves the set open, and the occurrence keeps the property-hub/checker
@@ -1152,7 +1167,16 @@ and the recommended rule:
   that role scope in its detail. The set is therefore closed over
   production callers, not over every caller in the repository; that is
   the stated meaning of `likely` here, and a misclassified role is a
-  known limit shared with checker eligibility. The alternative — test
+  known limit shared with checker eligibility. The closure scope is a
+  first-class edge attribute — `scope: production` against
+  `scope: repository` — stored beside the confidence, not inside free-text
+  detail: exact `who_uses` reads only `detail_json.$.detail` as optional
+  text today, so a structured field there would be dropped while `likely`
+  surfaced globally. Every confidence consumer — `who_uses`, neighborhood
+  expansion, search follow-ups and `used_by` counts, checker eligibility
+  and filtering — propagates it, with an acceptance test per consumer.
+  Without that propagation the rule falls back to repository-wide
+  closure. The alternative — test
   references as blockers — would leave ai-pipe's sets open for no
   production reason: 443 tests pass a real `SqliteAdapter`, 156 pass
   awaited helpers, and some pass object-literal fakes.
