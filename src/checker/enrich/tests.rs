@@ -2308,6 +2308,128 @@ fn all_failed_batch_cannot_replace_a_healthy_active_batch() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn completed_zero_fact_batch_is_reusable_without_replacing_active_facts() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class CardTable { insert(): void {} }\n\
+                  declare const card: CardTable; card.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let occurrence = occurrence(&conn)?;
+    let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+    let active_fingerprints = BTreeMap::from([(
+        "tsconfig.active.json".to_string(),
+        "active-project-plan".to_string(),
+    )]);
+    let active_batch = seed_active_checker_batch(
+        repo.path(),
+        &conn,
+        &hash,
+        &occurrence,
+        &declaration,
+        &active_fingerprints,
+    )?;
+
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let project_id = "tsconfig.narrowed.json";
+    let projects = BTreeMap::from([(project_id.to_string(), vec![occurrence.clone()])]);
+    let project_fingerprints = test_project_fingerprints(&projects);
+    let zero_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &snapshot,
+            plan_fingerprint: "zero-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects,
+            project_fingerprints: &project_fingerprints,
+            force_new: false,
+        },
+    )?;
+    let unknown = ProjectAnswer {
+        project_id: project_id.into(),
+        status: "unknown".into(),
+        receiver_type: None,
+        declarations: Vec::new(),
+        checker_input_fingerprint: "narrowed-inputs".into(),
+        error: None,
+    };
+    let outcome = map_occurrence(&conn, &occurrence, &[unknown])?;
+    assert!(outcome.facts.is_empty());
+    stage_batch(
+        &conn,
+        zero_batch,
+        project_id,
+        std::slice::from_ref(&occurrence),
+        &outcome.facts,
+        &outcome.projects,
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        zero_batch,
+        project_id,
+        "narrowed-inputs",
+        &[super::super::protocol::CheckerInputFile {
+            path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+            source_hash: hash,
+        }],
+        1,
+        1,
+    )?;
+
+    assert_eq!(
+        activate_staging_batch(repo.path(), &conn, zero_batch, &snapshot, false, None)?,
+        0
+    );
+    crate::structural::rebuild_projection(&conn, &snapshot)?;
+
+    let batches = conn
+        .prepare(
+            "SELECT id, active, checker_input_fingerprint
+             FROM checker_enrichment_batches ORDER BY id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(batches.len(), 2);
+    assert_eq!((batches[0].0, batches[0].1), (active_batch, 1));
+    assert_eq!((batches[1].0, batches[1].1), (zero_batch, 0));
+    assert!(
+        !batches[1].2.is_empty(),
+        "completed no-op marker must be distinguishable from abandoned staging"
+    );
+    let live_edges: i64 = conn.query_row(
+        "SELECT count(*) FROM resolved_edges WHERE provenance='checker'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(live_edges, 1);
+
+    let canonical_root = fs::canonicalize(repo.path())?;
+    let mut input_freshness = InputFreshnessCache::new(&canonical_root);
+    assert_eq!(
+        reusable_completed_batch(
+            &conn,
+            &snapshot,
+            "zero-plan",
+            projects.keys(),
+            &mut input_freshness,
+        )?,
+        Some(zero_batch)
+    );
+    Ok(())
+}
+
 /// Index one file and hand back its connection plus its indexed hash.
 fn indexed(repo: &Path, source: &str) -> Result<(Connection, String)> {
     fs::write(repo.join("main.ts"), source)?;
