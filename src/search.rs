@@ -393,6 +393,10 @@ pub struct Hit {
     pub match_reason: MatchReason,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched_identifiers: Vec<String>,
+    /// Absolute file lines containing at least one lexical query-term match.
+    /// Exhaustive search reports unique lines rather than match multiplicity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_lines: Option<Vec<i64>>,
     pub snippet: String,
     pub snippet_truncated: bool,
     /// Snapshot-scoped structural handles projected from this retrieval chunk.
@@ -1035,6 +1039,40 @@ struct ExhaustivePageState {
     scope: SearchScope,
 }
 
+#[derive(Debug)]
+struct ExhaustiveHitRow {
+    chunk_id: i64,
+    position: ExhaustiveCursorPosition,
+    file_role: String,
+    file_origin: String,
+    kind: String,
+    name: Option<String>,
+    start_line: i64,
+    end_line: i64,
+    repository_role: Option<String>,
+    highlighted_content: String,
+}
+
+const EXHAUSTIVE_MATCH_START: &str = "\u{1e}jscout-match-start\u{1f}";
+const EXHAUSTIVE_MATCH_END: &str = "\u{1e}jscout-match-end\u{1f}";
+
+fn exhaustive_match_lines(highlighted_content: &str, start_line: i64) -> Vec<i64> {
+    let mut lines = Vec::new();
+    let mut line = start_line;
+    let mut remaining = highlighted_content;
+    while let Some(marker) = remaining.find(EXHAUSTIVE_MATCH_START) {
+        line += remaining[..marker]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as i64;
+        if lines.last().copied() != Some(line) {
+            lines.push(line);
+        }
+        remaining = &remaining[marker + EXHAUSTIVE_MATCH_START.len()..];
+    }
+    lines
+}
+
 fn normalized_allowlist(values: &[String], allowed: &[&str]) -> Vec<String> {
     allowed
         .iter()
@@ -1290,10 +1328,14 @@ fn exhaustive_hits(
     let cursor_start = cursor_position.as_ref().map_or(0, |position| position.1);
     let cursor_chunk_id = cursor_position.as_ref().map_or(0, |position| position.2);
     let mut statement = conn.prepare(
-        "SELECT chunk.id, file.path, chunk.start, chunk.hash
+        "SELECT chunk.id, file.path, chunk.start, chunk.hash,
+                file.role, file.origin, chunk.kind, chunk.name,
+                chunk.start_line, chunk.end_line, policy.effective_role,
+                highlight(chunks_fts, 0, ?10, ?11)
          FROM chunks_fts
          JOIN chunks chunk ON chunk.id=chunks_fts.rowid
          JOIN files file ON file.id=chunk.file_id
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE chunks_fts MATCH ?1
            AND ((?2 AND file.origin='repository')
              OR (?3 AND file.origin='workspace')
@@ -1301,7 +1343,7 @@ fn exhaustive_hits(
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
            AND (?7 IS NULL OR (file.path,chunk.start,chunk.id)>(?7,?8,?9))
          ORDER BY file.path,chunk.start,chunk.id
-         LIMIT ?10",
+         LIMIT ?12",
     )?;
     let rows = statement.query_map(
         rusqlite::params![
@@ -1314,37 +1356,66 @@ fn exhaustive_hits(
             cursor_path,
             cursor_start,
             cursor_chunk_id,
+            EXHAUSTIVE_MATCH_START,
+            EXHAUSTIVE_MATCH_END,
             (options.limit + 1) as i64,
         ],
         |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                ExhaustiveCursorPosition {
+            Ok(ExhaustiveHitRow {
+                chunk_id: row.get(0)?,
+                position: ExhaustiveCursorPosition {
                     path: row.get(1)?,
                     start: row.get(2)?,
                     hash: row.get(3)?,
                 },
-            ))
+                file_role: row.get(4)?,
+                file_origin: row.get(5)?,
+                kind: row.get(6)?,
+                name: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
+                repository_role: row.get(10)?,
+                highlighted_content: row.get(11)?,
+            })
         },
     )?;
     let mut selected = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     let has_more = selected.len() > options.limit;
     selected.truncate(options.limit);
 
+    let mut anchors = project_exhaustive_anchors(conn, &selected)?;
     let mut hits = Vec::with_capacity(selected.len());
     let mut selected_positions = Vec::with_capacity(selected.len());
-    for (chunk_id, position) in selected {
-        if let Some(hit) = load_hit(
-            conn,
-            chunk_id,
-            0.0,
-            MatchReason::Lexical,
-            Vec::new(),
-            &scope.origins,
-        )? {
-            hits.push(hit);
-            selected_positions.push(position);
-        }
+    for row in selected {
+        let file_anchor = format!("file:{}", row.position.path);
+        let match_lines = exhaustive_match_lines(&row.highlighted_content, row.start_line);
+        let projected_anchors = anchors
+            .remove(&row.chunk_id)
+            .unwrap_or_else(|| vec![file_anchor.clone()]);
+        hits.push(Hit {
+            chunk_id: row.chunk_id,
+            file: row.position.path.clone(),
+            file_role: row.file_role,
+            repository_role: row.repository_role,
+            file_origin: row.file_origin,
+            kind: row.kind,
+            name: row.name,
+            start_line: row.start_line,
+            end_line: row.end_line,
+            score: 0.0,
+            match_reason: MatchReason::Lexical,
+            matched_identifiers: Vec::new(),
+            match_lines: Some(match_lines),
+            snippet: String::new(),
+            snippet_truncated: false,
+            anchors: projected_anchors,
+            file_anchor,
+            uses: Vec::new(),
+            used_by: Vec::new(),
+            include_followups: false,
+            include_neighborhood_followup: true,
+        });
+        selected_positions.push(row.position);
     }
     if cursor.is_none()
         && let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1)
@@ -2247,6 +2318,7 @@ fn load_hit(
         score,
         match_reason,
         matched_identifiers,
+        match_lines: None,
         snippet,
         snippet_truncated: false,
         anchors,
@@ -2595,6 +2667,82 @@ fn truncate_utf8(text: &mut String, max_bytes: usize) {
     text.truncate(cut);
 }
 
+type ChunkAnchorCandidate = (String, String, String, String);
+
+fn select_chunk_anchors(
+    file: &str,
+    chunk_name: Option<&str>,
+    candidates: Vec<ChunkAnchorCandidate>,
+) -> Vec<String> {
+    if let Some(name) = chunk_name {
+        let exact: Vec<String> = candidates
+            .iter()
+            .filter(|(_, symbol_name, symbol_scope, chunk_scope)| {
+                symbol_name == name && symbol_scope == chunk_scope
+            })
+            .map(|(key, _, _, _)| key.clone())
+            .collect();
+        if !exact.is_empty() {
+            return dedup(exact);
+        }
+    }
+    let overlaps = dedup(candidates.into_iter().map(|(key, _, _, _)| key).collect());
+    if overlaps.is_empty() {
+        vec![format!("file:{file}")]
+    } else {
+        overlaps
+    }
+}
+
+fn project_exhaustive_anchors(
+    conn: &Connection,
+    rows: &[ExhaustiveHitRow],
+) -> Result<HashMap<i64, Vec<String>>> {
+    if rows.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let chunk_ids =
+        serde_json::to_string(&rows.iter().map(|row| row.chunk_id).collect::<Vec<_>>())?;
+    let mut stmt = conn.prepare(
+        "SELECT c.id, g.node_key, s.name, s.scope_chain, c.scope_chain
+         FROM chunks c
+         JOIN symbols s ON s.file_id=c.file_id
+           AND s.decl_start < c.end AND s.decl_end > c.start
+         JOIN graph_nodes g ON g.native_table='symbols' AND g.native_id=s.id
+         WHERE c.id IN (SELECT value FROM json_each(?1))
+         ORDER BY c.id, s.decl_start, s.decl_end, g.node_key",
+    )?;
+    let candidates = stmt.query_map([chunk_ids], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut by_chunk: HashMap<i64, Vec<ChunkAnchorCandidate>> = HashMap::new();
+    for candidate in candidates {
+        let (chunk_id, key, name, symbol_scope, chunk_scope) = candidate?;
+        by_chunk
+            .entry(chunk_id)
+            .or_default()
+            .push((key, name, symbol_scope, chunk_scope));
+    }
+    let mut projected = HashMap::with_capacity(rows.len());
+    for row in rows {
+        projected.insert(
+            row.chunk_id,
+            select_chunk_anchors(
+                &row.position.path,
+                row.name.as_deref(),
+                by_chunk.remove(&row.chunk_id).unwrap_or_default(),
+            ),
+        );
+    }
+    Ok(projected)
+}
+
 fn project_chunk_anchors(
     conn: &Connection,
     chunk_id: i64,
@@ -2618,26 +2766,8 @@ fn project_chunk_anchors(
             r.get::<_, String>(3)?,
         ))
     })?;
-    let candidates: Vec<(String, String, String, String)> =
-        rows.collect::<std::result::Result<_, _>>()?;
-    if let Some(name) = chunk_name {
-        let exact: Vec<String> = candidates
-            .iter()
-            .filter(|(_, symbol_name, symbol_scope, chunk_scope)| {
-                symbol_name == name && symbol_scope == chunk_scope
-            })
-            .map(|(key, _, _, _)| key.clone())
-            .collect();
-        if !exact.is_empty() {
-            return Ok(dedup(exact));
-        }
-    }
-    let overlaps = dedup(candidates.into_iter().map(|(key, _, _, _)| key).collect());
-    if overlaps.is_empty() {
-        Ok(vec![format!("file:{file}")])
-    } else {
-        Ok(overlaps)
-    }
+    let candidates = rows.collect::<std::result::Result<_, _>>()?;
+    Ok(select_chunk_anchors(file, chunk_name, candidates))
 }
 
 fn dedup(values: Vec<String>) -> Vec<String> {

@@ -484,7 +484,7 @@ fn tool_defs(profile: ToolProfile) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Search indexed code chunks. The default is ranked hybrid retrieval with copy-safe follow-ups, optional graph context, and opt-in evidence-connected memory; exhaustive=true instead traverses the complete lexical chunk match set in deterministic pages and echoes its scope. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
+            "description": "Search indexed code chunks. The default is ranked hybrid retrieval with copy-safe follow-ups, optional graph context, and opt-in evidence-connected memory; exhaustive=true instead traverses the complete lexical chunk match set as deterministic locator pages with absolute unique match_lines and an echoed scope. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

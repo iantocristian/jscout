@@ -58,7 +58,13 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
     let hits = result
         .hits
         .iter()
-        .map(|hit| compact_hit(hit, &result.snapshot, default_match))
+        .map(|hit| {
+            if result.exhaustive.is_some() {
+                compact_exhaustive_hit(hit, &result.snapshot)
+            } else {
+                compact_hit(hit, &result.snapshot, default_match)
+            }
+        })
         .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
@@ -271,6 +277,39 @@ fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchRe
     }
     if hit.file_origin == "dependency" {
         value.insert("origin".into(), json!(hit.file_origin));
+    }
+    Value::Object(value)
+}
+
+fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str) -> Value {
+    let mut value = Map::new();
+    value.insert(
+        "at".into(),
+        json!(source_at(
+            Some(&hit.file),
+            Some(hit.start_line),
+            Some(hit.end_line)
+        )),
+    );
+    value.insert("kind".into(), json!(hit.kind));
+    value.insert(
+        "match_lines".into(),
+        json!(hit.match_lines.as_deref().unwrap_or_default()),
+    );
+    match hit.anchors.as_slice() {
+        [anchor] => {
+            value.insert("anchor".into(), json!(anchor));
+        }
+        anchors if !anchors.is_empty() => {
+            value.insert("anchors".into(), json!(anchors));
+        }
+        _ => {
+            value.insert("anchor".into(), json!(hit.file_anchor));
+        }
+    }
+    if hit.anchors.len() <= 1 {
+        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
+        value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
     Value::Object(value)
 }
