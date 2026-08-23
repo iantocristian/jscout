@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fs};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
 
 use anyhow::Result;
 
@@ -11,9 +14,9 @@ use super::{
     SearchExpansion, SearchMode, SearchOptions, SearchResult, SearchScopeFileRoles,
     apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
     candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
-    merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-    resolve_search_limit, search, select_attached_memory, select_neighborhood_projection,
-    select_path_projection, tiered_candidates,
+    exhaustive_fts_query, merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking,
+    reranker_document, resolve_search_limit, search, select_attached_memory,
+    select_neighborhood_projection, select_path_projection, tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -732,6 +735,206 @@ fn exhaustive_search_clamps_only_an_omitted_configured_limit() {
 }
 
 #[test]
+fn exhaustive_fts_query_scopes_every_term_to_content() {
+    assert_eq!(
+        exhaustive_fts_query("alpha beta.gamma"),
+        "content:\"alpha\" OR content:\"beta\" OR content:\"gamma\""
+    );
+}
+
+#[test]
+fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function links_iteration() {\n  const same = links_iteration + links_iteration;\n  return links_iteration;\n}\n",
+    )?;
+    fs::write(
+        repo.path().join("b.ts"),
+        "import { links_iteration } from './a';\nexport function caller() {\n  return links_iteration();\n}\n",
+    )?;
+    fs::write(
+        repo.path().join("pathOnlyNeedle.ts"),
+        "export const unrelated = true;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let exhaustive = search(
+        &conn,
+        None,
+        "LINKS_ITERATION",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: MAX_EXHAUSTIVE_PAGE_SIZE,
+            rerank: false,
+            compact: true,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let observed_lines = exhaustive
+        .hits
+        .iter()
+        .flat_map(|hit| {
+            hit.match_lines
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|line| (hit.file.clone(), *line))
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        observed_lines,
+        HashSet::from([
+            ("a.ts".into(), 1),
+            ("a.ts".into(), 2),
+            ("a.ts".into(), 3),
+            ("b.ts".into(), 1),
+            ("b.ts".into(), 3),
+        ])
+    );
+    assert!(exhaustive.hits.iter().all(|hit| {
+        hit.snippet.is_empty()
+            && hit.uses.is_empty()
+            && hit.used_by.is_empty()
+            && hit.match_lines.is_some()
+    }));
+    let compact = crate::compact::search_value(&exhaustive);
+    for hit in compact["hits"].as_array().expect("compact hits") {
+        let object = hit.as_object().expect("compact locator hit");
+        assert!(object.contains_key("at"));
+        assert!(object.contains_key("kind"));
+        assert!(object.contains_key("match_lines"));
+        assert!(object.contains_key("anchor") || object.contains_key("anchors"));
+        assert!(object.keys().all(|key| matches!(
+            key.as_str(),
+            "at" | "kind" | "match_lines" | "anchor" | "anchors" | "followups"
+        )));
+    }
+
+    let ranked = search(
+        &conn,
+        None,
+        "links_iteration",
+        &SearchOptions {
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let rich_definition = ranked
+        .hits
+        .iter()
+        .find(|hit| hit.file == "a.ts" && hit.name.as_deref() == Some("links_iteration"))
+        .expect("ranked definition hit");
+    assert!(!rich_definition.snippet.is_empty());
+    assert!(!rich_definition.used_by.is_empty());
+    assert!(rich_definition.match_lines.is_none());
+
+    let ranked_path_only = search(
+        &conn,
+        None,
+        "pathOnlyNeedle",
+        &SearchOptions {
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        ranked_path_only
+            .hits
+            .iter()
+            .any(|hit| hit.file == "pathOnlyNeedle.ts")
+    );
+
+    let path_only = search(
+        &conn,
+        None,
+        "pathOnlyNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert!(path_only.hits.is_empty());
+    let path_only_metadata = path_only.exhaustive.expect("exhaustive metadata");
+    assert_eq!(path_only_metadata.total_chunks, 0);
+    assert_eq!(path_only_metadata.returned, 0);
+    assert!(!path_only_metadata.truncated);
+    assert!(path_only_metadata.next_cursor.is_none());
+    Ok(())
+}
+
+#[test]
+fn exhaustive_match_lines_survive_source_sentinels_and_nul_bytes() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("sentinel.ts"),
+        "// \u{1e}jscout-match-start\u{1f}\nexport const collisionNeedle = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("nul.ts"),
+        "export function wrapper() {\n  // prefix\0suffix\n  return collisionNeedle;\n}\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let (canonical_content, searchable_content): (String, String) = conn.query_row(
+        "SELECT chunk.content, chunks_fts.content
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='nul.ts'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(canonical_content.contains('\0'));
+    assert!(!searchable_content.contains('\0'));
+    assert_eq!(
+        canonical_content
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+        searchable_content
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+    );
+
+    let result = search(
+        &conn,
+        None,
+        "collisionNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let match_lines = result
+        .hits
+        .iter()
+        .map(|hit| {
+            (
+                hit.file.as_str(),
+                hit.match_lines.as_deref().unwrap_or_default(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(match_lines["sentinel.ts"], [2]);
+    assert_eq!(match_lines["nul.ts"], [3]);
+    Ok(())
+}
+
+#[test]
 fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -1143,6 +1346,7 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
         score: 1.0,
         match_reason: MatchReason::Hybrid,
         matched_identifiers: Vec::new(),
+        match_lines: None,
         snippet: "entry() { return nearby(); }".into(),
         snippet_truncated: false,
         anchors: vec![entry.clone()],
@@ -1301,6 +1505,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
             score: 1.0,
             match_reason: MatchReason::Hybrid,
             matched_identifiers: Vec::new(),
+            match_lines: None,
             snippet: "x".repeat(8_000),
             snippet_truncated: false,
             anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
@@ -1376,6 +1581,7 @@ fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
             score: 1.0,
             match_reason: MatchReason::Hybrid,
             matched_identifiers: Vec::new(),
+            match_lines: None,
             snippet: "export function target() { return 1; }".into(),
             snippet_truncated: false,
             anchors: vec!["sym:src/target.ts#::target@1".into()],

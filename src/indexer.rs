@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -672,6 +673,17 @@ fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
     })
 }
 
+fn fts_content(content: &str) -> Cow<'_, str> {
+    if content.contains('\0') {
+        // FTS5 indexes text after an embedded NUL, but highlight() can omit
+        // the bytes between that NUL and a later match. A space keeps the NUL
+        // as a token boundary without changing any subsequent line offsets.
+        Cow::Owned(content.replace('\0', " "))
+    } else {
+        Cow::Borrowed(content)
+    }
+}
+
 fn insert_file(
     conn: &Connection,
     identity: &FileIdentity<'_>,
@@ -722,9 +734,10 @@ fn insert_file(
             ])?;
             let chunk_id = conn.last_insert_rowid();
             chunk_ids.push((c.start, c.end, chunk_id));
+            let searchable_content = fts_content(&c.content);
             ins_fts.execute(params![
                 chunk_id,
-                c.content,
+                searchable_content.as_ref(),
                 c.name.as_deref().unwrap_or(""),
                 c.symbols.join(" "),
                 identity.path,

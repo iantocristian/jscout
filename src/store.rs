@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "28";
+pub const SCHEMA_VERSION: &str = "29";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -230,7 +230,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='28' WHERE key='schema_version';",
+             UPDATE meta SET value='29' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -248,7 +248,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '28')
+INSERT INTO meta(key, value) VALUES('schema_version', '29')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -1404,6 +1404,39 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(unchanged, "stale");
+        Ok(())
+    }
+
+    #[test]
+    fn v28_fts_mirror_requires_writer_rebuild() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v28.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "INSERT INTO files(id, path, hash, role) VALUES(1, 'old.ts', 'file', 'production');
+             INSERT INTO chunks(
+               id, file_id, kind, start, end, start_line, end_line, hash, content
+             ) VALUES(1, 1, 'module', 0, 1, 1, 1, 'chunk', 'x');
+             INSERT INTO chunks_fts(rowid, content, name, symbols, path)
+             VALUES(1, 'x', '', '', 'old.ts');
+             UPDATE meta SET value='28' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must not use the pre-sanitization FTS mirror");
+        assert!(error.to_string().contains("schema v28"));
+
+        let upgraded = open_path(&database)?;
+        let state: (String, i64, i64) = upgraded.query_row(
+            "SELECT
+               (SELECT value FROM meta WHERE key='schema_version'),
+               (SELECT count(*) FROM chunks),
+               (SELECT count(*) FROM chunks_fts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0));
         Ok(())
     }
 

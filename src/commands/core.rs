@@ -170,7 +170,28 @@ pub(super) fn cmd_search(
         println!("no results");
         return Ok(());
     }
+    let exhaustive = result.exhaustive.is_some();
     for (i, h) in result.hits.iter().enumerate() {
+        if exhaustive {
+            let match_lines = h
+                .match_lines
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "{:2}. {}:{}-{} [{}] match_lines={match_lines}",
+                i + 1,
+                h.file,
+                h.start_line,
+                h.end_line,
+                h.kind,
+            );
+            println!("      anchors: {}", h.anchors.join(", "));
+            continue;
+        }
         let name = h
             .name
             .as_deref()
