@@ -136,6 +136,19 @@ pub(super) fn cmd_search(
         "retrieval: lexical={} vector={} reranker={}",
         result.retrieval.lexical, result.retrieval.vector, result.retrieval.reranker
     );
+    if let Some(exhaustive) = &result.exhaustive {
+        println!(
+            "exhaustive: returned={} total_chunks={} truncated={} page_size={}",
+            exhaustive.returned,
+            exhaustive.total_chunks,
+            exhaustive.truncated,
+            exhaustive.effective.page_size,
+        );
+        println!("scope: {}", serde_json::to_string(&exhaustive.scope)?);
+        if let Some(cursor) = &exhaustive.next_cursor {
+            println!("next cursor: {cursor}");
+        }
+    }
     if let Some(action) = result.retrieval.vector_action {
         println!("vector action: {action}");
     }
