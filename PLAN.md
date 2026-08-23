@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-20.
+> Status: authoritative plan as of 2026-08-23.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -16,8 +16,11 @@
 > corrections plus staged-use guidance for the existing G14/G18 surfaces. A
 > problem-solving investigation then confirmed that exact definitions are the
 > efficient drill-down surface while repeated expansion dominates response
-> volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
-> is the compact-transport and path-projection pass. G21 repository-local
+> volume. G19 is reserved for opt-in quiet-window scouting in watch. G20
+> compact transport, path projection, and profiled structured transport are
+> implemented. Its unreproducible historical aggregate replay gate is retired;
+> the retained claims are limited to the recorded prospective measurements.
+> G21 repository-local
 > runtime configuration and retrieval observability are implemented. G22
 > exhaustive lexical search and G23 skill investigation/inquiry loops are
 > planned from the production traces. None triggers G16 or
@@ -1198,11 +1201,11 @@ and the recommended rule:
   prototype follows the user-facing completeness work in G22–G23 (#83) and
   the bounded correctness items above.
 
-Sequence agreed in review: close G20b through its pending reproducible
-replay; G22 then G23 (#83); the bounded correctness items (2, 3, 5);
-multi-owner deduplication under the semantic signature (4); then the
-parameter-flow probe (1) and sidecar parallelism (6), each only on its own
-measurement.
+Sequence agreed in review, amended after closing G20b on its retained
+prospective evidence: G22 then G23 (#83); the bounded correctness items
+(2, 3, 5); multi-owner deduplication under the semantic signature (4); then
+the parameter-flow probe (1) and sidecar parallelism (6), each only on its
+own measurement.
 
 Remaining items from the optimization sequence:
 
@@ -2595,15 +2598,21 @@ subject-local resume, partial failures, gateway retry, and semantic-vector tail
 convergence. Until those exist, no `--scout` flag is shipped and watch's README
 boundary remains structure/checker/vector maintenance only.
 
-## In progress G20b — path transport and measured compatibility
+## Implemented G20b — path transport and measured compatibility
 
 G20a merged in PR #60 and implements the correctness and compact-transport portion: cross-origin
 exact follow-ups, one complete top-hit handoff, opt-in search-attached memory,
 bounded checker receiver display, exact usage labels, compact/body/full artifact
 views, successful-diagnostic gating, and canonical section-byte telemetry.
-G20b implements path-shaped expansion first, then runs the structured-content
-compatibility experiment and the registered fixed/staged replays. No aggregate
-byte claim is made before those replays run.
+G20b implements path-shaped expansion and the structured-content compatibility
+experiment. The historical fixed/staged replay requirement is retired rather
+than reported as passed: the private source snapshot is absent, raw responses
+were not retained, and several calls survive only in abbreviated form. The
+implementation is closed on the prospective n8n and Next.js projection checks
+and the client compatibility experiment below. Those results support only their
+recorded per-corpus claims; G20 makes no aggregate byte-reduction claim for the
+unreproducible historical workloads. Staged interaction measurement now belongs
+to G23, where the agent strategy actually changes.
 
 Real-monorepo use established a second bottleneck after localization quality:
 individually budgeted responses can still repeat enough metadata across an
@@ -2868,8 +2877,8 @@ but showed no context reduction while raw bytes increased by 88.3%. Therefore
 `auto` is profiled to verified Codex versions; Claude and unknown clients stay
 text-only, with explicit `text` and `structured` overrides. The installed pi
 agent has no MCP client surface, while pi-ai is the LLM gateway rather than an
-MCP result consumer. This compatibility result does not satisfy the aggregate
-fixed-call replay gate.
+MCP result consumer. This result establishes compatibility, not aggregate G20
+byte savings.
 
 The path projection also has a separately labelled
 [`n8n real-corpus proxy`](eval/results/g20b-n8n-path-transport-proxy-2026-08-21.md).
@@ -2877,9 +2886,8 @@ Across four fixed lexical expanded searches, it preserved the ordered hit
 anchors, emitted only edges present in the diagnostic neighborhood, reduced
 aggregate response bytes by 62.4%, nodes by 72.5%, and edges by 85.8%. The
 first pass exposed and fixed seed starvation by reserving one continuation per
-connected seed before global fill. This proxy does not satisfy the registered
-historical gate: the original private corpus is absent, raw responses were not
-retained, and abbreviated calls cannot be reconstructed honestly.
+connected seed before global fill. This proxy supports the recorded projection
+claim only; it is not presented as a reconstruction of the historical workload.
 
 The prospective
 [`Next.js full-posture check`](eval/results/g20b-next-full-posture-2026-08-21.md)
@@ -2891,10 +2899,10 @@ that multi-seed path selection could retain a real cross-file continuation that
 the equally bounded diagnostic neighborhood omitted. Neighborhood now reserves
 the selected path forest before filling its remaining fan-out budget; the full
 rerun made every path node and edge a subset in all four pairs. This is the
-required rich-response corpus point, but its 55.1% result does not clear or
-replace the unavailable historical 60% fixed-call gate.
+required rich-response corpus point. Its 55.1% reduction remains the claim for
+that workload; it is not generalized into a historical aggregate result.
 
-### Implementation order and acceptance
+### Implementation and validation record
 
 1. Preserve both exact call inventories and any recoverable raw responses before
    changing serializers; label the architecture inquiry's historical 460–510
@@ -2908,38 +2916,18 @@ replace the unavailable historical 60% fixed-call gate.
 5. Add path-shaped expansion while preserving explicit neighborhood mode.
 6. Run the structured-content compatibility experiment; ship it only where it
    reduces client-visible context without a fallback regression.
-7. For each historical workload, run two separate replays:
-   - a fixed-call transport replay with the same valid queries, arguments, call
-     count, and ordering, measuring serializer changes only; and
-   - a staged-session replay with sequential 4–6-result queries, one artifact at
-     a time, delayed expansion, and explicit memory only when needed, measuring
-     skill/orchestration behavior.
-
-For every search in both replay forms, report memory attachment requested,
-selected, and delivered separately using the existing telemetry fields
-`requested_retrieval.memory`, `semantic_selected`, and
-`semantic_artifacts_returned`. The opt-in default makes request adoption a
-separate causal gate: a zero-delivery arm must not be interpreted as a memory
-ranking result when the agent never requested attachment.
-
-The architecture fixed replay excludes the six invalid historical requests
-from byte parity but tests their replacement (`source_limit: 0`) separately.
-The 42-call architecture and 19-call problem-solving workloads are reported
-separately rather than pooled. Each staged replay reports reduced calls and
-bytes independently; its savings cannot be credited to the serializer target.
+7. Record the prospective n8n projection, Next.js full-posture, and MCP client
+   compatibility results with their claim boundaries. Retire the original 60%
+   historical aggregate gate because its inputs cannot be reconstructed; do
+   not reinterpret the prospective results as having passed it. Move staged
+   interaction measurement to G23 and keep strategy savings separate from
+   serializer claims.
 
 Acceptance requires:
 
 - all previously identified high-value facts—locations, anchors, snippets,
   decisive edges, descriptions, defining participants, and freshness—remain
   available without `debug` or `full`;
-- compact/default aggregate inner JSON bytes fall by at least 60% on the
-  fixed-call transport replay at equal fact coverage and call count. The two
-  workloads are evaluated separately so one cannot hide a regression in the
-  other. The reported 65–75% reduction remains a hypothesis until measured;
-- the staged-session replay reports call count, inner/wire/client-visible bytes,
-  and recovered high-value facts separately, without presenting strategy
-  savings as transport savings;
 - the prospective real-corpus path-projection workload includes at least one
   full-posture arm with vectors, reranking, and attached semantic memory.
   **Complete:** the Next.js check above supplies that point; the lexical n8n
@@ -2968,8 +2956,8 @@ Acceptance requires:
   returned nodes/edges than neighborhood mode and preserves the TargetsQueue
   feedback-loop continuations, while explicitly requested neighborhood output
   remains available;
-- the four exact definition responses in the problem-solving replay retain
-  their decisive source facts and remain separate drill-down calls;
+- exact definition remains a separate progressive drill-down whose decisive
+  source facts are not folded back into expanded search;
 - normal compact responses omit successful-stage scores/pools/hashes, while
   degraded/truncated responses and telemetry retain enough information to
   diagnose the event; and
@@ -3047,12 +3035,11 @@ the tool should state its size and return all of it on request. Ranking's
 structural limit belongs to vector similarity only. FTS tokenization cannot
 promise regex or substring exactness, which stays with `rg`.
 
-G20b is not a prerequisite. Its transport work shipped in #60 and #62; it
-remains open only because the historical 60% fixed-call replay is
-unreachable. It closes with a newly registered reproducible fixed-call
-workload plus the staged-session replay, after which it is marked implemented
-or its historical gate is explicitly replaced. The serializers are not
-reopened before G22.
+G20b is implemented and is not a prerequisite. Its historical 60% aggregate
+gate was explicitly retired because the source snapshot and complete raw calls
+cannot be reconstructed. The prospective n8n, Next.js, and MCP measurements
+retain their narrower recorded claims, and the staged interaction replay now
+belongs to G23. G22 does not reopen the serializers.
 
 Contract:
 
@@ -3165,8 +3152,11 @@ Skill text and server instructions only; no tool changes.
 Acceptance: the skill ships with the G22 fields; a replay of the
 links-iteration investigation following the skill reaches the
 `rg -w`-listed occurrences and states scope; recorded before and after:
-missed gold chunks, false completeness claims, calls, bytes, and telemetry's
-exact-anchor definition success rate.
+missed gold chunks, false completeness claims, calls, inner/wire/client-visible
+bytes, recovered high-value facts, memory attachment requested/selected/
+delivered, and telemetry's exact-anchor definition success rate. This is the
+staged interaction measurement formerly assigned to G20b. Its strategy savings
+are reported separately and are not credited to G20 serializer changes.
 
 ## Evaluation decisions already made
 
