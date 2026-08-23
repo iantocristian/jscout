@@ -27,6 +27,7 @@ fn planned_occurrence(
         package: package.into(),
         boundary_rank,
         deterministically_resolved: false,
+        value_flow_resolved: false,
         builtin_receiver: false,
         runtime_namesake: true,
     }
@@ -1573,6 +1574,36 @@ fn namespace_member_resolved_by_the_structural_graph_is_not_requeried() -> Resul
 }
 
 #[test]
+fn receiver_value_flow_answers_never_reach_the_checker() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "class Service { run(): void {} }\n\
+         const service = new Service();\n\
+         service.run();\n",
+    )?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+
+    let calls = load_occurrences(&conn)?;
+    let call = calls
+        .iter()
+        .find(|occurrence| occurrence.member == "run")
+        .expect("value-flow member call");
+    assert!(call.deterministically_resolved);
+    assert!(call.value_flow_resolved);
+    assert!(select_eligible(calls.clone(), &options()).0.is_empty());
+
+    let mut all = options();
+    all.include_all = true;
+    assert!(
+        select_eligible(calls, &all).0.is_empty(),
+        "--all audits other deterministic answers but must not repeat bounded value flow in TypeScript"
+    );
+    Ok(())
+}
+
+#[test]
 fn manual_default_keeps_all_one_hundred_fifty_thousand_eligible_occurrences() {
     let occurrences = (0..150_000)
         .map(|id| {
@@ -2390,6 +2421,49 @@ fn seed_active_checker_batch(
     activate_staging_batch(root, conn, batch_id, &snapshot, false, None)?;
     crate::structural::rebuild_projection(conn, &snapshot)?;
     Ok(batch_id)
+}
+
+#[test]
+fn receiver_value_flow_suppresses_canonical_checker_fact_during_projection() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class CardTable { insert(): void {} }\n\
+                  const card = new CardTable(); card.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let occurrence = occurrence(&conn)?;
+    assert!(occurrence.value_flow_resolved);
+
+    seed_active_checker_batch(
+        repo.path(),
+        &conn,
+        &hash,
+        &occurrence,
+        &declaration_at(source, "insert(): void {}", "insert", &hash),
+        &BTreeMap::from([("tsconfig.json".to_string(), "stable-plan".to_string())]),
+    )?;
+
+    let projected = conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM checker_enrichments
+              WHERE member_call_id=?1),
+           (SELECT count(*) FROM resolved_edges
+              WHERE provenance='receiver-value-flow' AND source_ref_id=?1),
+           (SELECT count(*) FROM resolved_edges
+              WHERE provenance='checker' AND source_ref_id=?1)",
+        [occurrence.id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        projected,
+        (1, 1, 0),
+        "the canonical checker fact stays reusable but must not duplicate the projected value-flow answer"
+    );
+    Ok(())
 }
 
 #[test]

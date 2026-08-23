@@ -509,7 +509,8 @@ pub(super) enum Command {
         /// Explicitly stop after this many spread-ordered occurrences
         #[arg(long)]
         max_occurrences: Option<usize>,
-        /// Include normally excluded roles, already-resolved calls, and every orphan scope
+        /// Include normally excluded roles, other resolved calls, and every orphan scope;
+        /// receiver value-flow calls stay excluded
         #[arg(long)]
         all: bool,
         /// Print the deterministic ownership/selection plan without building TypeScript Programs

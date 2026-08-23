@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::{file_role, origin, query::ModuleGraph, store};
 
-pub const PROJECTION_VERSION: &str = "11";
+pub const PROJECTION_VERSION: &str = "12";
 const WORKFLOW_HUB_DEGREE_LIMIT: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -19,7 +19,9 @@ struct SymbolNode {
     file_id: i64,
     path: String,
     name: String,
+    kind: String,
     scope: String,
+    start: i64,
     decl_start: i64,
     decl_end: i64,
     line: i64,
@@ -573,6 +575,21 @@ pub fn rebuild_projection_with_timing(
             eprintln!("timing project-member-calls={:?}", stage_started.elapsed());
         }
         let stage_started = Instant::now();
+        receiver_flow::project_receiver_value_flows(
+            conn,
+            &files,
+            &graph,
+            &symbols,
+            &root_symbol,
+            &mut insert_edge,
+        )?;
+        if timing {
+            eprintln!(
+                "timing project-receiver-value-flows={:?}",
+                stage_started.elapsed()
+            );
+        }
+        let stage_started = Instant::now();
         project_checker_enrichments(conn, &files, &symbols, snapshot, &mut insert_edge)?;
         if timing {
             eprintln!(
@@ -644,7 +661,7 @@ fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
 fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<SymbolNode>> {
     let mut raw = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, name, scope_chain, decl_start, decl_end, line
+        "SELECT id, file_id, name, kind, scope_chain, start, decl_start, decl_end, line
          FROM symbols ORDER BY file_id, scope_chain, name, decl_start, id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -653,9 +670,11 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
             r.get::<_, i64>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, i64>(4)?,
+            r.get::<_, String>(4)?,
             r.get::<_, i64>(5)?,
             r.get::<_, i64>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, i64>(8)?,
         ))
     })?;
     for row in rows {
@@ -664,12 +683,12 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
     raw.sort_by(|a, b| {
         let a_path = files.get(&a.1).map_or("", String::as_str);
         let b_path = files.get(&b.1).map_or("", String::as_str);
-        (a_path, &a.3, &a.2, a.4, a.0).cmp(&(b_path, &b.3, &b.2, b.4, b.0))
+        (a_path, &a.4, &a.2, a.6, a.0).cmp(&(b_path, &b.4, &b.2, b.6, b.0))
     });
 
     let mut ordinals: HashMap<(i64, String, String), usize> = HashMap::new();
     let mut symbols = Vec::with_capacity(raw.len());
-    for (id, file_id, name, scope, decl_start, decl_end, line) in raw {
+    for (id, file_id, name, kind, scope, start, decl_start, decl_end, line) in raw {
         let path = files
             .get(&file_id)
             .cloned()
@@ -684,7 +703,9 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
             file_id,
             path,
             name,
+            kind,
             scope,
+            start,
             decl_start,
             decl_end,
             line,
@@ -2166,6 +2187,16 @@ fn project_checker_enrichments(
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
     let coverage = checker_occurrence_coverage(conn, snapshot)?;
+    // `resolved_edges` can be much larger than the checker fact set. Scan it
+    // once instead of running an unindexed correlated lookup for every fact.
+    let value_flow_resolved = conn
+        .prepare(
+            "SELECT source_ref_id FROM resolved_edges
+             WHERE provenance='receiver-value-flow' AND confidence='likely'
+               AND source_ref_id IS NOT NULL",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
         symbols_by_file
@@ -2252,6 +2283,9 @@ fn project_checker_enrichments(
             target_start,
             target_end,
         ) = row?;
+        if value_flow_resolved.contains(&member_call_id) {
+            continue;
+        }
         let Some(occurrence_coverage) = coverage.get(&enrichment_member_call_id) else {
             continue;
         };
@@ -3758,6 +3792,8 @@ fn parse_symbol_key(key: &str) -> Result<(String, String, String, usize)> {
     let (path, scope) = path_scope.rsplit_once('#').context("missing scope")?;
     Ok((path.into(), scope.into(), name.into(), ordinal))
 }
+
+mod receiver_flow;
 
 #[cfg(test)]
 mod tests;
