@@ -1108,19 +1108,27 @@ Findings, in product order, with the decision taken:
    declarations onto the implementation before counting targets. Small PR.
 4. **Multi-owner querying.** An occurrence is queried once per owning
    tsconfig: n8n selected 6,554 and queried 14,265, storing facts two to
-   three times. By design. Deduplicate only under an equivalent semantic Program
-   signature — TypeScript runtime, normalized options, root membership,
-   project references, and resolved config/compiler inputs, excluding only
-   the project label — because answers depend on roots, references, and
-   augmentations, not on options alone. Cost only, and the strongest
-   measured efficiency item in this record.
+   three times. By design. Deduplicate only under an equivalent semantic
+   Program signature: the material `buildProject` already fingerprints,
+   minus only `project.id` — TypeScript runtime, normalized options, root
+   membership, project references (explicitly, where the manifest does not
+   represent them), config and compiler inputs, and the complete resolved
+   source-input manifest, which carries transitive, ambient, and
+   module-resolution effects. Two Programs can share roots and options and
+   still resolve different inputs (automatic `@types` lookup is relative to
+   the config directory), so options alone are not a key. Equivalence is
+   established from still-fresh recorded input manifests of a prior run,
+   or after building one owner's Program; a first run with no manifests
+   queries every owner. Cost only, and the strongest measured efficiency
+   item in this record.
 5. **Zero-fact narrowed runs.** A plan-scoped run on a snapshot that already
    has an active batch and yields zero facts (`--file scripts` after a
    package run) exits 1 without a summary and cannot reuse, because the
    retain-previous-batch safeguard treats it as a failed replacement. Manual
-   only — watch opens a new snapshot per generation. Treat it as a successful no-op: record a completed, inactive zero-fact
-   batch that exact reuse can match — reuse currently considers only active
-   batches — while the prior active fact batch stays active.
+   only — watch opens a new snapshot per generation. Treat it as a
+   successful no-op: record a completed, inactive zero-fact batch that exact
+   reuse can match — reuse currently considers only active batches — while
+   the prior active fact batch stays active.
 
 **Decision record: argument→parameter flow.** This is the first
 interprocedural step and therefore the first that rests on an assumption the
@@ -1135,10 +1143,17 @@ and the recommended rule:
   leaves the set open, and the occurrence keeps the property-hub/checker
   path. "Unpublished package" and "every import resolves in-repo" are
   necessary, not sufficient.
-- Test-role callers do not count. On ai-pipe they happen to be harmless (443
-  tests pass a real `SqliteAdapter`), but 156 pass awaited helpers and some
-  pass object-literal fakes, either of which leaves the set open; on repos
-  with fake classes they exceed the cap.
+- Closure is over production/unknown-role references only — the same role
+  set the checker's default eligibility uses. Test, fixture, generated, and
+  documentation-role references are ignored entirely: they are neither
+  closure blockers nor candidate contributors, and the emitted edge records
+  that role scope in its detail. The set is therefore closed over
+  production callers, not over every caller in the repository; that is
+  the stated meaning of `likely` here, and a misclassified role is a
+  known limit shared with checker eligibility. The alternative — test
+  references as blockers — would leave ai-pipe's sets open for no
+  production reason: 443 tests pass a real `SqliteAdapter`, 156 pass
+  awaited helpers, and some pass object-literal fakes.
 - Disagreeing call sites union into one closed set under the ≤3 rule, as
   factory returns do.
 - Depth 2. `api.mjs` → route-handler parameter → `db.mjs` parameter is the
@@ -1168,11 +1183,11 @@ Remaining items from the optimization sequence:
 6. **Bounded sidecar pool.** Productize `codex/checker-sidecar-experiment`:
    typed configuration for worker count and RSS recycle threshold, an
    aggregate memory budget, one fresh-worker retry on crash, and the five
-   test classes the experiment listed. Premature after grouped scopes, which removed most of the duplicated
-   Programs the experiment parallelized. Re-measure after multi-owner
-   deduplication and productize only if checker execution remains dominant
-   under a bounded aggregate RSS budget; the right default may be two
-   workers or none.
+   test classes the experiment listed. Premature after grouped scopes,
+   which removed most of the duplicated Programs the experiment
+   parallelized. Re-measure after multi-owner deduplication and productize
+   only if checker execution remains dominant under a bounded aggregate RSS
+   budget; the right default may be two workers or none.
 7. **TypeScript backend, later.** Move the pinned 5.9.3 to 6.0 when
    convenient (the API baseline TypeScript 7 targets). When 7.1 ships its
    API, prototype a native worker behind the same sidecar protocol with

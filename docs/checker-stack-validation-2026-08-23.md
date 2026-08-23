@@ -382,7 +382,7 @@ What this shows: read-only commands refuse both a v6 and a v26 database instead 
 | ai-pipe value-flow edges | – | 1025 edges / 557 occurrences; hand check 13/13 correct |
 | n8n `index` | 21.39s | 22.09s (+0.7s, +3%) |
 | n8n value-flow edges | – | 14,456 edges / 14,414 occurrences; hand check 11/11 correct |
-| n8n `enrich --package n8n-workflow --package @n8n/db` | not run | 374.62s cold (3,836 facts; ~5 min of it publish) / 11.60s reuse |
+| n8n `enrich --package n8n-workflow --package @n8n/db` | not run | pre-fix (`6a93b0d`): 374.62s cold / 11.60s reuse; post-fix (`3fb30ef`, PLAN.md item 5): 62.36s cold / 11.03s reuse; 3,836 facts in both |
 | n8n `enrich --file scripts` | not run | exit 1, 0 facts (finding 3) |
 | watch (ai-pipe copy) | not run | server edit: 279 ms refresh + 4.6s enrich (dirty scope only); test edit: 276 ms + 0.8s, no scope re-checked |
 | old v6 DB | not run | read-only and index both refuse; file untouched |
