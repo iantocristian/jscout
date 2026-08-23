@@ -605,7 +605,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     package_gate.validate_fresh()?;
     let mut input_freshness = InputFreshnessCache::new(&canonical_root);
     if !options.force_full
-        && let Some(batch_id) = reusable_active_batch(
+        && let Some(batch_id) = reusable_completed_batch(
             &conn,
             &snapshot,
             &plan_fingerprint,
@@ -1739,7 +1739,10 @@ fn plan_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
-fn reusable_active_batch<'a>(
+/// Reuse either the active publication or a completed inactive zero-fact
+/// marker. A non-empty batch fingerprint distinguishes the marker from
+/// interrupted staging that never passed activation checks.
+fn reusable_completed_batch<'a>(
     conn: &Connection,
     snapshot: &str,
     plan_fingerprint: &str,
@@ -1747,33 +1750,48 @@ fn reusable_active_batch<'a>(
     input_freshness: &mut InputFreshnessCache,
 ) -> Result<Option<i64>> {
     let project_ids = project_ids.collect::<Vec<_>>();
-    let Some(batch_id) = conn
-        .query_row(
+    let candidates = conn
+        .prepare(
             "SELECT id FROM checker_enrichment_batches
-             WHERE source_snapshot=?1 AND plan_fingerprint=?2 AND active=1",
-            params![snapshot, plan_fingerprint],
+             WHERE source_snapshot=?1 AND plan_fingerprint=?2 AND (
+               active=1 OR (
+                 active=0
+                 AND checker_input_fingerprint!=''
+                 AND NOT EXISTS(
+                   SELECT 1 FROM checker_enrichments enrichment
+                   WHERE enrichment.batch_id=checker_enrichment_batches.id
+                 )
+               )
+             )
+             ORDER BY active DESC, id DESC",
+        )?
+        .query_map(params![snapshot, plan_fingerprint], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for batch_id in candidates {
+        let complete: i64 = conn.query_row(
+            "SELECT count(*) FROM checker_project_runs
+             WHERE batch_id=?1 AND status='completed'
+               AND completed_occurrences=selected_occurrences",
+            [batch_id],
             |row| row.get(0),
-        )
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    let complete: i64 = conn.query_row(
-        "SELECT count(*) FROM checker_project_runs
-         WHERE batch_id=?1 AND status='completed'
-           AND completed_occurrences=selected_occurrences",
-        [batch_id],
-        |row| row.get(0),
-    )?;
-    if complete as usize != project_ids.len() {
-        return Ok(None);
-    }
-    for project_id in project_ids {
-        if !project_complete_and_fresh(conn, batch_id, project_id, input_freshness)? {
-            return Ok(None);
+        )?;
+        if complete as usize != project_ids.len() {
+            continue;
+        }
+        let mut fresh = true;
+        for project_id in &project_ids {
+            if !project_complete_and_fresh(conn, batch_id, project_id, input_freshness)? {
+                fresh = false;
+                break;
+            }
+        }
+        if fresh {
+            return Ok(Some(batch_id));
         }
     }
-    Ok(Some(batch_id))
+    Ok(None)
 }
 
 fn deactivate_stale_active_batch(
@@ -3336,11 +3354,7 @@ fn activate_staging_batch(
             params![snapshot, batch_id],
             |row| row.get(0),
         )?;
-        if staged_facts == 0 && previous_active != 0 {
-            bail!(
-                "checker staging batch has no targeted facts; the previously active batch was retained"
-            );
-        }
+        let retain_previous_active = staged_facts == 0 && previous_active != 0;
         let malformed_completed: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
              WHERE batch_id=?1 AND (
@@ -3445,6 +3459,20 @@ fn activate_staging_batch(
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let input_fingerprint = batch_fingerprint(&fingerprints);
+        // A narrowed plan can validly resolve to no facts. Keep the existing
+        // publication active, but stamp this completed inactive batch so an
+        // exact, fresh rerun can reuse the successful no-op.
+        if retain_previous_active {
+            conn.execute(
+                "UPDATE checker_enrichment_batches
+                 SET checker_input_fingerprint=?2 WHERE id=?1 AND active=0",
+                params![batch_id, input_fingerprint],
+            )?;
+            if conn.changes() != 1 {
+                bail!("checker staging batch disappeared before no-op completion");
+            }
+            return Ok(0);
+        }
         conn.execute(
             "UPDATE checker_enrichment_batches
              SET active=0 WHERE active=1 AND id!=?1",
