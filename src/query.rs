@@ -491,8 +491,10 @@ pub fn who_uses_anchor_in_origins(
 
     // Deterministic extraction represents an unresolved member call as two
     // edges: caller -> member hub -> candidate symbol. Attribute the candidate
-    // to the caller edge so the usage keeps its real file and line. A checker
-    // or resolver edge for the same site wins over this possible candidate.
+    // to the caller edge so the usage keeps its real file and line. Once any
+    // occurrence-specific edge closes that call at certain/likely, suppress
+    // every generic hub candidate instead of offering resolved sites as
+    // possible callers of other same-named symbols.
     let mut seen_sites = usages
         .iter()
         .map(|usage| (usage.file.clone(), usage.line))
@@ -511,6 +513,14 @@ pub fn who_uses_anchor_in_origins(
          WHERE candidate.dst_key=?1 AND candidate.kind='member_candidate'
            AND file.origin IN (SELECT value FROM json_each(?2))
            AND call.line IS NOT NULL
+           AND NOT EXISTS(
+             SELECT 1 FROM resolved_edges resolved
+             WHERE resolved.src_key=call.src_key
+               AND resolved.confidence IN ('certain','likely')
+               AND json_type(resolved.detail_json,'$.memberCallId')='integer'
+               AND json_extract(resolved.detail_json,'$.memberCallId')=
+                   json_extract(call.detail_json,'$.memberCallId')
+           )
          ORDER BY file.path,call.line,call.id,candidate.id",
     )?;
     let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
