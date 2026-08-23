@@ -876,7 +876,13 @@ fn search_options_from_args(
             } else {
                 search::SearchMode::Ranked
             },
-            limit: args["limit"].as_u64().unwrap_or(defaults.limit as u64) as usize,
+            limit: search::resolve_search_limit(
+                exhaustive,
+                args.get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize),
+                defaults.limit,
+            ),
             expand,
             file_roles: if args.get("file_roles").is_some() {
                 json_string_array(args, "file_roles")

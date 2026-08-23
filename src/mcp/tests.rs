@@ -80,7 +80,7 @@ fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enabl
         vector: true,
         rerank: true,
         attach_memory: true,
-        limit: 7,
+        limit: search::MAX_EXHAUSTIVE_PAGE_SIZE + 11,
         expansion: config::ExpansionSettings {
             enabled: true,
             ..Default::default()
@@ -98,7 +98,7 @@ fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enabl
         options.mode,
         search::SearchMode::Exhaustive { cursor: None }
     );
-    assert_eq!(options.limit, 7);
+    assert_eq!(options.limit, search::MAX_EXHAUSTIVE_PAGE_SIZE);
     assert!(!options.rerank);
     assert!(!options.include_memory);
     assert!(!options.expand);
@@ -121,6 +121,20 @@ fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enabl
         search::SearchMode::Exhaustive {
             cursor: Some("opaque".into())
         }
+    );
+
+    let (_, explicit_oversized) = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({
+            "query": "dispatch",
+            "exhaustive": true,
+            "limit": search::MAX_EXHAUSTIVE_PAGE_SIZE + 1
+        }),
+        &defaults,
+    )?;
+    assert_eq!(
+        explicit_oversized.limit,
+        search::MAX_EXHAUSTIVE_PAGE_SIZE + 1
     );
 
     for field in ["vector", "rerank", "include_memory", "expand"] {

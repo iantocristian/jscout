@@ -19,6 +19,18 @@ const DEFAULT_TOTAL_RENDERED_SUPPORT_LIMIT: usize = 8;
 pub const DEFAULT_EXPANSION_PATH_LIMIT: usize = 8;
 pub const MAX_EXPANSION_PATH_LIMIT: usize = 50;
 
+pub(crate) fn resolve_search_limit(
+    exhaustive: bool,
+    requested: Option<usize>,
+    configured: usize,
+) -> usize {
+    match requested {
+        Some(limit) => limit,
+        None if exhaustive => configured.min(MAX_EXHAUSTIVE_PAGE_SIZE),
+        None => configured,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpansionProjection {
@@ -1277,7 +1289,6 @@ fn exhaustive_hits(
     let cursor_path = cursor_position.as_ref().map(|position| position.0.as_str());
     let cursor_start = cursor_position.as_ref().map_or(0, |position| position.1);
     let cursor_chunk_id = cursor_position.as_ref().map_or(0, |position| position.2);
-    let roles_json = serde_json::to_string(&file_roles)?;
     let mut statement = conn.prepare(
         "SELECT chunk.id, file.path, chunk.start, chunk.hash
          FROM chunks_fts

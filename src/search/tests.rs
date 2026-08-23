@@ -12,8 +12,8 @@ use super::{
     apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
     candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
     merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-    search, select_attached_memory, select_neighborhood_projection, select_path_projection,
-    tiered_candidates,
+    resolve_search_limit, search, select_attached_memory, select_neighborhood_projection,
+    select_path_projection, tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -718,6 +718,17 @@ fn exhaustive_search_normalizes_role_and_origin_scope_and_enforces_page_ceiling(
     .expect_err("exhaustive page size must have a hard ceiling");
     assert!(too_large.to_string().contains("page size"));
     Ok(())
+}
+
+#[test]
+fn exhaustive_search_clamps_only_an_omitted_configured_limit() {
+    let oversized = MAX_EXHAUSTIVE_PAGE_SIZE + 1;
+    assert_eq!(
+        resolve_search_limit(true, None, oversized),
+        MAX_EXHAUSTIVE_PAGE_SIZE
+    );
+    assert_eq!(resolve_search_limit(true, Some(oversized), 10), oversized);
+    assert_eq!(resolve_search_limit(false, None, oversized), oversized);
 }
 
 #[test]

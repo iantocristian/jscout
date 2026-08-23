@@ -270,7 +270,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     } else {
                         search::SearchMode::Ranked
                     },
-                    limit: limit.unwrap_or(configured.limit),
+                    limit: search::resolve_search_limit(exhaustive, limit, configured.limit),
                     expand,
                     file_roles,
                     file_origins: file_origins.clone(),
