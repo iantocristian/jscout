@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::{embed, file_role, origin, query, semantic, store, structural};
 
@@ -194,7 +194,7 @@ pub struct ExhaustiveSearchMetadata {
     #[serde(skip)]
     request_fingerprint: String,
     #[serde(skip)]
-    selected_hits: usize,
+    selected_positions: Vec<ExhaustiveCursorPosition>,
     #[serde(skip)]
     page_had_more: bool,
 }
@@ -1005,12 +1005,19 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
-const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v1";
+const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v2";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExhaustiveCursorPosition {
+    path: String,
+    start: i64,
+    hash: String,
+}
 
 #[derive(Debug)]
 struct ExhaustivePageState {
     total_chunks: usize,
-    selected_hits: usize,
+    selected_positions: Vec<ExhaustiveCursorPosition>,
     has_more: bool,
     request_fingerprint: String,
     scope: SearchScope,
@@ -1070,14 +1077,67 @@ fn exhaustive_request_fingerprint(q: &str, file_roles: &[String], origins: &[Str
     hasher.finalize().to_hex().to_string()
 }
 
-fn encode_exhaustive_cursor(snapshot: &str, fingerprint: &str, chunk_id: i64) -> String {
-    format!("{EXHAUSTIVE_CURSOR_PREFIX}.{snapshot}.{fingerprint}.{chunk_id:016x}")
+fn encode_cursor_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(path.len() * 2);
+    for byte in path.bytes() {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
-fn decode_exhaustive_cursor(cursor: &str, snapshot: &str, fingerprint: &str) -> Result<i64> {
+fn decode_cursor_path(encoded: &str) -> Result<String> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
+        anyhow::bail!("invalid exhaustive search cursor");
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("invalid exhaustive search cursor"))?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("invalid exhaustive search cursor"))?;
+        decoded.push(((high << 4) | low) as u8);
+    }
+    String::from_utf8(decoded).map_err(|_| anyhow::anyhow!("invalid exhaustive search cursor"))
+}
+
+fn encode_exhaustive_cursor(
+    snapshot: &str,
+    fingerprint: &str,
+    position: &ExhaustiveCursorPosition,
+) -> String {
+    format!(
+        "{EXHAUSTIVE_CURSOR_PREFIX}.{snapshot}.{fingerprint}.{}.{:016x}.{}",
+        encode_cursor_path(&position.path),
+        position.start,
+        position.hash,
+    )
+}
+
+fn decode_exhaustive_cursor(
+    cursor: &str,
+    snapshot: &str,
+    fingerprint: &str,
+) -> Result<ExhaustiveCursorPosition> {
     let mut parts = cursor.split('.');
-    let (Some(prefix), Some(cursor_snapshot), Some(cursor_fingerprint), Some(chunk_id)) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
+    let (
+        Some(prefix),
+        Some(cursor_snapshot),
+        Some(cursor_fingerprint),
+        Some(path),
+        Some(start),
+        Some(hash),
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
     else {
         anyhow::bail!("invalid exhaustive search cursor");
     };
@@ -1085,12 +1145,14 @@ fn decode_exhaustive_cursor(cursor: &str, snapshot: &str, fingerprint: &str) -> 
         || prefix != EXHAUSTIVE_CURSOR_PREFIX
         || cursor_snapshot.len() != 64
         || cursor_fingerprint.len() != 64
-        || chunk_id.len() != 16
+        || start.len() != 16
+        || hash.len() != 64
         || !cursor_snapshot.bytes().all(|byte| byte.is_ascii_hexdigit())
         || !cursor_fingerprint
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
-        || !chunk_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !start.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         anyhow::bail!("invalid exhaustive search cursor");
     }
@@ -1102,49 +1164,55 @@ fn decode_exhaustive_cursor(cursor: &str, snapshot: &str, fingerprint: &str) -> 
     if cursor_fingerprint != fingerprint {
         anyhow::bail!("exhaustive search cursor does not match the query and scope");
     }
-    let chunk_id = i64::from_str_radix(chunk_id, 16)
+    let start = i64::from_str_radix(start, 16)
         .map_err(|_| anyhow::anyhow!("invalid exhaustive search cursor"))?;
-    if chunk_id <= 0 {
+    if start < 0 {
         anyhow::bail!("invalid exhaustive search cursor");
     }
-    Ok(chunk_id)
+    Ok(ExhaustiveCursorPosition {
+        path: decode_cursor_path(path)?,
+        start,
+        hash: hash.to_string(),
+    })
 }
 
 fn exhaustive_cursor_position(
     conn: &Connection,
     fts_query: &str,
-    chunk_id: i64,
+    position: &ExhaustiveCursorPosition,
     file_roles: &[String],
     file_origins: &[String],
-) -> Result<(String, i64)> {
+) -> Result<i64> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
-    let position = conn
-        .query_row(
-            "SELECT file.path, chunk.start
+    let (chunk_id, matches): (Option<i64>, i64) = conn.query_row(
+        "SELECT MIN(chunk.id), COUNT(*)
              FROM chunks_fts
              JOIN chunks chunk ON chunk.id=chunks_fts.rowid
              JOIN files file ON file.id=chunk.file_id
-             WHERE chunks_fts MATCH ?1 AND chunk.id=?2
-               AND ((?3 AND file.origin='repository')
-                 OR (?4 AND file.origin='workspace')
-                 OR (?5 AND file.origin='dependency'))
-               AND (?6 OR file.role IN (SELECT value FROM json_each(?7)))",
-            rusqlite::params![
-                fts_query,
-                chunk_id,
-                flags.0,
-                flags.1,
-                flags.2,
-                file_roles.is_empty(),
-                roles_json,
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()?;
-    position.ok_or_else(|| {
-        anyhow::anyhow!("exhaustive search cursor does not identify a matching chunk in scope")
-    })
+             WHERE chunks_fts MATCH ?1
+               AND file.path=?2 AND chunk.start=?3 AND chunk.hash=?4
+               AND ((?5 AND file.origin='repository')
+                 OR (?6 AND file.origin='workspace')
+                 OR (?7 AND file.origin='dependency'))
+               AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))",
+        rusqlite::params![
+            fts_query,
+            position.path,
+            position.start,
+            position.hash,
+            flags.0,
+            flags.1,
+            flags.2,
+            file_roles.is_empty(),
+            roles_json,
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if matches != 1 {
+        anyhow::bail!("exhaustive search cursor does not identify one matching chunk in scope");
+    }
+    chunk_id.ok_or_else(|| anyhow::anyhow!("invalid exhaustive search cursor"))
 }
 
 fn exhaustive_hits(
@@ -1158,13 +1226,13 @@ fn exhaustive_hits(
     let request_fingerprint = exhaustive_request_fingerprint(q, &file_roles, &scope.origins);
     let query = fts_query(q);
     let cursor_position = if let Some(cursor) = cursor {
-        let chunk_id = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
+        let position = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
         if query.is_empty() {
             anyhow::bail!("exhaustive search cursor does not identify a matching chunk in scope");
         }
-        let (path, start) =
-            exhaustive_cursor_position(conn, &query, chunk_id, &file_roles, &scope.origins)?;
-        Some((path, start, chunk_id))
+        let chunk_id =
+            exhaustive_cursor_position(conn, &query, &position, &file_roles, &scope.origins)?;
+        Some((position.path, position.start, chunk_id))
     } else {
         None
     };
@@ -1173,7 +1241,7 @@ fn exhaustive_hits(
             Vec::new(),
             ExhaustivePageState {
                 total_chunks: 0,
-                selected_hits: 0,
+                selected_positions: Vec::new(),
                 has_more: false,
                 request_fingerprint,
                 scope,
@@ -1211,7 +1279,7 @@ fn exhaustive_hits(
     let cursor_chunk_id = cursor_position.as_ref().map_or(0, |position| position.2);
     let roles_json = serde_json::to_string(&file_roles)?;
     let mut statement = conn.prepare(
-        "SELECT chunk.id
+        "SELECT chunk.id, file.path, chunk.start, chunk.hash
          FROM chunks_fts
          JOIN chunks chunk ON chunk.id=chunks_fts.rowid
          JOIN files file ON file.id=chunk.file_id
@@ -1237,14 +1305,24 @@ fn exhaustive_hits(
             cursor_chunk_id,
             (options.limit + 1) as i64,
         ],
-        |row| row.get::<_, i64>(0),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ExhaustiveCursorPosition {
+                    path: row.get(1)?,
+                    start: row.get(2)?,
+                    hash: row.get(3)?,
+                },
+            ))
+        },
     )?;
-    let mut chunk_ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-    let has_more = chunk_ids.len() > options.limit;
-    chunk_ids.truncate(options.limit);
+    let mut selected = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = selected.len() > options.limit;
+    selected.truncate(options.limit);
 
-    let mut hits = Vec::with_capacity(chunk_ids.len());
-    for chunk_id in chunk_ids {
+    let mut hits = Vec::with_capacity(selected.len());
+    let mut selected_positions = Vec::with_capacity(selected.len());
+    for (chunk_id, position) in selected {
         if let Some(hit) = load_hit(
             conn,
             chunk_id,
@@ -1254,6 +1332,7 @@ fn exhaustive_hits(
             &scope.origins,
         )? {
             hits.push(hit);
+            selected_positions.push(position);
         }
     }
     if cursor.is_none()
@@ -1261,12 +1340,11 @@ fn exhaustive_hits(
     {
         hit.include_followups = true;
     }
-    let selected_hits = hits.len();
     Ok((
         hits,
         ExhaustivePageState {
             total_chunks,
-            selected_hits,
+            selected_positions,
             has_more,
             request_fingerprint,
             scope,
@@ -1451,7 +1529,7 @@ pub fn search(
                 },
                 scope: state.scope.clone(),
                 request_fingerprint: state.request_fingerprint.clone(),
-                selected_hits: state.selected_hits,
+                selected_positions: state.selected_positions.clone(),
                 page_had_more: state.has_more,
             });
         let mut result = SearchResult {
@@ -2174,15 +2252,14 @@ fn refresh_exhaustive_metadata(result: &mut SearchResult) {
         return;
     };
     let returned = result.hits.len();
-    let truncated = metadata.page_had_more || returned < metadata.selected_hits;
+    let truncated = metadata.page_had_more || returned < metadata.selected_positions.len();
     let next_cursor = if truncated {
-        result.hits.last().map(|hit| {
-            encode_exhaustive_cursor(
-                &result.snapshot,
-                &metadata.request_fingerprint,
-                hit.chunk_id,
-            )
-        })
+        returned
+            .checked_sub(1)
+            .and_then(|index| metadata.selected_positions.get(index))
+            .map(|position| {
+                encode_exhaustive_cursor(&result.snapshot, &metadata.request_fingerprint, position)
+            })
     } else {
         None
     };

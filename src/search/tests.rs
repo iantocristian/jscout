@@ -456,12 +456,22 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
         "pagingNeedle",
         &SearchOptions {
             mode: SearchMode::Exhaustive { cursor: None },
-            limit: 1,
+            limit: 2,
             rerank: false,
             response_byte_limit: 1_000_000,
             ..Default::default()
         },
     )?;
+    assert_eq!(
+        first
+            .hits
+            .iter()
+            .map(|hit| hit.file.as_str())
+            .collect::<Vec<_>>(),
+        ["a.ts", "b.ts"]
+    );
+    let cursor_chunk_id = first.hits.last().expect("cursor hit").chunk_id;
+    let original_snapshot = first.snapshot.clone();
     let first_cursor = first
         .exhaustive
         .as_ref()
@@ -500,6 +510,104 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
     )
     .expect_err("cursor must bind the normalized scope");
     assert!(wrong_scope.to_string().contains("query and scope"));
+
+    // A content-equivalent database can assign the old row ID to a different
+    // chunk. Continuation must relocate the logical cursor chunk by stable
+    // source identity rather than trusting that disposable ID.
+    let rebuilt_repo = tempfile::tempdir()?;
+    fs::write(
+        rebuilt_repo.path().join("0-temporary.ts"),
+        "export const temporary = pagingNeedle;\n",
+    )?;
+    for (path, name) in [("a.ts", "alpha"), ("b.ts", "beta"), ("c.ts", "gamma")] {
+        fs::write(
+            rebuilt_repo.path().join(path),
+            format!("export function {name}() {{ return pagingNeedle; }}\n"),
+        )?;
+    }
+    let rebuilt_conn = store::open(rebuilt_repo.path())?;
+    indexer::index_repo(rebuilt_repo.path(), &rebuilt_conn)?;
+    fs::remove_file(rebuilt_repo.path().join("0-temporary.ts"))?;
+    indexer::index_repo(rebuilt_repo.path(), &rebuilt_conn)?;
+    assert_eq!(
+        crate::structural::current_snapshot(&rebuilt_conn)?,
+        original_snapshot
+    );
+    let reassigned_path: String = rebuilt_conn.query_row(
+        "SELECT file.path
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE chunk.id=?1",
+        [cursor_chunk_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(reassigned_path, "a.ts", "fixture must reuse the old ID");
+    let resumed_after_reassignment = search(
+        &rebuilt_conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor.clone()),
+            },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        resumed_after_reassignment
+            .hits
+            .iter()
+            .map(|hit| hit.file.as_str())
+            .collect::<Vec<_>>(),
+        ["c.ts"]
+    );
+
+    // An edit followed by an exact revert restores the snapshot while leaving
+    // the old chunk ID absent. The same cursor must still resume after b.ts.
+    fs::write(
+        repo.path().join("b.ts"),
+        "export function beta() { return pagingNeedle + changed; }\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    fs::write(
+        repo.path().join("b.ts"),
+        "export function beta() { return pagingNeedle; }\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        crate::structural::current_snapshot(&conn)?,
+        original_snapshot
+    );
+    let old_row_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE id=?1",
+        [cursor_chunk_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(old_row_count, 0, "fixture must retire the old ID");
+    let resumed_after_revert = search(
+        &conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor.clone()),
+            },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        resumed_after_revert
+            .hits
+            .iter()
+            .map(|hit| hit.file.as_str())
+            .collect::<Vec<_>>(),
+        ["c.ts"]
+    );
 
     fs::write(
         repo.path().join("d.ts"),
