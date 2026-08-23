@@ -386,9 +386,8 @@ pub(super) fn cmd_who_uses(
         eprintln!("no symbol found for '{spec}'");
         std::process::exit(1);
     }
-    let target_is_unique = targets.len() == 1;
     for t in &targets {
-        let usages = cli_who_uses_for_target(&conn, &graph, t, target_is_unique, file_origins)?;
+        let usages = cli_who_uses_for_target(&conn, &graph, t, file_origins)?;
         if json {
             println!("{}", serde_json::json!({ "target": t, "usages": usages }));
             continue;
@@ -436,11 +435,9 @@ fn cli_who_uses_for_target(
     conn: &rusqlite::Connection,
     graph: &query::ModuleGraph,
     target: &query::SymbolTarget,
-    target_is_unique: bool,
     file_origins: &[String],
 ) -> Result<Vec<query::Usage>> {
-    if target_is_unique && let Some(anchor) = query::unique_anchor_for_symbol_target(conn, target)?
-    {
+    if let Some(anchor) = query::unique_anchor_for_symbol_target(conn, target)? {
         query::who_uses_anchor_in_origins(conn, &anchor, file_origins)
     } else {
         query::who_uses_in_origins(conn, graph, target.file_id, &target.name, file_origins)
