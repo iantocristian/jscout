@@ -1045,8 +1045,14 @@ in this order:
    release-mode n8n cold-index runs then averaged 19.150 seconds before and
    19.536 seconds after (+2.0%, with noisy individual deltas from -3.2% to
    +9.7%). Five direct ai-pipe runs averaged 0.466 seconds before and 0.497
-   seconds after (+6.6%, or 31 ms). Unsupported cases remain on the property
-   hub.
+   seconds after (+6.6%, or 31 ms). The first fresh restricted n8n enrichment
+   exposed an unindexed correlated receiver-flow lookup during checker
+   projection: 3,836 facts against 869,952 edges took 374.62 seconds end to end.
+   Preloading the 14,414 resolved occurrence IDs once reduced the identical
+   run to 62.36 seconds while retaining 6,554 selected occurrences, 14,265
+   queries, 114 request batches, and 3,836 canonical facts exactly; unchanged
+   reuse completed with zero requests in 11.03 seconds. Unsupported cases
+   remain on the property hub.
 
 #### Durable staging, resume, and partial coverage
 
