@@ -279,6 +279,12 @@ struct StagingPlan<'a> {
     force_new: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivationOutcome {
+    facts_published: usize,
+    publication_changed: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Target {
     anchor: String,
@@ -835,7 +841,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     )?;
 
     if !failed_projects.is_empty() {
-        let facts_published = activate_staging_batch(
+        let activation = activate_staging_batch(
             &canonical_root,
             &conn,
             batch_id,
@@ -843,16 +849,18 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             true,
             Some(&package_gate),
         )?;
-        crate::structural::rebuild_projection(&conn, &snapshot)?;
+        if activation.publication_changed {
+            crate::structural::rebuild_projection(&conn, &snapshot)?;
+        }
         return Err(PartialEnrichmentError {
             batch_id,
-            facts_published,
+            facts_published: activation.facts_published,
             failures: failed_projects,
         }
         .into());
     }
 
-    let facts_published = activate_staging_batch(
+    let activation = activate_staging_batch(
         &canonical_root,
         &conn,
         batch_id,
@@ -860,7 +868,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         false,
         Some(&package_gate),
     )?;
-    crate::structural::rebuild_projection(&conn, &snapshot)?;
+    if activation.publication_changed {
+        crate::structural::rebuild_projection(&conn, &snapshot)?;
+    }
+    let facts_published = activation.facts_published;
 
     Ok(EnrichReport {
         snapshot,
@@ -1741,7 +1752,9 @@ fn plan_fingerprint(
 
 /// Reuse either the active publication or a completed inactive zero-fact
 /// marker. A non-empty batch fingerprint distinguishes the marker from
-/// interrupted staging that never passed activation checks.
+/// interrupted staging that never passed activation checks. The one-inactive-
+/// batch policy bounds marker lifetime to the next run that opens different
+/// staging; this covers immediate exact repeats without accumulating plans.
 fn reusable_completed_batch<'a>(
     conn: &Connection,
     snapshot: &str,
@@ -3299,9 +3312,9 @@ fn activate_staging_batch(
     snapshot: &str,
     allow_failed_projects: bool,
     package_gate: Option<&super::package_gate::GatePlan>,
-) -> Result<usize> {
+) -> Result<ActivationOutcome> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<usize> {
+    let result = (|| -> Result<ActivationOutcome> {
         if let Some(package_gate) = package_gate {
             package_gate.validate_fresh()?;
         }
@@ -3471,7 +3484,10 @@ fn activate_staging_batch(
             if conn.changes() != 1 {
                 bail!("checker staging batch disappeared before no-op completion");
             }
-            return Ok(0);
+            return Ok(ActivationOutcome {
+                facts_published: 0,
+                publication_changed: false,
+            });
         }
         conn.execute(
             "UPDATE checker_enrichment_batches
@@ -3495,12 +3511,15 @@ fn activate_staging_batch(
             [batch_id],
             |row| row.get::<_, i64>(0),
         )?;
-        Ok(facts as usize)
+        Ok(ActivationOutcome {
+            facts_published: facts as usize,
+            publication_changed: true,
+        })
     })();
     match result {
-        Ok(facts) => {
+        Ok(outcome) => {
             conn.execute_batch("COMMIT")?;
-            Ok(facts)
+            Ok(outcome)
         }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");

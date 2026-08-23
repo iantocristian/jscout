@@ -1821,7 +1821,8 @@ fn inferred_file_failure_preserves_sibling_progress_and_retries_only_the_failed_
         "a late file failure must remove that file's previously staged facts",
     );
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?,
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?
+            .facts_published,
         1,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -1908,7 +1909,8 @@ fn inferred_file_failure_preserves_sibling_progress_and_retries_only_the_failed_
         BTreeSet::from([good.id, bad.id])
     );
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?,
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?
+            .facts_published,
         2,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2124,7 +2126,8 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
     )?;
 
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?,
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, true, None)?
+            .facts_published,
         1
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2190,7 +2193,8 @@ fn failed_owner_activates_only_completed_projects_as_possible_and_remains_resuma
         )?;
     }
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?,
+        activate_staging_batch(repo.path(), &conn, resume_batch, &snapshot, false, None)?
+            .facts_published,
         2,
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2261,7 +2265,8 @@ fn all_failed_batch_cannot_replace_a_healthy_active_batch() -> Result<()> {
         1,
     )?;
     assert_eq!(
-        activate_staging_batch(repo.path(), &conn, healthy_batch, &snapshot, false, None)?,
+        activate_staging_batch(repo.path(), &conn, healthy_batch, &snapshot, false, None)?
+            .facts_published,
         1
     );
     crate::structural::rebuild_projection(&conn, &snapshot)?;
@@ -2384,9 +2389,11 @@ fn completed_zero_fact_batch_is_reusable_without_replacing_active_facts() -> Res
 
     assert_eq!(
         activate_staging_batch(repo.path(), &conn, zero_batch, &snapshot, false, None)?,
-        0
+        ActivationOutcome {
+            facts_published: 0,
+            publication_changed: false,
+        }
     );
-    crate::structural::rebuild_projection(&conn, &snapshot)?;
 
     let batches = conn
         .prepare(
@@ -2426,6 +2433,25 @@ fn completed_zero_fact_batch_is_reusable_without_replacing_active_facts() -> Res
             &mut input_freshness,
         )?,
         Some(zero_batch)
+    );
+
+    // An otherwise complete batch without the activation stamp models a
+    // process interrupted before publication and must not be reused.
+    conn.execute(
+        "UPDATE checker_enrichment_batches
+         SET checker_input_fingerprint='' WHERE id=?1",
+        [zero_batch],
+    )?;
+    let mut input_freshness = InputFreshnessCache::new(&canonical_root);
+    assert_eq!(
+        reusable_completed_batch(
+            &conn,
+            &snapshot,
+            "zero-plan",
+            projects.keys(),
+            &mut input_freshness,
+        )?,
+        None
     );
     Ok(())
 }
@@ -3373,7 +3399,8 @@ fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result
             )?;
         }
         assert_eq!(
-            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)?,
+            activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)?
+                .facts_published,
             candidate_count
         );
         crate::structural::rebuild_projection(&conn, &snapshot)?;
