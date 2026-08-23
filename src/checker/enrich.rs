@@ -13,10 +13,10 @@ use super::protocol::{
     RemoteError, TypeScriptIdentity,
 };
 
-/// Stored confidence semantics participate in both exact-plan reuse and
-/// cross-snapshot project carry. Bump this whenever the same checker answer
-/// would be classified differently.
-const CONFIDENCE_POLICY_FINGERPRINT: &[u8] = b"jscout-checker-confidence-policy-v2\0";
+/// Checker answer normalization and stored confidence semantics participate in
+/// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
+/// the same inputs could map to different facts or confidence.
+const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v3\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
 const INFERRED_ROOT_CAP: usize = 150;
 
@@ -1664,7 +1664,7 @@ fn project_planning_fingerprints(
             let config = summary.map_or("", |summary| summary.config_fingerprint.as_str());
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"jscout-checker-project-plan-v1\0");
-            hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
+            hasher.update(CHECKER_SEMANTICS_FINGERPRINT);
             for value in [
                 project_id.as_str(),
                 checker.version.as_str(),
@@ -1701,7 +1701,7 @@ fn plan_fingerprint(
     // previous single-target-only `likely` rule. Grouped inferred membership
     // also changes the planning boundary independently of that policy.
     hasher.update(b"jscout-checker-plan-v5\0");
-    hasher.update(CONFIDENCE_POLICY_FINGERPRINT);
+    hasher.update(CHECKER_SEMANTICS_FINGERPRINT);
     for value in [
         snapshot,
         &checker.version,

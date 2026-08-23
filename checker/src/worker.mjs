@@ -838,7 +838,14 @@ function symbolDeclarations(checker, receiverType, member) {
     const resolved = symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
     if (!symbols.includes(resolved)) symbols.push(resolved);
   }
-  return symbols.flatMap((symbol) => symbol.getDeclarations() ?? []);
+  return symbols.flatMap((symbol) => {
+    const declarations = symbol.getDeclarations() ?? [];
+    const implementation = declarations.find((declaration) => (
+      ts.isFunctionLike(declaration)
+      && checker.isImplementationOfOverload(declaration) === true
+    ));
+    return implementation ? [implementation] : declarations;
+  });
 }
 
 // Provenance of a declaration file relative to the indexed corpus. The Rust

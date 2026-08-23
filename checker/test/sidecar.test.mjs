@@ -334,6 +334,41 @@ test("plans ownership without a Program and resolves a bounded project batch", a
   await checker.close();
 });
 
+test("collapses overload signatures onto their implementation", async (context) => {
+  const source = [
+    "class Service {",
+    "  execute(value: string): void;",
+    "  execute(value: number): void;",
+    "  execute(value: string | number): void {}",
+    "}",
+    "declare const service: Service;",
+    "service.execute('x');",
+    "",
+  ].join("\n");
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true }, files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+
+  const resolved = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "service.execute('x')", "service", "execute")],
+  });
+  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
+  const declarations = resolved.result.results[0].answer.declarations;
+  assert.equal(declarations.length, 1);
+  const implementationStart = Buffer.byteLength(source.slice(
+    0,
+    source.indexOf("execute(value: string | number)"),
+  ));
+  assert.equal(declarations[0].start, implementationStart);
+  await checker.close();
+});
+
 test("can reuse one configured discovery snapshot and refreshes the next independent plan", async (context) => {
   const root = fixture({
     "main.ts": "export const main = 1;\n",
