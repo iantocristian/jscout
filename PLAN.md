@@ -3016,29 +3016,73 @@ A production investigation (the links-iteration convention check,
 2026-08-22) ran twelve `vector: false` searches at `limit: 10` over a bounded
 workspace corpus to establish a repository convention, missed at least one
 literal occurrence that `rg` listed, and reported the comparison as complete.
-The miss was truncation, not ranking. For identifier-shaped lexical queries
-over the indexed corpus the match set is finite and small; the tool should
-state its size and return all of it on request. The agent's own retrospective
-named the failure: limits were never widened and completeness was claimed
-from a truncated result. The structural limit belongs to ranked vector
-similarity only. FTS tokenization cannot promise regex or syntax-pattern
-exactness, which stays with `rg`.
+The miss was truncation, not ranking: no limit was ever widened, and
+completeness was claimed from a truncated result. For identifier-shaped
+lexical queries over the indexed corpus the match set is finite and small;
+the tool should state its size and return all of it on request. Ranking's
+structural limit belongs to vector similarity only. FTS tokenization cannot
+promise regex or substring exactness, which stays with `rg`.
 
-1. `semantic_search` with `vector: false` reports `total` (matching chunks
-   within the requested scope) and `truncated`, and accepts `limit: "all"`
-   under a hard ceiling with `offset` pagination beyond it. Lexical mode only;
-   vector mode remains ranked.
-2. Scope is part of the answer. Responses echo the effective `file_roles` and
-   `origins`, and completeness claims must state them: the trace's
-   `file_roles: ["production"]` silently excluded test and script code while
-   the answer said "all code places".
-3. No regex/pattern occurrence tool until G22 proves insufficient on a real
-   completeness question. `rg` covers pattern exactness meanwhile.
+G20b is not a prerequisite. Its transport work shipped in #60 and #62; it
+remains open only because the historical 60% fixed-call replay is
+unreachable. It closes with a newly registered reproducible fixed-call
+workload plus the staged-session replay, after which it is marked implemented
+or its historical gate is explicitly replaced. The serializers are not
+reopened before G22.
 
-Acceptance: replay the links-iteration investigation on the current binary
-with `limit: "all"`; every literal occurrence `rg` lists within scope is
-present and `total` equals the returned count; the same query at `limit: 10`
-carries `truncated: true` and the same `total`.
+Contract:
+
+1. **A mode, not a limit value.** `semantic_search` accepts
+   `exhaustive: true`. It is lexical only and rejects `vector: true`,
+   `rerank: true`, `expand`, and `include_memory`: the cross-encoder runs over
+   the fused pool independently of vector retrieval today, and expansion and
+   attached memory change both membership and latency. The response then has
+   one meaning — the FTS match set for the query terms over indexed chunks in
+   the requested scope. `vector: false` without `exhaustive` keeps today's
+   ranked behaviour.
+2. **The unit of completeness is the chunk.** Search returns one hit per
+   chunk, so the completeness fields are `total_chunks` (every matching chunk
+   in scope, counted before paging and before byte shedding), `returned`,
+   `truncated`, and `next_cursor`. Several occurrences inside one chunk are
+   one hit; an exhaustive hit carries `match_lines`, the lines inside the
+   chunk where a query term matches, so occurrence-level coverage is checked
+   from the chunk representation without claiming a line-occurrence hit model
+   that does not exist.
+3. **Paging.** Page size is bounded by a hard ceiling. `next_cursor` is
+   opaque and binds the query, the normalized scope, and the snapshot;
+   continuation against a changed snapshot fails with a snapshot error rather
+   than skipping or duplicating hits. Exhaustive order is deterministic and
+   unranked — path, chunk start, chunk id — so traversal is stable and needs
+   no tie-breaker.
+4. **Byte shedding is part of completeness.** `response_bytes` still applies.
+   `truncated` reflects the rendered prefix, and `next_cursor` advances from
+   the last hit actually rendered, never from the pre-budget candidate count.
+5. **Scope is echoed as a normalized object, not raw arrays.**
+   `scope: { corpus: "indexed_chunks", file_roles: "all" | [...], origins:
+   [...], snapshot }`, because an empty roles filter means every indexed role
+   and default origins mean both first-party classes. Completeness is a claim
+   about indexed files only; ignored, hidden (`.github/`), unsupported,
+   extensionless, and dependency files are outside it, and the scope object
+   says so.
+6. **Locator-heavy hits.** Exhaustive pages carry anchor, path, lines, kind,
+   and `match_lines`, with one complete top-hit handoff as today. They do not
+   run the per-hit `used_by` resolution that normal hits perform, so a
+   high-frequency identifier does not become thousands of exact-reference
+   lookups.
+7. No regex or pattern occurrence tool until G22 proves insufficient on a
+   real completeness question.
+
+Acceptance: a rare identifier (one page, `truncated: false`,
+`returned == total_chunks`); a high-frequency identifier traversed across
+pages with no duplicated or missing chunk; several occurrences inside one
+chunk recovered through `match_lines`; role and origin filters reflected in
+the scope object and the counts; the same traversal under a small
+`response_bytes` producing `truncated: true` and a cursor that resumes at the
+first unrendered hit; a snapshot change between pages failing the
+continuation. Replay the links-iteration investigation against a gold set
+built with `rg -w` over the indexed files in the same scope, compared at the
+representation the API returns — chunk plus `match_lines` — not at raw `rg`
+lines.
 
 ## Planned G23 — skill: investigation and inquiry loops
 
@@ -3053,28 +3097,35 @@ ceiling. The evaluation record adds the invented-anchor failure class and one
 anchoring event in which a delivered analog shaped architecture without
 supplying the missing behavior.
 
-Skill text only; no tool changes.
+Skill text and server instructions only; no tool changes.
 
-1. Two loops. Investigation: lexical search (`vector: false` while
-   identifiers are known), then `definition` on anchors copied verbatim, then
-   widen per G22 until `truncated` is false or `total` is covered; switch to
-   `vector: true` or `who_uses`/`neighborhood` when hunting aliases of a
-   value instead of inferring them from snippets. Inquiry: `semantic_memory`
-   first, `repository_overview` once, one orientation expansion,
-   `include_memory` off after useful memory is known.
-2. Completeness answers state scope (roles, origins) and separate convention
-   from correctness: "other code does this" establishes a repository habit,
-   not that the change is safe.
+1. Two loops, and the inquiry loop is conditional. Investigation, for known
+   identifiers: `exhaustive: true` lexical search first, `definition` on
+   anchors copied verbatim, widen by cursor until `truncated` is false;
+   switch to `vector: true` or `who_uses`/`neighborhood` only when hunting
+   aliases of a value rather than reading them off snippets. Inquiry, for
+   causal, workflow, and cross-file behaviour questions: `semantic_memory`
+   leads; `repository_overview` is a once-per-cold-repository orientation
+   call, not a step in every inquiry; one orientation expansion;
+   `include_memory` off once useful memory is known. A convention check on a
+   known identifier starts in the investigation loop directly.
+2. Completeness answers state the scope object and separate convention from
+   correctness: "other code does this" establishes a repository habit, not
+   that the change is safe.
 3. Expanded searches and artifact details run sequentially; parallel only
    for small lexical searches; expansion once per investigation, after
    localization.
 4. A changed response snapshot mid-session means re-verifying the evidence
    boundary before continuing.
+5. The skill is rewritten around the two loops rather than extended with
+   rules, and both MCP server instruction strings are updated in the same
+   change so agents on either surface receive the same guidance.
 
 Acceptance: the skill ships with the G22 fields; a replay of the
-links-iteration investigation following the skill reaches the `rg`-listed
-occurrences and states scope; telemetry's exact-anchor definition success
-rate is recorded before and after.
+links-iteration investigation following the skill reaches the
+`rg -w`-listed occurrences and states scope; recorded before and after:
+missed gold chunks, false completeness claims, calls, bytes, and telemetry's
+exact-anchor definition success rate.
 
 ## Evaluation decisions already made
 
