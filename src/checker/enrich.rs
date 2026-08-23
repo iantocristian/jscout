@@ -16,7 +16,7 @@ use super::protocol::{
 /// Checker answer normalization and stored confidence semantics participate in
 /// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
 /// the same inputs could map to different facts or confidence.
-const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v3\0";
+const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v4\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
 const INFERRED_ROOT_CAP: usize = 150;
 
