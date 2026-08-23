@@ -2187,6 +2187,16 @@ fn project_checker_enrichments(
     insert_edge: &mut rusqlite::CachedStatement<'_>,
 ) -> Result<()> {
     let coverage = checker_occurrence_coverage(conn, snapshot)?;
+    // `resolved_edges` can be much larger than the checker fact set. Scan it
+    // once instead of running an unindexed correlated lookup for every fact.
+    let value_flow_resolved = conn
+        .prepare(
+            "SELECT source_ref_id FROM resolved_edges
+             WHERE provenance='receiver-value-flow' AND confidence='likely'
+               AND source_ref_id IS NOT NULL",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
     let mut symbols_by_file: HashMap<i64, Vec<&SymbolNode>> = HashMap::new();
     for symbol in symbols {
         symbols_by_file
@@ -2225,12 +2235,6 @@ fn project_checker_enrichments(
          JOIN symbols target_symbol
            ON target.native_table='symbols' AND target.native_id=target_symbol.id
          JOIN files target_file ON target_file.id=target_symbol.file_id
-         WHERE NOT EXISTS (
-           SELECT 1 FROM resolved_edges value_flow
-           WHERE value_flow.provenance='receiver-value-flow'
-             AND value_flow.confidence='likely'
-             AND value_flow.source_ref_id=call.rowid
-         )
          ORDER BY enrichment.member_call_id, enrichment.target_anchor, enrichment.project_id",
     )?;
     let rows = statement.query_map([snapshot], |row| {
@@ -2279,6 +2283,9 @@ fn project_checker_enrichments(
             target_start,
             target_end,
         ) = row?;
+        if value_flow_resolved.contains(&member_call_id) {
+            continue;
+        }
         let Some(occurrence_coverage) = coverage.get(&enrichment_member_call_id) else {
             continue;
         };

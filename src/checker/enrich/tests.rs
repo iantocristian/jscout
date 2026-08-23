@@ -2424,6 +2424,49 @@ fn seed_active_checker_batch(
 }
 
 #[test]
+fn receiver_value_flow_suppresses_canonical_checker_fact_during_projection() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class CardTable { insert(): void {} }\n\
+                  const card = new CardTable(); card.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let occurrence = occurrence(&conn)?;
+    assert!(occurrence.value_flow_resolved);
+
+    seed_active_checker_batch(
+        repo.path(),
+        &conn,
+        &hash,
+        &occurrence,
+        &declaration_at(source, "insert(): void {}", "insert", &hash),
+        &BTreeMap::from([("tsconfig.json".to_string(), "stable-plan".to_string())]),
+    )?;
+
+    let projected = conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM checker_enrichments
+              WHERE member_call_id=?1),
+           (SELECT count(*) FROM resolved_edges
+              WHERE provenance='receiver-value-flow' AND source_ref_id=?1),
+           (SELECT count(*) FROM resolved_edges
+              WHERE provenance='checker' AND source_ref_id=?1)",
+        [occurrence.id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        projected,
+        (1, 1, 0),
+        "the canonical checker fact stays reusable but must not duplicate the projected value-flow answer"
+    );
+    Ok(())
+}
+
+#[test]
 fn input_freshness_cache_pins_first_digest_per_invocation() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("ambient.d.ts");

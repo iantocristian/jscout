@@ -102,7 +102,8 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage
-                               #   --all also includes resolved calls, excluded roles, and every orphan
+                               #   --all includes other resolved calls, excluded roles, every orphan;
+                               #   receiver value-flow answers remain excluded
 jscout watch <root> [--embed [--product]] [--enrich]
                                # full startup/reconciliation; incremental source generations
                                # optional code-vector/checker/semantic-vector phases
