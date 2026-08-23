@@ -1056,19 +1056,25 @@ in this order:
 
 #### Real-repository validation and remaining items (2026-08-23)
 
-The merged stack (#76–#80 plus the projection-scan fix) was run against the
-pre-stack binary (`1e9acac`) on ai-pipe `ea13166` and n8n `9d9e9bf` with
-scratch databases and no billed calls; the full record is
-`docs/checker-stack-validation-2026-08-23.md`. Headline measurements:
+The stack at `6a93b0d` (#76–#80 before the projection-scan fix `3fb30ef`)
+was run against the pre-stack binary (`1e9acac`) on ai-pipe `ea13166` and
+n8n `9d9e9bf` with scratch databases and no billed calls; the full record is
+`docs/checker-stack-validation-2026-08-23.md`. Its n8n restricted-enrichment
+timing is therefore pre-fix; the post-fix figures recorded in item 5 above
+supersede it. Headline measurements:
 
 - ai-pipe `enrich --all`: 355.06 s (458 one-file Programs, 1,412 facts) →
   29.30 s (12 projects, 387 checker facts, 1,412 combined with value flow).
   Default gate: 17.16 s cold, 0.30 s unchanged reuse. Occurrences with a
   `likely` member-call edge: 108 → 694 (557 value flow + 137 checker), none
   lost.
+- n8n restricted enrichment (`n8n-workflow` + `@n8n/db`, 6,554 selected
+  occurrences, 3,836 facts): 374.62 s cold at `6a93b0d`; 62.36 s cold and
+  11.03 s unchanged reuse after `3fb30ef`, identical facts.
 - n8n index: 21.39 s → 22.09 s (+3%, +26 MB). Value flow: ai-pipe 1,025
   edges over 557 occurrences; n8n 14,456 over 14,414. Hand check of 24
-  random edges at source: 24 correct, 4 over-approximate
+  sampled occurrences at source (13 ai-pipe, 11 n8n; spread over files and
+  flow kinds rather than seeded random): 24 correct, 4 over-approximate
   (`openDatabase(path, { driver })` with an explicit driver keeps the dead
   second adapter at `likely`). The parameter-property limit held: zero
   `this.x.y()` edges on n8n.
@@ -1102,23 +1108,33 @@ Findings, in product order, with the decision taken:
    declarations onto the implementation before counting targets. Small PR.
 4. **Multi-owner querying.** An occurrence is queried once per owning
    tsconfig: n8n selected 6,554 and queried 14,265, storing facts two to
-   three times. By design; dedupe when owning projects share effective
-   options. Cost only.
+   three times. By design. Deduplicate only under an equivalent semantic Program
+   signature — TypeScript runtime, normalized options, root membership,
+   project references, and resolved config/compiler inputs, excluding only
+   the project label — because answers depend on roots, references, and
+   augmentations, not on options alone. Cost only, and the strongest
+   measured efficiency item in this record.
 5. **Zero-fact narrowed runs.** A plan-scoped run on a snapshot that already
    has an active batch and yields zero facts (`--file scripts` after a
    package run) exits 1 without a summary and cannot reuse, because the
    retain-previous-batch safeguard treats it as a failed replacement. Manual
-   only — watch opens a new snapshot per generation. Treat it as success with
-   a retained-batch note.
+   only — watch opens a new snapshot per generation. Treat it as a successful no-op: record a completed, inactive zero-fact
+   batch that exact reuse can match — reuse currently considers only active
+   batches — while the prior active fact batch stays active.
 
 **Decision record: argument→parameter flow.** This is the first
 interprocedural step and therefore the first that rests on an assumption the
 code cannot prove: that every caller of a function is visible. The choices
 and the recommended rule:
 
-- Which callers count: direct static calls only; exported functions are
-  admitted only when every import resolves in-repo and the package is not
-  published.
+- Non-escape is the admission condition: every runtime reference to the
+  function binding, local and through imports, must be an indexed direct
+  call. An alias, a callback or property value, a re-export to an
+  unresolved consumer, a dynamic import, or any reference the index cannot
+  see (files outside the walk such as `.github/`, extensionless executables)
+  leaves the set open, and the occurrence keeps the property-hub/checker
+  path. "Unpublished package" and "every import resolves in-repo" are
+  necessary, not sufficient.
 - Test-role callers do not count. On ai-pipe they happen to be harmless (443
   tests pass a real `SqliteAdapter`), but 156 pass awaited helpers and some
   pass object-literal fakes, either of which leaves the set open; on repos
@@ -1130,21 +1146,33 @@ and the recommended rule:
 - `likely` under its own provenance (`parameter-flow`) so it can be audited
   or disabled separately; resolved occurrences are excluded from the checker
   by edge, as value flow is.
-- Measure before building: the index already holds every call site of every
-  `db.mjs` function and what each passes, so the yield on ai-pipe's 170
-  parameter-bound `db.*` sites under each rule is a query, not an
-  implementation.
+- Measure before building, with a bounded AST probe rather than SQL: the
+  index stores call spans, references, and chunks but no argument→parameter
+  relation (the existing `calls` query reparses candidate files). The probe
+  answers how many of ai-pipe's 170 parameter-bound `db.*` sites close under
+  the rule above; that number decides whether to build.
 - TypeScript annotations yield the same edges from a syntactic read of the
   parameter type. That is the erasure line and stays a separate decision.
+- Sequencing: this is graph coverage, not a performance item. A measured
+  prototype follows the user-facing completeness work in G22–G23 (#83) and
+  the bounded correctness items above.
+
+Sequence agreed in review: close G20b through its pending reproducible
+replay; G22 then G23 (#83); the bounded correctness items (2, 3, 5);
+multi-owner deduplication under the semantic signature (4); then the
+parameter-flow probe (1) and sidecar parallelism (6), each only on its own
+measurement.
 
 Remaining items from the optimization sequence:
 
 6. **Bounded sidecar pool.** Productize `codex/checker-sidecar-experiment`:
    typed configuration for worker count and RSS recycle threshold, an
    aggregate memory budget, one fresh-worker retry on crash, and the five
-   test classes the experiment listed. Re-measure after grouping: it removed
-   most of the duplicated work the pool parallelized, so the right default
-   may be two workers or none.
+   test classes the experiment listed. Premature after grouped scopes, which removed most of the duplicated
+   Programs the experiment parallelized. Re-measure after multi-owner
+   deduplication and productize only if checker execution remains dominant
+   under a bounded aggregate RSS budget; the right default may be two
+   workers or none.
 7. **TypeScript backend, later.** Move the pinned 5.9.3 to 6.0 when
    convenient (the API baseline TypeScript 7 targets). When 7.1 ships its
    API, prototype a native worker behind the same sidecar protocol with
@@ -1152,10 +1180,11 @@ Remaining items from the optimization sequence:
    if the checker is still the bottleneck on TS-heavy corpora after items 2
    and 6.
 
-Also open from the family layer: `node-esm` and `node-cjs` now carry
-identical options and could merge into one `node` family (a scope-ID
-change), and the NodeNext extensionless trade-off is unmeasured on
-bundler-style orphan `.ts`/`.js` files in `type: module` packages.
+Deferred with item 7, no evidence either is the next bottleneck: `node-esm`
+and `node-cjs` now carry identical options and could merge into one `node`
+family (a scope-ID change), and the NodeNext extensionless trade-off is
+unmeasured on bundler-style orphan `.ts`/`.js` files in `type: module`
+packages.
 
 #### Durable staging, resume, and partial coverage
 

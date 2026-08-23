@@ -1,4 +1,4 @@
-> Generated validation record for the #76–#80 checker stack. Scratch paths (`S=/private/tmp/jscout-stack-rw-2026-08-22`, `S/logs`, `S/sql`, `S/db`) were ephemeral and are not committed; the numbers quoted in PLAN.md come from this record.
+> Generated validation record for the #76–#80 checker stack. Binary under test: the stack at `6a93b0d`, before the projection-scan fix `3fb30ef` merged with #80; the 374.62 s n8n restricted-enrichment time below is pre-fix (post-fix: 62.36 s cold / 11.03 s reuse with identical facts, PLAN.md item 5). Scratch paths (`S=/private/tmp/jscout-stack-rw-2026-08-22`, `S/logs`, `S/sql`, `S/db`) were ephemeral and are not committed; the numbers quoted in PLAN.md come from this record.
 
 # jscout stack validation (PRs #76-#80) on real repositories
 
@@ -323,7 +323,7 @@ After enrichment (S/sql/arm2d-n8n-after-enrich*.txt):
 | checker facts on an occurrence that has a value-flow edge | 0 |
 | batches | id 1 (packages, 6,554 selected, 7 projects) active=1; id 2 (scripts, 855 selected, 2 projects) active=0 |
 
-What this shows: on n8n the index-time value-flow pass costs ~3% wall on `index` and yields 14.4k likely edges (10/10 hand-checked correct, and the NestJS parameter-property/decorator limit holds); restricted checker runs work and reuse exactly, but (a) the post-checker publish on the 1.1 GB database takes ~5 minutes single-threaded, (b) occurrences are checked once per owning tsconfig, and (c) a restricted run that produces no facts exits non-zero.
+What this shows: on n8n the index-time value-flow pass costs ~3% wall on `index` and yields 14.4k likely edges (11/11 hand-checked correct, and the NestJS parameter-property/decorator limit holds); restricted checker runs work and reuse exactly, but (a) the post-checker publish on the 1.1 GB database takes ~5 minutes single-threaded, (b) occurrences are checked once per owning tsconfig, and (c) a restricted run that produces no facts exits non-zero.
 
 ## Arm 3 — watch smoke on a copy of ai-pipe (stack binary)
 
