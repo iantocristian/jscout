@@ -439,15 +439,25 @@ struct RankedHitCandidate {
     matched_identifiers: Vec<String>,
 }
 
-/// Build an FTS5 query: each identifier-ish token quoted, OR-joined, so any
-/// match ranks (BM25 handles weighting) and no user input is FTS syntax.
-fn fts_query(q: &str) -> String {
-    let tokens: Vec<String> = q
-        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+/// Build an FTS5 query: each identifier-ish token is quoted and OR-joined, so
+/// any match ranks (BM25 handles weighting) and no user input is FTS syntax.
+fn fts_query_for_column(q: &str, column: Option<&str>) -> String {
+    q.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    tokens.join(" OR ")
+        .map(|term| match column {
+            Some(column) => format!("{column}:\"{term}\""),
+            None => format!("\"{term}\""),
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn fts_query(q: &str) -> String {
+    fts_query_for_column(q, None)
+}
+
+fn exhaustive_fts_query(q: &str) -> String {
+    fts_query_for_column(q, Some("content"))
 }
 
 fn exact_intent_tokens(query: &str) -> Vec<String> {
@@ -1329,7 +1339,7 @@ fn exhaustive_hits(
 ) -> Result<(Vec<Hit>, ExhaustivePageState)> {
     let (file_roles, scope) = exhaustive_scope(options, snapshot);
     let request_fingerprint = exhaustive_request_fingerprint(q, &file_roles, &scope.origins);
-    let query = fts_query(q);
+    let query = exhaustive_fts_query(q);
     let cursor_position = if let Some(cursor) = cursor {
         let position = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
         if query.is_empty() {

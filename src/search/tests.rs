@@ -14,9 +14,9 @@ use super::{
     SearchExpansion, SearchMode, SearchOptions, SearchResult, SearchScopeFileRoles,
     apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
     candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
-    merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-    resolve_search_limit, search, select_attached_memory, select_neighborhood_projection,
-    select_path_projection, tiered_candidates,
+    exhaustive_fts_query, merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking,
+    reranker_document, resolve_search_limit, search, select_attached_memory,
+    select_neighborhood_projection, select_path_projection, tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -735,6 +735,14 @@ fn exhaustive_search_clamps_only_an_omitted_configured_limit() {
 }
 
 #[test]
+fn exhaustive_fts_query_scopes_every_term_to_content() {
+    assert_eq!(
+        exhaustive_fts_query("alpha beta.gamma"),
+        "content:\"alpha\" OR content:\"beta\" OR content:\"gamma\""
+    );
+}
+
+#[test]
 fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -825,6 +833,24 @@ fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Re
     assert!(!rich_definition.used_by.is_empty());
     assert!(rich_definition.match_lines.is_none());
 
+    let ranked_path_only = search(
+        &conn,
+        None,
+        "pathOnlyNeedle",
+        &SearchOptions {
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        ranked_path_only
+            .hits
+            .iter()
+            .any(|hit| hit.file == "pathOnlyNeedle.ts")
+    );
+
     let path_only = search(
         &conn,
         None,
@@ -837,9 +863,12 @@ fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Re
             ..Default::default()
         },
     )?;
-    assert_eq!(path_only.hits.len(), 1);
-    assert_eq!(path_only.hits[0].file, "pathOnlyNeedle.ts");
-    assert_eq!(path_only.hits[0].match_lines.as_deref(), Some(&[][..]));
+    assert!(path_only.hits.is_empty());
+    let path_only_metadata = path_only.exhaustive.expect("exhaustive metadata");
+    assert_eq!(path_only_metadata.total_chunks, 0);
+    assert_eq!(path_only_metadata.returned, 0);
+    assert!(!path_only_metadata.truncated);
+    assert!(path_only_metadata.next_cursor.is_none());
     Ok(())
 }
 

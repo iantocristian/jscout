@@ -3066,16 +3066,17 @@ Contract:
    false, include_memory: false, page_size }`. The cross-encoder runs over the
    fused pool independently of vector retrieval today, and expansion and
    attached memory change both membership and latency; forcing them off gives
-   the response one meaning — the FTS match set for the query terms over
-   indexed chunks in the requested scope. `vector: false` without `exhaustive`
-   keeps today's ranked behaviour.
+   the response one meaning — the FTS content-column match set for the query
+   terms over indexed chunks in the requested scope. The ranked-only `name`,
+   `symbols`, and `path` columns cannot create exhaustive hits with no source
+   line. `vector: false` without `exhaustive` keeps today's ranked behaviour.
 2. **Continuation fields.** In exhaustive mode the integer `limit` is the
    page size, bounded by a hard ceiling, and `cursor` carries the opaque
    continuation token from the previous page. There is no `offset`.
 3. **The unit of completeness is the chunk.** Search returns one hit per
-   chunk, so the completeness fields are `total_chunks` (every matching chunk
-   in scope, counted before paging and before byte shedding), `returned`,
-   `truncated`, and `next_cursor`. An exhaustive hit carries `match_lines`,
+   chunk, so the completeness fields are `total_chunks` (every chunk whose
+   content matches in scope, counted before paging and before byte shedding),
+   `returned`, `truncated`, and `next_cursor`. An exhaustive hit carries `match_lines`,
    the unique lines inside the chunk where a query term matches. The claim is
    chunk coverage plus unique matching-line coverage; match multiplicity
    within a line and match spans are not represented, and the contract does

@@ -484,12 +484,12 @@ fn tool_defs(profile: ToolProfile) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Search indexed code chunks. The default is ranked hybrid retrieval with copy-safe follow-ups, optional graph context, and opt-in evidence-connected memory; exhaustive=true instead traverses the complete lexical chunk match set as deterministic locator pages with absolute unique match_lines and an echoed scope. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
+            "description": "Search indexed code chunks. The default is ranked hybrid retrieval with copy-safe follow-ups, optional graph context, and opt-in evidence-connected memory; exhaustive=true instead traverses the complete source-content chunk match set as deterministic locator pages with absolute unique match_lines and an echoed scope. Successful retrieval diagnostics stay in telemetry/debug; degraded stages remain visible. Use semantic_memory for broad memory discovery and exact artifact views.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language and/or identifiers" },
-                    "exhaustive": { "type": "boolean", "default": false, "description": "Traverse the complete lexical chunk match set in deterministic pages; overrides configured vector, rerank, expansion, and attached memory" },
+                    "exhaustive": { "type": "boolean", "default": false, "description": "Traverse the complete source-content chunk match set in deterministic pages; overrides configured vector, rerank, expansion, and attached memory" },
                     "limit": { "type": "integer", "minimum": 1, "description": "Maximum ranked hits, or exhaustive page size (maximum 200); omit to use repository configuration" },
                     "cursor": { "type": "string", "description": "Opaque continuation token returned by a previous exhaustive page; valid only with exhaustive=true" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Primary-hit role allowlist; omit to use repository configuration" },

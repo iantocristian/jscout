@@ -94,7 +94,7 @@ pub(super) enum Command {
         /// Max ranked results, or page size in exhaustive mode
         #[arg(short = 'k', long)]
         limit: Option<usize>,
-        /// Traverse the complete lexical chunk match set in deterministic pages
+        /// Traverse the complete source-content chunk match set in deterministic pages
         #[arg(long, conflicts_with_all = ["vector", "rerank", "expand", "memory"])]
         exhaustive: bool,
         /// Opaque continuation token from a previous exhaustive page
