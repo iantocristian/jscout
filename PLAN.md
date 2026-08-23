@@ -18,7 +18,9 @@
 > efficient drill-down surface while repeated expansion dominates response
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
 > is the compact-transport and path-projection pass. G21 repository-local
-> runtime configuration and retrieval observability are implemented. None triggers G16 or
+> runtime configuration and retrieval observability are implemented. G22
+> exhaustive lexical search, G23 skill investigation/inquiry loops, and G24
+> vector-path latency measurement are planned from the production traces. None triggers G16 or
 > widens the semantic product surface, and no retrieval default changes without
 > a same-binary, same-snapshot comparison.
 
@@ -3007,6 +3009,99 @@ commands, and operating template are implemented. The complete schema,
 migration boundary, phased implementation, tests, and acceptance criteria are
 in the
 [repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md).
+
+## Planned G22 — exhaustive lexical search contract
+
+A production investigation (the links-iteration convention check,
+2026-08-22) ran twelve `vector: false` searches at `limit: 10` over a bounded
+workspace corpus to establish a repository convention, missed at least one
+literal occurrence that `rg` listed, and reported the comparison as complete.
+The miss was truncation, not ranking. For identifier-shaped lexical queries
+over the indexed corpus the match set is finite and small; the tool should
+state its size and return all of it on request. The agent's own retrospective
+named the failure: limits were never widened and completeness was claimed
+from a truncated result. The structural limit belongs to ranked vector
+similarity only. FTS tokenization cannot promise regex or syntax-pattern
+exactness, which stays with `rg`.
+
+1. `semantic_search` with `vector: false` reports `total` (matching chunks
+   within the requested scope) and `truncated`, and accepts `limit: "all"`
+   under a hard ceiling with `offset` pagination beyond it. Lexical mode only;
+   vector mode remains ranked.
+2. Scope is part of the answer. Responses echo the effective `file_roles` and
+   `origins`, and completeness claims must state them: the trace's
+   `file_roles: ["production"]` silently excluded test and script code while
+   the answer said "all code places".
+3. No regex/pattern occurrence tool until G22 proves insufficient on a real
+   completeness question. `rg` covers pattern exactness meanwhile.
+
+Acceptance: replay the links-iteration investigation on the current binary
+with `limit: "all"`; every literal occurrence `rg` lists within scope is
+present and `total` equals the returned count; the same query at `limit: 10`
+carries `truncated: true` and the same `total`.
+
+## Planned G23 — skill: investigation and inquiry loops
+
+Three production sessions and the evaluation record show agents discovering
+the efficient loop themselves, partially. The TargetsQueue investigation
+converged on unexpanded search plus `definition` in its tail; the
+links-iteration investigation copied anchors and snapshot verbatim into six
+exact definitions but never widened limits; the architecture inquiry was
+memory-first with repeated attachments after discovery. The current skill
+gives one posture and an initial `limit` of 10 that agents read as a session
+ceiling. The evaluation record adds the invented-anchor failure class and one
+anchoring event in which a delivered analog shaped architecture without
+supplying the missing behavior.
+
+Skill text only; no tool changes.
+
+1. Two loops. Investigation: lexical search (`vector: false` while
+   identifiers are known), then `definition` on anchors copied verbatim, then
+   widen per G22 until `truncated` is false or `total` is covered; switch to
+   `vector: true` or `who_uses`/`neighborhood` when hunting aliases of a
+   value instead of inferring them from snippets. Inquiry: `semantic_memory`
+   first, `repository_overview` once, one orientation expansion,
+   `include_memory` off after useful memory is known.
+2. Completeness answers state scope (roles, origins) and separate convention
+   from correctness: "other code does this" establishes a repository habit,
+   not that the change is safe.
+3. Expanded searches and artifact details run sequentially; parallel only
+   for small lexical searches; expansion once per investigation, after
+   localization.
+4. A changed response snapshot mid-session means re-verifying the evidence
+   boundary before continuing.
+
+Acceptance: the skill ships with the G22 fields; a replay of the
+links-iteration investigation following the skill reaches the `rg`-listed
+occurrences and states scope; telemetry's exact-anchor definition success
+rate is recorded before and after.
+
+## Planned G24 — vector-path latency measurement
+
+The first production telemetry window shows `semantic_search` median elapsed
+near 6.2 s with vector active against 0.3 s disabled, while expansion added
+bytes and essentially no time. Those rows mix binaries and intentionally
+different retrieval postures, so this is a measurement task, not a finding.
+If per-query embedding dominates, it is the largest interactive cost of
+vector retrieval and a plausible driver of agents' parallel batching and
+deliberate `vector: false` choices.
+
+1. Surface the existing `RetrievalStatus` stage timings (`vector_timings`,
+   `reranker_timing`) in telemetry rows; G21 records requested and effective
+   posture, this adds where the time went.
+2. Measure on one binary and one snapshot: twenty queries across vector
+   on/off and rerank on/off, on the production monorepo and one evaluation
+   corpus.
+3. Decide on numbers. Query embedding dominant: keep the local inference
+   connection warm, cache query embeddings by query-text hash, or use a
+   smaller query-side model. Vector search dominant: index parameters.
+   Rerank dominant: candidate count. No retrieval default changes from this
+   task; it informs G21 defaults only through a same-binary, same-snapshot
+   comparison.
+
+Acceptance: a recorded table of stage timings per configuration, and either
+a latency change with before/after on the same binary or a documented
+decision that the cost is accepted.
 
 ## Evaluation decisions already made
 
