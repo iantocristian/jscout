@@ -1054,6 +1054,109 @@ in this order:
    reuse completed with zero requests in 11.03 seconds. Unsupported cases
    remain on the property hub.
 
+#### Real-repository validation and remaining items (2026-08-23)
+
+The merged stack (#76–#80 plus the projection-scan fix) was run against the
+pre-stack binary (`1e9acac`) on ai-pipe `ea13166` and n8n `9d9e9bf` with
+scratch databases and no billed calls; the full record is
+`docs/checker-stack-validation-2026-08-23.md`. Headline measurements:
+
+- ai-pipe `enrich --all`: 355.06 s (458 one-file Programs, 1,412 facts) →
+  29.30 s (12 projects, 387 checker facts, 1,412 combined with value flow).
+  Default gate: 17.16 s cold, 0.30 s unchanged reuse. Occurrences with a
+  `likely` member-call edge: 108 → 694 (557 value flow + 137 checker), none
+  lost.
+- n8n index: 21.39 s → 22.09 s (+3%, +26 MB). Value flow: ai-pipe 1,025
+  edges over 557 occurrences; n8n 14,456 over 14,414. Hand check of 24
+  random edges at source: 24 correct, 4 over-approximate
+  (`openDatabase(path, { driver })` with an explicit driver keeps the dead
+  second adapter at `likely`). The parameter-property limit held: zero
+  `this.x.y()` edges on n8n.
+- Watch on an ai-pipe copy: a server edit re-indexed in 279 ms and
+  re-checked only the dirty `inferred:.#node-esm/server~1` scope in 4.6 s,
+  and the new call received a value-flow edge; a test edit re-checked no
+  scope.
+- A schema-6 database is refused by read-only commands and by `index`
+  (below the durable floor, file untouched); v26 → v28 migrates in place.
+
+Findings, in product order, with the decision taken:
+
+1. **Where the edges land.** Value-flow edges sit mostly in tests (ai-pipe
+   499/557, n8n 9,071/14,414); only 9 are in ai-pipe `server/`. Production
+   code receives its instances as parameters — 170 `db.*` call sites in the
+   server are on parameters — and the checker answers none of those either:
+   the five inferred server/scripts scopes published 0 facts by default (833
+   unknown, the rest lib or vendored). Construction-site resolution is solved
+   and nearly free; the remaining lever for JS-first code is
+   argument→parameter flow, not more checker work. Design, not yet scheduled;
+   see the decision record below.
+2. **CLI `who-uses` ignores enriched edges.** `commands/core.rs` name-matches
+   only, so its output for `SqliteAdapter.query` is identical before and
+   after the stack while the database holds 11 `likely` in-edges. The MCP
+   `who_uses` tool already uses the anchor query. Fix: route the CLI through
+   `who_uses_anchor_in_origins` when the target resolves to one anchor. Small
+   PR.
+3. **Overload signatures.** TypeScript overloads map to one anchor per
+   signature (`@1..@4`), so a four-signature method demotes to `possible`
+   with `candidateCount 4` (three n8n occurrences). Fix: collapse signature
+   declarations onto the implementation before counting targets. Small PR.
+4. **Multi-owner querying.** An occurrence is queried once per owning
+   tsconfig: n8n selected 6,554 and queried 14,265, storing facts two to
+   three times. By design; dedupe when owning projects share effective
+   options. Cost only.
+5. **Zero-fact narrowed runs.** A plan-scoped run on a snapshot that already
+   has an active batch and yields zero facts (`--file scripts` after a
+   package run) exits 1 without a summary and cannot reuse, because the
+   retain-previous-batch safeguard treats it as a failed replacement. Manual
+   only — watch opens a new snapshot per generation. Treat it as success with
+   a retained-batch note.
+
+**Decision record: argument→parameter flow.** This is the first
+interprocedural step and therefore the first that rests on an assumption the
+code cannot prove: that every caller of a function is visible. The choices
+and the recommended rule:
+
+- Which callers count: direct static calls only; exported functions are
+  admitted only when every import resolves in-repo and the package is not
+  published.
+- Test-role callers do not count. On ai-pipe they happen to be harmless (443
+  tests pass a real `SqliteAdapter`), but 156 pass awaited helpers and some
+  pass object-literal fakes, either of which leaves the set open; on repos
+  with fake classes they exceed the cap.
+- Disagreeing call sites union into one closed set under the ≤3 rule, as
+  factory returns do.
+- Depth 2. `api.mjs` → route-handler parameter → `db.mjs` parameter is the
+  real shape; depth 1 leaves the set open on `saveWorkspace` itself.
+- `likely` under its own provenance (`parameter-flow`) so it can be audited
+  or disabled separately; resolved occurrences are excluded from the checker
+  by edge, as value flow is.
+- Measure before building: the index already holds every call site of every
+  `db.mjs` function and what each passes, so the yield on ai-pipe's 170
+  parameter-bound `db.*` sites under each rule is a query, not an
+  implementation.
+- TypeScript annotations yield the same edges from a syntactic read of the
+  parameter type. That is the erasure line and stays a separate decision.
+
+Remaining items from the optimization sequence:
+
+6. **Bounded sidecar pool.** Productize `codex/checker-sidecar-experiment`:
+   typed configuration for worker count and RSS recycle threshold, an
+   aggregate memory budget, one fresh-worker retry on crash, and the five
+   test classes the experiment listed. Re-measure after grouping: it removed
+   most of the duplicated work the pool parallelized, so the right default
+   may be two workers or none.
+7. **TypeScript backend, later.** Move the pinned 5.9.3 to 6.0 when
+   convenient (the API baseline TypeScript 7 targets). When 7.1 ships its
+   API, prototype a native worker behind the same sidecar protocol with
+   digest parity as the gate; a one-day typescript-native-bridge spike only
+   if the checker is still the bottleneck on TS-heavy corpora after items 2
+   and 6.
+
+Also open from the family layer: `node-esm` and `node-cjs` now carry
+identical options and could merge into one `node` family (a scope-ID
+change), and the NodeNext extensionless trade-off is unmeasured on
+bundler-style orphan `.ts`/`.js` files in `type: module` packages.
+
 #### Durable staging, resume, and partial coverage
 
 An enrichment run is keyed by structural snapshot, plan fingerprint, checker
