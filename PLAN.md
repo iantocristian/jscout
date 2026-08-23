@@ -19,8 +19,8 @@
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
 > is the compact-transport and path-projection pass. G21 repository-local
 > runtime configuration and retrieval observability are implemented. G22
-> exhaustive lexical search, G23 skill investigation/inquiry loops, and G24
-> vector-path latency measurement are planned from the production traces. None triggers G16 or
+> exhaustive lexical search and G23 skill investigation/inquiry loops are
+> planned from the production traces. None triggers G16 or
 > widens the semantic product surface, and no retrieval default changes without
 > a same-binary, same-snapshot comparison.
 
@@ -3075,33 +3075,6 @@ Acceptance: the skill ships with the G22 fields; a replay of the
 links-iteration investigation following the skill reaches the `rg`-listed
 occurrences and states scope; telemetry's exact-anchor definition success
 rate is recorded before and after.
-
-## Planned G24 — vector-path latency measurement
-
-The first production telemetry window shows `semantic_search` median elapsed
-near 6.2 s with vector active against 0.3 s disabled, while expansion added
-bytes and essentially no time. Those rows mix binaries and intentionally
-different retrieval postures, so this is a measurement task, not a finding.
-If per-query embedding dominates, it is the largest interactive cost of
-vector retrieval and a plausible driver of agents' parallel batching and
-deliberate `vector: false` choices.
-
-1. Surface the existing `RetrievalStatus` stage timings (`vector_timings`,
-   `reranker_timing`) in telemetry rows; G21 records requested and effective
-   posture, this adds where the time went.
-2. Measure on one binary and one snapshot: twenty queries across vector
-   on/off and rerank on/off, on the production monorepo and one evaluation
-   corpus.
-3. Decide on numbers. Query embedding dominant: keep the local inference
-   connection warm, cache query embeddings by query-text hash, or use a
-   smaller query-side model. Vector search dominant: index parameters.
-   Rerank dominant: candidate count. No retrieval default changes from this
-   task; it informs G21 defaults only through a same-binary, same-snapshot
-   comparison.
-
-Acceptance: a recorded table of stage timings per configuration, and either
-a latency change with before/after on the same binary or a documented
-decision that the cost is accepted.
 
 ## Evaluation decisions already made
 
