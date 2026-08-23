@@ -10,13 +10,14 @@ use crate::embed;
 use super::{
     DEFAULT_EXPANSION_PATH_LIMIT, DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
     DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit,
-    MAX_EXHAUSTIVE_PAGE_SIZE, MatchReason, Reranker, ResponseBudget, RetrievalStatus,
-    SearchExpansion, SearchMode, SearchOptions, SearchResult, SearchScopeFileRoles,
-    apply_repository_policy_penalty, apply_response_budget, approximate_name_usage_occurrences,
-    candidate_pool_limits, contains_code_identifier, edge_identity, exact_intent_tokens,
-    exhaustive_fts_query, merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking,
-    reranker_document, resolve_search_limit, search, select_attached_memory,
-    select_neighborhood_projection, select_path_projection, tiered_candidates,
+    MAX_EXHAUSTIVE_PAGE_SIZE, MatchReason, Reranker, ResponseBudget, ResponseBudgetTooSmall,
+    RetrievalStatus, SearchExpansion, SearchMode, SearchOptions, SearchResult,
+    SearchScopeFileRoles, apply_repository_policy_penalty, apply_response_budget,
+    approximate_name_usage_occurrences, candidate_pool_limits, contains_code_identifier,
+    edge_identity, exact_intent_tokens, exhaustive_fts_query, merge_reranked_prefix,
+    prefilter_ranking_by_role, record_vector_ranking, reranker_document, resolve_search_limit,
+    search, select_attached_memory, select_neighborhood_projection, select_path_projection,
+    tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -633,6 +634,195 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
     )
     .expect_err("cursor must fail against a changed snapshot");
     assert!(stale.to_string().contains("snapshot changed"));
+    Ok(())
+}
+
+fn exhaustive_budget_fixture() -> Result<(tempfile::TempDir, rusqlite::Connection)> {
+    let repo = tempfile::tempdir()?;
+    for (path, name) in [
+        ("a.ts", "alpha"),
+        ("b.ts", "bravo"),
+        ("c.ts", "charlie"),
+        ("d.ts", "delta"),
+    ] {
+        fs::write(
+            repo.path().join(path),
+            format!("export function {name}() {{ return strictBudgetNeedle; }}\n"),
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    Ok((repo, conn))
+}
+
+fn exhaustive_budget_search(
+    conn: &rusqlite::Connection,
+    cursor: Option<String>,
+    limit: usize,
+    compact: bool,
+    response_byte_limit: usize,
+) -> Result<SearchResult> {
+    search(
+        conn,
+        None,
+        "strictBudgetNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor },
+            limit,
+            rerank: false,
+            compact,
+            response_byte_limit,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn exhaustive_search_emits_complete_handoff_only_on_the_first_page() -> Result<()> {
+    let (_repo, conn) = exhaustive_budget_fixture()?;
+
+    let first_page = exhaustive_budget_search(&conn, None, 1, true, 1_000_000)?;
+    let first_value = crate::compact::search_value(&first_page);
+    assert!(first_value["hits"][0]["followups"]["arguments"].is_object());
+    let first_cursor = first_page
+        .exhaustive
+        .as_ref()
+        .and_then(|metadata| metadata.next_cursor.clone())
+        .expect("first page cursor");
+    let second_page = exhaustive_budget_search(&conn, Some(first_cursor), 1, true, 1_000_000)?;
+    let second_value = crate::compact::search_value(&second_page);
+    assert_eq!(second_page.hits[0].file, "b.ts");
+    assert!(second_value["hits"][0]["followups"]["tools"].is_array());
+    assert!(
+        second_value["hits"][0]["followups"]
+            .get("arguments")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn exhaustive_budget_locator_floor_advances_from_the_last_rendered_hit() -> Result<()> {
+    let (_repo, conn) = exhaustive_budget_fixture()?;
+
+    let below_floor = exhaustive_budget_search(&conn, None, 3, true, 1)
+        .expect_err("one byte cannot fit an exhaustive locator");
+    let floor = *below_floor
+        .downcast_ref::<ResponseBudgetTooSmall>()
+        .expect("typed exhaustive budget error");
+    assert_eq!(floor.byte_limit, 1);
+    assert!(floor.minimum_bytes > 1);
+    assert_eq!(
+        below_floor.to_string(),
+        format!(
+            "response_budget_too_small: response byte limit 1 cannot fit the minimum exhaustive response; minimum_bytes={}",
+            floor.minimum_bytes
+        )
+    );
+
+    let locator_page = exhaustive_budget_search(&conn, None, 3, true, floor.minimum_bytes)?;
+    let locator_metadata = locator_page
+        .exhaustive
+        .as_ref()
+        .expect("exhaustive locator metadata");
+    assert_eq!(locator_page.hits.len(), 1);
+    assert_eq!(locator_page.hits[0].file, "a.ts");
+    assert_eq!(locator_metadata.returned, 1);
+    assert!(locator_metadata.truncated);
+    let locator_cursor = locator_metadata
+        .next_cursor
+        .clone()
+        .expect("locator continuation cursor");
+    assert!(locator_page.response_budget.exhaustive_locator_only);
+    assert_eq!(
+        locator_page.response_budget.rendered_bytes,
+        floor.minimum_bytes
+    );
+    let locator_value = crate::compact::search_value(&locator_page);
+    let locator = locator_value["hits"][0]
+        .as_object()
+        .expect("compact exhaustive locator");
+    assert!(locator.contains_key("at"));
+    assert!(locator.contains_key("anchor") || locator.contains_key("anchors"));
+    assert!(!locator.contains_key("followups"));
+
+    let continuation = exhaustive_budget_search(&conn, Some(locator_cursor), 3, true, 1_000_000)?;
+    assert_eq!(
+        continuation
+            .hits
+            .iter()
+            .map(|hit| hit.file.as_str())
+            .collect::<Vec<_>>(),
+        ["b.ts", "c.ts", "d.ts"]
+    );
+    assert!(
+        crate::compact::search_value(&continuation)["hits"]
+            .as_array()
+            .expect("continuation hits")
+            .iter()
+            .all(|hit| hit["followups"].get("arguments").is_none())
+    );
+
+    let one_below = exhaustive_budget_search(&conn, None, 3, true, floor.minimum_bytes - 1)
+        .expect_err("one byte below the locator floor must fail deterministically");
+    let one_below = one_below
+        .downcast_ref::<ResponseBudgetTooSmall>()
+        .expect("typed boundary error");
+    assert_eq!(one_below.minimum_bytes, floor.minimum_bytes);
+    Ok(())
+}
+
+#[test]
+fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result<()> {
+    let (_repo, conn) = exhaustive_budget_fixture()?;
+
+    // A terminal page can become smaller when every locator is retained:
+    // shedding one hit adds both an opaque cursor and omission metadata. The
+    // advertised floor must therefore be the smallest rendered candidate
+    // seen across the whole shedding pass, not blindly the one-hit size.
+    let terminal_error = exhaustive_budget_search(&conn, None, 4, true, 1)
+        .expect_err("one byte cannot fit the terminal exhaustive page");
+    let terminal_floor = terminal_error
+        .downcast_ref::<ResponseBudgetTooSmall>()
+        .expect("typed terminal-page budget error")
+        .minimum_bytes;
+    let terminal_page = exhaustive_budget_search(&conn, None, 4, true, terminal_floor)?;
+    assert_eq!(terminal_page.response_budget.rendered_bytes, terminal_floor);
+    assert!(terminal_page.response_budget.exhaustive_locator_only);
+    let terminal_one_below = exhaustive_budget_search(&conn, None, 4, true, terminal_floor - 1)
+        .expect_err("one byte below the terminal-page floor must fail");
+    assert_eq!(
+        terminal_one_below
+            .downcast_ref::<ResponseBudgetTooSmall>()
+            .expect("typed terminal boundary error")
+            .minimum_bytes,
+        terminal_floor
+    );
+
+    // Diagnostic JSON serializes `byte_limit` itself. Its reported floor must
+    // already include the extra digits introduced when the caller retries at
+    // that value.
+    let debug_error = exhaustive_budget_search(&conn, None, 3, false, 1)
+        .expect_err("one byte cannot fit diagnostic exhaustive JSON");
+    let debug_floor = debug_error
+        .downcast_ref::<ResponseBudgetTooSmall>()
+        .expect("typed diagnostic budget error")
+        .minimum_bytes;
+    let debug_page = exhaustive_budget_search(&conn, None, 3, false, debug_floor)?;
+    assert_eq!(
+        serde_json::to_string_pretty(&debug_page)?.len(),
+        debug_page.response_budget.rendered_bytes
+    );
+    assert!(debug_page.response_budget.rendered_bytes <= debug_floor);
+    let debug_one_below = exhaustive_budget_search(&conn, None, 3, false, debug_floor - 1)
+        .expect_err("one byte below the diagnostic floor must fail");
+    assert_eq!(
+        debug_one_below
+            .downcast_ref::<ResponseBudgetTooSmall>()
+            .expect("typed diagnostic boundary error")
+            .minimum_bytes,
+        debug_floor
+    );
     Ok(())
 }
 

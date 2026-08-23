@@ -60,7 +60,11 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         .iter()
         .map(|hit| {
             if result.exhaustive.is_some() {
-                compact_exhaustive_hit(hit, &result.snapshot)
+                compact_exhaustive_hit(
+                    hit,
+                    &result.snapshot,
+                    result.response_budget.exhaustive_locator_only,
+                )
             } else {
                 compact_hit(hit, &result.snapshot, default_match)
             }
@@ -281,7 +285,7 @@ fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchRe
     Value::Object(value)
 }
 
-fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str) -> Value {
+fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str, locator_only: bool) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -307,7 +311,7 @@ fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str) -> Value {
             value.insert("anchor".into(), json!(hit.file_anchor));
         }
     }
-    if hit.anchors.len() <= 1 {
+    if !locator_only && hit.anchors.len() <= 1 {
         let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
         value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
