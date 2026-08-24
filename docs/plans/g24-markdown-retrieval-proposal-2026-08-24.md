@@ -14,7 +14,8 @@ Jscout treats repository Markdown as a separate retrieval product with its own
 database. It is not a source extension of the structural index and not
 semantic memory. The surface is `jscout docs`: it owns its inventory,
 Markdown-aware chunks, BM25 index, vector index, search results, snapshot,
-and observation ledger, all inside `.jscout-docs.db`.
+and observation ledger inside the configured documentation database, which
+defaults to `<root>/.jscout-docs.db`.
 
 BM25 always builds. Vector retrieval reuses the repository's existing
 `[embedding]` provider and model; when that provider is absent, documentation
@@ -22,10 +23,11 @@ search degrades to lexical retrieval rather than disabling. Freshness is a
 bounded reordering applied after relevance, only between candidates whose
 provenance is comparable, and never through the model reranker.
 
-History is an observation ledger, not reconstructed source history. Matching
-is conservative: exact content first, block alignment second, and no
-succession claim from ordinal position alone. Baseline content with no Git
-provenance has unknown authorship time.
+History is a block-observation ledger, not reconstructed source history.
+Matching is conservative and one-to-one: exact content first, unique
+neighbor-anchored block alignment second, and no succession claim from ordinal
+position alone. Baseline content with no Git provenance has unknown authorship
+time.
 
 ## Product boundary
 
@@ -44,8 +46,8 @@ chunk bodies never enter BM25 or vector candidate generation.
 The first review round showed the shared store cannot host an independent
 plane: it has one global schema version whose upgrade path rebuilds
 source-derived tables, and every read-only open requires a published
-structural snapshot. Documentation therefore lives in `.jscout-docs.db`,
-stored beside the configured main database, with:
+structural snapshot. Documentation therefore lives in a separately configured
+database, defaulting to `<root>/.jscout-docs.db`, with:
 
 - its own schema version, migration lifecycle, and readiness gate (a
   published documentation snapshot only);
@@ -56,10 +58,8 @@ stored beside the configured main database, with:
   generations, or semantic freshness.
 
 A code reindex cannot make documentation search unavailable, and a
-documentation migration failure cannot affect the main database. Deleting
-`.jscout-docs.db` removes jscout's complete local documentation state,
-including observation history; the history is local and is never a
-replacement for repository version control.
+documentation migration failure cannot affect the main database. The history
+is local and is never a replacement for repository version control.
 
 ## Configuration
 
@@ -72,17 +72,24 @@ exclude = []
 freshness = true
 max_rank_movement = 2
 
+[docs.database]
+path = ".jscout-docs.db"
+
 [docs.search]
 vector = true
+rerank = true
 limit = 10
 response_bytes = 24000
 ```
 
-There is no `[docs.embedding]` section: vectors use the `[embedding]`
-provider, model, and service as configured for the repository. Compatibility
-of a committed `[docs]` section with pre-docs jscout binaries is explicitly
-not a requirement. The feature activates only through a `docs` command, never
-through the mere presence of Markdown.
+`[docs.database]` is optional; its path defaults to `.jscout-docs.db` and is
+resolved relative to the indexed root. It is independent of `[database].path`.
+There is no `[docs.embedding]` or `[docs.reranker]` section: vectors use the
+repository `[embedding]` provider, model, and service, and reranking uses the
+repository `[reranker]` profile. Compatibility of a committed `[docs]` section
+with pre-docs jscout binaries is explicitly not a requirement. The feature
+activates only through a `docs` command, never through the mere presence of
+Markdown.
 
 ## Markdown corpus specification
 
@@ -101,7 +108,7 @@ The first rule that applies decides membership:
 
 Exclude beats include; ignore beats both; include cannot resurrect an ignored
 file in v1. `docs status` reports the deciding rule per encountered file
-(`indexed`, `excluded`, `not-included`, `oversized`, `non-utf8`) and per
+(`indexed`, `excluded`, `not-included`, `non-utf8`) and per
 pruned directory (`hard-skip`, `ignored`, `hidden-not-allowlisted`), without
 enumerating descendants beneath pruned directories. Version one admits `.md`
 only; MDX requires a separate parsing and safety decision.
@@ -114,23 +121,30 @@ only; MDX requires a separate parsing and safety decision.
 | Description, tags  | front matter                                 | medium weight  | no            | yes          |
 | Heading breadcrumb | full heading path                            | medium weight  | no            | yes          |
 | Nearest heading    | closest enclosing heading                    | via breadcrumb | yes           | yes          |
-| Body               | exact chunk text                             | base weight    | yes           | exact source |
+| Rendered body      | deterministic retrieval rendering of source  | base weight    | yes           | no           |
+| Source             | exact source spans and bytes                 | no             | no            | yes          |
 | Path               | repository-relative                          | lowest weight  | no            | yes          |
 
-Embedding identity is exactly `hash(format_version, nearest_heading, body)`.
-Nothing else enters that hash, so a file rename reuses every vector, an
-ancestor-heading or title edit is metadata-only, an H1 rename re-embeds only
-chunks whose nearest heading is that H1, and timestamps never affect vector
-identity. The low-weight path column serves directory vocabulary such as
-`adr` or `api/v2` without coupling renames to the vector cache. Column
-weights are evaluation hypotheses, not compatibility constants.
+`rendered_body` is the final deterministic body string sent to FTS and the
+embedder after comment removal and any bounded synthetic fence/table context
+has been applied. Embedding identity is exactly
+`hash(format_version, nearest_heading, rendered_body)`, using the same
+versioned serialization sent to the embedder. Nothing else enters that hash,
+so a file rename reuses every vector, an ancestor-heading or title edit is
+metadata-only, an H1 rename re-embeds only chunks whose nearest heading is
+that H1, and timestamps never affect vector identity. The low-weight path
+column serves directory vocabulary such as `adr` or `api/v2` without coupling
+renames to the vector cache. Column weights are evaluation hypotheses, not
+compatibility constants.
 
 ### Front matter
 
 - Recognized only when the file begins with `---`, has a valid closing
-  delimiter, and parses as YAML.
-- Only `title`, `description`, and `tags` are used; other keys are ignored;
-  front-matter dates do not affect freshness in v1.
+  delimiter, parses as YAML, and produces a top-level mapping. A valid YAML
+  scalar or sequence is not front matter and remains ordinary body text.
+- Only scalar-string `title` and `description` values and a scalar string or
+  sequence of scalar strings for `tags` are used; other keys or value types are
+  ignored. Front-matter dates do not affect freshness in v1.
 - Valid front matter is never emitted as a body chunk.
 - Malformed or unterminated front matter is ordinary Markdown body text,
   reported by `docs status` as `front_matter=malformed_as_body`, not a
@@ -141,53 +155,77 @@ weights are evaluation hypotheses, not compatibility constants.
 Markdown parses into source-backed blocks before size-based merging:
 paragraphs, headings, lists, tables, block quotes, fenced/indented code,
 visible HTML blocks, and thematic separators. HTML comments are excluded from
-retrieval text. Chunks never cross heading boundaries. History alignment
-operates on the underlying blocks before target-size merging, so inserting a
-paragraph does not shift every later chunk's identity.
+retrieval text. Headings establish structure and metadata but are not
+independent history occurrences; the ledger tracks retrieval-bearing body
+blocks. Chunks never cross heading boundaries. History alignment operates on
+the underlying body blocks independently of target-size merging.
+Retrieval chunks may regroup when blocks are inserted or removed; that may
+rebuild vectors, but it does not fabricate history transitions for unchanged
+blocks.
 
 Initial deterministic bounds, all evaluation hypotheses:
 
 ```text
-target:      ~600 tokens
-normal max:  ~1,000 tokens
-hard max:    24,000 UTF-8 bytes
-estimate:    bytes / 4
+target:                2,400 rendered UTF-8 bytes (~600 tokens)
+normal max:            4,000 rendered UTF-8 bytes (~1,000 tokens)
+hard max:             24,000 final embedding-input UTF-8 bytes
+heading context max:   1,024 rendered UTF-8 bytes
+synthetic body max:    1,024 rendered UTF-8 bytes
+token estimate:        rendered bytes / 4
 ```
 
-Oversized atomic blocks split at the last block-native boundary before the
-hard bound: newline for code, row for tables, top-level item for lists; a
-single oversized line splits at the last UTF-8 boundary. Fragments repeat
-required synthetic context (fence info string, table header) in their
-FTS/embedded representation without altering the exact source span. Fragment
-ordinals establish order only, never historical succession.
+The hard bound applies after nearest-heading serialization and synthetic
+context are added. If the nearest heading exceeds its context bound, its
+largest UTF-8 prefix that leaves room for the literal `\n[heading truncated]`
+is retained and the marker is appended; that bounded value is the
+`nearest_heading` used by the embedding identity. Fence info or table-header
+context is serialized as a prefix of `rendered_body` and truncated the same
+way within the synthetic-body bound using `\n[context truncated]`. The
+remaining total byte budget is used for source text.
+
+Oversized atomic blocks first split at the last block-native boundary before
+that remaining bound: newline for code, row for tables, and top-level item for
+lists. If no non-empty native fragment fits, every block type falls back to the
+last newline before the bound and then to the last UTF-8 boundary. This covers
+multiline paragraphs, quotes, HTML blocks, and oversized individual list
+items. Fragments repeat the bounded synthetic context in their rendered body
+without altering exact source spans. Fragment ordinals establish order only,
+never historical succession.
 
 ### Documents without body chunks
 
-A document producing no body chunks emits exactly one document-stub row:
-title, description, tags, breadcrumb, and path searchable; empty body; span
-covering the file; embedded only when its representation is non-empty. There
-are no empty per-section chunks.
+A document producing no body chunks emits exactly one lexical-only
+document-stub row: title, description, tags, path, and all document headings in
+source order are searchable; empty rendered body; no nearest heading; span
+covering the file. Stubs are not embedded. There are no empty per-section
+chunks.
 
 ## Storage model
 
-Within `.jscout-docs.db`, responsibilities (names may change during
-implementation):
+Within the configured documentation database, responsibilities (names may
+change during implementation):
 
 - `doc_snapshots`: one immutable row per successfully published scan —
   monotonic local sequence, observation timestamp, corpus fingerprint,
   optional Git worktree/commit identity with author and committer times,
   chunk-format version, inventory and rejection counts. A failed scan never
   publishes or advances the sequence.
-- `doc_chunk_contents`: content-addressed representations — raw-body hash,
-  embedding-identity hash, body text while a current occurrence references
-  it, token/byte accounting, format version.
-- `doc_chunk_occurrences`: the current searchable projection — path,
-  breadcrumb, same-heading ordinal, exact source spans, content identity,
-  freshness provenance. FTS rows and vector occurrence entries reference
-  these.
-- `doc_chunk_observations`: append-only validity intervals per logical
-  occurrence — content identity, first/last active snapshot, transition kind
-  and confidence, Git provenance when available. Unchanged chunks add no rows.
+- `doc_block_contents`: content-addressed source blocks — raw-body hash and
+  body text only while a current block occurrence references it.
+- `doc_block_occurrences`: current source-backed history units — path,
+  stable logical-occurrence ID, current-observation ID, structural order,
+  exact source span, content hash, heading context, and Git provenance when
+  available.
+- `doc_block_observations`: immutable append-only block events — lifecycle
+  event, logical-occurrence ID, predecessor-observation ID when uniquely
+  established, zero or more change flags, snapshot sequence, content hash,
+  match confidence, and provenance. Unchanged blocks add no rows and retain
+  their last current-observation reference. The current occurrence projection,
+  not the event ledger, defines what is active in the published snapshot.
+- `doc_chunks`: the current searchable projection built from ordered current
+  blocks — path, breadcrumb, source spans, rendered body, embedding identity,
+  and aggregated freshness provenance. FTS rows and vector occurrence entries
+  reference these chunks.
 - retrieval projections: `doc_chunks_fts`, content-addressed
   `doc_embeddings` keyed by embedding-identity hash and profile,
   `doc_embedding_index_entries`, and `vec_doc_embeddings_{dimensions}`.
@@ -198,38 +236,59 @@ earlier point leaves the previous snapshot active and searchable.
 
 ## History and continuity
 
-Transition kinds, stored per observation:
+Each block observation stores one lifecycle event — `baseline`, `added`,
+`continued`, or `removed` — plus zero or more orthogonal change flags:
 
-- `body_changed`: body blocks changed;
-- `context_changed`: nearest heading or occurrence metadata changed;
-- `moved`: identical content changed location;
-- `added`; and
-- `removed` — recorded only for confirmed inventory removal; a file excluded
-  by a read or parse failure does not close its intervals as `removed`.
+- `body_changed`: a uniquely matched predecessor has different body content;
+- `context_changed`: nearest heading or other retrieval context changed;
+  source-offset and ordinal changes alone do not count; and
+- `moved`: the matched block changed path or reordered relative to matched
+  neighboring blocks. Line, byte-span, or ordinal shifts caused only by an
+  insertion or deletion are not movement.
 
-Only `body_changed` affects freshness initially: a heading rename changes
-embedding context without making the underlying claim newly authored.
+A transition can therefore be both `body_changed` and `context_changed`, or
+both `body_changed` and `moved`. A successful scan emits `removed` when a
+previous block is confirmed absent from the current corpus. A read, parse, or
+inventory failure never emits `removed` for the unavailable file.
 
-Matching order between two snapshots:
+For observed provenance, a post-baseline `added` event establishes freshness
+at its snapshot sequence, and `body_changed` advances it. `context_changed` or
+`moved` alone carries the prior freshness forward: a heading rename does not
+make the underlying claim newly authored. The first snapshot records blocks
+without Git provenance with lifecycle `baseline` and provenance `unknown`;
+`first_seen_at` is operational metadata, not authorship time.
 
-1. exact content at the same location;
-2. exact content moved elsewhere;
-3. exact underlying-block alignment within the same section;
-4. high-confidence edited-block alignment anchored by unchanged neighboring
-   blocks;
-5. otherwise a new occurrence with no predecessor.
+Matching between two successfully parsed snapshots is conservative and
+one-to-one:
 
-Ordinal position alone never establishes continuity. False succession is
-worse than missing succession; ambiguous split/merge/reflow cases create new
-occurrences. The first snapshot records occurrences without Git provenance as
-`baseline_unknown`: `first_seen_at` is operational metadata, not authorship
-time.
+1. Within each unchanged path, an exact hash that occurs once on each side
+   matches directly, independent of heading text or source order. A matched
+   block is `moved` when its relative order against other matched blocks
+   changed.
+2. Repeated exact hashes within one path match only when already matched
+   neighboring blocks leave exactly one one-to-one monotone pairing. Otherwise
+   every ambiguous copy remains unmatched.
+3. Among the remaining blocks, an exact hash is `moved` only when it occurs
+   exactly once in the unmatched old corpus and exactly once in the unmatched
+   new corpus.
+4. An edited block receives a predecessor only when exactly one unmatched old
+   block and one unmatched new block occur between the same immediately
+   adjacent matched neighbors in one document. The pair is `body_changed` and
+   also receives any applicable context or movement flag.
+5. Every other unmatched new block is `added`; every other confirmed unmatched
+   old block is `removed`.
+
+Ordinal position alone never establishes continuity. If duplicate content,
+multiple valid monotone pairings, document-edge edits, split/merge/reflow, or
+any other case leaves more than one predecessor or successor possible, no
+predecessor is recorded. False succession is worse than missing succession.
 
 ## Git provenance
 
 In a Git worktree, documentation indexing records the checked-out `HEAD` and
 runs one line-porcelain blame per changed tracked Markdown file, mapping
-blamed lines onto already-produced chunks. Rules:
+blamed lines onto already-produced blocks and then aggregating them into
+retrieval chunks. Rules:
 
 - both author and committer times are stored; "newest" for freshness means
   the latest author time among contributing body lines, because author time
@@ -237,13 +296,16 @@ blamed lines onto already-produced chunks. Rules:
   integration date;
 - shallow-clone boundary commits contribute no timestamp; a chunk whose
   contributing lines all blame to a boundary commit has unknown git age;
-- the blame mapping is cached by blob OID plus the newest commit touching the
-  file's path, so unrelated commits do not invalidate it; history rewriting
-  changes the path-tip commit and invalidates correctly;
-- working-tree modified lines are labelled `working_tree` and order newer
-  than any committed line of the same document, without inventing a commit;
-- staged-but-never-committed and untracked files have no Git authorship time
-  in any mode and carry observed or unknown provenance;
+- the blame mapping cache key includes a hash of the exact file bytes being
+  blamed, the newest commit touching the file's path, and the shallow boundary
+  fingerprint. Worktree edits, path-history rewriting, and clone deepening
+  therefore invalidate correctly; unrelated commits and staging an unchanged
+  worktree file do not;
+- modified lines in an already tracked file are labelled `working_tree`
+  whether staged or unstaged and order newer than committed lines, without
+  inventing a commit;
+- newly added staged files and untracked files have no Git authorship time and
+  carry observed or unknown provenance;
 - filesystem modification time is never a fallback;
 - Git absence or a per-file blame failure emits a diagnostic and degrades
   that file to observed/unknown provenance without failing the scan.
@@ -257,27 +319,48 @@ Freshness is a bounded reordering, not a score. The pipeline is: BM25 and
 vector retrieval, reciprocal-rank fusion with deterministic tie-breaks, the
 optional model reranker — which receives path, breadcrumb, and content, and
 never temporal metadata — then freshness reordering, then truncation to
-`limit` and response-budget shedding.
+`limit` and response-budget shedding. Fusion and reranking retain at least
+`limit + max_rank_movement` candidates through freshness reordering whenever
+that many candidates exist.
 
-Reordering rule: run `max_rank_movement` bubble passes (default 2); an
-adjacent pair swaps only when the lower candidate is strictly newer under the
-partial order below and both sides carry comparable provenance. A candidate
-therefore rises or falls at most `max_rank_movement` positions, the bound is
-enforced by construction, and base relevance order is otherwise preserved.
+Reordering rule:
+
+1. Record every candidate's one-based relevance rank as `base_rank`.
+2. Scan adjacent pairs from rank 1 downward. A pair may swap only when the
+   lower candidate is strictly newer under the partial order below and both
+   candidates' resulting positions remain within `max_rank_movement` of their
+   own `base_rank`.
+3. Repeat the same top-to-bottom scan until a complete scan makes no swap.
+
+Every swap removes one comparable freshness inversion, so the procedure
+terminates. The original-rank guard, rather than the number of scans, enforces
+that each candidate rises or falls by at most `max_rank_movement`. Base
+relevance order is otherwise preserved.
 
 Comparable provenance and the partial order:
 
-- within git provenance: `working_tree` lines are newest, then latest author
-  time among contributing body lines;
-- within observed provenance: later observed transition beats earlier, by
-  snapshot sequence;
+- within git provenance: `working_tree` is newest, then latest author time
+  among contributing body lines;
+- within observed provenance: the later post-baseline `added` or
+  `body_changed` event wins by snapshot sequence; context-only and move-only
+  events retain the preceding observed value;
 - git-basis and observed-basis candidates are not comparable in v1 — their
   clocks differ — and never reorder against each other;
 - unknown provenance participates in no reordering and receives no advantage
   or penalty.
 
+A retrieval chunk has one basis, chosen deterministically: `working_tree` when
+any contributing body line has that label; otherwise `git` with the latest
+usable author time among its contributing lines; otherwise `observed` with the
+latest freshness-bearing block event whenever usable Git authorship is
+unavailable, including non-Git repositories, blame failures, untracked files,
+and newly staged files; and otherwise `unknown`. A chunk whose lines all map to
+shallow boundary commits is `unknown` unless a later local observed body event
+exists.
+
 Every hit exposes its freshness basis (`git`, `working_tree`, `observed`,
-`unknown`), timestamps or observation interval, base rank, and movement.
+`unknown`), Git timestamp or freshness-bearing observation snapshot sequence
+and timestamp, base rank, and movement.
 Compact agent output retains path, heading, lines, basis, and a
 human-readable changed/observed value. `--no-freshness` disables reordering
 for comparison while still reporting bases.
@@ -323,20 +406,14 @@ follow the same complete-response accounting as code search.
 
 Further failure-state machinery is deferred until the base feature is in use.
 
-## Retention and privacy
+## Retention
 
-Minimal in v1; there is no configurable retention subsystem, privacy mode, or
-purge command:
-
-- the active index stores current raw Markdown only;
-- the observation ledger retains retired hashes and temporal/transition
-  metadata, never retired raw bodies or rendered embedding text — an author's
-  deletion does not leave a recoverable copy in jscout;
-- content-addressed vectors remain durable for branch/revert reuse; vectors
-  carry reduced but non-zero information and this is documented rather than
-  mitigated in v1;
-- deleting `.jscout-docs.db` purges jscout's complete local documentation
-  state.
+- The published documentation snapshot stores the raw Markdown it currently
+  serves.
+- After a successful replacement snapshot, retired block bodies are removed
+  from logical storage. The ledger keeps hashes and transition metadata, and
+  the content-addressed vector cache may keep retired vectors.
+- Version one adds no retention configuration or purge command.
 
 ## Delivery and acceptance
 
@@ -350,24 +427,31 @@ Deterministic tests:
 - membership precedence is deterministic and visible: exclude beats include,
   ignore beats both, the hidden allowlist admits `.github`, `.claude`, and
   `.agents`, and `docs status` names the deciding rule;
-- front-matter recognition, fallback-to-body, and title derivation follow the
-  specified order; a rename changes no embedding identity;
-- block-aligned matching: inserting one paragraph yields exactly one `added`
-  occurrence and no succession rows for untouched text;
-- ordinal-only continuity never occurs; ambiguous split/merge produces no
-  predecessor;
-- heading renames produce `context_changed` only and refresh no body
-  freshness;
-- oversized fence/table/list splitting is deterministic and spans are exact;
-- a document with no body chunks yields exactly one searchable stub row;
+- front-matter recognition requires the specified top-level mapping and value
+  types; fallback-to-body and title derivation follow the specified order;
+- the embedding key hashes the exact versioned text sent to the embedder; a
+  file rename changes no embedding identity;
+- block-aligned matching: inserting one uniquely distinguishable paragraph
+  yields exactly one `added` block observation and no events for untouched
+  blocks, even when retrieval chunks regroup;
+- duplicate, ordinal-only, and ambiguous split/merge matches produce no
+  predecessor; combined edits retain every applicable change flag;
+- heading renames produce `context_changed` only; post-baseline additions and
+  body changes advance observed freshness, while context-only and move-only
+  changes do not;
+- every oversized block type splits deterministically, final rendered
+  representations stay within the hard byte bound, and source spans are exact;
+- a document with no body chunks yields exactly one searchable lexical-only
+  stub row;
 - BM25 works with no provider; `--vector` errors without one; hybrid RRF is
   deterministic across insertion order;
-- freshness movement never exceeds `max_rank_movement`; git and observed
-  candidates never reorder against each other; unknown provenance never
-  moves;
+- freshness movement from each candidate's recorded base rank never exceeds
+  `max_rank_movement`; git and observed candidates never reorder against each
+  other; unknown provenance never moves; a rank just outside `limit` can enter
+  the result when the bound permits;
 - shallow boundary commits yield unknown git age; rebase preserves author
   time and freshness ordering; the blame cache survives unrelated commits and
-  invalidates on path-history rewrite;
+  invalidates on worktree edits, path-history rewrite, and clone deepening;
 - a code reindex leaves documentation search available and vice versa; a
   failed docs scan leaves the prior snapshot searchable;
 - code and semantic snapshots, counts, and fingerprints are byte-identical
@@ -387,6 +471,5 @@ against movement bounds of 1–3.
 
 - FTS column weights, chunk-size bounds, and `max_rank_movement` default are
   evaluation hypotheses.
-- Whether `docs watch` ships with phase 4 or later.
 - Historical search, contradiction detection, MDX, remote documentation
   sources, and author-declared supersession remain out of scope.

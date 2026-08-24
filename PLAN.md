@@ -3188,46 +3188,52 @@ global schema version and structural-snapshot-gated opens — and that a
 multiplicative score decay is not bounded in effect once applied to
 rank-fusion scores. The revised decisions:
 
-1. Documentation lives in a separate `.jscout-docs.db` beside the configured
-   main database, with its own schema version, migration lifecycle, readiness
-   gate, last-good snapshot publication, and retry state. The main database,
-   structural snapshots, configuration fingerprints, watch generations, and
-   semantic freshness are untouched by every docs operation. Compatibility of
-   a committed `[docs]` configuration section with pre-docs binaries is not a
-   requirement.
+1. Documentation lives in a separately configured database, defaulting to
+   `<root>/.jscout-docs.db`, with its own schema version, migration lifecycle,
+   readiness gate, last-good snapshot publication, and retry state.
+   `[docs.database].path` overrides that default independently of the main
+   database path. The main database, structural snapshots, configuration
+   fingerprints, watch generations, and semantic freshness are untouched by
+   every docs operation. Compatibility of a committed `[docs]` configuration
+   section with pre-docs binaries is not a requirement.
 2. Corpus: ignore-aware `.md` inventory with a fixed root-level hidden
    allowlist (`.github`, `.claude`, `.agents`); Markdown block chunking that
    never crosses heading boundaries; one document-stub row for body-empty
-   documents; membership decisions reported per file by `docs status`.
+   documents; `docs status` reports the deciding rule for every encountered
+   file and pruned directory.
 3. Retrieval: BM25 always builds; vectors reuse the existing `[embedding]`
    provider, model, and service — no second provider section and no second
    local model; reciprocal-rank fusion; embedding identity is exactly
-   hash(format_version, nearest_heading, body), so file renames and
+   `hash(format_version, nearest_heading, rendered_body)`, where
+   `rendered_body` is the final text sent to the embedder, so file renames and
    ancestor-heading edits reuse vectors; the CLI contract is defined directly,
    with `--vector` meaning required vector participation and no vector-only
    mode existing.
-4. History: an append-only observation ledger inside the docs database.
-   Matching is conservative — exact content first, then underlying-block
-   alignment; ordinal position alone never establishes continuity; `removed`
-   is recorded only for confirmed inventory removal, never for a file
-   excluded by a read failure; baseline content without Git provenance has
-   unknown authorship time and is never presented as newly written.
+4. History: an append-only block-observation ledger inside the docs database,
+   separate from the current size-merged retrieval-chunk projection. Matching
+   is conservative and one-to-one — exact content first, then uniquely
+   neighbor-anchored edited blocks; ordinal position alone never establishes
+   continuity and ambiguous matches receive no predecessor. `removed` is
+   recorded only when a successfully parsed current corpus confirms a prior
+   block is absent, never when a file is unavailable because of a read or parse
+   failure; baseline content without Git provenance has unknown authorship time
+   and is never presented as newly written.
 5. Freshness: order-based and bounded, not a score multiplier. After
-   relevance fusion and optional reranking, at most `max_rank_movement`
-   (default 2) adjacent-swap positions, and only between candidates with
-   comparable provenance: git orders against git by latest author time with
-   working-tree lines newest, observed orders against observed by snapshot
-   sequence, git and observed never reorder against each other, and unknown
-   provenance never moves and is never advantaged. The model reranker never
-   receives temporal metadata. Shallow-clone boundary commits contribute no
-   timestamp; blame mappings cache by blob OID plus the path-tip commit;
-   filesystem mtime is never a fallback. `--no-freshness` preserves the
-   relevance order for comparison.
-6. Privacy: the ledger retains retired hashes and transition metadata, never
-   retired raw bodies or rendered embedding text; content-addressed vectors
-   remain durable for branch and revert reuse; no retention subsystem,
-   privacy mode, or purge command ships in v1. Deleting `.jscout-docs.db`
-   removes all local documentation state.
+   relevance fusion and optional reranking, each candidate's final rank differs
+   from its base rank by at most `max_rank_movement` (default 2), and swaps
+   occur only between candidates with comparable provenance: git orders
+   against git by latest author time with working-tree lines newest, observed
+   orders post-baseline `added` and `body_changed` events by snapshot sequence,
+   git and observed never reorder against each other, and unknown provenance
+   never moves and is never advantaged. The model reranker never receives
+   temporal metadata. Shallow-clone boundary commits contribute no timestamp;
+   blame mappings cache by exact file-byte hash, path-tip commit, and shallow
+   boundary fingerprint; filesystem mtime is never a fallback.
+   `--no-freshness` preserves the relevance order for comparison.
+6. Retention: current raw Markdown is stored for the active documentation
+   snapshot. After a successful replacement snapshot, retired block bodies are
+   not retained in the ledger; retired hashes, transition metadata, and
+   content-addressed vectors may remain. Version one adds no retention controls.
 
 Delivery: phase 1 is the corpus, BM25, `docs index`/`status`/`search
 --lexical-only`, the MCP documentation-search surface, and ledger recording;
@@ -3237,12 +3243,12 @@ phase 4 adds documentation-only watch. No implementation milestone is
 assigned and no current goal is displaced.
 
 Acceptance: a code reindex and any docs operation are mutually invisible,
-with foreign-plane state byte-identical either way; inserting one paragraph
-produces one `added` occurrence and no succession rows for untouched text;
-freshness movement never exceeds its configured bound and never crosses
-provenance bases; a repository with no `[embedding]` provider retains full
-lexical documentation search; retired bodies are unrecoverable from the docs
-database; and the subordinate detail document
+with foreign-plane state byte-identical either way; inserting one uniquely
+distinguishable paragraph produces one `added` block observation and no
+succession rows for untouched blocks; freshness movement never exceeds its
+configured bound and never crosses provenance bases; a repository with no
+`[embedding]` provider retains full lexical documentation search; and the
+subordinate detail document
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
 remains non-normative, this entry winning on any disagreement.
 
