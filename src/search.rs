@@ -211,7 +211,25 @@ pub struct ExhaustiveSearchMetadata {
     page_had_more: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseBudgetTooSmall {
+    pub byte_limit: usize,
+    pub minimum_bytes: usize,
+}
+
+impl std::fmt::Display for ResponseBudgetTooSmall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "response_budget_too_small: response byte limit {} cannot fit the minimum exhaustive response; minimum_bytes={}",
+            self.byte_limit, self.minimum_bytes
+        )
+    }
+}
+
+impl std::error::Error for ResponseBudgetTooSmall {}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
     #[serde(flatten)]
@@ -299,7 +317,7 @@ impl RetrievalStatus {
     }
 }
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ResponseBudget {
     pub byte_limit: usize,
     pub rendered_bytes: usize,
@@ -314,6 +332,10 @@ pub struct ResponseBudget {
     pub truncated_snippets: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_sections: Option<SearchSectionBytes>,
+    /// Render a retained exhaustive hit as a bare locator when the response
+    /// budget cannot carry even its compact follow-up hint.
+    #[serde(skip)]
+    pub(crate) exhaustive_locator_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -325,19 +347,7 @@ pub struct SearchSectionBytes {
     pub total_bytes: usize,
 }
 
-impl SearchSectionBytes {
-    fn reserved() -> Self {
-        Self {
-            hits_bytes: usize::MAX,
-            graph_bytes: usize::MAX,
-            memory_bytes: usize::MAX,
-            envelope_bytes: usize::MAX,
-            total_bytes: usize::MAX,
-        }
-    }
-}
-
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchExpansion {
     pub projection: ExpansionProjection,
     pub seeds: Vec<String>,
@@ -374,7 +384,7 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub chunk_id: i64,
     pub file: String,
@@ -1695,7 +1705,6 @@ pub fn search(
             expansion,
             response_budget: ResponseBudget {
                 byte_limit: options.response_byte_limit,
-                transport_sections: (!options.compact).then(SearchSectionBytes::reserved),
                 ..Default::default()
             },
         };
@@ -2428,9 +2437,28 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
     if byte_limit == 0 {
         anyhow::bail!("response byte limit must be greater than zero");
     }
-    if !compact && result.response_budget.transport_sections.is_none() {
-        result.response_budget.transport_sections = Some(SearchSectionBytes::reserved());
+    let exhaustive_baseline = result.exhaustive.is_some().then(|| result.clone());
+    if apply_response_budget_once(result, compact)? {
+        return Ok(());
     }
+    let rendered = result.response_budget.rendered_bytes;
+    if let Some(baseline) = exhaustive_baseline {
+        let minimum_bytes = minimum_exhaustive_response_bytes(&baseline, compact)?;
+        return Err(ResponseBudgetTooSmall {
+            byte_limit,
+            minimum_bytes,
+        }
+        .into());
+    }
+    anyhow::bail!(
+        "response byte limit {byte_limit} is below the minimum search envelope ({rendered} bytes)"
+    );
+}
+
+/// Apply one deterministic shedding pass. `false` means no retained response
+/// fits the requested limit; the caller decides which public error to return.
+fn apply_response_budget_once(result: &mut SearchResult, compact: bool) -> Result<bool> {
+    let byte_limit = result.response_budget.byte_limit;
 
     refresh_exhaustive_metadata(result);
     capture_unbudgeted_bytes(result, compact)?;
@@ -2447,7 +2475,8 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
 
     loop {
         refresh_exhaustive_metadata(result);
-        if settle_rendered_bytes(result, compact)? <= byte_limit {
+        let rendered = settle_search_response(result, compact)?;
+        if rendered <= byte_limit {
             break;
         }
         result.response_budget.truncated = true;
@@ -2516,8 +2545,24 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             continue;
         }
 
-        // Ranked hits are the primary product. Shed only lower-ranked hits;
-        // the top hit remains even when the requested byte limit is too small.
+        // Exhaustive pages must either retain at least one complete locator or
+        // fail. After shedding the complete first-page handoff, remove the
+        // remaining tools-only hints before dropping any locators so the
+        // rendered prefix stays as long as the byte limit permits. Anchor
+        // identity is never shortened because every retained locator must
+        // remain exact.
+        if compact
+            && !result.hits.is_empty()
+            && result.exhaustive.is_some()
+            && !result.response_budget.exhaustive_locator_only
+        {
+            result.response_budget.exhaustive_locator_only = true;
+            continue;
+        }
+
+        // Shed only from the tail: ranked search keeps its top hit, while an
+        // exhaustive page keeps a prefix whose cursor identifies the last
+        // rendered hit.
         if result.hits.len() > 1 {
             result.hits.pop();
             result.response_budget.omitted_hits += 1;
@@ -2542,17 +2587,17 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             hit.uses.pop();
             continue;
         }
-        if let Some(hit) = result
-            .hits
-            .iter_mut()
-            .rev()
-            .find(|hit| hit.anchors.len() > 1)
+        if result.exhaustive.is_none()
+            && let Some(hit) = result
+                .hits
+                .iter_mut()
+                .rev()
+                .find(|hit| hit.anchors.len() > 1)
         {
             hit.anchors.pop();
             continue;
         }
 
-        let rendered = result.response_budget.rendered_bytes;
         if let Some((index, _)) = result
             .hits
             .iter()
@@ -2571,25 +2616,13 @@ fn apply_response_budget(result: &mut SearchResult, compact: bool) -> Result<()>
             continue;
         }
 
-        let minimum = settle_rendered_bytes(result, compact)?;
-        anyhow::bail!(
-            "response byte limit {byte_limit} is below the minimum search envelope ({minimum} bytes)"
-        );
+        settle_search_response(result, compact)?;
+        return Ok(false);
     }
 
-    if !compact {
-        for _ in 0..8 {
-            let sections = crate::compact::search_section_bytes(result)?;
-            if result.response_budget.transport_sections == Some(sections) {
-                break;
-            }
-            result.response_budget.transport_sections = Some(sections);
-            settle_rendered_bytes(result, compact)?;
-        }
-    }
     refresh_exhaustive_metadata(result);
-    settle_rendered_bytes(result, compact)?;
-    Ok(())
+    settle_search_response(result, compact)?;
+    Ok(true)
 }
 
 fn cap_semantic_supports(result: &mut SearchResult, limit: usize) {
@@ -2673,15 +2706,59 @@ fn settle_rendered_bytes(result: &mut SearchResult, compact: bool) -> Result<usi
     rendered_bytes(result, compact)
 }
 
+/// Settle the exact transport that the caller will receive. Diagnostic output
+/// includes compact-section accounting, so placeholder widths cannot be used
+/// to decide whether a response fits or to advertise a retry floor.
+fn settle_search_response(result: &mut SearchResult, compact: bool) -> Result<usize> {
+    if compact {
+        return settle_rendered_bytes(result, true);
+    }
+    for _ in 0..8 {
+        let sections = crate::compact::search_section_bytes(result)?;
+        result.response_budget.transport_sections = Some(sections);
+        let rendered = settle_rendered_bytes(result, false)?;
+        if crate::compact::search_section_bytes(result)? == sections {
+            return Ok(rendered);
+        }
+    }
+    let sections = crate::compact::search_section_bytes(result)?;
+    result.response_budget.transport_sections = Some(sections);
+    settle_rendered_bytes(result, false)
+}
+
 fn capture_unbudgeted_bytes(result: &mut SearchResult, compact: bool) -> Result<usize> {
     for _ in 0..8 {
-        let rendered = settle_rendered_bytes(result, compact)?;
+        let rendered = settle_search_response(result, compact)?;
         if result.response_budget.unbudgeted_bytes == rendered {
             return Ok(rendered);
         }
         result.response_budget.unbudgeted_bytes = rendered;
     }
-    settle_rendered_bytes(result, compact)
+    settle_search_response(result, compact)
+}
+
+/// Find the first byte limit for which the real budgeting pass succeeds. The
+/// baseline is cloned before any shedding, so initial and empty responses are
+/// candidates and every probe recomputes retry-dependent diagnostic fields.
+fn minimum_exhaustive_response_bytes(baseline: &SearchResult, compact: bool) -> Result<usize> {
+    let mut upper_candidate = baseline.clone();
+    upper_candidate.response_budget.byte_limit = usize::MAX;
+    if !apply_response_budget_once(&mut upper_candidate, compact)? {
+        anyhow::bail!("exhaustive response did not fit the maximum byte limit");
+    }
+    let mut lower = 1_usize;
+    let mut upper = upper_candidate.response_budget.rendered_bytes;
+    while lower < upper {
+        let candidate_limit = lower + (upper - lower) / 2;
+        let mut candidate = baseline.clone();
+        candidate.response_budget.byte_limit = candidate_limit;
+        if apply_response_budget_once(&mut candidate, compact)? {
+            upper = candidate_limit;
+        } else {
+            lower = candidate_limit + 1;
+        }
+    }
+    Ok(lower)
 }
 
 fn rendered_bytes(result: &SearchResult, compact: bool) -> Result<usize> {

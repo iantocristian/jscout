@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-20.
+> Status: authoritative plan as of 2026-08-24.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -19,8 +19,8 @@
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
 > is the compact-transport and path-projection pass. G21 repository-local
 > runtime configuration and retrieval observability are implemented. G22
-> exhaustive lexical search and G23 skill investigation/inquiry loops are
-> planned from the production traces. None triggers G16 or
+> exhaustive lexical search is implemented; G23 skill investigation/inquiry
+> loops are planned from the production traces. Neither triggers G16 or
 > widens the semantic product surface, and no retrieval default changes without
 > a same-binary, same-snapshot comparison.
 
@@ -3034,7 +3034,7 @@ migration boundary, phased implementation, tests, and acceptance criteria are
 in the
 [repository runtime configuration implementation plan](docs/repository-configuration-plan-2026-08-20.md).
 
-## Planned G22 — exhaustive lexical search contract
+## Implemented G22 — exhaustive lexical search contract
 
 A production investigation (the links-iteration convention check,
 2026-08-22) ran twelve `vector: false` searches at `limit: 10` over a bounded
