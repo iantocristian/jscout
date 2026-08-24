@@ -311,6 +311,14 @@ fn embedding_profile_versions_the_document_text_format() -> anyhow::Result<()> {
     let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
     assert_eq!(config["document_text"], DOCUMENT_TEXT_FORMAT);
 
+    let markdown_profile = provider.profile_for(crate::docs::CHUNK_FORMAT_VERSION)?;
+    let markdown_config: serde_json::Value = serde_json::from_str(&markdown_profile.config_json)?;
+    assert_eq!(
+        markdown_config["document_text"],
+        crate::docs::CHUNK_FORMAT_VERSION
+    );
+    assert_ne!(profile.fingerprint, markdown_profile.fingerprint);
+
     let old_config = serde_json::json!({
         "protocol": "openai-embeddings-v1",
         "url": "https://example.test/v1/embeddings",

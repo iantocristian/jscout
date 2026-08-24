@@ -88,6 +88,11 @@ jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only witho
                                #   add --expand for a bounded structural context pack
                                #   --no-vector, --no-rerank, or --lexical-only control stages
                                #   --json is compact; --debug-json retains diagnostics
+jscout docs index <root>       # publish Markdown into the separate .jscout-docs.db
+jscout docs search <root> Q    # BM25 plus ready shared-profile vectors
+                               #   --lexical-only needs no embedding provider
+jscout docs embed <root>       # embed missing Markdown representations
+jscout docs status <root>      # corpus decisions, history, and vector readiness
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
                                #   compact JSON by default; --debug-json for diagnostics
@@ -152,6 +157,32 @@ jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
 jscout agent-guide --install R # install a project-local jscout skill
 ```
+
+### Markdown documentation retrieval
+
+Repository Markdown is indexed independently from code and semantic memory.
+`jscout docs index` deterministically captures configured `.md` files, builds
+BM25, records block observations, and atomically publishes a last-good snapshot
+in `.jscout-docs.db`. It neither creates nor changes `.jscout.db`.
+
+```bash
+jscout docs index /path/to/repo
+jscout docs search /path/to/repo "current deployment procedure" --lexical-only
+
+# Optional: reuse the existing [embedding] provider and model.
+jscout docs embed /path/to/repo
+jscout docs search /path/to/repo "current deployment procedure"
+```
+
+Vector search joins BM25 only when the current documentation snapshot has a
+complete vector generation for the configured shared profile. Ordinary search
+falls back to BM25 when vectors are absent; `--vector` requires vector
+participation and fails instead. The MCP `documentation_search` tool exposes
+the same separate corpus. Membership defaults to `**/*.md`; configure it with
+`[docs]`, and override the independent database with
+`[docs.database].path`. Observed-freshness rank movement is available for the
+phase-3 evaluation but remains disabled by default until Git provenance and
+the freshness evaluation gate are complete.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:
@@ -857,12 +888,14 @@ unsupported versions, invalid endpoints, missing configured sidecars, and
 contradictory watch settings fail before a database is opened or a sidecar is
 started.
 
-The first writer command creates missing parent directories for the configured
-database path, so `database.path = ".jscout/jscout.db"` needs no preparatory
-`mkdir`. Read-only search and MCP startup remain non-mutating: they require an
-already published database and never create a missing path.
+The first writer command creates missing parent directories for its configured
+database path, so `database.path = ".jscout/jscout.db"` and
+`docs.database.path = ".jscout/docs.db"` need no preparatory `mkdir`.
+Read-only search and MCP startup remain non-mutating: they require each
+selected plane's already-published database and never create a missing path.
 
-The file configures the database; retrieval defaults and budgets; embedding,
+The file configures the independent code and documentation databases;
+documentation membership; retrieval defaults and budgets; embedding,
 reranker, and local-inference models; LLM/provider metadata and scouting
 concurrency; Node/gateway and
 checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
@@ -1353,8 +1386,8 @@ inputs; keep it with restricted raw eval artifacts, not in the repository.
 
 ## Storage
 
-Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
-`.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, classified
+Code structure and semantic memory live in `.jscout.db`: chunks + FTS5
+(BM25), symbols, import/export tables, classified
 references, event/member-call sites, provenance-keyed embedding caches,
 dimension-specific sqlite-vec indexes, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
@@ -1366,6 +1399,12 @@ file rows and are refreshed even when source hashes are unchanged. Files also
 carry `repository`, `workspace`, or `dependency` origin plus optional package
 instance/path identity. Package instances record canonical root, name, version,
 locator, manifest hash, and completeness status.
+
+Repository Markdown lives in the independent `.jscout-docs.db`, with its own
+schema, root binding, snapshots, FTS, block-observation ledger, embedding cache,
+and vector readiness generations. Neither database is attached to or migrated
+by operations on the other plane. Both default files and their WAL sidecars
+are listed in this repository's `.gitignore`.
 
 Agent-authored and generated `workflow`, `card`, `summary`, `concept`, and
 `annotation` records live in separate `semantic_artifacts`/

@@ -70,7 +70,7 @@ Documentation settings live in the existing repository configuration:
 [docs]
 include = ["**/*.md"]
 exclude = []
-freshness = true
+freshness = false
 max_rank_movement = 2
 
 [docs.database]
@@ -82,6 +82,11 @@ rerank = true
 limit = 10
 response_bytes = 24000
 ```
+
+Freshness remains disabled by default until the phase-3 Git/observed
+evaluation gate reports and the default is explicitly accepted. Setting it to
+`true` is an evaluation override; the observation ledger is still recorded
+while rank movement is disabled.
 
 `[docs.database]` is optional; its path defaults to `.jscout-docs.db` and is
 resolved relative to the indexed root. It is independent of `[database].path`.

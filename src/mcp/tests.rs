@@ -6,12 +6,105 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile, call_tool,
-    definition_source_metrics, duration_ms, expansion_role_metrics, log_request,
-    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, tool_defs,
+    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile, available_tool_defs,
+    call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
+    expansion_role_metrics, log_request, open_mcp_connection, render_bounded_items,
+    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
+    server_instructions_for_readiness, sum_durations, tool_defs,
 };
-use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
+use crate::{
+    config,
+    docs::{corpus, store as docs_store},
+    embed, indexer,
+    scout::SourceView,
+    search, store, structural,
+};
+
+#[test]
+fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the blue release channel.\n",
+    )?;
+    let main_database_path = repo.path().join(store::DB_FILE);
+    let conn = store::open(repo.path())?;
+    let corpus = corpus::scan(repo.path(), &corpus::CorpusOptions::default())?;
+    let docs_database_path = repo.path().join(crate::docs::DB_FILE);
+    let mut docs = docs_store::DocsStore::open(
+        repo.path(),
+        Some(&docs_database_path),
+        Some(&main_database_path),
+    )?;
+    docs.publish(&corpus)?;
+    drop(docs);
+
+    let (_inert, code_ready, code_error) =
+        open_mcp_connection(repo.path(), &main_database_path, &docs_database_path)?;
+    assert!(!code_ready);
+    assert!(code_error.is_some());
+
+    let defaults = config::DocsSettings {
+        include: vec!["**/*.md".into()],
+        exclude: Vec::new(),
+        freshness: true,
+        max_rank_movement: 2,
+        database: config::DocsDatabaseSettings {
+            path: docs_database_path,
+        },
+        search: config::DocsSearchSettings {
+            vector: false,
+            rerank: false,
+            limit: 10,
+            response_bytes: 24_000,
+        },
+    };
+    let rendered = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &main_database_path,
+        &json!({ "query": "blue release" }),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["hits"][0]["path"], "README.md");
+    assert_eq!(value["hits"][0]["heading"], "Deployment");
+    assert_eq!(value["hits"][0]["source_state"], "current");
+    assert_eq!(value["retrieval"]["vector"], "disabled");
+    assert!(
+        tool_defs(ToolProfile::Baseline)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "documentation_search")
+    );
+    let docs_only = available_tool_defs(ToolProfile::Structural, false);
+    assert_eq!(docs_only.as_array().unwrap().len(), 1);
+    assert_eq!(docs_only[0]["name"], "documentation_search");
+    assert!(
+        server_instructions_for_readiness(ToolProfile::Structural, false)
+            .contains("Only the independent repository documentation plane is ready")
+    );
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the red release channel.\n",
+    )?;
+    let stale = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &main_database_path,
+        &json!({ "query": "blue release" }),
+    )?;
+    let stale: serde_json::Value = serde_json::from_str(&stale)?;
+    assert_eq!(stale["hits"][0]["source_state"], "source_mismatch");
+    assert_eq!(stale["hits"][0]["source_detail"], "hash_mismatch");
+    assert_eq!(stale["hits"][0]["content"], "Use the blue release channel.");
+    Ok(())
+}
 
 #[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {

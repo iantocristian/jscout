@@ -7,7 +7,7 @@ use super::{
     Cli, Command, ConfigCommand, ScoutCommand, effective_search_response_byte_limit, or_configured,
     render_cli_neighborhood, render_semantic_memory_text, resolve_flag,
 };
-use crate::{semantic::SemanticArtifact, structural};
+use crate::{cli::DocsCommand, semantic::SemanticArtifact, structural};
 use clap::Parser;
 
 #[test]
@@ -187,6 +187,67 @@ fn lexical_only_and_rerank_controls_parse_independently() {
     assert!(expand);
     assert_eq!(expand_mode.as_deref(), Some("neighborhood"));
     assert_eq!(expand_paths, Some(12));
+}
+
+#[test]
+fn documentation_commands_and_required_vector_controls_parse() {
+    let Cli { command, .. } = Cli::try_parse_from([
+        "jscout",
+        "docs",
+        "search",
+        ".",
+        "release guide",
+        "--vector",
+        "--no-rerank",
+        "--no-freshness",
+        "--limit",
+        "7",
+    ])
+    .expect("documentation search parses");
+    let Command::Docs {
+        command:
+            DocsCommand::Search {
+                query,
+                vector,
+                no_rerank,
+                no_freshness,
+                limit,
+                ..
+            },
+    } = command
+    else {
+        panic!("expected documentation search")
+    };
+    assert_eq!(query, "release guide");
+    assert!(vector);
+    assert!(no_rerank);
+    assert!(no_freshness);
+    assert_eq!(limit, Some(7));
+
+    assert!(
+        Cli::try_parse_from([
+            "jscout",
+            "docs",
+            "search",
+            ".",
+            "query",
+            "--vector",
+            "--lexical-only",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "jscout",
+            "docs",
+            "search",
+            ".",
+            "query",
+            "--json",
+            "--debug-json",
+        ])
+        .is_err()
+    );
 }
 
 #[test]

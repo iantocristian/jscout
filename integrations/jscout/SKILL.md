@@ -1,6 +1,6 @@
 ---
 name: jscout
-description: Use the jscout repository index to investigate known identifiers completely or answer causal and cross-file questions with source-backed evidence in an indexed JavaScript or TypeScript project.
+description: Use the jscout repository indexes to search authored Markdown, investigate known identifiers completely, or answer causal and cross-file questions with source-backed evidence in an indexed JavaScript or TypeScript project.
 ---
 
 # jscout repository guide
@@ -10,6 +10,19 @@ then verify decisive claims in current source. Choose the loop that matches the
 question instead of running every retrieval surface. The Inquiry loop requires
 the structural profile's memory and graph tools; when they are unavailable,
 use the Investigation loop and exact source tools or switch profiles.
+
+## Authored repository documentation
+
+Use `documentation_search` when the question is about repository Markdown,
+written procedures, design notes, or current authored guidance. This is a
+separate documentation snapshot and result type; do not treat a documentation
+hit as code-search evidence or semantic memory. Start with the default hybrid
+posture. Set `vector: false` for a BM25-only comparison, and set
+`require_vector: true` only when failure is preferable to lexical fallback.
+Use returned path, heading, line range, documentation snapshot, and indexed
+file hash as the evidence boundary. Conflicting prose remains authored source,
+not runtime proof; verify behavior in code when the answer depends on what the
+software actually does.
 
 ## Investigation loop: known identifiers and conventions
 

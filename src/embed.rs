@@ -30,15 +30,15 @@ pub struct Provider {
 }
 
 #[derive(Clone, Debug)]
-struct ProfileSpec {
-    provider: String,
-    model: String,
-    fingerprint: String,
-    config_json: String,
-    dimensions: Option<usize>,
+pub(crate) struct ProfileSpec {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) fingerprint: String,
+    pub(crate) config_json: String,
+    pub(crate) dimensions: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedProfile {
     pub id: i64,
     pub dimensions: usize,
@@ -133,9 +133,9 @@ pub(crate) fn code_vector_failure_action(error: &anyhow::Error) -> &'static str 
     vector_failure_action(error, "run jscout embed <root> --repair")
 }
 
-struct EmbeddingResponse {
-    vectors: Vec<Vec<f32>>,
-    profile_fingerprint: Option<String>,
+pub(crate) struct EmbeddingResponse {
+    pub(crate) vectors: Vec<Vec<f32>>,
+    pub(crate) profile_fingerprint: Option<String>,
 }
 
 fn default_query_prefix(model: &str) -> &'static str {
@@ -248,6 +248,10 @@ impl Provider {
     }
 
     fn profile(&self) -> Result<ProfileSpec> {
+        self.profile_for(DOCUMENT_TEXT_FORMAT)
+    }
+
+    pub(crate) fn profile_for(&self, document_text_format: &str) -> Result<ProfileSpec> {
         let (configuration, dimensions) = match self.protocol {
             Protocol::Local => {
                 let base = self
@@ -282,7 +286,7 @@ impl Provider {
                 (
                     json!({
                         "protocol": "jscout-local-v1",
-                        "document_text": DOCUMENT_TEXT_FORMAT,
+                        "document_text": document_text_format,
                         "embedding": embedding,
                     }),
                     Some(dimensions),
@@ -291,7 +295,7 @@ impl Provider {
             Protocol::Voyage => (
                 json!({
                     "protocol": "voyage-v1",
-                    "document_text": DOCUMENT_TEXT_FORMAT,
+                    "document_text": document_text_format,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                     "revision": self.revision,
@@ -301,7 +305,7 @@ impl Provider {
             Protocol::OpenAi => (
                 json!({
                     "protocol": "openai-embeddings-v1",
-                    "document_text": DOCUMENT_TEXT_FORMAT,
+                    "document_text": document_text_format,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                     "revision": self.revision,
@@ -367,15 +371,36 @@ impl Provider {
     }
 
     fn embed_documents(&self, texts: &[String]) -> Result<EmbeddingResponse> {
-        self.embed_texts(texts, false)
+        self.embed_documents_for(texts, DOCUMENT_TEXT_FORMAT)
+    }
+
+    pub(crate) fn embed_documents_for(
+        &self,
+        texts: &[String],
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
+        self.embed_texts(texts, false, document_text_format)
     }
 
     fn embed_query(&self, text: &str) -> Result<EmbeddingResponse> {
-        let text = format!("{}{}", self.query_prefix, text);
-        self.embed_texts(&[text], true)
+        self.embed_query_for(text, DOCUMENT_TEXT_FORMAT)
     }
 
-    fn embed_texts(&self, texts: &[String], query: bool) -> Result<EmbeddingResponse> {
+    pub(crate) fn embed_query_for(
+        &self,
+        text: &str,
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
+        let text = format!("{}{}", self.query_prefix, text);
+        self.embed_texts(&[text], true, document_text_format)
+    }
+
+    fn embed_texts(
+        &self,
+        texts: &[String],
+        query: bool,
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
         let body = match self.protocol {
             Protocol::Local => json!({
                 "model": self.model,
@@ -409,7 +434,7 @@ impl Provider {
             }
             let configuration = json!({
                 "protocol": "jscout-local-v1",
-                "document_text": DOCUMENT_TEXT_FORMAT,
+                "document_text": document_text_format,
                 "embedding": {
                     "model": response["model"],
                     "dimensions": response["dimensions"],
@@ -1828,7 +1853,10 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
-fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse) -> Result<()> {
+pub(crate) fn validate_response_profile(
+    profile: &ProfileSpec,
+    response: &EmbeddingResponse,
+) -> Result<()> {
     if let Some(fingerprint) = &response.profile_fingerprint
         && fingerprint != &profile.fingerprint
     {

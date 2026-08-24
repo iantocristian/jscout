@@ -62,6 +62,8 @@ mod tests {
             "one orientation expansion",
             "Restart the affected exhaustive traversal",
             "repository convention",
+            "documentation_search",
+            "separate documentation snapshot",
         ] {
             assert!(GUIDE.contains(marker), "missing guide contract: {marker}");
         }

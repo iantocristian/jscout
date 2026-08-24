@@ -6,6 +6,21 @@ version = 1
 [database]
 path = ".jscout.db"
 
+[docs]
+include = ["**/*.md"]
+exclude = []
+freshness = false
+max_rank_movement = 2
+
+[docs.database]
+path = ".jscout-docs.db"
+
+[docs.search]
+vector = true
+rerank = true
+limit = 10
+response_bytes = 24000
+
 [search]
 vector = true
 rerank = true

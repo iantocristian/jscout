@@ -4,10 +4,10 @@ mod model;
 
 pub use load::init;
 pub use model::{
-    DatabaseSettings, DiagnosticsSettings, EffectiveConfig, EmbeddingSettings, ExpansionSettings,
-    IndexSettings, InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel,
-    OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig, SearchSettings, SidecarSettings,
-    TelemetrySettings, ValueSource, WatchSettings,
+    DatabaseSettings, DiagnosticsSettings, DocsDatabaseSettings, DocsSearchSettings, DocsSettings,
+    EffectiveConfig, EmbeddingSettings, ExpansionSettings, IndexSettings, InferenceSettings,
+    LlmSettings, McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider, RerankerSettings,
+    RuntimeConfig, SearchSettings, SidecarSettings, TelemetrySettings, ValueSource, WatchSettings,
 };
 
 #[cfg(test)]

@@ -18,6 +18,18 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
         config.effective.database.path,
         root.path().canonicalize()?.join(".jscout.db")
     );
+    assert_eq!(
+        config.effective.docs.database.path,
+        root.path().canonicalize()?.join(".jscout-docs.db")
+    );
+    assert_eq!(config.effective.docs.include, ["**/*.md"]);
+    assert!(config.effective.docs.exclude.is_empty());
+    assert!(!config.effective.docs.freshness);
+    assert_eq!(config.effective.docs.max_rank_movement, 2);
+    assert!(config.effective.docs.search.vector);
+    assert!(config.effective.docs.search.rerank);
+    assert_eq!(config.effective.docs.search.limit, 10);
+    assert_eq!(config.effective.docs.search.response_bytes, 24_000);
     assert!(config.effective.search.vector);
     assert!(config.effective.search.rerank);
     assert!(!config.effective.search.attach_memory);
@@ -25,6 +37,7 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert_eq!(config.effective.search.expansion.mode, "paths");
     assert_eq!(config.effective.search.expansion.paths, 8);
     assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
+    assert_eq!(config.sources["docs.database.path"], ValueSource::Builtin);
     Ok(())
 }
 
@@ -36,6 +49,18 @@ fn repository_config_resolves_paths_and_records_sources() -> anyhow::Result<()> 
         r#"version = 1
 [database]
 path = "state/index.db"
+[docs]
+include = ["**/*.md", ".github/*.md"]
+exclude = ["archive/**"]
+freshness = false
+max_rank_movement = 4
+[docs.database]
+path = "state/docs.db"
+[docs.search]
+vector = false
+rerank = false
+limit = 7
+response_bytes = 12000
 [search]
 rerank = false
 attach_memory = false
@@ -50,12 +75,71 @@ file = "logs/mcp.jsonl"
         root.path().canonicalize()?.join("state/index.db")
     );
     assert_eq!(
+        config.effective.docs.database.path,
+        root.path().canonicalize()?.join("state/docs.db")
+    );
+    assert_ne!(
+        config.effective.database.path,
+        config.effective.docs.database.path
+    );
+    assert_eq!(config.effective.docs.include, ["**/*.md", ".github/*.md"]);
+    assert_eq!(config.effective.docs.exclude, ["archive/**"]);
+    assert!(!config.effective.docs.freshness);
+    assert_eq!(config.effective.docs.max_rank_movement, 4);
+    assert!(!config.effective.docs.search.vector);
+    assert!(!config.effective.docs.search.rerank);
+    assert_eq!(config.effective.docs.search.limit, 7);
+    assert_eq!(config.effective.docs.search.response_bytes, 12_000);
+    assert_eq!(
         config.effective.telemetry.file,
         Some(root.path().canonicalize()?.join("logs/mcp.jsonl"))
     );
     assert!(!config.effective.search.rerank);
     assert!(!config.effective.search.attach_memory);
     assert_eq!(config.sources["search.rerank"], ValueSource::Config);
+    assert_eq!(config.sources["docs.database.path"], ValueSource::Config);
+    assert_eq!(config.sources["docs.search.limit"], ValueSource::Config);
+    let shown = config.show_text();
+    assert!(shown.contains("docs: database="));
+    assert!(shown.contains("docs-search: vector=false rerank=false limit=7 response_bytes=12000"));
+    let json = config.show_json()?;
+    assert!(json.contains("\"docs\""));
+    assert!(json.contains("state/docs.db"));
+    Ok(())
+}
+
+#[test]
+fn documentation_database_path_is_independent_of_main_database_path() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(
+        root.path(),
+        "version = 1\n[database]\npath = \"state/code.db\"\n",
+    )?;
+    let defaults = RuntimeConfig::load(Some(root.path()), None)?;
+    let canonical_root = root.path().canonicalize()?;
+    assert_eq!(
+        defaults.effective.docs.database.path,
+        canonical_root.join(".jscout-docs.db")
+    );
+
+    write_config(
+        root.path(),
+        "version = 1\n[database]\npath = \"state/code.db\"\n[docs.database]\npath = \"other/docs.db\"\n",
+    )?;
+
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(
+        config.effective.database.path,
+        canonical_root.join("state/code.db")
+    );
+    assert_eq!(
+        config.effective.docs.database.path,
+        canonical_root.join("other/docs.db")
+    );
+    assert_eq!(
+        defaults.fingerprint, config.fingerprint,
+        "docs-only configuration must not change the code-plane fingerprint"
+    );
     Ok(())
 }
 
@@ -91,6 +175,10 @@ fn unknown_fields_and_versions_fail_with_the_configuration_path() -> anyhow::Res
     let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
     assert!(error.to_string().contains(FILE_NAME));
 
+    write_config(root.path(), "version = 1\n[docs]\nfreshnes = false\n")?;
+    let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+    assert!(error.to_string().contains(FILE_NAME));
+
     write_config(root.path(), "version = 99\n")?;
     let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
     assert!(
@@ -98,6 +186,37 @@ fn unknown_fields_and_versions_fail_with_the_configuration_path() -> anyhow::Res
             .to_string()
             .contains("unsupported jscout configuration version")
     );
+    Ok(())
+}
+
+#[test]
+fn documentation_globs_and_positive_bounds_fail_during_load() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    for (text, expected) in [
+        (
+            "version = 1\n[docs]\ninclude = [\"!private/**\"]\n",
+            "documentation include/exclude patterns",
+        ),
+        (
+            "version = 1\n[docs]\nmax_rank_movement = 0\n",
+            "docs.max_rank_movement",
+        ),
+        (
+            "version = 1\n[docs.search]\nlimit = 0\n",
+            "docs.search.limit",
+        ),
+        (
+            "version = 1\n[docs.search]\nresponse_bytes = 0\n",
+            "docs.search.response_bytes",
+        ),
+    ] {
+        write_config(root.path(), text)?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in `{error:#}`"
+        );
+    }
     Ok(())
 }
 
@@ -209,6 +328,9 @@ fn init_refuses_to_overwrite_and_emits_the_current_schema() -> anyhow::Result<()
     assert_eq!(loaded.effective.mcp.result_transport, "auto");
     assert!(init(root.path(), None).is_err());
     assert!(TEMPLATE.contains("rerank = true"));
+    assert!(TEMPLATE.contains("[docs.database]"));
+    assert!(TEMPLATE.contains("path = \".jscout-docs.db\""));
+    assert!(TEMPLATE.contains("freshness = false"));
     Ok(())
 }
 

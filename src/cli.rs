@@ -25,6 +25,11 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Index, embed, search, or inspect repository Markdown documentation
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
     /// Parse a repository and print structural statistics
     Stats {
         /// Repository root
@@ -551,6 +556,86 @@ pub(super) enum Command {
     Scout {
         #[command(subcommand)]
         command: ScoutCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(super) enum DocsCommand {
+    /// Build and transactionally publish the current Markdown corpus and BM25 index
+    Index {
+        /// Repository root
+        root: PathBuf,
+        /// Use a documentation database at this path instead of the configured path
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Emit JSON instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Materialize missing vectors for the current documentation snapshot
+    Embed {
+        /// Repository root whose documentation snapshot is already indexed
+        root: PathBuf,
+        /// Use a documentation database at this path instead of the configured path
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Batch size per embedding request
+        #[arg(long)]
+        batch: Option<usize>,
+        /// Emit JSON instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search the current Markdown corpus with BM25 and optional vectors
+    Search {
+        /// Repository root whose documentation snapshot is already indexed
+        root: PathBuf,
+        /// Natural-language or identifier query
+        query: String,
+        /// Use a documentation database at this path instead of the configured path
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Maximum returned chunks
+        #[arg(short = 'k', long)]
+        limit: Option<usize>,
+        /// Require vector participation; error instead of degrading to BM25
+        #[arg(long, conflicts_with_all = ["no_vector", "lexical_only"])]
+        vector: bool,
+        /// Skip vector retrieval even when configured and ready
+        #[arg(long, conflicts_with = "vector")]
+        no_vector: bool,
+        /// Use BM25 only (equivalent to --no-vector --no-rerank)
+        #[arg(long)]
+        lexical_only: bool,
+        /// Enable model reranking, overriding repository configuration
+        #[arg(long, conflicts_with_all = ["no_rerank", "lexical_only"])]
+        rerank: bool,
+        /// Skip model reranking even when configured
+        #[arg(long, conflicts_with = "rerank")]
+        no_rerank: bool,
+        /// Disable bounded temporal reordering for relevance comparison
+        #[arg(long)]
+        no_freshness: bool,
+        /// Maximum bytes in the complete rendered response
+        #[arg(long)]
+        response_bytes: Option<usize>,
+        /// Emit compact agent JSON
+        #[arg(long, conflicts_with = "debug_json")]
+        json: bool,
+        /// Emit full retrieval diagnostics as JSON
+        #[arg(long, conflicts_with = "json")]
+        debug_json: bool,
+    },
+    /// Report the published corpus, rejections, history, and vector readiness
+    Status {
+        /// Repository root
+        root: PathBuf,
+        /// Use a documentation database at this path instead of the configured path
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Emit JSON instead of a human-readable summary
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -5,15 +5,16 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
-    DatabaseSettings, DiagnosticsSettings, EffectiveConfig, EmbeddingSettings, ExpansionSettings,
-    FILE_NAME, IndexSettings, InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel,
-    OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings,
-    SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource, WatchSettings,
+    DatabaseSettings, DiagnosticsSettings, DocsDatabaseSettings, DocsSearchSettings, DocsSettings,
+    EffectiveConfig, EmbeddingSettings, ExpansionSettings, FILE_NAME, IndexSettings,
+    InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider,
+    RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE,
+    TelemetrySettings, ValueSource, WatchSettings,
 };
-use crate::{file_role, origin, search, store};
+use crate::{docs, file_role, origin, search, store};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,8 @@ struct FileConfig {
     version: u32,
     #[serde(default)]
     database: DatabaseFileConfig,
+    #[serde(default)]
+    docs: DocsFileConfig,
     #[serde(default)]
     search: SearchFileConfig,
     #[serde(default)]
@@ -49,6 +52,34 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct DatabaseFileConfig {
     path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsFileConfig {
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    freshness: Option<bool>,
+    max_rank_movement: Option<usize>,
+    #[serde(default)]
+    database: DocsDatabaseFileConfig,
+    #[serde(default)]
+    search: DocsSearchFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsDatabaseFileConfig {
+    path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsSearchFileConfig {
+    vector: Option<bool>,
+    rerank: Option<bool>,
+    limit: Option<usize>,
+    response_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,6 +233,25 @@ struct WatchFileConfig {
     enrich_timeout_seconds: Option<u64>,
     debounce_ms: Option<u64>,
     reconcile_seconds: Option<u64>,
+}
+
+/// The established runtime fingerprint belongs to the code plane. Keep the
+/// independent documentation settings out of its preimage so changing only
+/// `[docs]` cannot invalidate code-plane configuration identities.
+#[derive(Serialize)]
+struct CodeFingerprintSettings<'a> {
+    database: &'a DatabaseSettings,
+    search: &'a SearchSettings,
+    embedding: &'a EmbeddingSettings,
+    inference: &'a InferenceSettings,
+    reranker: &'a RerankerSettings,
+    llm: &'a LlmSettings,
+    sidecars: &'a SidecarSettings,
+    mcp: &'a McpSettings,
+    telemetry: &'a TelemetrySettings,
+    diagnostics: &'a DiagnosticsSettings,
+    index: &'a IndexSettings,
+    watch: &'a WatchSettings,
 }
 
 struct Resolver {
@@ -384,6 +434,53 @@ impl RuntimeConfig {
             PathBuf::from(store::DB_FILE)
         } else {
             resolve_path(root.as_deref(), &database_value, false)?
+        };
+
+        let docs_database_configured = raw.docs.database.path.is_some();
+        let docs_database_value = resolver.string(
+            "docs.database.path",
+            raw.docs.database.path,
+            None,
+            docs::DB_FILE,
+        );
+        let docs_database_path = if root.is_none() && !docs_database_configured {
+            PathBuf::from(docs::DB_FILE)
+        } else {
+            resolve_path(root.as_deref(), &docs_database_value, false)?
+        };
+        let docs_include = resolver.configured_or(
+            "docs.include",
+            raw.docs.include,
+            vec!["**/*.md".to_string()],
+        );
+        let docs_exclude =
+            resolver.configured_or("docs.exclude", raw.docs.exclude, Vec::<String>::new());
+        docs::corpus::validate_patterns(&docs_include, &docs_exclude)
+            .context("validate documentation include/exclude patterns")?;
+        let docs = DocsSettings {
+            include: docs_include,
+            exclude: docs_exclude,
+            freshness: resolver.bool("docs.freshness", raw.docs.freshness, None, false)?,
+            max_rank_movement: resolver.usize(
+                "docs.max_rank_movement",
+                raw.docs.max_rank_movement,
+                None,
+                2,
+            )?,
+            database: DocsDatabaseSettings {
+                path: docs_database_path,
+            },
+            search: DocsSearchSettings {
+                vector: resolver.bool("docs.search.vector", raw.docs.search.vector, None, true)?,
+                rerank: resolver.bool("docs.search.rerank", raw.docs.search.rerank, None, true)?,
+                limit: resolver.usize("docs.search.limit", raw.docs.search.limit, None, 10)?,
+                response_bytes: resolver.usize(
+                    "docs.search.response_bytes",
+                    raw.docs.search.response_bytes,
+                    None,
+                    24_000,
+                )?,
+            },
         };
 
         let search_file_roles = resolver.configured_or(
@@ -896,6 +993,7 @@ impl RuntimeConfig {
             database: DatabaseSettings {
                 path: database_path,
             },
+            docs,
             search,
             embedding,
             inference,
@@ -908,7 +1006,20 @@ impl RuntimeConfig {
             index,
             watch,
         };
-        let encoded = serde_json::to_vec(&effective)?;
+        let encoded = serde_json::to_vec(&CodeFingerprintSettings {
+            database: &effective.database,
+            search: &effective.search,
+            embedding: &effective.embedding,
+            inference: &effective.inference,
+            reranker: &effective.reranker,
+            llm: &effective.llm,
+            sidecars: &effective.sidecars,
+            mcp: &effective.mcp,
+            telemetry: &effective.telemetry,
+            diagnostics: &effective.diagnostics,
+            index: &effective.index,
+            watch: &effective.watch,
+        })?;
         let fingerprint = blake3::hash(&encoded).to_hex().to_string();
         Ok(Self {
             root,
