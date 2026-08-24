@@ -36,8 +36,40 @@ mod tests {
     use super::{GUIDE, install};
 
     #[test]
+    fn guide_encodes_the_investigation_and_inquiry_contracts() {
+        for marker in [
+            "Investigation loop",
+            "Inquiry loop",
+            "exhaustive: true",
+            "next_cursor",
+            "truncated` is false",
+            "total_chunks",
+            "match_lines",
+            "response_budget_too_small",
+            "minimum_bytes=<N>",
+            "one exact returned `sym:` anchor",
+            "strip only the leading `file:`",
+            "human-authored `symbol` mode",
+            "search's explicit `origins` allowlist",
+            "Never synthesize follow-up arguments from echoed",
+            "`scope.origins`",
+            "separate non-exhaustive",
+            "Baseline forces both unavailable stages off",
+            "semantic_memory",
+            "repository_overview` once",
+            "include_memory: false",
+            "expand: false",
+            "one orientation expansion",
+            "Restart the affected exhaustive traversal",
+            "repository convention",
+        ] {
+            assert!(GUIDE.contains(marker), "missing guide contract: {marker}");
+        }
+        assert!(!GUIDE.contains("initial result limit at 10"));
+    }
+
+    #[test]
     fn installs_once_without_overwriting() -> Result<()> {
-        assert!(GUIDE.contains("Use `calls` for exact member-method"));
         let repo = tempfile::tempdir()?;
         let target = install(repo.path())?;
         assert_eq!(std::fs::read_to_string(&target)?, GUIDE);

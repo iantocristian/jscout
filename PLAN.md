@@ -19,10 +19,10 @@
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
 > is the compact-transport and path-projection pass. G21 repository-local
 > runtime configuration and retrieval observability are implemented. G22
-> exhaustive lexical search is implemented; G23 skill investigation/inquiry
-> loops are planned from the production traces. Neither triggers G16 or
-> widens the semantic product surface, and no retrieval default changes without
-> a same-binary, same-snapshot comparison.
+> exhaustive lexical search is implemented. G23 investigation/inquiry guidance
+> is implemented, with its production replay still pending. Neither triggers
+> G16 or widens the semantic product surface, and no retrieval default changes
+> without a same-binary, same-snapshot comparison.
 
 ## Document policy
 
@@ -3131,7 +3131,7 @@ the same scope, as unique `(path, line)` values, compared at the
 representation the API returns — chunk plus `match_lines` — not at raw `rg`
 output.
 
-## Planned G23 — skill: investigation and inquiry loops
+## G23 — guidance implemented, acceptance replay pending
 
 Three production sessions and the evaluation record show agents discovering
 the efficient loop themselves, partially. The TargetsQueue investigation
@@ -3144,7 +3144,10 @@ ceiling. The evaluation record adds the invented-anchor failure class and one
 anchoring event in which a delivered analog shaped architecture without
 supplying the missing behavior.
 
-Skill text and server instructions only; no tool changes.
+Skill and MCP guidance plus one profile-correctness fix: Baseline now forces
+configured expansion off, matching its existing forced-off attached-memory
+posture, while still rejecting an explicitly enabled expansion. There are no
+schema, Structural retrieval, or product-default changes.
 
 1. Two loops, and the inquiry loop is conditional. Investigation, for known
    identifiers: `exhaustive: true` lexical search first, `definition` on
