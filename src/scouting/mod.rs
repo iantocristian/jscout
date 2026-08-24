@@ -222,9 +222,105 @@ struct Claimed<T> {
     supersedes_artifact_id: Option<i64>,
 }
 
+/// Best-effort failure guard for claims that have been committed but whose
+/// model tasks have not yet reached a terminal ledger transition. Wave setup
+/// deliberately performs one transaction per input, so a later setup error
+/// must release every earlier claim before unwinding the batch.
+struct StagedRunGuard<'a> {
+    conn: &'a Connection,
+    run_ids: Vec<i64>,
+}
+
+impl<'a> StagedRunGuard<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            run_ids: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, run_id: i64) {
+        self.run_ids.push(run_id);
+    }
+
+    fn resolve(&mut self, run_id: i64) {
+        if let Some(index) = self
+            .run_ids
+            .iter()
+            .position(|candidate| *candidate == run_id)
+        {
+            self.run_ids.swap_remove(index);
+        }
+    }
+
+    fn cleanup(&mut self) {
+        for run_id in self.run_ids.drain(..) {
+            let _ = ledger::finish_run(
+                self.conn,
+                run_id,
+                RunOutcome::Failed,
+                None,
+                Some("wave_aborted"),
+            );
+        }
+    }
+}
+
+impl Drop for StagedRunGuard<'_> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+struct BatchOutcomes {
+    outcomes: std::vec::IntoIter<Result<CompletionOutcome, GatewayError>>,
+    expected: usize,
+    actual: usize,
+}
+
+impl BatchOutcomes {
+    fn dispatch(gateway: &mut dyn LlmGateway, tasks: &[CompletionTask<'_>]) -> Self {
+        let expected = tasks.len();
+        let outcomes = gateway.complete_batch(tasks);
+        let actual = outcomes.len();
+        Self {
+            outcomes: outcomes.into_iter(),
+            expected,
+            actual,
+        }
+    }
+
+    fn cardinality_error(&self, kind: &str) -> Option<anyhow::Error> {
+        (self.actual != self.expected).then(|| {
+            anyhow::anyhow!(
+                "gateway returned {} outcomes for {} {kind} requests",
+                self.actual,
+                self.expected,
+            )
+        })
+    }
+
+    fn next_or_protocol(&mut self, kind: &str) -> Result<CompletionOutcome, GatewayError> {
+        self.outcomes.next().unwrap_or_else(|| {
+            Err(GatewayError::Protocol(format!(
+                "gateway omitted a {kind} batch outcome"
+            )))
+        })
+    }
+}
+
 enum Scheduled<T> {
     Reused(Box<ScoutReport>),
     Call(Claimed<T>),
+}
+
+impl<T> Scheduled<T> {
+    fn claimed_run_id(&self) -> Option<i64> {
+        match self {
+            Self::Reused(_) => None,
+            Self::Call(claimed) => Some(claimed.run_id),
+        }
+    }
 }
 
 /// One prepared refresh of either kind, so a mixed selection keeps one
@@ -269,6 +365,16 @@ impl ScheduledRefresh {
 
     fn calls_model(&self) -> bool {
         !matches!(self, Self::Reused(_))
+    }
+
+    fn claimed_run_id(&self) -> Option<i64> {
+        match self {
+            Self::Reused(_) => None,
+            Self::Workflow(_, claimed) => Some(claimed.run_id),
+            Self::Card(_, claimed) => Some(claimed.run_id),
+            Self::Summary(_, claimed) => Some(claimed.run_id),
+            Self::Concept(_, claimed) => Some(claimed.run_id),
+        }
     }
 }
 
@@ -527,6 +633,7 @@ pub fn scout_workflow_plan(
     let mut pending = VecDeque::from(prepared);
     while !pending.is_empty() {
         let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
         let mut calls_in_wave = 0;
         while calls_in_wave < options.policy.max_concurrency {
             let Some(prepared) = pending.pop_front() else {
@@ -546,6 +653,7 @@ pub fn scout_workflow_plan(
                     run_id,
                     supersedes_artifact_id,
                 } => {
+                    staged_runs.track(run_id);
                     model_calls += 1;
                     calls_in_wave += 1;
                     scheduled.push(Scheduled::Call(Claimed {
@@ -566,9 +674,10 @@ pub fn scout_workflow_plan(
                 }),
             })
             .collect::<Vec<_>>();
-        let mut outcomes = gateway.complete_batch(&tasks).into_iter();
-        let mut first_error = None;
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("workflow");
         for item in scheduled {
+            let run_id = item.claimed_run_id();
             let result = match item {
                 Scheduled::Reused(report) => Ok(*report),
                 Scheduled::Call(claimed) => finish_claimed_workflow(
@@ -576,11 +685,16 @@ pub fn scout_workflow_plan(
                     conn,
                     options,
                     claimed,
-                    outcomes.next().expect("one outcome per claimed workflow"),
+                    outcomes.next_or_protocol("workflow"),
                 ),
             };
             match result {
-                Ok(report) => reports.push(report),
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    reports.push(report);
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -660,6 +774,7 @@ pub fn scout_card_plan(
     let mut pending = VecDeque::from(prepared);
     while !pending.is_empty() {
         let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
         let mut calls_in_wave = 0;
         while calls_in_wave < options.policy.max_concurrency {
             let Some(prepared) = pending.pop_front() else {
@@ -686,6 +801,7 @@ pub fn scout_card_plan(
                     run_id,
                     supersedes_artifact_id,
                 } => {
+                    staged_runs.track(run_id);
                     model_calls += 1;
                     calls_in_wave += 1;
                     Scheduled::Call(Claimed {
@@ -707,9 +823,10 @@ pub fn scout_card_plan(
                 }),
             })
             .collect::<Vec<_>>();
-        let mut outcomes = gateway.complete_batch(&tasks).into_iter();
-        let mut first_error = None;
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("card");
         for (selection_scope, item) in scheduled {
+            let run_id = item.claimed_run_id();
             let result = match item {
                 Scheduled::Reused(report) => Ok(*report),
                 Scheduled::Call(claimed) => finish_claimed_card(
@@ -717,11 +834,16 @@ pub fn scout_card_plan(
                     conn,
                     options,
                     claimed,
-                    outcomes.next().expect("one outcome per claimed card"),
+                    outcomes.next_or_protocol("card"),
                 ),
             };
             let report = match result {
-                Ok(report) => report,
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    report
+                }
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -802,6 +924,7 @@ pub fn scout_concept_plan(
     let mut pending = VecDeque::from(prepared);
     while !pending.is_empty() {
         let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
         let mut calls_in_wave = 0;
         while calls_in_wave < options.policy.max_concurrency {
             let Some(prepared) = pending.pop_front() else {
@@ -814,7 +937,8 @@ pub fn scout_concept_plan(
                 continue;
             }
             let item = claim_prepared_concept(conn, options, prepared)?;
-            if matches!(item, Scheduled::Call(_)) {
+            if let Some(run_id) = item.claimed_run_id() {
+                staged_runs.track(run_id);
                 model_calls += 1;
                 calls_in_wave += 1;
             }
@@ -830,9 +954,10 @@ pub fn scout_concept_plan(
                 }),
             })
             .collect::<Vec<_>>();
-        let mut outcomes = gateway.complete_batch(&tasks).into_iter();
-        let mut first_error = None;
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("concept");
         for item in scheduled {
+            let run_id = item.claimed_run_id();
             let result = match item {
                 Scheduled::Reused(report) => Ok(*report),
                 Scheduled::Call(claimed) => finish_claimed_concept(
@@ -840,11 +965,16 @@ pub fn scout_concept_plan(
                     conn,
                     options,
                     claimed,
-                    outcomes.next().expect("one outcome per claimed concept"),
+                    outcomes.next_or_protocol("concept"),
                 ),
             };
             match result {
-                Ok(report) => reports.push(report),
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    reports.push(report);
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
@@ -1222,6 +1352,7 @@ pub fn scout_refresh(
         let mut pending = VecDeque::from(prepared_rank);
         while !pending.is_empty() {
             let mut scheduled = Vec::new();
+            let mut staged_runs = StagedRunGuard::new(conn);
             let mut calls_in_wave = 0;
             while calls_in_wave < policy.max_concurrency {
                 let Some(prepared) = pending.pop_front() else {
@@ -1239,7 +1370,8 @@ pub fn scout_refresh(
                     continue;
                 }
                 let item = claim_prepared_refresh(conn, prepared)?;
-                if item.calls_model() {
+                if let Some(run_id) = item.claimed_run_id() {
+                    staged_runs.track(run_id);
                     model_calls += 1;
                     calls_in_wave += 1;
                 }
@@ -1249,14 +1381,20 @@ pub fn scout_refresh(
                 .iter()
                 .filter_map(ScheduledRefresh::task)
                 .collect::<Vec<_>>();
-            let mut outcomes = gateway.complete_batch(&tasks).into_iter();
-            let mut first_error = None;
+            let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+            let mut first_error = outcomes.cardinality_error("refresh");
             for item in scheduled {
+                let run_id = item.claimed_run_id();
                 let outcome = item
                     .calls_model()
-                    .then(|| outcomes.next().expect("one outcome per claimed refresh"));
+                    .then(|| outcomes.next_or_protocol("refresh"));
                 match finish_scheduled_refresh(root, conn, item, outcome) {
-                    Ok(report) => reports.push(report),
+                    Ok(report) => {
+                        if let Some(run_id) = run_id {
+                            staged_runs.resolve(run_id);
+                        }
+                        reports.push(report);
+                    }
                     Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
                 }
@@ -2597,6 +2735,7 @@ pub fn scout_summaries(
         let mut pending = VecDeque::from(prepared_level);
         while !pending.is_empty() {
             let mut scheduled = Vec::new();
+            let mut staged_runs = StagedRunGuard::new(conn);
             let mut calls_in_wave = 0;
             while calls_in_wave < options.policy.max_concurrency {
                 let Some(prepared) = pending.pop_front() else {
@@ -2623,6 +2762,7 @@ pub fn scout_summaries(
                         run_id,
                         supersedes_artifact_id,
                     } => {
+                        staged_runs.track(run_id);
                         model_calls += 1;
                         calls_in_wave += 1;
                         scheduled.push(Scheduled::Call(Claimed {
@@ -2643,9 +2783,10 @@ pub fn scout_summaries(
                     }),
                 })
                 .collect::<Vec<_>>();
-            let mut outcomes = gateway.complete_batch(&tasks).into_iter();
-            let mut first_error = None;
+            let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+            let mut first_error = outcomes.cardinality_error("summary");
             for item in scheduled {
+                let run_id = item.claimed_run_id();
                 let result = match item {
                     Scheduled::Reused(report) => Ok(*report),
                     Scheduled::Call(claimed) => finish_claimed_summary(
@@ -2653,11 +2794,16 @@ pub fn scout_summaries(
                         conn,
                         options,
                         claimed,
-                        outcomes.next().expect("one outcome per claimed summary"),
+                        outcomes.next_or_protocol("summary"),
                     ),
                 };
                 match result {
-                    Ok(report) => batch.reports.push(report),
+                    Ok(report) => {
+                        if let Some(run_id) = run_id {
+                            staged_runs.resolve(run_id);
+                        }
+                        batch.reports.push(report);
+                    }
                     Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
                 }

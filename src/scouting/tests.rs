@@ -19,6 +19,7 @@ struct FakeGateway {
     calls: usize,
     capability_calls: usize,
     batch_sizes: Vec<usize>,
+    batch_result_count: Option<usize>,
     last_max_tokens: Option<u64>,
     on_complete: Option<Box<dyn FnMut()>>,
 }
@@ -30,9 +31,15 @@ impl FakeGateway {
             calls: 0,
             capability_calls: 0,
             batch_sizes: Vec::new(),
+            batch_result_count: None,
             last_max_tokens: None,
             on_complete: None,
         }
+    }
+
+    fn with_batch_result_count(mut self, count: usize) -> Self {
+        self.batch_result_count = Some(count);
+        self
     }
 }
 
@@ -85,10 +92,22 @@ impl LlmGateway for FakeGateway {
         tasks: &[CompletionTask<'_>],
     ) -> Vec<Result<CompletionOutcome, GatewayError>> {
         self.batch_sizes.push(tasks.len());
-        tasks
+        let mut outcomes = tasks
             .iter()
             .map(|task| self.complete(task.request, task.timeout))
-            .collect()
+            .collect::<Vec<_>>();
+        let Some(result_count) = self.batch_result_count else {
+            return outcomes;
+        };
+        outcomes.truncate(result_count);
+        while outcomes.len() < result_count {
+            outcomes.push(
+                self.results
+                    .pop_front()
+                    .expect("missing configured extra batch result"),
+            );
+        }
+        outcomes
     }
 }
 
@@ -1184,6 +1203,117 @@ fn remote_timeout_fails_one_subject_and_the_batch_continues() -> Result<()> {
             .any(|report| report.status == "completed"),
         "the batch continues past a remote timeout"
     );
+    Ok(())
+}
+
+#[test]
+fn later_claim_conflict_releases_an_earlier_staged_run() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let conn = fixture(dir.path())?;
+    let mut options = card_options();
+    options.anchors = vec!["flow.ts:start".into(), "flow.ts:finish".into()];
+    options.policy = RequestPolicy::new(30, 2, 240_000)?.with_max_concurrency(2)?;
+    let plan = super::plan::cards(dir.path(), &conn, &options.anchors)?;
+    assert_eq!(plan.items.len(), 2);
+
+    let mut preparation_gateway = FakeGateway::new(Vec::new());
+    let mut cache = super::PreparationCache::default();
+    let first = super::prepare_card(
+        &mut preparation_gateway,
+        &mut cache,
+        plan.items[0].clone(),
+        &options,
+    )?;
+    let blocked = super::prepare_card(
+        &mut preparation_gateway,
+        &mut cache,
+        plan.items[1].clone(),
+        &options,
+    )?;
+    let first_fingerprint = first.spec.input_fingerprint;
+    let blocked_fingerprint = blocked.spec.input_fingerprint.clone();
+    let super::ledger::RunClaim::Claimed {
+        run_id: blocked_run,
+        ..
+    } = super::ledger::claim_run(&conn, &blocked.spec, false)?
+    else {
+        panic!("expected the conflicting input to be claimed");
+    };
+
+    let mut gateway = FakeGateway::new(Vec::new());
+    let error = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)
+        .expect_err("the later in-flight input must reject the wave");
+    assert!(
+        error.to_string().contains("already in progress"),
+        "{error:#}"
+    );
+    assert_eq!(gateway.calls, 0, "no staged request may dispatch");
+
+    let (status, error_code): (String, Option<String>) = conn.query_row(
+        "SELECT status, error_code FROM scout_runs
+         WHERE input_fingerprint=?1 ORDER BY id DESC LIMIT 1",
+        [&first_fingerprint],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(status, "failed");
+    assert_eq!(error_code.as_deref(), Some("wave_aborted"));
+    let blocked_status: String = conn.query_row(
+        "SELECT status FROM scout_runs WHERE id=?1",
+        [blocked_run],
+        |row| row.get(0),
+    )?;
+    assert_eq!(blocked_status, "running");
+    assert_ne!(first_fingerprint, blocked_fingerprint);
+    Ok(())
+}
+
+#[test]
+fn malformed_batch_cardinality_terminalizes_every_claim() -> Result<()> {
+    for result_count in [1, 3] {
+        let dir = tempfile::tempdir()?;
+        let conn = fixture(dir.path())?;
+        let mut options = card_options();
+        options.anchors = vec!["flow.ts:start".into(), "flow.ts:finish".into()];
+        options.policy = RequestPolicy::new(30, 2, 240_000)?.with_max_concurrency(2)?;
+        let plan = super::plan::cards(dir.path(), &conn, &options.anchors)?;
+        assert_eq!(plan.items.len(), 2);
+
+        let mut gateway = FakeGateway::new(vec![
+            Ok(card_outcome(card_submission())),
+            Ok(card_outcome(card_submission())),
+            Ok(card_outcome(card_submission())),
+        ])
+        .with_batch_result_count(result_count);
+        let error = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)
+            .expect_err("malformed batch cardinality must fail the wave");
+        assert_eq!(gateway.batch_sizes, vec![2]);
+        assert_eq!(gateway.calls, 2, "every expected task must be dispatched");
+        assert!(
+            error.to_string().contains(&format!(
+                "gateway returned {result_count} outcomes for 2 card requests"
+            )),
+            "{error:#}"
+        );
+
+        let running: i64 = conn.query_row(
+            "SELECT count(*) FROM scout_runs WHERE status='running'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(running, 0, "malformed results must not strand a claim");
+        if result_count == 1 {
+            let protocol_failures: i64 = conn.query_row(
+                "SELECT count(*) FROM scout_runs
+                 WHERE status='failed' AND error_code='protocol'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                protocol_failures, 1,
+                "the missing outcome must terminalize its claimed run"
+            );
+        }
+    }
     Ok(())
 }
 
