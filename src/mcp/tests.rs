@@ -161,48 +161,100 @@ fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enabl
 }
 
 #[test]
-fn profile_instructions_explain_when_to_use_structural_traversal() {
+fn profile_instructions_encode_g23_workflows_and_capabilities() {
     let baseline = server_instructions(ToolProfile::Baseline);
     let structural = server_instructions(ToolProfile::Structural);
-    assert!(baseline.contains("semantic_search"));
-    assert!(baseline.contains("calls for exact member-method"));
-    assert!(baseline.contains("repository alone does not mean the whole repository"));
-    assert!(!baseline.contains("neighborhood"));
-    assert!(structural.contains("neighborhood"));
-    assert!(structural.contains("repository_overview"));
-    assert!(structural.contains("semantic_memory"));
-    assert!(structural.contains("entities"));
-    assert!(structural.contains("paths"));
-    assert!(structural.contains("calls for exact member-method"));
-    assert!(structural.contains("opt-in evidence-connected preview"));
-    assert!(structural.contains("Split multi-clause tasks"));
-    assert!(structural.contains("repository byte budget"));
-    assert!(structural.contains("follow-up search"));
-    assert!(structural.contains("Verify decisive claims in source"));
-    assert!(structural.contains("direct participants field"));
-    assert!(structural.contains("as defining"));
-    assert!(structural.contains("as supporting"));
-    assert!(structural.contains("repository alone does not mean the whole repository"));
 
-    let tools = tool_defs(ToolProfile::Structural);
-    let search = tools
-        .as_array()
-        .expect("tool definitions")
-        .iter()
-        .find(|tool| tool["name"] == "semantic_search")
-        .expect("search definition");
-    let origins = &search["inputSchema"]["properties"]["origins"];
-    assert!(origins.get("default").is_none());
-    assert!(
-        origins["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("repository configuration"))
-    );
-    assert!(
-        origins["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("not the whole repository"))
-    );
+    for instructions in [baseline, structural] {
+        for marker in [
+            "Investigation loop",
+            "exhaustive=true",
+            "next_cursor",
+            "truncated=false",
+            "total_chunks",
+            "page-local returned",
+            "match_lines",
+            "response_budget_too_small",
+            "minimum_bytes=N",
+            "response_bytes=N",
+            "sym: anchor plus its snapshot",
+            "strip only the leading file:",
+            "Human-authored symbol mode",
+            "corpus, file_roles, origins, and snapshot",
+            "convention",
+            "safe",
+            "sequential",
+            "snapshot change",
+        ] {
+            assert!(
+                instructions.contains(marker),
+                "missing server-instruction contract: {marker}"
+            );
+        }
+    }
+
+    for unavailable in [
+        "semantic_memory",
+        "repository_overview",
+        "neighborhood",
+        "entities",
+        "paths",
+        "annotate",
+        "include_memory",
+        "expand=true",
+    ] {
+        assert!(
+            !baseline.contains(unavailable),
+            "baseline advertises unavailable capability: {unavailable}"
+        );
+    }
+    for available in [
+        "Inquiry loop",
+        "semantic_memory",
+        "repository_overview once",
+        "include_memory=false",
+        "expand=false",
+        "one separate expand=true",
+        "neighborhood",
+        "entities",
+        "paths",
+        "Annotate",
+    ] {
+        assert!(
+            structural.contains(available),
+            "structural instructions omit capability: {available}"
+        );
+    }
+    assert!(baseline.contains("structural profile"));
+    assert!(baseline.contains("calls for exact member-method"));
+    assert!(structural.contains("calls, events, and file_outline"));
+
+    for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
+        let tools = tool_defs(profile);
+        let search = tools
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .find(|tool| tool["name"] == "semantic_search")
+            .expect("search definition");
+        assert!(
+            search["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Profile-specific"))
+        );
+        let origins = &search["inputSchema"]["properties"]["origins"];
+        assert!(origins.get("default").is_none());
+        assert!(
+            origins["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("repository configuration"))
+        );
+        assert!(
+            origins["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("not the whole repository"))
+        );
+    }
 }
 
 #[test]
