@@ -23,7 +23,7 @@ use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{
     ChatMessage, CompleteRequest, PROTOCOL_VERSION, ProviderOptions, SubmitTool,
 };
-use crate::llm::{GatewayError, LlmGateway};
+use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway};
 use crate::recon::{self, MemberFile, SubjectSelector, SubjectState};
 use crate::{scouting::ledger, structural};
 
@@ -156,6 +156,41 @@ struct PreparedRepository {
     item: RepositoryPlanItem,
     request: CompleteRequest,
     spec: RunSpec,
+}
+
+struct ClaimedRepository {
+    prepared: PreparedRepository,
+    run_id: i64,
+}
+
+enum ScheduledRepository {
+    ContextOverBudget {
+        skip: BatchSkip,
+        subdivisions: Vec<RepositoryPlanItem>,
+        depth_limit_reached: bool,
+    },
+    Reused(Box<RepositoryWaveClassification>),
+    Call(Box<ScheduledRepositoryCall>),
+}
+
+enum RepositoryWaveResult {
+    ContextOverBudget {
+        skip: BatchSkip,
+        subdivisions: Vec<RepositoryPlanItem>,
+        depth_limit_reached: bool,
+    },
+    Classified(Box<RepositoryWaveClassification>),
+}
+
+struct ScheduledRepositoryCall {
+    subdivision_parent: RepositoryPlanItem,
+    claimed: ClaimedRepository,
+}
+
+struct RepositoryWaveClassification {
+    subdivision_parent: RepositoryPlanItem,
+    scout_report: ScoutReport,
+    role: Option<String>,
 }
 
 pub fn submit_tool_schema(evidence_ids: &[String]) -> Value {
@@ -991,6 +1026,7 @@ pub fn dry_run_report(
     Ok(json!({
         "dry_run": true,
         "max_calls": rendered_limit(options.policy.max_calls),
+        "max_concurrency": options.policy.max_concurrency,
         "max_subjects": rendered_limit(options.max_subjects),
         "max_depth": options.max_depth,
         "context_bytes": options.policy.context_bytes,
@@ -1037,75 +1073,211 @@ pub fn execute(
         ..ScoutBatchReport::default()
     };
 
-    while let Some(item) = queue.pop_front() {
-        let subject_key = item.subject_key.clone();
-        let prepared = match prepare(gateway, &mut cache, item.clone(), options, &snapshot) {
-            Ok(prepared) => prepared,
-            Err(error)
-                if error
-                    .downcast_ref::<super::ContextBudgetExceeded>()
-                    .is_some() =>
-            {
-                report.skipped_over_budget.push(BatchSkip {
-                    subject: subject_key,
-                    reason: error.to_string(),
-                });
-                if item.depth < options.max_depth {
-                    enqueue_subdivisions(
-                        &mut queue,
-                        &mut seen,
-                        &mut subject_count,
-                        &mut report,
-                        options.max_subjects,
-                        subdivide(root, conn, &item)?,
-                    );
-                } else {
-                    report.auto_limit_reached = true;
+    while !queue.is_empty() {
+        let mut scheduled = Vec::new();
+        let mut staged_runs = super::StagedRunGuard::new(conn);
+        while scheduled.len() < options.policy.max_concurrency {
+            let Some(item) = queue.pop_front() else {
+                break;
+            };
+            let subject_key = item.subject_key.clone();
+            let prepared = match prepare(gateway, &mut cache, item.clone(), options, &snapshot) {
+                Ok(prepared) => prepared,
+                Err(error)
+                    if error
+                        .downcast_ref::<super::ContextBudgetExceeded>()
+                        .is_some() =>
+                {
+                    let skip = BatchSkip {
+                        subject: subject_key,
+                        reason: error.to_string(),
+                    };
+                    let depth_limit_reached = item.depth >= options.max_depth;
+                    let subdivisions = if depth_limit_reached {
+                        Vec::new()
+                    } else {
+                        subdivide(root, conn, &item)?
+                    };
+                    scheduled.push(ScheduledRepository::ContextOverBudget {
+                        skip,
+                        subdivisions,
+                        depth_limit_reached,
+                    });
+                    continue;
                 }
+                Err(error) => return Err(error),
+            };
+            let reusable = if options.rebuild {
+                false
+            } else {
+                ledger::reusable_run(conn, &prepared.spec)?.is_some()
+            };
+            if !reusable && report.model_calls >= options.policy.max_calls {
+                report.skipped_for_call_budget += 1;
                 continue;
             }
-            Err(error) => return Err(error),
-        };
-        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-        if !reusable && report.model_calls >= options.policy.max_calls {
-            report.skipped_for_call_budget += 1;
+            let subdivision_parent = prepared.item.clone();
+            let claim = ledger::claim_run(conn, &prepared.spec, options.rebuild)?;
+            match claim {
+                RunClaim::Reused(run_id) => {
+                    let (scout_report, role) =
+                        reuse_report(conn, run_id, &prepared.item, &prepared.spec)?;
+                    scheduled.push(ScheduledRepository::Reused(Box::new(
+                        RepositoryWaveClassification {
+                            subdivision_parent,
+                            scout_report,
+                            role: Some(role),
+                        },
+                    )));
+                }
+                RunClaim::Claimed { run_id, .. } => {
+                    report.model_calls += 1;
+                    staged_runs.track(run_id);
+                    scheduled.push(ScheduledRepository::Call(Box::new(
+                        ScheduledRepositoryCall {
+                            subdivision_parent,
+                            claimed: ClaimedRepository { prepared, run_id },
+                        },
+                    )));
+                }
+            }
+        }
+        if scheduled.is_empty() {
             continue;
         }
-        let subdivision_parent = prepared.item.clone();
-        let (scout_report, role) = execute_one(root, conn, gateway, options, prepared, &snapshot)?;
-        if scout_report.status != "reused" {
-            report.model_calls += 1;
-        }
-        let mixed = role.as_deref() == Some("mixed");
-        report.reports.push(scout_report);
-        if mixed {
-            if subdivision_parent.depth >= options.max_depth {
-                report.auto_limit_reached = true;
-                continue;
+        let tasks = scheduled
+            .iter()
+            .filter_map(|scheduled| match scheduled {
+                ScheduledRepository::Call(scheduled) => Some(CompletionTask {
+                    request: &scheduled.claimed.prepared.request,
+                    timeout: options.policy.timeout,
+                }),
+                ScheduledRepository::ContextOverBudget { .. } | ScheduledRepository::Reused(_) => {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = super::BatchOutcomes::dispatch(gateway, &tasks);
+        drop(tasks);
+        let mut first_error = outcomes.cardinality_error("repository");
+        let mut completed = Vec::with_capacity(scheduled.len());
+        for scheduled in scheduled {
+            match scheduled {
+                ScheduledRepository::ContextOverBudget {
+                    skip,
+                    subdivisions,
+                    depth_limit_reached,
+                } => completed.push(RepositoryWaveResult::ContextOverBudget {
+                    skip,
+                    subdivisions,
+                    depth_limit_reached,
+                }),
+                ScheduledRepository::Reused(classification) => {
+                    completed.push(RepositoryWaveResult::Classified(classification));
+                }
+                ScheduledRepository::Call(scheduled) => {
+                    let ScheduledRepositoryCall {
+                        subdivision_parent,
+                        claimed,
+                    } = *scheduled;
+                    let run_id = claimed.run_id;
+                    let outcome = outcomes.next_or_protocol("repository");
+                    match finish_claimed(root, conn, claimed, &snapshot, outcome) {
+                        Ok((scout_report, role)) => {
+                            staged_runs.resolve(run_id);
+                            completed.push(RepositoryWaveResult::Classified(Box::new(
+                                RepositoryWaveClassification {
+                                    subdivision_parent,
+                                    scout_report,
+                                    role,
+                                },
+                            )));
+                        }
+                        Err(error) if first_error.is_none() => first_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
             }
-            enqueue_subdivisions(
-                &mut queue,
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        let mut wave_subdivisions = Vec::new();
+        for completed in completed {
+            let children = match completed {
+                RepositoryWaveResult::ContextOverBudget {
+                    skip,
+                    subdivisions,
+                    depth_limit_reached,
+                } => {
+                    report.skipped_over_budget.push(skip);
+                    if depth_limit_reached {
+                        report.auto_limit_reached = true;
+                        Vec::new()
+                    } else {
+                        subdivisions
+                    }
+                }
+                RepositoryWaveResult::Classified(classification) => {
+                    let RepositoryWaveClassification {
+                        subdivision_parent,
+                        scout_report,
+                        role,
+                    } = *classification;
+                    result_subdivisions(
+                        root,
+                        conn,
+                        options,
+                        subdivision_parent,
+                        scout_report,
+                        role,
+                        &mut report,
+                    )?
+                }
+            };
+            wave_subdivisions.extend(admit_subdivisions(
                 &mut seen,
                 &mut subject_count,
                 &mut report,
                 options.max_subjects,
-                subdivide(root, conn, &subdivision_parent)?,
-            );
+                children,
+            ));
         }
+        prepend_subdivisions(&mut queue, wave_subdivisions);
     }
     recon::reconcile_file_policy(root, conn)?;
     report.subjects_considered = Some(subject_count);
     Ok(report)
 }
 
-fn enqueue_subdivisions(
-    queue: &mut VecDeque<RepositoryPlanItem>,
+fn result_subdivisions(
+    root: &Path,
+    conn: &Connection,
+    options: &RepositoryScoutOptions,
+    subdivision_parent: RepositoryPlanItem,
+    scout_report: ScoutReport,
+    role: Option<String>,
+    report: &mut ScoutBatchReport,
+) -> Result<Vec<RepositoryPlanItem>> {
+    let mixed = role.as_deref() == Some("mixed");
+    report.reports.push(scout_report);
+    if !mixed {
+        return Ok(Vec::new());
+    }
+    if subdivision_parent.depth >= options.max_depth {
+        report.auto_limit_reached = true;
+        return Ok(Vec::new());
+    }
+    subdivide(root, conn, &subdivision_parent)
+}
+
+fn admit_subdivisions(
     seen: &mut BTreeSet<String>,
     subject_count: &mut usize,
     report: &mut ScoutBatchReport,
     max_subjects: usize,
     mut children: Vec<RepositoryPlanItem>,
-) {
+) -> Vec<RepositoryPlanItem> {
     children.sort_by(|left, right| {
         right
             .state
@@ -1130,6 +1302,13 @@ fn enqueue_subdivisions(
         *subject_count += 1;
         admitted.push(child);
     }
+    admitted
+}
+
+fn prepend_subdivisions(
+    queue: &mut VecDeque<RepositoryPlanItem>,
+    admitted: Vec<RepositoryPlanItem>,
+) {
     // The parent has already established that its coarse classification is
     // insufficient. Refine it before unrelated pending subjects consume the
     // remaining call budget, while preserving descending weight order.
@@ -1138,27 +1317,20 @@ fn enqueue_subdivisions(
     }
 }
 
-fn execute_one(
+fn finish_claimed(
     root: &Path,
     conn: &Connection,
-    gateway: &mut dyn LlmGateway,
-    options: &RepositoryScoutOptions,
-    prepared: PreparedRepository,
+    claimed: ClaimedRepository,
     snapshot: &str,
+    outcome: Result<CompletionOutcome, GatewayError>,
 ) -> Result<(ScoutReport, Option<String>)> {
+    let ClaimedRepository { prepared, run_id } = claimed;
     let PreparedRepository {
         item,
-        request,
+        request: _,
         spec,
     } = prepared;
-    let run_id = match ledger::claim_run(conn, &spec, options.rebuild)? {
-        RunClaim::Reused(run_id) => {
-            let (report, role) = reuse_report(conn, run_id, &item, &spec)?;
-            return Ok((report, Some(role)));
-        }
-        RunClaim::Claimed { run_id, .. } => run_id,
-    };
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let status = if matches!(error, GatewayError::Canceled(_)) {
@@ -1567,6 +1739,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet, VecDeque},
         fs,
+        time::Duration,
     };
 
     use anyhow::Result;
@@ -1576,7 +1749,115 @@ mod tests {
         DiscoveredSubject, EvidenceItem, RepositoryEvidencePack, Submission, build_evidence,
         rendered_limit, validate,
     };
+    use crate::llm::config::{ModelSpec, RequestPolicy};
+    use crate::llm::protocol::{
+        CompleteRequest, ModelCapabilities, ProviderSummary, ToolCall, Usage,
+    };
+    use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway, StartedInfo};
+    use crate::scouting::ledger::{self, RunClaim};
     use crate::{indexer, recon, store};
+
+    struct RepositoryGateway {
+        results: VecDeque<std::result::Result<CompletionOutcome, GatewayError>>,
+        calls: usize,
+        batch_sizes: Vec<usize>,
+    }
+
+    impl RepositoryGateway {
+        fn new(results: Vec<std::result::Result<CompletionOutcome, GatewayError>>) -> Self {
+            Self {
+                results: results.into(),
+                calls: 0,
+                batch_sizes: Vec::new(),
+            }
+        }
+    }
+
+    impl LlmGateway for RepositoryGateway {
+        fn capabilities(
+            &mut self,
+            model: Option<&str>,
+        ) -> std::result::Result<(ProviderSummary, Option<ModelCapabilities>), GatewayError>
+        {
+            Ok((
+                ProviderSummary {
+                    builtin: 1,
+                    custom: Vec::new(),
+                },
+                model.map(|_| ModelCapabilities {
+                    provider: "faux".into(),
+                    model: "faux-model".into(),
+                    api: "faux".into(),
+                    base_url: Some("https://faux.example.test/v1".into()),
+                    context_window: Some(200_000),
+                    max_tokens: Some(32_000),
+                    reasoning: true,
+                    supports_service_tier: false,
+                    supports_tools: true,
+                    billing_path: Some("api".into()),
+                    auth_configured: true,
+                    auth_type: Some("api_key".into()),
+                    auth_source: Some("test".into()),
+                }),
+            ))
+        }
+
+        fn complete(
+            &mut self,
+            _request: &CompleteRequest,
+            _timeout: Duration,
+        ) -> std::result::Result<CompletionOutcome, GatewayError> {
+            self.calls += 1;
+            self.results
+                .pop_front()
+                .expect("unexpected repository completion call")
+        }
+
+        fn complete_batch(
+            &mut self,
+            tasks: &[CompletionTask<'_>],
+        ) -> Vec<std::result::Result<CompletionOutcome, GatewayError>> {
+            self.batch_sizes.push(tasks.len());
+            tasks
+                .iter()
+                .map(|task| self.complete(task.request, task.timeout))
+                .collect()
+        }
+    }
+
+    fn repository_outcome(role: &str) -> CompletionOutcome {
+        CompletionOutcome {
+            started: StartedInfo {
+                provider: "faux".into(),
+                model: "faux-model".into(),
+                api: "faux".into(),
+                base_url: Some("https://faux.example.test/v1".into()),
+                billing_path: "api".into(),
+                auth_source: "test".into(),
+            },
+            tool_call: ToolCall {
+                name: super::SUBMIT_TOOL_NAME.into(),
+                arguments: json!({
+                    "role": role,
+                    "confidence": "likely",
+                    "explanation": format!("the evidence classifies this scope as {role}"),
+                    "evidence": ["E001"],
+                }),
+            },
+            stop_reason: "toolUse".into(),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                reasoning_tokens: None,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 120,
+                cost_total: 0.0,
+            },
+            attempts: 1,
+            response_model: Some("faux-model".into()),
+        }
+    }
 
     fn evidence() -> RepositoryEvidencePack {
         RepositoryEvidencePack {
@@ -1599,10 +1880,259 @@ mod tests {
         }
     }
 
+    fn scope_item(
+        root: &std::path::Path,
+        conn: &rusqlite::Connection,
+        scope: &str,
+    ) -> Result<super::RepositoryPlanItem> {
+        let subject_key = format!("area:repository:{scope}");
+        let selector = recon::SubjectSelector::RepositoryArea {
+            scope: scope.into(),
+            direct_only: false,
+        };
+        let state = recon::build_scope_state(root, conn, subject_key.clone(), selector)?;
+        super::complete_plan_item(
+            root,
+            conn,
+            DiscoveredSubject {
+                subject_key,
+                subject_kind: "area".into(),
+                display_name: scope.into(),
+                parent_subject_key: None,
+                depth: 0,
+                state,
+            },
+        )
+    }
+
+    fn repository_options(
+        max_calls: usize,
+        max_concurrency: usize,
+        max_subjects: usize,
+    ) -> Result<super::RepositoryScoutOptions> {
+        Ok(super::RepositoryScoutOptions {
+            model: ModelSpec::parse("faux:faux-model")?,
+            reasoning: None,
+            service_tier: None,
+            policy: RequestPolicy::new(30, max_calls, 240_000)?
+                .with_max_concurrency(max_concurrency)?,
+            rebuild: false,
+            max_subjects,
+            max_depth: 1,
+        })
+    }
+
+    fn repository_plan(
+        snapshot: &str,
+        items: Vec<super::RepositoryPlanItem>,
+        max_subjects: usize,
+    ) -> super::RepositoryPlan {
+        super::RepositoryPlan {
+            snapshot: snapshot.into(),
+            max_subjects,
+            max_depth: 1,
+            subject_limit_reached: false,
+            configured_projects: 0,
+            configuration_problems: Vec::new(),
+            items,
+            omitted_subjects: Vec::new(),
+        }
+    }
+
+    fn write_mixed_scope(root: &std::path::Path, scope: &str) -> Result<()> {
+        fs::create_dir_all(root.join(scope).join("docs"))?;
+        fs::write(
+            root.join(scope).join("runtime.ts"),
+            "export const run = 1;\n",
+        )?;
+        fs::write(
+            root.join(scope).join("docs/guide.ts"),
+            "export const guide = 1;\n",
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn unbounded_limits_render_as_all_instead_of_machine_integers() {
         assert_eq!(rendered_limit(usize::MAX), json!("all"));
         assert_eq!(rendered_limit(512), json!(512));
+    }
+
+    #[test]
+    fn wave_abort_guard_finishes_claims_staged_before_a_conflict() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write_mixed_scope(repo.path(), "a")?;
+        write_mixed_scope(repo.path(), "b")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let options = repository_options(2, 2, 10)?;
+        let first = scope_item(repo.path(), &conn, "a")?;
+        let conflicting = scope_item(repo.path(), &conn, "b")?;
+
+        let mut preparation_gateway = RepositoryGateway::new(Vec::new());
+        let mut cache = crate::scouting::PreparationCache::default();
+        let conflicting_prepared = super::prepare(
+            &mut preparation_gateway,
+            &mut cache,
+            conflicting.clone(),
+            &options,
+            &snapshot,
+        )?;
+        let conflicting_run_id =
+            match ledger::claim_run(&conn, &conflicting_prepared.spec, options.rebuild)? {
+                RunClaim::Claimed { run_id, .. } => run_id,
+                RunClaim::Reused(_) => panic!("fresh conflicting subject unexpectedly reused"),
+            };
+
+        let mut gateway = RepositoryGateway::new(Vec::new());
+        let error = super::execute(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &options,
+            repository_plan(&snapshot, vec![first, conflicting], 10),
+        )
+        .expect_err("the already-running second subject must reject wave setup");
+        assert!(format!("{error:#}").contains("already in progress"));
+        assert_eq!(gateway.calls, 0, "the partial wave must not be dispatched");
+
+        let runs = {
+            let mut statement =
+                conn.prepare("SELECT id, status, error_code FROM scout_runs ORDER BY id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter()
+                .find(|(run_id, _, _)| *run_id == conflicting_run_id)
+                .map(|(_, status, code)| (status.as_str(), code.as_deref())),
+            Some(("running", None)),
+            "the competing process still owns its claim",
+        );
+        assert!(runs.iter().any(|(run_id, status, code)| {
+            *run_id != conflicting_run_id
+                && status == "failed"
+                && code.as_deref() == Some("wave_aborted")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn reused_results_wait_for_the_wave_barrier_and_preserve_priority() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write_mixed_scope(repo.path(), "a")?;
+        write_mixed_scope(repo.path(), "b")?;
+        write_mixed_scope(repo.path(), "c")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+
+        let first_options = repository_options(2, 2, 12)?;
+        let mut first_gateway = RepositoryGateway::new(vec![
+            Ok(repository_outcome("mixed")),
+            Ok(repository_outcome("runtime")),
+        ]);
+        super::execute(
+            repo.path(),
+            &conn,
+            &mut first_gateway,
+            &first_options,
+            repository_plan(
+                &snapshot,
+                vec![
+                    scope_item(repo.path(), &conn, "b")?,
+                    scope_item(repo.path(), &conn, "c")?,
+                ],
+                12,
+            ),
+        )?;
+        assert_eq!(first_gateway.calls, 2);
+
+        let options = repository_options(2, 1, 12)?;
+        let mut gateway = RepositoryGateway::new(vec![
+            Ok(repository_outcome("mixed")),
+            Ok(repository_outcome("runtime")),
+        ]);
+        let report = super::execute(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &options,
+            repository_plan(
+                &snapshot,
+                vec![
+                    scope_item(repo.path(), &conn, "a")?,
+                    scope_item(repo.path(), &conn, "c")?,
+                    scope_item(repo.path(), &conn, "b")?,
+                ],
+                12,
+            ),
+        )?;
+
+        assert_eq!(gateway.batch_sizes, vec![1, 1]);
+        assert_eq!(report.model_calls, 2);
+        assert_eq!(report.reports.len(), 4);
+        assert_eq!(report.reports[0].subject, "area:repository:a");
+        assert!(
+            report.reports[1].subject.starts_with("area:repository:a"),
+            "the first parent's child must enter the next serialized wave before later subjects: {:?}",
+            report
+                .reports
+                .iter()
+                .map(|report| report.subject.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.reports[2].subject, "area:repository:c");
+        assert_eq!(report.reports[2].status, "reused");
+        assert_eq!(report.reports[3].subject, "area:repository:b");
+        assert_eq!(report.reports[3].status, "reused");
+        Ok(())
+    }
+
+    #[test]
+    fn over_budget_subdivisions_wait_for_the_wave_barrier() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        write_mixed_scope(repo.path(), "a")?;
+        write_mixed_scope(repo.path(), "b")?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let first = scope_item(repo.path(), &conn, "a")?;
+        let mut over_budget = scope_item(repo.path(), &conn, "b")?;
+        over_budget.evidence.rendered = "x".repeat(40_000);
+
+        let mut options = repository_options(2, 2, 10)?;
+        options.policy.context_bytes = 20_000;
+        let mut gateway = RepositoryGateway::new(vec![
+            Ok(repository_outcome("mixed")),
+            Ok(repository_outcome("runtime")),
+        ]);
+        let report = super::execute(
+            repo.path(),
+            &conn,
+            &mut gateway,
+            &options,
+            repository_plan(&snapshot, vec![first, over_budget], 10),
+        )?;
+
+        assert_eq!(gateway.batch_sizes, vec![1, 1]);
+        assert_eq!(report.model_calls, 2);
+        assert_eq!(report.skipped_over_budget.len(), 1);
+        assert_eq!(report.skipped_over_budget[0].subject, "area:repository:b");
+        assert_eq!(report.reports[0].subject, "area:repository:a");
+        assert!(
+            report.reports[1].subject.starts_with("area:repository:a"),
+            "the called parent's child must remain ahead of buffered over-budget subdivisions"
+        );
+        Ok(())
     }
 
     fn discovered(key: &str, kind: &str, member_count: usize) -> super::DiscoveredSubject {
@@ -1686,8 +2216,7 @@ mod tests {
         let mut subject_count = 1;
         let mut report = super::ScoutBatchReport::default();
 
-        super::enqueue_subdivisions(
-            &mut queue,
+        let admitted = super::admit_subdivisions(
             &mut seen,
             &mut subject_count,
             &mut report,
@@ -1697,6 +2226,7 @@ mod tests {
                 planned("area:repository:parent/big", 20),
             ],
         );
+        super::prepend_subdivisions(&mut queue, admitted);
 
         assert_eq!(
             queue
@@ -1711,6 +2241,51 @@ mod tests {
         );
         assert_eq!(subject_count, 3);
         assert!(!report.auto_limit_reached);
+    }
+
+    #[test]
+    fn concurrent_parent_subdivisions_preserve_parent_plan_order() {
+        let mut queue = VecDeque::from([planned("area:repository:pending", 10)]);
+        let mut seen = BTreeSet::from(["area:repository:pending".to_string()]);
+        let mut subject_count = 1;
+        let mut report = super::ScoutBatchReport::default();
+        let mut wave = Vec::new();
+
+        wave.extend(super::admit_subdivisions(
+            &mut seen,
+            &mut subject_count,
+            &mut report,
+            5,
+            vec![
+                planned("area:repository:first/small", 2),
+                planned("area:repository:first/big", 20),
+            ],
+        ));
+        wave.extend(super::admit_subdivisions(
+            &mut seen,
+            &mut subject_count,
+            &mut report,
+            5,
+            vec![
+                planned("area:repository:second/small", 3),
+                planned("area:repository:second/big", 30),
+            ],
+        ));
+        super::prepend_subdivisions(&mut queue, wave);
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "area:repository:first/big",
+                "area:repository:first/small",
+                "area:repository:second/big",
+                "area:repository:second/small",
+                "area:repository:pending",
+            ],
+        );
     }
 
     #[test]

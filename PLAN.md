@@ -19,10 +19,10 @@
 > volume. G19 is reserved for opt-in quiet-window scouting in watch, while G20
 > is the compact-transport and path-projection pass. G21 repository-local
 > runtime configuration and retrieval observability are implemented. G22
-> exhaustive lexical search is implemented; G23 skill investigation/inquiry
-> loops are planned from the production traces. Neither triggers G16 or
-> widens the semantic product surface, and no retrieval default changes without
-> a same-binary, same-snapshot comparison. G24 repository documentation
+> exhaustive lexical search is implemented. G23 investigation/inquiry guidance
+> is implemented, with its production replay still pending. Neither triggers
+> G16 or widens the semantic product surface, and no retrieval default changes
+> without a same-binary, same-snapshot comparison. G24 repository documentation
 > retrieval is proposed: a separate documentation database and corpus that
 > changes no code-retrieval behavior.
 
@@ -1566,12 +1566,13 @@ checker work terminates its bounded sidecar when superseded. Before starting
 each optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh may return individual file rejections. `jscout index` and
-the watcher report every rejected path/stage/error and publish the indexable
-corpus as a successful, clean generation. Non-retryable read failures and
-deterministic parse rejections are subject-local: a whole-repository retry
-cannot repair binary media with a source-looking extension or a permanently
-protected file.
+A structural refresh may return individual file rejections. `jscout index`
+reports every rejected path/stage/error. The watcher reports full details once
+per distinct rejection set, reports once when the entire set clears, and keeps
+`rejected=N` in every refresh summary. Both publish the indexable corpus as a
+successful, clean generation. Non-retryable read failures and deterministic
+parse rejections are subject-local: a whole-repository retry cannot repair
+binary media with a source-looking extension or a permanently protected file.
 A later file event or periodic reconciliation naturally tries the path again.
 
 Read-error disposition is one explicit rule. Descriptor exhaustion,
@@ -3132,7 +3133,7 @@ the same scope, as unique `(path, line)` values, compared at the
 representation the API returns — chunk plus `match_lines` — not at raw `rg`
 output.
 
-## Planned G23 — skill: investigation and inquiry loops
+## G23 — guidance implemented, acceptance replay pending
 
 Three production sessions and the evaluation record show agents discovering
 the efficient loop themselves, partially. The TargetsQueue investigation
@@ -3145,7 +3146,10 @@ ceiling. The evaluation record adds the invented-anchor failure class and one
 anchoring event in which a delivered analog shaped architecture without
 supplying the missing behavior.
 
-Skill text and server instructions only; no tool changes.
+Skill and MCP guidance plus one profile-correctness fix: Baseline now forces
+configured expansion off, matching its existing forced-off attached-memory
+posture, while still rejecting an explicitly enabled expansion. There are no
+schema, Structural retrieval, or product-default changes.
 
 1. Two loops, and the inquiry loop is conditional. Investigation, for known
    identifiers: `exhaustive: true` lexical search first, `definition` on

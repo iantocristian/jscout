@@ -6,9 +6,17 @@ use anyhow::Result;
 
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
-    RefreshScope, WatchOptions, clear_reconciliation_deadline_if_dirty, is_refresh_boundary,
-    run_refresh, validate_options,
+    RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
+    clear_reconciliation_deadline_if_dirty, is_refresh_boundary, run_refresh, validate_options,
 };
+
+fn rejection(path: &str, stage: &'static str, error: &str) -> crate::indexer::IndexRejection {
+    crate::indexer::IndexRejection {
+        path: path.to_string(),
+        stage,
+        error: error.to_string(),
+    }
+}
 
 fn seconds(value: u64) -> Duration {
     Duration::from_secs(value)
@@ -16,6 +24,50 @@ fn seconds(value: u64) -> Duration {
 
 fn source_signal(path: &str) -> DirtySignal {
     DirtySignal::source(format!("source:{path}"), path)
+}
+
+#[test]
+fn rejection_details_are_reported_once_per_distinct_set() {
+    let first = rejection("video-a.ts", "read", "invalid UTF-8");
+    let second = rejection("video-b.ts", "extract", "unsupported syntax");
+    let mut latch = RejectionReportLatch::default();
+
+    assert_eq!(
+        latch.observe(&[first.clone(), second.clone()]),
+        RejectionReportDecision::Details
+    );
+    assert_eq!(
+        latch.observe(&[first.clone(), second.clone()]),
+        RejectionReportDecision::Silent
+    );
+    assert_eq!(
+        latch.observe(&[second.clone(), first.clone()]),
+        RejectionReportDecision::Silent
+    );
+
+    let changed_error = rejection("video-a.ts", "read", "permission denied");
+    assert_eq!(
+        latch.observe(&[changed_error, second]),
+        RejectionReportDecision::Details
+    );
+}
+
+#[test]
+fn rejection_recovery_and_reappearance_are_each_reported_once() {
+    let rejected = rejection("video.ts", "read", "invalid UTF-8");
+    let mut latch = RejectionReportLatch::default();
+
+    assert_eq!(latch.observe(&[]), RejectionReportDecision::Silent);
+    assert_eq!(
+        latch.observe(std::slice::from_ref(&rejected)),
+        RejectionReportDecision::Details
+    );
+    assert_eq!(
+        latch.observe(&[]),
+        RejectionReportDecision::Cleared { previous: 1 }
+    );
+    assert_eq!(latch.observe(&[]), RejectionReportDecision::Silent);
+    assert_eq!(latch.observe(&[rejected]), RejectionReportDecision::Details);
 }
 
 #[test]

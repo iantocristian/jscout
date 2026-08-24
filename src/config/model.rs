@@ -150,6 +150,9 @@ pub struct RerankerSettings {
 pub struct LlmSettings {
     pub model: String,
     pub reasoning: Option<String>,
+    /// Maximum number of scouting model requests allowed in flight. Model
+    /// execution may overlap; validation and database publication do not.
+    pub max_concurrency: usize,
     pub openai_base_url: Option<String>,
     pub api_key_env: String,
     pub auth_file: PathBuf,

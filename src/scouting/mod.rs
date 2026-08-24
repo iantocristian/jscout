@@ -15,7 +15,7 @@ pub mod repository;
 pub mod summary;
 pub mod workflow;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use crate::llm::protocol::{
     ChatMessage, CompleteRequest, ModelCapabilities, PROTOCOL_VERSION, ProviderOptions,
     ProviderSummary, SubmitTool, Usage,
 };
-use crate::llm::{GatewayError, LlmGateway};
+use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway};
 use crate::semantic::{self, WorkflowCandidateSet};
 use crate::structural;
 
@@ -211,8 +211,120 @@ struct PreparedConcept {
     canonical_name: String,
     sources: Vec<concept::ConceptSource>,
     snapshot: String,
+    planned_predecessor: Option<i64>,
     request: CompleteRequest,
     spec: RunSpec,
+}
+
+struct Claimed<T> {
+    prepared: T,
+    run_id: i64,
+    supersedes_artifact_id: Option<i64>,
+}
+
+/// Best-effort failure guard for claims that have been committed but whose
+/// model tasks have not yet reached a terminal ledger transition. Wave setup
+/// deliberately performs one transaction per input, so a later setup error
+/// must release every earlier claim before unwinding the batch.
+struct StagedRunGuard<'a> {
+    conn: &'a Connection,
+    run_ids: Vec<i64>,
+}
+
+impl<'a> StagedRunGuard<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        Self {
+            conn,
+            run_ids: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, run_id: i64) {
+        self.run_ids.push(run_id);
+    }
+
+    fn resolve(&mut self, run_id: i64) {
+        if let Some(index) = self
+            .run_ids
+            .iter()
+            .position(|candidate| *candidate == run_id)
+        {
+            self.run_ids.swap_remove(index);
+        }
+    }
+
+    fn cleanup(&mut self) {
+        for run_id in self.run_ids.drain(..) {
+            let _ = ledger::finish_run(
+                self.conn,
+                run_id,
+                RunOutcome::Failed,
+                None,
+                Some("wave_aborted"),
+            );
+        }
+    }
+}
+
+impl Drop for StagedRunGuard<'_> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+struct BatchOutcomes {
+    outcomes: std::vec::IntoIter<Result<CompletionOutcome, GatewayError>>,
+    expected: usize,
+    actual: usize,
+}
+
+impl BatchOutcomes {
+    fn dispatch(gateway: &mut dyn LlmGateway, tasks: &[CompletionTask<'_>]) -> Self {
+        let expected = tasks.len();
+        let outcomes = if tasks.is_empty() {
+            Vec::new()
+        } else {
+            gateway.complete_batch(tasks)
+        };
+        let actual = outcomes.len();
+        Self {
+            outcomes: outcomes.into_iter(),
+            expected,
+            actual,
+        }
+    }
+
+    fn cardinality_error(&self, kind: &str) -> Option<anyhow::Error> {
+        (self.actual != self.expected).then(|| {
+            anyhow::anyhow!(
+                "gateway returned {} outcomes for {} {kind} requests",
+                self.actual,
+                self.expected,
+            )
+        })
+    }
+
+    fn next_or_protocol(&mut self, kind: &str) -> Result<CompletionOutcome, GatewayError> {
+        self.outcomes.next().unwrap_or_else(|| {
+            Err(GatewayError::Protocol(format!(
+                "gateway omitted a {kind} batch outcome"
+            )))
+        })
+    }
+}
+
+enum Scheduled<T> {
+    Reused(Box<ScoutReport>),
+    Call(Claimed<T>),
+}
+
+impl<T> Scheduled<T> {
+    fn claimed_run_id(&self) -> Option<i64> {
+        match self {
+            Self::Reused(_) => None,
+            Self::Call(claimed) => Some(claimed.run_id),
+        }
+    }
 }
 
 /// One prepared refresh of either kind, so a mixed selection keeps one
@@ -222,6 +334,170 @@ enum PreparedRefresh {
     Card(Box<CardScoutOptions>, Box<PreparedCard>),
     Summary(Box<SummaryScoutOptions>, Box<PreparedSummary>),
     Concept(Box<ConceptScoutOptions>, Box<PreparedConcept>),
+}
+
+enum ScheduledRefresh {
+    Reused(ScoutReport),
+    Workflow(Box<WorkflowScoutOptions>, Claimed<PreparedWorkflow>),
+    Card(Box<CardScoutOptions>, Claimed<PreparedCard>),
+    Summary(Box<SummaryScoutOptions>, Claimed<PreparedSummary>),
+    Concept(Box<ConceptScoutOptions>, Claimed<PreparedConcept>),
+}
+
+impl ScheduledRefresh {
+    fn task(&self) -> Option<CompletionTask<'_>> {
+        match self {
+            Self::Reused(_) => None,
+            Self::Workflow(options, claimed) => Some(CompletionTask {
+                request: &claimed.prepared.request,
+                timeout: options.policy.timeout,
+            }),
+            Self::Card(options, claimed) => Some(CompletionTask {
+                request: &claimed.prepared.request,
+                timeout: options.policy.timeout,
+            }),
+            Self::Summary(options, claimed) => Some(CompletionTask {
+                request: &claimed.prepared.request,
+                timeout: options.policy.timeout,
+            }),
+            Self::Concept(options, claimed) => Some(CompletionTask {
+                request: &claimed.prepared.request,
+                timeout: options.policy.timeout,
+            }),
+        }
+    }
+
+    fn calls_model(&self) -> bool {
+        !matches!(self, Self::Reused(_))
+    }
+
+    fn claimed_run_id(&self) -> Option<i64> {
+        match self {
+            Self::Reused(_) => None,
+            Self::Workflow(_, claimed) => Some(claimed.run_id),
+            Self::Card(_, claimed) => Some(claimed.run_id),
+            Self::Summary(_, claimed) => Some(claimed.run_id),
+            Self::Concept(_, claimed) => Some(claimed.run_id),
+        }
+    }
+}
+
+fn claim_prepared_refresh(
+    conn: &Connection,
+    prepared: PreparedRefresh,
+) -> Result<ScheduledRefresh> {
+    match prepared {
+        PreparedRefresh::Workflow(options, prepared) => {
+            match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => Ok(ScheduledRefresh::Reused(reuse_report(
+                    conn,
+                    run_id,
+                    &prepared.candidate_set,
+                    &prepared.spec,
+                )?)),
+                RunClaim::Claimed {
+                    run_id,
+                    supersedes_artifact_id,
+                } => Ok(ScheduledRefresh::Workflow(
+                    options,
+                    Claimed {
+                        prepared: *prepared,
+                        run_id,
+                        supersedes_artifact_id,
+                    },
+                )),
+            }
+        }
+        PreparedRefresh::Card(options, prepared) => {
+            match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => Ok(ScheduledRefresh::Reused(card_reuse_report(
+                    conn,
+                    run_id,
+                    &prepared.subject,
+                    &prepared.spec,
+                )?)),
+                RunClaim::Claimed {
+                    run_id,
+                    supersedes_artifact_id,
+                } => Ok(ScheduledRefresh::Card(
+                    options,
+                    Claimed {
+                        prepared: *prepared,
+                        run_id,
+                        supersedes_artifact_id,
+                    },
+                )),
+            }
+        }
+        PreparedRefresh::Summary(options, prepared) => {
+            match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => Ok(ScheduledRefresh::Reused(reused(
+                    conn,
+                    run_id,
+                    "summary",
+                    prepared.scope.scope_key,
+                    prepared.children.len(),
+                    &prepared.spec,
+                )?)),
+                RunClaim::Claimed {
+                    run_id,
+                    supersedes_artifact_id,
+                } => Ok(ScheduledRefresh::Summary(
+                    options,
+                    Claimed {
+                        prepared: *prepared,
+                        run_id,
+                        supersedes_artifact_id,
+                    },
+                )),
+            }
+        }
+        PreparedRefresh::Concept(options, prepared) => {
+            match claim_prepared_concept(conn, &options, *prepared)? {
+                Scheduled::Reused(report) => Ok(ScheduledRefresh::Reused(*report)),
+                Scheduled::Call(claimed) => Ok(ScheduledRefresh::Concept(options, claimed)),
+            }
+        }
+    }
+}
+
+fn finish_scheduled_refresh(
+    root: &Path,
+    conn: &Connection,
+    scheduled: ScheduledRefresh,
+    outcome: Option<Result<CompletionOutcome, GatewayError>>,
+) -> Result<ScoutReport> {
+    match scheduled {
+        ScheduledRefresh::Reused(report) => Ok(report),
+        ScheduledRefresh::Workflow(options, claimed) => finish_claimed_workflow(
+            root,
+            conn,
+            &options,
+            claimed,
+            outcome.expect("claimed refresh has a model outcome"),
+        ),
+        ScheduledRefresh::Card(options, claimed) => finish_claimed_card(
+            root,
+            conn,
+            &options,
+            claimed,
+            outcome.expect("claimed refresh has a model outcome"),
+        ),
+        ScheduledRefresh::Summary(options, claimed) => finish_claimed_summary(
+            root,
+            conn,
+            &options,
+            claimed,
+            outcome.expect("claimed refresh has a model outcome"),
+        ),
+        ScheduledRefresh::Concept(options, claimed) => finish_claimed_concept(
+            root,
+            conn,
+            &options,
+            claimed,
+            outcome.expect("claimed refresh has a model outcome"),
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -358,24 +634,78 @@ pub fn scout_workflow_plan(
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
-    for prepared in prepared {
-        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-        if !reusable && model_calls >= options.policy.max_calls {
-            skipped += 1;
-            continue;
+    let mut pending = VecDeque::from(prepared);
+    while !pending.is_empty() {
+        let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
+        let mut calls_in_wave = 0;
+        while calls_in_wave < options.policy.max_concurrency {
+            let Some(prepared) = pending.pop_front() else {
+                break;
+            };
+            let reusable =
+                !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+            if !reusable && model_calls >= options.policy.max_calls {
+                skipped += 1;
+                continue;
+            }
+            match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => scheduled.push(Scheduled::Reused(Box::new(
+                    reuse_report(conn, run_id, &prepared.candidate_set, &prepared.spec)?,
+                ))),
+                RunClaim::Claimed {
+                    run_id,
+                    supersedes_artifact_id,
+                } => {
+                    staged_runs.track(run_id);
+                    model_calls += 1;
+                    calls_in_wave += 1;
+                    scheduled.push(Scheduled::Call(Claimed {
+                        prepared,
+                        run_id,
+                        supersedes_artifact_id,
+                    }));
+                }
+            }
         }
-        let report = execute_prepared_workflow(
-            root,
-            conn,
-            gateway,
-            options,
-            prepared,
-            model_calls < options.policy.max_calls,
-        )?;
-        if report.status != "reused" {
-            model_calls += 1;
+        let tasks = scheduled
+            .iter()
+            .filter_map(|item| match item {
+                Scheduled::Reused(_) => None,
+                Scheduled::Call(claimed) => Some(CompletionTask {
+                    request: &claimed.prepared.request,
+                    timeout: options.policy.timeout,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("workflow");
+        for item in scheduled {
+            let run_id = item.claimed_run_id();
+            let result = match item {
+                Scheduled::Reused(report) => Ok(*report),
+                Scheduled::Call(claimed) => finish_claimed_workflow(
+                    root,
+                    conn,
+                    options,
+                    claimed,
+                    outcomes.next_or_protocol("workflow"),
+                ),
+            };
+            match result {
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    reports.push(report);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
-        reports.push(report);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
     }
     Ok(ScoutBatchReport {
         reports,
@@ -445,46 +775,109 @@ pub fn scout_card_plan(
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
-    for prepared in prepared {
-        let selection_scope = prepared.selection_scope.clone();
-        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-        if !reusable && model_calls >= options.policy.max_calls {
-            skipped += 1;
+    let mut pending = VecDeque::from(prepared);
+    while !pending.is_empty() {
+        let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
+        let mut calls_in_wave = 0;
+        while calls_in_wave < options.policy.max_concurrency {
+            let Some(prepared) = pending.pop_front() else {
+                break;
+            };
+            let selection_scope = prepared.selection_scope.clone();
+            let reusable =
+                !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+            if !reusable && model_calls >= options.policy.max_calls {
+                skipped += 1;
+                if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
+                    coverage.skipped_call_budget += 1;
+                }
+                continue;
+            }
+            let item = match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => Scheduled::Reused(Box::new(card_reuse_report(
+                    conn,
+                    run_id,
+                    &prepared.subject,
+                    &prepared.spec,
+                )?)),
+                RunClaim::Claimed {
+                    run_id,
+                    supersedes_artifact_id,
+                } => {
+                    staged_runs.track(run_id);
+                    model_calls += 1;
+                    calls_in_wave += 1;
+                    Scheduled::Call(Claimed {
+                        prepared,
+                        run_id,
+                        supersedes_artifact_id,
+                    })
+                }
+            };
+            scheduled.push((selection_scope, item));
+        }
+        let tasks = scheduled
+            .iter()
+            .filter_map(|(_, item)| match item {
+                Scheduled::Reused(_) => None,
+                Scheduled::Call(claimed) => Some(CompletionTask {
+                    request: &claimed.prepared.request,
+                    timeout: options.policy.timeout,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("card");
+        for (selection_scope, item) in scheduled {
+            let run_id = item.claimed_run_id();
+            let result = match item {
+                Scheduled::Reused(report) => Ok(*report),
+                Scheduled::Call(claimed) => finish_claimed_card(
+                    root,
+                    conn,
+                    options,
+                    claimed,
+                    outcomes.next_or_protocol("card"),
+                ),
+            };
+            let report = match result {
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    report
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
             if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
-                coverage.skipped_call_budget += 1;
+                match report.status.as_str() {
+                    "reused" => coverage.reused += 1,
+                    "completed" => {
+                        coverage.model_calls += 1;
+                        coverage.completed += 1;
+                    }
+                    "incomplete" => {
+                        coverage.model_calls += 1;
+                        coverage.incomplete += 1;
+                    }
+                    "failed" => {
+                        coverage.model_calls += 1;
+                        coverage.failed += 1;
+                    }
+                    _ => coverage.model_calls += 1,
+                }
             }
-            continue;
+            reports.push(report);
         }
-        let report = execute_prepared_card(
-            root,
-            conn,
-            gateway,
-            options,
-            prepared,
-            model_calls < options.policy.max_calls,
-        )?;
-        if report.status != "reused" {
-            model_calls += 1;
+        if let Some(error) = first_error {
+            return Err(error);
         }
-        if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
-            match report.status.as_str() {
-                "reused" => coverage.reused += 1,
-                "completed" => {
-                    coverage.model_calls += 1;
-                    coverage.completed += 1;
-                }
-                "incomplete" => {
-                    coverage.model_calls += 1;
-                    coverage.incomplete += 1;
-                }
-                "failed" => {
-                    coverage.model_calls += 1;
-                    coverage.failed += 1;
-                }
-                _ => coverage.model_calls += 1,
-            }
-        }
-        reports.push(report);
     }
     Ok(ScoutBatchReport {
         reports,
@@ -532,24 +925,67 @@ pub fn scout_concept_plan(
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
-    for prepared in prepared {
-        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-        if !reusable && model_calls >= options.policy.max_calls {
-            skipped += 1;
-            continue;
+    let mut pending = VecDeque::from(prepared);
+    while !pending.is_empty() {
+        let mut scheduled = Vec::new();
+        let mut staged_runs = StagedRunGuard::new(conn);
+        let mut calls_in_wave = 0;
+        while calls_in_wave < options.policy.max_concurrency {
+            let Some(prepared) = pending.pop_front() else {
+                break;
+            };
+            let reusable =
+                !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+            if !reusable && model_calls >= options.policy.max_calls {
+                skipped += 1;
+                continue;
+            }
+            let item = claim_prepared_concept(conn, options, prepared)?;
+            if let Some(run_id) = item.claimed_run_id() {
+                staged_runs.track(run_id);
+                model_calls += 1;
+                calls_in_wave += 1;
+            }
+            scheduled.push(item);
         }
-        let report = execute_prepared_concept(
-            root,
-            conn,
-            gateway,
-            options,
-            prepared,
-            model_calls < options.policy.max_calls,
-        )?;
-        if report.status != "reused" {
-            model_calls += 1;
+        let tasks = scheduled
+            .iter()
+            .filter_map(|item| match item {
+                Scheduled::Reused(_) => None,
+                Scheduled::Call(claimed) => Some(CompletionTask {
+                    request: &claimed.prepared.request,
+                    timeout: options.policy.timeout,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+        let mut first_error = outcomes.cardinality_error("concept");
+        for item in scheduled {
+            let run_id = item.claimed_run_id();
+            let result = match item {
+                Scheduled::Reused(report) => Ok(*report),
+                Scheduled::Call(claimed) => finish_claimed_concept(
+                    root,
+                    conn,
+                    options,
+                    claimed,
+                    outcomes.next_or_protocol("concept"),
+                ),
+            };
+            match result {
+                Ok(report) => {
+                    if let Some(run_id) = run_id {
+                        staged_runs.resolve(run_id);
+                    }
+                    reports.push(report);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
-        reports.push(report);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
     }
     Ok(ScoutBatchReport {
         reports,
@@ -600,6 +1036,7 @@ pub fn dry_run_report(
     Ok(serde_json::json!({
         "dry_run": true,
         "max_calls": options.policy.max_calls,
+        "max_concurrency": options.policy.max_concurrency,
         "context_bytes": options.policy.context_bytes,
         "calls_planned": eligible.min(options.policy.max_calls),
         "over_context_bytes_items": over_budget,
@@ -672,6 +1109,7 @@ pub fn card_dry_run_report(
     Ok(serde_json::json!({
         "dry_run": true,
         "max_calls": options.policy.max_calls,
+        "max_concurrency": options.policy.max_concurrency,
         "context_bytes": options.policy.context_bytes,
         "calls_planned": eligible.min(options.policy.max_calls),
         "over_context_bytes_items": over_budget,
@@ -724,6 +1162,7 @@ pub fn concept_dry_run_report(
     Ok(serde_json::json!({
         "dry_run": true,
         "max_calls": options.policy.max_calls,
+        "max_concurrency": options.policy.max_concurrency,
         "context_bytes": options.policy.context_bytes,
         "calls_planned": eligible.min(options.policy.max_calls),
         "over_context_bytes_items": over_budget,
@@ -829,77 +1268,100 @@ pub fn scout_refresh(
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
-    // Children refresh before parents, and each target is prepared
-    // immediately before it executes: a summary prepared against a child the
-    // same command is about to replace would reuse its own stale run. The
-    // just-in-time re-plan sees every successor published moments earlier.
+    // Children refresh before parents. Each dependency rank is prepared only
+    // after the previous rank publishes; independent targets inside one rank
+    // may then execute in bounded waves.
     let mut targets = selection.targets;
-    targets.sort_by_key(|target| {
-        (
-            match &target.config {
-                refresh::RefreshConfig::Workflow(_) | refresh::RefreshConfig::Card(_) => 0_u8,
-                refresh::RefreshConfig::Summary(config) => match config.level.as_str() {
-                    "file" => 1,
-                    "module" => 2,
-                    _ => 3,
-                },
-                // Concepts depend directly on cards/workflows and run last;
-                // summaries do not depend on concepts.
-                refresh::RefreshConfig::Concept(_) => 4,
-            },
-            target.artifact_id,
-        )
-    });
-    for target in targets {
-        let artifact_id = target.artifact_id;
-        let subject = format!("artifact {artifact_id}");
-        let outcome = match target.config {
-            refresh::RefreshConfig::Workflow(config) => prepare_workflow_refresh(
-                root,
-                conn,
-                gateway,
-                &mut cache,
-                artifact_id,
-                config,
-                target.model,
-                target.reasoning,
-                &policy,
-            ),
-            refresh::RefreshConfig::Card(config) => prepare_card_refresh(
-                root,
-                conn,
-                gateway,
-                &mut cache,
-                artifact_id,
-                config,
-                target.model,
-                target.reasoning,
-                &policy,
-            ),
-            refresh::RefreshConfig::Summary(config) => prepare_summary_refresh(
-                root,
-                conn,
-                gateway,
-                &mut cache,
-                artifact_id,
-                config,
-                target.model,
-                target.reasoning,
-                &policy,
-            ),
-            refresh::RefreshConfig::Concept(config) => prepare_concept_refresh(
-                conn,
-                gateway,
-                &mut cache,
-                artifact_id,
-                config,
-                target.model,
-                target.reasoning,
-                &policy,
-            ),
-        };
-        match outcome {
-            Ok(Some(prepared)) => {
+    targets.sort_by_key(|target| (refresh_rank(&target.config), target.artifact_id));
+    let mut targets = targets.into_iter().peekable();
+    while let Some(first) = targets.next() {
+        let rank = refresh_rank(&first.config);
+        let mut rank_targets = vec![first];
+        while targets
+            .peek()
+            .is_some_and(|target| refresh_rank(&target.config) == rank)
+        {
+            rank_targets.push(targets.next().expect("peeked refresh target"));
+        }
+        let mut prepared_rank = Vec::new();
+        for target in rank_targets {
+            let artifact_id = target.artifact_id;
+            let subject = format!("artifact {artifact_id}");
+            let outcome = match target.config {
+                refresh::RefreshConfig::Workflow(config) => prepare_workflow_refresh(
+                    root,
+                    conn,
+                    gateway,
+                    &mut cache,
+                    artifact_id,
+                    config,
+                    target.model,
+                    target.reasoning,
+                    &policy,
+                ),
+                refresh::RefreshConfig::Card(config) => prepare_card_refresh(
+                    root,
+                    conn,
+                    gateway,
+                    &mut cache,
+                    artifact_id,
+                    config,
+                    target.model,
+                    target.reasoning,
+                    &policy,
+                ),
+                refresh::RefreshConfig::Summary(config) => prepare_summary_refresh(
+                    root,
+                    conn,
+                    gateway,
+                    &mut cache,
+                    artifact_id,
+                    config,
+                    target.model,
+                    target.reasoning,
+                    &policy,
+                ),
+                refresh::RefreshConfig::Concept(config) => prepare_concept_refresh(
+                    conn,
+                    gateway,
+                    &mut cache,
+                    artifact_id,
+                    config,
+                    target.model,
+                    target.reasoning,
+                    &policy,
+                ),
+            };
+            match outcome {
+                Ok(Some(prepared)) => prepared_rank.push(prepared),
+                Ok(None) => skipped_unresolvable.push(BatchSkip {
+                    subject,
+                    reason: "did not reconstruct exactly one deterministic input".into(),
+                }),
+                Err(error) if error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
+                    skipped_over_budget.push(BatchSkip {
+                        subject,
+                        reason: error.to_string(),
+                    });
+                }
+                Err(error) if error.downcast_ref::<UnresolvableRefresh>().is_some() => {
+                    skipped_unresolvable.push(BatchSkip {
+                        subject,
+                        reason: error.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut pending = VecDeque::from(prepared_rank);
+        while !pending.is_empty() {
+            let mut scheduled = Vec::new();
+            let mut staged_runs = StagedRunGuard::new(conn);
+            let mut calls_in_wave = 0;
+            while calls_in_wave < policy.max_concurrency {
+                let Some(prepared) = pending.pop_front() else {
+                    break;
+                };
                 let spec = match &prepared {
                     PreparedRefresh::Workflow(_, workflow) => &workflow.spec,
                     PreparedRefresh::Card(_, card) => &card.spec,
@@ -911,58 +1373,39 @@ pub fn scout_refresh(
                     skipped += 1;
                     continue;
                 }
-                let allow_new_call = model_calls < policy.max_calls;
-                let report = match prepared {
-                    PreparedRefresh::Workflow(options, workflow) => execute_prepared_workflow(
-                        root,
-                        conn,
-                        gateway,
-                        &options,
-                        *workflow,
-                        allow_new_call,
-                    )?,
-                    PreparedRefresh::Card(options, card) => {
-                        execute_prepared_card(root, conn, gateway, &options, *card, allow_new_call)?
-                    }
-                    PreparedRefresh::Summary(options, summary) => execute_prepared_summary(
-                        root,
-                        conn,
-                        gateway,
-                        &options,
-                        *summary,
-                        allow_new_call,
-                    )?,
-                    PreparedRefresh::Concept(options, concept) => execute_prepared_concept(
-                        root,
-                        conn,
-                        gateway,
-                        &options,
-                        *concept,
-                        allow_new_call,
-                    )?,
-                };
-                if report.status != "reused" {
+                let item = claim_prepared_refresh(conn, prepared)?;
+                if let Some(run_id) = item.claimed_run_id() {
+                    staged_runs.track(run_id);
                     model_calls += 1;
+                    calls_in_wave += 1;
                 }
-                reports.push(report);
+                scheduled.push(item);
             }
-            Ok(None) => skipped_unresolvable.push(BatchSkip {
-                subject,
-                reason: "did not reconstruct exactly one deterministic input".into(),
-            }),
-            Err(error) if error.downcast_ref::<ContextBudgetExceeded>().is_some() => {
-                skipped_over_budget.push(BatchSkip {
-                    subject,
-                    reason: error.to_string(),
-                });
+            let tasks = scheduled
+                .iter()
+                .filter_map(ScheduledRefresh::task)
+                .collect::<Vec<_>>();
+            let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+            let mut first_error = outcomes.cardinality_error("refresh");
+            for item in scheduled {
+                let run_id = item.claimed_run_id();
+                let outcome = item
+                    .calls_model()
+                    .then(|| outcomes.next_or_protocol("refresh"));
+                match finish_scheduled_refresh(root, conn, item, outcome) {
+                    Ok(report) => {
+                        if let Some(run_id) = run_id {
+                            staged_runs.resolve(run_id);
+                        }
+                        reports.push(report);
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
             }
-            Err(error) if error.downcast_ref::<UnresolvableRefresh>().is_some() => {
-                skipped_unresolvable.push(BatchSkip {
-                    subject,
-                    reason: error.to_string(),
-                });
+            if let Some(error) = first_error {
+                return Err(error);
             }
-            Err(error) => return Err(error),
         }
     }
     Ok(ScoutBatchReport {
@@ -973,6 +1416,20 @@ pub fn scout_refresh(
         skipped_unresolvable,
         ..ScoutBatchReport::default()
     })
+}
+
+fn refresh_rank(config: &refresh::RefreshConfig) -> u8 {
+    match config {
+        refresh::RefreshConfig::Workflow(_) | refresh::RefreshConfig::Card(_) => 0,
+        refresh::RefreshConfig::Summary(config) => match config.level.as_str() {
+            "file" => 1,
+            "module" => 2,
+            _ => 3,
+        },
+        // Concepts depend directly on cards/workflows and run last;
+        // summaries do not depend on concepts.
+        refresh::RefreshConfig::Concept(_) => 4,
+    }
 }
 
 #[expect(
@@ -1196,6 +1653,7 @@ fn prepare_workflow(
     })
 }
 
+#[cfg(test)]
 fn execute_prepared_workflow(
     root: &Path,
     conn: &Connection,
@@ -1204,27 +1662,47 @@ fn execute_prepared_workflow(
     prepared: PreparedWorkflow,
     allow_new_call: bool,
 ) -> Result<ScoutReport> {
-    let PreparedWorkflow {
-        candidate_set,
-        evidence,
-        request,
-        spec,
-    } = prepared;
-    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
+    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &prepared.spec)?.is_none())
+    {
         bail!("workflow call budget exhausted before a non-reusable run");
     }
-    let input_fingerprint = spec.input_fingerprint.clone();
-    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
+    let claim = match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
         RunClaim::Reused(run_id) => {
-            return reuse_report(conn, run_id, &candidate_set, &spec);
+            return reuse_report(conn, run_id, &prepared.candidate_set, &prepared.spec);
         }
         RunClaim::Claimed {
             run_id,
             supersedes_artifact_id,
-        } => (run_id, supersedes_artifact_id),
+        } => Claimed {
+            prepared,
+            run_id,
+            supersedes_artifact_id,
+        },
     };
+    let outcome = gateway.complete(&claim.prepared.request, options.policy.timeout);
+    finish_claimed_workflow(root, conn, options, claim, outcome)
+}
 
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+fn finish_claimed_workflow(
+    root: &Path,
+    conn: &Connection,
+    options: &WorkflowScoutOptions,
+    claimed: Claimed<PreparedWorkflow>,
+    outcome: Result<CompletionOutcome, GatewayError>,
+) -> Result<ScoutReport> {
+    let Claimed {
+        prepared,
+        run_id,
+        supersedes_artifact_id,
+    } = claimed;
+    let PreparedWorkflow {
+        candidate_set,
+        evidence,
+        request: _,
+        spec,
+    } = prepared;
+    let input_fingerprint = spec.input_fingerprint.clone();
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let (status, code) = match &error {
@@ -1506,35 +1984,28 @@ fn prepare_card(
     })
 }
 
-fn execute_prepared_card(
+fn finish_claimed_card(
     root: &Path,
     conn: &Connection,
-    gateway: &mut dyn LlmGateway,
     options: &CardScoutOptions,
-    prepared: PreparedCard,
-    allow_new_call: bool,
+    claimed: Claimed<PreparedCard>,
+    outcome: Result<CompletionOutcome, GatewayError>,
 ) -> Result<ScoutReport> {
+    let Claimed {
+        prepared,
+        run_id,
+        supersedes_artifact_id,
+    } = claimed;
     let PreparedCard {
         subject,
         selection_scope: _,
         snapshot,
         evidence,
-        request,
+        request: _,
         spec,
     } = prepared;
-    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
-        bail!("card call budget exhausted before a non-reusable run");
-    }
     let input_fingerprint = spec.input_fingerprint.clone();
-    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
-        RunClaim::Reused(run_id) => return card_reuse_report(conn, run_id, &subject, &spec),
-        RunClaim::Claimed {
-            run_id,
-            supersedes_artifact_id,
-        } => (run_id, supersedes_artifact_id),
-    };
-
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let (status, code) = match &error {
@@ -1817,57 +2288,46 @@ fn prepare_concept(
         canonical_name,
         sources,
         snapshot,
+        planned_predecessor: None,
         request,
         spec,
     })
 }
 
-fn execute_prepared_concept(
-    root: &Path,
+fn claim_prepared_concept(
     conn: &Connection,
-    gateway: &mut dyn LlmGateway,
     options: &ConceptScoutOptions,
-    prepared: PreparedConcept,
-    allow_new_call: bool,
-) -> Result<ScoutReport> {
-    let PreparedConcept {
-        canonical_name,
-        sources,
-        snapshot,
-        request,
-        spec,
-    } = prepared;
+    mut prepared: PreparedConcept,
+) -> Result<Scheduled<PreparedConcept>> {
     // Pin the concept lineage before the provider call. A same-name concept
     // published while the model is running is not an implicit predecessor:
     // accepting it would overwrite a result this run never planned against.
-    let planned_predecessor = current_concept_for_key(conn, &canonical_name)?;
+    let planned_predecessor = current_concept_for_key(conn, &prepared.canonical_name)?;
     if let Some(explicit_predecessor) = options.supersedes_artifact_id
         && planned_predecessor != Some(explicit_predecessor)
     {
         bail!(
-            "concept `{canonical_name}` changed before refresh publication (expected artifact {explicit_predecessor}, current {planned_predecessor:?})"
+            "concept `{}` changed before refresh publication (expected artifact {explicit_predecessor}, current {planned_predecessor:?})",
+            prepared.canonical_name
         );
     }
-    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
-        bail!("concept call budget exhausted before a non-reusable run");
-    }
-    let input_fingerprint = spec.input_fingerprint.clone();
-    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
-        RunClaim::Reused(run_id) => {
-            return reused(
-                conn,
+    let (run_id, supersedes_artifact_id) =
+        match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+            RunClaim::Reused(run_id) => {
+                return Ok(Scheduled::Reused(Box::new(reused(
+                    conn,
+                    run_id,
+                    "concept",
+                    prepared.canonical_name,
+                    prepared.sources.len(),
+                    &prepared.spec,
+                )?)));
+            }
+            RunClaim::Claimed {
                 run_id,
-                "concept",
-                canonical_name,
-                sources.len(),
-                &spec,
-            );
-        }
-        RunClaim::Claimed {
-            run_id,
-            supersedes_artifact_id,
-        } => (run_id, supersedes_artifact_id),
-    };
+                supersedes_artifact_id,
+            } => (run_id, supersedes_artifact_id),
+        };
     if supersedes_artifact_id.is_some() && supersedes_artifact_id != planned_predecessor {
         ledger::finish_run(
             conn,
@@ -1877,11 +2337,40 @@ fn execute_prepared_concept(
             Some("inputs_changed"),
         )?;
         bail!(
-            "concept `{canonical_name}` lineage changed while claiming the run (planned {planned_predecessor:?}, ledger {supersedes_artifact_id:?})"
+            "concept `{}` lineage changed while claiming the run (planned {planned_predecessor:?}, ledger {supersedes_artifact_id:?})",
+            prepared.canonical_name
         );
     }
+    prepared.planned_predecessor = planned_predecessor;
+    Ok(Scheduled::Call(Claimed {
+        prepared,
+        run_id,
+        supersedes_artifact_id,
+    }))
+}
 
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+fn finish_claimed_concept(
+    root: &Path,
+    conn: &Connection,
+    options: &ConceptScoutOptions,
+    claimed: Claimed<PreparedConcept>,
+    outcome: Result<CompletionOutcome, GatewayError>,
+) -> Result<ScoutReport> {
+    let Claimed {
+        prepared,
+        run_id,
+        supersedes_artifact_id: _,
+    } = claimed;
+    let PreparedConcept {
+        canonical_name,
+        sources,
+        snapshot,
+        planned_predecessor,
+        request: _,
+        spec,
+    } = prepared;
+    let input_fingerprint = spec.input_fingerprint.clone();
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let (status, code) = match &error {
@@ -2229,6 +2718,7 @@ pub fn scout_summaries(
         let plan = plan::summaries(root, conn, level, &options.scopes)?;
         let automatic = plan.mode == "automatic";
         batch.skipped_unscoutable += plan.skipped.len();
+        let mut prepared_level = Vec::new();
         for item in plan.items {
             let subject = item.scope.clone();
             let prepared = match prepare_summary(gateway, &mut cache, item, options) {
@@ -2244,24 +2734,87 @@ pub fn scout_summaries(
                 }
                 Err(error) => return Err(error),
             };
-            let reusable =
-                !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-            if !reusable && model_calls >= options.policy.max_calls {
-                batch.skipped_for_call_budget += 1;
-                continue;
+            prepared_level.push(prepared);
+        }
+        let mut pending = VecDeque::from(prepared_level);
+        while !pending.is_empty() {
+            let mut scheduled = Vec::new();
+            let mut staged_runs = StagedRunGuard::new(conn);
+            let mut calls_in_wave = 0;
+            while calls_in_wave < options.policy.max_concurrency {
+                let Some(prepared) = pending.pop_front() else {
+                    break;
+                };
+                let reusable =
+                    !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+                if !reusable && model_calls >= options.policy.max_calls {
+                    batch.skipped_for_call_budget += 1;
+                    continue;
+                }
+                match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                    RunClaim::Reused(run_id) => {
+                        scheduled.push(Scheduled::Reused(Box::new(reused(
+                            conn,
+                            run_id,
+                            "summary",
+                            prepared.scope.scope_key,
+                            prepared.children.len(),
+                            &prepared.spec,
+                        )?)));
+                    }
+                    RunClaim::Claimed {
+                        run_id,
+                        supersedes_artifact_id,
+                    } => {
+                        staged_runs.track(run_id);
+                        model_calls += 1;
+                        calls_in_wave += 1;
+                        scheduled.push(Scheduled::Call(Claimed {
+                            prepared,
+                            run_id,
+                            supersedes_artifact_id,
+                        }));
+                    }
+                }
             }
-            let report = execute_prepared_summary(
-                root,
-                conn,
-                gateway,
-                options,
-                prepared,
-                model_calls < options.policy.max_calls,
-            )?;
-            if report.status != "reused" {
-                model_calls += 1;
+            let tasks = scheduled
+                .iter()
+                .filter_map(|item| match item {
+                    Scheduled::Reused(_) => None,
+                    Scheduled::Call(claimed) => Some(CompletionTask {
+                        request: &claimed.prepared.request,
+                        timeout: options.policy.timeout,
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let mut outcomes = BatchOutcomes::dispatch(gateway, &tasks);
+            let mut first_error = outcomes.cardinality_error("summary");
+            for item in scheduled {
+                let run_id = item.claimed_run_id();
+                let result = match item {
+                    Scheduled::Reused(report) => Ok(*report),
+                    Scheduled::Call(claimed) => finish_claimed_summary(
+                        root,
+                        conn,
+                        options,
+                        claimed,
+                        outcomes.next_or_protocol("summary"),
+                    ),
+                };
+                match result {
+                    Ok(report) => {
+                        if let Some(run_id) = run_id {
+                            staged_runs.resolve(run_id);
+                        }
+                        batch.reports.push(report);
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
             }
-            batch.reports.push(report);
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
     }
     batch.model_calls = model_calls;
@@ -2320,6 +2873,7 @@ pub fn summary_dry_run_report(
     Ok(serde_json::json!({
         "dry_run": true,
         "max_calls": options.policy.max_calls,
+        "max_concurrency": options.policy.max_concurrency,
         "context_bytes": options.policy.context_bytes,
         "calls_planned": eligible.min(options.policy.max_calls),
         "over_context_bytes_items": over_budget,
@@ -2394,43 +2948,27 @@ fn prepare_summary(
     })
 }
 
-fn execute_prepared_summary(
+fn finish_claimed_summary(
     root: &Path,
     conn: &Connection,
-    gateway: &mut dyn LlmGateway,
     options: &SummaryScoutOptions,
-    prepared: PreparedSummary,
-    allow_new_call: bool,
+    claimed: Claimed<PreparedSummary>,
+    outcome: Result<CompletionOutcome, GatewayError>,
 ) -> Result<ScoutReport> {
+    let Claimed {
+        prepared,
+        run_id,
+        supersedes_artifact_id,
+    } = claimed;
     let PreparedSummary {
         scope,
         children,
         snapshot,
-        request,
+        request: _,
         spec,
     } = prepared;
-    if !allow_new_call && (options.rebuild || ledger::reusable_run(conn, &spec)?.is_none()) {
-        bail!("summary call budget exhausted before a non-reusable run");
-    }
     let input_fingerprint = spec.input_fingerprint.clone();
-    let (run_id, supersedes_artifact_id) = match ledger::claim_run(conn, &spec, options.rebuild)? {
-        RunClaim::Reused(run_id) => {
-            return reused(
-                conn,
-                run_id,
-                "summary",
-                scope.scope_key,
-                children.len(),
-                &spec,
-            );
-        }
-        RunClaim::Claimed {
-            run_id,
-            supersedes_artifact_id,
-        } => (run_id, supersedes_artifact_id),
-    };
-
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let (status, code) = match &error {

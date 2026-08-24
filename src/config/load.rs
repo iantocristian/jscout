@@ -125,6 +125,7 @@ struct RerankerFileConfig {
 struct LlmFileConfig {
     model: Option<String>,
     reasoning: Option<String>,
+    max_concurrency: Option<usize>,
     openai_base_url: Option<String>,
     api_key_env: Option<String>,
     auth_file: Option<String>,
@@ -745,6 +746,12 @@ impl RuntimeConfig {
                 raw.llm.reasoning,
                 Some("JSCOUT_LLM_REASONING"),
             ),
+            max_concurrency: resolver.usize(
+                "llm.max_concurrency",
+                raw.llm.max_concurrency,
+                None,
+                1,
+            )?,
             openai_base_url,
             api_key_env: resolver.string(
                 "llm.api_key_env",

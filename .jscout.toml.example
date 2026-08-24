@@ -62,6 +62,9 @@ max_chars = 4000
 [llm]
 model = "openai-codex:gpt-5.6-terra"
 # reasoning = "high"
+# Scouting is serialized by default. Increase deliberately when the selected
+# provider/account can sustain overlapping requests.
+max_concurrency = 1
 # For API-key OpenAI through a Responses-compatible gateway:
 # model = "openai:gpt-5.6-terra"
 # openai_base_url = "https://gateway.example.com/v1"

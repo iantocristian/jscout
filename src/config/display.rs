@@ -78,13 +78,14 @@ impl RuntimeConfig {
                 self.effective.reranker.model
             ),
             format!(
-                "llm: model={} reasoning={} base_url={}",
+                "llm: model={} reasoning={} max_concurrency={} base_url={}",
                 self.effective.llm.model,
                 self.effective
                     .llm
                     .reasoning
                     .as_deref()
                     .unwrap_or("<provider default>"),
+                self.effective.llm.max_concurrency,
                 self.effective
                     .llm
                     .openai_base_url
