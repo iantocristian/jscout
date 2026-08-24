@@ -281,7 +281,11 @@ struct BatchOutcomes {
 impl BatchOutcomes {
     fn dispatch(gateway: &mut dyn LlmGateway, tasks: &[CompletionTask<'_>]) -> Self {
         let expected = tasks.len();
-        let outcomes = gateway.complete_batch(tasks);
+        let outcomes = if tasks.is_empty() {
+            Vec::new()
+        } else {
+            gateway.complete_batch(tasks)
+        };
         let actual = outcomes.len();
         Self {
             outcomes: outcomes.into_iter(),

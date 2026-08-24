@@ -1076,8 +1076,7 @@ pub fn execute(
     while !queue.is_empty() {
         let mut scheduled = Vec::new();
         let mut staged_runs = super::StagedRunGuard::new(conn);
-        let mut calls_in_wave = 0;
-        while calls_in_wave < options.policy.max_concurrency {
+        while scheduled.len() < options.policy.max_concurrency {
             let Some(item) = queue.pop_front() else {
                 break;
             };
@@ -1133,7 +1132,6 @@ pub fn execute(
                 }
                 RunClaim::Claimed { run_id, .. } => {
                     report.model_calls += 1;
-                    calls_in_wave += 1;
                     staged_runs.track(run_id);
                     scheduled.push(ScheduledRepository::Call(Box::new(
                         ScheduledRepositoryCall {
@@ -1159,20 +1157,9 @@ pub fn execute(
                 }
             })
             .collect::<Vec<_>>();
-        let expected_outcomes = tasks.len();
-        let outcomes = if tasks.is_empty() {
-            Vec::new()
-        } else {
-            gateway.complete_batch(&tasks)
-        };
+        let mut outcomes = super::BatchOutcomes::dispatch(gateway, &tasks);
         drop(tasks);
-        let actual_outcomes = outcomes.len();
-        let mut outcomes = outcomes.into_iter();
-        let mut first_error = (actual_outcomes != expected_outcomes).then(|| {
-            anyhow::anyhow!(
-                "gateway returned {actual_outcomes} outcomes for {expected_outcomes} repository requests"
-            )
-        });
+        let mut first_error = outcomes.cardinality_error("repository");
         let mut completed = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
             match scheduled {
@@ -1194,11 +1181,7 @@ pub fn execute(
                         claimed,
                     } = *scheduled;
                     let run_id = claimed.run_id;
-                    let outcome = outcomes.next().unwrap_or_else(|| {
-                        Err(GatewayError::Protocol(
-                            "gateway omitted a repository batch outcome".into(),
-                        ))
-                    });
+                    let outcome = outcomes.next_or_protocol("repository");
                     match finish_claimed(root, conn, claimed, &snapshot, outcome) {
                         Ok((scout_report, role)) => {
                             staged_runs.resolve(run_id);
@@ -1286,19 +1269,6 @@ fn result_subdivisions(
         return Ok(Vec::new());
     }
     subdivide(root, conn, &subdivision_parent)
-}
-
-#[cfg(test)]
-fn enqueue_subdivisions(
-    queue: &mut VecDeque<RepositoryPlanItem>,
-    seen: &mut BTreeSet<String>,
-    subject_count: &mut usize,
-    report: &mut ScoutBatchReport,
-    max_subjects: usize,
-    children: Vec<RepositoryPlanItem>,
-) {
-    let admitted = admit_subdivisions(seen, subject_count, report, max_subjects, children);
-    prepend_subdivisions(queue, admitted);
 }
 
 fn admit_subdivisions(
@@ -2086,7 +2056,7 @@ mod tests {
         )?;
         assert_eq!(first_gateway.calls, 2);
 
-        let options = repository_options(2, 2, 12)?;
+        let options = repository_options(2, 1, 12)?;
         let mut gateway = RepositoryGateway::new(vec![
             Ok(repository_outcome("mixed")),
             Ok(repository_outcome("runtime")),
@@ -2111,19 +2081,19 @@ mod tests {
         assert_eq!(report.model_calls, 2);
         assert_eq!(report.reports.len(), 4);
         assert_eq!(report.reports[0].subject, "area:repository:a");
-        assert_eq!(report.reports[1].subject, "area:repository:c");
-        assert_eq!(report.reports[1].status, "reused");
-        assert_eq!(report.reports[2].subject, "area:repository:b");
-        assert_eq!(report.reports[2].status, "reused");
         assert!(
-            report.reports[3].subject.starts_with("area:repository:a"),
-            "the first parent's child must receive the remaining call before later-parent children: {:?}",
+            report.reports[1].subject.starts_with("area:repository:a"),
+            "the first parent's child must enter the next serialized wave before later subjects: {:?}",
             report
                 .reports
                 .iter()
                 .map(|report| report.subject.as_str())
                 .collect::<Vec<_>>()
         );
+        assert_eq!(report.reports[2].subject, "area:repository:c");
+        assert_eq!(report.reports[2].status, "reused");
+        assert_eq!(report.reports[3].subject, "area:repository:b");
+        assert_eq!(report.reports[3].status, "reused");
         Ok(())
     }
 
@@ -2246,8 +2216,7 @@ mod tests {
         let mut subject_count = 1;
         let mut report = super::ScoutBatchReport::default();
 
-        super::enqueue_subdivisions(
-            &mut queue,
+        let admitted = super::admit_subdivisions(
             &mut seen,
             &mut subject_count,
             &mut report,
@@ -2257,6 +2226,7 @@ mod tests {
                 planned("area:repository:parent/big", 20),
             ],
         );
+        super::prepend_subdivisions(&mut queue, admitted);
 
         assert_eq!(
             queue

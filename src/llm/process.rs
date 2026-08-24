@@ -54,8 +54,9 @@ struct GatewayWriter {
     next_id: AtomicU64,
 }
 
-/// Independent cancellation handle. Explicit callers may write synchronously;
-/// the Ctrl-C path only sends target ids to the gateway's cancellation queue.
+/// Independent cancellation handle. The writer handle identifies the
+/// registered gateway; cancellation itself is queued so signal handling never
+/// waits on child stdin.
 #[derive(Clone)]
 pub struct GatewayControl {
     writer: Arc<GatewayWriter>,
@@ -72,14 +73,10 @@ struct InterruptControl {
 /// dispatched. The generation remains latched after active requests finish,
 /// so a delayed worker from the same batch cannot mistake a cleared pending
 /// bit for permission to start.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct DispatchAdmission {
     generation: u64,
     interrupted: bool,
-    /// Generation of the interrupt this admission actually declined. Zero is
-    /// the sentinel because a handled interrupt increments the generation
-    /// before a dispatcher can observe it.
-    observed_generation: Arc<AtomicU64>,
 }
 
 impl GatewayControl {
@@ -107,10 +104,14 @@ impl InterruptControl {
             .any(|gateway| Arc::ptr_eq(&gateway.writer, writer))
     }
 
-    fn enqueue_active_cancellations(&self) {
+    fn enqueue_active_cancellations(&self) -> bool {
+        let mut queued = false;
         for gateway in &self.gateways {
-            let _ = gateway.cancel_active();
+            if let Ok(active) = gateway.cancel_active() {
+                queued |= active;
+            }
         }
+        queued
     }
 
     fn any_active(&self) -> bool {
@@ -132,29 +133,7 @@ impl DispatchAdmission {
         Ok(Self {
             generation: INTERRUPT_GENERATION.load(Ordering::SeqCst),
             interrupted: INTERRUPT_PENDING.load(Ordering::SeqCst),
-            observed_generation: Arc::new(AtomicU64::new(0)),
         })
-    }
-
-    fn observe_interrupt(&self, generation: u64) {
-        self.observed_generation.store(generation, Ordering::SeqCst);
-    }
-
-    /// Release a latched, idle interrupt only after the request or whole batch
-    /// that observed it has declined dispatch. Comparing generations prevents
-    /// this cleanup from erasing a newer interrupt that raced with teardown.
-    fn finish_for(&self, writer: &Arc<GatewayWriter>) {
-        if let Ok(registered) = INTERRUPT_CONTROL.lock() {
-            let observed_generation = self.observed_generation.load(Ordering::SeqCst);
-            if observed_generation != 0
-                && observed_generation == INTERRUPT_GENERATION.load(Ordering::SeqCst)
-                && registered
-                    .as_ref()
-                    .is_some_and(|control| control.contains(writer) && !control.any_active())
-            {
-                INTERRUPT_PENDING.store(false, Ordering::SeqCst);
-            }
-        }
     }
 }
 
@@ -186,10 +165,7 @@ fn request_interrupt_cancellation() -> bool {
             }
             INTERRUPT_GENERATION.fetch_add(1, Ordering::SeqCst);
             match registered.as_ref() {
-                Some(control) => {
-                    control.enqueue_active_cancellations();
-                    true
-                }
+                Some(control) => control.enqueue_active_cancellations(),
                 None => false,
             }
         }
@@ -479,7 +455,6 @@ impl ProcessGateway {
                 || INTERRUPT_PENDING.load(Ordering::SeqCst)
                 || admission.generation != interrupt_generation)
         {
-            admission.observe_interrupt(interrupt_generation);
             return Err(GatewayError::Canceled(
                 "interrupted before gateway dispatch".into(),
             ));
@@ -647,7 +622,6 @@ impl LlmGateway for ProcessGatewayPool {
                     .iter_mut()
                     .zip(batch)
                     .map(|(worker, task)| {
-                        let admission = admission.clone();
                         scope.spawn(move || {
                             worker.complete_with_admission(task.request, task.timeout, admission)
                         })
@@ -664,7 +638,6 @@ impl LlmGateway for ProcessGatewayPool {
             });
             outcomes.extend(batch_outcomes);
         }
-        admission.finish_for(&self.workers[0].writer);
         outcomes
     }
 }
@@ -714,10 +687,7 @@ impl ProcessGateway {
         grace: Duration,
     ) -> Result<CompletionOutcome, GatewayError> {
         let admission = DispatchAdmission::capture()?;
-        let outcome =
-            self.complete_with_grace_and_admission(request, timeout, grace, admission.clone());
-        admission.finish_for(&self.writer);
-        outcome
+        self.complete_with_grace_and_admission(request, timeout, grace, admission)
     }
 
     fn complete_with_grace_and_admission(
@@ -838,7 +808,7 @@ mod fake {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1065,8 +1035,8 @@ done"#,
         let delayed_request = complete_request();
         let (release_delayed, wait_for_release) = mpsc::channel();
         let (first_result, delayed_result) = thread::scope(|scope| -> anyhow::Result<_> {
-            let first_admission = admission.clone();
-            let delayed_admission = admission.clone();
+            let first_admission = admission;
+            let delayed_admission = admission;
             let first_worker = &mut first;
             let first_request = &first_request;
             let first_handle = scope.spawn(move || {
@@ -1115,7 +1085,6 @@ done"#,
             !late_dispatch.exists(),
             "the delayed worker sent a completion after Ctrl-C"
         );
-        admission.finish_for(&delayed.writer);
         delayed.complete(&complete_request(), Duration::from_secs(2))?;
         assert!(
             late_dispatch.exists(),
@@ -1125,76 +1094,25 @@ done"#,
     }
 
     #[test]
-    fn idle_interrupt_is_handled_until_the_admission_declines() -> anyhow::Result<()> {
+    fn idle_interrupt_requests_immediate_exit() -> anyhow::Result<()> {
         let _interrupt_test = INTERRUPT_TEST_LOCK
             .lock()
             .map_err(|_| anyhow::anyhow!("interrupt test lock poisoned"))?;
-        let dir = tempfile::tempdir()?;
-        let dispatched = dir.path().join("dispatched");
         let body = format!(
             r#"while IFS= read -r line; do
   case "$line" in
     *'"kind":"hello"'*) echo '{READY}' ;;
-    *'"kind":"complete"'*)
-      touch '{dispatched}'
-      echo '{{"protocol":1,"id":"r3","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
-      echo '{{"protocol":1,"id":"r3","kind":"result","tool_call":{{"name":"submit","arguments":{{"ok":true}}}},"stop_reason":"toolUse","usage":{{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":3,"cost_total":0}}}}'
-      ;;
     *'"kind":"shutdown"'*) exit 0 ;;
   esac
-done"#,
-            dispatched = dispatched.display(),
+done"#
         );
-        let (node, script) = write_fake_gateway(dir.path(), &body)?;
-        let mut gateway = ProcessGateway::spawn(&node, &script)?;
+        let gateway = spawn_with(&body)?;
         register_interrupt_controls(vec![gateway.control()])?;
-        let admission = DispatchAdmission::capture()?;
 
-        let writer = Arc::clone(&gateway.writer);
-        let stdin = writer
-            .stdin
-            .lock()
-            .map_err(|_| anyhow::anyhow!("gateway stdin lock poisoned"))?;
-        let request = complete_request();
-        let (rejected, handled) = thread::scope(|scope| -> anyhow::Result<_> {
-            let worker_admission = admission.clone();
-            let worker = &mut gateway;
-            let completion = scope.spawn(move || {
-                worker.complete_with_admission(&request, Duration::from_secs(2), worker_admission)
-            });
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while writer.next_id.load(std::sync::atomic::Ordering::SeqCst) < 2 {
-                if Instant::now() >= deadline {
-                    anyhow::bail!("worker did not prepare its completion frame");
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-
-            let (finished, interrupt_result) = mpsc::channel();
-            let canceler = scope.spawn(move || {
-                finished
-                    .send(request_interrupt_cancellation())
-                    .expect("interrupt result receiver");
-            });
-            let handled = interrupt_result.recv_timeout(Duration::from_secs(1));
-            drop(stdin);
-            let rejected = completion.join().expect("gateway worker");
-            canceler.join().expect("interrupt thread");
-            Ok((rejected, handled?))
-        })?;
-
-        assert!(handled);
-        assert!(INTERRUPT_PENDING.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
-            matches!(rejected, Err(GatewayError::Canceled(_))),
-            "got {rejected:?}"
+            !request_interrupt_cancellation(),
+            "an idle first interrupt must make the handler exit 130"
         );
-        assert!(!dispatched.exists());
-
-        admission.finish_for(&gateway.writer);
-        assert!(!INTERRUPT_PENDING.load(std::sync::atomic::Ordering::SeqCst));
-        gateway.complete(&complete_request(), Duration::from_secs(2))?;
-        assert!(dispatched.exists());
         Ok(())
     }
 
