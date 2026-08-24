@@ -780,7 +780,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                             runtime.effective.llm.reasoning.as_deref(),
                         ),
                         service_tier,
-                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                            .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
                         rebuild,
                         max_subjects,
                         max_depth,
@@ -829,7 +830,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                             runtime.effective.llm.reasoning.as_deref(),
                         ),
                         service_tier,
-                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                            .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
                         rebuild,
                         supersedes_artifact_id: None,
                     },
@@ -883,7 +885,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                             runtime.effective.llm.reasoning.as_deref(),
                         ),
                         service_tier,
-                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                            .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
                         rebuild,
                         supersedes_artifact_id: None,
                     },
@@ -921,7 +924,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                         runtime.effective.llm.reasoning.as_deref(),
                     ),
                     service_tier,
-                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                    policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                        .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
                     rebuild,
                     supersedes_artifact_id: None,
                 },
@@ -964,7 +968,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                             runtime.effective.llm.reasoning.as_deref(),
                         ),
                         service_tier,
-                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                        policy: llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                            .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
                         rebuild,
                         supersedes_artifact_id: None,
                     },
@@ -986,7 +991,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 runtime,
                 &artifacts,
                 dry_run,
-                llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?,
+                llm::config::RequestPolicy::new(timeout, max_calls, context_bytes)?
+                    .with_max_concurrency(runtime.effective.llm.max_concurrency)?,
             ),
         },
     }

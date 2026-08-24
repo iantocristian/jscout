@@ -21,14 +21,14 @@ use super::protocol::{
     CompleteRequest, GatewayVersions, Inbound, ModelCapabilities, Outbound, PROTOCOL_VERSION,
     ProviderSummary, encode,
 };
-use super::{CompletionOutcome, GatewayError, LlmGateway, StartedInfo};
+use super::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway, StartedInfo};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
-static INTERRUPT_CONTROL: Mutex<Option<GatewayControl>> = Mutex::new(None);
+static INTERRUPT_CONTROL: Mutex<Option<InterruptControl>> = Mutex::new(None);
 static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub struct ProcessGateway {
@@ -38,6 +38,13 @@ pub struct ProcessGateway {
     active_request: Arc<Mutex<Option<String>>>,
     pub versions: GatewayVersions,
     poisoned: bool,
+}
+
+/// A fixed set of one-request gateway processes. Scouting uses one worker by
+/// default; a larger configured pool overlaps provider waits without making
+/// the semantic database a concurrent-write surface.
+pub struct ProcessGatewayPool {
+    workers: Vec<ProcessGateway>,
 }
 
 struct GatewayWriter {
@@ -53,6 +60,11 @@ pub struct GatewayControl {
     active_request: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct InterruptControl {
+    gateways: Vec<GatewayControl>,
+}
+
 impl GatewayControl {
     /// Send cancellation for the current completion, if one is active.
     pub fn cancel_active(&self) -> Result<bool, GatewayError> {
@@ -66,6 +78,27 @@ impl GatewayControl {
         };
         self.writer.send(&Outbound::Cancel { target_id })?;
         Ok(true)
+    }
+}
+
+impl InterruptControl {
+    fn cancel_active(&self) -> Result<bool, GatewayError> {
+        let mut canceled = false;
+        let mut first_error = None;
+        for gateway in &self.gateways {
+            match gateway.cancel_active() {
+                Ok(active) => canceled |= active,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if canceled {
+            Ok(true)
+        } else if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -100,20 +133,24 @@ fn request_interrupt_cancellation() -> bool {
         .unwrap_or(false)
 }
 
-fn register_interrupt_control(control: GatewayControl) -> Result<(), GatewayError> {
+fn register_interrupt_controls(controls: Vec<GatewayControl>) -> Result<(), GatewayError> {
     install_interrupt_handler()?;
     *INTERRUPT_CONTROL
         .lock()
-        .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+        .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))? =
+        Some(InterruptControl { gateways: controls });
     INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     Ok(())
 }
 
 fn unregister_interrupt_control(writer: &Arc<GatewayWriter>) {
     if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
-        && registered
-            .as_ref()
-            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
+        && registered.as_ref().is_some_and(|control| {
+            control
+                .gateways
+                .iter()
+                .any(|gateway| Arc::ptr_eq(&gateway.writer, writer))
+        })
     {
         *registered = None;
         INTERRUPT_PENDING.store(false, Ordering::SeqCst);
@@ -154,7 +191,22 @@ impl Drop for ActiveRequestGuard {
         if let Ok(mut active) = self.active_request.lock() {
             *active = None;
         }
-        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+        let any_active = INTERRUPT_CONTROL
+            .lock()
+            .ok()
+            .and_then(|registered| registered.clone())
+            .is_some_and(|control| {
+                control.gateways.iter().any(|gateway| {
+                    gateway
+                        .active_request
+                        .lock()
+                        .ok()
+                        .is_some_and(|active| active.is_some())
+                })
+            });
+        if !any_active {
+            INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -297,7 +349,7 @@ impl ProcessGateway {
         )?;
         let environment = gateway_environment(runtime)?;
         let client = Self::spawn_with_environment(&node, &gateway, &environment)?;
-        register_interrupt_control(client.control())?;
+        register_interrupt_controls(vec![client.control()])?;
         Ok(client)
     }
 
@@ -397,6 +449,85 @@ impl ProcessGateway {
             writer: Arc::clone(&self.writer),
             active_request: Arc::clone(&self.active_request),
         }
+    }
+}
+
+impl ProcessGatewayPool {
+    /// Launch exactly the configured number of independent gateway workers.
+    /// Configuration validates the value and deliberately applies no upper
+    /// clamp: increasing concurrency is an explicit operator choice.
+    pub fn launch(
+        gateway_path: Option<&Path>,
+        runtime: &crate::config::RuntimeConfig,
+        max_concurrency: usize,
+    ) -> anyhow::Result<Self> {
+        if max_concurrency == 0 {
+            anyhow::bail!("llm.max_concurrency must be greater than zero");
+        }
+        let node =
+            config::resolve_node_setting(&runtime.effective.sidecars.node, "the pi-ai gateway")?;
+        config::verify_node_version(&node)?;
+        let gateway = config::resolve_gateway_setting(
+            gateway_path,
+            runtime.effective.sidecars.gateway.as_deref(),
+        )?;
+        let environment = gateway_environment(runtime)?;
+        let mut workers = Vec::with_capacity(max_concurrency);
+        for _ in 0..max_concurrency {
+            workers.push(ProcessGateway::spawn_with_environment(
+                &node,
+                &gateway,
+                &environment,
+            )?);
+        }
+        register_interrupt_controls(workers.iter().map(ProcessGateway::control).collect())?;
+        Ok(Self { workers })
+    }
+}
+
+impl LlmGateway for ProcessGatewayPool {
+    fn capabilities(
+        &mut self,
+        model: Option<&str>,
+    ) -> Result<(ProviderSummary, Option<ModelCapabilities>), GatewayError> {
+        self.workers[0].capabilities(model)
+    }
+
+    fn complete(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        self.workers[0].complete(request, timeout)
+    }
+
+    fn complete_batch(
+        &mut self,
+        tasks: &[CompletionTask<'_>],
+    ) -> Vec<Result<CompletionOutcome, GatewayError>> {
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        for batch in tasks.chunks(self.workers.len()) {
+            let batch_outcomes = std::thread::scope(|scope| {
+                let handles = self
+                    .workers
+                    .iter_mut()
+                    .zip(batch)
+                    .map(|(worker, task)| {
+                        scope.spawn(move || worker.complete(task.request, task.timeout))
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(GatewayError::Io("gateway worker thread panicked".into()))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            outcomes.extend(batch_outcomes);
+        }
+        outcomes
     }
 }
 
@@ -552,9 +683,9 @@ mod tests {
     use serde_json::json;
 
     use super::super::protocol::{ChatMessage, CompleteRequest, SubmitTool};
-    use super::super::{GatewayError, LlmGateway};
+    use super::super::{CompletionTask, GatewayError, LlmGateway};
     use super::{
-        ProcessGateway, gateway_environment, register_interrupt_control,
+        ProcessGateway, ProcessGatewayPool, gateway_environment, register_interrupt_controls,
         request_interrupt_cancellation, write_fake_gateway,
     };
 
@@ -660,6 +791,46 @@ done"#
     }
 
     #[test]
+    fn gateway_pool_overlaps_independent_completions() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let markers = dir.path().join("markers");
+        std::fs::create_dir(&markers)?;
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      touch '{markers}/'$$
+      while [ "$(find '{markers}' -type f | wc -l | tr -d ' ')" -lt 2 ]; do sleep 0.01; done
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      echo '{{"protocol":1,"id":"r2","kind":"result","tool_call":{{"name":"submit","arguments":{{"ok":true}}}},"stop_reason":"toolUse","usage":{{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":3,"cost_total":0}}}}'
+      ;;
+    *'"kind":"shutdown"'*) echo '{{"protocol":1,"id":"r3","kind":"shutdown_result"}}'; exit 0 ;;
+  esac
+done"#,
+            markers = markers.display(),
+        );
+        let (node, script) = write_fake_gateway(dir.path(), &body)?;
+        let workers = vec![
+            ProcessGateway::spawn(&node, &script)?,
+            ProcessGateway::spawn(&node, &script)?,
+        ];
+        let mut pool = ProcessGatewayPool { workers };
+        let requests = [complete_request(), complete_request()];
+        let tasks = requests
+            .iter()
+            .map(|request| CompletionTask {
+                request,
+                timeout: Duration::from_secs(2),
+            })
+            .collect::<Vec<_>>();
+        let outcomes = pool.complete_batch(&tasks);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.into_iter().all(|outcome| outcome.is_ok()));
+        Ok(())
+    }
+
+    #[test]
     fn remote_errors_carry_code_and_retryability() -> anyhow::Result<()> {
         let body = format!(
             r#"while IFS= read -r line; do
@@ -701,7 +872,7 @@ done"#
 done"#
         );
         let mut gateway = spawn_with(&body)?;
-        register_interrupt_control(gateway.control())?;
+        register_interrupt_controls(vec![gateway.control()])?;
         let canceler = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             request_interrupt_cancellation()

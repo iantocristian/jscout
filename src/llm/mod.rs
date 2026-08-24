@@ -36,6 +36,13 @@ pub struct CompletionOutcome {
     pub response_model: Option<String>,
 }
 
+/// One independently timed model request in a bounded scouting batch.
+#[derive(Clone, Copy)]
+pub struct CompletionTask<'a> {
+    pub request: &'a CompleteRequest,
+    pub timeout: Duration,
+}
+
 #[derive(Debug)]
 pub enum GatewayError {
     /// Launch failure: missing node, missing gateway file, exec error.
@@ -120,6 +127,19 @@ pub trait LlmGateway {
         request: &CompleteRequest,
         timeout: Duration,
     ) -> Result<CompletionOutcome, GatewayError>;
+
+    /// Complete an already bounded set of independent scouting requests.
+    /// Test doubles and non-process implementations retain deterministic
+    /// serial behavior unless they explicitly provide concurrent transport.
+    fn complete_batch(
+        &mut self,
+        tasks: &[CompletionTask<'_>],
+    ) -> Vec<Result<CompletionOutcome, GatewayError>> {
+        tasks
+            .iter()
+            .map(|task| self.complete(task.request, task.timeout))
+            .collect()
+    }
 }
 
 /// `jscout llm doctor`: report every layer needed for a model call. With no

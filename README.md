@@ -860,7 +860,8 @@ database path, so `database.path = ".jscout/jscout.db"` needs no preparatory
 already published database and never create a missing path.
 
 The file configures the database; retrieval defaults and budgets; embedding,
-reranker, and local-inference models; LLM/provider metadata; Node/gateway and
+reranker, and local-inference models; LLM/provider metadata and scouting
+concurrency; Node/gateway and
 checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
 watch defaults. Query text, exact targets, dry-run intent, temporary widened
 budgets, and model-call caps remain per invocation. Changing retrieval posture
@@ -898,6 +899,7 @@ Terra through a non-default OpenAI Responses-compatible gateway:
 model = "openai:gpt-5.6-terra"
 openai_base_url = "https://gateway.example.com/v1"
 api_key_env = "OPENAI_API_KEY"
+max_concurrency = 1
 ```
 
 ```bash
@@ -919,13 +921,25 @@ prove that a remote account has quota. Generative scout commands start and
 stop the configured gateway automatically; there is no separate gateway
 daemon to launch.
 
+Scouting model calls are serialized by default. Set
+`llm.max_concurrency = N` to allow at most `N` independent subjects to wait on
+the provider concurrently. jscout launches one local gateway worker per slot,
+claims every run in the ledger before dispatch, and then validates and
+publishes results in deterministic plan order. Summary and refresh dependency
+levels remain barriers: only independent subjects inside the same level
+overlap. `--max-calls` remains the total command budget and is not multiplied
+by concurrency. Values must be positive and are not artificially capped; the
+operator is responsible for provider rate limits and local process overhead.
+Repository reconnaissance overlaps only the current frontier; children of a
+`mixed` scope enter the next wave, in parent plan order.
+
 The gateway owns one visible retry layer: at most two retries with 500 ms then
 1,000 ms backoff, only for classified connection, timeout, rate-limit, overload, or
 capacity failures. Every attempt keeps the exact provider, model, service tier,
 and billing path. Auth, schema, context-window, quota, credit, and billing
 failures are terminal; there is no hidden provider/model/tier fallback. The
 command timeout includes retries and backoff. The first Ctrl-C sends
-cancellation to the active gateway request; a second Ctrl-C, or an interrupt
+cancellation to every active gateway request; a second Ctrl-C, or an interrupt
 when no request is active, forces exit status 130.
 
 Normal gateway errors use stable controlled messages. Provider exception text,

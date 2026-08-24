@@ -96,6 +96,7 @@ max_chars = 4000
 [llm]
 model = "openai:gpt-5.6-terra"
 reasoning = "high"
+max_concurrency = 1
 openai_base_url = "https://gateway.example.com/v1"
 api_key_env = "OPENAI_API_KEY"
 auth_file = "~/.pi-ai/auth.json"
@@ -127,7 +128,8 @@ The file owns stable operator policy and command defaults:
 - code-vector, semantic-vector, reranker, attached-memory, and expansion
   defaults;
 - search limits, byte ceilings, origins, and file-role policy;
-- embedding, reranker, inference, LLM, gateway, and checker configuration;
+- embedding, reranker, inference, LLM, bounded scouting concurrency, gateway,
+  and checker configuration;
 - stable dependency-corpus selections and watch phase defaults when those
   command sections are added; and
 - MCP profile/source view plus telemetry and request-log paths.

@@ -11,13 +11,14 @@ use super::{
 };
 use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{CompleteRequest, ModelCapabilities, ProviderSummary, ToolCall, Usage};
-use crate::llm::{CompletionOutcome, GatewayError, LlmGateway, StartedInfo};
+use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway, StartedInfo};
 use crate::{indexer, store};
 
 struct FakeGateway {
     results: VecDeque<Result<CompletionOutcome, GatewayError>>,
     calls: usize,
     capability_calls: usize,
+    batch_sizes: Vec<usize>,
     last_max_tokens: Option<u64>,
     on_complete: Option<Box<dyn FnMut()>>,
 }
@@ -28,6 +29,7 @@ impl FakeGateway {
             results: results.into(),
             calls: 0,
             capability_calls: 0,
+            batch_sizes: Vec::new(),
             last_max_tokens: None,
             on_complete: None,
         }
@@ -76,6 +78,17 @@ impl LlmGateway for FakeGateway {
         self.results
             .pop_front()
             .expect("unexpected completion call")
+    }
+
+    fn complete_batch(
+        &mut self,
+        tasks: &[CompletionTask<'_>],
+    ) -> Vec<Result<CompletionOutcome, GatewayError>> {
+        self.batch_sizes.push(tasks.len());
+        tasks
+            .iter()
+            .map(|task| self.complete(task.request, task.timeout))
+            .collect()
     }
 }
 
@@ -1115,7 +1128,9 @@ fn remote_timeout_fails_one_subject_and_the_batch_continues() -> Result<()> {
     let conn = fixture(dir.path())?;
     let mut options = card_options();
     options.anchors = vec!["flow.ts:start".into(), "flow.ts:finish".into()];
-    options.policy = RequestPolicy::new(30, 2, 240_000).expect("policy");
+    options.policy = RequestPolicy::new(30, 2, 240_000)
+        .expect("policy")
+        .with_max_concurrency(2)?;
     let plan = super::plan::cards(dir.path(), &conn, &options.anchors)?;
     assert_eq!(plan.items.len(), 2);
     let mut gateway = FakeGateway::new(vec![
@@ -1127,7 +1142,23 @@ fn remote_timeout_fails_one_subject_and_the_batch_continues() -> Result<()> {
         })),
         Ok(card_outcome(card_submission())),
     ]);
+    let database = store::db_path(dir.path());
+    gateway.on_complete = Some(Box::new(move || {
+        let inspection = store::open_path(&database).expect("open scouting ledger");
+        let claimed: i64 = inspection
+            .query_row(
+                "SELECT count(*) FROM scout_runs WHERE status='running'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count claimed runs");
+        assert_eq!(
+            claimed, 2,
+            "every concurrent call is claimed before dispatch"
+        );
+    }));
     let batch = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)?;
+    assert_eq!(gateway.batch_sizes, vec![2]);
     assert_eq!(batch.reports.len(), 2);
     let failed = batch
         .reports

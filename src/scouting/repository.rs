@@ -23,7 +23,7 @@ use crate::llm::config::{ModelSpec, RequestPolicy};
 use crate::llm::protocol::{
     ChatMessage, CompleteRequest, PROTOCOL_VERSION, ProviderOptions, SubmitTool,
 };
-use crate::llm::{GatewayError, LlmGateway};
+use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway};
 use crate::recon::{self, MemberFile, SubjectSelector, SubjectState};
 use crate::{scouting::ledger, structural};
 
@@ -156,6 +156,11 @@ struct PreparedRepository {
     item: RepositoryPlanItem,
     request: CompleteRequest,
     spec: RunSpec,
+}
+
+struct ClaimedRepository {
+    prepared: PreparedRepository,
+    run_id: i64,
 }
 
 pub fn submit_tool_schema(evidence_ids: &[String]) -> Value {
@@ -991,6 +996,7 @@ pub fn dry_run_report(
     Ok(json!({
         "dry_run": true,
         "max_calls": rendered_limit(options.policy.max_calls),
+        "max_concurrency": options.policy.max_concurrency,
         "max_subjects": rendered_limit(options.max_subjects),
         "max_depth": options.max_depth,
         "context_bytes": options.policy.context_bytes,
@@ -1037,65 +1043,176 @@ pub fn execute(
         ..ScoutBatchReport::default()
     };
 
-    while let Some(item) = queue.pop_front() {
-        let subject_key = item.subject_key.clone();
-        let prepared = match prepare(gateway, &mut cache, item.clone(), options, &snapshot) {
-            Ok(prepared) => prepared,
-            Err(error)
-                if error
-                    .downcast_ref::<super::ContextBudgetExceeded>()
-                    .is_some() =>
-            {
-                report.skipped_over_budget.push(BatchSkip {
-                    subject: subject_key,
-                    reason: error.to_string(),
-                });
-                if item.depth < options.max_depth {
-                    enqueue_subdivisions(
+    while !queue.is_empty() {
+        let mut claimed = Vec::new();
+        while claimed.len() < options.policy.max_concurrency {
+            let Some(item) = queue.pop_front() else {
+                break;
+            };
+            let subject_key = item.subject_key.clone();
+            let prepared = match prepare(gateway, &mut cache, item.clone(), options, &snapshot) {
+                Ok(prepared) => prepared,
+                Err(error)
+                    if error
+                        .downcast_ref::<super::ContextBudgetExceeded>()
+                        .is_some() =>
+                {
+                    report.skipped_over_budget.push(BatchSkip {
+                        subject: subject_key,
+                        reason: error.to_string(),
+                    });
+                    if item.depth < options.max_depth {
+                        enqueue_subdivisions(
+                            &mut queue,
+                            &mut seen,
+                            &mut subject_count,
+                            &mut report,
+                            options.max_subjects,
+                            subdivide(root, conn, &item)?,
+                        );
+                    } else {
+                        report.auto_limit_reached = true;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let reusable =
+                !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
+            if !reusable && report.model_calls >= options.policy.max_calls {
+                report.skipped_for_call_budget += 1;
+                continue;
+            }
+            let subdivision_parent = prepared.item.clone();
+            match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
+                RunClaim::Reused(run_id) => {
+                    let (scout_report, role) =
+                        reuse_report(conn, run_id, &prepared.item, &prepared.spec)?;
+                    accept_result(
+                        root,
+                        conn,
+                        options,
+                        subdivision_parent,
+                        scout_report,
+                        Some(role),
                         &mut queue,
                         &mut seen,
                         &mut subject_count,
                         &mut report,
-                        options.max_subjects,
-                        subdivide(root, conn, &item)?,
-                    );
-                } else {
-                    report.auto_limit_reached = true;
+                    )?;
                 }
-                continue;
+                RunClaim::Claimed { run_id, .. } => {
+                    report.model_calls += 1;
+                    claimed.push((subdivision_parent, ClaimedRepository { prepared, run_id }));
+                }
             }
-            Err(error) => return Err(error),
-        };
-        let reusable = !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
-        if !reusable && report.model_calls >= options.policy.max_calls {
-            report.skipped_for_call_budget += 1;
+        }
+        if claimed.is_empty() {
             continue;
         }
-        let subdivision_parent = prepared.item.clone();
-        let (scout_report, role) = execute_one(root, conn, gateway, options, prepared, &snapshot)?;
-        if scout_report.status != "reused" {
-            report.model_calls += 1;
-        }
-        let mixed = role.as_deref() == Some("mixed");
-        report.reports.push(scout_report);
-        if mixed {
-            if subdivision_parent.depth >= options.max_depth {
-                report.auto_limit_reached = true;
-                continue;
+        let tasks = claimed
+            .iter()
+            .map(|(_, claimed)| CompletionTask {
+                request: &claimed.prepared.request,
+                timeout: options.policy.timeout,
+            })
+            .collect::<Vec<_>>();
+        let outcomes = gateway.complete_batch(&tasks);
+        let mut first_error = None;
+        let mut completed = Vec::new();
+        for ((subdivision_parent, claimed), outcome) in claimed.into_iter().zip(outcomes) {
+            match finish_claimed(root, conn, claimed, &snapshot, outcome) {
+                Ok((scout_report, role)) => {
+                    completed.push((subdivision_parent, scout_report, role));
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
             }
-            enqueue_subdivisions(
-                &mut queue,
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        let mut wave_subdivisions = Vec::new();
+        for (subdivision_parent, scout_report, role) in completed {
+            let children = result_subdivisions(
+                root,
+                conn,
+                options,
+                subdivision_parent,
+                scout_report,
+                role,
+                &mut report,
+            )?;
+            wave_subdivisions.extend(admit_subdivisions(
                 &mut seen,
                 &mut subject_count,
                 &mut report,
                 options.max_subjects,
-                subdivide(root, conn, &subdivision_parent)?,
-            );
+                children,
+            ));
         }
+        prepend_subdivisions(&mut queue, wave_subdivisions);
     }
     recon::reconcile_file_policy(root, conn)?;
     report.subjects_considered = Some(subject_count);
     Ok(report)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "repository result handling carries the bounded subdivision state explicitly"
+)]
+fn accept_result(
+    root: &Path,
+    conn: &Connection,
+    options: &RepositoryScoutOptions,
+    subdivision_parent: RepositoryPlanItem,
+    scout_report: ScoutReport,
+    role: Option<String>,
+    queue: &mut VecDeque<RepositoryPlanItem>,
+    seen: &mut BTreeSet<String>,
+    subject_count: &mut usize,
+    report: &mut ScoutBatchReport,
+) -> Result<()> {
+    let children = result_subdivisions(
+        root,
+        conn,
+        options,
+        subdivision_parent,
+        scout_report,
+        role,
+        report,
+    )?;
+    enqueue_subdivisions(
+        queue,
+        seen,
+        subject_count,
+        report,
+        options.max_subjects,
+        children,
+    );
+    Ok(())
+}
+
+fn result_subdivisions(
+    root: &Path,
+    conn: &Connection,
+    options: &RepositoryScoutOptions,
+    subdivision_parent: RepositoryPlanItem,
+    scout_report: ScoutReport,
+    role: Option<String>,
+    report: &mut ScoutBatchReport,
+) -> Result<Vec<RepositoryPlanItem>> {
+    let mixed = role.as_deref() == Some("mixed");
+    report.reports.push(scout_report);
+    if !mixed {
+        return Ok(Vec::new());
+    }
+    if subdivision_parent.depth >= options.max_depth {
+        report.auto_limit_reached = true;
+        return Ok(Vec::new());
+    }
+    subdivide(root, conn, &subdivision_parent)
 }
 
 fn enqueue_subdivisions(
@@ -1104,8 +1221,19 @@ fn enqueue_subdivisions(
     subject_count: &mut usize,
     report: &mut ScoutBatchReport,
     max_subjects: usize,
-    mut children: Vec<RepositoryPlanItem>,
+    children: Vec<RepositoryPlanItem>,
 ) {
+    let admitted = admit_subdivisions(seen, subject_count, report, max_subjects, children);
+    prepend_subdivisions(queue, admitted);
+}
+
+fn admit_subdivisions(
+    seen: &mut BTreeSet<String>,
+    subject_count: &mut usize,
+    report: &mut ScoutBatchReport,
+    max_subjects: usize,
+    mut children: Vec<RepositoryPlanItem>,
+) -> Vec<RepositoryPlanItem> {
     children.sort_by(|left, right| {
         right
             .state
@@ -1130,6 +1258,13 @@ fn enqueue_subdivisions(
         *subject_count += 1;
         admitted.push(child);
     }
+    admitted
+}
+
+fn prepend_subdivisions(
+    queue: &mut VecDeque<RepositoryPlanItem>,
+    admitted: Vec<RepositoryPlanItem>,
+) {
     // The parent has already established that its coarse classification is
     // insufficient. Refine it before unrelated pending subjects consume the
     // remaining call budget, while preserving descending weight order.
@@ -1138,27 +1273,20 @@ fn enqueue_subdivisions(
     }
 }
 
-fn execute_one(
+fn finish_claimed(
     root: &Path,
     conn: &Connection,
-    gateway: &mut dyn LlmGateway,
-    options: &RepositoryScoutOptions,
-    prepared: PreparedRepository,
+    claimed: ClaimedRepository,
     snapshot: &str,
+    outcome: Result<CompletionOutcome, GatewayError>,
 ) -> Result<(ScoutReport, Option<String>)> {
+    let ClaimedRepository { prepared, run_id } = claimed;
     let PreparedRepository {
         item,
-        request,
+        request: _,
         spec,
     } = prepared;
-    let run_id = match ledger::claim_run(conn, &spec, options.rebuild)? {
-        RunClaim::Reused(run_id) => {
-            let (report, role) = reuse_report(conn, run_id, &item, &spec)?;
-            return Ok((report, Some(role)));
-        }
-        RunClaim::Claimed { run_id, .. } => run_id,
-    };
-    let outcome = match gateway.complete(&request, options.policy.timeout) {
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let status = if matches!(error, GatewayError::Canceled(_)) {
@@ -1711,6 +1839,51 @@ mod tests {
         );
         assert_eq!(subject_count, 3);
         assert!(!report.auto_limit_reached);
+    }
+
+    #[test]
+    fn concurrent_parent_subdivisions_preserve_parent_plan_order() {
+        let mut queue = VecDeque::from([planned("area:repository:pending", 10)]);
+        let mut seen = BTreeSet::from(["area:repository:pending".to_string()]);
+        let mut subject_count = 1;
+        let mut report = super::ScoutBatchReport::default();
+        let mut wave = Vec::new();
+
+        wave.extend(super::admit_subdivisions(
+            &mut seen,
+            &mut subject_count,
+            &mut report,
+            5,
+            vec![
+                planned("area:repository:first/small", 2),
+                planned("area:repository:first/big", 20),
+            ],
+        ));
+        wave.extend(super::admit_subdivisions(
+            &mut seen,
+            &mut subject_count,
+            &mut report,
+            5,
+            vec![
+                planned("area:repository:second/small", 3),
+                planned("area:repository:second/big", 30),
+            ],
+        ));
+        super::prepend_subdivisions(&mut queue, wave);
+
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "area:repository:first/big",
+                "area:repository:first/small",
+                "area:repository:second/big",
+                "area:repository:second/small",
+                "area:repository:pending",
+            ],
+        );
     }
 
     #[test]
