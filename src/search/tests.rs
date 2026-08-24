@@ -645,9 +645,14 @@ fn exhaustive_budget_fixture() -> Result<(tempfile::TempDir, rusqlite::Connectio
         ("c.ts", "charlie"),
         ("d.ts", "delta"),
     ] {
+        let terminal_only = if path == "a.ts" {
+            "export const terminalOnlyNeedle = true;\n"
+        } else {
+            ""
+        };
         fs::write(
             repo.path().join(path),
-            format!("export function {name}() {{ return strictBudgetNeedle; }}\n"),
+            format!("export function {name}() {{ return strictBudgetNeedle; }}\n{terminal_only}"),
         )?;
     }
     let conn = store::open(repo.path())?;
@@ -662,10 +667,28 @@ fn exhaustive_budget_search(
     compact: bool,
     response_byte_limit: usize,
 ) -> Result<SearchResult> {
+    exhaustive_budget_search_query(
+        conn,
+        "strictBudgetNeedle",
+        cursor,
+        limit,
+        compact,
+        response_byte_limit,
+    )
+}
+
+fn exhaustive_budget_search_query(
+    conn: &rusqlite::Connection,
+    query: &str,
+    cursor: Option<String>,
+    limit: usize,
+    compact: bool,
+    response_byte_limit: usize,
+) -> Result<SearchResult> {
     search(
         conn,
         None,
-        "strictBudgetNeedle",
+        query,
         &SearchOptions {
             mode: SearchMode::Exhaustive { cursor },
             limit,
@@ -813,7 +836,7 @@ fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result
         serde_json::to_string_pretty(&debug_page)?.len(),
         debug_page.response_budget.rendered_bytes
     );
-    assert!(debug_page.response_budget.rendered_bytes <= debug_floor);
+    assert_eq!(debug_page.response_budget.rendered_bytes, debug_floor);
     let debug_one_below = exhaustive_budget_search(&conn, None, 3, false, debug_floor - 1)
         .expect_err("one byte below the diagnostic floor must fail");
     assert_eq!(
@@ -823,6 +846,40 @@ fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result
             .minimum_bytes,
         debug_floor
     );
+    Ok(())
+}
+
+#[test]
+fn exhaustive_budget_floor_includes_initial_and_empty_responses() -> Result<()> {
+    let (_repo, conn) = exhaustive_budget_fixture()?;
+    for query in ["terminalOnlyNeedle", "absentBudgetNeedle"] {
+        for compact in [true, false] {
+            let error = exhaustive_budget_search_query(&conn, query, None, 10, compact, 1)
+                .expect_err("one byte cannot fit an exhaustive response");
+            let minimum = error
+                .downcast_ref::<ResponseBudgetTooSmall>()
+                .expect("typed exhaustive budget error")
+                .minimum_bytes;
+            let exact = exhaustive_budget_search_query(&conn, query, None, 10, compact, minimum)?;
+            assert_eq!(exact.response_budget.rendered_bytes, minimum);
+            if query == "absentBudgetNeedle" {
+                assert!(exact.hits.is_empty());
+                assert!(!exact.response_budget.truncated);
+            } else {
+                assert_eq!(exact.hits.len(), 1);
+            }
+            let one_below =
+                exhaustive_budget_search_query(&conn, query, None, 10, compact, minimum - 1)
+                    .expect_err("one byte below the exhaustive floor must fail");
+            assert_eq!(
+                one_below
+                    .downcast_ref::<ResponseBudgetTooSmall>()
+                    .expect("typed exhaustive boundary error")
+                    .minimum_bytes,
+                minimum
+            );
+        }
+    }
     Ok(())
 }
 
