@@ -3215,9 +3215,10 @@ rank-fusion scores. The revised decisions:
    neighbor-anchored edited blocks; ordinal position alone never establishes
    continuity and ambiguous matches receive no predecessor. `removed` is
    recorded only when a successfully parsed current corpus confirms a prior
-   block is absent, never when a file is unavailable because of a read or parse
-   failure; baseline content without Git provenance has unknown authorship time
-   and is never presented as newly written.
+   block is absent; a file unavailable through a read or parse failure leaves
+   the current projection with lifecycle `unavailable` instead; baseline
+   content without Git provenance has unknown authorship time and is never
+   presented as newly written.
 5. Freshness: order-based and bounded, not a score multiplier. After
    relevance fusion and optional reranking, each candidate's final rank differs
    from its base rank by at most `max_rank_movement` (default 2), and swaps
@@ -3230,10 +3231,12 @@ rank-fusion scores. The revised decisions:
    blame mappings cache by exact file-byte hash, path-tip commit, and shallow
    boundary fingerprint; filesystem mtime is never a fallback.
    `--no-freshness` preserves the relevance order for comparison.
-6. Retention: current raw Markdown is stored for the active documentation
-   snapshot. After a successful replacement snapshot, retired block bodies are
-   not retained in the ledger; retired hashes, transition metadata, and
-   content-addressed vectors may remain. Version one adds no retention controls.
+6. Retention: hit content is served from stored current rendered bodies and
+   block text, with exact source spans referencing the checkout for raw bytes;
+   no full raw Markdown copy is stored. After a successful replacement
+   snapshot, retired block bodies are not retained in the ledger; retired
+   hashes, transition metadata, and content-addressed vectors may remain.
+   Version one adds no retention controls.
 
 Delivery: phase 1 is the corpus, BM25, `docs index`/`status`/`search
 --lexical-only`, the MCP documentation-search surface, and ledger recording;

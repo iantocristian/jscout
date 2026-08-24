@@ -38,8 +38,9 @@ time.
   `documentation_search` tool; documentation hits never masquerade as
   structural hits, seed graph expansion, or satisfy semantic support anchors.
 
-Normal documentation search indexes only the current checkout. Historical
-chunk bodies never enter BM25 or vector candidate generation.
+Normal documentation search indexes only the current checkout. Retired block
+content and retired cached vectors never enter BM25 or vector candidate
+generation.
 
 ## Separate documentation database
 
@@ -107,8 +108,10 @@ The first rule that applies decides membership:
    `**/*.md`.
 
 Exclude beats include; ignore beats both; include cannot resurrect an ignored
-file in v1. `docs status` reports the deciding rule per encountered file
-(`indexed`, `excluded`, `not-included`, `non-utf8`) and per
+file in v1. Files larger than 4 MiB (4,194,304 bytes, an evaluation
+hypothesis) are excluded from admission. `docs status` reports the deciding
+rule per encountered file (`indexed`, `excluded`, `not-included`,
+`hidden-not-allowlisted`, `oversized`, `non-utf8`) and per
 pruned directory (`hard-skip`, `ignored`, `hidden-not-allowlisted`), without
 enumerating descendants beneath pruned directories. Version one admits `.md`
 only; MDX requires a separate parsing and safety decision.
@@ -122,7 +125,7 @@ only; MDX requires a separate parsing and safety decision.
 | Heading breadcrumb | full heading path                            | medium weight  | no            | yes          |
 | Nearest heading    | closest enclosing heading                    | via breadcrumb | yes           | yes          |
 | Rendered body      | deterministic retrieval rendering of source  | base weight    | yes           | no           |
-| Source             | exact source spans and bytes                 | no             | no            | yes          |
+| Source             | exact source byte and line spans             | no             | no            | yes          |
 | Path               | repository-relative                          | lowest weight  | no            | yes          |
 
 `rendered_body` is the final deterministic body string sent to FTS and the
@@ -195,8 +198,9 @@ never historical succession.
 ### Documents without body chunks
 
 A document producing no body chunks emits exactly one lexical-only
-document-stub row: title, description, tags, path, and all document headings in
-source order are searchable; empty rendered body; no nearest heading; span
+document-stub row: title, description, tags, path, and all document headings
+are searchable, the headings carried in source order by the stub's breadcrumb
+column at its weight; empty rendered body; no nearest heading; span
 covering the file. Stubs are not embedded. There are no empty per-section
 chunks.
 
@@ -224,7 +228,7 @@ change during implementation):
   not the event ledger, defines what is active in the published snapshot.
 - `doc_chunks`: the current searchable projection built from ordered current
   blocks — path, breadcrumb, source spans, rendered body, embedding identity,
-  and aggregated freshness provenance. FTS rows and vector occurrence entries
+  and aggregated freshness provenance. FTS rows and vector index entries
   reference these chunks.
 - retrieval projections: `doc_chunks_fts`, content-addressed
   `doc_embeddings` keyed by embedding-identity hash and profile,
@@ -237,7 +241,8 @@ earlier point leaves the previous snapshot active and searchable.
 ## History and continuity
 
 Each block observation stores one lifecycle event — `baseline`, `added`,
-`continued`, or `removed` — plus zero or more orthogonal change flags:
+`continued`, `unavailable`, or `removed` — plus zero or more orthogonal
+change flags:
 
 - `body_changed`: a uniquely matched predecessor has different body content;
 - `context_changed`: nearest heading or other retrieval context changed;
@@ -249,14 +254,20 @@ Each block observation stores one lifecycle event — `baseline`, `added`,
 A transition can therefore be both `body_changed` and `context_changed`, or
 both `body_changed` and `moved`. A successful scan emits `removed` when a
 previous block is confirmed absent from the current corpus. A read, parse, or
-inventory failure never emits `removed` for the unavailable file.
+inventory failure never emits `removed` for the unavailable file: the file's
+blocks leave the current projection with lifecycle `unavailable`, so search
+stops serving content the checkout cannot parse and their bodies follow the
+normal retired-content rules. When the file parses again, matching runs
+against its last successfully parsed state, and unchanged content resumes its
+logical occurrences as `continued`.
 
 For observed provenance, a post-baseline `added` event establishes freshness
 at its snapshot sequence, and `body_changed` advances it. `context_changed` or
 `moved` alone carries the prior freshness forward: a heading rename does not
 make the underlying claim newly authored. The first snapshot records blocks
 without Git provenance with lifecycle `baseline` and provenance `unknown`;
-`first_seen_at` is operational metadata, not authorship time.
+the baseline observation's snapshot timestamp is operational metadata, not
+authorship time.
 
 Matching between two successfully parsed snapshots is conservative and
 one-to-one:
@@ -359,8 +370,11 @@ shallow boundary commits is `unknown` unless a later local observed body event
 exists.
 
 Every hit exposes its freshness basis (`git`, `working_tree`, `observed`,
-`unknown`), Git timestamp or freshness-bearing observation snapshot sequence
-and timestamp, base rank, and movement.
+`unknown`), the basis value, base rank, and movement. The basis value is the
+Git author timestamp for `git`; the literal `uncommitted` for `working_tree`,
+with the latest committed author time as secondary metadata when one exists;
+the freshness-bearing observation snapshot sequence and timestamp for
+`observed`; and absent for `unknown`.
 Compact agent output retains path, heading, lines, basis, and a
 human-readable changed/observed value. `--no-freshness` disables reordering
 for comparison while still reporting bases.
@@ -395,8 +409,9 @@ follow the same complete-response accounting as code search.
 ## Failure semantics
 
 - Markdown read/parse failure: reject that file visibly; permanent per-file
-  failures are corpus exclusions, retryable corpus failures leave the
-  previous documentation snapshot active.
+  failures are corpus exclusions whose blocks leave the current projection as
+  `unavailable`, retryable corpus failures leave the previous documentation
+  snapshot active.
 - Embedding provider absent: BM25 remains active.
 - Provider failure during `docs embed`: completed cached batches are kept;
   search reports degraded vector status and uses BM25 — a previous vector
@@ -408,8 +423,9 @@ Further failure-state machinery is deferred until the base feature is in use.
 
 ## Retention
 
-- The published documentation snapshot stores the raw Markdown it currently
-  serves.
+- Hit content is served from stored current rendered bodies and block text;
+  exact source spans reference the current checkout for raw bytes, and no
+  full raw Markdown copy is stored.
 - After a successful replacement snapshot, retired block bodies are removed
   from logical storage. The ledger keeps hashes and transition metadata, and
   the content-addressed vector cache may keep retired vectors.
@@ -454,8 +470,12 @@ Deterministic tests:
   invalidates on worktree edits, path-history rewrite, and clone deepening;
 - a code reindex leaves documentation search available and vice versa; a
   failed docs scan leaves the prior snapshot searchable;
+- a permanent per-file failure marks the file's blocks `unavailable` and
+  unsearchable without emitting `removed`; a later successful parse resumes
+  unchanged blocks as `continued`;
 - code and semantic snapshots, counts, and fingerprints are byte-identical
-  after any docs operation.
+  after any docs operation, and the documentation database is byte-identical
+  after any code or semantic operation.
 
 Retrieval evaluation, before freshness defaults are accepted: a fixed corpus
 with conflicting versioned instructions of known order, old evergreen
@@ -469,7 +489,7 @@ against movement bounds of 1–3.
 
 ## Open items
 
-- FTS column weights, chunk-size bounds, and `max_rank_movement` default are
-  evaluation hypotheses.
+- FTS column weights, chunk-size bounds, the 4 MiB file-admission bound, and
+  the `max_rank_movement` default are evaluation hypotheses.
 - Historical search, contradiction detection, MDX, remote documentation
   sources, and author-declared supersession remain out of scope.
