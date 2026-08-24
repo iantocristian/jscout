@@ -3194,7 +3194,9 @@ rank-fusion scores. The revised decisions:
 
 1. Documentation lives in a separately configured database, defaulting to
    `<root>/.jscout-docs.db`, with its own schema version, migration lifecycle,
-   readiness gate, last-good snapshot publication, and retry state.
+   docs application identity, canonical-root binding, readiness gate,
+   last-good snapshot publication, and retry state. Path and same-file checks
+   reject aliases with the main database or another root's docs store.
    `[docs.database].path` overrides that default independently of the main
    database path. The main database, structural snapshots, configuration
    fingerprints, watch generations, and semantic freshness are untouched by
@@ -3203,30 +3205,37 @@ rank-fusion scores. The revised decisions:
 2. Corpus: ignore-aware `.md` inventory with a fixed root-level hidden
    allowlist (`.github`, `.claude`, `.agents`); Markdown block chunking that
    never crosses heading boundaries; one document-stub row for body-empty
-   documents; `docs status` reports the deciding rule for every encountered
-   file and pruned directory.
+   documents; deterministic file-only config globs, BOM handling, symlink
+   exclusion, sorted publication, and `docs status` reporting the deciding rule
+   for every encountered file and pruned directory.
 3. Retrieval: BM25 always builds; vectors reuse the existing `[embedding]`
    provider, model, and service — no second provider section and no second
    local model; reciprocal-rank fusion; embedding identity is exactly
-   `hash(format_version, nearest_heading, rendered_body)`, where
-   `rendered_body` is the final text sent to the embedder, so file renames and
-   ancestor-heading edits reuse vectors; the CLI contract is defined directly,
-   with `--vector` meaning required vector participation and no vector-only
-   mode existing.
+   `hash(format_version, nearest_heading, rendered_body)`, with the exact
+   provider text and hash preimage fixed by the incorporated contract, so file
+   renames and ancestor-heading edits reuse vectors; vector search participates
+   only when the current snapshot/profile has a complete persisted readiness
+   generation; RRF reuses `k = 60`, with lexical score defined as `-FTS5
+   bm25()` and deterministic source-key tie-breaks; the CLI contract is defined directly,
+   with `--vector` meaning required vector participation and no vector-only mode
+   existing.
 4. History: an append-only block-observation ledger inside the docs database,
    separate from the current size-merged retrieval-chunk projection. Matching
    is conservative and one-to-one — exact content first, then uniquely
    neighbor-anchored edited blocks; ordinal position alone never establishes
    continuity and ambiguous matches receive no predecessor. `removed` is
    recorded only when a successfully parsed current corpus confirms a prior
-   block is absent. A permanent read or parse failure is a visible corpus gap,
+   block is absent. A classified permanent file open/read failure is a visible corpus gap,
    emits no lifecycle transition, and breaks continuity; when that file later
    parses, its blocks start new baseline occurrences. Baseline content without
    Git provenance has unknown authorship time and is never presented as newly
-   written. A retryable corpus failure publishes nothing and leaves the
-   complete last-good snapshot active. Version one never creates cross-path
+   written. Retryable I/O and every database, transaction, configuration,
+   discovery, inventory, cancellation, or consistency-drift failure publishes
+   nothing and leaves the complete last-good snapshot active. Version one never creates cross-path
    predecessor edges: Git rename detection is heuristic, so identical content
    at another path starts a new occurrence even when Git reports a rename.
+   Pure within-path reordering updates the current projection but emits no
+   history event in version one.
    Without usable Git provenance, a pure rename therefore restarts observed
    freshness for every block; this accepted version-one false-recency trade-off
    is bounded by `max_rank_movement` and measured by the renamed-file
@@ -3239,11 +3248,13 @@ rank-fusion scores. The revised decisions:
    orders post-baseline `added` and `body_changed` events by snapshot sequence,
    git and observed never reorder against each other, and unknown provenance
    never moves and is never advantaged. The model reranker never receives
-   temporal metadata. Shallow-clone boundary commits contribute no timestamp;
-   provenance Git commands disable replacement objects and configured
-   ignore-revs; blame mappings cache by repository-relative path, exact file-
-   byte hash, path-tip commit, and shallow boundary fingerprint; filesystem
-   mtime is never a fallback.
+   temporal metadata. Only commits listed by the repository's resolved shallow
+   file count as shallow boundaries and contribute no timestamp; provenance
+   uses captured indexed bytes with
+   `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
+   blame mappings cache by repository-relative
+   path, exact file-byte hash, path-tip commit, and shallow boundary
+   fingerprint; filesystem mtime is never a fallback.
    `--no-freshness` preserves the relevance order for comparison.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
@@ -3268,10 +3279,10 @@ succession rows for untouched blocks; globally unique copied content and
 Git-detected renames receive no cross-path predecessor; freshness movement
 never exceeds its configured bound and never crosses provenance bases; a
 repository with no `[embedding]` provider retains full lexical documentation
-search; and the
-subordinate detail document
+search; crash recovery exposes exactly one complete old or replacement docs
+snapshot, never a partial mixture; and the detailed implementation contract
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
-remains non-normative, this entry winning on any disagreement.
+is incorporated by reference, this entry winning on any explicit disagreement.
 
 ## Evaluation decisions already made
 
