@@ -178,6 +178,7 @@ pub struct RequestPolicy {
     pub timeout: Duration,
     pub max_calls: usize,
     pub context_bytes: usize,
+    pub max_concurrency: usize,
 }
 
 impl RequestPolicy {
@@ -195,7 +196,16 @@ impl RequestPolicy {
             timeout: Duration::from_secs(timeout_secs),
             max_calls,
             context_bytes,
+            max_concurrency: 1,
         })
+    }
+
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Result<Self> {
+        if max_concurrency == 0 {
+            bail!("llm.max_concurrency must be greater than zero");
+        }
+        self.max_concurrency = max_concurrency;
+        Ok(self)
     }
 }
 
@@ -230,12 +240,16 @@ mod tests {
     }
 
     #[test]
-    fn request_policy_rejects_zero_budgets() {
+    fn request_policy_rejects_zero_budgets() -> anyhow::Result<()> {
         assert!(RequestPolicy::new(0, 1, 1).is_err());
         assert!(RequestPolicy::new(1, 0, 1).is_err());
         assert!(RequestPolicy::new(1, 1, 0).is_err());
         let policy = RequestPolicy::new(300, 8, 200_000).expect("valid policy");
         assert_eq!(policy.timeout, Duration::from_secs(300));
+        assert_eq!(policy.max_concurrency, 1);
+        assert!(policy.clone().with_max_concurrency(0).is_err());
+        assert_eq!(policy.with_max_concurrency(8)?.max_concurrency, 8);
+        Ok(())
     }
 
     #[test]

@@ -21,6 +21,7 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert!(config.effective.search.vector);
     assert!(config.effective.search.rerank);
     assert!(!config.effective.search.attach_memory);
+    assert_eq!(config.effective.llm.max_concurrency, 1);
     assert_eq!(config.effective.search.expansion.mode, "paths");
     assert_eq!(config.effective.search.expansion.paths, 8);
     assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
@@ -159,6 +160,10 @@ fn unsafe_endpoints_and_remote_binds_fail_during_configuration_load() -> anyhow:
             "version = 1\n[watch]\nenrich_timeout_seconds = 0\n",
             "watch.enrich_timeout_seconds",
         ),
+        (
+            "version = 1\n[llm]\nmax_concurrency = 0\n",
+            "llm.max_concurrency",
+        ),
     ] {
         write_config(root.path(), text)?;
         assert!(
@@ -168,6 +173,16 @@ fn unsafe_endpoints_and_remote_binds_fail_during_configuration_load() -> anyhow:
                 .contains(expected)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn llm_scout_concurrency_is_explicit_and_uncapped() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(root.path(), "version = 1\n[llm]\nmax_concurrency = 128\n")?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(config.effective.llm.max_concurrency, 128);
+    assert_eq!(config.sources["llm.max_concurrency"], ValueSource::Config);
     Ok(())
 }
 

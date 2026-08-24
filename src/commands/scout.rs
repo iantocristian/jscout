@@ -6,6 +6,22 @@ use crate::{config, llm, scouting};
 
 use super::core::open_database_for_write;
 
+fn launch_scout_gateway(
+    gateway_path: Option<&Path>,
+    runtime: &config::RuntimeConfig,
+    call_capacity: usize,
+) -> Result<llm::process::ProcessGatewayPool> {
+    llm::process::ProcessGatewayPool::launch(
+        gateway_path,
+        runtime,
+        runtime
+            .effective
+            .llm
+            .max_concurrency
+            .min(call_capacity.max(1)),
+    )
+}
+
 pub(super) fn cmd_scout_workflows(
     root: &Path,
     database: Option<&Path>,
@@ -29,7 +45,8 @@ pub(super) fn cmd_scout_workflows(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let call_capacity = options.policy.max_calls.min(plan.items.len());
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, call_capacity)?;
     let batch = scouting::scout_workflow_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -71,7 +88,7 @@ pub(super) fn cmd_scout_repository(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, options.scout.policy.max_calls)?;
     let batch = scouting::repository::execute(root, &conn, &mut gateway, &options.scout, plan)?;
     if let Some(subjects) = batch.subjects_considered
         && initial_subjects <= options.warn_subjects
@@ -104,7 +121,7 @@ pub(super) fn cmd_scout_summaries(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, options.policy.max_calls)?;
     let batch = scouting::scout_summaries(root, &conn, &mut gateway, &options)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -135,7 +152,8 @@ pub(super) fn cmd_scout_cards(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let call_capacity = options.policy.max_calls.min(plan.items.len());
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, call_capacity)?;
     let batch = scouting::scout_card_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -158,7 +176,8 @@ pub(super) fn cmd_scout_concepts(
         );
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let call_capacity = options.policy.max_calls.min(plan.items.len());
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, call_capacity)?;
     let batch = scouting::scout_concept_plan(root, &conn, &mut gateway, &options, plan)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)
@@ -182,6 +201,7 @@ pub(super) fn cmd_scout_refresh(
             serde_json::to_string_pretty(&serde_json::json!({
                 "dry_run": true,
                 "max_calls": policy.max_calls,
+                "max_concurrency": policy.max_concurrency,
                 "context_bytes": policy.context_bytes,
                 "selection": selection.summary,
                 "plans": plans,
@@ -205,7 +225,8 @@ pub(super) fn cmd_scout_refresh(
         println!("no stale or degraded generated workflows, cards, or summaries to refresh");
         return Ok(());
     }
-    let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
+    let call_capacity = policy.max_calls.min(selection.targets.len());
+    let mut gateway = launch_scout_gateway(gateway_path, runtime, call_capacity)?;
     let batch = scouting::scout_refresh(root, &conn, &mut gateway, selection, policy)?;
     print_scout_batch(&batch);
     scout_batch_exit(&batch)

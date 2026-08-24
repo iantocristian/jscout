@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
@@ -21,23 +21,32 @@ use super::protocol::{
     CompleteRequest, GatewayVersions, Inbound, ModelCapabilities, Outbound, PROTOCOL_VERSION,
     ProviderSummary, encode,
 };
-use super::{CompletionOutcome, GatewayError, LlmGateway, StartedInfo};
+use super::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway, StartedInfo};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
-static INTERRUPT_CONTROL: Mutex<Option<GatewayControl>> = Mutex::new(None);
+static INTERRUPT_CONTROL: Mutex<Option<InterruptControl>> = Mutex::new(None);
 static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub struct ProcessGateway {
     child: Child,
     writer: Arc<GatewayWriter>,
+    cancel_sender: Sender<String>,
     inbound: Receiver<Result<Inbound, GatewayError>>,
     active_request: Arc<Mutex<Option<String>>>,
     pub versions: GatewayVersions,
     poisoned: bool,
+}
+
+/// A fixed set of one-request gateway processes. Scouting uses one worker by
+/// default; a larger configured pool overlaps provider waits without making
+/// the semantic database a concurrent-write surface.
+pub struct ProcessGatewayPool {
+    workers: Vec<ProcessGateway>,
 }
 
 struct GatewayWriter {
@@ -45,16 +54,33 @@ struct GatewayWriter {
     next_id: AtomicU64,
 }
 
-/// Independent write-side handle. It can be moved to a signal/control thread
-/// while the main client is blocked waiting for a completion response.
+/// Independent cancellation handle. The writer handle identifies the
+/// registered gateway; cancellation itself is queued so signal handling never
+/// waits on child stdin.
 #[derive(Clone)]
 pub struct GatewayControl {
     writer: Arc<GatewayWriter>,
+    cancel_sender: Sender<String>,
     active_request: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct InterruptControl {
+    gateways: Vec<GatewayControl>,
+}
+
+/// Interrupt state captured before a completion or bounded batch is
+/// dispatched. The generation remains latched after active requests finish,
+/// so a delayed worker from the same batch cannot mistake a cleared pending
+/// bit for permission to start.
+#[derive(Clone, Copy)]
+struct DispatchAdmission {
+    generation: u64,
+    interrupted: bool,
+}
+
 impl GatewayControl {
-    /// Send cancellation for the current completion, if one is active.
+    /// Queue cancellation for the current completion, if one is active.
     pub fn cancel_active(&self) -> Result<bool, GatewayError> {
         let target_id = self
             .active_request
@@ -64,8 +90,50 @@ impl GatewayControl {
         let Some(target_id) = target_id else {
             return Ok(false);
         };
-        self.writer.send(&Outbound::Cancel { target_id })?;
+        self.cancel_sender
+            .send(target_id)
+            .map_err(|_| GatewayError::ChildExited("gateway cancellation queue closed".into()))?;
         Ok(true)
+    }
+}
+
+impl InterruptControl {
+    fn contains(&self, writer: &Arc<GatewayWriter>) -> bool {
+        self.gateways
+            .iter()
+            .any(|gateway| Arc::ptr_eq(&gateway.writer, writer))
+    }
+
+    fn enqueue_active_cancellations(&self) -> bool {
+        let mut queued = false;
+        for gateway in &self.gateways {
+            if let Ok(active) = gateway.cancel_active() {
+                queued |= active;
+            }
+        }
+        queued
+    }
+
+    fn any_active(&self) -> bool {
+        self.gateways.iter().any(|gateway| {
+            gateway
+                .active_request
+                .lock()
+                .ok()
+                .is_some_and(|active| active.is_some())
+        })
+    }
+}
+
+impl DispatchAdmission {
+    fn capture() -> Result<Self, GatewayError> {
+        let _gate = INTERRUPT_CONTROL
+            .lock()
+            .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))?;
+        Ok(Self {
+            generation: INTERRUPT_GENERATION.load(Ordering::SeqCst),
+            interrupted: INTERRUPT_PENDING.load(Ordering::SeqCst),
+        })
     }
 }
 
@@ -87,24 +155,40 @@ fn handle_interrupt() {
 }
 
 fn request_interrupt_cancellation() -> bool {
-    if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    let control = INTERRUPT_CONTROL
-        .lock()
-        .ok()
-        .and_then(|registered| registered.clone());
-    control
-        .as_ref()
-        .and_then(|control| control.cancel_active().ok())
-        .unwrap_or(false)
+    // The pending transition shares the admission gate with send_complete.
+    // Either a completion publishes its id first and this snapshot cancels it,
+    // or this transition wins and that completion is refused before sending.
+    let handled = match INTERRUPT_CONTROL.lock() {
+        Ok(registered) => {
+            if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            INTERRUPT_GENERATION.fetch_add(1, Ordering::SeqCst);
+            match registered.as_ref() {
+                Some(control) => control.enqueue_active_cancellations(),
+                None => false,
+            }
+        }
+        Err(_) => {
+            if INTERRUPT_PENDING.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            INTERRUPT_GENERATION.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+    };
+    // The Ctrl-C thread only enqueues target ids. A dedicated per-gateway
+    // writer serializes Complete before Cancel and may wait on stdin without
+    // preventing this handler from processing a second interrupt.
+    handled
 }
 
-fn register_interrupt_control(control: GatewayControl) -> Result<(), GatewayError> {
+fn register_interrupt_controls(controls: Vec<GatewayControl>) -> Result<(), GatewayError> {
     install_interrupt_handler()?;
-    *INTERRUPT_CONTROL
+    let mut registered = INTERRUPT_CONTROL
         .lock()
-        .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+        .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))?;
+    *registered = Some(InterruptControl { gateways: controls });
     INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     Ok(())
 }
@@ -113,7 +197,7 @@ fn unregister_interrupt_control(writer: &Arc<GatewayWriter>) {
     if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
         && registered
             .as_ref()
-            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
+            .is_some_and(|control| control.contains(writer))
     {
         *registered = None;
         INTERRUPT_PENDING.store(false, Ordering::SeqCst);
@@ -121,40 +205,62 @@ fn unregister_interrupt_control(writer: &Arc<GatewayWriter>) {
 }
 
 impl GatewayWriter {
-    fn send(&self, message: &Outbound) -> Result<String, GatewayError> {
+    fn prepare(&self, message: &Outbound) -> Result<(String, String), GatewayError> {
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let id = format!("r{sequence}");
         let line = encode(&id, message)
             .map_err(|error| GatewayError::Protocol(format!("encode failure: {error}")))?;
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| GatewayError::Io("gateway stdin lock poisoned".into()))?;
+        Ok((id, line))
+    }
+
+    fn write_line(stdin: &mut ChildStdin, line: &str) -> Result<(), GatewayError> {
         stdin
             .write_all(line.as_bytes())
             .and_then(|()| stdin.write_all(b"\n"))
             .and_then(|()| stdin.flush())
-            .map_err(|error| GatewayError::ChildExited(format!("gateway stdin closed: {error}")))?;
+            .map_err(|error| GatewayError::ChildExited(format!("gateway stdin closed: {error}")))
+    }
+
+    fn send(&self, message: &Outbound) -> Result<String, GatewayError> {
+        let (id, line) = self.prepare(message)?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway stdin lock poisoned".into()))?;
+        Self::write_line(&mut stdin, &line)?;
         Ok(id)
     }
 }
 
 struct ActiveRequestGuard {
+    writer: Arc<GatewayWriter>,
     active_request: Arc<Mutex<Option<String>>>,
 }
 
 impl ActiveRequestGuard {
-    fn new(active_request: Arc<Mutex<Option<String>>>) -> Self {
-        Self { active_request }
+    fn new(writer: Arc<GatewayWriter>, active_request: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            writer,
+            active_request,
+        }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active_request.lock() {
+        if let Ok(registered) = INTERRUPT_CONTROL.lock() {
+            if let Ok(mut active) = self.active_request.lock() {
+                *active = None;
+            }
+            if registered
+                .as_ref()
+                .is_some_and(|control| control.contains(&self.writer) && !control.any_active())
+            {
+                INTERRUPT_PENDING.store(false, Ordering::SeqCst);
+            }
+        } else if let Ok(mut active) = self.active_request.lock() {
             *active = None;
         }
-        INTERRUPT_PENDING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -250,12 +356,22 @@ impl ProcessGateway {
             }
         });
 
+        let writer = Arc::new(GatewayWriter {
+            stdin: Mutex::new(stdin),
+            next_id: AtomicU64::new(0),
+        });
+        let (cancel_sender, cancel_receiver) = channel();
+        let cancel_writer = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            while let Ok(target_id) = cancel_receiver.recv() {
+                let _ = cancel_writer.send(&Outbound::Cancel { target_id });
+            }
+        });
+
         let mut gateway_client = Self {
             child,
-            writer: Arc::new(GatewayWriter {
-                stdin: Mutex::new(stdin),
-                next_id: AtomicU64::new(0),
-            }),
+            writer,
+            cancel_sender,
             inbound,
             active_request: Arc::new(Mutex::new(None)),
             versions: GatewayVersions {
@@ -297,7 +413,7 @@ impl ProcessGateway {
         )?;
         let environment = gateway_environment(runtime)?;
         let client = Self::spawn_with_environment(&node, &gateway, &environment)?;
-        register_interrupt_control(client.control())?;
+        register_interrupt_controls(vec![client.control()])?;
         Ok(client)
     }
 
@@ -307,21 +423,55 @@ impl ProcessGateway {
             .inspect_err(|_| self.poisoned = true)
     }
 
-    /// Publish a completion frame and its cancel target under the same
-    /// active-request lock. A Ctrl-C handler can therefore never observe a
-    /// sent completion without also seeing the id it must cancel.
+    /// Serialize this completion ahead of any queued cancel, then publish its
+    /// cancel target under the interrupt admission gate. The potentially
+    /// blocking pipe write happens only after the global and active-id locks
+    /// have been released.
     fn send_complete(
         &mut self,
         request: &CompleteRequest,
+        admission: DispatchAdmission,
     ) -> Result<(String, ActiveRequestGuard), GatewayError> {
+        let writer = Arc::clone(&self.writer);
+        let (id, line) = writer
+            .prepare(&Outbound::Complete(Box::new(request.clone())))
+            .inspect_err(|_| self.poisoned = true)?;
+        // Taking stdin first guarantees a cancellation queued after active-id
+        // publication cannot overtake the Complete frame. This wait is outside
+        // INTERRUPT_CONTROL, so it cannot stall the Ctrl-C callback.
+        let mut stdin = writer
+            .stdin
+            .lock()
+            .map_err(|_| GatewayError::Io("gateway stdin lock poisoned".into()))?;
+        let interrupt_gate = INTERRUPT_CONTROL
+            .lock()
+            .map_err(|_| GatewayError::Io("Ctrl-C control lock poisoned".into()))?;
+        let interrupt_applies = interrupt_gate
+            .as_ref()
+            .is_some_and(|control| control.contains(&self.writer));
+        let interrupt_generation = INTERRUPT_GENERATION.load(Ordering::SeqCst);
+        if interrupt_applies
+            && (admission.interrupted
+                || INTERRUPT_PENDING.load(Ordering::SeqCst)
+                || admission.generation != interrupt_generation)
+        {
+            return Err(GatewayError::Canceled(
+                "interrupted before gateway dispatch".into(),
+            ));
+        }
         let active_request = Arc::clone(&self.active_request);
         let mut active = active_request
             .lock()
             .map_err(|_| GatewayError::Io("gateway active-request lock poisoned".into()))?;
-        let id = self.send(&Outbound::Complete(Box::new(request.clone())))?;
         *active = Some(id.clone());
         drop(active);
-        Ok((id, ActiveRequestGuard::new(active_request)))
+        let active_guard = ActiveRequestGuard::new(Arc::clone(&writer), active_request);
+        drop(interrupt_gate);
+        if let Err(error) = GatewayWriter::write_line(&mut stdin, &line) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok((id, active_guard))
     }
 
     /// Receive the next message for `id` within `timeout`. Messages for other
@@ -395,8 +545,100 @@ impl ProcessGateway {
     pub fn control(&self) -> GatewayControl {
         GatewayControl {
             writer: Arc::clone(&self.writer),
+            cancel_sender: self.cancel_sender.clone(),
             active_request: Arc::clone(&self.active_request),
         }
+    }
+}
+
+impl ProcessGatewayPool {
+    /// Launch exactly the configured number of independent gateway workers.
+    /// Configuration validates the value and deliberately applies no upper
+    /// clamp: increasing concurrency is an explicit operator choice.
+    pub fn launch(
+        gateway_path: Option<&Path>,
+        runtime: &crate::config::RuntimeConfig,
+        max_concurrency: usize,
+    ) -> anyhow::Result<Self> {
+        if max_concurrency == 0 {
+            anyhow::bail!("llm.max_concurrency must be greater than zero");
+        }
+        let node =
+            config::resolve_node_setting(&runtime.effective.sidecars.node, "the pi-ai gateway")?;
+        config::verify_node_version(&node)?;
+        let gateway = config::resolve_gateway_setting(
+            gateway_path,
+            runtime.effective.sidecars.gateway.as_deref(),
+        )?;
+        let environment = gateway_environment(runtime)?;
+        let mut workers = Vec::with_capacity(max_concurrency);
+        for _ in 0..max_concurrency {
+            workers.push(ProcessGateway::spawn_with_environment(
+                &node,
+                &gateway,
+                &environment,
+            )?);
+        }
+        register_interrupt_controls(workers.iter().map(ProcessGateway::control).collect())?;
+        Ok(Self { workers })
+    }
+}
+
+impl LlmGateway for ProcessGatewayPool {
+    fn capabilities(
+        &mut self,
+        model: Option<&str>,
+    ) -> Result<(ProviderSummary, Option<ModelCapabilities>), GatewayError> {
+        self.workers[0].capabilities(model)
+    }
+
+    fn complete(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        self.workers[0].complete(request, timeout)
+    }
+
+    fn complete_batch(
+        &mut self,
+        tasks: &[CompletionTask<'_>],
+    ) -> Vec<Result<CompletionOutcome, GatewayError>> {
+        let admission = match DispatchAdmission::capture() {
+            Ok(admission) => admission,
+            Err(error) => {
+                let message = error.to_string();
+                return tasks
+                    .iter()
+                    .map(|_| Err(GatewayError::Io(message.clone())))
+                    .collect();
+            }
+        };
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        for batch in tasks.chunks(self.workers.len()) {
+            let batch_outcomes = std::thread::scope(|scope| {
+                let handles = self
+                    .workers
+                    .iter_mut()
+                    .zip(batch)
+                    .map(|(worker, task)| {
+                        scope.spawn(move || {
+                            worker.complete_with_admission(task.request, task.timeout, admission)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(GatewayError::Io("gateway worker thread panicked".into()))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            outcomes.extend(batch_outcomes);
+        }
+        outcomes
     }
 }
 
@@ -429,13 +671,33 @@ impl LlmGateway for ProcessGateway {
 }
 
 impl ProcessGateway {
+    fn complete_with_admission(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+        admission: DispatchAdmission,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        self.complete_with_grace_and_admission(request, timeout, Duration::from_secs(5), admission)
+    }
+
     fn complete_with_grace(
         &mut self,
         request: &CompleteRequest,
         timeout: Duration,
         grace: Duration,
     ) -> Result<CompletionOutcome, GatewayError> {
-        let (id, _active) = self.send_complete(request)?;
+        let admission = DispatchAdmission::capture()?;
+        self.complete_with_grace_and_admission(request, timeout, grace, admission)
+    }
+
+    fn complete_with_grace_and_admission(
+        &mut self,
+        request: &CompleteRequest,
+        timeout: Duration,
+        grace: Duration,
+        admission: DispatchAdmission,
+    ) -> Result<CompletionOutcome, GatewayError> {
+        let (id, _active) = self.send_complete(request, admission)?;
         let wire_timeout = timeout + grace;
         let started = match self.receive_for(&id, wire_timeout)? {
             Inbound::Started {
@@ -546,17 +808,21 @@ mod fake {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
     use super::super::protocol::{ChatMessage, CompleteRequest, SubmitTool};
-    use super::super::{GatewayError, LlmGateway};
+    use super::super::{CompletionTask, GatewayError, LlmGateway};
     use super::{
-        ProcessGateway, gateway_environment, register_interrupt_control,
-        request_interrupt_cancellation, write_fake_gateway,
+        DispatchAdmission, INTERRUPT_PENDING, ProcessGateway, ProcessGatewayPool,
+        gateway_environment, register_interrupt_controls, request_interrupt_cancellation,
+        write_fake_gateway,
     };
+
+    static INTERRUPT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn gateway_environment_contains_typed_non_secret_runtime_configuration() -> anyhow::Result<()> {
@@ -633,6 +899,24 @@ mod tests {
         Ok(gateway)
     }
 
+    fn wait_until_active(control: &super::GatewayControl) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if control
+                .active_request
+                .lock()
+                .map_err(|_| anyhow::anyhow!("gateway active-request lock poisoned"))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("gateway did not publish its active request");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn completes_through_a_fake_gateway_and_shuts_down() -> anyhow::Result<()> {
         let body = format!(
@@ -656,6 +940,226 @@ done"#
         assert_eq!(outcome.usage.total_tokens, 3);
         assert_eq!(outcome.attempts, 1);
         drop(gateway); // shutdown path must not hang
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_pool_overlaps_independent_completions() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let markers = dir.path().join("markers");
+        std::fs::create_dir(&markers)?;
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      touch '{markers}/'$$
+      while [ "$(find '{markers}' -type f | wc -l | tr -d ' ')" -lt 2 ]; do sleep 0.01; done
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      echo '{{"protocol":1,"id":"r2","kind":"result","tool_call":{{"name":"submit","arguments":{{"ok":true}}}},"stop_reason":"toolUse","usage":{{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":3,"cost_total":0}}}}'
+      ;;
+    *'"kind":"shutdown"'*) echo '{{"protocol":1,"id":"r3","kind":"shutdown_result"}}'; exit 0 ;;
+  esac
+done"#,
+            markers = markers.display(),
+        );
+        let (node, script) = write_fake_gateway(dir.path(), &body)?;
+        let workers = vec![
+            ProcessGateway::spawn(&node, &script)?,
+            ProcessGateway::spawn(&node, &script)?,
+        ];
+        let mut pool = ProcessGatewayPool { workers };
+        let requests = [complete_request(), complete_request()];
+        let tasks = requests
+            .iter()
+            .map(|request| CompletionTask {
+                request,
+                timeout: Duration::from_secs(2),
+            })
+            .collect::<Vec<_>>();
+        let outcomes = pool.complete_batch(&tasks);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.into_iter().all(|outcome| outcome.is_ok()));
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_rejects_a_delayed_worker_from_the_same_batch() -> anyhow::Result<()> {
+        let _interrupt_test = INTERRUPT_TEST_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("interrupt test lock poisoned"))?;
+        let dir = tempfile::tempdir()?;
+        let late_dispatch = dir.path().join("late-dispatch");
+        let first_dir = tempfile::tempdir_in(dir.path())?;
+        let second_dir = tempfile::tempdir_in(dir.path())?;
+        let first_body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      echo '{{"protocol":1,"id":"r2","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      ;;
+    *'"kind":"cancel"'*)
+      echo '{{"protocol":1,"id":"r3","kind":"cancel_result","target_id":"r2","active":true}}'
+      echo '{{"protocol":1,"id":"r2","kind":"canceled","reason":"canceled"}}'
+      ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#
+        );
+        let second_body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"complete"'*)
+      touch '{late_dispatch}'
+      echo '{{"protocol":1,"id":"r3","kind":"started","provider":"faux","model":"faux-model","api":"faux","billing_path":"api","auth_source":"test"}}'
+      echo '{{"protocol":1,"id":"r3","kind":"result","tool_call":{{"name":"submit","arguments":{{"ok":true}}}},"stop_reason":"toolUse","usage":{{"input_tokens":1,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":3,"cost_total":0}}}}'
+      ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#,
+            late_dispatch = late_dispatch.display(),
+        );
+        let (first_node, first_script) = write_fake_gateway(first_dir.path(), &first_body)?;
+        let (second_node, second_script) = write_fake_gateway(second_dir.path(), &second_body)?;
+        let mut first = ProcessGateway::spawn(&first_node, &first_script)?;
+        let mut delayed = ProcessGateway::spawn(&second_node, &second_script)?;
+        let first_control = first.control();
+        register_interrupt_controls(vec![first_control.clone(), delayed.control()])?;
+
+        // One ticket represents the whole batch. The delayed worker keeps this
+        // pre-interrupt generation even after the first worker clears pending.
+        let admission = DispatchAdmission::capture()?;
+        let first_request = complete_request();
+        let delayed_request = complete_request();
+        let (release_delayed, wait_for_release) = mpsc::channel();
+        let (first_result, delayed_result) = thread::scope(|scope| -> anyhow::Result<_> {
+            let first_admission = admission;
+            let delayed_admission = admission;
+            let first_worker = &mut first;
+            let first_request = &first_request;
+            let first_handle = scope.spawn(move || {
+                first_worker.complete_with_admission(
+                    first_request,
+                    Duration::from_secs(2),
+                    first_admission,
+                )
+            });
+            let delayed_worker = &mut delayed;
+            let delayed_request = &delayed_request;
+            let delayed_handle = scope.spawn(move || {
+                wait_for_release
+                    .recv()
+                    .expect("delayed worker release sender");
+                delayed_worker.complete_with_admission(
+                    delayed_request,
+                    Duration::from_secs(2),
+                    delayed_admission,
+                )
+            });
+
+            wait_until_active(&first_control)?;
+            assert!(request_interrupt_cancellation());
+            let first_result = first_handle.join().expect("first gateway worker");
+            assert!(
+                !INTERRUPT_PENDING.load(std::sync::atomic::Ordering::SeqCst),
+                "the completed active worker should clear the pending bit"
+            );
+            release_delayed
+                .send(())
+                .expect("delayed worker release receiver");
+            let delayed_result = delayed_handle.join().expect("delayed gateway worker");
+            Ok((first_result, delayed_result))
+        })?;
+
+        assert!(
+            matches!(first_result, Err(GatewayError::Canceled(_))),
+            "got {first_result:?}"
+        );
+        assert!(
+            matches!(delayed_result, Err(GatewayError::Canceled(_))),
+            "got {delayed_result:?}"
+        );
+        assert!(
+            !late_dispatch.exists(),
+            "the delayed worker sent a completion after Ctrl-C"
+        );
+        delayed.complete(&complete_request(), Duration::from_secs(2))?;
+        assert!(
+            late_dispatch.exists(),
+            "a fresh post-cancellation admission should still dispatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_interrupt_requests_immediate_exit() -> anyhow::Result<()> {
+        let _interrupt_test = INTERRUPT_TEST_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("interrupt test lock poisoned"))?;
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#
+        );
+        let gateway = spawn_with(&body)?;
+        register_interrupt_controls(vec![gateway.control()])?;
+
+        assert!(
+            !request_interrupt_cancellation(),
+            "an idle first interrupt must make the handler exit 130"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_handler_does_not_wait_for_gateway_stdin() -> anyhow::Result<()> {
+        let _interrupt_test = INTERRUPT_TEST_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("interrupt test lock poisoned"))?;
+        let body = format!(
+            r#"while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+    *'"kind":"shutdown"'*) exit 0 ;;
+  esac
+done"#
+        );
+        let gateway = spawn_with(&body)?;
+        let control = gateway.control();
+        register_interrupt_controls(vec![control.clone()])?;
+        *control
+            .active_request
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway active-request lock poisoned"))? =
+            Some("r2".to_string());
+
+        let stdin = gateway
+            .writer
+            .stdin
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway stdin lock poisoned"))?;
+        let (finished, completion) = mpsc::channel();
+        let canceler = thread::spawn(move || {
+            let first = request_interrupt_cancellation();
+            let second = request_interrupt_cancellation();
+            finished
+                .send((first, second))
+                .expect("interrupt result receiver");
+        });
+        let result = completion.recv_timeout(Duration::from_secs(1));
+        drop(stdin);
+        canceler.join().expect("interrupt thread");
+
+        assert_eq!(
+            result?,
+            (true, false),
+            "the first interrupt should enqueue cancellation and the second should force exit"
+        );
         Ok(())
     }
 
@@ -685,6 +1189,9 @@ done"#
 
     #[test]
     fn registered_interrupt_control_cancels_while_completion_waits() -> anyhow::Result<()> {
+        let _interrupt_test = INTERRUPT_TEST_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("interrupt test lock poisoned"))?;
         let body = format!(
             r#"while IFS= read -r line; do
   case "$line" in
@@ -701,7 +1208,7 @@ done"#
 done"#
         );
         let mut gateway = spawn_with(&body)?;
-        register_interrupt_control(gateway.control())?;
+        register_interrupt_controls(vec![gateway.control()])?;
         let canceler = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             request_interrupt_cancellation()
