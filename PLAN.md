@@ -3143,7 +3143,10 @@ ceiling. The evaluation record adds the invented-anchor failure class and one
 anchoring event in which a delivered analog shaped architecture without
 supplying the missing behavior.
 
-Skill and MCP guidance text only; no schema or runtime changes.
+Skill and MCP guidance plus one profile-correctness fix: Baseline now forces
+configured expansion off, matching its existing forced-off attached-memory
+posture, while still rejecting an explicitly enabled expansion. There are no
+schema, Structural retrieval, or product-default changes.
 
 1. Two loops, and the inquiry loop is conditional. Investigation, for known
    identifiers: `exhaustive: true` lexical search first, `definition` on

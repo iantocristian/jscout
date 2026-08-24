@@ -161,6 +161,52 @@ fn exhaustive_search_overrides_configured_stages_and_rejects_only_explicit_enabl
 }
 
 #[test]
+fn baseline_ranked_search_forces_unavailable_configured_stages_off() -> Result<()> {
+    let defaults = config::SearchSettings {
+        vector: false,
+        attach_memory: true,
+        expansion: config::ExpansionSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (vector, options) = search_options_from_args(
+        ToolProfile::Baseline,
+        &json!({ "query": "dispatch", "vector": true }),
+        &defaults,
+    )?;
+    assert!(vector);
+    assert!(!options.expand);
+    assert!(!options.include_memory);
+
+    let (_, explicit_disable) = search_options_from_args(
+        ToolProfile::Baseline,
+        &json!({ "query": "dispatch", "expand": false }),
+        &defaults,
+    )?;
+    assert!(!explicit_disable.expand);
+
+    let explicit_enable = search_options_from_args(
+        ToolProfile::Baseline,
+        &json!({ "query": "dispatch", "expand": true }),
+        &defaults,
+    )
+    .expect_err("baseline must still reject an explicitly enabled structural stage");
+    assert!(explicit_enable.to_string().contains("unavailable"));
+
+    let (_, structural) = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({ "query": "dispatch" }),
+        &defaults,
+    )?;
+    assert!(structural.expand);
+    assert!(structural.include_memory);
+    Ok(())
+}
+
+#[test]
 fn profile_instructions_encode_g23_workflows_and_capabilities() {
     let baseline = server_instructions(ToolProfile::Baseline);
     let structural = server_instructions(ToolProfile::Structural);
@@ -180,6 +226,8 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "sym: anchor plus its snapshot",
             "strip only the leading file:",
             "Human-authored symbol mode",
+            "original search's explicit origins allowlist",
+            "never synthesize it from echoed scope.origins",
             "corpus, file_roles, origins, and snapshot",
             "convention",
             "safe",
@@ -227,7 +275,9 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
     }
     assert!(baseline.contains("structural profile"));
     assert!(baseline.contains("calls for exact member-method"));
+    assert!(baseline.contains("forces unavailable expansion and attached memory off"));
     assert!(structural.contains("calls, events, and file_outline"));
+    assert!(structural.contains("expand=false and include_memory=false"));
 
     for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
         let tools = tool_defs(profile);

@@ -46,13 +46,19 @@ known code.
    strip only the leading `file:` from its returned file anchor and pass the
    remainder as `file_outline.path`; never pass the prefixed anchor as `path`.
    When no exact anchor is available, human-authored `symbol` mode remains a
-   fuzzy localization fallback, not evidence of same-name exactness.
+   fuzzy localization fallback, not evidence of same-name exactness. Whenever
+   manually constructing a compatible locator follow-up, copy the original
+   search's explicit `origins` allowlist unchanged; if the search omitted
+   `origins`, keep it omitted. Never synthesize follow-up arguments from echoed
+   `scope.origins`.
 4. Only after lexical localization, use a separate non-exhaustive ranked
    `semantic_search` with `vector: true` or `who_uses` when looking for aliases
-   or callers that source-text matches do not enumerate. When the structural
-   profile exposes graph tools, an exact-anchor `neighborhood` can inspect
-   relationships and one separate expanded search can orient a cross-file
-   route. Expand at most once, after localization.
+   or callers that source-text matches do not enumerate. In the structural
+   profile, set `expand: false` and `include_memory: false` on that ranked
+   search; Baseline forces both unavailable stages off. An exact-anchor
+   `neighborhood` can inspect relationships when exposed, and one separate
+   expanded search can orient a cross-file route. Expand at most once, after
+   localization.
 5. A completeness answer must state the echoed scope: corpus, file roles,
    origins, and snapshot. Exhaustive coverage is by indexed chunk plus unique
    `match_lines`; it is not regex, substring, or within-line occurrence
