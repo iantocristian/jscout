@@ -248,9 +248,9 @@ Each block observation stores one lifecycle event — `baseline`, `added`,
 - `body_changed`: a uniquely matched predecessor has different body content;
 - `context_changed`: nearest heading or other retrieval context changed;
   source-offset and ordinal changes alone do not count; and
-- `moved`: the matched block changed path or reordered relative to matched
-  neighboring blocks. Line, byte-span, or ordinal shifts caused only by an
-  insertion or deletion are not movement.
+- `moved`: the matched block reordered relative to matched neighboring blocks.
+  Line, byte-span, or ordinal shifts caused only by an insertion or deletion
+  are not movement.
 
 A transition can therefore be both `body_changed` and `context_changed`, or
 both `body_changed` and `moved`. A successful scan emits `removed` when a
@@ -290,6 +290,12 @@ one-to-one:
    also receives any applicable context or movement flag.
 5. Every other unmatched new block is `added`; every other confirmed unmatched
    old block is `removed`.
+
+Consequently, without usable Git provenance, a pure file rename is recorded as
+`removed` plus `added` and restarts observed freshness for every block at the
+new path; version one accepts this false-recency trade-off because its ranking
+effect is bounded by `max_rank_movement`, and the renamed-file evaluation arm
+measures it.
 
 Ordinal position alone never establishes continuity. If duplicate content,
 multiple valid monotone pairings, document-edge edits, split/merge/reflow, or

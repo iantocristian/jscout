@@ -3223,6 +3223,10 @@ rank-fusion scores. The revised decisions:
    complete last-good snapshot active. Version one never creates cross-path
    predecessor edges: Git rename detection is heuristic, so identical content
    at another path starts a new occurrence even when Git reports a rename.
+   Without usable Git provenance, a pure rename therefore restarts observed
+   freshness for every block; this accepted version-one false-recency trade-off
+   is bounded by `max_rank_movement` and measured by the renamed-file
+   evaluation arm.
 5. Freshness: order-based and bounded, not a score multiplier. After
    relevance fusion and optional reranking, each candidate's final rank differs
    from its base rank by at most `max_rank_movement` (default 2), and swaps
