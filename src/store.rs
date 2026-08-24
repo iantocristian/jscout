@@ -110,8 +110,21 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
 /// uses this to give warm and cold sessions isolated semantic-memory state
 /// while both read the same frozen source tree.
 pub fn open_path(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create index database directory {} for {}",
+                parent.display(),
+                path.display()
+            )
+        })?;
+    }
     register_sqlite_vec();
-    let conn = Connection::open(path)?;
+    let conn = Connection::open(path)
+        .with_context(|| format!("open index database {} for writing", path.display()))?;
     let has_schema: bool = conn.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'
@@ -1194,6 +1207,24 @@ mod tests {
             |row| row.get::<_, String>(0),
         )?;
         assert_eq!(unchanged, "14");
+        Ok(())
+    }
+
+    #[test]
+    fn writer_open_creates_a_missing_database_parent() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("nested/state");
+        let database = parent.join("index.db");
+
+        let error = open_path_read_only(&database)
+            .expect_err("read-only open must not create a configured output directory");
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!parent.exists());
+
+        let conn = open_path(&database)?;
+        drop(conn);
+        assert!(parent.is_dir());
+        assert!(database.is_file());
         Ok(())
     }
 

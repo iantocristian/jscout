@@ -854,6 +854,11 @@ unsupported versions, invalid endpoints, missing configured sidecars, and
 contradictory watch settings fail before a database is opened or a sidecar is
 started.
 
+The first writer command creates missing parent directories for the configured
+database path, so `database.path = ".jscout/jscout.db"` needs no preparatory
+`mkdir`. Read-only search and MCP startup remain non-mutating: they require an
+already published database and never create a missing path.
+
 The file configures the database; retrieval defaults and budgets; embedding,
 reranker, and local-inference models; LLM/provider metadata; Node/gateway and
 checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
