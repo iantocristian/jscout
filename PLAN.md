@@ -22,7 +22,9 @@
 > exhaustive lexical search is implemented. G23 investigation/inquiry guidance
 > is implemented, with its production replay still pending. Neither triggers
 > G16 or widens the semantic product surface, and no retrieval default changes
-> without a same-binary, same-snapshot comparison.
+> without a same-binary, same-snapshot comparison. G24 repository documentation
+> retrieval is proposed: a separate documentation database and corpus that
+> changes no code-retrieval behavior.
 
 ## Document policy
 
@@ -3176,6 +3178,111 @@ links-iteration investigation following the skill reaches the
 `rg -w`-listed occurrences and states scope; recorded before and after:
 missed gold chunks, false completeness claims, calls, bytes, and telemetry's
 exact-anchor definition success rate.
+
+## Proposed G24 — repository documentation retrieval
+
+Repository Markdown is authored source material that agents currently cannot
+retrieve through jscout. It is the wrong shape for the structural index — a
+JavaScript parser cannot manufacture documentation chunks, and prose changes
+must not couple to structural snapshots — and the wrong shape for semantic
+memory, whose artifacts carry code-evidence chains that authored prose does
+not acquire by being indexed. The first proposal round (PR #96) additionally
+established that the shared database cannot host an independent plane — one
+global schema version and structural-snapshot-gated opens — and that a
+multiplicative score decay is not bounded in effect once applied to
+rank-fusion scores. The revised decisions:
+
+1. Documentation lives in a separately configured database, defaulting to
+   `<root>/.jscout-docs.db`, with its own schema version, migration lifecycle,
+   docs application identity, canonical-root binding, readiness gate,
+   last-good snapshot publication, and retry state. Path and same-file checks
+   reject aliases with the main database or another root's docs store.
+   `[docs.database].path` overrides that default independently of the main
+   database path. The main database, structural snapshots, configuration
+   fingerprints, watch generations, and semantic freshness are untouched by
+   every docs operation. Compatibility of a committed `[docs]` configuration
+   section with pre-docs binaries is not a requirement.
+2. Corpus: ignore-aware `.md` inventory with a fixed root-level hidden
+   allowlist (`.github`, `.claude`, `.agents`); Markdown block chunking that
+   never crosses heading boundaries; one document-stub row for body-empty
+   documents; deterministic file-only config globs, BOM handling, symlink
+   exclusion, sorted publication, and `docs status` reporting the deciding rule
+   for every encountered file and pruned directory.
+3. Retrieval: BM25 always builds; vectors reuse the existing `[embedding]`
+   provider, model, and service — no second provider section and no second
+   local model; reciprocal-rank fusion; embedding identity is exactly
+   `hash(format_version, nearest_heading, rendered_body)`, with the exact
+   provider text and hash preimage fixed by the incorporated contract, so file
+   renames and ancestor-heading edits reuse vectors; vector search participates
+   only when the current snapshot/profile has a complete persisted readiness
+   generation; RRF reuses `k = 60`, with lexical score defined as `-FTS5
+   bm25()` and deterministic source-key tie-breaks; the CLI contract is defined directly,
+   with `--vector` meaning required vector participation and no vector-only mode
+   existing.
+4. History: an append-only block-observation ledger inside the docs database,
+   separate from the current size-merged retrieval-chunk projection. Matching
+   is conservative and one-to-one — exact content first, then uniquely
+   neighbor-anchored edited blocks; ordinal position alone never establishes
+   continuity and ambiguous matches receive no predecessor. `removed` is
+   recorded only when a successfully parsed current corpus confirms a prior
+   block is absent. A classified permanent file open/read failure is a visible corpus gap,
+   emits no lifecycle transition, and breaks continuity; when that file later
+   parses, its blocks start new baseline occurrences. Baseline content without
+   Git provenance has unknown authorship time and is never presented as newly
+   written. Retryable I/O and every database, transaction, configuration,
+   discovery, inventory, cancellation, or consistency-drift failure publishes
+   nothing and leaves the complete last-good snapshot active. Version one never creates cross-path
+   predecessor edges: Git rename detection is heuristic, so identical content
+   at another path starts a new occurrence even when Git reports a rename.
+   Pure within-path reordering updates the current projection but emits no
+   history event in version one.
+   Without usable Git provenance, a pure rename therefore restarts observed
+   freshness for every block; this accepted version-one false-recency trade-off
+   is bounded by `max_rank_movement` and measured by the renamed-file
+   evaluation arm.
+5. Freshness: order-based and bounded, not a score multiplier. After
+   relevance fusion and optional reranking, each candidate's final rank differs
+   from its base rank by at most `max_rank_movement` (default 2), and swaps
+   occur only between candidates with comparable provenance: git orders
+   against git by latest author time with working-tree lines newest, observed
+   orders post-baseline `added` and `body_changed` events by snapshot sequence,
+   git and observed never reorder against each other, and unknown provenance
+   never moves and is never advantaged. The model reranker never receives
+   temporal metadata. Only commits listed by the repository's resolved shallow
+   file count as shallow boundaries and contribute no timestamp; provenance
+   uses captured indexed bytes with
+   `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
+   blame mappings cache by repository-relative
+   path, exact file-byte hash, path-tip commit, and shallow boundary
+   fingerprint; filesystem mtime is never a fallback.
+   `--no-freshness` preserves the relevance order for comparison.
+6. Retention: hit content is served from stored current rendered bodies and
+   block text; source spans are snapshot-relative and carry the indexed full-
+   file hash. Checkout source is read once into an immutable buffer, and only
+   that same buffer may be sliced after its hash matches; a separate check then
+   read is forbidden. No full raw Markdown copy is stored. After a successful
+   replacement snapshot, retired block bodies are not retained in the ledger;
+   retired hashes, transition metadata, and content-addressed vectors may
+   remain. Version one adds no retention controls.
+
+Delivery: phase 1 is the corpus, BM25, `docs index`/`status`/`search
+--lexical-only`, the MCP documentation-search surface, and ledger recording;
+phase 2 adds vectors from the shared profile; phase 3 adds Git/observed
+freshness only after the retrieval evaluation corpus exists and reports;
+phase 4 adds documentation-only watch. No implementation milestone is
+assigned and no current goal is displaced.
+
+Acceptance: a code reindex and any docs operation are mutually invisible,
+with foreign-plane state byte-identical either way; inserting one uniquely
+distinguishable paragraph produces one `added` block observation and no
+succession rows for untouched blocks; globally unique copied content and
+Git-detected renames receive no cross-path predecessor; freshness movement
+never exceeds its configured bound and never crosses provenance bases; a
+repository with no `[embedding]` provider retains full lexical documentation
+search; crash recovery exposes exactly one complete old or replacement docs
+snapshot, never a partial mixture; and the detailed implementation contract
+[docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
+is incorporated by reference, this entry winning on any explicit disagreement.
 
 ## Evaluation decisions already made
 
