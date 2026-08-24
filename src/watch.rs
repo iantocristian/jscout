@@ -645,6 +645,44 @@ struct RefreshResult {
     outcome: indexer::IndexOutcome,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejectionReportDecision {
+    Silent,
+    Details,
+    Cleared { previous: usize },
+}
+
+#[derive(Default)]
+struct RejectionReportLatch {
+    // This is diagnostic state only. The refresh summary remains authoritative
+    // and continues to report the rejection count for every generation.
+    previous: Vec<indexer::IndexRejection>,
+}
+
+impl RejectionReportLatch {
+    fn observe(&mut self, rejections: &[indexer::IndexRejection]) -> RejectionReportDecision {
+        let mut current = rejections.to_vec();
+        current.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.stage.cmp(right.stage))
+                .then_with(|| left.error.cmp(&right.error))
+        });
+        if current == self.previous {
+            return RejectionReportDecision::Silent;
+        }
+
+        let previous = self.previous.len();
+        let decision = if current.is_empty() {
+            RejectionReportDecision::Cleared { previous }
+        } else {
+            RejectionReportDecision::Details
+        };
+        self.previous = current;
+        decision
+    }
+}
+
 pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     validate_options(options)?;
     let root = root.canonicalize()?;
@@ -674,6 +712,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         options.embed_on_change,
         options.enrich_on_change,
     );
+    let mut rejection_report_latch = RejectionReportLatch::default();
     let mut classifier = EventClassifier::new(&root, &database);
     let mut registry = WatchRegistry::default();
     let mut targets =
@@ -752,7 +791,17 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         options.debug,
                     ) {
                         Ok(result) => {
-                            indexer::report_rejections(&result.outcome);
+                            match rejection_report_latch.observe(&result.outcome.rejections) {
+                                RejectionReportDecision::Silent => {}
+                                RejectionReportDecision::Details => {
+                                    indexer::report_rejections(&result.outcome);
+                                }
+                                RejectionReportDecision::Cleared { previous } => {
+                                    eprintln!(
+                                        "watch index input rejections cleared (previous={previous})"
+                                    );
+                                }
+                            }
                             eprintln!(
                                 "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} rejected={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
                                 work.generation,

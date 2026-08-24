@@ -581,11 +581,14 @@ dependency traversal is a phase error because that explicitly requested
 package inventory is planned as one bounded unit.
 Non-retryable file reads and deterministic extraction failures are rejected
 inputs. They do not degrade a refresh or trigger whole-repository retries, and
-their path, stage, and error remain visible in every index report. The default
-ten-minute reconciliation pass naturally attempts those paths again while also
-repairing missed notifications. Its interval is measured from completion of
-the previous generation, avoiding back-to-back refreshes when a cycle itself is
-slow; a nonzero interval must be greater than the debounce period.
+their path, stage, and error remain visible in every manual index report.
+The watcher prints the full details once per distinct rejection set, reports
+when the set clears, and retains `rejected=N` in every refresh summary. The
+default ten-minute reconciliation pass naturally attempts those paths again
+while also repairing missed notifications. Its interval is measured from
+completion of the previous generation, avoiding back-to-back refreshes when a
+cycle itself is slow; a nonzero interval must be greater than the debounce
+period.
 Set `--reconcile-seconds 0` only when giving up that bounded recovery is
 acceptable; it does not disable phase-error retries.
 
@@ -960,10 +963,11 @@ failures, and deterministic extraction errors. The final summary reports both
 `removed=N` and `rejected=N`, followed by every rejected path, its stage
 (`walk`, `ignore`, `workspace-manifest`,
 `workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `read`, or
-`extract`), and the underlying error on stderr; `watch` prints the same detail
-on each cycle. A recognized transient read error fails the phase instead, so a
-reduced corpus is not published; watch retries indefinitely with an
-exponential delay capped at 30 seconds.
+`extract`), and the underlying error on stderr. `watch` prints those details
+once per distinct rejection set, emits one recovery line when they clear, and
+keeps the count in every refresh summary. A recognized transient read error
+fails the phase instead, so a reduced corpus is not published; watch retries
+indefinitely with an exponential delay capped at 30 seconds.
 
 ## Call-site queries
 
