@@ -3215,10 +3215,14 @@ rank-fusion scores. The revised decisions:
    neighbor-anchored edited blocks; ordinal position alone never establishes
    continuity and ambiguous matches receive no predecessor. `removed` is
    recorded only when a successfully parsed current corpus confirms a prior
-   block is absent; a file unavailable through a read or parse failure leaves
-   the current projection with lifecycle `unavailable` instead; baseline
-   content without Git provenance has unknown authorship time and is never
-   presented as newly written.
+   block is absent. A permanent read or parse failure is a visible corpus gap,
+   emits no lifecycle transition, and breaks continuity; when that file later
+   parses, its blocks start new baseline occurrences. Baseline content without
+   Git provenance has unknown authorship time and is never presented as newly
+   written. A retryable corpus failure publishes nothing and leaves the
+   complete last-good snapshot active. Version one never creates cross-path
+   predecessor edges: Git rename detection is heuristic, so identical content
+   at another path starts a new occurrence even when Git reports a rename.
 5. Freshness: order-based and bounded, not a score multiplier. After
    relevance fusion and optional reranking, each candidate's final rank differs
    from its base rank by at most `max_rank_movement` (default 2), and swaps
@@ -3228,15 +3232,19 @@ rank-fusion scores. The revised decisions:
    git and observed never reorder against each other, and unknown provenance
    never moves and is never advantaged. The model reranker never receives
    temporal metadata. Shallow-clone boundary commits contribute no timestamp;
-   blame mappings cache by exact file-byte hash, path-tip commit, and shallow
-   boundary fingerprint; filesystem mtime is never a fallback.
+   provenance Git commands disable replacement objects and configured
+   ignore-revs; blame mappings cache by repository-relative path, exact file-
+   byte hash, path-tip commit, and shallow boundary fingerprint; filesystem
+   mtime is never a fallback.
    `--no-freshness` preserves the relevance order for comparison.
 6. Retention: hit content is served from stored current rendered bodies and
-   block text, with exact source spans referencing the checkout for raw bytes;
-   no full raw Markdown copy is stored. After a successful replacement
-   snapshot, retired block bodies are not retained in the ledger; retired
-   hashes, transition metadata, and content-addressed vectors may remain.
-   Version one adds no retention controls.
+   block text; source spans are snapshot-relative and carry the indexed full-
+   file hash. Checkout source is read once into an immutable buffer, and only
+   that same buffer may be sliced after its hash matches; a separate check then
+   read is forbidden. No full raw Markdown copy is stored. After a successful
+   replacement snapshot, retired block bodies are not retained in the ledger;
+   retired hashes, transition metadata, and content-addressed vectors may
+   remain. Version one adds no retention controls.
 
 Delivery: phase 1 is the corpus, BM25, `docs index`/`status`/`search
 --lexical-only`, the MCP documentation-search surface, and ledger recording;
@@ -3248,9 +3256,11 @@ assigned and no current goal is displaced.
 Acceptance: a code reindex and any docs operation are mutually invisible,
 with foreign-plane state byte-identical either way; inserting one uniquely
 distinguishable paragraph produces one `added` block observation and no
-succession rows for untouched blocks; freshness movement never exceeds its
-configured bound and never crosses provenance bases; a repository with no
-`[embedding]` provider retains full lexical documentation search; and the
+succession rows for untouched blocks; globally unique copied content and
+Git-detected renames receive no cross-path predecessor; freshness movement
+never exceeds its configured bound and never crosses provenance bases; a
+repository with no `[embedding]` provider retains full lexical documentation
+search; and the
 subordinate detail document
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
 remains non-normative, this entry winning on any disagreement.

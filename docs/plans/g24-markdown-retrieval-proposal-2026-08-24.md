@@ -58,7 +58,7 @@ database, defaulting to `<root>/.jscout-docs.db`, with:
 - no participation in structural snapshots, code config fingerprints, watch
   generations, or semantic freshness.
 
-A code reindex cannot make documentation search unavailable, and a
+A code reindex cannot disrupt documentation search, and a
 documentation migration failure cannot affect the main database. The history
 is local and is never a replacement for repository version control.
 
@@ -125,7 +125,7 @@ only; MDX requires a separate parsing and safety decision.
 | Heading breadcrumb | full heading path                            | medium weight  | no            | yes          |
 | Nearest heading    | closest enclosing heading                    | via breadcrumb | yes           | yes          |
 | Rendered body      | deterministic retrieval rendering of source  | base weight    | yes           | no           |
-| Source             | exact source byte and line spans             | no             | no            | yes          |
+| Source             | snapshot-relative byte/line spans + file hash | no             | no            | yes          |
 | Path               | repository-relative                          | lowest weight  | no            | yes          |
 
 `rendered_body` is the final deterministic body string sent to FTS and the
@@ -214,6 +214,8 @@ change during implementation):
   optional Git worktree/commit identity with author and committer times,
   chunk-format version, inventory and rejection counts. A failed scan never
   publishes or advances the sequence.
+- `doc_files`: current admitted documents — repository-relative path, indexed
+  full-file content hash, byte and line accounting, and document metadata.
 - `doc_block_contents`: content-addressed source blocks — raw-body hash and
   body text only while a current block occurrence references it.
 - `doc_block_occurrences`: current source-backed history units — path,
@@ -241,8 +243,7 @@ earlier point leaves the previous snapshot active and searchable.
 ## History and continuity
 
 Each block observation stores one lifecycle event — `baseline`, `added`,
-`continued`, `unavailable`, or `removed` — plus zero or more orthogonal
-change flags:
+`continued`, or `removed` — plus zero or more orthogonal change flags:
 
 - `body_changed`: a uniquely matched predecessor has different body content;
 - `context_changed`: nearest heading or other retrieval context changed;
@@ -253,21 +254,20 @@ change flags:
 
 A transition can therefore be both `body_changed` and `context_changed`, or
 both `body_changed` and `moved`. A successful scan emits `removed` when a
-previous block is confirmed absent from the current corpus. A read, parse, or
-inventory failure never emits `removed` for the unavailable file: the file's
-blocks leave the current projection with lifecycle `unavailable`, so search
-stops serving content the checkout cannot parse and their bodies follow the
-normal retired-content rules. When the file parses again, matching runs
-against its last successfully parsed state, and unchanged content resumes its
-logical occurrences as `continued`.
+previous block is confirmed absent from the current corpus. A permanent
+per-file read, parse, or inventory failure is recorded as a visible rejection,
+emits no block lifecycle event, and removes the file from the current
+projection. Matching never crosses that failure gap. If the file later parses,
+its blocks receive new logical-occurrence IDs with lifecycle `baseline`; their
+observation time is not authorship time. A retryable corpus failure publishes
+nothing and leaves the complete last-good snapshot active.
 
 For observed provenance, a post-baseline `added` event establishes freshness
 at its snapshot sequence, and `body_changed` advances it. `context_changed` or
 `moved` alone carries the prior freshness forward: a heading rename does not
-make the underlying claim newly authored. The first snapshot records blocks
-without Git provenance with lifecycle `baseline` and provenance `unknown`;
-the baseline observation's snapshot timestamp is operational metadata, not
-authorship time.
+make the underlying claim newly authored. An initial or post-gap baseline
+without Git provenance has provenance `unknown`; the baseline observation's
+snapshot timestamp is operational metadata, not authorship time.
 
 Matching between two successfully parsed snapshots is conservative and
 one-to-one:
@@ -279,9 +279,11 @@ one-to-one:
 2. Repeated exact hashes within one path match only when already matched
    neighboring blocks leave exactly one one-to-one monotone pairing. Otherwise
    every ambiguous copy remains unmatched.
-3. Among the remaining blocks, an exact hash is `moved` only when it occurs
-   exactly once in the unmatched old corpus and exactly once in the unmatched
-   new corpus.
+3. Version one never creates predecessor edges across repository paths. Git
+   rename detection is heuristic and therefore cannot prove succession; a
+   rename may be reported as snapshot metadata, but it does not change block
+   matching. Unmatched old and new blocks receive no cross-path predecessor
+   even when their exact hash is globally unique.
 4. An edited block receives a predecessor only when exactly one unmatched old
    block and one unmatched new block occur between the same immediately
    adjacent matched neighbors in one document. The pair is `body_changed` and
@@ -307,11 +309,16 @@ retrieval chunks. Rules:
   integration date;
 - shallow-clone boundary commits contribute no timestamp; a chunk whose
   contributing lines all blame to a boundary commit has unknown git age;
-- the blame mapping cache key includes a hash of the exact file bytes being
-  blamed, the newest commit touching the file's path, and the shallow boundary
-  fingerprint. Worktree edits, path-history rewriting, and clone deepening
-  therefore invalidate correctly; unrelated commits and staging an unchanged
-  worktree file do not;
+- provenance Git commands disable replacement objects with
+  `--no-replace-objects`, and blame clears repository `blame.ignoreRevsFile`
+  configuration with `-c blame.ignoreRevsFile=`. Ambient replace refs and
+  ignore-revs configuration cannot alter attribution;
+- the blame mapping cache key includes the repository-relative path, a hash of
+  the exact file bytes being blamed, the newest commit touching that path, and
+  the shallow boundary fingerprint. Worktree edits, path-history rewriting,
+  clone deepening, and same-content files with different histories therefore
+  resolve correctly; unrelated commits and staging an unchanged worktree file
+  do not invalidate it;
 - modified lines in an already tracked file are labelled `working_tree`
   whether staged or unstaged and order newer than committed lines, without
   inventing a commit;
@@ -363,8 +370,8 @@ Comparable provenance and the partial order:
 A retrieval chunk has one basis, chosen deterministically: `working_tree` when
 any contributing body line has that label; otherwise `git` with the latest
 usable author time among its contributing lines; otherwise `observed` with the
-latest freshness-bearing block event whenever usable Git authorship is
-unavailable, including non-Git repositories, blame failures, untracked files,
+latest freshness-bearing block event whenever usable Git authorship is absent,
+including non-Git repositories, blame failures, untracked files,
 and newly staged files; and otherwise `unknown`. A chunk whose lines all map to
 shallow boundary commits is `unknown` unless a later local observed body event
 exists.
@@ -403,15 +410,21 @@ default          BM25, plus vector fusion when the profile has a usable index
 
 The MCP `documentation_search` tool returns documentation-specific hits:
 path, heading breadcrumb, line range, content, documentation snapshot
-sequence, freshness basis and value, base rank and movement. Result budgets
+sequence, indexed file hash, freshness basis and value, base rank and movement.
+Byte and line spans are relative to that indexed file hash. To return raw
+checkout source, jscout reads the file once into an immutable buffer, hashes
+that buffer, and slices only that same buffer when the hash matches. On a
+mismatch or missing file, it returns the stored hit content and a
+source-mismatch state, never bytes from the wrong revision. Result budgets
 follow the same complete-response accounting as code search.
 
 ## Failure semantics
 
-- Markdown read/parse failure: reject that file visibly; permanent per-file
-  failures are corpus exclusions whose blocks leave the current projection as
-  `unavailable`, retryable corpus failures leave the previous documentation
-  snapshot active.
+- Markdown read/parse failure: use the code-plane I/O classification; a
+  permanent per-file failure is a visible corpus rejection, emits no block
+  lifecycle event, removes the file from the current projection, and prevents
+  matching across the gap; a retryable corpus failure publishes nothing and
+  leaves the previous documentation snapshot active.
 - Embedding provider absent: BM25 remains active.
 - Provider failure during `docs embed`: completed cached batches are kept;
   search reports degraded vector status and uses BM25 — a previous vector
@@ -423,9 +436,11 @@ Further failure-state machinery is deferred until the base feature is in use.
 
 ## Retention
 
-- Hit content is served from stored current rendered bodies and block text;
-  exact source spans reference the current checkout for raw bytes, and no
-  full raw Markdown copy is stored.
+- Hit content is served from stored current rendered bodies and block text.
+  Exact source spans are snapshot-relative and paired with the indexed full-
+  file hash. Checkout source is read once into an immutable buffer; that same
+  buffer is hashed and, only on a match, sliced. No full raw Markdown copy is
+  stored.
 - After a successful replacement snapshot, retired block bodies are removed
   from logical storage. The ledger keeps hashes and transition metadata, and
   the content-addressed vector cache may keep retired vectors.
@@ -452,6 +467,8 @@ Deterministic tests:
   blocks, even when retrieval chunks regroup;
 - duplicate, ordinal-only, and ambiguous split/merge matches produce no
   predecessor; combined edits retain every applicable change flag;
+- globally unique copied content and Git-detected renames receive no cross-path
+  predecessor in version one;
 - heading renames produce `context_changed` only; post-baseline additions and
   body changes advance observed freshness, while context-only and move-only
   changes do not;
@@ -468,11 +485,16 @@ Deterministic tests:
 - shallow boundary commits yield unknown git age; rebase preserves author
   time and freshness ordering; the blame cache survives unrelated commits and
   invalidates on worktree edits, path-history rewrite, and clone deepening;
+  two identical files with distinct path histories use distinct cache entries;
+  configured ignore-revs and replacement refs do not alter attribution;
 - a code reindex leaves documentation search available and vice versa; a
-  failed docs scan leaves the prior snapshot searchable;
-- a permanent per-file failure marks the file's blocks `unavailable` and
-  unsearchable without emitting `removed`; a later successful parse resumes
-  unchanged blocks as `continued`;
+  retryable docs scan failure leaves the prior snapshot searchable;
+- a permanent per-file failure is visibly rejected without emitting `removed`
+  or another block lifecycle event; a later successful parse starts new
+  baseline logical occurrences and cannot inherit freshness across the gap;
+- checkout edits after publication, including a concurrent edit during source
+  resolution, never make snapshot spans resolve to wrong bytes: raw source is
+  hashed and sliced from one captured immutable buffer;
 - code and semantic snapshots, counts, and fingerprints are byte-identical
   after any docs operation, and the documentation database is byte-identical
   after any code or semantic operation.
