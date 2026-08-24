@@ -1564,12 +1564,13 @@ checker work terminates its bounded sidecar when superseded. Before starting
 each optional phase, the coordinator drains pending events and skips that
 phase if a newer structural generation is already required.
 
-A structural refresh may return individual file rejections. `jscout index` and
-the watcher report every rejected path/stage/error and publish the indexable
-corpus as a successful, clean generation. Non-retryable read failures and
-deterministic parse rejections are subject-local: a whole-repository retry
-cannot repair binary media with a source-looking extension or a permanently
-protected file.
+A structural refresh may return individual file rejections. `jscout index`
+reports every rejected path/stage/error. The watcher reports full details once
+per distinct rejection set, reports once when the entire set clears, and keeps
+`rejected=N` in every refresh summary. Both publish the indexable corpus as a
+successful, clean generation. Non-retryable read failures and deterministic
+parse rejections are subject-local: a whole-repository retry cannot repair
+binary media with a source-looking extension or a permanently protected file.
 A later file event or periodic reconciliation naturally tries the path again.
 
 Read-error disposition is one explicit rule. Descriptor exhaustion,
