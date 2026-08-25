@@ -1,234 +1,220 @@
 # Structural extraction: entities, symbols, and graph edges
 
-Structural extraction is the part of jscout that turns each parsed JS/TS file into flat, source-local fact rows — symbols, imports, exports, references, member calls, event wiring, and typed "entity sites" — and then, in a separate pass, re-resolves those rows across the module graph into a keyed node/edge graph that retrieval traverses. The two halves are deliberately not the same pass: extraction is cached per file hash and knows nothing outside the file it is looking at, while projection is a wholesale rebuild that owns every node-key format, every confidence downgrade, and every cross-file resolution. This document enumerates what each visitor emits, what happens to TypeScript type information, and what the projected node and edge kinds actually are.
+Structural extraction turns one parsed JS/TS file into flat, source-local fact rows — symbols, imports, exports, references, member calls, event sites, entity sites — and writes them verbatim into SQLite. A later, separate pass reads those rows back out across the whole repository and re-resolves them into a keyed node/edge graph in `graph_nodes` and `resolved_edges`, attaching a confidence level and a provenance string to every edge it mints. The split exists because cross-file resolution and node-key formats change far more often than parsing does, and the two halves are versioned independently: `entity::EXTRACTION_VERSION` (`src/entity.rs:14`, currently `"5"`) forces a full reparse when bumped, while `structural::PROJECTION_VERSION` (`src/structural.rs:13`, currently `"11"`) only invalidates the disposable graph. TypeScript type information is erased from the runtime side of this pipeline at five specific points and re-extracted, deliberately, as a parallel documentary plane that can be read but never traversed as runtime behavior.
 
-## Two stages and why they are split
+## Stage one: three passes over one AST
 
-`graph::extract` (`src/graph.rs:67`) takes one `ParserReturn` plus one `Semantic` and returns a `FileGraph` (`src/graph.rs:50`) of flat rows. `structural::rebuild_projection` (`src/structural.rs:431`) reads those rows back out of SQLite and writes `graph_nodes`, `resolved_edges`, `entities`, `entity_occurrences`, and `entity_edges` (column definitions in [05-storage-schema.md](05-storage-schema.md)). The split follows the versioning: `EXTRACTION_VERSION` (`"5"`, `src/entity.rs:14`) invalidates file hashes and forces a reparse, whereas `PROJECTION_VERSION` (`"11"`, `src/structural.rs:12`) only invalidates the disposable graph. Changing a node-key format or a confidence rule therefore costs a projection rebuild, not a full reparse of the repo.
+`indexer::extract_file` (`src/indexer.rs:662`) parses the source once inside `parse::with_parsed` and calls `graph::extract(ret, semantic)` (`src/graph.rs:67`), which returns a `FileGraph` (`src/graph.rs:49`). `graph::extract` is not itself a `Visit` implementation. It does three things in a fixed order: runs the heuristic visitor first (`src/graph.rs:70`), drains oxc's `module_record` for imports and exports (`src/graph.rs:73-171`), and then walks the root scope's bindings for symbols and their resolved references (`src/graph.rs:238-309`). The entity visitor is invoked in between, at `src/graph.rs:172`, because it needs the export set the module-record drain just computed.
 
-The disposability is literal. `rebuild_projection` deletes exactly three tables inside `BEGIN IMMEDIATE` — `resolved_edges`, `graph_nodes`, `entities` (`src/structural.rs:447-449`). `entity_occurrences` and `entity_edges` disappear only through `ON DELETE CASCADE` off `entities` (`src/store.rs:434`, `src/store.rs:455`). Every canonical extraction table (`symbols`, `refs`, `imports`, `exports`, `contract_imports`, `contract_exports`, `member_calls`, `events`, `entity_sites`, `module_edges`) is untouched. On success the same transaction stamps `meta.snapshot` and `meta.projection_version`; any error rolls the whole thing back. With `JSCOUT_TIMING` set, each stage prints its elapsed time to stderr (`src/structural.rs:493-541`).
+The import drain forks every entry: each `import_entries` row becomes a `contract_imports` row unconditionally, and only `!entry.is_type` also becomes an `imports` row (`src/graph.rs:73-88`). The three export loops fork the same way — `local_export_entries` (93-121), `indirect_export_entries` (122-156), `star_export_entries` (157-171). The indirect loop additionally emits a `RefRow` with `kind: "reexport"` (`src/graph.rs:147-155`), which is how a barrel file's re-export becomes a traversable edge rather than a dangling name. Two export-local sets are accumulated: `exported_contract_locals` collects only from `local_export_entries` and only when `ExportLocalName::Name` matches, so `export default` contributes nothing (`src/graph.rs:99-106`); `exported_locals` takes the runtime subset and is then extended by CommonJS `module.exports` names at `src/graph.rs:189`. So the contract lists are a superset of the runtime lists for ES module syntax only — CommonJS bindings enter the runtime lists alone.
 
-Parsing happens in `parse::with_parsed` (`src/parse.rs:26`), which builds `Semantic` with `with_build_nodes(true)` (`src/parse.rs:46-48`) because reference classification walks AST ancestors and cannot do so without the node store. `source_type_for` (`src/parse.rs:9`) forces the additive JSX grammar on for every JavaScript source type while leaving TypeScript extension-strict.
+The binding walk iterates `scoping.get_bindings(root_scope_id())` (`src/graph.rs:231-236`). Root bindings only: nested functions, block locals, and closures never become symbol nodes. That is a real modelling loss, mitigated later — a reference inside a closure is attributed to the enclosing root declaration by `owner_at` (`src/structural.rs:2410`), which picks the smallest declaration span containing the byte offset. `SymbolRow` therefore carries two spans (`src/graph.rs:11-19`): `(start, end)` is the identifier, `(decl_start, decl_end)` is the whole declaration, and it is the declaration span that makes containment attribution work at all.
 
-## The three extraction passes
+The heuristic pass, `heur::extract` (`src/heur.rs:285`), is a genuine `Visit` (`src/heur.rs:125`) covering exactly what a checkerless graph cannot bind through the module record: `require` destructuring in `visit_variable_declarator` (126), `module.exports`/`exports.X` assignment in `visit_assignment_expression` (157-196), string-keyed event wiring matched against six `EMIT_METHODS` and seven `LISTEN_METHODS` (`src/heur.rs:79-95`, dispatched at 216-218), every static member call with six exact byte offsets (`src/heur.rs:32-52`, populated at 198-243), statically named `MethodDefinition`s in named classes (248-265), and `import()` with a static specifier (267-282). It needs `Semantic` for one question only: whether the receiver base identifier is unbound in the file's scope tree, answered at `src/heur.rs:204-208`, which is what separates a genuine global (`console`, a CommonJS `module`) from a parameter that happens to share the name. Its class methods are the single exception to root-scope-only symbols — `src/graph.rs:211-222` turns each into a `SymbolRow` with `kind: "method:{Class}"` and `scope_chain: {Class}`.
 
-`graph::extract` composes three sources of facts over the same program. Look at how little of it is a visitor: the import/export half is read straight out of oxc's precomputed `module_record`, and the symbol half walks `Semantic`'s scoping table rather than the AST.
+The third pass, `entity::extract` (`src/entity.rs:1073`), runs `EntityVisitor` over the program with the contract-superset export set. A fourth visitor, `TypeReferenceVisitor` (`src/entity.rs:64`), runs nested inside it over type annotations and type declarations.
+
+The diagram below shows how the three passes feed one `FileGraph`. Note that `HEUR` runs before the module-record drain, that the type fork produces two parallel import/export lists, and that `ECL` — the contract-superset export set — is what gates entity extraction.
 
 ```mermaid
 flowchart TD
-    SRC["Source file bytes"] --> PARSE["parse::with_parsed"]
-    PARSE --> REC["oxc module_record"]
-    PARSE --> SEM["oxc Semantic + Scoping"]
-    PARSE --> PROG["oxc Program AST"]
-    REC --> GX["graph::extract"]
-    SEM --> GX
-    PROG --> HEUR["heur::extract HeurVisitor"]
-    PROG --> ENT["entity::extract EntityVisitor"]
-    ENT --> TRV["TypeReferenceVisitor"]
-    HEUR --> GX
-    ENT --> GX
-    GX --> IMP["imports and exports runtime plane"]
-    GX --> CIMP["contract_imports and contract_exports all bindings"]
-    GX --> SYM["symbols root scope plus class methods"]
-    GX --> REFS["refs call render extend use reexport"]
-    HEUR --> MC["member_calls with six byte spans"]
-    HEUR --> EV["events emit and listen"]
-    ENT --> ES["entity_sites runtime general contract"]
-    GX --> FG["FileGraph"]
-    FG --> INS["indexer::insert_file"]
+  SRC["Source file"] --> PARSE["parse::with_parsed"]
+  PARSE --> AST["oxc Program AST"]
+  PARSE --> REC["oxc ModuleRecord"]
+  PARSE --> SEM["oxc Semantic scoping"]
+  AST --> HEUR["heur::extract - Visit"]
+  SEM --> HEUR
+  REC --> FORK["import and export drain, type fork"]
+  FORK --> CONTRACT["contract_imports + contract_exports"]
+  FORK --> RUNTIME["imports + exports"]
+  FORK --> ECL["exported_contract_locals"]
+  FORK --> REEX["RefRow kind reexport"]
+  ECL --> ENT["entity::extract - EntityVisitor"]
+  AST --> ENT
+  ENT --> TRV["TypeReferenceVisitor - nested"]
+  TRV --> ES["entity_sites"]
+  ENT --> ES
+  SEM --> BIND["root-scope binding walk"]
+  BIND --> SYM["SymbolRow"]
+  BIND --> REF["RefRow, confidence certain"]
+  HEUR --> SYM
+  HEUR --> RUNTIME
+  HEUR --> REF
+  HEUR --> MC["member_calls, six byte offsets"]
+  HEUR --> EV["events"]
+  SYM --> FG["FileGraph"]
+  REF --> FG
+  REEX --> FG
+  RUNTIME --> FG
+  CONTRACT --> FG
+  MC --> FG
+  EV --> FG
+  ES --> FG
+  FG --> DB["SQLite canonical tables"]
 ```
 
-`HeurVisitor` and `EntityVisitor` are the only true `Visit` implementations; `TRV` is a third, run nested inside `EntityVisitor` on type annotations and type declarations. `SYM` has two disjoint feeders: the scoping walk at `src/graph.rs:230-260` and `heur.methods` at `src/graph.rs:211-222`. And `IMP` and `CIMP` are two separate outputs of the same loop, not a filter applied later.
-
-## Symbols: root scope, plus class methods, minus imports
-
-Symbols come from `scoping.get_bindings(root_scope_id())` (`src/graph.rs:230-236`) — module-level bindings only. Nested functions, block locals, and closures never become symbol nodes; references to them are attributed to the enclosing root declaration by `owner_at`. Two exclusions apply inside that walk, and both live under `if !is_import` (`src/graph.rs:243`): import bindings never produce a `SymbolRow` at all, and among the rest, any binding whose `SymbolFlags` intersect `TypeAlias | Interface` is skipped (`src/graph.rs:245`). `symbol_kind` (`src/graph.rs:313`) then flattens the remaining flags to one of `class`, `function`, `const`, `var`.
-
-Class methods are the other, larger source of symbols. `HeurVisitor::visit_class` (`src/heur.rs:248`) emits a `MethodDef` for every `MethodDefinition` with a statically resolvable key, and `src/graph.rs:211-222` turns each into a `SymbolRow` with `kind: "method:{Class}"` and `scope_chain` set to the class name. That `scope_chain` is what keeps `UserService.save` and `OrderService.save` distinct nodes, and these rows — not the root bindings — are what member-call candidates and checker enrichments resolve onto.
-
-`SymbolRow` (`src/graph.rs:11`) carries two spans: `start`/`end` for the identifier and `decl_start`/`decl_end` for the whole declaration. The declaration span is the containment span `owner_at` (`src/structural.rs:2352`) uses to attribute an arbitrary byte offset to a symbol, picking the smallest enclosing span. The interval is half-open (`decl_start <= offset < decl_end`), and `refs` stores only a start offset, so a reference sitting exactly at `decl_end` attributes to the enclosing scope rather than the symbol.
-
-Symbol identity is minted at projection time, not extraction time. `load_symbols` (`src/structural.rs:598`) sorts by `(path, scope, name, decl_start, id)` and assigns a 1-based ordinal per `(file_id, scope, name)`, producing `sym:{path}#{scope}::{name}@{ordinal}` (`src/structural.rs:3661`). `parse_symbol_key` (`src/structural.rs:3665`) reverses the format so a stale anchor from an earlier snapshot can be re-resolved by `(path, scope, name)` instead of erroring. The cost of positional ordinals is real: inserting a second same-named declaration earlier in the same file and scope renumbers the later one, silently changing its key across snapshots.
-
-## Reference classification
-
-Every resolved reference to a root binding becomes a `RefRow` (`src/graph.rs:39`) unless `r.flags().is_type_only()` (`src/graph.rs:268`). `classify_reference` (`src/graph.rs:327`) walks up to five ancestors and returns the first match: a JSX opening or closing element yields `render`, a `CallExpression`/`NewExpression` yields `call` when the callee span contains the reference and `use` otherwise, a `Class` whose `super_class` contains the reference yields `extend`, and the default is `use`. A `StaticMemberExpression` at depth 0 whose object is the reference also records the property name, which `src/graph.rs:276-283` uses to refine a namespace import: `ns.foo()` records `target_name = "foo"` with detail `via namespace ns` instead of the useless `*`.
-
-Two more `RefRow` sources exist outside the binding walk. Indirect re-exports emit a `reexport` row (`src/graph.rs:147-155`), and every static `import()` with a literal or fully-static template specifier emits a `use` row with detail `dynamic import` (`src/graph.rs:197-208`). All `RefRow`s are written at confidence `certain`; downgrades happen at projection.
+Every `RefRow` that leaves `BIND` or `HEUR` carries `confidence: "certain"` (the literals are at `src/graph.rs:150, 201, 287, 299`; the field and its comment are at `src/graph.rs:43`). This is not a claim that every reference is correct — it is the statement that extraction never guesses. All downgrading happens at projection, from cross-file evidence extraction does not have.
 
 ## What happens to TypeScript type information
 
-Type information is not deleted. It is forked into a parallel documentary plane that is stored, resolved, and projected separately, and that no workflow traversal will follow. Seven mechanisms implement this.
+Erasure is applied at four points in `graph.rs` and one in the export fork, and it is narrower than it first looks.
 
-| # | Mechanism | Where | Effect |
-|---|---|---|---|
-| 1 | Type symbols dropped | `src/graph.rs:245` | An `interface` or `type` alias never becomes a `symbol` node |
-| 2 | Type-position references dropped | `src/graph.rs:268` | `let a: Foo` produces no runtime edge |
-| 3 | Imports/exports forked | `src/graph.rs:84-87`, `113-121`, `142-146`, `167-170` | Every entry lands in `contract_*`; only `!entry.is_type` also lands in the runtime list |
-| 4 | Module edge labeled | `src/indexer.rs:929-945` | `type_only = max(is_runtime) = 0` over a UNION of runtime and contract-only request sources |
-| 5 | Type structure re-extracted | `src/entity.rs:831`, `855`, `879`, `209-277` | Declarations and exported signatures emit `plane: "contract"` sites |
-| 6 | Contract export chains resolved separately | `src/query.rs:147`, `src/query.rs:17-22` | `resolve_contract_export_traced` reads `contract_exports`; `resolve_export_traced` reads `exports` |
-| 7 | Contract edges inert for workflow | `src/structural.rs:2942`, `2946`, `2960` | No contract kind appears in any `workflow_*_kind` match |
+| Site | What is erased | What survives |
+|---|---|---|
+| `src/graph.rs:245-247` | Root bindings whose flags intersect `SymbolFlags::TypeAlias \| SymbolFlags::Interface` produce no `SymbolRow` | `enum`, `namespace`, and ambient `declare const/function/class` bindings still produce runtime `SymbolRow`s |
+| `src/graph.rs:268-270` | References with `is_type_only()` produce no `RefRow` | Value-position references to a type-adjacent symbol |
+| `src/graph.rs:294` | An import binding with no module-record entry (a type import) emits nothing at all — the third match arm | — |
+| `src/graph.rs:73-88, 108-121, 145-156, 167-170` | `entry.is_type` rows are kept out of `imports`/`exports` | The same rows land in `contract_imports`/`contract_exports` |
+| `src/graph.rs:99-106, 172` | — | `exported_contract_locals` is the type-inclusive export set handed to `entity::extract`, so a type-only export still enables exported-signature contract extraction |
 
-Mechanism 4 is the subtle one. `src/indexer.rs` builds a UNION (over the request resolution described in [02-ingestion.md](02-ingestion.md)) where `imports`, `exports.from_request`, and `refs.target_request` contribute `is_runtime = 1` and `contract_imports`, `contract_exports.from_request` contribute `0`; a request reachable only through type positions gets `type_only = 1`. `project_module_edges` then emits kind `imports_types` instead of `import` (`src/structural.rs:805`) and `imports_package_types` instead of `imports_package` (`src/structural.rs:819-823`), with relation weight 0.6 rather than 0.75 (`src/structural.rs:3311-3312`). The tradeoff is stated plainly by the query's shape: adding a new runtime request source and forgetting the UNION would silently demote real runtime dependencies to the type plane.
+The filter at 245-247 sits inside the `if !is_import` branch, and it names only two flags. A TypeScript `enum` therefore appears twice in the model: as a runtime symbol node (because `enum` is a value at runtime) and as a `contract`-plane declaration site (`src/entity.rs:879-893`). That asymmetry is correct — a `const enum` is erased, a plain `enum` is not — but the code does not distinguish them on the graph side.
 
-The fork at `src/graph.rs:84-87` makes `contract_imports` a superset of `imports` for ES module syntax, but not in general: CommonJS `require()` bindings (`src/graph.rs:180-187`) go into `g.imports` only and `module.exports` / `exports.X` shapes (`src/graph.rs:188-196`) into `g.exports` only, so in a CJS file the runtime plane contains entries the contract plane does not.
+The contract plane re-extracts the erased structure as a parallel fact set. `TypeReferenceVisitor` keeps it honest in two ways. It maintains a stack of bound type-parameter names, pushed and popped around function types (`src/entity.rs:82-86`), constructor types (88-92), and mapped types (94-98), with `is_bound` scanning the stack in reverse (127-133), so a generic `T` is never recorded as a reference to some unrelated declaration named `T`. And it drops 27 builtin wrappers — `Array`, `Promise`, `Record`, `Pick`, `Awaited`, `Map`, `Date`, `RegExp`, and the rest — at `src/entity.rs:1113-1144`, so `Promise<User>` yields one reference to `User` rather than two.
 
-`TypeReferenceVisitor` (`src/entity.rs:64`) is what keeps the contract plane from filling with noise. It maintains a stack of bound type-parameter names, pushed and popped around function types, constructor types, mapped types, and the declaration's own type parameters (`src/entity.rs:116-125`), and skips any `TSTypeReference` whose name is currently bound or is one of the 27 builtin wrappers in `is_builtin_contract_wrapper` (`src/entity.rs:1113` — `Array`, `Promise`, `Record`, `Partial`, `Pick`, `Omit`, `Map`, `Set`, `Date`, `Error`, `RegExp`, and so on). `Page<T>` therefore yields `Page` and any concrete argument, but never `T` or `Promise`. A leak in the push/pop discipline would erase legitimate references sharing a parameter name. Both `visit_ts_interface_declaration` and `visit_ts_type_alias_declaration` walk their subtree twice — once with a fresh collector, once with `self` (`src/entity.rs:842-857`, `866-881`) — which doubles work on deeply nested type structures.
+Quarantine is enforced on the projection side. `project_contract_site` stamps `"documentary": true` into the entity meta, the occurrence detail, and the graph edge detail (`src/structural.rs:1528, 1561, 1604`). No contract edge kind appears in `workflow_direct_kind` (`src/structural.rs:3013`), `workflow_general_association_kind` (3017), or `workflow_runtime_boundary_kind` (3031), so workflow traversal never selects one as a step. That is the step-selection guarantee only; contract edges still count toward `graph_degree` (`src/structural.rs:3351`), which is exactly why the workflow code forces `hub_floor = 1.0` with a comment stating that symbol degree includes documentary and file-projection edges (`src/structural.rs:2733-2735`). Contract edges remain fully visible to `neighborhood` and `paths`.
 
-## Entity sites: the recognizer inventory
+## Entity site inventory
 
-`EntityVisitor` (`src/entity.rs:47`) visits `VariableDeclarator`, `Class`, `ObjectExpression`, `CallExpression`, `StaticMemberExpression`, `ComputedMemberExpression`, `NewExpression`, `Decorator`, `Function`, and the three TS declaration nodes. Each recognizer is shape-specific rather than general. Every emitted site is an `EntitySite` (`src/entity.rs:17`) carrying plane, entity type, role, identity kind, identity name and byte offset, optional target name and offset, span, extractor, provenance, and confidence.
+`EntitySite` (`src/entity.rs:17-31`) is a flat record carrying `plane`, `entity_type`, `role`, `identity_kind`, an identity name that is raw source text rather than a key, an optional target name, a span, and the `extractor`/`provenance`/`confidence` triple that names which recognizer fired and how far it can be trusted. `entity_sites` CHECK-constrains `plane` to `runtime|contract|general`, `identity_kind` to `literal|reference`, and `confidence` to `certain|likely|possible` (`src/store.rs:405, 408, 415`). The recognizers are deliberately narrow; each names a framework or convention.
 
-| Plane | Entity type | Role | Extractor | Provenance | Conf. | Site |
-|---|---|---|---|---|---|---|
-| runtime | `registry` | `registered_handler` | `twenty-define-logic-function` | `framework-pattern` | likely | `src/entity.rs:324` |
-| runtime | `registry` | `dispatch_site` | `twenty-logic-function-dispatch` | `framework-field` | likely | `src/entity.rs:937` |
-| runtime | `data_lifecycle` | `lifecycle_listener` | `twenty-database-event-trigger` | `framework-pattern` | likely | `src/entity.rs:352` |
-| runtime | `data_lifecycle` | `lifecycle_producer` | `graphql-mutation-lifecycle` | `naming-convention` | likely | `src/entity.rs:390` |
-| runtime | `job` | `job_producer` / `job_handler` | `queue-cron-call` | `runtime-api-pattern` | likely | `src/entity.rs:458` |
-| runtime | `job` | `job_handler` | `queue-worker-constructor` | `runtime-api-pattern` | likely | `src/entity.rs:1026` |
-| runtime | `job` | `job_handler` | `job-handler-decorator` | `decorator-pattern` | likely | `src/entity.rs:761` |
-| runtime | `di_token` | `provider` | `di-provider-object` | `provider-object-pattern` | likely | `src/entity.rs:724` |
-| runtime | `di_token` | `injection_site` | `di-inject-decorator` | `decorator-pattern` | likely | `src/entity.rs:760` |
-| general | `route` | `route_handler` | `http-router-call` | `routing-api-pattern` | likely | `src/entity.rs:498` |
-| general | `route` | `route_handler` | `http-route-decorator` | `routing-decorator-pattern` | likely | `src/entity.rs:666` |
-| general | `graphql_operation` | `graphql_operation` | `graphql-client-operation` | `graphql-api-pattern` | likely | `src/entity.rs:525` |
-| general | `graphql_operation` | `graphql_handler` | `graphql-operation-decorator` | `graphql-decorator-pattern` | likely | `src/entity.rs:691` |
-| general | `environment_variable` | `environment_read` | `process-env-member` / `process-env-computed-member` | `environment-syntax` | likely | `src/entity.rs:974`, `994` |
-| general | `environment_variable` | `environment_read` | `environment-api-call` | `environment-api-pattern` | likely | `src/entity.rs:547` |
-| general | `config_key` | `config_read` | `configuration-api-call` | `configuration-api-pattern` | likely | `src/entity.rs:566` |
-| general | `feature_flag` | `feature_flag_check` | `feature-flag-call` | `feature-flag-api-pattern` | likely | `src/entity.rs:586` |
-| general | `database_resource` | `database_read` / `database_write` / `database_acquire` | `database-api-call` | `database-api-pattern` | likely | `src/entity.rs:601` |
-| general | `external_host` | `external_host_call` | `static-url-call` | `network-api-pattern` | likely | `src/entity.rs:624` |
-| contract | `interface` / `type_alias` / `enum` | `contract_declaration` | `contract-declaration` | `type-declaration` | certain | `src/entity.rs:833`, `857`, `881` |
-| contract | `schema` | `contract_declaration` | `contract-declaration` | `validation-schema-pattern` | likely | `src/entity.rs:800` |
-| contract | `schema` | `contract_declaration` | `contract-declaration` | `dto-schema-pattern` | likely | `src/entity.rs:901` |
-| contract | `reference` | `contract_reference` / `parameter_contract` / `return_contract` | `typescript-contract-reference` | `type-syntax` | certain | `src/entity.rs:190-205` |
-| contract | `decorator` | `decorator_use` | `decorator-contract` | `decorator-syntax` | certain | `src/entity.rs:1048` |
+Runtime plane — every one is `likely`:
 
-Confidence is fixed at the push helper rather than per recognizer. `push_general` hardcodes `"likely"` (`src/entity.rs:150`); `push_contract_references` hardcodes `"certain"` with provenance `type-syntax` (`src/entity.rs:201-203`) because the syntax alone proves a type reference; `push_contract_declaration` takes a `(provenance, confidence)` pair so TS declarations are `certain` while inferred zod/DTO schemas are `likely`. Runtime-plane sites are hand-written `"likely"` at each site.
+| entity_type | role | extractor | provenance | Site |
+|---|---|---|---|---|
+| `registry` | `registered_handler` | `twenty-define-logic-function` | `framework-pattern` | `src/entity.rs:325` |
+| `registry` | `dispatch_site` | `twenty-logic-function-dispatch` | `framework-field` | `src/entity.rs:938` |
+| `data_lifecycle` | `lifecycle_listener` | `twenty-database-event-trigger` | `framework-pattern` | `src/entity.rs:353` |
+| `data_lifecycle` | `lifecycle_producer` | `graphql-mutation-lifecycle` | `naming-convention` | `src/entity.rs:392` |
+| `job` | `job_producer` or `job_handler` | `queue-cron-call` | `runtime-api-pattern` | `src/entity.rs:458` |
+| `job` | `job_handler` | `job-handler-decorator` | `decorator-pattern` | `src/entity.rs:767` |
+| `job` | `job_handler` | `queue-worker-constructor` | `runtime-api-pattern` | `src/entity.rs:1027` |
+| `di_token` | `provider` | `di-provider-object` | `provider-object-pattern` | `src/entity.rs:726` |
+| `di_token` | `injection_site` | `di-inject-decorator` | `decorator-pattern` | `src/entity.rs:767` |
 
-Identity comes from `EntityVisitor::identity` (`src/entity.rs:279`): an identifier reference, a `Foo.name` member unwrapped to `Foo`, or a static string. `static_string` (`src/entity.rs:1529`) folds literals, fully static template literals, and identifiers found in a file-global, single-pass, non-scope-aware `static_strings` map. The code says so at `src/entity.rs:49-51` and holds affected sites at `likely` for exactly that reason: two same-named constants in different scopes collide with last-write-wins, and a constant used before its declarator is visited resolves to nothing.
+General plane — all `likely`, because `push_general` hardcodes it (`src/entity.rs:150`):
 
-Gating varies sharply between recognizers. `extract_job_call` (`src/entity.rs:414`) accepts only `add`/`addBulk`/`addCron`/`enqueue`/`publish`/`schedule` and additionally requires the lowercased receiver path to contain one of `queue`, `job`, `worker`, `cron`, `schedul`, `producer`. `is_general_callee` (`src/entity.rs:1348`) is the opposite: it admits every HTTP verb plus roughly thirty common method names, so `extract_general_call` runs its six pattern checks on a large fraction of all member calls in a repo, with real discrimination deferred to substring checks on the callee path (`is_router_holder`, `is_config_api_path`). `database_call` (`src/entity.rs:1399`) layers holder heuristics in order — a `*Repository`/`*Repo`/`*Model` segment first, then the segment after a database API segment, then the first argument only when the holder is literally `db`/`database`/`prisma` — so adding a holder shape can silently change which resource name wins.
+| entity_type | role | extractor | provenance | Site |
+|---|---|---|---|---|
+| `route` | `route_handler` | `http-router-call` | `routing-api-pattern` | `src/entity.rs:499` |
+| `route` | `route_handler` | `http-route-decorator` | `routing-decorator-pattern` | `src/entity.rs:668` |
+| `graphql_operation` | `graphql_operation` | `graphql-client-operation` | `graphql-api-pattern` | `src/entity.rs:526` |
+| `graphql_operation` | `graphql_handler` | `graphql-operation-decorator` | `graphql-decorator-pattern` | `src/entity.rs:692` |
+| `environment_variable` | `environment_read` | `environment-api-call` | `environment-api-pattern` | `src/entity.rs:548` |
+| `environment_variable` | `environment_read` | `process-env-member` | `environment-syntax` | `src/entity.rs:975` |
+| `environment_variable` | `environment_read` | `process-env-computed-member` | `environment-syntax` | `src/entity.rs:995` |
+| `config_key` | `config_read` | `configuration-api-call` | `configuration-api-pattern` | `src/entity.rs:567` |
+| `feature_flag` | `feature_flag_check` | `feature-flag-call` | `feature-flag-api-pattern` | `src/entity.rs:587` |
+| `database_resource` | `database_read` / `database_write` / `database_acquire` | `database-api-call` | `database-api-pattern` | `src/entity.rs:602` |
+| `external_host` | `external_host_call` | `static-url-call` | `network-api-pattern` | `src/entity.rs:625` |
 
-## The heuristic tier
+Contract plane:
 
-`heur::extract` (`src/heur.rs:285`) covers what a checkerless runtime graph cannot bind through `module_record`.
+| entity_type | role | extractor | provenance | confidence | Site |
+|---|---|---|---|---|---|
+| `interface` | `contract_declaration` | `contract-declaration` | `type-declaration` | `certain` | `src/entity.rs:833` |
+| `type_alias` | `contract_declaration` | `contract-declaration` | `type-declaration` | `certain` | `src/entity.rs:857` |
+| `enum` | `contract_declaration` | `contract-declaration` | `type-declaration` | `certain` | `src/entity.rs:881` |
+| `schema` | `contract_declaration` | `contract-declaration` | `validation-schema-pattern` | `likely` | `src/entity.rs:800` |
+| `schema` | `contract_declaration` | `contract-declaration` | `dto-schema-pattern` | `likely` | `src/entity.rs:901` |
+| `reference` | `contract_reference` / `parameter_contract` / `return_contract` | `typescript-contract-reference` | `type-syntax` | `certain` | `src/entity.rs:190-205` |
+| `decorator` | `decorator_use` | `decorator-contract` | `decorator-syntax` | `certain` | `src/entity.rs:1049` |
 
-| Output | Shape recognized | Where | Consumed as |
-|---|---|---|---|
-| `requires` | `const x = require('m')`, `const {a} = require('m')` | `src/heur.rs:126-155` | `g.imports` rows |
-| `cjs_exports` | `module.exports.X =`, `exports.X =`, `module.exports = {…}` | `src/heur.rs:157-196` | `g.exports` rows |
-| `events` | first argument is a static string and the method is in `EMIT_METHODS` or `LISTEN_METHODS` | `src/heur.rs:79-95`, `215-231` | `events` table |
-| `member_calls` | every `StaticMemberExpression` call | `src/heur.rs:232-243` | `member_calls` table |
-| `dynamic_imports` | `import('m')` with a static specifier | `src/heur.rs:267-282` | `refs` rows kind `use` |
-| `methods` | statically named `MethodDefinition` in a named class | `src/heur.rs:248-265` | `symbols` rows kind `method:{Class}` |
+`push_contract_references` hardcodes `certain`/`type-syntax` (`src/entity.rs:202-203`) because a type reference is proven by syntax alone; `push_contract_declaration` takes trust as a parameter (`src/entity.rs:161, 176-177`) so type declarations are `certain` while inferred schema patterns are `likely`.
 
-`MemberCall` (`src/heur.rs:32`) records six exact byte offsets — call start/end, receiver start/end, property start/end — because those are the join key the TypeScript checker sidecar uses to attach a precise type fact to one occurrence. `receiver_unbound` is computed only for bare-identifier receivers (`src/heur.rs:203-210`); `this.x()` and chained receivers always record `false`, which is not the same as "bound". `span_of` at `src/heur.rs:307` is dead code, explicitly marked `#[allow(unused)]`.
+Two recognizer limits are worth stating plainly. `EntityVisitor.static_strings` is file-global and single-pass, populated in `visit_variable_declarator` (`src/entity.rs:790-793`), and the comment at `src/entity.rs:49-51` says so: a constant declared *after* its use site does not fold, so `router.get(ROUTE, h)` above `const ROUTE = '/x'` produces no route site. And `is_general_callee` (`src/entity.rs:1348`) admits every HTTP method name, so `config.get('k')`, `router.get('/x', h)`, and `repo.find(...)` all enter `extract_general_call` and are separated only by receiver-path guards (`is_router_holder` 1242, `is_config_api_path` 1279, `database_call` 1399). One call expression can legitimately emit more than one general site.
 
-## Projection: node kinds and edge kinds
+## Stage two: projection
 
-Projection runs six stages in a fixed order, and the order is load-bearing rather than cosmetic. `project_entity_callers` queries `resolved_edges WHERE kind='call'` (`src/structural.rs:1872-1875`), so it only produces anything because `project_references` already ran in the same transaction.
+`rebuild_projection_with_timing` (`src/structural.rs:474`) does its three reads *before* opening a transaction — `load_files`, `ModuleGraph::load_with_contracts`, `load_symbols` at `src/structural.rs:479-481` — then `BEGIN IMMEDIATE` and deletes exactly three tables: `resolved_edges`, `graph_nodes`, `entities` (`src/structural.rs:492-496`). Occurrences and entity edges disappear by foreign-key cascade. It inserts file nodes and symbol nodes (503-531), runs six stages, upserts `meta.snapshot` and `meta.projection_version` (589-598), and commits, or rolls the whole thing back on any stage error (601-607). Note what it does *not* write: `meta.resolution_hash` is upserted by the indexer, outside this transaction, at `src/indexer.rs:567-571`.
+
+The diagram shows the six stages and the one ordering dependency that makes the order load-bearing.
 
 ```mermaid
-flowchart LR
-    ME["module_edges"] --> PM["project_module_edges"]
-    RF["refs"] --> PR["project_references"]
-    ES["entity_sites"] --> PE["project_entities"]
-    ES --> PC["project_contract_site"]
-    MC["member_calls"] --> PMC["project_member_calls"]
-    CE["checker_enrichments"] --> PCE["project_checker_enrichments"]
-    EV["events"] --> PEV["project_events"]
-    PM --> RE["resolved_edges"]
-    PR --> RE
-    PE --> RE
-    PE --> PEC["project_entity_callers"]
-    PEC --> RE
-    PC --> RE
-    PMC --> RE
-    PCE --> RE
-    PEV --> RE
-    PM --> GN["graph_nodes"]
-    PE --> GN
-    PC --> GN
-    PMC --> GN
-    PEV --> GN
-    PE --> ENT["entities and occurrences and entity_edges"]
-    PC --> ENT
-    MG["query::ModuleGraph"] --> PR
-    MG --> PE
-    MG --> PC
+flowchart TD
+  READ["Reads before BEGIN: files, ModuleGraph, load_symbols"] --> TX["BEGIN IMMEDIATE, DELETE 3 tables"]
+  TX --> NODES["Insert file nodes and symbol nodes"]
+  NODES --> S1["Stage 1 project_module_edges"]
+  S1 --> S2["Stage 2 project_references"]
+  S2 --> S3["Stage 3 project_entities"]
+  S3 --> S4["Stage 4 project_member_calls"]
+  S4 --> S5["Stage 5 project_checker_enrichments"]
+  S5 --> S6["Stage 6 project_events"]
+  S6 --> META["Upsert meta.snapshot and meta.projection_version"]
+  META --> COMMIT["COMMIT or ROLLBACK"]
+  S2 --> CALLEDGES["resolved_edges kind=call"]
+  S3 --> PEC["project_entity_callers"]
+  CALLEDGES --> PEC
+  PEC --> VIA["produces_lifecycle_via / produces_job_via"]
+  S3 --> CAT["ContractCatalog::build"]
+  CAT --> PCS["project_contract_site"]
 ```
 
-`ModuleGraph` feeds three of the stages and nothing else; it is loaded once with `load_with_contracts` (`src/query.rs:31`) so both export planes are in memory. `project_entity_callers` hangs off `project_entities` rather than being a stage of its own, which is why it can read the `call` edges the earlier stage wrote. `project_checker_enrichments` reads `graph_nodes` in its join, so it must run after the nodes exist.
+`PEC` is the dependency: `project_entity_callers` (`src/structural.rs:1912`) queries `resolved_edges WHERE dst_key=?1 AND kind='call'` (1922-1927) to collapse a producer helper into `produces_lifecycle_via`/`produces_job_via` edges from each of its callers straight to the entity. It finds anything only because stage 2 already wrote the call edges into the same transaction. Reorder the stages and the two-hop worker recall silently disappears; the test at `src/structural/tests.rs:346` pins it.
 
-Node keys are all minted in `src/structural.rs`:
+Symbol identity is minted here, not at extraction. `load_symbols` (`src/structural.rs:644`) re-sorts raw rows by `(path, scope, name, decl_start, id)` (664-668) — path, not `file_id`, so rowids never leak into identity — and assigns a 1-based ordinal per `(file_id, scope, name)` (671-677), producing `sym:{path}#{scope}::{name}@{ordinal}` (`symbol_key`, `src/structural.rs:3737`). `parse_symbol_key` (3741) reverses it so a stale anchor can be re-parsed and re-resolved. The tradeoff is positional: inserting a second same-named symbol earlier in a file shifts the ordinals of later ones, so an anchor can silently rebind — mitigated by `expected_snapshot` and the `"re-resolved"` status, not eliminated.
 
-| Node kind | Key format | Where |
+## Node and edge inventories
+
+Node kinds, exhaustive:
+
+| Node kind | Key format | Minted at |
 |---|---|---|
-| `file` | `file:{path}` | `src/structural.rs:3561` |
-| `symbol` | `sym:{path}#{scope}::{name}@{ordinal}` | `src/structural.rs:3661` |
-| `package` | `pkg:{name}` or `pkg:{name}@{version}#{digest8}` | `src/structural.rs:3565-3577` |
-| `entity` | `entity:{type}:{name}` (literal) or `entity:{type}:ref-{digest16}` (reference) | `src/structural.rs:3587`, `3634` |
-| `contract` | `contract:{type}:{path}#{name}`, `…:ref-{digest16}`, `…:external:{request}#{name}`, `…:unresolved:{request}#{name}` | `src/structural.rs:3591`, `3599`, `3614`, `3622` |
-| `member_hub` | `member:unknown:{prop}` | `src/structural.rs:3583` |
-| `event_hub` | `event:unknown:{name}` | `src/structural.rs:3579` |
-| `event_site` | `event-site:{path}:{event_id}` | `src/structural.rs:2310` |
+| `file` | `file:{path}` | `src/structural.rs:506`, key at 3637 |
+| `symbol` | `sym:{path}#{scope}::{name}@{ordinal}` | 516, key at 3737 |
+| `package` (dependency instance) | `pkg:{name}@{version}#{digest8}` | 774, key at 3645 |
+| `package` (bare hub) | `pkg:{name}` | 825, key at 3641 |
+| `entity` | `entity:{type}:{name}` or `entity:{type}:ref-{digest16}` | 1177, keys at 3663 / 3710 |
+| `contract` | `contract:{type}:{path}#{name}`, `…:ref-{digest16}`, `…:external:{request}#{name}`, `…:unresolved:{request}#{name}` | 1546, keys at 3667, 3675, 3690, 3698 |
+| `member_hub` | `member:unknown:{prop}` | 2022, key at 3659 |
+| `event_hub` | `event:unknown:{name}` | 2355, key at 3655 |
+| `event_site` | `event-site:{path}:{event_id}` | 2369, formatted inline at 2368 |
 
-Literal entity keys are repo-global by design, so a job named `email` enqueued in two unrelated packages collapses into one node — deliberate for cross-file joining, surprising in a monorepo. Reference keys digest the resolved target set, falling back to `{path}\0{name}` when nothing resolved (`src/structural.rs:3634-3646`), which makes the fallback key per-file rather than global.
+`encode_key_component` (`src/structural.rs:3725`) percent-escapes every byte outside `[A-Za-z0-9._\-/@]`, so the `#`, `:` and `@` separators stay unambiguous. Literal-identity entities key on the name; reference-identity entities key on a blake3 of the joined resolved target keys, falling back to `{path}\0{name}` when nothing resolved (`reference_entity_key`, `src/structural.rs:3710-3723`). That collapse is the point of the plane — two dispatch sites naming the same imported symbol become one entity so the producer and the handler meet at a shared node — and its cost is that unresolved references never join across files, and that no human can read a target off the key.
 
-The full edge inventory, with the ranking weight each kind carries in `relation_weight` (`src/structural.rs:3291`):
+Edge kinds, exhaustive, by stage:
 
-| Kind | Source → target | Emitted by | Weight |
+| Stage | Kind | Direction | Confidence / provenance |
 |---|---|---|---|
-| `call`, `render`, `extend` | symbol/file → symbol/file/package | `project_references` | 1.0 |
-| `reexport` / `use` | symbol/file → symbol/file/package | `project_references` | 0.75 / 0.5 (default) |
-| `import` / `imports_types` | file → file/package hub | `project_module_edges` | 0.75 / 0.6 |
-| `imports_package` / `imports_package_types` | file → package instance hub | `project_module_edges` | 0.5 / 0.6 |
-| `contains_module` | package hub → file | `project_module_edges` | 0.5 |
-| `dispatches` | symbol → entity | `project_entities` | 1.0 |
-| `registered_handler` | entity → symbol | `project_entities` | 1.0 |
-| `produces_lifecycle` / `produces_lifecycle_via` | symbol → entity / caller → entity | `project_entities` / `project_entity_callers` | 1.0 |
-| `lifecycle_listener` | entity → symbol | `project_entities` | 1.0 |
-| `produces_job` / `produces_job_via` | symbol → entity / caller → entity | `project_entities` / `project_entity_callers` | 1.0 |
-| `job_handler` | entity → symbol | `project_entities` | 1.0 |
-| `injects` / `provides` | symbol → entity / entity → symbol | `project_entities` | 1.0 |
-| `handles_route` / `handles_graphql` | entity → symbol | `project_entities` | 1.0 |
-| `invokes_graphql` | symbol → entity | `project_entities` | 0.9 |
-| `reads_resource` / `writes_resource` | symbol → entity | `project_entities` | 0.9 |
-| `acquires_resource`, `reads_env`, `reads_config`, `checks_flag`, `calls_host` | symbol → entity | `project_entities` | 0.8 |
-| `declares_contract` | file → contract | `project_contract_site` | 0.55 |
-| `accepts_contract` / `returns_contract` / `references_contract` | symbol or contract → contract | `project_contract_site` | 0.65 |
-| `decorated_by` | symbol → contract | `project_contract_site` | 0.7 |
-| `member_call` | symbol/file → member hub, or symbol → symbol (checker) | `project_member_calls`, `project_checker_enrichments` | 0.9 |
-| `member_candidate` | member hub → symbol | `project_member_calls` | 0.9 |
-| `contains_event` | file → event site | `project_events` | 0.6 |
-| `emits` / `listens` | site → hub / hub → site | `project_events` | 0.7 |
+| 1 | `contains_module` | package instance → file | `certain` / `dependency-index` (`src/structural.rs:800-810`) |
+| 1 | `import`, `imports_types` | file → file or package hub | 6-way table below (`src/structural.rs:849-859`) |
+| 1 | `imports_package`, `imports_package_types` | file → package instance | same 6-way table (`src/structural.rs:864-878`) |
+| 2 | `call`, `render`, `extend`, `use`, `reexport` | symbol or file → symbol or package | `semantic+resolver`, `semantic+resolver-inferred`, or `semantic+resolver-candidate` (`src/structural.rs:1029-1070`) |
+| 3 | `dispatches`, `produces_lifecycle`, `produces_job`, `injects`, `invokes_graphql`, `reads_env`, `reads_config`, `reads_resource`, `writes_resource`, `acquires_resource`, `checks_flag`, `calls_host` | symbol or file → entity | site confidence / site provenance (`src/structural.rs:1235-1256`) |
+| 3 | `produces_lifecycle_via`, `produces_job_via` | caller symbol → entity | met confidence / `entity-boundary-collapse` (`src/structural.rs:1942-1956`) |
+| 3 | `registered_handler`, `lifecycle_listener`, `job_handler`, `provides`, `handles_route`, `handles_graphql` | entity → symbol | site provenance, or `registration-site-fallback` / `provider-site-fallback` (`src/structural.rs:1305-1335`) |
+| 3 | `declares_contract`, `accepts_contract`, `returns_contract`, `decorated_by`, `references_contract` | file, contract, or symbol → contract | site confidence, `documentary: true` (`src/structural.rs:1592-1618`) |
+| 4 | `member_candidate` | member hub → symbol | always `possible` / `member-name-match` (`src/structural.rs:2039-2053`) |
+| 4 | `member_call` | symbol or file → member hub | always `possible` / `member-name-match` (`src/structural.rs:2059-2075`) |
+| 5 | `member_call` | symbol → symbol | `certain` or `possible` / `checker` (`src/structural.rs:2303-2324`) |
+| 6 | `contains_event` | file → event site | always `certain` / `syntax` (`src/structural.rs:2379-2389`) |
+| 6 | `emits`, `listens` | event site ↔ event hub | always `possible` / `string-event` (`src/structural.rs:2390-2405`) |
 
-Only `call`, `render`, `extend`, and `member_call` count as direct workflow hops (`src/structural.rs:2942`). The eight producer/consumer kinds pair up into four complementary families in `workflow_runtime_boundary_kind` (`src/structural.rs:2960`): registry, lifecycle, job, di. Everything contract-plane is absent from all three workflow predicates, which is what makes documentary edges inert for traversal even though they are stored and rankable — see [07-retrieval.md](07-retrieval.md) for how the traversals consume these weights.
+The import confidence table at `src/structural.rs:841-848` is a plain six-way match on `(type_only, resolution)`: `(true, "workspace-inferred") → (likely, type-workspace-inferred)`, `(true, "workspace") → (certain, type-workspace)`, `(true, _) → (certain, type-resolver)`, `(false, "workspace-inferred") → (likely, workspace-inferred)`, `(false, "workspace") → (certain, workspace)`, `(false, _) → (certain, resolver)`. The comment above it states the reason: heuristic workspace mappings (mirrored `dist` layouts, source-name search) are leads, not proven links, and never project as certain.
 
-## Resolution, ambiguity, and the honest fallbacks
+## Where confidence is lowered
 
-`project_references` (`src/structural.rs:838`) finds the owning symbol via `owner_at`, falling back to the file node, then resolves the target: local names against root symbols, cross-module through `ModuleGraph::edge` and `resolve_export_traced` to chase barrels. Two independent downgrades apply. Ambiguity — more than one root symbol with the name — forces `possible` with provenance `semantic+resolver-candidate` and lists all candidates in `detail_json`; a hop across a `workspace-inferred` module edge demotes `certain` to `likely` with provenance `semantic+resolver-inferred`, but only when the reference started at `certain` (`src/structural.rs:977-990`). When `graph.edge()` misses entirely, the reference still projects onto a package or package-instance hub from `package_for` (`src/structural.rs:968-971`) rather than vanishing.
+The lattice is `certain > likely > possible`, ranked by `confidence_rank` (`src/structural.rs:3628`) and weighted 1.0/0.6/0.3 by `confidence_weight` (3358). `lower_confidence` (`src/structural.rs:1961-1973`) is a meet, but it is not the universal mechanism — `project_references` downgrades inline instead (1029-1042), never calling it. The invariant that a projected edge is no more confident than any input it composed happens to hold, but it is enforced by two separate pieces of code.
 
-`project_entities` (`src/structural.rs:1031`) splits by role: producer-side roles emit `symbol/file --kind--> entity`, handler-side roles emit `entity --kind--> symbol`. Two decisions are worth naming. First, boundary collapse — for `lifecycle_producer` and `job_producer`, `project_entity_callers` (`src/structural.rs:1861`) mints `produces_lifecycle_via` / `produces_job_via` edges from every existing caller of the producer symbol straight to the entity, so a two-hop `handler → helper → queue.add` becomes reachable in one workflow hop. The cost is edge multiplication by caller count and a provenance string (`entity-boundary-collapse`) that is the only explanation for why a caller sits adjacent to an entity it never names. Second, no fabricated handlers — a `route_handler` or `graphql_handler` from a call-shaped extractor whose target does not resolve to a symbol keeps its occurrence but skips the edge entirely via `continue` (`src/structural.rs:1246-1258`), so consumers must not assume every occurrence has a matching `entity_edges` row.
+```mermaid
+flowchart TD
+  REF["RefRow, certain from extraction"] --> RES["Resolve through ModuleGraph::edge and resolve_export_traced"]
+  RES --> ZERO{"Any target?"}
+  ZERO -->|"no"| DROP["Emit nothing"]
+  ZERO -->|"yes"| AMB{"More than one same-named root symbol?"}
+  AMB -->|"yes"| POSS["possible, semantic plus resolver-candidate, one edge per candidate"]
+  AMB -->|"no"| INF{"Reached via workspace-inferred edge or export chain?"}
+  INF -->|"yes"| LIK["likely, semantic plus resolver-inferred"]
+  INF -->|"no"| CERT["certain, semantic plus resolver"]
+```
 
-`project_contract_site` (`src/structural.rs:1408`) resolves through `ContractCatalog.imports` plus `resolve_contract_export_traced`, falling back to local declarations, then to root symbols. Unresolvable references still get a stable key: `contract:{type}:external:{request}#{name}` for bare specifiers, `contract:{type}:unresolved:…` for relative ones. For a `contract_reference` the edge source is the smallest enclosing contract declaration (`ContractCatalog::enclosing`), so `type A = B` projects as `A --references_contract--> B` rather than as a file-level edge.
+An ambiguous reference fans out: one edge per candidate, all `possible` (`src/structural.rs:1059-1071`), which is why `ProjectedTargets` (`src/structural.rs:83`) carries the key list and the `ambiguous` flag together — set by `projected_symbols` when more than one root symbol matches (2418-2425). A reference with zero targets emits nothing at all (1026-1028). Stage 5's checker facts drop to `possible` when any project reported `possible` or any project run failed (`src/structural.rs:2295-2300`).
 
-Deduplication is narrower than it looks. `projected_edges` (`src/structural.rs:1053`) is a local of `project_entities`, shared only with `project_entity_callers`; the comment at `src/structural.rs:1050-1052` scopes it explicitly to entity relationships. `project_module_edges`, `project_references`, `project_member_calls`, `project_checker_enrichments`, and `project_events` all insert unconditionally, `resolved_edges` has no UNIQUE constraint (`src/store.rs:517-532`), and `graph_degree` counts every row. Duplicate `(src, dst, kind)` rows are normal outside the entity stage.
+Two attributions deserve precision. A site's source symbol comes from `owner_at` on the declaration spans; when the offset falls in no span, `site_source_symbol` (`src/structural.rs:1636`) returns `None` and the caller falls back to the containing file node. The one forward-looking exception is extractor-gated to `decorator-contract | http-route-decorator | graphql-operation-decorator` (1643-1648) and bounded to 512 bytes (1656), because decorators precede their declaration; a decorator with a large inline payload deliberately degrades to the file rather than attaching to a distant symbol. And a `contract_reference` site resolves its source differently again: `catalog.enclosing` first (`src/structural.rs:1580-1583`, defined at 1438), so a type referenced inside an interface body attributes to that interface, with `site_source_symbol` as the fallback and `file_key` as the last resort.
 
-## Member hubs and checker enrichment
+Stage 3 refuses one fabrication outright. An inline route or GraphQL handler with no resolvable symbol target — `app.get('/x', (req, res) => {…})` — is skipped entirely rather than falling back to the containing file or the next declaration (`src/structural.rs:1288-1303`), pinned by `src/structural/tests.rs:958`. The entity occurrence survives, so the route is findable; the `handles_route` edge does not, so the route is not traversable. Decorator-based handlers, whose target is syntactically adjacent, do take the site fallback and record `detail.targetResolution = "site-fallback"` (1307-1318).
 
-`project_member_calls` (`src/structural.rs:1924`) is the checkerless fallback for `x.save()`. For every `member_calls` row whose property name matches at least one symbol name anywhere in the repo, it creates a global `member:unknown:{prop}` hub, fans `member_candidate` edges at confidence `possible` out to every same-named symbol once per hub, and links the calling symbol to the hub with a `member_call` edge, also `possible`. This keeps the call reachable and enumerates honest candidates instead of guessing one, at the price of very high-degree hubs for property names like `get` or `run` — `hub_damping` (`src/structural.rs:3326`) and the workflow degree limit exist largely to contain that.
+## Cost and skip
 
-`project_checker_enrichments` (`src/structural.rs:2103`) adds precise `member_call` edges with provenance `checker` on top of the hubs rather than replacing them. Its join is unforgiving: the enrichment batch must be `active` and stamped with the current snapshot, its `checker_project_runs` row must be `status='completed'`, the source file's hash must still match, all six byte offsets must still match a live `member_calls` row, and `checker::target_fingerprint(target, target_hash, decl_start, decl_end)` must still match what was recorded. A stale or mismatched fact drops out silently instead of projecting a wrong edge; the price is that any span-numbering change in `src/heur.rs` invalidates every checker fact without erroring. Confidence degrades to `possible` when the fact itself was `possible` or when the occurrence had failed projects; unknown projects alone do not downgrade it. The sidecar protocol that produces these rows is covered in [09-sidecars.md](09-sidecars.md).
+`project_member_calls` mints a `member_hub` for every property name that matches *any* symbol name anywhere in the repository, plus a `member_candidate` edge to every same-named symbol (`src/structural.rs:2016-2054`). On a large repo this is the densest region of the graph, held back only by `possible` confidence and `hub_damping` (`src/structural.rs:3402`). Routing through a hub instead of emitting direct symbol→symbol edges makes the ambiguity structurally visible and rankable, at the cost of that fan-out. Stage 5 is the escape: when the TypeScript checker sidecar has resolved a receiver type, `project_checker_enrichments` writes a direct symbol→symbol `member_call` with `occurrenceSpecific: true`, and it gates hard — the batch must be active, its `source_snapshot` must equal the snapshot being built, the project run must be `completed`, the source file must join by `(path, hash)`, `call.rowid` must equal `enrichment.member_call_id`, all six byte offsets must still match, the coverage lookup must hit, and the target fingerprint must recompute (`src/structural.rs:2186-2207, 2255-2268`). A whitespace edit that shifts offsets silently retires the fact — that is the intended failure mode for durable facts pointing into a disposable graph.
 
-## Testing and known gaps
-
-There is no `tests/` directory; every `#[test]` lives inline. `src/entity.rs` has ten tests driving the visitor through `parse::with_parsed` on synthetic TS fixtures and asserting on emitted `EntitySite` tuples, including generic-parameter exclusion from contract references. `src/structural.rs` has 22 tests that index a real tempdir repo through `indexer::index_repo` and assert on projected nodes and edges — type-only barrels resolving in the contract plane with zero runtime edges, inline route handlers not attaching to the next declaration, ambiguous root references projecting every candidate as `possible`, same-named methods scoped by class, and checker facts going inert after a snapshot change.
-
-`src/graph.rs` and `src/heur.rs` have zero tests of their own. CommonJS require and `module.exports` shapes, dynamic imports, the emit/listen method lists, `receiver_unbound` computation, and the five-ancestor walk in `classify_reference` are covered only indirectly. Nothing asserts that the extractor and role string sets stay in sync with `relation_weight` and the `workflow_*_kind` match arms, so a newly added entity role can fall through the `_ => {}` arm ending the `project_entities` role match and produce no edge at all, or land on the default relation weight of 0.5, without any test failing.
-
-Two costs are visible in the projection code. `project_entities` issues a `SELECT id FROM entities WHERE entity_key=?1` after every entity insert (`src/structural.rs:1128`) and `resolve_reference_at` (`src/structural.rs:1815`) issues a per-site `refs` lookup — both N+1 patterns proportional to entity-site count. And `src/structural.rs` is 5265 lines, roughly 1590 of them the inline test module; the production half mixes projection, key formats, ranking weights, anchor resolution, and three traversal algorithms in one file ([17-sharp-edges.md](17-sharp-edges.md) collects the consequences).
+Finally, the whole rebuild is usually skipped. `src/indexer.rs:535-565` compares a `ProjectionIdentity { snapshot, projection_version, resolution_hash }` against the stored one; if they match and no checker batch changed, it republishes the existing rows inside its own transaction and sets `outcome.projection_rebuilt = false`. That gate is what makes an O(repo) wholesale rebuild acceptable in practice. It depends on `compute_resolution_hash` (`src/structural.rs:383`) being a faithful digest of module resolution, which reads tsconfigs, manifests, and `node_modules` layout that no file hash covers: it hashes six length-prefixed strings per module edge — source path, request, target path, package, resolution, `package_instances.canonical_root` — plus `type_only` appended as raw little-endian `i64`, under the domain tag `jscout-resolution-hash-v2\0` (385, 411-422). It hashes paths and canonical roots rather than rowids specifically so that renumbering does not invalidate the skip. See [05-storage-schema.md](05-storage-schema.md) for the tables these rows land in, [07-retrieval.md](07-retrieval.md) for how the projected graph is traversed, and [09-sidecars.md](09-sidecars.md) for the checker batch that stage 5 consumes.

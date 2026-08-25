@@ -1,301 +1,225 @@
 # Storage: SQLite schema, indexes, and vectors
 
-Everything jscout knows about a repository lives in one SQLite file, `.jscout.db`, at the repository root. That file mixes two kinds of state with very different costs: rows derived deterministically from source text, which can be recomputed at fresh-index speed, and rows that cost money or minutes to produce — embedding vectors bought from a provider, LLM-generated semantic artifacts, and TypeScript-checker facts that required a full type-checked program build. The schema, the connection policy, the migration boundary, and the reset primitives all exist to make the first category cheap to throw away without touching the second. `src/store.rs` holds the entire DDL and every reset/open primitive; `src/embed.rs` owns the sqlite-vec half; `src/indexer.rs` and `src/structural.rs` are the write drivers described in [02-ingestion.md](02-ingestion.md) and [03-structural-extraction.md](03-structural-extraction.md).
+Every fact jscout knows about a repository lives in one SQLite file, `.jscout.db`, at the repository root. That file holds 37 regular tables, one FTS5 virtual table, and a variable number of `vec0` virtual tables created on demand — one per embedding dimensionality. The schema is deliberately split into two planes: everything derivable from source (files, chunks, symbols, references, the resolved graph projection) is thrown away and recomputed on demand, while everything that cost money or model time (the content-addressed embedding cache, semantic artifacts and their supports, reconnaissance verdicts) is carried forward across schema versions. `src/store.rs` (1394 lines, of which 1042 onward are an inline `#[cfg(test)] mod tests`) owns the DDL, the connection policy, and the reset helpers; `src/embed.rs` owns the sqlite-vec plane; `src/structural.rs` and `src/indexer.rs` write the projection and publish it.
 
-## Version constants and the file on disk
+## Version stamps and the two openers
 
-There is no `PRAGMA user_version` in play — `user_version` and `application_id` stay 0. Versioning is entirely rows in a `meta(key, value)` table, and four constants gate four kinds of invalidation.
+Two constants gate everything. `SCHEMA_VERSION = "26"` (`src/store.rs:8`) is the current shape; `DURABLE_SCHEMA_FLOOR = 16` (`src/store.rs:9`, private, unlike the `pub` `DB_FILE` and `SCHEMA_VERSION`) is the oldest version whose durable tables are still shape-compatible. Both are compared against the `meta.schema_version` row.
 
-| Constant | Value | Defined | Stored in | What a bump invalidates |
-|---|---|---|---|---|
-| `SCHEMA_VERSION` | `"23"` | `src/store.rs:8` | `meta.schema_version` | Table shapes. Readers demand exact equality; writers accept 16–23. |
-| `DURABLE_SCHEMA_FLOOR` | `16` | `src/store.rs:9` | — | Below this, `open_path` refuses to touch the file at all. |
-| `PROJECTION_VERSION` | `"11"` | `src/structural.rs:12` | `meta.projection_version` | The graph projection. Also folded into the snapshot hash, so a bump invalidates every snapshot. |
-| `entity::EXTRACTION_VERSION` | `"5"` | `src/entity.rs:14` | `meta.extraction_version` | Per-file extraction output. Sets `files.hash=''` on every row. Not folded into the snapshot hash. |
+The read path is strict. `open_path_read_only` refuses to create the file (`src/store.rs:54-59`), opens with `SQLITE_OPEN_READ_ONLY`, sets `foreign_keys=ON` and `query_only=ON` (`src/store.rs:60-64`), demands `meta.schema_version` equal `"26"` exactly (`src/store.rs:78-83`), and then demands that both `meta.snapshot` and `meta.projection_version` exist before handing back a connection (`src/store.rs:84-96`). An unindexed checkout therefore fails with "has no published structural snapshot; run `jscout index`" rather than returning empty result sets that look like a real answer. It never migrates and never takes write authority, so anything that needs to bootstrap must go through the writer — which is why the MCP server holds a read-only connection for its session and opens a writer only for the one write-capable tool (see [11-mcp-surface.md](11-mcp-surface.md)).
 
-`meta` carries exactly eight key shapes: `schema_version`, `root`, `snapshot`, `projection_version`, `resolution_hash`, `extraction_version`, and the two per-profile sync markers `embedding_index_synced_v1:{id}` and `semantic_embedding_index_synced_v1:{id}`. Two are load-bearing beyond bookkeeping: a database counts as *published* if and only if `meta` contains both `snapshot` and `projection_version`, enforced on read-only opens by a single `EXISTS(...) AND EXISTS(...)` query (`src/store.rs:84-98`).
+The write path is permissive within a window. `open_path` registers sqlite-vec (`src/store.rs:106`), opens the file (`src/store.rs:107`), probes `sqlite_master` for a `meta` table (`src/store.rs:108-114`), and reads the version (`src/store.rs:116-122`). A version outside `16..=SCHEMA_VERSION.parse()` bails without applying a single pragma or writing a byte (`src/store.rs:123-140`) — the upper bound is derived from the constant, not a second literal. Only after the gate passes does it apply `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON` (`src/store.rs:144-146`) and run `init_schema`. Two tests reopen a rejected database and assert the version string and legacy row shapes are untouched (`src/store.rs:1058-1099`, `src/store.rs:1224-1284`). `register_sqlite_vec` (`src/store.rs:13-25`) transmutes `sqlite_vec::sqlite3_vec_init` into the extension-entry signature inside `unsafe` and installs it via `sqlite3_auto_extension` under a `Once`, so every `Connection::open` anywhere in the process after the first `store::open*` call inherits `vec0`, including connections that never asked for it.
 
-## Connection policy
+## One migration boundary, not a ladder
 
-The file lives at `root.join(".jscout.db")` (`src/store.rs:7,38-40`), with `-wal` and `-shm` siblings. Two open functions have deliberately different authority: `open_path` (`src/store.rs:105-149`) creates the file if absent, runs the migration check, then sets pragmas and calls `init_schema`; `open_path_read_only` (`src/store.rs:53-100`) refuses to create, refuses to migrate, and bails on an unpublished database.
+There is no per-version migration ladder. Anything below 16 or above 26 is refused; anything in between runs `rebuild_legacy_disposable_schema` (`src/store.rs:156`), which discards the entire disposable plane and lets the current `init_schema` recreate it.
 
-| Setting | Writer (`open_path`) | Reader (`open_path_read_only`) | Watch connection |
-|---|---|---|---|
-| Open flags | default read-write-create | `SQLITE_OPEN_READ_ONLY` | read-write |
-| `journal_mode` | `WAL` | inherited | inherited |
-| `synchronous` | `NORMAL` | — | — |
-| `foreign_keys` | `ON` | `ON` | inherited |
-| `query_only` | — | `ON` | — |
-| `busy_timeout` | unset (0) | unset (0) | 5s (`src/watch.rs:16,965`) |
-| Schema check | 16 ≤ v ≤ 23, else bail | `v == "23"`, else bail | via writer |
-| Publication check | none | both `snapshot` and `projection_version` must exist | none |
-
-No `cache_size`, `mmap_size`, or `temp_store` tuning is set anywhere. The unset `busy_timeout` on ordinary connections is a real limit: a second writer — say a manual `jscout index` while `jscout watch` is running — gets `SQLITE_BUSY` immediately with no retry. Readers are fine under WAL.
-
-sqlite-vec is loaded once per process, not per connection. `register_sqlite_vec` (`src/store.rs:13-25`) transmutes `sqlite_vec::sqlite3_vec_init` into the C extension-entry signature and hands it to `rusqlite::ffi::sqlite3_auto_extension` inside a `std::sync::Once`. Auto-extension registration is process-global, which is the point: the read-only, `query_only=ON` connections used by the query and MCP surfaces could not load an extension themselves, and this way they get `vec0` for free. The cost is an `unsafe` transmute plus total invisibility at the call site — any unrelated `Connection::open` in the same process silently acquires `vec0` too.
-
-## Complete table inventory
-
-Thirty-seven tables come from `init_schema`, plus `chunks_fts` from a shared constant and two families of dimension-named virtual tables created lazily. The Tier column is explained in the next section: **D** = disposable snapshot, **S** = snapshot-scoped but expensive, **C** = content-addressed cache, **M** = durable semantic memory.
-
-| Table | Tier | Stores | Key columns |
-|---|---|---|---|
-| `meta` | mixed | Version stamps, publication and sync markers | `key` PK, `value` |
-| `package_instances` | S | Workspace/dependency package identity | `canonical_root` UK, `origin`, `manifest_hash`, `status` |
-| `files` | D | One row per indexed file | `path` UK, `hash`, `role`, `origin`, `package_instance_id` |
-| `chunks` | D | Code chunks with full text | `file_id`, `hash`, `start`, `content` |
-| `chunks_fts` | D | FTS5 mirror of chunk text | `rowid == chunks.id`; `content, name, symbols, path` |
-| `symbols` | D | Declared names and declaration spans | `file_id`, `name`, `kind`, `decl_start`, `exported` |
-| `exports` / `imports` | D | Runtime module bindings | `file_id`, `export_name` / `imported_name`, `request` |
-| `contract_exports` / `contract_imports` | D | Type-only bindings, kept separate | same shape as above |
-| `module_edges` | D | Resolved import edges | `from_file`, `to_file`, `package`, `resolution`, `type_only` |
-| `refs` | D | Unresolved reference evidence | `file_id`, `kind`, `confidence`, `target_name` |
-| `events` | D | Emit/listen sites | `file_id`, `role`, `name`, `method` |
-| `member_calls` | D | Member-call sites, four span pairs | `file_id`, `prop`, `receiver`, call/receiver/property spans |
-| `entity_sites` | D | Ungrouped per-file entity evidence | `plane`, `entity_type`, `identity_name`, `confidence` |
-| `entities` | D | Canonical grouped entities | `entity_key` UK, `plane`, `entity_type` |
-| `entity_occurrences` | D | Grouped site instances | `entity_id`, `site_id` UK, `file_id` |
-| `entity_edges` | D | Entity-to-entity assertions | `occurrence_id`, `target_key`, `kind` |
-| `graph_nodes` | D | Projection nodes | `node_key` PK, `native_table`, `native_id` |
-| `resolved_edges` | D | Projection edges | `src_key`, `dst_key`, `kind`, `confidence`, `provenance` |
-| `embedding_profiles` | C | Provider/model/config identity | `config_fingerprint` UK, `dimensions` |
-| `embeddings` | C | Chunk vectors, content-addressed | PK `(chunk_hash, profile_id)`, `vec` |
-| `semantic_embeddings` | C | Artifact vectors, content-addressed | PK `(document_hash, profile_id)`, `vec` |
-| `embedding_index_entries` | D | Current chunk occurrences for KNN | `id` = vec0 rowid, UK `(chunk_id, profile_id)` |
-| `vec_embeddings_{N}` | D rows | vec0 KNN index over chunks | `rowid`, `embedding FLOAT[N]`, partitions `profile_id`, `origin` |
-| `checker_enrichment_batches` | S | One TypeScript-checker run | `source_snapshot`, `active` (partial UK) |
-| `checker_project_runs` | S | Per-tsconfig-project status | PK `(batch_id, project_id)`, `peak_rss_bytes` |
-| `checker_project_inputs` | S | Per-project input files and hashes | PK `(batch_id, project_id, input_kind, input_path)` |
-| `checker_enrichments` | S | Resolved member-call targets | `source_file`, `source_hash`, 6 spans, `target_anchor` |
-| `checker_occurrence_projects` | S | Per-project answer, incl. `unknown` | PK `(batch_id, member_call_id, project_id)` |
-| `scout_runs` | M | One LLM run: provider, cost, status | `(scout_kind, input_fingerprint)` partial UK |
-| `scout_classifications` | M | Per-anchor decision incl. exclusions | PK `(run_id, anchor_key)`, `decision` |
-| `repository_classifications` | M | Immutable scope role verdicts | `run_id` UK, `subject_key`, `evidence_fingerprint` |
-| `repository_file_policy` | D | Per-file effective role projection | `file_id` PK, `classification_id`, `source_hash` |
-| `repository_current_classifications` | D | Current-verdict projection | `subject_key` UK, `role`, `confidence` |
-| `semantic_artifacts` | M | Generated cards, workflows, summaries | `supersedes_artifact_id` (partial UK), `artifact_fingerprint` |
-| `semantic_relations` | M | Artifact-to-artifact links | PK `(src, dst, relation, claim_path)`, `dst_fingerprint` |
-| `semantic_supports` | M | Claim to file, line span, hash | `artifact_id`, `evidence_file`, `source_hash` |
-| `semantic_embedding_index_entries` | M | Current artifact occurrences for KNN | `id` = vec0 rowid, UK `(artifact_id, profile_id)`, `document_hash` |
-| `vec_semantic_embeddings_{N}` | M rows | vec0 KNN index over artifacts | `rowid`, `embedding FLOAT[N]`, partition `profile_id` |
-
-## The disposable/durable split, concretely
-
-There are three reset widths, and which tables each one clears is the whole story. The narrowest, `reset_extraction_state` (`src/store.rs:916-945`), is what a normal reindex uses; `reset_snapshot_state` (`src/store.rs:954-962`) adds package identity and the publication meta keys; `rebuild_legacy_disposable_schema` (`src/store.rs:156-232`) is the migration hammer and drops 29 tables outright, checker plane included.
-
-Read this diagram for what each reset arrow reaches, and note that the checker plane survives the two in-process resets but not a schema migration.
+What to look for below: the gate has three exits, and only the middle one touches the file.
 
 ```mermaid
 flowchart TD
-  RE["reset_extraction_state"]
-  RS["reset_snapshot_state"]
-  MIG["rebuild_legacy_disposable_schema"]
-
-  D["Disposable snapshot: the 21 tables marked D above, plus vec_embeddings_N rows"]
-  S["Snapshot-scoped and expensive: package_instances plus the five checker tables"]
-  C["Content-addressed cache: embedding_profiles, embeddings, semantic_embeddings"]
-  M["Durable semantic memory: the 7 tables marked M, plus vec_semantic_embeddings_N rows"]
-
-  RE -->|"clears"| D
-  RS -->|"clears"| D
-  RS -->|"clears package_instances only"| S
-  MIG -->|"drops tables"| D
-  MIG -->|"drops tables"| S
-  RE -.->|"untouched"| C
-  RE -.->|"untouched"| M
-  MIG -.->|"untouched"| C
-  MIG -.->|"untouched"| M
+  OPEN["open_path — src/store.rs:105"] --> REG["register_sqlite_vec — process-wide auto-extension"]
+  REG --> PROBE["Probe sqlite_master for table 'meta'"]
+  PROBE -->|"absent"| PRAGMA["Apply WAL, synchronous=NORMAL, foreign_keys=ON"]
+  PROBE -->|"present"| VER["Read meta.schema_version"]
+  VER -->|"equals 26"| PRAGMA
+  VER -->|"below 16 or above 26"| BAIL["bail: unsupported durable schema — no pragma, no write"]
+  VER -->|"16..=25"| MIG["rebuild_legacy_disposable_schema"]
+  MIG --> VEC["Enumerate vec_embeddings_N and vec_semantic_embeddings_N by GLOB, digits-only guard"]
+  VEC --> TX["BEGIN IMMEDIATE"]
+  TX --> EMPTY["DELETE FROM each vec0 table — retained, not dropped"]
+  EMPTY --> DROPS["DROP 29 source-derived tables, children first"]
+  DROPS --> META["DELETE publication keys and both sync-marker prefixes; UPDATE schema_version to 26"]
+  META --> COMMIT["COMMIT or ROLLBACK"]
+  COMMIT --> PRAGMA
+  PRAGMA --> INIT["init_schema: 37 CREATE TABLE, FTS5, late indexes, one ALTER"]
 ```
 
-`RE` and `RS` both leave `C` and `M` alone by construction — that is the whole justification for the two-level embedding storage below. `MIG` reaches `S` as well as `D`: the checker plane is in the drop batch (`src/store.rs:187-194`), so expensive TypeScript facts survive a same-schema rebuild but not a schema-version migration. What lets `S` survive a full refresh is `retain_checker_batches_for_snapshot` (`src/store.rs:967-973`), called at `src/indexer.rs:350`, which deletes every batch whose `source_snapshot` differs from the freshly recomputed hash — a rebuild that reproduces the exact structural identity keeps its checker facts, one that does not throws them away before projection can publish.
+The `VEC` and `EMPTY` nodes are where the durable/disposable line is subtlest. The `vec0` tables are enumerated with a `GLOB` plus a `NOT GLOB '*[^0-9]*'` suffix guard (`src/store.rs:157-169`), then emptied inside the transaction after re-validating the numeric suffix in Rust (`src/store.rs:174-183`). They are retained rather than dropped because their rowids are snapshot-local `embedding_index_entries.id` values — the rows are meaningless after a rebuild, but the table shape is not (`src/store.rs:150-155`). `DROPS` covers 29 statements (`src/store.rs:185-213`), ending with `package_instances`; one of them, `checker_input_files`, names a table `init_schema` no longer creates, so it is a dead drop. Note that `semantic_embedding_index_entries` is in the drop list: a version migration discards semantic *vector materialization* even though it preserves the artifacts and their cached vectors.
 
-Two asymmetries inside `reset_extraction_state`. `symbols` is absent from its explicit `DELETE` batch and is emptied only by the cascade from `DELETE FROM files` (`src/store.rs:938`), which undercuts the "children before parents so foreign-key enforcement only checks already-emptied tables" comment at `src/store.rs:918-920` — that one delete does scan a fully populated child. And `clear_vector_rows` (`src/embed.rs:1552`) empties only `vec_embeddings_{N}`; the semantic vec0 tables are deliberately left intact, which is why artifact vectors keep answering KNN across a source reindex.
+Schema changes since v23 arrive for free through this mechanism because the tables are recreated: `idx_graph_nodes_native ON graph_nodes(native_id, native_table)` added at v25 (`src/store.rs:517-518`), and `idx_member_calls_file` widened from `(file_id)` to `(file_id, receiver_start, prop)` at v26 (`src/store.rs:391-392`). Two tests stamp a database back to 24 and 25, break the index, reopen, and assert `pragma_index_info` returns the exact new column order (`src/store.rs:1305-1359`) — index column order is a testable contract here. The one exception to the rebuild-everything rule is a genuine `ALTER TABLE`: `repository_classifications.cited_evidence_json` is added if `pragma_table_info` shows it missing (`src/store.rs:838-851`), because that column landed mid-review of v20 on a durable table.
+
+The tradeoff is stated in the error text: upgrading from any of 16..25 forces a full reindex, and a v15 file is refused outright rather than best-effort migrated, so an operator with a valuable v15 embedding cache must preserve the file by hand. The version literal `'26'` is hardcoded three times — the constant (`src/store.rs:8`), the migration's `UPDATE` (`src/store.rs:220`), and the `init_schema` seed insert (`src/store.rs:238`) — so a bump that misses one leaves migrated databases stamped at the old value and re-entering the migration on every open.
+
+## Table inventory
+
+Plane column: **D** = disposable (rebuilt from source), **S** = snapshot-scoped (survives an extraction reset, cleared by a full refresh), **P** = projection (rebuilt by `structural::rebuild_projection`), **U** = durable (survives every reset and every in-range migration except where noted), **C** = checker plane (retained by caller policy).
+
+| Table | Line | Plane | What it holds | Key columns |
+| --- | --- | --- | --- | --- |
+| `meta` | `237` | mixed | Version stamps, publication markers, vector sync markers | `key`, `value` |
+| `package_instances` | `241` | S | Workspace members and `node_modules` dependencies | `canonical_root` UNIQUE, `origin`, `status` |
+| `files` | `255` | D | The FK hub; nine tables cascade from it | `path` UNIQUE, `hash`, `origin`, `package_instance_id` |
+| `chunks` | `266` | D | Full chunk text plus spans | `file_id`, `hash`, `content`, `start_line`/`end_line` |
+| `chunks_fts` | `31` | D | FTS5 mirror of chunk content | `rowid = chunks.id`; `content`/`name`/`symbols`/`path` |
+| `symbols` | `283` | D | Declarations with separate decl and body spans | `name`, `decl_start`/`decl_end`, `exported` |
+| `exports` / `imports` | `299` / `308` | D | Runtime module bindings | `export_name`, `imported_name`, `request` |
+| `contract_exports` / `contract_imports` | `319` / `328` | D | Type-only bindings, physically separated | same shape as above |
+| `module_edges` | `336` | D | File-to-file import edges | `from_file`, `to_file` (no FK), `resolution`, `type_only` |
+| `refs` | `348` | D | Pre-resolution reference evidence | `kind`, `confidence`, `target_request`, `target_name` |
+| `events` | `364` | D | Event-bus emit/listen pairs | `role`, `name`, `method` |
+| `member_calls` | `375` | D | Member-call sites with four span pairs | `prop`, `receiver`, `receiver_start`/`_end`, `property_start`/`_end` |
+| `entity_sites` | `397` | D | Source-local entity evidence before resolution | `plane`, `entity_type`, `identity_kind`, `identity_name` |
+| `entities` | `422` | P | Canonical grouped entities | `entity_key` UNIQUE, `plane`, `identity_anchor` |
+| `entity_occurrences` | `433` | P | Site-to-entity join | `site_id` UNIQUE, `entity_id`, `role` |
+| `entity_edges` | `454` | P | Entity assertions keyed by string | `target_key`, `kind`, `confidence` |
+| `embedding_profiles` | `468` | U | Provider + model + inference config identity | `config_fingerprint` UNIQUE, `dimensions` |
+| `embeddings` | `479` | U | Content-addressed code-chunk vectors | PK `(chunk_hash, profile_id)`, `vec` BLOB |
+| `semantic_embeddings` | `489` | U | Content-addressed artifact-document vectors | PK `(document_hash, profile_id)` |
+| `embedding_index_entries` | `496` | D | Per-occurrence vec0 rowid allocation | `id` = vec0 rowid; UNIQUE `(chunk_id, profile_id)` |
+| `vec_embeddings_<d>` | `embed.rs:1128` | D | vec0 float payload for code chunks | `embedding FLOAT[d]`, `profile_id`/`origin` PARTITION KEY |
+| `graph_nodes` | `505` | P | Projection node table | `node_key` PK, `native_table`, `native_id` |
+| `resolved_edges` | `520` | P | Projection edge table | `src_key`, `dst_key`, `kind`, `confidence`, `provenance` |
+| `checker_enrichment_batches` | `543` | C | One generation of TypeScript-checker facts | `active` (partial UNIQUE), `source_snapshot`, `plan_fingerprint` |
+| `checker_project_runs` | `561` | C | Per-tsconfig-project execution record | PK `(batch_id, project_id)`, `execution_kind`, `peak_rss_bytes` |
+| `checker_project_inputs` | `578` | C | Per-project input file hashes | PK `(batch_id, project_id, input_kind, input_path)`, `source_hash` |
+| `checker_enrichments` | `589` | C | Resolved member-call targets | `member_call_id` (no FK), six spans, `target_anchor` |
+| `checker_occurrence_projects` | `618` | C | Per-occurrence, per-project answer including `unknown` | `status`, `source_hash`, six spans |
+| `scout_runs` | `638` | U | One LLM scouting invocation | `status`, `input_fingerprint`, `billing_path`, `usage_json` |
+| `repository_classifications` | `672` | U | Immutable reconnaissance verdicts | `run_id` UNIQUE, `subject_key`, `role`, `evidence_fingerprint` |
+| `repository_file_policy` | `701` | D | Per-file role acceleration, fresh+`likely` only | `file_id` PK, `effective_role`, `source_hash` |
+| `repository_current_classifications` | `721` | D | Currently-active verdicts including neutral ones | `subject_key` UNIQUE, `role`, `conflict_files` |
+| `scout_classifications` | `745` | U | Per-candidate decision including exclusions | PK `(run_id, anchor_key)`, `decision` |
+| `semantic_artifacts` | `754` | U | Cards, workflows, summaries, concepts | `supersedes_artifact_id` self-FK, `artifact_fingerprint` |
+| `semantic_relations` | `774` | U | Artifact-to-artifact dependencies | PK `(src, dst, relation, claim_path)`, `dst_fingerprint` |
+| `semantic_supports` | `797` | U | Claim grounding in file + line span | `anchor_key`, `evidence_start_line`, `source_hash`, `context_hash` |
+| `semantic_embedding_index_entries` | `817` | U | Per-artifact vec0 rowid allocation | `id` = vec0 rowid, `document_hash` |
+| `vec_semantic_embeddings_<d>` | `embed.rs:1168` | U | vec0 float payload for artifacts | `embedding FLOAT[d]`, `profile_id` PARTITION KEY |
 
 ## Structural core
 
-The disposable plane is one FK tree rooted at `files`, plus two projection tables with no foreign keys at all. Look for where the cascade arrows stop.
+What to look for: a single cascade root (`files`), one table joined by rowid rather than by foreign key (`chunks_fts`), and three tables at the bottom that no extractor writes — they are projected.
 
 ```mermaid
 erDiagram
-    package_instances ||--o{ files : "package_instance_id CASCADE"
-    package_instances ||--o{ module_edges : "SET NULL"
-    files ||--o{ chunks : "file_id CASCADE"
-    files ||--o{ symbols : "file_id CASCADE"
-    files ||--o{ imports : "file_id CASCADE"
-    files ||--o{ exports : "file_id CASCADE"
-    files ||--o{ contract_imports : "file_id CASCADE"
-    files ||--o{ contract_exports : "file_id CASCADE"
-    files ||--o{ module_edges : "from_file CASCADE"
-    files ||--o{ refs : "file_id CASCADE"
-    files ||--o{ events : "file_id CASCADE"
-    files ||--o{ member_calls : "file_id CASCADE"
-    files ||--o{ entity_sites : "file_id CASCADE"
-    chunks ||--|| chunks_fts : "rowid equality no FK"
-    entity_sites ||--|| entity_occurrences : "site_id UNIQUE CASCADE"
-    entities ||--o{ entity_occurrences : "entity_id CASCADE"
-    entity_occurrences ||--o{ entity_edges : "occurrence_id CASCADE"
-    files }o..o{ graph_nodes : "projected no FK"
-    symbols }o..o{ graph_nodes : "projected no FK"
-    refs }o..o{ resolved_edges : "projected no FK"
-    member_calls }o..o{ resolved_edges : "projected no FK"
-    files {
-        int id PK
-        text path UK
-        text hash
-        text role
-        text origin
-    }
-    chunks {
-        int id PK
-        int file_id FK
-        text hash
-        text content
-    }
-    entities {
-        int id PK
-        text entity_key UK
-        text plane
-    }
-    graph_nodes {
-        text node_key PK
-        text native_table
-        int native_id
-    }
+  package_instances ||--o{ files : "package_instance_id CASCADE"
+  package_instances ||--o{ module_edges : "package_instance_id SET NULL"
+  files ||--o{ chunks : "file_id CASCADE"
+  files ||--o{ symbols : "file_id CASCADE"
+  files ||--o{ exports : "file_id CASCADE"
+  files ||--o{ imports : "file_id CASCADE"
+  files ||--o{ contract_exports : "file_id CASCADE"
+  files ||--o{ contract_imports : "file_id CASCADE"
+  files ||--o{ module_edges : "from_file CASCADE"
+  files ||--o{ refs : "file_id CASCADE"
+  files ||--o{ events : "file_id CASCADE"
+  files ||--o{ member_calls : "file_id CASCADE"
+  files ||--o{ entity_sites : "file_id CASCADE"
+  files ||--o{ entity_occurrences : "file_id CASCADE"
+  chunks ||--|| chunks_fts : "rowid equals chunks.id, no FK"
+  chunks ||--o{ entity_sites : "chunk_id SET NULL"
+  entity_sites ||--|| entity_occurrences : "site_id UNIQUE CASCADE"
+  entities ||--o{ entity_occurrences : "entity_id CASCADE"
+  entity_occurrences ||--o{ entity_edges : "occurrence_id CASCADE"
+  refs ||--o{ resolved_edges : "projected by structural.rs"
+  member_calls ||--o{ resolved_edges : "projected by structural.rs"
+  module_edges ||--o{ resolved_edges : "projected by structural.rs"
+  events ||--o{ resolved_edges : "projected by structural.rs"
+  files ||--o{ graph_nodes : "projected as node_kind file"
+  symbols ||--o{ graph_nodes : "projected as node_kind symbol"
 ```
 
-Three relationships there are not enforced by SQLite, and that is the point. `chunks_fts` is a plain FTS5 virtual table, not FK-aware, so the `rowid == chunks.id` identity is maintained only by two `prepare_cached` statements running in lockstep in `insert_file` (`src/indexer.rs:517-527`); every read joins on it (`src/search.rs:264-265`), and nothing would catch a drift. `graph_nodes` deliberately has no FK to `files` — its `(native_table, native_id)` pair is a soft pointer back to whichever canonical table produced the node, so the projection can be truncated and rebuilt without touching anything upstream. And `entities` tops a three-level cascade: `rebuild_projection` issues only `DELETE FROM entities` (`src/structural.rs:449`) and relies on the FKs to clear occurrences and then edges.
+Three details in that diagram carry design weight. `module_edges.to_file` is a plain `INTEGER` with no foreign key, so an edge pointing at a file that has not been inserted yet — or that lives outside the corpus entirely — survives instead of failing insertion. `contract_exports` and `contract_imports` duplicate the shape of `exports`/`imports` rather than adding a `type_only` flag, so a resolution query that forgot to check a flag cannot accidentally infer runtime execution from a type-only relationship (`src/store.rs:316-318`); the cost is a duplicated table shape, duplicated indexes, and two joins where one would do. And `chunks_fts` is the only relationship in the diagram maintained purely by hand — FTS5 tables are not foreign-key aware, so the rowid identity is established at insert (`src/indexer.rs:703`), broken explicitly on per-file delete (`src/store.rs:1000-1003`), and re-established wholesale on reset.
 
-`insert_file` writes in a fixed order — `files`, `chunks` plus `chunks_fts`, `symbols`, `imports`, `exports`, `contract_imports`, `contract_exports`, `events`, `member_calls`, `entity_sites`, and finally `refs` (`src/indexer.rs:493-720`). The `contract_*` tables duplicate the column shape of `imports`/`exports` rather than adding a flag, per `src/store.rs:316-318`: structural call resolution must never infer execution from a type-only relationship, and separate tables make that impossible to get wrong in a join.
+One conceptual column is enforced two different ways: `refs.chunk_id`, `events.chunk_id`, and `member_calls.chunk_id` are plain integers, while `entity_sites.chunk_id` and `entity_occurrences.chunk_id` are real foreign keys with `ON DELETE SET NULL`. The unenforced ones dangle after chunks are cleared, which is tolerable only because they are cleared in the same batch.
 
-## Semantic memory and scouting
+## Semantic, vector, and scouting planes
 
-This half is append-only by design and has no pruning path anywhere in the codebase. Look for the two disposable projections hanging off the immutable classification history.
+What to look for: two `vec0` tables reachable only by rowid, and a reconnaissance triangle where one durable table feeds two disposable projections.
 
 ```mermaid
 erDiagram
-    scout_runs ||--o{ scout_classifications : "run_id CASCADE"
-    scout_runs ||--|| repository_classifications : "run_id UNIQUE CASCADE"
-    scout_runs ||--o{ semantic_artifacts : "scout_run_id"
-    repository_classifications ||--o{ repository_file_policy : "classification_id"
-    repository_classifications ||--|| repository_current_classifications : "classification_id PK CASCADE"
-    semantic_artifacts ||--o{ semantic_supports : "artifact_id CASCADE"
-    semantic_artifacts ||--o{ semantic_relations : "src_artifact_id CASCADE"
-    semantic_artifacts ||--o| semantic_artifacts : "supersedes UNIQUE successor"
-    semantic_artifacts ||--o{ semantic_embedding_index_entries : "artifact_id CASCADE"
-    scout_runs {
-        int id PK
-        text scout_kind
-        text status
-        text input_fingerprint
-        text source_snapshot
-    }
-    repository_classifications {
-        int id PK
-        text subject_key
-        text role
-        text evidence_fingerprint
-    }
-    semantic_artifacts {
-        int id PK
-        text artifact_type
-        text body_json
-        text artifact_fingerprint
-    }
-    semantic_supports {
-        text claim_path
-        text evidence_file
-        text source_hash
-        text context_hash
-    }
+  embedding_profiles ||--o{ embeddings : "profile_id CASCADE"
+  embedding_profiles ||--o{ semantic_embeddings : "profile_id CASCADE"
+  embedding_profiles ||--o{ embedding_index_entries : "profile_id CASCADE"
+  embedding_profiles ||--o{ semantic_embedding_index_entries : "profile_id CASCADE"
+  chunks ||--o{ embedding_index_entries : "chunk_id CASCADE"
+  chunks ||--o{ embeddings : "hash joins chunk_hash, content-addressed"
+  embedding_index_entries ||--|| vec_embeddings_N : "id equals rowid, no FK possible"
+  semantic_embedding_index_entries ||--|| vec_semantic_embeddings_N : "id equals rowid, no FK possible"
+  semantic_embeddings ||--o{ semantic_embedding_index_entries : "document_hash"
+  semantic_artifacts ||--o{ semantic_supports : "artifact_id CASCADE"
+  semantic_artifacts ||--o{ semantic_relations : "src_artifact_id CASCADE"
+  semantic_artifacts ||--o{ semantic_relations : "dst_artifact_id no cascade"
+  semantic_artifacts ||--o| semantic_artifacts : "supersedes_artifact_id partial UNIQUE"
+  semantic_artifacts ||--o{ semantic_embedding_index_entries : "artifact_id CASCADE"
+  scout_runs ||--o{ scout_classifications : "run_id CASCADE"
+  scout_runs ||--o| repository_classifications : "run_id UNIQUE CASCADE"
+  scout_runs ||--o{ semantic_artifacts : "scout_run_id"
+  repository_classifications ||--o{ repository_file_policy : "classification_id no ON DELETE"
+  repository_classifications ||--o| repository_current_classifications : "classification_id CASCADE"
+  files ||--o| repository_file_policy : "file_id CASCADE"
 ```
 
-Two partial unique indexes carry the concurrency semantics. `idx_scout_runs_active` on `(scout_kind, input_fingerprint) WHERE status IN ('running','completed')` (`src/store.rs:647-649`) is a live claim: a second scout over identical inputs either reuses the completed run or collides with the in-flight one, and `--rebuild` must mark the old run `superseded` to release the slot. `idx_semantic_artifacts_one_successor` on `supersedes_artifact_id WHERE NOT NULL` (`src/store.rs:777-779`) forces the supersession chain to be linear rather than a DAG, which is what makes "is this the current version" answerable with a single `NOT EXISTS` subquery — inlined into semantic KNN at `src/embed.rs:1424-1428`.
+The `embedding_index_entries` to `vec_embeddings_N` relationship is the load-bearing hack. A `vec0` table has no foreign keys and no joinable columns beyond its partition keys, so the regular table is made authoritative and its primary key *is* the virtual table's rowid; the comment stating the pattern sits at `src/store.rs:813-815` for the semantic side, and both insert paths take `last_insert_rowid()` of the entries table (`src/embed.rs:1430-1443`). Every KNN result joins back through `i.id = v.rowid`. The cost is that two tables must be kept in step by hand on every write, and every delete path must remove `vec0` rows *before* the FK cascade destroys the join table — which is why `delete_file` calls `embed::delete_vector_rows_for_file` first (`src/store.rs:998-1007`).
 
-`semantic_supports` anchors a claim to `(evidence_file, start_line, end_line, source_hash, context_hash)` rather than to a `chunk_id`, because chunk IDs are snapshot-local and vanish on every reindex while path plus content hash survive; the same hash doubles as the staleness detector. The cost is that support validation re-reads files from disk, so it is I/O-bound and assumes the working tree still matches the indexed snapshot.
+The reconnaissance triangle encodes overlapping information three ways on purpose. `repository_classifications` is durable and append-only because each row cost an LLM call, and its `evidence_fingerprint` is deliberately snapshot-free so a later run can reuse a verdict after an unrelated reindex. `repository_file_policy` is rebuilt from fresh, `likely`-only verdicts so a stale or hedged classification never hides or penalizes a file (`src/store.rs:698-700`). `repository_current_classifications` keeps the neutral `possible`/`mixed`/`unknown` verdicts too, so a read-only overview can explain the active policy without pretending immutable historical rows are current after a branch switch. One asymmetry: the durable table's `subject_kind` CHECK allows `'project'` while the current-classifications CHECK allows only `'package'` and `'area'` (`src/store.rs:676` vs `src/store.rs:723`), so a project-kind classification can be recorded but never projected as current. Scouting itself is covered in [08-scouting.md](08-scouting.md).
 
-`repository_file_policy` and `repository_current_classifications` are the disposable rows here: `recon::reconcile_file_policy` truncates and rebuilds both inside `BEGIN IMMEDIATE` (`src/recon.rs:396-399`). It is not a pure projection over `repository_classifications` — it joins `scout_runs` on `status='completed'` (`src/recon.rs:293-297`) and re-verifies each scope against the working tree, which is why it takes a `root`. It is also best-effort: `reconcile_file_policy_after_index` (`src/recon.rs:504-521`) swallows any error, clears both tables, and warns rather than failing the index, so the structural plane publishes regardless.
+## What survives what
 
-## The vector plane
+Three reset helpers define the split by subtraction, and each is a strict superset of the one before it.
 
-sqlite-vec's `vec0` tables fix vector width at DDL time (`FLOAT[N]`) and carry no foreign keys, and both facts shape the design. Table names encode the dimension — `vec_embeddings_768`, `vec_semantic_embeddings_1024` — because two models with different widths cannot share a table (`src/embed.rs:924-941,943-959`). That forces string interpolation of table names into SQL, guarded by a `1..=8192` bound before construction and, when names are read back out of `sqlite_master` during migration, a numeric-only GLOB plus a Rust `is_ascii_digit` recheck (`src/store.rs:158-181`). With no foreign keys available, a regular table is made authoritative and the virtual rows are slaved to its `id`. In this diagram, note which arrows are joins on a content hash and which are rowid equalities.
+`reset_extraction_state` (`src/store.rs:931`) calls `embed::clear_vector_rows`, then deletes 19 tables children-before-parents in one batch so foreign-key enforcement only ever scans already-emptied referencing tables (`src/store.rs:936-955`), then **drops** `chunks_fts` (`src/store.rs:956`) and recreates it from the shared constant (`src/store.rs:958`). The drop is not stylistic: an FTS5 `DELETE` must read each row to compute inverted-index deltas, while a `DROP` is O(1). That is why the DDL lives in one `CHUNKS_FTS_CREATE` constant with a comment warning that the reset must use the identical definition (`src/store.rs:27-36`). Two things survive that look like they should not: `symbols` is not in the delete list and clears only by FK cascade from `files`, which quietly breaks the children-first discipline the comment above it claims; and `clear_vector_rows` iterates `SELECT DISTINCT dimensions FROM embedding_profiles` and empties only the *code-side* `vec_embeddings_<d>` tables (`src/embed.rs:1810-1821`), so semantic vectors survive an extraction reset intact.
 
-```mermaid
-flowchart LR
-  CH["chunks with hash column"]
-  EMB["embeddings keyed by chunk_hash and profile_id"]
-  ENT["embedding_index_entries id chunk_id profile_id"]
-  VEC["vec_embeddings_N partitioned by profile_id and origin"]
-  PROF["embedding_profiles dimensions and config_fingerprint"]
-  ART["semantic_artifacts"]
-  SEMB["semantic_embeddings keyed by document_hash"]
-  SENT["semantic_embedding_index_entries with document_hash"]
-  SVEC["vec_semantic_embeddings_N partitioned by profile_id"]
+`reset_snapshot_state` (`src/store.rs:969`) is `reset_extraction_state` plus `DELETE FROM package_instances` and deletion of the four publication keys `root`, `snapshot`, `projection_version`, `resolution_hash`. That extra scope is the whole difference between `IndexMode::Incremental` and `IndexMode::FullRefresh`.
 
-  CH -->|"blake3 hash join"| EMB
-  CH -->|"one entry per current occurrence"| ENT
-  ENT -->|"id equals rowid"| VEC
-  EMB -->|"vec blob copied in"| VEC
-  PROF -->|"dimensions selects table name"| VEC
-  PROF -->|"dimensions selects table name"| SVEC
-  ART -->|"document hash join"| SEMB
-  ART -->|"one entry per current artifact"| SENT
-  SENT -->|"id equals rowid"| SVEC
-  SEMB -->|"vec blob copied in"| SVEC
-```
+The durable plane — untouched by both helpers — is `embedding_profiles`, `embeddings`, `semantic_embeddings`, `semantic_embedding_index_entries`, `semantic_artifacts`, `semantic_relations`, `semantic_supports`, `scout_runs`, `scout_classifications`, `repository_classifications`, and the `vec_semantic_embeddings_<d>` tables. The checker plane survives a reset but is then subject to caller policy: `clear_checker_batches` drops everything for manual indexing, while `preserve_active_checker_batch_for_watch` deletes only `active=0` staging rows and keeps the single active batch as a hidden carry source (`src/store.rs:982-996`, chosen at `src/indexer.rs:528-534`). Both return `bool` so the indexer can force a projection rebuild when they changed something. This pair replaced the older `retain_checker_batches_for_snapshot(conn, snapshot)`.
 
-`EMB` is content-addressed, so many chunks with identical text share one vector and a full disposable reindex costs zero re-embedding — chunk IDs change, chunk hashes do not. `ENT` materializes the current occurrences: `materialize_profile` inserts the entry row, takes `last_insert_rowid()`, and writes `VEC` at exactly that rowid (`src/embed.rs:1164-1199`). The price of the split is duplicated vector bytes plus a repair protocol. `sync_vector_index` (`src/embed.rs:1082-1162`) opens `SAVEPOINT jscout_vector_sync`, deletes `VEC` rows whose rowid has no matching entry, materializes new entries, then re-inserts `VEC` rows the entries table claims but `vec0` lacks — the comment calls this repairing "a virtual row lost by an older, non-transactional build." A per-profile `meta` marker records that the full audit ran once; afterwards a cheap regular-table anti-join detects new work instead (`src/embed.rs:1245-1268`). The semantic side is a separate function, `sync_semantic_vector_index` (`src/embed.rs:973-1080`), with its own savepoint and marker key; `sync_vector_index` never touches semantic tables.
+The v16 floor is pinned by one test that seeds a v16 database with files, chunks, a profile plus a materialized vector, a semantic artifact, a scout run, a repository classification, a file-policy row, and an active checker batch, reopens it, and asserts the exact tuple `(1,1,1,1,0,0,0)` — profiles, embeddings, artifacts, and classifications survive; file policy, files, and checker batches do not — plus zero rows in both `embedding_index_entries` and `vec_embeddings_2` (`src/store.rs:1101-1200`).
 
-Query form is exact KNN: `WHERE embedding MATCH ?1 AND k=?2 AND profile_id=?3 AND origin=?4 ORDER BY distance`, with the score handed back as `1.0 - distance` (`src/embed.rs:1492-1529`); [07-retrieval.md](07-retrieval.md) covers how those scores fuse with bm25. Partitioning by `origin` lets `vec0` prune before scanning, but a partition key cannot be matched with an `IN` list, so a multi-origin search issues one query per origin with `k = limit` each, concatenates, sorts, and truncates client-side. Recall is therefore per-origin top-k, not global top-k: searching three origins scans three times and can still miss a globally better hit if one origin dominates the neighborhood.
+## Publication, and the paths the prior analysis called unreachable
 
-Embedding writes commit one `BEGIN IMMEDIATE` per HTTP batch (`src/embed.rs:720-740`) rather than one per run, so a cancelled or crashed embed keeps everything already paid for; the cost is that the database passes through many intermediate states, which is precisely why `sync_vector_index` runs afterwards and must tolerate a partially materialized index.
+Nothing is readable until `meta.snapshot` and `meta.projection_version` land. `structural::rebuild_projection` opens `BEGIN IMMEDIATE` (`src/structural.rs:492`), deletes `resolved_edges`, `graph_nodes`, and `entities` (`src/structural.rs:494-496`), runs six projection stages, and upserts both markers inside the same transaction (`src/structural.rs:590-599`) before COMMIT (`src/structural.rs:601-608`). A failed projection therefore cannot leave a published marker over stale edges. The third marker is not atomic with them: `resolution_hash` is written at `src/indexer.rs:567-572`, *after* the projection transaction commits, so a crash in that window leaves a published snapshot with a stale or absent resolution hash — the next open recomputes and rebuilds, but the atomicity claim covers only two of the three keys.
+
+Two optimizations in `index_repo_impl` are worth naming precisely, because a previous reading of this codebase concluded the incremental indexer was `#[cfg(test)]` and unreachable. That is no longer true. `indexer::incremental_refresh_repo_with_options` is `pub`, carries no `cfg` attribute, and is the watcher's default refresh path (`src/indexer.rs:209-222`, called from `src/watch.rs:1093`). What remains `#[cfg(test)]` is a set of wrappers over that live entry point, listed in [13-incremental-and-watch.md](13-incremental-and-watch.md); the one that matters here is `index_repo_without_extraction_reset` (`src/indexer.rs:290`), kept only so tests can prove the wholesale reset produces the same database. Both of the following therefore run in production:
+
+- **The truncation heuristic.** The indexer counts files whose stored `hash` is empty and switches from per-file replacement to a wholesale reset when `cleared * 2 >= existing.len()` — at or above 50%, not strictly above — gated on `allow_extraction_reset && !existing.is_empty()` (`src/indexer.rs:386-399`). Hashes are blanked by `ensure_extraction_version` (`src/indexer.rs:633`) when `entity::EXTRACTION_VERSION` changes, which also drops `resolved_edges` and `graph_nodes` and unpublishes the snapshot. Cascading `delete_file` through tens of thousands of files re-scans the large evidence tables and the FTS index once per file; truncating keeps a forced re-index at fresh-index cost.
+- **The unchanged-skip.** After computing `resolution_hash` and `snapshot`, if the triple `(snapshot, projection_version, resolution_hash)` matches what is already published and no checker batch changed, the indexer republishes the three markers inside `BEGIN IMMEDIATE` and returns without projecting at all (`src/indexer.rs:541-564`). This is sound because the projection is a pure function of the canonical tables: the snapshot covers extracted content and the resolution hash covers module edges, whose inputs (tsconfigs, manifests, `node_modules` layout) live outside indexed content.
+
+Both paths are exercised on every watcher cycle. See [13-incremental-and-watch.md](13-incremental-and-watch.md) for the surrounding loop.
+
+One further nuance: `embed::materialize_cached_embeddings` is conditional on `outcome.indexed > 0` (`src/indexer.rs:514-516`), so an index run that changed nothing does not touch the vector plane at all. And `recon::reconcile_file_policy_after_index` (`src/recon.rs:498`, called from both `src/indexer.rs:563` and `578`) returns `()`, not `Result`: on error it clears `repository_file_policy` and `repository_current_classifications`, prints a warning, and lets the index succeed with neutral policy.
 
 ## Full-text search
 
-`chunks_fts` is created from a single shared constant so its definition cannot drift between `init_schema` and the reset path (`src/store.rs:27-36`):
+There is exactly one FTS5 table, `chunks_fts(content, name, symbols, path)` with `tokenize="unicode61 tokenchars '_$'"` (`src/store.rs:31-36`). Promoting `_` and `$` to word characters keeps `snake_case` and `$jquery`-style identifiers whole through tokenization, which matters because identifier search is the dominant query shape. Ranking uses `bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0)` (`src/search.rs:896`) — name weighted 4×, symbols 3×, content 2×, path 1×.
 
-```
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  content, name, symbols, path,
-  tokenize="unicode61 tokenchars '_$'"
-);
-```
-
-`tokenchars '_$'` keeps `snake_case` and `$`-prefixed identifiers as single tokens. It is a plain FTS5 table — not `content=` external-content, not contentless — so it stores a second full copy of every chunk's text; that duplication, not the inverted index, dominates database size. Resets `DROP TABLE chunks_fts` and recreate it rather than deleting rows, because deleting FTS5 rows one at a time rewrites the inverted index while dropping discards the shadow tables outright. Single-file deletion is manual for the same reason: `delete_file` (`src/store.rs:977-985`) removes vec0 rows, then FTS rows via `rowid IN (SELECT id FROM chunks WHERE file_id=?)`, then the `files` row — order matters, because the FTS subquery needs `chunks` to still exist. Ranking is `bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0)` — name 4×, symbols 3×, content 2×, path 1×, lower is better (`src/search.rs:263`).
-
-## Migration is one boundary, not a ladder
-
-`open_path` compares `meta.schema_version` against the string `"23"`. Three outcomes (`src/store.rs:115-143`): equal means do nothing; a parsed value in 16–22 runs `rebuild_legacy_disposable_schema`; anything else bails with a message telling the user to preserve the old file if its embedding cache or semantic memory matters. The rebuild enumerates dimension-suffixed vec0 tables from `sqlite_master`, `DELETE`s their rows rather than dropping the tables, drops 29 disposable tables inside `BEGIN IMMEDIATE`, deletes the `root`/`snapshot`/`projection_version`/`resolution_hash`/`extraction_version` meta keys plus both sync-marker prefixes, and stamps `23`.
-
-Both sides of the tradeoff are visible: any upgrade from 16–22 forces a full reindex and anything below 16 is a hard refusal, but in exchange there is no migration ladder to maintain, because the disposable plane recomputes at fresh-index cost and the cache and memory shapes have been stable since v16. One ad-hoc `ALTER` survives outside that path — `repository_classifications.cited_evidence_json` is backfilled if absent (`src/store.rs:822-838`), so databases from a mid-review v20 commit keep their reconnaissance history.
-
-One textual footgun: `'23'` is hardcoded as a literal in the migration's `UPDATE meta SET value='23'` (`src/store.rs:220`) and again in the `init_schema` insert (`src/store.rs:238`), so bumping `SCHEMA_VERSION` means editing three places, or migrated databases stay stamped 23 and re-enter the migration on every open.
-
-## Transactions and the publication boundary
-
-The indexer wraps the reset, every file extraction, and orphan deletion in one deferred `BEGIN`, and the same transaction ends by deleting `snapshot`, `projection_version`, and `resolution_hash` from `meta` before `COMMIT` (`src/indexer.rs:237,324-327`). Canonical rows and *unpublication* therefore land atomically, so the dependency and resolution phase that follows can fail without leaving a stale graph queryable. Symmetrically, `rebuild_projection` runs `BEGIN IMMEDIATE`, truncates `resolved_edges`/`graph_nodes`/`entities`, runs its projection stages, and writes `snapshot` and `projection_version` as the last two statements before `COMMIT` (`src/structural.rs:445-556`) — publication is literally the final act. The symmetry has one hole: `resolution_hash` is written by the caller in a separate autocommit statement *after* the projection commits (`src/indexer.rs:384-388`), so a crash in that window leaves a database that passes the read-only publication check with a missing or stale `resolution_hash`.
-
-Nested operations use named savepoints rather than `BEGIN`, because they run both standalone and inside a caller's transaction and savepoints nest while `BEGIN` does not: `jscout_vector_sync`, `jscout_vector_materialize`, and `jscout_semantic_vector_sync` in `src/embed.rs`, plus `with_read_snapshot` (`src/store.rs:842-859`), which pins a multi-statement read to one SQLite snapshot so search expansion can call neighborhood traversal without a torn view. Error handling everywhere is a manual `ROLLBACK TO` plus `RELEASE` in a repeated closure-and-match idiom.
-
-Production only ever takes the full-refresh path. `refresh_repo_with_options` (`src/indexer.rs:150-156`) is the sole production entry point — called from `cmd_index` and from the watcher — and it always passes `IndexMode::FullRefresh`; `index_repo` and `index_repo_with_options` are `#[cfg(test)]` (`src/indexer.rs:132,140`). Several mechanisms in the file are therefore dead in production. With `FullRefresh` the `existing` map starts empty (`src/indexer.rs:204-206`), so the "at least half the files have a cleared hash, truncate instead of cascading per-file deletes" heuristic (`src/indexer.rs:229-234`) is never consulted, nothing is skipped as unchanged, and the orphan sweep is a no-op. The republish shortcut is likewise unreachable: `previous` is forced to the all-`None` identity whenever `extraction_reset` is true (`src/indexer.rs:310-318`), which is always, so `previous == current` can never hold. Those paths exist so tests can compare full-refresh output against the historical incremental algorithm; [11-incremental-and-watch.md](11-incremental-and-watch.md) traces what the watcher actually does instead.
+The exact-identifier tier added in G17 uses FTS differently: as a bounded candidate generator only. It issues a phrase match with `LIMIT limit * 32` clamped to `32..4096`, then re-verifies case-sensitive identifier boundaries against the stored chunk text in Rust before admitting a hit (`src/search.rs:659-697`). The comment gives the reason: object-literal field keys, non-call member reads and writes, and some computed state containers never become `refs` or `member_calls` rows, so the structured tables cannot answer "where does this identifier literally appear". See [07-retrieval.md](07-retrieval.md).
 
 ## Indexes that exist for a specific reason
 
-| Index | On | Why |
-|---|---|---|
-| `idx_chunks_hash` | `chunks(hash)` | Makes the content-addressed join `embeddings e ON e.chunk_hash=c.hash` cheap during materialization |
-| `idx_events_file`, `idx_member_calls_file` | `(file_id)` | Keeps a per-file cascade delete off a full scan of a high-volume table; asserted by a `pragma_index_info` test |
-| `idx_resolved_edges_src`, `_dst` | `(key, confidence, kind)` | Leads with the key and carries both filter columns, so filtered traversal either direction is index-only |
-| `idx_checker_one_active_batch` | `(active) WHERE active=1` | At most one active checker batch database-wide |
-| `idx_repository_classifications_evidence` | `(subject_key, evidence_fingerprint, id DESC)` | Reuses a prior verdict when the snapshot-free evidence identity matches |
+| Index | Table and columns | Why |
+| --- | --- | --- |
+| `idx_chunks_hash` (`281`) | `chunks(hash)` | Makes the content-addressed join `embeddings e ON e.chunk_hash = c.hash` cheap during vector materialization |
+| `idx_events_file` (`372`) | `events(file_id)` | Keeps the per-file cascade delete off a full scan of a high-volume table |
+| `idx_member_calls_file` (`391-392`) | `member_calls(file_id, receiver_start, prop)` | Widened at v26 so member-call projection joins are index-only |
+| `idx_embedding_entries_profile` (`502-503`) | `embedding_index_entries(profile_id, chunk_id)` | Drives the anti-join that detects unmaterialized occurrences |
+| `idx_graph_nodes_native` (`517-518`) | `graph_nodes(native_id, native_table)` | Added at v25; makes the projection-to-source reverse lookup index-only |
+| `idx_resolved_edges_src` / `_dst` (`532`, `534`) | `(key, confidence, kind)` | Confidence- and kind-filtered traversal stays index-only in either direction |
+| `idx_checker_one_active_batch` (`556-557`) | UNIQUE `(active) WHERE active=1` | Database-enforced "at most one active checker batch", no application logic |
+| `idx_checker_enrichments_source` (`611`) | `(source_file, call_start)` | The content-based re-match join that replaces a foreign key to `member_calls` |
+| `idx_scout_runs_active` (`662-664`) | UNIQUE `(scout_kind, input_fingerprint) WHERE status IN ('running','completed')` | Single-flight claim for scouting; `--rebuild` must supersede first |
+| `idx_repository_classifications_evidence` (`695`) | `(subject_key, evidence_fingerprint, id DESC)` | Lets a later run reuse a verdict whose evidence has not changed |
+| `idx_semantic_artifacts_one_successor` (`793-795`) | UNIQUE `(supersedes_artifact_id) WHERE NOT NULL` | Makes supersession a chain, never a tree |
 
-## Limits and gaps
+Making single-flight and single-active into partial unique indexes rather than application checks means no code path can forget them; the cost is that the failure surfaces as a raw SQLite constraint error that callers must translate.
 
-There is no `VACUUM` anywhere in `src/`, and no retention policy for any append-only table. `semantic_artifacts`, `scout_runs`, `scout_classifications`, and `repository_classifications` grow monotonically; repeated full reindexes leave free pages that SQLite reuses but never returns to the filesystem, so the file approaches a high-water mark and stays there.
+## Vector plane mechanics
 
-`checker_enrichments.member_call_id` and `source_file_id` are integers with no foreign keys, by explicit design comment (`src/store.rs:534-538`): a projection rebuild renumbers those IDs and must not cascade-destroy facts that cost a full TypeScript program build. Re-anchoring goes through `source_file` + `source_hash` + all six span columns instead, and the projection join enforces the snapshot at read time as well as at retention time — `project_checker_enrichments` requires `batch.active=1 AND batch.source_snapshot=?1 AND run.status='completed'` (`src/structural.rs:2127-2143`), so stale checker facts cannot leak even if the retention delete were skipped. Referential integrity in this plane is convention, not enforcement.
+`vec_embeddings_<d>` is created on demand with `embedding FLOAT[d] distance_metric=cosine, profile_id INTEGER PARTITION KEY, origin TEXT PARTITION KEY` (`src/embed.rs:1128-1132`); the semantic variant partitions only on `profile_id`, since artifacts have no file origin (`src/embed.rs:1168-1171`). Dimensions are validated `1..=8192` before being interpolated into the table name (`src/embed.rs:1103-1108`, `1158-1161`), which bounds the `vec_*_<digits>` namespace and makes the migration's GLOB enumeration total. The partition keys prefilter KNN inside the index rather than post-filtering results, which would silently shrink k — but a partition key accepts only a single equality, so origin-filtered search issues one query per requested origin and merges in Rust.
 
-Dynamic table names are interpolated into SQL in roughly a dozen places in `src/embed.rs`. The guards are real but live inside `vector_table()` and `semantic_vector_table()`, so any new call site that formats a name itself loses them; nothing tests that vec0 names survive an adversarial `sqlite_master` row. `module_edges` is truncated and fully rebuilt on every index run (`src/indexer.rs:956-957`) even when zero files changed, because its inputs — tsconfigs, manifests, `node_modules` layout — live outside indexed content and are covered by `resolution_hash` rather than by the snapshot hash. See [17-sharp-edges.md](17-sharp-edges.md) for the rest.
+Freshness is a `meta` marker plus a cheap anti-join, not an audit. `vector_index_needs_sync` first checks for `meta['embedding_index_synced_v1:<profile_id>']`, then runs `chunks ⋈ embeddings LEFT JOIN embedding_index_entries WHERE i.id IS NULL LIMIT 1` (`src/embed.rs:1502-1531`) — index-time, versus O(vectors) for auditing every `vec0` row on every search. The invariant it depends on is that a marker may not outlive a populated table, so `ensure_vector_table` deletes every marker for that dimension before publishing a replacement (`src/embed.rs:1118-1124`) — but only when the table did not already exist (`if !existed`), not unconditionally. Because profiles of equal dimension share one `vec0` table, invalidation is by dimension, not by profile. Both `delete_vector_rows_for_file` and `clear_vector_rows` call `ensure_vector_table` (`src/embed.rs:1804`, `1818`), so a code path whose entire job is deletion can create an empty virtual table as a side effect. See [06-semantic-layer.md](06-semantic-layer.md) for how vectors are produced.
 
-## Testing
+## Transactions, pragmas, and concurrency
 
-All tests are inline `#[cfg(test)] mod tests` blocks; there is no top-level `tests/` directory. The store tests aim at the risky boundaries rather than at DDL coverage. `read_only_open_never_creates_or_migrates_an_index` builds a v14 file and asserts both the reader and the writer reject it *and* that `schema_version` is unchanged afterwards. `v16_durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema` seeds every durable plane at v16, reopens, and asserts exact row counts across `embedding_profiles`, `embeddings`, `semantic_artifacts`, `repository_classifications`, `repository_file_policy`, `files`, `checker_enrichment_batches`, `embedding_index_entries`, and `vec_embeddings_2` — the one test that pins the whole durable/disposable contract. `genuine_v15_embedding_schema_is_rejected_without_mutation` proves the pre-profile `embeddings` shape is refused with the file untouched, and `indexes_high_volume_evidence_tables_by_file` introspects `pragma_index_info` to assert `idx_events_file` and `idx_member_calls_file` lead with `file_id`. Uncovered: concurrent writers, `busy_timeout`, resuming a partially completed embedding run across a process restart, and the `sqlite3_auto_extension` registration itself, which is exercised only implicitly by every other test that touches a vec0 table.
+Writes use a bare `execute_batch("BEGIN IMMEDIATE")` with a closure and manual COMMIT/ROLLBACK; the idiom recurs roughly 25 times across `src/store.rs`, `src/structural.rs`, `src/indexer.rs`, `src/recon.rs`, `src/checker/enrich.rs`, and `src/scouting/`. Reads use `store::with_read_snapshot` (`src/store.rs:858-874`), which wraps a named `SAVEPOINT` so a multi-statement read sees one SQLite snapshot. Savepoints rather than transactions, because they nest: search expansion can re-enter neighborhood traversal, which pins its own snapshot, without the inner call committing or aborting the outer one. Callers pass distinct names — `jscout_search`, `jscout_neighborhood`, `jscout_semantic_query`, `jscout_scout_plan` — and the vector plane uses the same trick for the same reason.
+
+Every savepoint error arm discards the unwind result with `let _ = conn.execute_batch("ROLLBACK TO …; RELEASE …")` (`src/store.rs:869`, `src/embed.rs:1136-1139`, and the rest), so a failure to unwind is invisible and leaves an open savepoint on the connection. `busy_timeout` is left at SQLite's default of 0 on every connection except the watcher's, which sets 5 seconds (`src/watch.rs:17`, `1314`) — so a second CLI invocation or an MCP `annotate` racing an index run gets an immediate `SQLITE_BUSY` rather than waiting. The read-only opener sets no `journal_mode` at all; `with_read_snapshot`'s savepoint is what pins the snapshot on those connections.
+
+## Known gaps
+
+`store::file_source_path` (`src/store.rs:1012-1039`) is the reminder that `files.path` is a display key, not a path. Repository and workspace origins join `root + files.path`; dependency origins must join `package_instances.canonical_root + files.package_path`, because a dependency's `files.path` is a synthetic `dependency:name@version/rel` string. Any consumer treating `files.path` as a filesystem path is wrong for a third of the corpus.
+
+`semantic_relations.dst_artifact_id` references `semantic_artifacts(id)` without `ON DELETE CASCADE` while `src_artifact_id` has it (`src/store.rs:775-776`), so deleting a summarized child artifact raises an FK error while deleting the summarizing parent succeeds. `repository_file_policy.classification_id` similarly has no `ON DELETE` clause pointing at the durable parent — harmless while classifications are immutable, an error the first time someone purges history. `semantic_relations.names_concept` is a reserved CHECK value with no writer (`src/store.rs:777-781`). And no test asserts the total table count or diffs a live schema against `init_schema`, so the drop list in the migration and the `CREATE` list in `init_schema` can drift apart silently — as `checker_input_files` already has.
+
+Finally, a note on evidence: the repository's own checked-in `.jscout.db` is schema v4 and `eval/fixtures/structural/.jscout.db` is v6. Both are far below `DURABLE_SCHEMA_FLOOR`, so the current binary refuses both. Their `.schema` output describes a shape with `embeddings(chunk_hash, model, dim, vec)`, no `entity_*`/`checker_*`/`scout_*`/`package_instances` tables, and `member_calls` without receiver spans — it is not evidence about v26 and must not be read as such. Further rough edges are collected in [19-sharp-edges.md](19-sharp-edges.md).

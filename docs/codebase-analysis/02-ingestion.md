@@ -1,176 +1,167 @@
 # Ingestion: discovery, parsing, chunking, and resolution
 
-Ingestion turns a checkout on disk into rows in the SQLite snapshot. It enumerates every indexable JS/TS file under a repository root, parses each with oxc inside a scoped arena, cuts the program into symbol-aligned chunks that deliberately drop type-only syntax, classifies each file's role and corpus origin, writes chunks and structural evidence in one sequential transaction, and then — after the canonical rows are committed — resolves every module request into `module_edges` using an `oxc_resolver` configured with an alias table built from the repository's own manifests. Everything downstream reads only what this phase produced, so its determinism and its erasure decisions are load-bearing for the whole system.
+Ingestion turns a checkout on disk into rows. Four mechanically separate stages meet inside `index_repo_impl` (`src/indexer.rs:307`): an ignore-aware inventory produces a sorted list of absolute paths plus a list of per-path failures (`src/walk.rs:98`); each file is read, hashed, and — if its hash moved — parsed once inside a scoped arena and cut into chunks (`src/parse.rs:26`, `src/chunk.rs:106`); every file gets a role label from its path and its first 4 KiB (`src/file_role.rs:16`); and a workspace manifest scan builds an alias table that lets `oxc_resolver` land monorepo imports on indexed source rather than on build output (`src/workspace.rs:76`). The stage that most shapes what retrieval can see is chunking, because it erases type-only syntax: an authored `.d.ts` gets a `files` row and contract evidence but can produce zero chunks and therefore zero embeddings.
 
-## Discovery
+## Discovery: what enters the corpus
 
-`walk::source_files` (`src/walk.rs:22`) builds an `ignore::WalkBuilder` with `hidden(true)`, `git_ignore(true)`, `git_global(true)` and `git_exclude(true)`, so dot-entries and all three gitignore layers are honored without project-specific configuration, then installs a `filter_entry` closure (`src/walk.rs:29`) rejecting any directory whose basename appears in `SKIP_DIRS`. Because `filter_entry` prunes rather than filters, those subtrees are never descended even when not gitignored — which matters for `dist/`, since a built monorepo package often ships output that is present but uncommitted.
+`source_walk_builder` (`src/walk.rs:82`) configures `ignore::WalkBuilder` with `hidden(true)`, `git_ignore(true)`, `git_global(true)`, `git_exclude(true)` (`src/walk.rs:86-89`) and one `filter_entry` closure (`src/walk.rs:90`) that calls `is_in_skipped_directory` (`src/walk.rs:70`). That predicate strips the root prefix and tests every remaining component against `SKIP_DIRS` — `node_modules`, `dist`, `.next`, `coverage`, `out` (`src/walk.rs:11`). Because the test runs on the *root-relative* path, a repository whose own root directory is named `dist` still indexes: `strip_prefix` leaves an empty path with no components. `build` is deliberately absent from the list; `src/build/` is a real authored directory in many repos, and gitignore already excludes genuine build output (test at `src/walk.rs:197`).
 
-| Knob | Value | Where |
-| --- | --- | --- |
-| Indexable extensions | `js jsx ts tsx mjs cjs mts cts` | `src/walk.rs:5` |
-| Pruned directories | `node_modules dist build .next coverage out` | `src/walk.rs:8` |
-| Always rejected | `*.d.ts`, `*.d.mts`, `*.d.cts` | `src/walk.rs:13` |
-| Ignore sources | `.gitignore`, global gitignore, `.git/info/exclude`, hidden entries | `src/walk.rs:25-28` |
+`is_indexable` (`src/walk.rs:13`) is now nothing but an extension test against `EXTENSIONS` (`src/walk.rs:8`). Declaration files are not rejected by extension — a `.d.ts` has extension `ts` and passes. The comment at `src/walk.rs:14-16` gives the reasoning: declaration files carry the contract plane, and excluding them by suffix threw that evidence away; *generated* declarations are meant to be excluded structurally, by the skipped-directory prune and by origin policy. The tradeoff shows in the numbers: a `.d.ts` occupies a `files` row and contributes near-zero chunks, so file and chunk counts diverge, and a hand-written `.d.ts` under an output directory nobody named in `SKIP_DIRS` now enters the corpus.
 
-The declaration-file rejection is the first appearance of the type-erasure stance: a `.d.ts` has no runtime behavior, so it contributes nothing the indexer models. The result vector is `sort()`ed (`src/walk.rs:39`), and that sort is what makes the entire index reproducible — file ids, chunk ids, and the structural snapshot hash all inherit walk order. There is no user-facing include/exclude configuration; the only levers are gitignore and the hardcoded `SKIP_DIRS`, which is also reused by workspace glob expansion and entry-candidate filtering (`src/workspace.rs:520`) and by dependency file collection (`src/dependency.rs:537`). `src/walk.rs` has no unit tests of its own.
+`SKIP_DIRS` is read from eight places — `is_in_skipped_directory` (`src/walk.rs:78`), which the watcher's event filter also calls (`src/watch.rs:498`), plus `checked_child_dirs` (`src/workspace.rs:544`), `entry_candidates` (`src/workspace.rs:884`), mirror-tail detection (`src/workspace.rs:980`), wildcard prefix translation (`src/workspace.rs:1044`), and two filesystem scan helpers (`src/workspace.rs:1120`, `:1193`). It is not, however, the whole exclusion policy: the hidden-file and gitignore flags exclude far more, and they are only reachable through the builder.
 
-## Parsing: the arena-scoped borrow
+## The I/O trichotomy
 
-oxc allocates the AST in a bump arena, and `Semantic` borrows that AST. `parse::with_parsed` (`src/parse.rs:26`) turns that lifetime constraint into an API: it creates an `Allocator` on its own stack frame, parses into it, builds semantic data from `&ret.program`, and calls the caller's closure with `(&ParserReturn, &Semantic)`. Only an owned `T` escapes, so no caller can hold a `Program` past the arena's lifetime and all per-file analysis has to be one pass inside the closure — which is what `extract_file` does, running the chunker and `graph::extract` back to back and returning an owned `FileData { chunks, graph, lines }` (`src/indexer.rs:480-491`). `SemanticBuilder` is configured `.with_build_nodes(true)` (`src/parse.rs:46`) because reference classification in the graph extractor walks node ancestors.
+`source_inventory` (`src/walk.rs:98`) replaced a lossy `walker.flatten()` with a three-way classification driven by `src/io_policy.rs`. The premise is that not all filesystem failures mean the same thing, and collapsing them either loses data silently or wedges a repository over one unreadable directory.
 
-Error handling is deliberately narrow. oxc returns diagnostics for recoverable problems as a matter of course, so only `ret.panicked` aborts (`src/parse.rs:34`) — a file with recoverable syntax errors still indexes in full. When the parser does abort, the first diagnostic is lifted into the outer `anyhow` error text (`src/parse.rs:35-43`) rather than attached as context, because callers already add the path and `Display` on a context chain would otherwise collapse to just the path.
+| Class | Predicate | Walk behavior | Rationale |
+|---|---|---|---|
+| Inventory race | `io_policy::is_inventory_race` — `NotFound`, `IsADirectory`, `NotADirectory` (`src/io_policy.rs:6`) | Dropped silently (`src/walk.rs:112`, `:128`) | An inventory is not atomic; a file deleted mid-walk is absence, not loss |
+| Retryable | `io_policy::is_retryable` — `Interrupted`/`WouldBlock`/`TimedOut`/connection kinds, plus `EIO`, `EMFILE`, `ENFILE`, `ENOMEM`, `ESTALE`, … (`src/io_policy.rs:16`, `:38`) | Abort the whole inventory with context (`src/walk.rs:108-111`, `:123-127`) | A resource failure can affect an arbitrary slice of the corpus; publishing a clean-but-random subset is worse than failing |
+| Permanent | everything else — `PermissionDenied`, `InvalidData`, … | `WalkRejection { path, stage, error }` and continue (`src/walk.rs:113-118`, `:129-135`) | One chmod-000 subtree must not stop the repository from indexing |
 
-`source_type_for` (`src/parse.rs:9`) takes `SourceType::from_path` and, for anything `is_javascript()`, calls `.with_jsx(true)`. The comment at `src/parse.rs:11-15` gives the reason: oxc 0.143 derives the non-JSX variant for `.js`/`.mjs`/`.cjs`, but JSX in `.js` is routine in Babel- and framework-owned sources, and JSX's grammar is additive for JavaScript, so `a < b && c > d` still parses (test at `src/parse.rs:87`). TypeScript stays extension-strict — only `.tsx` enables TSX — because `<T>expr` type assertions and JSX elements are genuinely ambiguous in `.ts`. Exotic JS hostile to JSX tokenization could still mis-parse; an unknown extension falls back to `SourceType::default()`.
+A depth-0 error also aborts (`src/walk.rs:108`) — failing at the root is not a partial failure. Rejections carry a `stage` string separating a traversal failure (`"walk"`) from an ignore-file read failure (`"ignore"`), and `index_repo_impl` folds both into `IndexOutcome` (`src/indexer.rs:338-351`). The same trichotomy reappears in `classified_io` for workspace discovery (`src/workspace.rs:337-357`) and inline in the source read loop (`src/indexer.rs:412-423`) — the cost being that every filesystem call site becomes a three-arm match, and workspace discovery grew a parallel `classified_*` copy of each traversal helper alongside the unclassified `FilesystemSources` versions.
 
-## Chunking
+`files.sort()` (`src/walk.rs:141`) makes traversal order stable across runs. It is *not* what makes ids or hashes deterministic: the structural snapshot is computed with `ORDER BY f.path` and the resolution hash with an explicit multi-column ordering (`src/structural.rs`), and on the incremental path unchanged files keep their existing rowids (`src/indexer.rs:427-436`), so `files.id` does not follow inventory order after the first index. The sort buys reproducible diagnostics and stable rejection ordering.
 
-Sizing is byte-based and crude: `est_tokens(span) = (span.end - span.start) / 4` (`src/chunk.rs:64`), with `TARGET_TOKENS = 1200` and `MAX_TOKENS = 2000` (`src/chunk.rs:9-10`) — 4800 and 8000 bytes. There is no overlap window; the model is a span-partition of the file, not a sliding window. The path from statements to rows:
+`SourcePathPolicy` (`src/walk.rs:38`) exposes the same ignore configuration to the watcher as a standalone `ignore::IncrementalIgnore` matcher, so single-path event classification uses the walker's policy rather than a copied rule set. Its `is_ignored` (`src/walk.rs:56`) deliberately reports "not ignored" when the matcher errors — the watcher then schedules a refresh whose inventory pass will classify and report the error properly. The watcher rebuilds the policy after each successful refresh (`src/watch.rs:457`), so ignore-file edits take effect at the same publication boundary as the new inventory.
 
-```mermaid
-flowchart TD
-  SRC["Source text + oxc Program"] --> US["units_for_statement per top-level stmt"]
-  US -->|"interface, type alias, import type, declare"| ERASE["No unit emitted"]
-  US -->|"import"| UI["Unit kind Imports"]
-  US -->|"function, class, const fn"| UN["Named unit"]
-  US -->|"anything else"| UM["Unit kind Module, anonymous"]
-  UN -->|"est_tokens over MAX"| SPLIT["Header unit atomic plus one unit per body member"]
-  UI --> LC["with_leading_comment extends span back over adjacent comment"]
-  UN --> LC
-  UM --> LC
-  SPLIT --> LC
-  LC --> MERGE["merge_units walks adjacent pairs"]
-  MERGE -->|"both Imports, no size cap"| GLUE["Span union min start to max end"]
-  MERGE -->|"both anonymous Module and sum under TARGET"| GLUE
-  MERGE -->|"named, atomic, or scope mismatch"| FLUSH["Flush unit"]
-  GLUE --> FLUSH
-  FLUSH --> U2C["unit_to_chunks"]
-  U2C -->|"still over MAX"| SBL["split_by_lines into 4800 byte pieces"]
-  U2C --> CH["Chunk with blake3 hash, line numbers, file_imports"]
-  SBL --> CH
-```
+`walk::source_files` (`src/walk.rs:148`) discards rejections and returns only the file list. It exists for read-only diagnostics — `cmd_chunks` and `cmd_stats` (`src/commands/core.rs:435`, `:468`) — and indexing must not use it, because dropping rejections would make an inaccessible subtree indistinguishable from an empty one.
 
-The `ERASE` branch is the philosophy made mechanical. `units_for_statement` (`src/chunk.rs:119`) matches `TSInterfaceDeclaration`, `TSTypeAliasDeclaration`, `TSImportEqualsDeclaration`, `declare` module declarations, `import type` and `export type` and emits nothing (`src/chunk.rs:122-127`); the same arms repeat inside the `export <decl>` unwrap (`src/chunk.rs:160-163`), and `units_for_function` returns early for `f.declare` (`src/chunk.rs:205`). No chunk is ever created for a type-only construct, so interfaces and type aliases are not retrievable through chunk search at all. Type edges survive separately in `contract_imports`/`contract_exports`, but the text of a type declaration is only ever visible in a chunk by accident, via span union (see below).
+## Parsing: one arena, one pass
 
-`SPLIT` handles oversized declarations. A function over `MAX_TOKENS` becomes an `atomic` header unit spanning `full_span.start .. first_body_statement.start`, plus one non-atomic `Module` unit per body statement carrying the function name in `scope_chain` (`src/chunk.rs:242-261`). Classes split the same way into a `ClassHeader` and one `Method` unit per member (`src/chunk.rs:295-317`). `units_for_var` promotes a single-declarator `const Foo = () => …` or `= function …` to a named unit and applies the same header/body split to an oversized arrow with a block body (`src/chunk.rs:329-375`). `component_or_function` (`src/chunk.rs:190`) calls a named unit a `Component` when the file is JSX and the name starts with an ASCII uppercase letter.
+`with_parsed` (`src/parse.rs:26`) is a scoped-borrow around oxc's arena allocation. `Allocator::default()` is created on that stack frame (`src/parse.rs:31`), `Parser::new(&allocator, source, source_type).parse()` allocates the `Program` inside it (`src/parse.rs:33`), `SemanticBuilder::new().with_build_nodes(true).build(&ret.program)` borrows it (`src/parse.rs:45-47`), and the caller sees only `(&ParserReturn<'_>, &Semantic<'_>)` inside an `FnOnce` returning an owned `T`. No AST node can outlive the call, which is enforced by lifetimes rather than convention. The consequence is that every per-file analysis has to happen in one pass, and it does: `extract_file` (`src/indexer.rs:662-673`) runs the chunker and `graph::extract` back to back inside the closure and returns owned `FileData`. Node building is on because reference classification walks node ancestors (comment at `src/parse.rs:44`).
 
-`merge_units` (`src/chunk.rs:405`) is where the "named declarations stand alone" rule lives. Two adjacent units merge only when neither is `atomic`, their `scope_chain`s are equal, and either both are `Imports` — with *no* size cap at all, so a huge import block merges into one unit and is only afterwards line-split — or both are anonymous `Module` units whose combined estimate is at or under `TARGET_TOKENS` (`src/chunk.rs:429-434`). The stated reason (`src/chunk.rs:421-424`) is that a chunk that *is* `getUser` retrieves better than one containing `getUser` plus three unrelated statements. The cost is row count: a file of one-line exports produces one chunk per export, each with its own embedding.
+Only `ret.panicked` rejects a file (`src/parse.rs:34`); recoverable diagnostics still index in full, which is what makes a repository mid-refactor still searchable. The first diagnostic is lifted into the *outer* anyhow message (`src/parse.rs:42`) because callers already attach the path, and an anyhow context chain's `Display` would collapse to path-only.
 
-Merging takes `min(start) .. max(end)` (`src/chunk.rs:436-437`) — a span union, not a concatenation. Any text lying between two merged units is absorbed, including erased type declarations that produced no unit, so a `type Foo = …` sandwiched between two mergeable anonymous statements does reappear in chunk content. Erasure is a guarantee about *chunk boundaries and names*, not about which bytes can appear inside a chunk.
+`source_type_for` (`src/parse.rs:9`) opts every `is_javascript()` source type into `.with_jsx(true)` (`src/parse.rs:16`) while leaving TypeScript extension-strict. JSX's grammar is additive over JS, so ordinary comparisons like `a < b && c > d` still parse (test at `src/parse.rs:74`); `.ts` cannot get the same treatment because `<T>expr` type assertions and JSX elements are genuinely ambiguous. Unknown extensions fall back to `SourceType::default()`.
 
-Chunk spans within a file are also **not** strictly disjoint. `chunk_program` applies `with_leading_comment` to every unit including the inner body-statement units of a split (`src/chunk.rs:112-114`), so a comment sitting inside a header unit's span can also be pulled into the following body unit's span, duplicating that comment across two chunks. In practice this is benign — `chunk_for` (`src/indexer.rs:552`) attributes evidence to the *first* chunk whose `[start, end)` contains the offset, and evidence offsets never land inside a comment — but any consumer that assumes a partition will be wrong. `with_leading_comment` (`src/chunk.rs:389`) scans comments in reverse, stops at the first one ending at or before the span start, and extends only when the intervening gap is whitespace with at most one newline.
+## Chunking: erasure, then symbol-aligned boundaries
 
-`unit_to_chunks` (`src/chunk.rs:461`) is the last-resort splitter. Anything still over `MAX_TOKENS` goes through `split_by_lines` (`src/chunk.rs:494`), which walks 4800-byte budgets, backs the provisional end up to the nearest preceding `\n`, and guards `is_char_boundary` on both sides of that search so a multibyte codepoint is never cut (`src/chunk.rs:503-517`). A single "line" longer than the budget yields an over-budget chunk rather than a broken one. Multi-part results are named `Name#part1`, `#part2`, and only part 1 keeps `symbols` (`src/chunk.rs:471-481`).
+Sizing is crude on purpose: `est_tokens` is `bytes / 4` (`src/chunk.rs:64`), measured against `TARGET_TOKENS = 1200` and `MAX_TOKENS = 2000` (`src/chunk.rs:9-10`) — 4800 and 8000 bytes. There is **no overlap window**: chunks are cut at syntactic boundaries and adjacent chunks share no text, so retrieval cannot rely on a straddling window to catch a symbol sitting at a seam. The compensation is that boundaries land where a reader would place them, and that every chunk carries the file's full import list as context (`file_imports`, `src/chunk.rs:42`, from `module_record.requested_modules` at `src/chunk.rs:90-96`).
 
-| `Chunk` field | Note |
-| --- | --- |
-| `kind` | `Function \| Component \| Class \| ClassHeader \| Method \| Imports \| Module` (`src/chunk.rs:14`), snake_case in SQL/JSON |
-| `name` / `scope_chain` | `scope_chain` is outermost-first, e.g. `["UserService"]` for a method |
-| `symbols` | top-level declared names; part 1 only for split chunks |
-| `start` / `end` | byte offsets, used by `chunk_for` to attach evidence |
-| `start_line` / `end_line` | 1-based, `partition_point` over newline offsets (`src/chunk.rs:59`) |
-| `hash` / `content` | `blake3(content)` hex (`src/chunk.rs:486`) plus the verbatim source slice |
-| `file_imports` | sorted `requested_modules` keys — per-*file* context copied onto every chunk (`src/chunk.rs:41-42`) |
-
-## Role and origin
-
-Two orthogonal labels are attached to every file. `file_role::classify` (`src/file_role.rs:16`) lowercases the path, splits it into components, lowercases the first ≤4096 bytes as a header (with an `is_char_boundary` walk-back so the truncation is UTF-8 safe), and applies a fixed precedence: generated → fixture → test → documentation → production. Markers are whole path components or filename infixes, and `@generated`-style header text also forces `generated` (`src/file_role.rs:115`). Singular `doc/` is deliberately excluded from the documentation markers (`src/file_role.rs:71-74`) because document-domain production code commonly uses that directory name. `penalty` (`src/file_role.rs:95`) turns the role into a retrieval multiplier — production/absent 1.0, unknown 0.75, documentation 0.4, test 0.3, fixture 0.2, generated 0.1 — and maps any *unrecognized* role to 0.0, so adding a role to `ALL` without updating `penalty` would silently zero those files out of ranking. Classification runs before the unchanged-hash comparison (`src/indexer.rs:262` precedes `:263`), so a refresh pays for it on every file regardless.
-
-`origin` is a much smaller three-value partition — `repository`, `workspace`, `dependency` (`src/origin.rs:3`) — stored as a `files.origin` column with a CHECK constraint and used as a query-time allowlist by every retrieval surface. Only the first two are on by default (`src/origin.rs:4`). `workspace` is assigned after the fact by a literal path-prefix `UPDATE` in `dependency::synchronize_instances`, and `dependency` rows live under a synthetic path.
-
-## The drive loop
-
-`index_repo_impl` (`src/indexer.rs:177`) is the entire driver and it is strictly sequential: one `rusqlite::Connection`, one `for file in &files`, no parallelism anywhere in the crate. Only `refresh_repo_with_options` (`src/indexer.rs:150`) is reachable from production — `jscout index` (`src/main.rs:1572`) and every watcher generation use it, always with `IndexMode::FullRefresh`. The incremental variants are `#[cfg(test)]` (`src/indexer.rs:132-146`), retained so differential tests can prove wholesale truncation produces the same database as historical per-file replacement.
-
-```mermaid
-sequenceDiagram
-  participant D as index_repo_impl
-  participant DB as SQLite
-  participant W as walk and parse
-  participant R as oxc_resolver
-  D->>DB: ensure_extraction_version, own IMMEDIATE txn
-  D->>W: source_files, sorted
-  D->>DB: BEGIN
-  D->>DB: reset_snapshot_state truncates everything
-  loop each file, sequential
-    D->>W: read, blake3, classify, extract_file
-    W-->>D: chunks plus FileGraph plus LineIndex
-    D->>DB: insert_file into files, chunks, chunks_fts, evidence tables
-  end
-  D->>DB: DELETE snapshot, projection_version, resolution_hash then COMMIT
-  D->>DB: synchronize_instances, own txn
-  D->>DB: index_dependency_files, own txn
-  D->>R: resolve_module_edges, own txn
-  R-->>DB: module_edges rows
-  D->>DB: compute_resolution_hash and snapshot, then publish or rebuild
-```
-
-Read the diagram for where the transaction boundaries fall. `ensure_extraction_version` (`src/indexer.rs:443`) runs first and alone: when `meta.extraction_version` differs from `entity::EXTRACTION_VERSION` (`"5"`, `src/entity.rs:14`) it blanks every `files.hash`, deletes `resolved_edges` and `graph_nodes`, deletes the `snapshot` and `projection_version` meta keys, and upserts the new version, all inside its own `BEGIN IMMEDIATE`. On the production `FullRefresh` path this is largely dead weight, since `store::reset_snapshot_state` truncates unconditionally a few lines later; the hash-blanking only matters to the test-only incremental path. It is also not the only staleness gate — `store::SCHEMA_VERSION` (`src/store.rs:8`, `"23"`, with `DURABLE_SCHEMA_FLOOR = 16`) either rebuilds the disposable schema on open or hard-errors outside the supported window.
-
-`extraction_reset` (`src/indexer.rs:233`) is always true for `FullRefresh`, and true on the incremental path when at least half the existing hashes are blank; the comment at `src/indexer.rs:222-228` explains that at that scale each `store::delete_file` cascades through fully-populated evidence tables and the FTS index, so truncating once and inserting like a fresh index is far cheaper. `reset_extraction_state` (`src/store.rs:916`) clears vector rows first, deletes children before parents so foreign-key enforcement only checks emptied tables, and drops and recreates `chunks_fts` rather than deleting rows; `reset_snapshot_state` widens that to `package_instances` and the `root`/`snapshot`/`projection_version`/`resolution_hash` meta keys.
-
-Inside the loop, `seen.insert(rel)` happens at `src/indexer.rs:253`, *before* the file is read. That ordering is the failure contract: a read or extract error records an `IndexFailure` and continues, and because the path is already in `seen` the cleanup pass at `src/indexer.rs:299` will not treat it as disappeared-from-disk and delete the previous row. The dependency loop re-establishes this for read failures (`src/indexer.rs:770`) but deliberately not for minified skips (`src/indexer.rs:781-786`), so a newly-minified file is dropped from the corpus.
-
-The most important lines are `src/indexer.rs:323-327`: the three projection-identity meta keys are deleted in the *same* transaction as the canonical file writes, then committed together. Everything after that point — dependency discovery, planning, instance sync, dependency indexing, module resolution, projection rebuild — can fail, and each runs in its own separate transaction. Committing the invalidation up front means a mid-phase failure leaves committed content and no public snapshot, never a stale-but-published graph. The `root` meta key is a small hole: `reset_snapshot_state` deletes it (`src/store.rs:957-958`) and it is only re-inserted after the dependency phase (`src/indexer.rs:339-343`).
-
-Finally, `ProjectionIdentity` (`src/indexer.rs:402`) — the triple `(snapshot, projection_version, resolution_hash)` — is captured before invalidation and compared against the freshly computed one at `src/indexer.rs:358`; if all three match, the run republishes the meta keys and returns with `projection_rebuilt = false`. `resolution_hash` is separate because module resolution depends on tsconfigs, manifests and `node_modules` layout — inputs outside indexed file content — so without it, adding a tsconfig `paths` entry would silently keep a stale graph. The cost is that resolution runs in full on every pass before the fast path can be evaluated.
-
-## Workspace aliases and the resolution decision tree
-
-`WorkspaceMap::build` (`src/workspace.rs:56`) reads workspace globs from `pnpm-workspace.yaml` (via a hand-rolled partial YAML reader at `src/workspace.rs:222` that understands block sequences and one inline-array form and nothing else) or the root `package.json` `workspaces` field, then expands literal, `*` and `**` segments with leading-`!` exclusions. For each package with a usable `name`, `add_package` (`src/workspace.rs:149`) emits three shapes of alias entry: exact `name/sub$` for each declared non-wildcard subpath export, wildcard entries for `*` exports plus an implicit `name/dist/*`, and a bare `name` prefix whose values are `[source entry file, src/, package dir]`.
-
-The list is then sorted **descending** by key and deduped (`src/workspace.rs:96-97`), which is not cosmetic. `oxc_resolver` commits to the first matching prefix entry, and a matched-but-failing entry stops resolution rather than falling through — so if bare `name` were consulted before `name/dist/*`, every subpath import into a workspace package would fail against the package root instead of reaching the mirrored source. Descending key order guarantees every `name/…` entry precedes bare `name`.
+The following diagram traces one file from the inventory to its `chunks` rows. Watch the two early exits — the hash short-circuit and the erasure arm — and note that `merge_units` is the only path to `unit_to_chunks`.
 
 ```mermaid
 flowchart TD
-  REQ["Request from imports, exports, refs, contract tables"] --> DEP{"Importer is a dependency file"}
-  DEP -->|"yes"| NOALIAS["dependency_resolver, no aliases, no tsconfig"]
-  DEP -->|"no"| PRIM["Primary resolver, workspace aliases plus TsconfigDiscovery Auto"]
-  PRIM -->|"error"| RETRY["no_tsconfig resolver, aliases only"]
-  NOALIAS --> OUT{"Resolved"}
-  PRIM --> OUT
-  RETRY --> OUT
-  OUT -->|"no, and not a bare package name"| UNRES["resolution unresolved, no package"]
-  OUT -->|"no, bare package name"| PKGONLY["package set, resolution null"]
-  OUT -->|"yes"| CANON["Canonicalize resolved path"]
-  CANON --> IDX{"Path is an indexed file"}
-  IDX -->|"yes"| CLASS["to_file set, resolution from WorkspaceMap classify"]
-  IDX -->|"no, not a package request"| UNRES
-  IDX -->|"no, bare package name"| ATTR["package set plus deepest matching package_instance root"]
-  CLASS --> ROW["module_edges row"]
-  UNRES --> ROW
-  PKGONLY --> ROW
-  ATTR --> ROW
+  INV["inventory.files entry"] --> READ["fs.read_to_string - src/indexer.rs:407"]
+  READ --> HASH["blake3 hash plus file_role::classify - src/indexer.rs:425-426"]
+  HASH --> SAME{"hash unchanged?"}
+  SAME -->|"yes"| ROLEUP["UPDATE files.role only - src/indexer.rs:430"]
+  SAME -->|"no"| EXTRACT["extract_file - src/indexer.rs:440"]
+  EXTRACT --> ARENA["with_parsed: Allocator, Parser, SemanticBuilder - src/parse.rs:31-47"]
+  ARENA --> STMT["units_for_statement per top-level stmt - src/chunk.rs:119"]
+  STMT -->|"interface, type alias, import type, export type, declare module, declare function"| ERASED["no unit emitted"]
+  STMT --> UNITS["Unit list"]
+  UNITS --> COMMENT["with_leading_comment extends span backward - src/chunk.rs:113"]
+  COMMENT --> MERGE["merge_units - src/chunk.rs:404"]
+  MERGE --> U2C["unit_to_chunks - src/chunk.rs:460"]
+  U2C --> OVER{"est_tokens over MAX?"}
+  OVER -->|"yes"| SPLIT["split_by_lines into partN - src/chunk.rs:493"]
+  OVER -->|"no"| ONE["single span"]
+  SPLIT --> ROWS["Chunk rows with blake3 and line numbers"]
+  ONE --> ROWS
+  ROWS --> INSERT["insert_file writes files, chunks, chunks_fts, symbols, imports, exports, refs - src/indexer.rs:453"]
 ```
 
-`resolve_module_edges` (`src/indexer.rs:860`) builds all three resolvers from one `resolver_options` template (`src/indexer.rs:91`): TS-first extension order, `extension_alias` implementing the `./x.js`-means-`./x.ts` convention, `condition_names = RESOLVE_CONDITIONS` (`import, require, node, default`), and `main_fields = [module, main]`. `RETRY` exists because one tsconfig whose `extends` points at an uninstalled package fails every resolution beneath it; degrading to plain resolution keeps most edges at the cost of making tsconfig-resolved edges indistinguishable from fallback ones. `NOALIAS` exists because applying first-party workspace aliases inside third-party code could redirect a dependency's own `import 'foo'` into an unrelated same-named workspace package.
+`units_for_statement` (`src/chunk.rs:119`) emits nothing for `TSInterfaceDeclaration`, `TSTypeAliasDeclaration`, `TSImportEqualsDeclaration` (`src/chunk.rs:122-124`), a `declare`d `TSModuleDeclaration` (`:125`), a type-kind `ImportDeclaration` (`:126`), and a type-kind `ExportNamedDeclaration` (`:127`). The `export <decl>` unwrap repeats the same arms (`src/chunk.rs:160-163`), and `units_for_function` returns early on `f.declare` (`src/chunk.rs:205`). A file whose statements are all of these produces an empty `Vec<Chunk>` — the `ERASED` branch above with nothing downstream of it. That is the intended outcome for a `.d.ts`: it still gets a `files` row and its contract imports and exports still land in `contract_imports`/`contract_exports`, but it contributes no chunk text, no FTS rows, and no embeddings.
 
-`CANON` (`src/indexer.rs:988`) is what actually collapses pnpm symlink farms: the resolver's output is canonicalized before lookup, and the `by_path` map it is looked up in was itself built from canonicalized physical paths (`src/indexer.rs:907`). `ATTR` uses `package_roots`, loaded from dependency `package_instances` and sorted by *descending* path-component count (`src/indexer.rs:914-926`), so a `path.starts_with(root)` scan attributes a file to the deepest matching instance — longest-prefix ordering that matters for nested `node_modules`. `CLASS` calls `WorkspaceMap::classify` (`src/workspace.rs:118`), yielding `resolver` when no workspace alias was involved, `workspace` for an exact manifest-backed mapping, and `workspace-inferred` for a heuristic one.
+The erasure is not symmetric, and the gap matters. `units_for_class` (`src/chunk.rs:273`) and `units_for_var` (`src/chunk.rs:318`) have no `declare` check at all, so top-level `declare const x: T;` and `export declare class C {}` *do* produce chunks. Only `declare function` is erased at the declaration level. The erasure test (`src/chunk.rs:549`) does not cover those forms.
 
-That provenance comes from `package_entry` (`src/workspace.rs:445`), which prefers manifest truth — root export targets, then `source`/`module`/`main` — but only accepts a target naming an *existing* source file, since `entry_candidates` (`src/workspace.rs:517`) drops anything under a `SKIP_DIR` or ending in `.d.ts` and maps a `.js` value to `[.ts, .tsx, .js, .jsx]`. When nothing survives it falls back to `browser`, `src/index.*`, `index.*` and marks the result `Inferred`. `subpath_source` (`src/workspace.rs:559`) is a three-rung ladder: an existing manifest target, then a dist-mirror guess (`dist[/flavor]/x.js` → `src/x.ts` or `x.ts`, flavors at `src/workspace.rs:551`), then `unique_source_match`, a depth-≤4 scan of `src/` that answers only when exactly one candidate matches — ambiguity yields nothing rather than a guess. Condition selection is shared with dependency planning through `package_exports::collect_active_targets` (`src/package_exports.rs:11`), which commits on the first active condition in *declaration order* without backtracking — which only works because serde_json's `preserve_order` feature is enabled.
+## Merging, span union, and the split products
 
-The request set comes from a `UNION ALL` over `imports`, `exports.from_request`, `refs.target_request` (runtime) and `contract_imports`/`contract_exports` (type-only), grouped by `(file_id, request)` with `max(is_runtime) = 0` as the `type_only` flag (`src/indexer.rs:928-945`). That is one row per `(file, request)` pair, not per import site, and a request appearing both as a runtime import and an `import type` collapses to a single runtime edge. Results are memoized in a `HashMap<(importer, request), …>` — the only performance optimization in the loop. `external_package_name` (`src/indexer.rs:1039`) keeps bundler conventions out of the package layer: it accepts only `node:`/`bun:` schemes and rejects requests starting with `.`, `/`, `~`, `#` or containing `\`, `%`, `?`, so `~/assets/x.png`, `@/components/app` and `#internal/x` become `unresolved` evidence rather than invented `pkg:` nodes.
+`merge_units` (`src/chunk.rs:404`) walks the unit list with a single accumulator. A merge requires, in order: neither unit `atomic`, identical `scope_chain`, and then either both units are `Imports` or both are anonymous `Module` units whose combined `est_tokens` stays under `TARGET_TOKENS` (`src/chunk.rs:428-433`). Named declarations therefore never share a chunk with a neighbor — the comment at `src/chunk.rs:420-423` states the retrieval argument: a chunk that *is* `getUser` beats one that merely contains it. The cost is one chunk and one embedding per export in a file of one-line re-exports.
+
+Merging is a span union, `min(start)..max(end)` (`src/chunk.rs:436`), not a text concatenation. That keeps `start`/`end` usable as byte offsets into the original source, which is what lets extracted sites be attributed to a chunk by offset containment. It also means erased type declarations sitting *between* two merged anonymous units reappear verbatim in the chunk's content: erasure is a guarantee about chunk boundaries and names, not about bytes.
+
+Oversized declarations are split rather than truncated. A function over `MAX_TOKENS` becomes an atomic header unit spanning `[fn_start, first_body_stmt.start)` plus one anonymous `Module` unit per body statement, each carrying the function name in its `scope_chain` (`src/chunk.rs:242-260`). A class splits into `ClassHeader` plus one `Method` unit per member (`src/chunk.rs:273-315`). `units_for_var` promotes a single-declarator `const Foo = () => …` to a named function or component unit and applies the same body split to a block-bodied arrow (`src/chunk.rs:318-374`). The `atomic` flag on headers exists purely so `merge_units` cannot glue a split product back to a neighbor.
+
+Whatever survives merging still over `MAX_TOKENS` is line-split by `split_by_lines` (`src/chunk.rs:493`) into `#partN` pieces (`src/chunk.rs:471`). The budget is `TARGET_TOKENS * 4` bytes; the provisional end is walked back to a UTF-8 char boundary, then back to the last newline inside the window, then clamped to a char boundary again (`src/chunk.rs:502-516`). Two consequences follow. A single line longer than 4800 bytes yields an over-budget span, because there is no newline in the window to back up to. And `symbols` is populated only on part 1 (`src/chunk.rs:480`) — later parts carry an empty symbol list, so symbol-based lookup finds only the head of a split declaration.
+
+Two more edges are worth naming. `merge_units` applies *no* size cap to adjacent `Imports` units (`src/chunk.rs:431`), so a 2000-line import block becomes one unit and is only afterwards chopped into `#partN` pieces by the line fallback. And `with_leading_comment` (`src/chunk.rs:388`) runs on every unit including split-body units (`src/chunk.rs:112-114`), so a comment lying inside a header unit's span can also be pulled into the following body unit. Chunk spans are therefore not a strict partition of the file; anything that assumes disjoint `[start, end)` ranges will double-count comment text.
+
+## Role and origin labels
+
+`file_role::classify` (`src/file_role.rs:16`) lowercases the repository-relative path and the first 4 KiB of source (clamped to a char boundary) and returns exactly one of five values in a fixed precedence: generated, fixture, test, documentation, production. It never returns `"unknown"`, even though `"unknown"` is in `ALL` (`src/file_role.rs:5-12`) and in `DEFAULT_EXPANSION` (`src/file_role.rs:14`); its only real source is the `files.role` column default (`src/store.rs:259`), reached by a row inserted without a role. Unlike `files.origin`, `files.role` has no CHECK constraint.
+
+| Role | Retrieval multiplier (`src/file_role.rs:95`) |
+|---|---|
+| `production`, or no role at all | 1.0 |
+| `unknown` | 0.75 |
+| `documentation` | 0.4 |
+| `test` | 0.3 |
+| `fixture` | 0.2 |
+| `generated` | 0.1 |
+| anything else | 0.0 |
+
+That last row is a trap: adding a value to `file_role::ALL` without adding an arm to `penalty` silently zeroes those files out of ranking rather than failing to compile. Separately, classification runs *before* the unchanged-hash comparison (`src/indexer.rs:426` precedes `:427`), so every refresh pays for lowercasing the path and 4 KiB of every file even when nothing changed — the price of being able to fix a role label without re-extracting.
+
+Origin is a coarser, three-value partition: `repository`, `workspace`, `dependency` (`src/origin.rs:3`), with `[repository, workspace]` as the default allowlist (`src/origin.rs:4`). An empty allowlist and any value outside the three are errors (`src/origin.rs:10`). Unlike role, this one is enforced at the schema level by a CHECK constraint on `files.origin` (`src/store.rs:260-261`). First-party source is written with `origin: "repository"` (`src/indexer.rs:449`); the workspace and dependency values are applied later by `dependency::synchronize_instances`.
+
+## Workspace discovery and the alias table
+
+`WorkspaceMap::discover_with_fs` (`src/workspace.rs:76`) takes the *indexed source list* and returns a `WorkspaceDiscovery { map, rejections }`. It builds `IndexedSources` from the inventory (`src/workspace.rs:82`), reads workspace globs from `pnpm-workspace.yaml` or the root `package.json` `workspaces` field — both the array form and the `{"packages": [...]}` object form are accepted (`src/workspace.rs:402-408`) — and expands them to member directories (`src/workspace.rs:83-84`). Each member's `package.json` is read through `classified_io`, so a JSON parse error becomes a `workspace-manifest` rejection (`src/workspace.rs:105-109`) while an `EMFILE` aborts discovery entirely (`src/workspace.rs:346-348`). A member with no `name`, or a name starting with `.` or `/`, is skipped silently (`src/workspace.rs:113-118`) — no rejection is recorded, so the package simply never gets an alias and nothing in the outcome says why.
+
+Alias ordering is the subtlest invariant in this subsystem. `oxc_resolver` commits to the first alias entry whose key prefixes the request, and a matched-but-failing entry *stops* resolution rather than falling through to the next entry. `add_indexed_package` (`src/workspace.rs:155`) pushes, in construction order, exact `name/sub$` and wildcard `name/sub` subpath entries (`src/workspace.rs:265-268`, `:250-255`), then `name/dist/*` (`src/workspace.rs:184`), then bare `name` (`src/workspace.rs:185`). The list is then sorted **descending** by key and deduped (`src/workspace.rs:139-140`), which guarantees every `name/…` key sorts before bare `name`. If bare `name` were consulted first it would match every subpath import into that package and then fail, breaking them all. The constraint lives entirely in a string comparison; nothing in the type expresses it.
+
+The next diagram is the resolution decision tree — how a request becomes a labeled module edge. Watch `CLASSIFY`: whether an edge reads `workspace` or `workspace-inferred` is decided by one `HashSet` membership test, and everything not aliased at all falls out as `resolver`.
+
+```mermaid
+flowchart TD
+  REQ["import request from importer file"] --> RELA{"starts with . or /"}
+  RELA -->|"yes"| RESOLVER["classify returns resolver - src/workspace.rs:204"]
+  RELA -->|"no"| PKG{"names an aliased workspace package"}
+  PKG -->|"no"| EXT["external_package_name or unresolved - src/indexer.rs:1244"]
+  PKG -->|"yes"| ALIAS["alias table, descending key order - src/workspace.rs:139"]
+  ALIAS --> EXACT["name/sub dollar exact subpath entry"]
+  ALIAS --> WILD["name/sub wildcard entry"]
+  ALIAS --> DIST["name/dist/star entry"]
+  ALIAS --> BARE["bare name entry"]
+  EXACT --> RESOLVED["oxc_resolver returns a path"]
+  WILD --> RESOLVED
+  DIST --> RESOLVED
+  BARE --> RESOLVED
+  RESOLVED --> INDEXED{"path in canonicalized indexed-file map"}
+  INDEXED -->|"no"| UNRES["resolution set to unresolved - src/indexer.rs:1201"]
+  INDEXED -->|"yes"| CLASSIFY{"specifier in manifest_specifiers"}
+  CLASSIFY -->|"yes"| WS["workspace - src/workspace.rs:206"]
+  CLASSIFY -->|"no"| WSINF["workspace-inferred - src/workspace.rs:208"]
+```
+
+`manifest_specifiers` is populated only when an alias target came from manifest data — a package entry with `Origin::Manifest` (`src/workspace.rs:173-175`) or a subpath export with `Origin::Manifest` (`src/workspace.rs:262-263`). Everything else lands in the `WSINF` branch. Note that a request the map does not recognize as a workspace request returns `"resolver"` (`src/workspace.rs:203-204`), not `"workspace-inferred"`; the inferred label is reserved for specifiers that *are* workspace-owned but whose target was guessed.
+
+## Entry preference: a five-pass ladder
+
+`preferred_package_entry` (`src/workspace.rs:671-706`) decides which file a bare workspace-package import lands on. It runs five passes:
+
+| Pass | Source of the field | Where the target must exist | Origin recorded |
+|---|---|---|---|
+| 1 | manifest fields (`src/workspace.rs:679`) | indexed corpus | `Manifest` |
+| 2 | manifest fields (`:684`) | filesystem, build output excluded | `Manifest` |
+| 3 | inferred fields (`:690`) | indexed corpus | `Inferred` |
+| 4 | inferred fields (`:695`) | filesystem, build output excluded | `Inferred` |
+| 5 | manifest fields (`:700`) | filesystem, build output **allowed** | `Manifest` |
+
+The shape preserves the historical manifest-before-inferred precedence while preferring source that is actually in the corpus over a recognized output layout, and keeps `dist/index.js` as a real last resort for a package that genuinely ships no source. The preference matrix is pinned by a five-case test at `src/workspace/tests.rs:214`. The residual gap: a `main` pointing into an *unrecognized* output directory — `lib/`, say, which is not in `SKIP_DIRS` — wins at pass 2 over indexed `src/`, is labeled `Manifest`, and produces a `workspace` edge to a file that was never indexed.
+
+`entry_candidates` (`src/workspace.rs:881`) does the extension guessing: a `.js` manifest value expands to `[.ts, .tsx, .js, .jsx]` (`src/workspace.rs:896-900`), mirroring the resolver's `extension_alias`. It also drops `.d.ts`/`.d.mts`/`.d.cts` targets outright (`src/workspace.rs:885-887`), so a package whose only export target is a declaration file gets no manifest entry at all — an interaction with the decision to *index* declaration files that is easy to miss.
+
+Subpath exports go through `package_exports::collect_active_targets` (`src/package_exports.rs:11`), which appends strings, recurses through arrays in order, and — for objects — commits to the **first** key present in `RESOLVE_CONDITIONS` (`import`, `require`, `node`, `default`) and returns without backtracking (`src/package_exports.rs:19-26`). This is correct only because `serde_json`'s `preserve_order` feature keeps declaration order; without it the "first active condition" would be whatever the hash map yielded. Wildcard exports become one alias whose values are the translated target prefixes plus two trailing generic fallbacks, `<dir>/src/*` and `<dir>/*` (`src/workspace.rs:1023-1026`). Those fallbacks exist because a matched-but-failing alias blocks resolution entirely; the price is that the alias can silently resolve specifiers the package's `exports` map would actually forbid.
 
 ## Dependency scoping
 
-Dependency indexing is opt-in through `--deps` (`src/main.rs:73-76`, comma-separated or repeatable), and `normalized_selectors` (`src/dependency.rs:563`) requires exactly one bare package name per entry — subpaths, `@version` suffixes and `.`-prefixed values are hard errors. `discover` (`src/dependency.rs:76`) never walks `node_modules`: it pulls `(importer path, request)` pairs out of the *already indexed* `imports`/`exports`/`refs` tables, resolves each from its real importer location with a resolver carrying no workspace aliases, walks up from the resolved file to the first `package.json` whose `name` matches, and canonicalizes that root. Resolving from real importer locations is what discovers two installed versions of one name; canonicalization collapses pnpm's symlink farm to one instance per real version. A selected-but-unused package gets one probe at `<root>/node_modules/<name>` (`src/dependency.rs:124`); Yarn PnP is rejected outright (`src/dependency.rs:86-90`); a selector resolving to nothing aborts the run (`src/dependency.rs:131-135`), after the first-party rows are already committed.
+`dependency::discover` (`src/dependency.rs:76`) never walks `node_modules`. It reads `(importer, request)` pairs from the importer rows just written by first-party extraction (`src/dependency.rs:93`), resolves each matching request from its real importer with an alias-free resolver (`src/dependency.rs:105-119`), climbs to the first `package.json` whose `name` matches, and canonicalizes. Canonicalization is what collapses pnpm's symlink farm to one row per real installed instance — and simultaneously surfaces two installed versions of one name as two instances. A package imported only from an unindexed file is invisible to this method; the sole fallback is a direct probe of `<root>/node_modules/<selector>/package.json`, and only when no instance of that name was already found (`src/dependency.rs:121-130`). A selector that remains unresolved aborts the run (`src/dependency.rs:132-136`) — after the entire first-party corpus has been read, parsed, and written, though still inside the transaction that rolls back.
 
-| Stage | Behavior | Where |
-| --- | --- | --- |
-| Analysis roots | manifest `source` field or `"source"` export condition (`manifest-source`), else runtime export/`module`/`main` targets (`runtime`), else the package root (`package-root`) | `src/dependency.rs:382` |
-| File collection | recursive, skipping dot-prefixed entries and nested `node_modules` | `src/dependency.rs:535-561` |
-| Ordering | forced entries first, then lexicographic | `src/dependency.rs:327-337` |
-| Budgets | 10 000 files / 100 MiB total / 2 MiB per file; overflow marks the plan `truncated` | `src/dependency.rs:22-24`, `:351-358` |
-| Minified skip | `.min.` in the name, or first line >4000 chars followed by four lines >1000 chars — unless forced | `src/dependency.rs:295-309` |
+The Yarn PnP bail (`src/dependency.rs:87-91`) is narrower than it looks: it fires only when selectors are non-empty (the function returns early otherwise at `:84-86`), `<root>/node_modules` is not a directory, *and* `.pnp.cjs` or `.pnp.loader.mjs` exists.
 
-Forced entries are hoisted before the budget applies and exempted from the minified filter, because the file first-party imports resolve to must survive truncation; the price is that a minified bundle serving as the package entry gets indexed whole. The budgets are `DependencyLimits` fields that no caller overrides — both `cmd_index` (`src/main.rs:1571-1577`) and the watcher use `..Default::default()` — so they are effectively hardcoded.
+`plan_package` (`src/dependency.rs:313`) picks analysis roots from `source` fields first, then runtime export/`module`/`main` targets, then the package root (`src/dependency.rs:387`). Candidates are sorted with forced entries hoisted ahead of everything (`src/dependency.rs:334-344`) before the 10 000-file / 100 MiB / 2 MiB budget is applied (`src/dependency.rs:356-363`), so the file a first-party import actually resolves to survives truncation and the module edge does not dangle; forced entries are also exempt from the minified filter (`src/dependency.rs:298`). Any skip marks the plan `truncated` (`src/dependency.rs:372-376`). The limits are nominally configurable through `DependencyLimits`, but every construction in the codebase uses `Default`, so they are effectively hardcoded.
 
-`synchronize_instances` (`src/dependency.rs:161`) runs in its own transaction and treats the selector list as authoritative. It resets every non-dependency file back to `origin='repository'`, upserts one `package_instances` row per workspace package and per plan, deletes instances no longer desired — routing their files through `store::delete_file` first, because FTS5 and sqlite-vec rows do not participate in foreign-key cascades (`src/dependency.rs:205-207`) — then re-tags workspace subtrees by literal path prefix, shallow roots first (`src/dependency.rs:221-224`) so a nested package's later `UPDATE` wins on its own subtree. Omitting `--deps` on a later run therefore removes the entire dependency corpus. Dependency files are written under `dependency:<name>@<version>#<8 hex of canonical root>/<package path>` (`src/indexer.rs:848-857`); an 8-hex collision would surface as a confusing `files.path` UNIQUE violation rather than a clear error.
+## Where the seams are thin
 
-## Failure model and known gaps
+The `fs_ops::FileSystem` trait (`src/fs_ops.rs:16`) injects `read_to_string`, `metadata`, `read_dir`, and `file_type` into source publication, workspace discovery, and dependency planning, which lets `src/test_fs.rs` inject per-operation failures without thread-local state in production modules (`src/fs_ops.rs:8-10`). It deliberately excludes canonicalization, existence probes, the diagnostic `package_entry_paths` traversal, resolver internals, and the `ignore` walk (`src/fs_ops.rs:12-15`). That exclusion is load-bearing: `package_entry_paths` (`src/workspace.rs:711`) uses raw `fs::read_to_string` and `FilesystemSources` and swallows a discovery error to keep repository-overview scouting working, so its answers can differ from the indexing path's where discovery partially fails.
 
-The failure split is sharp: per-file `read` and `extract` errors are recorded in `IndexOutcome.failures` with a stage label and the run continues, while every dependency, resolution, and projection error propagates as `Err` and aborts the command. `outcome.unchanged` is incremented at `src/indexer.rs:269` and `:800` but read nowhere outside tests — on the production path `existing` starts empty, so it is structurally always zero, which is why `cmd_index` does not print it (`src/main.rs:1582-1584`).
+Two behaviors in the source loop deserve explicit statement because they invert the usual reading. An inventory race `continue`s *without* inserting into `seen` (`src/indexer.rs:412`), so a file that vanishes between inventory and read is deliberately treated as deleted and its row is removed by the cleanup pass (`src/indexer.rs:467-471`). A permanent read error *does* insert into `seen` (`src/indexer.rs:417`) after deleting the old row and recording a `read` rejection — the path stays known, its content does not. Rejection stages form a de-facto vocabulary across the subsystem: `walk` and `ignore` from the walker, `workspace-manifest`, `workspace-canonicalize`, and `workspace-walk` from discovery, and `read` and `extract` from the indexer.
 
-Costs visible in the code and not yet addressed: `chunk_for` (`src/indexer.rs:552`) is a linear scan over the file's chunks run once per ref, event, member call, and entity site, over a vector already sorted by construction; `with_leading_comment` re-scans the comment list per unit; `unique_source_match` (`src/workspace.rs:685`) does an unmemoized depth-4 directory scan per unmapped subpath export. Coverage is uneven in a matching way — `src/indexer.rs` carries differential and atomicity tests and `src/workspace.rs`/`src/dependency.rs` carry fixture-based tests including a Unix-only pnpm symlink case, but `src/walk.rs` has none at all and `src/chunk.rs` has no test for merge behavior or the oversized-function body split.
+Finally, `unique_source_match` — the last-resort scan mapping an unmapped subpath export onto a source file — uses two different depth limits: `components().count() > 5` in the indexed-source variant (`src/workspace.rs:809`) versus `depth > 4` in the filesystem variants (`src/workspace.rs:1101`, `:1165`). Both answer only on an exactly-unique match, so ambiguity yields nothing rather than a wrong guess, and neither is memoized, so a package with many unmapped subpath exports rescans `src/` once per export.
 
-Related: [structural extraction](03-structural-extraction.md) consumes what this phase produces, the tables written here are described in [the storage schema](05-storage-schema.md), and the watcher that reuses this driver is in [incremental and watch](11-incremental-and-watch.md).
+The rows this stage writes are consumed by [structural extraction](03-structural-extraction.md) and [the storage schema](05-storage-schema.md); the incremental variant of the same pipeline is in [incremental and watch](13-incremental-and-watch.md).
