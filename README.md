@@ -109,7 +109,7 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --all includes other resolved calls, excluded roles, every orphan;
                                #   receiver value-flow answers remain excluded
 jscout watch <root> [--embed [--product]] [--enrich]
-                               # full startup/reconciliation; incremental source generations
+                               # full startup/boundaries; complete-inventory incremental reconciliation
                                # optional code-vector/checker/semantic-vector phases
                                #   --product keeps embedding to the effective product corpus
                                #   repeat --deps from index to retain that corpus
@@ -542,14 +542,25 @@ does not imply that checker configuration was unchanged.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
 project-batched, resumable checker pass for the resulting snapshot. Across a
-changed snapshot it may carry an unchanged project when its configuration
-chain, membership, checker identity, and protocol fingerprint match. Each fact
-is rebound to the current member-call row only when its source hash and exact
-call/receiver/property spans still match and its target fingerprint remains
-current. If any owner of a multi-project occurrence cannot carry, all owners
-are re-queried. Dirty projects and occurrences run first; fully carried
-projects construct no TypeScript Program. The old batch remains non-public and
-is deleted when the new current-snapshot batch activates.
+changed snapshot it first considers each fully completed project in the newest
+reusable superseded staging source, then falls back project-by-project to the
+active publication. An empty newer destination left by a crash cannot displace
+that source. Pending, partial, failed, or coverage-incomplete staging rows are
+never carried. Configuration chain, membership, checker identity, protocol,
+external inputs, and exact occurrence/target fingerprints are all revalidated.
+If any owner of a multi-project occurrence cannot carry, all owners are
+re-queried. Dirty projects and occurrences run first; fully carried projects
+construct no TypeScript Program. Validated copies and predecessor-staging
+retirement commit atomically, and neither old source is projected for the new
+snapshot.
+
+Source dirty affinity is a watcher backlog rather than generation-local state.
+It accumulates code paths across supersession, cancellation, retries, and
+terminal partial publication, and clears only after a non-superseded checker
+publication succeeds. Documentation changes remain refresh-only. Enrichment
+reports distinguish exact-batch reuse, durable staging resume, staging resets,
+unique carried occurrences, project-occurrence carry, and carry sourced from
+superseded staging versus the active publication.
 
 External checker inputs remain watched for carried projects. An independent
 daily-scale deadline schedules `enrich --full` semantics inside the watcher;
@@ -580,22 +591,27 @@ jscout embed . --product --semantic
 `jscout watch` subscribes before its startup pass and begins with the same full
 disposable-snapshot refresh as `jscout index`. A bounded batch containing only
 indexed JavaScript/TypeScript source paths then uses incremental extraction: it
-walks and hashes the complete source tree, but parses and replaces only changed
-or missing files. Startup, periodic reconciliation, more than 256 changed
-source paths, Git/submodule controls, source-inventory ignore files,
+walks and hashes the complete shared code-and-document inventory, but parses
+and replaces only changed or missing files. Admitted Markdown/MDX changes use
+the same incremental refresh without entering checker dirty affinity. Periodic
+reconciliation also runs this complete-inventory incremental path, so it still
+repairs missed create/delete/ignore transitions without rebuilding unchanged
+rows. Startup, more than 256 changed source paths, Git/submodule controls,
+source-inventory ignore files,
 package/workspace manifests, lockfiles, tsconfig/jsconfig or declaration
-inputs, selected dependency/checker inputs, directories, backend errors, and
-uncertain missing paths use full refresh. Full scope is sticky within a
-coalesced generation.
+inputs, selected dependency/checker inputs, pathless events, and backend errors
+use full refresh. Non-boundary directory and uncertain missing-path events use
+the same complete-inventory incremental path, because their paths are not the
+correctness inventory. Full scope is sticky within a coalesced generation.
 
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
 needed. Manual indexing clears checker facts. Watch may reuse an exact-snapshot
-batch or keep one changed-snapshot batch hidden as input to the following
-validated carry pass. A deterministic extraction
-rejection or non-retryable read failure is reported and excluded; an old row
-for that path is not served as current. The refresh still succeeds over the
-indexable corpus.
+batch or keep the active publication plus the newest reusable superseded
+staging source hidden as inputs to the following validated carry pass. A
+deterministic extraction rejection or non-retryable read failure is reported
+and excluded; an old row for that path is not served as current. The refresh
+still succeeds over the indexable corpus.
 The classified workspace map is built first. Workspace globs are expanded
 against the filesystem, so a declared package keeps first-party identity even
 when it contains only excluded build output or gitignored source. Indexed
@@ -1146,7 +1162,7 @@ unchanged project facts into a newly published current-snapshot batch. Run
 edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
-periodic full reconciliation. `watch --embed` updates the default corpus;
+periodic complete-inventory incremental reconciliation. `watch --embed` updates the default corpus;
 `watch --embed --product` applies the same fresh reconnaissance policy and
 neutral production fallback as `jscout embed --product`, so it does not widen a
 product-only vector cache. Each embedding phase reports missing documents,
@@ -1155,6 +1171,15 @@ a fully cached pass therefore reports reuse rather than `embedded=0/0`.
 `watch --embed` also repairs and tops up semantic-artifact vectors after the
 checker phase. Manual `jscout index` always remains a full disposable-snapshot
 rebuild.
+The startup line records the jscout version, executable-byte fingerprint,
+loaded non-secret runtime-config fingerprint, whether a config file was loaded,
+restart-required config semantics, checker-policy fingerprint derived from the
+actual watcher enrichment selection, and a separate non-secret fingerprint of
+the effective watch invocation after CLI overrides alongside the effective
+watch flags. These identities make logs from different binaries or policies
+comparable without exposing credentials. If the running executable cannot be
+read, jscout warns and records `binary_fingerprint=unavailable`; diagnostic
+identity never prevents watch or MCP startup.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

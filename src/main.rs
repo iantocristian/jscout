@@ -28,6 +28,7 @@ mod package_exports;
 mod parse;
 mod query;
 mod recon;
+mod runtime_identity;
 mod scout;
 mod scouting;
 mod search;

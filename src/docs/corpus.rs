@@ -3,9 +3,10 @@ use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ignore::{IncrementalIgnore, WalkBuilder};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser as OxcParser;
 use oxc_span::SourceType;
@@ -39,6 +40,97 @@ impl Default for CorpusOptions {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
+}
+
+/// Path-only form of the documentation admission policy used by the watcher.
+/// It deliberately shares the corpus glob, ignore, and hidden-path semantics,
+/// but does not read or parse the file. A matching event therefore schedules
+/// the complete inventory pass that remains the authority for membership.
+pub struct DocumentationPathPolicy {
+    root: PathBuf,
+    include: GlobSet,
+    exclude: GlobSet,
+    ignore: IncrementalIgnore,
+    active: bool,
+}
+
+impl DocumentationPathPolicy {
+    pub fn new(root: &Path, options: &CorpusOptions) -> Result<Self> {
+        let include = build_glob_set(&options.include, "include")?;
+        let exclude = build_glob_set(&options.exclude, "exclude")?;
+        let ignore = documentation_ignore(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            include,
+            exclude,
+            ignore,
+            active: !options.include.is_empty(),
+        })
+    }
+
+    /// Rebuild ignore state after a successful refresh publishes any edits to
+    /// `.gitignore`, `.ignore`, or repository exclude files.
+    pub fn reload_ignore(&mut self) -> Result<()> {
+        self.ignore = documentation_ignore(&self.root)?;
+        Ok(())
+    }
+
+    /// Whether this path could belong to the configured documentation corpus.
+    /// Ignore loading errors conservatively return true so the authoritative
+    /// inventory pass can classify and report them.
+    pub fn is_admitted(&mut self, path: &Path, is_dir: bool) -> bool {
+        if !self.active || is_dir {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if !is_document_path(relative) || hidden_path_is_excluded(relative) {
+            return false;
+        }
+        let Some(normalized) = normalized_utf8_path(relative) else {
+            return false;
+        };
+        if !self.include.is_match(&normalized) || self.exclude.is_match(&normalized) {
+            return false;
+        }
+        let (matched, error) = self.ignore.matched_with_errors(relative, false);
+        error.is_some() || !matched.is_ignore()
+    }
+
+    /// Whether a directory-shaped path could contain visible documentation.
+    /// This is deliberately independent of include/exclude file globs: the
+    /// authoritative inventory descends every visible directory and applies
+    /// arbitrary globs to files. The watcher uses this only after the source
+    /// plane ignored an existing directory or a missing path, so it closes the
+    /// allowlisted-hidden-root gap without stealing source-file affinity.
+    pub fn may_contain_document(&mut self, path: &Path) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() || hidden_path_is_excluded(relative) {
+            return false;
+        }
+        let (matched, error) = self.ignore.matched_with_errors(relative, true);
+        error.is_some() || !matched.is_ignore()
+    }
+}
+
+fn documentation_ignore(root: &Path) -> Result<IncrementalIgnore> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .follow_links(false);
+    builder
+        .build_matchers()
+        .pop()
+        .ok_or_else(|| anyhow!("documentation ignore matcher was not built"))
 }
 
 #[cfg(test)]
