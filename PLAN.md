@@ -3367,9 +3367,10 @@ The revised decisions:
    file count as shallow boundaries and contribute no timestamp; provenance
    uses captured indexed bytes with
    `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
-   blame mappings cache by repository-relative
-   path, exact file-byte hash, path-tip commit, and shallow boundary
-   fingerprint; filesystem mtime is never a fallback.
+   blame mappings cache by an opaque hash of Git's worktree-relative prefix for
+   the indexed root, indexed-root-relative path, exact file-byte hash, path-tip
+   commit, and shallow boundary fingerprint; nested roots sharing one database
+   cannot alias one another, and filesystem mtime is never a fallback.
    `--no-freshness` preserves the relevance order for comparison.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-

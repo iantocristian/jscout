@@ -411,16 +411,19 @@ CREATE TABLE IF NOT EXISTS doc_file_provenance(
   detail TEXT
 );
 
--- Rebuildable blame mappings. One current entry per path prevents this cache
--- from becoming a document-history store, while the complete key avoids reuse
--- across worktree edits, rewritten path history, or clone deepening.
+-- Rebuildable blame mappings. One current entry per indexed-root-scoped path
+-- prevents this cache from becoming a document-history store, while the
+-- complete key avoids reuse across roots, worktree edits, rewritten path
+-- history, or clone deepening.
 CREATE TABLE IF NOT EXISTS doc_blame_cache(
-  path TEXT PRIMARY KEY,
+  path_scope TEXT NOT NULL,
+  path TEXT NOT NULL,
   bytes_hash TEXT NOT NULL,
   path_tip TEXT NOT NULL,
   shallow_fingerprint TEXT NOT NULL,
   attribution_json TEXT NOT NULL,
-  format_version TEXT NOT NULL
+  format_version TEXT NOT NULL,
+  PRIMARY KEY(path_scope,path)
 );
 
 CREATE TRIGGER IF NOT EXISTS doc_chunk_meta_requires_docs_insert
@@ -1609,9 +1612,9 @@ mod tests {
                file_id,projection_hash,status,detail
              ) VALUES(1,'projection','resolved',NULL);
              INSERT INTO doc_blame_cache(
-               path,bytes_hash,path_tip,shallow_fingerprint,
+               path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
                attribution_json,format_version
-             ) VALUES('README.md','file','tip','shallow','[]','test-v1');
+             ) VALUES('scope','README.md','file','tip','shallow','[]','test-v1');
              INSERT INTO meta(key,value)
                VALUES('documentation_provenance_format_version','test-v1');
              UPDATE meta SET value='31' WHERE key='schema_version';",
@@ -2229,6 +2232,7 @@ mod tests {
         assert_eq!(
             relation_columns(&conn, "doc_blame_cache")?,
             [
+                "path_scope",
                 "path",
                 "bytes_hash",
                 "path_tip",
@@ -2265,10 +2269,10 @@ mod tests {
                file_id,projection_hash,status,detail
              ) VALUES(1,'projection','resolved',NULL);
              INSERT INTO doc_blame_cache(
-               path,bytes_hash,path_tip,shallow_fingerprint,
+               path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
                attribution_json,format_version
              ) VALUES(
-               'README.md','file','tip','shallow','[]','documentation-provenance-v1'
+               'scope','README.md','file','tip','shallow','[]','documentation-provenance-v1'
              );
              INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
                VALUES(1,'README','','','','README.md');

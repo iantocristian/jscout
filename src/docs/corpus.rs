@@ -1064,7 +1064,7 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
                 let rendered_body = render_source_range(bytes, range.clone(), &removals);
                 let contributing_lines =
                     contributing_line_ranges(bytes, range.clone(), &removals, &git_lines);
-                if rendered_body.is_empty() || contributing_lines.is_empty() {
+                if rendered_body.is_empty() {
                     continue;
                 }
                 if mdx_preamble_open
@@ -2618,16 +2618,15 @@ mod tests {
     }
 
     #[test]
-    fn removed_comment_whitespace_does_not_close_mdx_preamble() -> Result<()> {
-        let file = parse_document(
-            "preamble.mdx",
-            b"{/* hidden */}   \n\nimport Widget from './widget'\n",
-        )?;
-        assert!(file.blocks.is_empty());
+    fn rendered_whitespace_without_contributing_lines_keeps_phase2_chunk_shape() -> Result<()> {
+        let file = parse_document("whitespace.md", b"<!-- hidden -->   \n")?;
+        assert_eq!(file.blocks.len(), 1);
+        assert_eq!(file.blocks[0].rendered_body, "   ");
+        assert!(file.blocks[0].contributing_lines.is_empty());
         assert_eq!(file.chunks.len(), 1);
-        assert!(file.chunks[0].is_stub);
+        assert!(!file.chunks[0].is_stub);
+        assert_eq!(file.chunks[0].rendered_body, "   ");
         assert!(file.chunks[0].contributing_lines.is_empty());
-        assert!(!file.chunks[0].rendered_body.contains("Widget"));
         Ok(())
     }
 

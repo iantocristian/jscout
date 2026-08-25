@@ -133,9 +133,9 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
     )?;
     conn.execute(
         "INSERT INTO doc_blame_cache(
-           path,bytes_hash,path_tip,shallow_fingerprint,
+           path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
            attribution_json,format_version
-         ) VALUES('README.md','bytes-a','tip-a','shallow-a','[]','cache-v1')",
+         ) VALUES('scope-a','README.md','bytes-a','tip-a','shallow-a','[]','cache-v1')",
         [],
     )?;
     assert_eq!(

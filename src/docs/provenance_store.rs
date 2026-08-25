@@ -51,7 +51,7 @@ pub(crate) struct ProvenanceResolution {
     /// Exact current keys whose mappings resolved successfully. Every other
     /// cache row, including a stale row for an active but failed path, is
     /// removed in the publication transaction.
-    pub retained_cache_keys: BTreeMap<String, BlameCacheKey>,
+    pub retained_cache_keys: BTreeMap<(String, String), BlameCacheKey>,
 }
 
 /// Resolve current documentation provenance without mutating SQLite. The
@@ -157,9 +157,13 @@ fn resolve_git_document(
 
     match aggregate_document(document, &mapping, successful_status, successful_detail) {
         Ok(document) => {
-            resolution
-                .retained_cache_keys
-                .insert(path.clone(), mapping.cache_key.clone());
+            resolution.retained_cache_keys.insert(
+                (
+                    mapping.cache_key.path_scope.clone(),
+                    mapping.cache_key.path.clone(),
+                ),
+                mapping.cache_key.clone(),
+            );
             if cache_update {
                 resolution.cache_updates.push(mapping);
             }
@@ -300,9 +304,10 @@ fn load_blame_mapping(conn: &Connection, key: &BlameCacheKey, bytes: &[u8]) -> R
         .query_row(
             "SELECT attribution_json
              FROM doc_blame_cache
-             WHERE path=?1 AND bytes_hash=?2 AND path_tip=?3
-               AND shallow_fingerprint=?4 AND format_version=?5",
+             WHERE path_scope=?1 AND path=?2 AND bytes_hash=?3 AND path_tip=?4
+               AND shallow_fingerprint=?5 AND format_version=?6",
             params![
+                key.path_scope,
                 key.path,
                 key.bytes_hash,
                 key.path_tip,
@@ -360,10 +365,10 @@ fn git_logical_line_count(bytes: &[u8]) -> usize {
 pub(crate) fn upsert_blame_cache(conn: &Connection, mappings: &[BlameMapping]) -> Result<usize> {
     let mut statement = conn.prepare_cached(
         "INSERT INTO doc_blame_cache(
-           path, bytes_hash, path_tip, shallow_fingerprint,
+           path_scope, path, bytes_hash, path_tip, shallow_fingerprint,
            attribution_json, format_version
-         ) VALUES(?1,?2,?3,?4,?5,?6)
-         ON CONFLICT(path) DO UPDATE SET
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(path_scope,path) DO UPDATE SET
            bytes_hash=excluded.bytes_hash,
            path_tip=excluded.path_tip,
            shallow_fingerprint=excluded.shallow_fingerprint,
@@ -375,6 +380,7 @@ pub(crate) fn upsert_blame_cache(conn: &Connection, mappings: &[BlameMapping]) -
         let attribution_json = serde_json::to_string(&mapping.lines)
             .with_context(|| format!("serialize blame cache for {}", mapping.cache_key.path))?;
         changed += statement.execute(params![
+            mapping.cache_key.path_scope,
             mapping.cache_key.path,
             mapping.cache_key.bytes_hash,
             mapping.cache_key.path_tip,
@@ -390,12 +396,12 @@ pub(crate) fn upsert_blame_cache(conn: &Connection, mappings: &[BlameMapping]) -
 /// the rebuildable cache from becoming document history.
 pub(crate) fn prune_blame_cache(
     conn: &Connection,
-    retained_cache_keys: &BTreeMap<String, BlameCacheKey>,
+    retained_cache_keys: &BTreeMap<(String, String), BlameCacheKey>,
 ) -> Result<usize> {
     let cached_rows = {
         let mut statement = conn.prepare(
-            "SELECT path,bytes_hash,path_tip,shallow_fingerprint,format_version
-             FROM doc_blame_cache ORDER BY path",
+            "SELECT path_scope,path,bytes_hash,path_tip,shallow_fingerprint,format_version
+             FROM doc_blame_cache ORDER BY path_scope,path",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -404,21 +410,26 @@ pub(crate) fn prune_blame_cache(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let mut statement = conn.prepare_cached("DELETE FROM doc_blame_cache WHERE path=?1")?;
+    let mut statement =
+        conn.prepare_cached("DELETE FROM doc_blame_cache WHERE path_scope=?1 AND path=?2")?;
     let mut removed = 0_usize;
-    for (path, bytes_hash, path_tip, shallow_fingerprint, format_version) in cached_rows {
-        let retained = retained_cache_keys.get(&path).is_some_and(|key| {
-            key.bytes_hash == bytes_hash
-                && key.path_tip == path_tip
-                && key.shallow_fingerprint == shallow_fingerprint
-                && format_version == super::PROVENANCE_FORMAT_VERSION
-        });
+    for (path_scope, path, bytes_hash, path_tip, shallow_fingerprint, format_version) in cached_rows
+    {
+        let retained = retained_cache_keys
+            .get(&(path_scope.clone(), path.clone()))
+            .is_some_and(|key| {
+                key.bytes_hash == bytes_hash
+                    && key.path_tip == path_tip
+                    && key.shallow_fingerprint == shallow_fingerprint
+                    && format_version == super::PROVENANCE_FORMAT_VERSION
+            });
         if !retained {
-            removed += statement.execute([path])?;
+            removed += statement.execute(params![path_scope, path])?;
         }
     }
     Ok(removed)
@@ -500,12 +511,20 @@ mod tests {
         }
 
         fn commit(&self) -> Result<()> {
+            self.commit_at(
+                "documentation",
+                "2001-01-01T00:00:00 +0000",
+                "2002-01-01T00:00:00 +0000",
+            )
+        }
+
+        fn commit_at(&self, message: &str, author_date: &str, committer_date: &str) -> Result<()> {
             self.git(&["add", "--all"])?;
             let output = Command::new("git")
-                .args(["commit", "--quiet", "-m", "documentation"])
+                .args(["commit", "--quiet", "-m", message])
                 .current_dir(self.path())
-                .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00 +0000")
-                .env("GIT_COMMITTER_DATE", "2002-01-01T00:00:00 +0000")
+                .env("GIT_AUTHOR_DATE", author_date)
+                .env("GIT_COMMITTER_DATE", committer_date)
                 .output()?;
             if !output.status.success() {
                 bail!(
@@ -521,12 +540,14 @@ mod tests {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "CREATE TABLE doc_blame_cache(
-               path TEXT PRIMARY KEY,
+               path_scope TEXT NOT NULL,
+               path TEXT NOT NULL,
                bytes_hash TEXT NOT NULL,
                path_tip TEXT NOT NULL,
                shallow_fingerprint TEXT NOT NULL,
                attribution_json TEXT NOT NULL,
-               format_version TEXT NOT NULL
+               format_version TEXT NOT NULL,
+               PRIMARY KEY(path_scope,path)
              );
              CREATE TABLE files(
                id INTEGER PRIMARY KEY,
@@ -623,6 +644,72 @@ mod tests {
         assert_eq!(stored.0, invalid.documents[0].projection_hash);
         assert_eq!(stored.1, "resolved");
         assert!(stored.2.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cache_scope_separates_nested_index_roots_with_the_same_document_path() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        let original = b"# Shared\n\nSame instruction.\n";
+        let final_bytes = b"# Shared\n\nSame instruction.\n\n<!-- aligned -->\n";
+        fs::create_dir_all(repository.path().join("a"))?;
+        fs::create_dir_all(repository.path().join("b"))?;
+        fs::write(repository.path().join("a/README.md"), original)?;
+        repository.commit_at(
+            "add a",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+        fs::write(repository.path().join("b/README.md"), original)?;
+        repository.commit_at(
+            "add b",
+            "2010-01-01T00:00:00 +0000",
+            "2010-01-01T00:00:00 +0000",
+        )?;
+        fs::write(repository.path().join("a/README.md"), final_bytes)?;
+        fs::write(repository.path().join("b/README.md"), final_bytes)?;
+        repository.commit_at(
+            "align comments",
+            "2020-01-01T00:00:00 +0000",
+            "2020-01-01T00:00:00 +0000",
+        )?;
+
+        let conn = cache_connection()?;
+        let resolve_root = |root: &Path| -> Result<ProvenanceResolution> {
+            let capture = RepositoryCapture::capture(root);
+            let corpus = corpus::repository_inventory(root, &CorpusOptions::default())?;
+            resolve_document_provenance(&conn, &capture, &corpus.documents)
+        };
+        let first = resolve_root(&repository.path().join("a"))?;
+        assert_eq!(first.cache_updates.len(), 1);
+        assert_eq!(
+            first.documents[0]
+                .chunks
+                .iter()
+                .filter_map(|chunk| chunk.author_time)
+                .max(),
+            Some(978_307_200)
+        );
+        upsert_blame_cache(&conn, &first.cache_updates)?;
+
+        let second = resolve_root(&repository.path().join("b"))?;
+        assert_eq!(second.cache_updates.len(), 1);
+        assert_ne!(
+            first.cache_updates[0].cache_key.path_scope,
+            second.cache_updates[0].cache_key.path_scope
+        );
+        assert_eq!(first.cache_updates[0].cache_key.path, "README.md");
+        assert_eq!(second.cache_updates[0].cache_key.path, "README.md");
+        assert_eq!(
+            second.documents[0]
+                .chunks
+                .iter()
+                .filter_map(|chunk| chunk.author_time)
+                .max(),
+            Some(1_262_304_000)
+        );
         Ok(())
     }
 

@@ -537,10 +537,12 @@ retrieval chunks. Rules:
   `--no-ignore-revs-file` follows it. Other provenance commands also use
   `git --no-replace-objects <subcommand> ...`; ambient replace refs and
   ignore-revs configuration cannot alter attribution;
-- the blame mapping cache key includes the repository-relative path, a hash of
-  the exact file bytes being blamed, the newest commit touching that path as
-  resolved from the recorded head, and the shallow-set fingerprint. Worktree
-  edits, path-history rewriting,
+- the blame mapping cache key includes an opaque hash of Git's emitted
+  worktree-relative prefix for the indexed root, the indexed-root-relative
+  path, a hash of the exact file bytes being blamed, the newest commit touching
+  that path as resolved from the recorded head, and the shallow-set
+  fingerprint. Nested indexed roots that publish into the same database cannot
+  alias one another's `README.md` mapping. Worktree edits, path-history rewriting,
   clone deepening, and same-content files with different histories therefore
   resolve correctly; unrelated commits and staging an unchanged worktree file
   do not invalidate it;

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 const CACHE_KEY_DOMAIN: &[u8] = b"jscout-doc-blame-cache-v1\0";
+const PATH_SCOPE_DOMAIN: &[u8] = b"jscout-doc-git-path-scope-v1\0";
 const SHALLOW_SET_DOMAIN: &[u8] = b"jscout-doc-shallow-set-v1\0";
 
 /// Git state recorded before a documentation corpus is captured and parsed.
@@ -17,6 +18,7 @@ const SHALLOW_SET_DOMAIN: &[u8] = b"jscout-doc-shallow-set-v1\0";
 #[derive(Debug, Clone)]
 pub(crate) struct GitRepository {
     root: PathBuf,
+    path_scope: String,
     head: String,
     shallow: ShallowState,
 }
@@ -41,6 +43,7 @@ pub(crate) struct ProvenanceDiagnostic {
 /// deliberately absent: unrelated commits must not invalidate the mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct BlameCacheKey {
+    pub path_scope: String,
     pub path: String,
     pub bytes_hash: String,
     pub path_tip: String,
@@ -52,6 +55,7 @@ impl BlameCacheKey {
     pub(crate) fn fingerprint(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(CACHE_KEY_DOMAIN);
+        hash_field(&mut hasher, self.path_scope.as_bytes());
         hash_field(&mut hasher, self.path.as_bytes());
         hash_field(&mut hasher, self.bytes_hash.as_bytes());
         hash_field(&mut hasher, self.path_tip.as_bytes());
@@ -165,10 +169,13 @@ impl GitRepository {
             "indexed root is not a directory: {}",
             root.display()
         );
+        ensure_work_tree(root).context("verify indexed root is inside a Git worktree")?;
+        let path_scope = read_path_scope(root).context("record Git path scope")?;
         let head = read_head(root).context("record checked-out HEAD")?;
         let shallow = read_shallow_state(root).context("record shallow set")?;
         Ok(Self {
             root: root.to_path_buf(),
+            path_scope,
             head,
             shallow,
         })
@@ -212,6 +219,7 @@ impl GitRepository {
         };
         Ok(Some(BlameRequest {
             cache_key: BlameCacheKey {
+                path_scope: self.path_scope.clone(),
                 path: path.to_owned(),
                 bytes_hash: blake3::hash(bytes).to_hex().to_string(),
                 path_tip,
@@ -369,6 +377,38 @@ fn read_head(root: &Path) -> Result<String> {
     ];
     let output = run_git(root, &args, None)?;
     parse_single_oid(&output, "HEAD")
+}
+
+fn ensure_work_tree(root: &Path) -> Result<()> {
+    let args = [
+        OsString::from("--no-replace-objects"),
+        OsString::from("rev-parse"),
+        OsString::from("--is-inside-work-tree"),
+    ];
+    let output = run_git(root, &args, None)?;
+    let value = output.strip_suffix(b"\n").unwrap_or(&output);
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    ensure!(
+        value == b"true",
+        "indexed root is not inside a Git worktree"
+    );
+    Ok(())
+}
+
+fn read_path_scope(root: &Path) -> Result<String> {
+    let args = [
+        OsString::from("--no-replace-objects"),
+        OsString::from("rev-parse"),
+        OsString::from("--show-prefix"),
+    ];
+    let output = run_git(root, &args, None)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PATH_SCOPE_DOMAIN);
+    // Hash Git's raw output, including its record terminator. This keeps the
+    // scope byte-stable without assuming that the worktree-relative prefix is
+    // UTF-8 or contains no newline bytes.
+    hash_field(&mut hasher, &output);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn read_path_tip(root: &Path, head: &str, path: &str) -> Result<Option<String>> {
@@ -1225,7 +1265,44 @@ mod tests {
             RepositoryCapture::Git(_) => bail!("plain directory unexpectedly detected as Git"),
             RepositoryCapture::Unknown(diagnostic) => {
                 assert_eq!(diagnostic.operation, "capture Git documentation provenance");
-                assert!(diagnostic.detail.contains("HEAD"));
+                assert!(diagnostic.detail.contains("worktree"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bare_repository_root_degrades_to_visible_unknown() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        repository.write("README.md", b"tracked documentation\n")?;
+        repository.commit(
+            "documentation",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+
+        let clone_parent = tempfile::tempdir()?;
+        let bare = clone_parent.path().join("bare.git");
+        let output = Command::new("git")
+            .args(["clone", "--quiet", "--bare"])
+            .arg(repository.path())
+            .arg(&bare)
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "git clone --bare failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(bare.join("README.md"), b"unrelated filesystem file\n")?;
+
+        match RepositoryCapture::capture(&bare) {
+            RepositoryCapture::Git(_) => bail!("bare repository unexpectedly treated as worktree"),
+            RepositoryCapture::Unknown(diagnostic) => {
+                assert_eq!(diagnostic.operation, "capture Git documentation provenance");
+                assert!(diagnostic.detail.contains("not inside a Git worktree"));
             }
         }
         Ok(())
@@ -1233,6 +1310,7 @@ mod tests {
 
     fn test_cache_key() -> BlameCacheKey {
         BlameCacheKey {
+            path_scope: "scope".to_owned(),
             path: "guide.md".to_owned(),
             bytes_hash: "bytes".to_owned(),
             path_tip: "tip".to_owned(),
