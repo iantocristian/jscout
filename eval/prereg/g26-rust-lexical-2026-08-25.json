@@ -1,0 +1,499 @@
+{
+  "protocol_version": 1,
+  "goal": "G26 phase-1 Rust lexical retrieval without JavaScript/TypeScript regression",
+  "repository": "iantocristian/jscout",
+  "baseline_revision": "4ad4ea2d9b94f7268d155ab3ff9bf27b78625393",
+  "baseline_binary": "release build of baseline_revision",
+  "corpus_revision_policy": "Each arm indexes its own clean checkout; query and gold-file definitions are frozen by this manifest.",
+  "ranking_unit": "The rank of a file is its first search hit; repeated chunks from the same file are deduplicated in hit order.",
+  "query_mode": "lexical",
+  "k": 10,
+  "gates": {
+    "rust_file_recall_at_10_minimum": 0.9,
+    "control_file_recall_at_10_must_not_decrease": true,
+    "control_mrr_maximum_drop": 0.02,
+    "control_top_five_gold_may_not_fall_below_rank": 10
+  },
+  "queries": [
+    {
+      "id": "rust-01",
+      "cohort": "rust",
+      "question": "Where is a format's complete registry descriptor defined?",
+      "query": "FormatSpec",
+      "gold_files": ["src/formats.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-02",
+      "cohort": "rust",
+      "question": "Where is format-specific repository directory admission decided?",
+      "query": "repository_directory_admitted",
+      "gold_files": ["src/formats.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-03",
+      "cohort": "rust",
+      "question": "Where are capability-eligible format identifiers selected?",
+      "query": "eligible_ids",
+      "gold_files": ["src/formats.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-04",
+      "cohort": "rust",
+      "question": "Where is the result of lossless Rust extraction represented?",
+      "query": "RustExtraction",
+      "gold_files": ["src/rust_lang.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-05",
+      "cohort": "rust",
+      "question": "Where are Rust syntax ranges coalesced and split into chunks?",
+      "query": "coalesce_and_split",
+      "gold_files": ["src/rust_lang.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-06",
+      "cohort": "rust",
+      "question": "Where is the gap-free Rust chunk partition validated?",
+      "query": "validate_partition",
+      "gold_files": ["src/rust_lang.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-07",
+      "cohort": "rust",
+      "question": "Where does an incremental source refresh rebind checker state?",
+      "query": "incremental_refresh_repo_rebinding_checker",
+      "gold_files": ["src/indexer.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-08",
+      "cohort": "rust",
+      "question": "Where are persisted per-format extraction contracts checked?",
+      "query": "ensure_format_contracts",
+      "gold_files": ["src/indexer.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-09",
+      "cohort": "rust",
+      "question": "Where is the checker-eligible canonical file identity computed?",
+      "query": "checker_canonical_identity",
+      "gold_files": ["src/indexer.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-10",
+      "cohort": "rust",
+      "question": "Where is an active checker batch rebound to a replacement snapshot?",
+      "query": "rebind_active_checker_batch",
+      "gold_files": ["src/store.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-11",
+      "cohort": "rust",
+      "question": "Where is module-resolution identity hashed?",
+      "query": "compute_resolution_hash",
+      "gold_files": ["src/structural.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-12",
+      "cohort": "rust",
+      "question": "Where is the structural snapshot computed together with resolution?",
+      "query": "compute_snapshot_with_resolution",
+      "gold_files": ["src/structural.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-13",
+      "cohort": "rust",
+      "question": "Where is the neutral repository inventory consumer contract defined?",
+      "query": "RepositoryInventoryConsumer",
+      "gold_files": ["src/walk.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-14",
+      "cohort": "rust",
+      "question": "Where is repository source-path policy represented?",
+      "query": "SourcePathPolicy",
+      "gold_files": ["src/walk.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-15",
+      "cohort": "rust",
+      "question": "Where is docs-vector registry isolation tested end to end?",
+      "query": "documentation_vectors_follow_registry_eligibility_not_docs_corpus",
+      "gold_files": ["src/docs/retrieval.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-16",
+      "cohort": "rust",
+      "question": "Where are exact occurrence candidates selected?",
+      "query": "exact_occurrence_chunks",
+      "gold_files": ["src/search.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-17",
+      "cohort": "rust",
+      "question": "Where are package importer requests collected?",
+      "query": "importer_requests",
+      "gold_files": ["src/dependency.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-18",
+      "cohort": "rust",
+      "question": "Where is the in-memory module graph loaded?",
+      "query": "ModuleGraph",
+      "gold_files": ["src/query.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-19",
+      "cohort": "rust",
+      "question": "Where are recorded checker input files validated for freshness?",
+      "query": "active_batch_inputs_fresh",
+      "gold_files": ["src/checker/enrich.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-20",
+      "cohort": "rust",
+      "question": "Where are changed paths intersected with the checker source inventory?",
+      "query": "current_dirty_source_files",
+      "gold_files": ["src/checker/enrich.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-21",
+      "cohort": "rust",
+      "question": "Where does the checker package gate compute runtime reachability?",
+      "query": "runtime_reachable",
+      "gold_files": ["src/checker/package_gate.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-22",
+      "cohort": "rust",
+      "question": "Where are filesystem watch events classified into refresh signals?",
+      "query": "EventClassifier",
+      "gold_files": ["src/watch.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-23",
+      "cohort": "rust",
+      "question": "Where are missing code embedding documents selected?",
+      "query": "missing_embedding_documents",
+      "gold_files": ["src/embed.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "rust-24",
+      "cohort": "rust",
+      "question": "Where does the docs corpus adapt the neutral inventory walker?",
+      "query": "repository_inventory_with_consumer",
+      "gold_files": ["src/docs/corpus.rs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": []
+    },
+    {
+      "id": "control-01",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a gateway model spec parsed?",
+      "query": "parseModelSpec",
+      "gold_files": ["gateway/src/registry.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/registry.mjs", "gateway/src/server.mjs"]
+    },
+    {
+      "id": "control-02",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are provider reasoning options normalized?",
+      "query": "reasoningOptions",
+      "gold_files": ["gateway/src/registry.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/registry.mjs", "gateway/src/completion.mjs"]
+    },
+    {
+      "id": "control-03",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are model service-tier options derived?",
+      "query": "serviceTierOptions",
+      "gold_files": ["gateway/src/registry.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/registry.mjs", "gateway/src/completion.mjs"]
+    },
+    {
+      "id": "control-04",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a provider billing path selected?",
+      "query": "billingPath",
+      "gold_files": ["gateway/src/registry.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/registry.mjs", "gateway/src/completion.mjs", "gateway/src/server.mjs"]
+    },
+    {
+      "id": "control-05",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is gateway process state constructed?",
+      "query": "createGatewayState",
+      "gold_files": ["gateway/src/server.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/server.mjs", "gateway/test/gateway.test.mjs", "gateway/src/main.mjs"]
+    },
+    {
+      "id": "control-06",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are gateway protocol messages dispatched?",
+      "query": "handleMessage",
+      "gold_files": ["gateway/src/server.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/server.mjs", "gateway/test/gateway.test.mjs", "gateway/src/main.mjs"]
+    },
+    {
+      "id": "control-07",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are checker protocol messages encoded?",
+      "query": "encodeMessage",
+      "gold_files": ["checker/src/protocol.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/protocol.mjs", "checker/test/sidecar.test.mjs"]
+    },
+    {
+      "id": "control-08",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are checker planning inputs split into bounded frames?",
+      "query": "chunkPlanMemberFiles",
+      "gold_files": ["checker/src/protocol.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/protocol.mjs", "checker/test/sidecar.test.mjs"]
+    },
+    {
+      "id": "control-09",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a checker plan-result pager created?",
+      "query": "createPlanMemberResultPager",
+      "gold_files": ["checker/src/protocol.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/protocol.mjs", "checker/src/main.mjs", "checker/test/sidecar.test.mjs"]
+    },
+    {
+      "id": "control-10",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is the next checker plan-result page taken?",
+      "query": "takePlanMemberResultPage",
+      "gold_files": ["checker/src/protocol.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/protocol.mjs", "checker/src/main.mjs", "checker/test/sidecar.test.mjs"]
+    },
+    {
+      "id": "control-11",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is an in-progress checker planning session cleared?",
+      "query": "clearPlanSession",
+      "gold_files": ["checker/src/main.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/main.mjs"]
+    },
+    {
+      "id": "control-12",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is checker member planning finalized?",
+      "query": "finishPlanMembers",
+      "gold_files": ["checker/src/main.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["checker/src/main.mjs"]
+    },
+    {
+      "id": "control-13",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is the graph-memory data structure implemented?",
+      "query": "GraphMemory",
+      "gold_files": ["examples/graph-memory/demo.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["examples/graph-memory/demo.mjs"]
+    },
+    {
+      "id": "control-14",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are graph-memory alias groups converted into a map?",
+      "query": "buildAliasMap",
+      "gold_files": ["examples/graph-memory/demo.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["examples/graph-memory/demo.mjs"]
+    },
+    {
+      "id": "control-15",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are graph-memory worker outputs assembled?",
+      "query": "assembleGraph",
+      "gold_files": ["examples/graph-memory/demo.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["examples/graph-memory/demo.mjs", "examples/graph-memory/demo.test.mjs"]
+    },
+    {
+      "id": "control-16",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is the example Acme graph answer synthesized?",
+      "query": "synthesizeAcmeAnswer",
+      "gold_files": ["examples/graph-memory/demo.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["examples/graph-memory/demo.mjs"]
+    },
+    {
+      "id": "control-17",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a checkout payment authorized?",
+      "query": "authorizePayment",
+      "gold_files": ["eval/fixtures/structural/src/payments.ts"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["eval/fixtures/structural/src/payments.ts", "eval/fixtures/structural/src/checkout.ts"]
+    },
+    {
+      "id": "control-18",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is checkout inventory reserved?",
+      "query": "reserveInventory",
+      "gold_files": ["eval/fixtures/structural/src/inventory.ts"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["eval/fixtures/structural/src/inventory.ts", "eval/fixtures/structural/src/checkout.ts"]
+    },
+    {
+      "id": "control-19",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is the receipt worker started?",
+      "query": "startReceiptWorker",
+      "gold_files": ["eval/fixtures/structural/src/worker.ts"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["eval/fixtures/structural/src/worker.ts"]
+    },
+    {
+      "id": "control-20",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is the checkout HTTP request handled?",
+      "query": "handleCheckout",
+      "gold_files": ["eval/fixtures/structural/src/http.ts"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["eval/fixtures/structural/src/http.ts"]
+    },
+    {
+      "id": "control-21",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a nearest-rank percentile selected?",
+      "query": "nearestRank",
+      "gold_files": ["bench/perf/lib.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["bench/perf/lib.mjs", "bench/perf/perf.test.mjs"]
+    },
+    {
+      "id": "control-22",
+      "cohort": "javascript-typescript-control",
+      "question": "Where is a SQLite benchmark database checkpointed?",
+      "query": "checkpointDatabase",
+      "gold_files": ["bench/perf/lib.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["bench/perf/lib.mjs", "scripts/eval-run-memory.mjs"]
+    },
+    {
+      "id": "control-23",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are staged benchmark symlinks checked for containment?",
+      "query": "assertContainedSymlinks",
+      "gold_files": ["bench/perf/lib.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["bench/perf/lib.mjs"]
+    },
+    {
+      "id": "control-24",
+      "cohort": "javascript-typescript-control",
+      "question": "Where are OpenAI-compatible provider definitions parsed?",
+      "query": "parseOpenAICompatibleProviders",
+      "gold_files": ["gateway/src/registry.mjs"],
+      "query_mode": "lexical",
+      "k": 10,
+      "baseline_output": ["gateway/src/registry.mjs", "gateway/src/server.mjs"]
+    }
+  ]
+}
