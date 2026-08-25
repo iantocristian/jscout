@@ -240,7 +240,7 @@ fn reconciliation_is_immediate_only_after_the_previous_generation_completes() {
         .next_work(seconds(10))
         .expect("immediate reconciliation");
     assert_eq!(refresh.generation, 2);
-    assert_eq!(refresh.refresh_scope, RefreshScope::Full);
+    assert_eq!(refresh.refresh_scope, RefreshScope::Incremental);
     assert!(!refresh.force_full_enrichment);
 }
 
@@ -350,7 +350,7 @@ fn a_large_source_batch_promotes_to_full_refresh() {
 fn event_classifier_excludes_only_the_exact_database_family() {
     let root = PathBuf::from("/repo");
     let database = root.join(".jscout.db");
-    let classifier = EventClassifier::new(&root, &database);
+    let classifier = EventClassifier::new(&root, &database, &Default::default()).unwrap();
     assert!(classifier.classify(&[database]).is_none());
     assert!(
         classifier
@@ -368,7 +368,8 @@ fn event_classifier_excludes_only_the_exact_database_family() {
 fn selected_external_prefix_overrides_node_modules_noise() {
     let root = PathBuf::from("/repo");
     let dependency = root.join("node_modules/pkg");
-    let mut classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let mut classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
     classifier.set_external(Default::default(), [dependency.clone()].into());
     assert!(
         classifier
@@ -385,7 +386,8 @@ fn selected_external_prefix_overrides_node_modules_noise() {
 #[test]
 fn a_refresh_boundary_dominates_source_paths_in_one_event() {
     let root = PathBuf::from("/repo");
-    let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
 
     let signal = classifier
         .classify(&[root.join("src/main.ts"), root.join("package.json")])
@@ -408,7 +410,8 @@ fn lockfiles_and_configs_are_full_refresh_boundaries() {
     assert!(is_refresh_boundary(Path::new(".ignore")));
 
     let root = PathBuf::from("/repo");
-    let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
     for boundary in [".gitignore", ".ignore", "pnpm-workspace.yaml"] {
         assert!(
             classifier
@@ -440,7 +443,8 @@ fn event_filter_uses_walker_ignore_policy_without_excluding_authored_build_dirs(
         root.join("node_modules/dep/index.js"),
         "module.exports = 1;\n",
     )?;
-    let classifier = EventClassifier::new(root, &root.join("watch.db"));
+    let classifier =
+        EventClassifier::new(root, &root.join("watch.db"), &Default::default()).unwrap();
 
     assert!(
         classifier
@@ -472,7 +476,8 @@ fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
         root.join("generated/output.ts"),
         "export const output = 1;\n",
     )?;
-    let mut classifier = EventClassifier::new(root, &root.join("watch.db"));
+    let mut classifier =
+        EventClassifier::new(root, &root.join("watch.db"), &Default::default()).unwrap();
 
     assert!(
         classifier
@@ -480,11 +485,62 @@ fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
             .is_some()
     );
     fs::write(root.join(".gitignore"), "/generated/\n")?;
-    classifier.reload_source_policy();
+    classifier.reload_path_policies()?;
     assert!(
         classifier
             .classify(&[root.join("generated/output.ts")])
             .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn event_filter_applies_the_configured_documentation_policy() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::create_dir(root.join(".git"))?;
+    fs::create_dir_all(root.join("docs"))?;
+    fs::create_dir_all(root.join("private"))?;
+    fs::create_dir_all(root.join(".github"))?;
+    fs::create_dir_all(root.join(".hidden"))?;
+    fs::write(root.join(".gitignore"), "/docs/\n")?;
+    fs::write(root.join("docs/ignored.md"), "ignored\n")?;
+    fs::write(root.join("private/excluded.md"), "excluded\n")?;
+    fs::write(root.join(".github/guide.mdx"), "visible\n")?;
+    fs::write(root.join(".hidden/secret.md"), "hidden\n")?;
+    let documentation = crate::docs::corpus::CorpusOptions {
+        exclude: vec!["private/**".to_string()],
+        ..Default::default()
+    };
+    let mut classifier = EventClassifier::new(root, &root.join("watch.db"), &documentation)?;
+
+    assert!(
+        classifier
+            .classify(&[root.join("docs/ignored.md")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join("private/excluded.md")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join(".hidden/secret.md")])
+            .is_none()
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".github/guide.mdx")]),
+        Some(DirtySignal::documentation(
+            "documentation:.github/guide.mdx"
+        ))
+    );
+
+    fs::write(root.join(".gitignore"), "")?;
+    classifier.reload_path_policies()?;
+    assert_eq!(
+        classifier.classify(&[root.join("docs/deleted.md")]),
+        Some(DirtySignal::documentation("documentation:docs/deleted.md"))
     );
     Ok(())
 }
@@ -497,12 +553,15 @@ fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result
     fs::create_dir(root.path().join("renamed-directory"))?;
     fs::create_dir(root.path().join(".git"))?;
     fs::write(root.path().join(".git/index"), "git metadata\n")?;
-    let classifier = EventClassifier::new(root.path(), &root.path().join("watch.db"));
+    let classifier = EventClassifier::new(
+        root.path(),
+        &root.path().join("watch.db"),
+        &Default::default(),
+    )?;
 
-    assert!(
-        classifier
-            .classify(&[root.path().join("README.md")])
-            .is_none()
+    assert_eq!(
+        classifier.classify(&[root.path().join("README.md")]),
+        Some(DirtySignal::documentation("documentation:README.md"))
     );
     assert!(
         classifier

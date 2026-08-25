@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use notify::{RecursiveMode, Watcher};
 use rusqlite::Connection;
 
-use crate::{checker, embed, indexer, store, structural, walk};
+use crate::{checker, docs, embed, indexer, store, structural, walk};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
@@ -100,12 +100,33 @@ impl DirtySignal {
         }
     }
 
+    fn documentation(reason: impl Into<String>) -> Self {
+        Self {
+            scope: RefreshScope::Incremental,
+            reasons: [reason.into()].into(),
+            source_paths: BTreeSet::new(),
+            force_full_enrichment: false,
+        }
+    }
+
     fn checker_drift_flush() -> Self {
         Self {
             scope: RefreshScope::Incremental,
             reasons: ["checker-drift-flush".to_string()].into(),
             source_paths: BTreeSet::new(),
             force_full_enrichment: true,
+        }
+    }
+
+    fn reconciliation() -> Self {
+        Self {
+            // Incremental refresh still walks and hashes the complete code and
+            // documentation inventory. It differs from full refresh only by
+            // retaining unchanged canonical rows instead of rebuilding them.
+            scope: RefreshScope::Incremental,
+            reasons: ["periodic-reconciliation".to_string()].into(),
+            source_paths: BTreeSet::new(),
+            force_full_enrichment: false,
         }
     }
 
@@ -253,7 +274,7 @@ impl Coordinator {
 
     fn mark_reconciliation(&mut self, now: Duration) {
         debug_assert!(self.is_clean());
-        self.mark_dirty(now, DirtySignal::full("periodic-reconciliation"));
+        self.mark_dirty(now, DirtySignal::reconciliation());
         self.refresh_immediate = true;
     }
 
@@ -436,27 +457,37 @@ struct EventClassifier {
     external_exact: BTreeSet<PathBuf>,
     external_prefixes: BTreeSet<PathBuf>,
     source_policy: RefCell<walk::SourcePathPolicy>,
+    documentation_policy: RefCell<docs::corpus::DocumentationPathPolicy>,
 }
 
 impl EventClassifier {
-    fn new(root: &Path, database: &Path) -> Self {
+    fn new(
+        root: &Path,
+        database: &Path,
+        documentation: &docs::corpus::CorpusOptions,
+    ) -> Result<Self> {
         let mut excluded = BTreeSet::new();
         excluded.insert(database.to_path_buf());
         for suffix in ["-wal", "-shm", "-journal"] {
             excluded.insert(PathBuf::from(format!("{}{suffix}", database.display())));
         }
-        Self {
+        Ok(Self {
             root: root.to_path_buf(),
             excluded,
             git_controls: git_control_paths(root),
             external_exact: BTreeSet::new(),
             external_prefixes: BTreeSet::new(),
             source_policy: RefCell::new(walk::SourcePathPolicy::new(root)),
-        }
+            documentation_policy: RefCell::new(docs::corpus::DocumentationPathPolicy::new(
+                root,
+                documentation,
+            )?),
+        })
     }
 
-    fn reload_source_policy(&mut self) {
+    fn reload_path_policies(&mut self) -> Result<()> {
         *self.source_policy.get_mut() = walk::SourcePathPolicy::new(&self.root);
+        self.documentation_policy.get_mut().reload_ignore()
     }
 
     fn set_external(&mut self, exact: BTreeSet<PathBuf>, prefixes: BTreeSet<PathBuf>) {
@@ -508,6 +539,18 @@ impl EventClassifier {
                 continue;
             }
             if self
+                .documentation_policy
+                .borrow_mut()
+                .is_admitted(&path, path.is_dir())
+            {
+                let relative = display_path(&self.root, &path);
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::documentation(format!("documentation:{relative}")),
+                );
+                continue;
+            }
+            if self
                 .source_policy
                 .borrow_mut()
                 .is_ignored(&path, path.is_dir())
@@ -526,8 +569,8 @@ impl EventClassifier {
                 );
                 continue;
             }
-            // Existing regular files with irrelevant extensions are ordinary
-            // repository noise (README edits, Finder metadata, and similar).
+            // Existing regular files outside both admitted corpora are
+            // ordinary repository noise (Finder metadata and similar).
             // Missing paths and directories remain conservative because a
             // backend may be reporting a delete, rename, or rescan without
             // enough type information to classify it safely.
@@ -715,7 +758,12 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         options.enrich_on_change,
     );
     let mut rejection_report_latch = RejectionReportLatch::default();
-    let mut classifier = EventClassifier::new(&root, &database);
+    let documentation = docs::corpus::CorpusOptions {
+        include: options.docs_include.to_vec(),
+        exclude: options.docs_exclude.to_vec(),
+        ..Default::default()
+    };
+    let mut classifier = EventClassifier::new(&root, &database, &documentation)?;
     let mut registry = WatchRegistry::default();
     let mut targets =
         collect_watch_targets(&root, &database).unwrap_or_else(|_| git_watch_targets(&root));
@@ -841,7 +889,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             normalize_targets(&mut targets);
                             update_classifier_targets(&mut classifier, &targets);
                             registry.reconcile(&mut watcher, &root, &targets);
-                            classifier.reload_source_policy();
+                            classifier.reload_path_policies()?;
                             drain_events(
                                 &receiver,
                                 &classifier,

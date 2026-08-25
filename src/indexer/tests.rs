@@ -1836,7 +1836,7 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
         ),
         (
             "files",
-            "SELECT f.path, f.hash, f.role, f.origin, f.package_path,
+            "SELECT f.path, f.hash, f.corpus, f.format, f.role, f.origin, f.package_path,
                     p.origin, p.name, p.version, p.canonical_root, p.locator,
                     p.manifest_hash, p.status
              FROM files f LEFT JOIN package_instances p ON p.id=f.package_instance_id",
@@ -1853,6 +1853,30 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
              FROM chunks_fts fts
              JOIN chunks c ON c.id=fts.rowid
              JOIN files f ON f.id=c.file_id",
+        ),
+        (
+            "doc_inventory",
+            "SELECT path, subject, rule, detail, path_base64, path_encoding
+             FROM doc_inventory",
+        ),
+        (
+            "doc_chunk_meta",
+            "SELECT file.path, chunk.start, metadata.title,
+                    metadata.description, metadata.tags_json,
+                    metadata.breadcrumb, metadata.nearest_heading,
+                    metadata.ordinal, metadata.embedding_identity,
+                    metadata.front_matter_state
+             FROM doc_chunk_meta metadata
+             JOIN chunks chunk ON chunk.id=metadata.chunk_id
+             JOIN files file ON file.id=chunk.file_id",
+        ),
+        (
+            "docs_fts",
+            "SELECT file.path, chunk.start, fts.title, fts.metadata,
+                    fts.breadcrumb, fts.body, fts.path
+             FROM docs_fts fts
+             JOIN chunks chunk ON chunk.id=fts.rowid
+             JOIN files file ON file.id=chunk.file_id",
         ),
         (
             "symbols",
@@ -2206,6 +2230,7 @@ fn incremental_read_failure_removes_the_stale_file_row() -> Result<()> {
 #[test]
 fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result<()> {
     let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join(".git"))?;
     fs::write(
         repo.path().join("main.ts"),
         "import { stable } from './stable';\n\
@@ -2224,6 +2249,23 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
         repo.path().join("old-name.ts"),
         "export const renamed = 4;\n",
     )?;
+    fs::write(
+        repo.path().join("guide.md"),
+        "# Existing guide\n\nBefore documentation.\n",
+    )?;
+    fs::write(
+        repo.path().join("removed.md"),
+        "# Removed guide\n\nThis disappears.\n",
+    )?;
+    fs::write(repo.path().join(".gitignore"), "later-visible.ts\n")?;
+    fs::write(
+        repo.path().join("later-visible.ts"),
+        "export const admittedAfterIgnoreChange = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("later-hidden.md"),
+        "# Hidden later\n\nInitially admitted documentation.\n",
+    )?;
 
     let incremental = store::open_path(&repo.path().join("incremental.db"))?;
     let full = store::open_path(&repo.path().join("full.db"))?;
@@ -2237,6 +2279,16 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
         repo.path().join("renamed.ts"),
     )?;
     fs::write(repo.path().join("added.ts"), "export const added = 5;\n")?;
+    fs::write(
+        repo.path().join("guide.md"),
+        "# Existing guide\n\nAfter documentation.\n",
+    )?;
+    fs::remove_file(repo.path().join("removed.md"))?;
+    fs::write(
+        repo.path().join("added.mdx"),
+        "# Added guide\n\nNew MDX documentation.\n",
+    )?;
+    fs::write(repo.path().join(".gitignore"), "later-hidden.md\n")?;
     fs::write(
         repo.path().join("main.ts"),
         "import { stable } from './stable';\n\
@@ -2255,9 +2307,9 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
             incremental_outcome.unchanged,
             incremental_outcome.removed,
         ),
-        (4, 1, 2)
+        (7, 1, 4)
     );
-    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (5, 0));
+    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (8, 0));
 
     let incremental_resolution = structural::compute_resolution_hash(&incremental)?;
     let full_resolution = structural::compute_resolution_hash(&full)?;

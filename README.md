@@ -109,7 +109,7 @@ jscout enrich <root>           # explicit occurrence-scoped TypeScript checker p
                                #   --all includes other resolved calls, excluded roles, every orphan;
                                #   receiver value-flow answers remain excluded
 jscout watch <root> [--embed [--product]] [--enrich]
-                               # full startup/reconciliation; incremental source generations
+                               # full startup/boundaries; complete-inventory incremental reconciliation
                                # optional code-vector/checker/semantic-vector phases
                                #   --product keeps embedding to the effective product corpus
                                #   repeat --deps from index to retain that corpus
@@ -580,9 +580,13 @@ jscout embed . --product --semantic
 `jscout watch` subscribes before its startup pass and begins with the same full
 disposable-snapshot refresh as `jscout index`. A bounded batch containing only
 indexed JavaScript/TypeScript source paths then uses incremental extraction: it
-walks and hashes the complete source tree, but parses and replaces only changed
-or missing files. Startup, periodic reconciliation, more than 256 changed
-source paths, Git/submodule controls, source-inventory ignore files,
+walks and hashes the complete shared code-and-document inventory, but parses
+and replaces only changed or missing files. Admitted Markdown/MDX changes use
+the same incremental refresh without entering checker dirty affinity. Periodic
+reconciliation also runs this complete-inventory incremental path, so it still
+repairs missed create/delete/ignore transitions without rebuilding unchanged
+rows. Startup, more than 256 changed source paths, Git/submodule controls,
+source-inventory ignore files,
 package/workspace manifests, lockfiles, tsconfig/jsconfig or declaration
 inputs, selected dependency/checker inputs, directories, backend errors, and
 uncertain missing paths use full refresh. Full scope is sticky within a
@@ -1146,7 +1150,7 @@ unchanged project facts into a newly published current-snapshot batch. Run
 edges are required.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
-periodic full reconciliation. `watch --embed` updates the default corpus;
+periodic complete-inventory incremental reconciliation. `watch --embed` updates the default corpus;
 `watch --embed --product` applies the same fresh reconnaissance policy and
 neutral production fallback as `jscout embed --product`, so it does not widen a
 product-only vector cache. Each embedding phase reports missing documents,

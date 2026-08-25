@@ -1481,11 +1481,13 @@ full or incremental structural refresh
   -> optionally embed/sync current semantic artifacts (`--embed`)
 ```
 
-Startup and reconciliation generations run a full disposable-plane refresh.
-An ordinary bounded batch of JavaScript/TypeScript source paths uses
-incremental extraction: it still walks and hashes the complete current source
-tree, but preserves unchanged first-party rows and parses/replaces only changed
-or missing files. Dependency discovery, module resolution, snapshot
+Startup and structural-boundary generations run a full disposable-plane
+refresh. An ordinary bounded batch of JavaScript/TypeScript source paths, an
+admitted Markdown/MDX event, or periodic reconciliation uses incremental
+extraction: it still walks and hashes the complete current shared code-and-doc
+inventory, but preserves unchanged rows and parses/replaces only changed or
+missing files. Documentation events do not enter checker dirty affinity.
+Dependency discovery, module resolution, snapshot
 calculation, hidden old-checker-batch retention/retirement, vector occurrence
 rematerialization, and projection publication still run against the complete
 resulting snapshot. `jscout index` remains a full rebuild and always clears
@@ -1611,14 +1613,15 @@ required.
 
 ### Trigger and reconciliation policy
 
-Relevant events carry a typed refresh scope. Indexed source-file create,
-update, delete, and rename paths select incremental extraction while all
-resolution, ownership, checkout, dependency, and uncertain boundaries select
-full refresh. Scopes coalesce during debounce, full scope dominates and remains
-sticky for the generation, and more than 256 distinct source paths promotes
-the generation to full refresh. The incremental executor still scans the
-complete source tree and runs complete resolution and publication, so event
-paths are optimization hints rather than the correctness inventory.
+Relevant events carry a typed refresh scope. Indexed source-file and admitted
+Markdown/MDX create, update, delete, and rename paths select incremental
+extraction while all resolution, ownership, checkout, dependency, and
+uncertain boundaries select full refresh. Scopes coalesce during debounce,
+full scope dominates and remains sticky for the generation, and more than 256
+distinct source paths promotes the generation to full refresh. The incremental
+executor still scans the complete shared code-and-doc inventory and runs
+complete resolution and publication, so event paths are optimization hints
+rather than the correctness inventory.
 
 Jscout-owned output paths are excluded before relevance classification and
 before the unknown-event escalation rule. The exclusion set is exact, not a
@@ -1648,9 +1651,10 @@ Triggers include:
 - notification overflow, backend errors, or unknown non-excluded event shapes.
 
 Existing regular files that fail every relevance rule are ignored rather than
-escalated: documentation, editor metadata, and other unindexed files therefore
-do not rebuild the repository. Pathless/rescan events, directories, and
-otherwise uncertain missing paths remain conservative full-refresh triggers.
+escalated: documentation excluded by the configured corpus policy, editor
+metadata, and other unindexed files therefore do not rebuild the repository.
+Pathless/rescan events, directories, and otherwise uncertain missing paths
+remain conservative full-refresh triggers.
 
 After each refresh or enrichment, the coordinator reconciles its narrow
 external watches with the newly resolved package instances and checker input
@@ -1665,7 +1669,8 @@ timer. Persistent registration failure does not itself keep the structural
 generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
-(default ten minutes) schedules a full refresh even when no event arrived.
+(default ten minutes) schedules a complete-inventory incremental refresh even
+when no event arrived.
 The interval starts when a generation completes, not when its timer fires, so
 a slow refresh cannot cause back-to-back cycles. A nonzero interval must exceed
 the debounce period, and reconciliation starts immediately when due rather
@@ -1782,8 +1787,8 @@ substitution rather than a completed measurement of that checkout.
   TypeScript runtime, and ambient declaration changes converge;
 - edit -> enrich -> revert cannot reactivate a checker batch created before
   intervening external checker-input changes;
-- bounded source-only generations parse only changed files and report
-  unchanged-file reuse, while startup, reconciliation, branch/config/package,
+- bounded source/doc generations and periodic reconciliation parse only changed
+  files and report unchanged-file reuse, while startup, branch/config/package,
   large-batch, and uncertain generations use full refresh;
 - no refresh mode can project a checker batch from a different snapshot;
 - plain watch never serves checker edges from an older generation;
