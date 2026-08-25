@@ -814,9 +814,9 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
 -- Canonical TypeScript-checker facts are exact-snapshot public data. A watch
--- refresh may temporarily retain the prior active batch as a hidden source
--- for validated, per-project carry into the next snapshot; manual indexing
--- clears the plane.
+-- refresh may temporarily retain the prior active batch plus the most useful
+-- superseded staging batch as hidden sources for validated, per-project carry
+-- into the next snapshot; manual indexing clears the plane.
 -- Source/target identities are deliberately not foreign keys because a
 -- projection rebuild must not cascade through canonical checker facts.
 CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
@@ -1276,18 +1276,41 @@ pub(crate) fn clear_checker_batches(conn: &Connection) -> Result<bool> {
     Ok(changed)
 }
 
-/// A watcher refresh keeps the active publication plus the newest superseded
-/// staging batch as carry sources. Only completed projects from staging are
-/// eligible later; incomplete rows remain durable solely so the successor can
-/// reject them project-by-project. Ordinary projection still requires the
-/// active batch's source snapshot to equal the current snapshot.
-pub(crate) fn preserve_active_checker_batch_for_watch(conn: &Connection) -> Result<bool> {
+/// Keep the active publication plus one superseded staging carry source.
+///
+/// Prefer the newest inactive batch containing at least one fully completed,
+/// coverage-complete project. This matters after a crash between opening an
+/// empty destination and copying its predecessor: the empty destination has a
+/// newer row id but must not displace the useful completed source. If no
+/// inactive batch has reusable coverage, retain only the newest marker.
+/// Ordinary projection still requires the active batch's source snapshot to
+/// equal the current snapshot.
+pub(crate) fn preserve_checker_carry_source_for_watch(conn: &Connection) -> Result<bool> {
     let changed = conn.execute(
         "DELETE FROM checker_enrichment_batches
          WHERE active=0
            AND id!=(
-             SELECT id FROM checker_enrichment_batches
-             WHERE active=0 ORDER BY id DESC LIMIT 1
+             SELECT candidate.id FROM checker_enrichment_batches candidate
+             WHERE candidate.active=0
+             ORDER BY EXISTS(
+               SELECT 1 FROM checker_project_runs run
+               WHERE run.batch_id=candidate.id
+                 AND run.status='completed'
+                 AND run.selected_occurrences>0
+                 AND run.completed_occurrences=run.selected_occurrences
+                 AND (
+                   SELECT count(*) FROM checker_occurrence_projects coverage
+                   WHERE coverage.batch_id=run.batch_id
+                     AND coverage.project_id=run.project_id
+                 )=run.selected_occurrences
+                 AND NOT EXISTS(
+                   SELECT 1 FROM checker_occurrence_projects coverage
+                   WHERE coverage.batch_id=run.batch_id
+                     AND coverage.project_id=run.project_id
+                     AND coverage.status='failed'
+                 )
+             ) DESC, candidate.id DESC
+             LIMIT 1
            )",
         [],
     )? != 0;

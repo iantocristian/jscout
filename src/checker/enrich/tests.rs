@@ -1289,7 +1289,11 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
         batch_id: 1,
         facts_published: 10,
         projects_carried: 1,
+        projects_carried_from_staging: 1,
+        projects_carried_from_active: 0,
+        projects_partially_carried: 1,
         occurrences_carried: 2,
+        project_occurrences_carried: 3,
         projects_resumed: 3,
         occurrences_resumed: 4,
         projects_reset: 5,
@@ -1312,7 +1316,7 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
             .contains("broken.mjs (span_mismatch: indexed occurrence moved)")
     );
     assert!(terminal_partial.to_string().contains(
-        "projects_carried=1 occurrences_carried=2 projects_resumed=3 occurrences_resumed=4 projects_reset=5 occurrences_reset=6"
+        "projects_carried=1 projects_carried_from_staging=1 projects_carried_from_active=0 projects_partially_carried=1 occurrences_carried=2 project_occurrences_carried=3 projects_resumed=3 occurrences_resumed=4 projects_reset=5 occurrences_reset=6"
     ));
     let terminal_partial = anyhow::Error::new(terminal_partial);
     assert!(is_terminal_partial_failure(&terminal_partial));
@@ -1321,7 +1325,11 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
         batch_id: 2,
         facts_published: 10,
         projects_carried: 0,
+        projects_carried_from_staging: 0,
+        projects_carried_from_active: 0,
+        projects_partially_carried: 0,
         occurrences_carried: 0,
+        project_occurrences_carried: 0,
         projects_resumed: 0,
         occurrences_resumed: 0,
         projects_reset: 0,
@@ -2947,6 +2955,40 @@ fn successor_prefers_complete_staging_projects_and_falls_back_to_active() -> Res
         .keys()
         .map(|project| (project.clone(), vec![occurrence_v3.clone()]))
         .collect::<BTreeMap<_, _>>();
+    let destination_before_crash = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "successor-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects_v3,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    assert!(crate::store::preserve_checker_carry_source_for_watch(
+        &conn
+    )?);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_enrichment_batches WHERE id=?1",
+            [destination_before_crash],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "restart pruning must discard the newer empty destination"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_enrichment_batches WHERE id=?1",
+            [staging_batch],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "restart pruning must retain the older completed staging source"
+    );
     let destination = open_staging_batch(
         &conn,
         &StagingPlan {
@@ -3000,6 +3042,192 @@ fn successor_prefers_complete_staging_projects_and_falls_back_to_active() -> Res
         .collect::<std::result::Result<Vec<_>, _>>()?;
     assert_eq!(batches, vec![(active_batch, true), (destination, false)]);
     Ok(())
+}
+
+#[test]
+fn stale_selected_staging_result_is_rechecked_without_time_travel_to_active() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class CardTable { insert(): void {} }\n\
+                  declare const card: CardTable; card.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let occurrence_v1 = occurrence(&conn)?;
+    let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let project = "tsconfig.json";
+    let fingerprints = BTreeMap::from([(project.to_string(), "stable-plan".to_string())]);
+    let active_batch = seed_active_checker_batch(
+        repo.path(),
+        &conn,
+        &hash,
+        &occurrence_v1,
+        &declaration,
+        &fingerprints,
+    )?;
+
+    fs::write(
+        repo.path().join("generation-2.ts"),
+        "export const g2 = 2;\n",
+    )?;
+    crate::indexer::watch_full_refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &crate::indexer::IndexOptions::default(),
+    )?;
+    let occurrence_v2 = occurrence(&conn)?;
+    let projects_v2 = BTreeMap::from([(project.to_string(), vec![occurrence_v2.clone()])]);
+    let staging_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "superseded-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects_v2,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    let staging_outcome = map_occurrence(
+        &conn,
+        &occurrence_v2,
+        &[project_answer(project, vec![declaration.clone()])],
+    )?;
+    stage_batch(
+        &conn,
+        staging_batch,
+        project,
+        std::slice::from_ref(&occurrence_v2),
+        &staging_outcome.facts,
+        &staging_outcome.projects,
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        staging_batch,
+        project,
+        "staging-inputs",
+        &[super::super::protocol::CheckerInputFile {
+            path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+            source_hash: hash,
+        }],
+        1,
+        1,
+    )?;
+    conn.execute(
+        "UPDATE checker_enrichments SET target_fingerprint='stale-selected-staging-target'
+         WHERE batch_id=?1 AND project_id=?2",
+        params![staging_batch, project],
+    )?;
+
+    let active_target = conn.query_row(
+        "SELECT target_anchor, target_fingerprint FROM checker_enrichments
+         WHERE batch_id=?1 AND project_id=?2 LIMIT 1",
+        params![active_batch, project],
+        |row| {
+            Ok(Target {
+                anchor: row.get(0)?,
+                fingerprint: row.get(1)?,
+            })
+        },
+    )?;
+    assert!(
+        target_is_current(&conn, &active_target)?,
+        "the active result must remain a viable fallback so this pins no-time-travel precedence"
+    );
+
+    fs::write(
+        repo.path().join("generation-3.ts"),
+        "export const g3 = 3;\n",
+    )?;
+    crate::indexer::watch_full_refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &crate::indexer::IndexOptions::default(),
+    )?;
+    let occurrence_v3 = occurrence(&conn)?;
+    let projects_v3 = BTreeMap::from([(project.to_string(), vec![occurrence_v3])]);
+    let destination = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "successor-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects_v3,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    let carried = carry_forward_projects(
+        &conn,
+        destination,
+        &identity,
+        2,
+        &projects_v3,
+        &fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
+    )?;
+
+    assert_eq!(carried.projects_carried, 0);
+    assert_eq!(carried.occurrences_carried, 0);
+    assert_eq!(
+        carried.projects_requiring_check,
+        BTreeSet::from([project.to_string()])
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checker_occurrence_projects WHERE batch_id=?1",
+            [destination],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn reset_carried_projects_are_removed_from_effective_carry_telemetry() {
+    let shared_occurrence = 17;
+    let mut carry = CarryOutcome {
+        projects_carried: 0,
+        projects_carried_from_staging: 1,
+        projects_carried_from_active: 1,
+        projects_partially_carried: 2,
+        occurrences_carried: 1,
+        project_occurrences_carried: 2,
+        fully_carried_projects: BTreeSet::new(),
+        occurrences_by_project: BTreeMap::from([
+            ("a".into(), BTreeSet::from([shared_occurrence])),
+            ("b".into(), BTreeSet::from([shared_occurrence])),
+        ]),
+        source_by_project: BTreeMap::from([
+            ("a".into(), CarrySourceKind::SupersededStaging),
+            ("b".into(), CarrySourceKind::ActivePublication),
+        ]),
+        invalidated_occurrences: BTreeSet::new(),
+        projects_requiring_check: BTreeSet::new(),
+    };
+
+    carry.discard_project_carry("a");
+    assert_eq!(carry.occurrences_carried, 0);
+    assert_eq!(carry.project_occurrences_carried, 1);
+    assert_eq!(carry.projects_partially_carried, 1);
+    assert_eq!(carry.projects_carried_from_staging, 0);
+    assert_eq!(carry.projects_carried_from_active, 1);
+
+    carry.discard_project_carry("b");
+    assert_eq!(
+        carry.occurrences_carried, 0,
+        "shared occurrence decrements once"
+    );
+    assert_eq!(carry.project_occurrences_carried, 0);
+    assert_eq!(carry.projects_partially_carried, 0);
+    assert_eq!(carry.projects_carried_from_active, 0);
 }
 
 #[test]

@@ -73,10 +73,15 @@ pub struct EnrichReport {
     pub checker_version: String,
     pub checker_source: String,
     pub projects: usize,
+    /// Projects whose complete selected occurrence set survived carry.
     pub projects_carried: usize,
+    /// Projects with at least one surviving carried owner-occurrence from the
+    /// corresponding source. These include both full and partial carry.
     pub projects_carried_from_staging: usize,
     pub projects_carried_from_active: usize,
+    /// Projects with some, but not all, selected occurrences carried.
     pub projects_partially_carried: usize,
+    /// Unique occurrences whose complete owner set survived carry.
     pub occurrences_carried: usize,
     /// Owner-occurrence pairs; unlike `occurrences_carried`, this counts one
     /// shared occurrence once for each TypeScript project that supplied it.
@@ -121,7 +126,11 @@ struct PartialEnrichmentError {
     batch_id: i64,
     facts_published: usize,
     projects_carried: usize,
+    projects_carried_from_staging: usize,
+    projects_carried_from_active: usize,
+    projects_partially_carried: usize,
     occurrences_carried: usize,
+    project_occurrences_carried: usize,
     projects_resumed: usize,
     occurrences_resumed: usize,
     projects_reset: usize,
@@ -162,13 +171,17 @@ impl fmt::Display for PartialEnrichmentError {
             .join(", ");
         write!(
             formatter,
-            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project scope(s) had failures: {}; reuse projects_carried={} occurrences_carried={} projects_resumed={} occurrences_resumed={} projects_reset={} occurrences_reset={}; unresolved ownership remains possible",
+            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project scope(s) had failures: {}; reuse projects_carried={} projects_carried_from_staging={} projects_carried_from_active={} projects_partially_carried={} occurrences_carried={} project_occurrences_carried={} projects_resumed={} occurrences_resumed={} projects_reset={} occurrences_reset={}; unresolved ownership remains possible",
             self.batch_id,
             self.facts_published,
             self.failures.len(),
             failed,
             self.projects_carried,
+            self.projects_carried_from_staging,
+            self.projects_carried_from_active,
+            self.projects_partially_carried,
             self.occurrences_carried,
+            self.project_occurrences_carried,
             self.projects_resumed,
             self.occurrences_resumed,
             self.projects_reset,
@@ -297,7 +310,48 @@ struct CarryOutcome {
     project_occurrences_carried: usize,
     fully_carried_projects: BTreeSet<String>,
     occurrences_by_project: BTreeMap<String, BTreeSet<i64>>,
+    source_by_project: BTreeMap<String, CarrySourceKind>,
+    invalidated_occurrences: BTreeSet<i64>,
     projects_requiring_check: BTreeSet<String>,
+}
+
+impl CarryOutcome {
+    /// Remove carry credit when a resumed project's checker-input fingerprint
+    /// forces its staged rows to be deleted and recomputed. The final report
+    /// describes facts that actually survived into publication, not attempted
+    /// carry that was subsequently reset.
+    fn discard_project_carry(&mut self, project: &str) {
+        let Some(occurrences) = self.occurrences_by_project.remove(project) else {
+            return;
+        };
+        if occurrences.is_empty() {
+            return;
+        }
+        self.project_occurrences_carried = self
+            .project_occurrences_carried
+            .saturating_sub(occurrences.len());
+        for occurrence in occurrences {
+            if self.invalidated_occurrences.insert(occurrence) {
+                self.occurrences_carried = self.occurrences_carried.saturating_sub(1);
+            }
+        }
+        if self.fully_carried_projects.remove(project) {
+            self.projects_carried = self.projects_carried.saturating_sub(1);
+        } else {
+            self.projects_partially_carried = self.projects_partially_carried.saturating_sub(1);
+        }
+        match self.source_by_project.remove(project) {
+            Some(CarrySourceKind::SupersededStaging) => {
+                self.projects_carried_from_staging =
+                    self.projects_carried_from_staging.saturating_sub(1);
+            }
+            Some(CarrySourceKind::ActivePublication) => {
+                self.projects_carried_from_active =
+                    self.projects_carried_from_active.saturating_sub(1);
+            }
+            None => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,7 +815,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             force_new: options.force_full,
         },
     )?;
-    let carry = if options.carry_forward && !options.force_full {
+    let mut carry = if options.carry_forward && !options.force_full {
         carry_forward_projects(
             &conn,
             batch_id,
@@ -776,10 +830,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     };
     if carry.occurrences_carried != 0 {
         eprintln!(
-            "checker enrichment: carried {}/{} occurrences across {}/{} projects",
+            "checker enrichment: carried {}/{} occurrences across {} fully and {} partially carried projects ({} total)",
             carry.occurrences_carried,
             selected.len(),
             carry.projects_carried,
+            carry.projects_partially_carried,
             project_plan.len()
         );
     }
@@ -817,6 +872,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         if completed.len() == occurrences.len() {
             let reset = reset_project_staging(&conn, batch_id, project_id)?;
             if reset != 0 {
+                carry.discard_project_carry(project_id);
                 projects_reset += 1;
                 occurrences_reset += reset;
             }
@@ -879,6 +935,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                         occurrences_resumed += staging_resumed;
                     }
                 } else {
+                    carry.discard_project_carry(project_id);
                     projects_reset += 1;
                     occurrences_reset += execution.staging_occurrences_reset;
                 }
@@ -909,6 +966,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                         occurrences_resumed += staging_resumed;
                     }
                 } else {
+                    carry.discard_project_carry(project_id);
                     projects_reset += 1;
                     occurrences_reset += execution.staging_occurrences_reset;
                 }
@@ -964,7 +1022,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             batch_id,
             facts_published: activation.facts_published,
             projects_carried: carry.projects_carried,
+            projects_carried_from_staging: carry.projects_carried_from_staging,
+            projects_carried_from_active: carry.projects_carried_from_active,
+            projects_partially_carried: carry.projects_partially_carried,
             occurrences_carried: carry.occurrences_carried,
+            project_occurrences_carried: carry.project_occurrences_carried,
             projects_resumed: resumed_projects.len(),
             occurrences_resumed,
             projects_reset,
@@ -2014,18 +2076,10 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<i64> {
-        // Keep the newest superseded staging batch until the new destination
-        // has copied its valid completed projects. Older inactive plans cannot
-        // beat that source and are bounded here before another row is added.
-        conn.execute(
-            "DELETE FROM checker_enrichment_batches
-             WHERE active=0
-               AND id!=(
-                 SELECT id FROM checker_enrichment_batches
-                 WHERE active=0 ORDER BY id DESC LIMIT 1
-               )",
-            [],
-        )?;
+        // Keep the best completed staging source until the new destination has
+        // copied it. Ranking reusable coverage ahead of row id closes the
+        // crash/reopen window where a newer empty destination exists.
+        crate::store::preserve_checker_carry_source_for_watch(conn)?;
         conn.execute(
             "INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,
@@ -2602,6 +2656,7 @@ fn carry_forward_projects(
         let mut projects_carried_from_active = 0;
         let mut projects_partially_carried = 0;
         let mut fully_carried_projects = BTreeSet::new();
+        let mut source_by_project = BTreeMap::new();
         for (project, occurrences) in projects {
             let completed: i64 = conn.query_row(
                 "SELECT count(*) FROM checker_occurrence_projects
@@ -2623,14 +2678,6 @@ fn carry_forward_projects(
                 )?;
                 projects_carried += 1;
                 fully_carried_projects.insert(project.clone());
-                match selected_sources[project].kind {
-                    CarrySourceKind::SupersededStaging => {
-                        projects_carried_from_staging += 1;
-                    }
-                    CarrySourceKind::ActivePublication => {
-                        projects_carried_from_active += 1;
-                    }
-                }
             } else {
                 conn.execute(
                     "UPDATE checker_project_runs
@@ -2645,6 +2692,18 @@ fn carry_forward_projects(
                 }
             }
             if completed > 0 {
+                let source = selected_sources
+                    .get(project)
+                    .with_context(|| format!("missing carry source for {project}"))?;
+                source_by_project.insert(project.clone(), source.kind);
+                match source.kind {
+                    CarrySourceKind::SupersededStaging => {
+                        projects_carried_from_staging += 1;
+                    }
+                    CarrySourceKind::ActivePublication => {
+                        projects_carried_from_active += 1;
+                    }
+                }
                 for input in selected_sources
                     .get(project)
                     .into_iter()
@@ -2683,6 +2742,8 @@ fn carry_forward_projects(
             project_occurrences_carried: carried.len(),
             fully_carried_projects,
             occurrences_by_project,
+            source_by_project,
+            invalidated_occurrences: BTreeSet::new(),
             projects_requiring_check,
         })
     })();

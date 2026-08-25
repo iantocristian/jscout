@@ -674,7 +674,7 @@ fn index_repo_impl<F: FileSystem>(
         let checker_batches_changed = match checker_retention {
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {
-                store::preserve_active_checker_batch_for_watch(conn)?
+                store::preserve_checker_carry_source_for_watch(conn)?
             }
         };
         let current = ProjectionIdentity {
