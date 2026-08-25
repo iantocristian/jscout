@@ -8,12 +8,13 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::{
-    DatabaseSettings, DiagnosticsSettings, EffectiveConfig, EmbeddingSettings, ExpansionSettings,
-    FILE_NAME, IndexSettings, InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel,
-    OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings,
-    SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource, WatchSettings,
+    DatabaseSettings, DiagnosticsSettings, DocsSearchSettings, DocsSettings, EffectiveConfig,
+    EmbeddingSettings, ExpansionSettings, FILE_NAME, IndexSettings, InferenceSettings, LlmSettings,
+    McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig,
+    SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource,
+    WatchSettings,
 };
-use crate::{file_role, origin, search, store};
+use crate::{docs, file_role, origin, search, store};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,8 @@ struct FileConfig {
     version: u32,
     #[serde(default)]
     database: DatabaseFileConfig,
+    #[serde(default)]
+    docs: DocsFileConfig,
     #[serde(default)]
     search: SearchFileConfig,
     #[serde(default)]
@@ -49,6 +52,24 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct DatabaseFileConfig {
     path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsFileConfig {
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    #[serde(default)]
+    search: DocsSearchFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsSearchFileConfig {
+    vector: Option<bool>,
+    rerank: Option<bool>,
+    limit: Option<usize>,
+    response_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -384,6 +405,31 @@ impl RuntimeConfig {
             PathBuf::from(store::DB_FILE)
         } else {
             resolve_path(root.as_deref(), &database_value, false)?
+        };
+
+        let docs_include = resolver.configured_or(
+            "docs.include",
+            raw.docs.include,
+            vec!["**/*.md".to_string()],
+        );
+        let docs_exclude =
+            resolver.configured_or("docs.exclude", raw.docs.exclude, Vec::<String>::new());
+        docs::corpus::validate_patterns(&docs_include, &docs_exclude)
+            .context("validate documentation include/exclude patterns")?;
+        let docs = DocsSettings {
+            include: docs_include,
+            exclude: docs_exclude,
+            search: DocsSearchSettings {
+                vector: resolver.bool("docs.search.vector", raw.docs.search.vector, None, true)?,
+                rerank: resolver.bool("docs.search.rerank", raw.docs.search.rerank, None, true)?,
+                limit: resolver.usize("docs.search.limit", raw.docs.search.limit, None, 10)?,
+                response_bytes: resolver.usize(
+                    "docs.search.response_bytes",
+                    raw.docs.search.response_bytes,
+                    None,
+                    24_000,
+                )?,
+            },
         };
 
         let search_file_roles = resolver.configured_or(
@@ -896,6 +942,7 @@ impl RuntimeConfig {
             database: DatabaseSettings {
                 path: database_path,
             },
+            docs,
             search,
             embedding,
             inference,

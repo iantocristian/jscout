@@ -70,6 +70,42 @@ fn scope_matching_is_literal_and_root_direct_is_bounded() {
 }
 
 #[test]
+fn documentation_rows_do_not_change_code_scope_evidence() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    std::fs::create_dir_all(repo.path().join("src"))?;
+    std::fs::write(repo.path().join("src/run.ts"), "export const run = 1;\n")?;
+    let conn = store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let selector = SubjectSelector::RepositoryArea {
+        scope: ".".into(),
+        direct_only: false,
+    };
+    let before = build_scope_state(
+        repo.path(),
+        &conn,
+        "area:repository:.".into(),
+        selector.clone(),
+    )?;
+
+    conn.execute_batch(
+        "INSERT INTO files(id,path,hash,role,origin)
+           VALUES(100,'README.md','docs','documentation','repository');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(100,100,'markdown_section',NULL,'','',0,8,1,1,'doc-chunk','# Guide');
+         INSERT INTO doc_chunk_meta(
+           chunk_id,title,breadcrumb,nearest_heading,ordinal,
+           embedding_identity,front_matter_state
+         ) VALUES(100,'Guide','Guide','Guide',0,'identity','absent');",
+    )?;
+    let after = build_scope_state(repo.path(), &conn, "area:repository:.".into(), selector)?;
+
+    assert_eq!(after.members, before.members);
+    assert_eq!(after.evidence_fingerprint, before.evidence_fingerprint);
+    Ok(())
+}
+
+#[test]
 fn policy_reuses_exact_subject_evidence_and_stales_only_changed_scope() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::create_dir_all(repo.path().join("docs"))?;

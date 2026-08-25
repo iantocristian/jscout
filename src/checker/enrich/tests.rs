@@ -61,6 +61,30 @@ fn test_project_fingerprints(
         .collect()
 }
 
+#[test]
+fn dirty_checker_inventory_excludes_documentation_files() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let conn = crate::store::open(repo.path())?;
+    conn.execute_batch(
+        "INSERT INTO files(id,path,hash,role,origin)
+           VALUES(1,'src/main.ts','code','production','repository');
+         INSERT INTO files(id,path,hash,role,origin)
+           VALUES(2,'README.md','docs','documentation','repository');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(2,2,'markdown_document',NULL,'','',0,0,1,1,'doc-chunk','');
+         INSERT INTO doc_chunk_meta(
+           chunk_id,title,breadcrumb,nearest_heading,ordinal,
+           embedding_identity,front_matter_state
+         ) VALUES(2,'README','',NULL,0,NULL,'absent');",
+    )?;
+
+    let dirty =
+        current_dirty_source_files(&conn, &["README.md".to_string(), "src/main.ts".to_string()])?;
+    assert_eq!(dirty, BTreeSet::from(["src/main.ts".to_string()]));
+    Ok(())
+}
+
 #[cfg(unix)]
 struct FakeCheckerLaunch {
     resolve_frames: Vec<String>,

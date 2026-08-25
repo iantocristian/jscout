@@ -370,9 +370,15 @@ fn discover_scope_subjects(root: &Path, conn: &Connection) -> Result<Vec<Discove
 
     let mut unowned = BTreeSet::new();
     let mut statement = conn.prepare(
-        "SELECT path FROM files
-         WHERE origin='repository' AND package_instance_id IS NULL
-         ORDER BY path",
+        "SELECT file.path FROM files file
+         WHERE file.origin='repository' AND file.package_instance_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM chunks chunk
+             JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+             WHERE chunk.file_id=file.id
+           )
+         ORDER BY file.path",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     for path in rows {
@@ -487,8 +493,15 @@ fn discover_project_subjects(
 
 fn all_first_party_files(conn: &Connection) -> Result<Vec<MemberFile>> {
     let mut statement = conn.prepare(
-        "SELECT id, path, hash FROM files
-         WHERE origin IN ('repository','workspace') ORDER BY path",
+        "SELECT file.id, file.path, file.hash FROM files file
+         WHERE file.origin IN ('repository','workspace')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM chunks chunk
+             JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+             WHERE chunk.file_id=file.id
+           )
+         ORDER BY file.path",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(MemberFile {
@@ -2418,6 +2431,30 @@ mod tests {
         assert_eq!(evidence.surface_counts["handwritten"], 9);
         assert_eq!(evidence.surface_counts["generated"], 1);
         assert!(evidence.rendered.contains("whole-scope artifact surfaces"));
+        Ok(())
+    }
+
+    #[test]
+    fn checker_planning_inventory_excludes_documentation_rows() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = store::open(repo.path())?;
+        conn.execute_batch(
+            "INSERT INTO files(id,path,hash,role,origin)
+               VALUES(1,'src/main.ts','code','production','repository');
+             INSERT INTO files(id,path,hash,role,origin)
+               VALUES(2,'README.md','docs','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(2,2,'markdown_document',NULL,'','',0,0,1,1,'doc-chunk','');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES(2,'README','',NULL,0,NULL,'absent');",
+        )?;
+
+        let files = super::all_first_party_files(&conn)?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.ts");
         Ok(())
     }
 }

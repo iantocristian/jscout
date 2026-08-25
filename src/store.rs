@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "29";
+pub const SCHEMA_VERSION: &str = "30";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -31,6 +31,16 @@ fn register_sqlite_vec() {
 const CHUNKS_FTS_CREATE: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   content, name, symbols, path,
+  tokenize="unicode61 tokenchars '_$'"
+);
+"#;
+
+/// Independent BM25 corpus for authored repository documentation. Its rowids
+/// are shared `chunks.id` values, but documentation rows are never mirrored
+/// into `chunks_fts`, so admitting Markdown cannot alter code term statistics.
+const DOCS_FTS_CREATE: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+  title, metadata, breadcrumb, body, path,
   tokenize="unicode61 tokenchars '_$'"
 );
 "#;
@@ -181,6 +191,9 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                (name GLOB 'vec_embeddings_[0-9]*'
                 AND substr(name, length('vec_embeddings_') + 1) NOT GLOB '*[^0-9]*')
                OR
+               (name GLOB 'vec_doc_embeddings_[0-9]*'
+                AND substr(name, length('vec_doc_embeddings_') + 1) NOT GLOB '*[^0-9]*')
+               OR
                (name GLOB 'vec_semantic_embeddings_[0-9]*'
                 AND substr(name, length('vec_semantic_embeddings_') + 1) NOT GLOB '*[^0-9]*')
              )
@@ -194,6 +207,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
         for table in vector_tables {
             let dimensions = table
                 .strip_prefix("vec_semantic_embeddings_")
+                .or_else(|| table.strip_prefix("vec_doc_embeddings_"))
                 .or_else(|| table.strip_prefix("vec_embeddings_"))
                 .unwrap_or_default();
             if dimensions.is_empty() || !dimensions.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -202,7 +216,9 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
             conn.execute(&format!("DELETE FROM {table}"), [])?;
         }
         conn.execute_batch(
-            "DROP TABLE IF EXISTS embedding_index_entries;
+            "DROP TABLE IF EXISTS doc_vector_generations;
+             DROP TABLE IF EXISTS doc_embedding_index_entries;
+             DROP TABLE IF EXISTS embedding_index_entries;
              DROP TABLE IF EXISTS semantic_embedding_index_entries;
              DROP TABLE IF EXISTS checker_occurrence_projects;
              DROP TABLE IF EXISTS checker_project_inputs;
@@ -232,7 +248,10 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS member_calls;
              DROP TABLE IF EXISTS imports;
              DROP TABLE IF EXISTS exports;
+             DROP TABLE IF EXISTS docs_fts;
              DROP TABLE IF EXISTS chunks_fts;
+             DROP TABLE IF EXISTS doc_chunk_meta;
+             DROP TABLE IF EXISTS doc_inventory;
              DROP TABLE IF EXISTS chunks;
              DROP TABLE IF EXISTS symbols;
              DROP TABLE IF EXISTS files;
@@ -243,7 +262,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'extraction_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='29' WHERE key='schema_version';",
+             UPDATE meta SET value='30' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -261,7 +280,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '29')
+INSERT INTO meta(key, value) VALUES('schema_version', '30')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -305,6 +324,36 @@ CREATE TABLE IF NOT EXISTS chunks(
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
+
+-- Documentation chunks share files/chunks and the structural snapshot, while
+-- their retrieval-only fields remain in this disposable sidecar. Every
+-- admitted documentation file has at least one metadata row (a document stub
+-- when it has no body), which also provides a schema-level corpus marker.
+CREATE TABLE IF NOT EXISTS doc_chunk_meta(
+  chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  breadcrumb TEXT NOT NULL DEFAULT '',
+  nearest_heading TEXT,
+  ordinal INTEGER NOT NULL,
+  embedding_identity TEXT,
+  front_matter_state TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_doc_chunk_embedding_identity
+  ON doc_chunk_meta(embedding_identity);
+
+-- Current-snapshot membership diagnostics. Pruned directories and rejected
+-- files have no files/chunks row, so this projection is intentionally not
+-- foreign-keyed to the admitted corpus.
+CREATE TABLE IF NOT EXISTS doc_inventory(
+  path TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  rule TEXT NOT NULL,
+  detail TEXT,
+  path_base64 TEXT,
+  path_encoding TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_doc_inventory_path_subject
+  ON doc_inventory(path, subject);
 
 CREATE TABLE IF NOT EXISTS symbols(
   id INTEGER PRIMARY KEY,
@@ -617,6 +666,25 @@ CREATE TABLE IF NOT EXISTS embedding_index_entries(
 );
 CREATE INDEX IF NOT EXISTS idx_embedding_entries_profile
   ON embedding_index_entries(profile_id, chunk_id);
+
+-- Documentation vector occurrences use their own sqlite-vec tables because
+-- sqlite-vec applies KNN's k before a relational corpus filter can run.
+CREATE TABLE IF NOT EXISTS doc_embedding_index_entries(
+  id INTEGER PRIMARY KEY,
+  chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  UNIQUE (chunk_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_embedding_entries_profile
+  ON doc_embedding_index_entries(profile_id, chunk_id);
+
+CREATE TABLE IF NOT EXISTS doc_vector_generations(
+  snapshot TEXT NOT NULL,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  dimensions INTEGER NOT NULL,
+  chunk_format_version TEXT NOT NULL,
+  PRIMARY KEY (snapshot, profile_id, dimensions, chunk_format_version)
+);
 
 CREATE TABLE IF NOT EXISTS graph_nodes(
   node_key TEXT PRIMARY KEY,
@@ -942,6 +1010,7 @@ CREATE INDEX IF NOT EXISTS idx_semantic_embedding_entries_profile
 ",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    conn.execute_batch(DOCS_FTS_CREATE)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_files_origin ON files(origin);
          CREATE INDEX IF NOT EXISTS idx_files_package_instance ON files(package_instance_id);
@@ -1052,6 +1121,8 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM repository_file_policy;
          DELETE FROM repository_current_classifications;
+         DELETE FROM doc_vector_generations;
+         DELETE FROM doc_embedding_index_entries;
          DELETE FROM embedding_index_entries;
          DELETE FROM entity_edges;
          DELETE FROM entity_occurrences;
@@ -1071,13 +1142,17 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM contract_imports;
          DELETE FROM contract_exports;
          DELETE FROM module_edges;
+         DELETE FROM doc_chunk_meta;
+         DELETE FROM doc_inventory;
          DELETE FROM chunks;
          DELETE FROM files;
          DELETE FROM resolved_edges;
          DELETE FROM graph_nodes;
+         DROP TABLE docs_fts;
          DROP TABLE chunks_fts;",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    conn.execute_batch(DOCS_FTS_CREATE)?;
     Ok(())
 }
 
@@ -1118,7 +1193,26 @@ pub(crate) fn preserve_active_checker_batch_for_watch(conn: &Connection) -> Resu
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
 /// FTS rows are removed explicitly since fts5 isn't FK-aware.
 pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
+    let documentation: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1
+           FROM chunks chunk
+           JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+           WHERE chunk.file_id=?1
+         )",
+        [file_id],
+        |row| row.get(0),
+    )?;
     crate::embed::delete_vector_rows_for_file(conn, file_id)?;
+    if documentation {
+        // Readiness is snapshot-exact, but removing old generations here also
+        // bounds stale metadata during incremental watched replacements.
+        conn.execute("DELETE FROM doc_vector_generations", [])?;
+    }
+    conn.execute(
+        "DELETE FROM docs_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
+        [file_id],
+    )?;
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
         [file_id],
@@ -1167,7 +1261,7 @@ mod tests {
 
     use super::{
         DB_FILE, SCHEMA_VERSION, file_source_path, open, open_path, open_path_read_only,
-        open_read_only,
+        open_read_only, reset_extraction_state,
     };
 
     fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>> {
@@ -1599,6 +1693,93 @@ mod tests {
             index_columns(&conn, "idx_member_calls_file")?,
             ["file_id", "receiver_start", "prop"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_projection_schema_is_disposable_but_cache_survives_reset() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        let meta_columns = conn
+            .prepare("SELECT name FROM pragma_table_info('doc_chunk_meta') ORDER BY cid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            meta_columns,
+            [
+                "chunk_id",
+                "title",
+                "breadcrumb",
+                "nearest_heading",
+                "ordinal",
+                "embedding_identity",
+                "front_matter_state",
+            ]
+        );
+        let fts_columns = conn
+            .prepare("SELECT name FROM pragma_table_info('docs_fts') ORDER BY cid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            fts_columns,
+            ["title", "metadata", "breadcrumb", "body", "path"]
+        );
+
+        conn.execute_batch(
+            "INSERT INTO embedding_profiles(
+               id,provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES(1,'test','tiny','profile',2,'{}');
+             INSERT INTO embeddings(chunk_hash,profile_id,vec)
+               VALUES('doc-identity',1,x'0000000000000000');
+             INSERT INTO files(id,path,hash,role,origin)
+               VALUES(1,'README.md','file','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(1,1,'markdown_document',NULL,'','',0,0,1,1,'source','');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES(1,'README','',NULL,0,'doc-identity','absent');
+             INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+               VALUES(1,'README','','','','README.md');
+             INSERT INTO doc_inventory(path,subject,rule)
+               VALUES('README.md','file','indexed');
+             INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+               VALUES(1,1,1);
+             INSERT INTO doc_vector_generations(
+               snapshot,profile_id,dimensions,chunk_format_version
+             ) VALUES('snapshot',1,2,'markdown-v1');
+             CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
+               embedding FLOAT[2] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               snapshot TEXT PARTITION KEY
+             );
+             INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id,snapshot)
+               VALUES(1,x'0000000000000000',1,'snapshot');",
+        )?;
+
+        reset_extraction_state(&conn)?;
+        let state: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM files),
+               (SELECT count(*) FROM docs_fts),
+               (SELECT count(*) FROM doc_chunk_meta),
+               (SELECT count(*) FROM doc_inventory),
+               (SELECT count(*) FROM vec_doc_embeddings_2),
+               (SELECT count(*) FROM embeddings)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(state, (0, 0, 0, 0, 0, 1));
         Ok(())
     }
 

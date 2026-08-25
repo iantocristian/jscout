@@ -1538,9 +1538,15 @@ fn current_dirty_source_files(
     }
     let requested = dirty_files.iter().collect::<BTreeSet<_>>();
     let mut statement = conn.prepare(
-        "SELECT path FROM files
-         WHERE origin IN ('repository', 'workspace')
-         ORDER BY path",
+        "SELECT file.path FROM files file
+         WHERE file.origin IN ('repository', 'workspace')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM chunks chunk
+             JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+             WHERE chunk.file_id=file.id
+           )
+         ORDER BY file.path",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows

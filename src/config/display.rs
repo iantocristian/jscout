@@ -30,6 +30,17 @@ impl RuntimeConfig {
             format!("fingerprint: {}", self.fingerprint),
             format!("database: {}", self.effective.database.path.display()),
             format!(
+                "docs: include={:?} exclude={:?}",
+                self.effective.docs.include, self.effective.docs.exclude,
+            ),
+            format!(
+                "docs-search: vector={} rerank={} limit={} response_bytes={}",
+                self.effective.docs.search.vector,
+                self.effective.docs.search.rerank,
+                self.effective.docs.search.limit,
+                self.effective.docs.search.response_bytes,
+            ),
+            format!(
                 "search: vector={} rerank={} memory={} expand={} expansion_mode={} limit={} response_bytes={}",
                 self.effective.search.vector,
                 self.effective.search.rerank,

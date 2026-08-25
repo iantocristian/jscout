@@ -166,7 +166,9 @@ pub fn synchronize_instances(
     workspace: &WorkspaceMap,
     plans: &[PackagePlan],
 ) -> Result<BTreeMap<PathBuf, i64>> {
-    conn.execute_batch("BEGIN")?;
+    // A savepoint preserves standalone atomicity and nests inside the indexer's
+    // all-or-nothing publication transaction.
+    conn.execute_batch("SAVEPOINT jscout_dependency_instances")?;
     let result = (|| {
         conn.execute(
             "UPDATE files
@@ -255,11 +257,13 @@ pub fn synchronize_instances(
     })();
     match result {
         Ok(instances) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch("RELEASE jscout_dependency_instances")?;
             Ok(instances)
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_dependency_instances; RELEASE jscout_dependency_instances",
+            );
             Err(error)
         }
     }

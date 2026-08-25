@@ -27,6 +27,8 @@ pub struct WatchOptions<'a> {
     pub provider: Option<&'a embed::Provider>,
     pub embed_product_only: bool,
     pub dependencies: &'a [String],
+    pub docs_include: &'a [String],
+    pub docs_exclude: &'a [String],
     pub enrich_on_change: bool,
     pub enrich_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
@@ -782,14 +784,15 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             );
             match work.phase {
                 Phase::Refresh => {
-                    match run_refresh(
-                        &root,
-                        &database,
-                        options.dependencies,
-                        work.refresh_scope,
-                        options.timing,
-                        options.debug,
-                    ) {
+                    let index_options = indexer::IndexOptions {
+                        dependencies: options.dependencies.to_vec(),
+                        docs_include: options.docs_include.to_vec(),
+                        docs_exclude: options.docs_exclude.to_vec(),
+                        timing: options.timing,
+                        debug: options.debug,
+                        ..Default::default()
+                    };
+                    match run_refresh(&root, &database, &index_options, work.refresh_scope) {
                         Ok(result) => {
                             match rejection_report_latch.observe(&result.outcome.rejections) {
                                 RejectionReportDecision::Silent => {}
@@ -1125,23 +1128,15 @@ fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
 fn run_refresh(
     root: &Path,
     database: &Path,
-    dependencies: &[String],
+    options: &indexer::IndexOptions,
     scope: RefreshScope,
-    timing: bool,
-    debug: bool,
 ) -> Result<RefreshResult> {
     let conn = open_phase_database(root, database)?;
-    let options = indexer::IndexOptions {
-        dependencies: dependencies.to_vec(),
-        timing,
-        debug,
-        ..Default::default()
-    };
     let outcome = match scope {
         RefreshScope::Incremental => {
-            indexer::incremental_refresh_repo_with_options(root, &conn, &options)?
+            indexer::incremental_refresh_repo_with_options(root, &conn, options)?
         }
-        RefreshScope::Full => indexer::watch_full_refresh_repo_with_options(root, &conn, &options)?,
+        RefreshScope::Full => indexer::watch_full_refresh_repo_with_options(root, &conn, options)?,
     };
     let snapshot = structural::current_snapshot(&conn)?;
     Ok(RefreshResult { snapshot, outcome })

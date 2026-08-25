@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
+use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision};
 use crate::io_policy;
 
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
@@ -29,7 +30,19 @@ pub struct WalkRejection {
 #[derive(Debug, Default)]
 pub struct SourceInventory {
     pub files: Vec<PathBuf>,
+    #[cfg(test)]
     pub rejections: Vec<WalkRejection>,
+}
+
+/// The shared index pass walks the repository once and returns two extraction
+/// inputs with separate ranking semantics. `files` remains code-only so
+/// workspace and dependency discovery retain their existing contract.
+#[derive(Debug)]
+pub struct RepositoryInventory {
+    pub files: Vec<PathBuf>,
+    pub rejections: Vec<WalkRejection>,
+    pub documents: Vec<CapturedDocument>,
+    pub documentation_decisions: Vec<Decision>,
 }
 
 /// Path matcher configured from the same ignore policy as the source walker.
@@ -139,7 +152,37 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
         }
     }
     files.sort();
-    Ok(SourceInventory { files, rejections })
+    #[cfg(not(test))]
+    drop(rejections);
+    Ok(SourceInventory {
+        files,
+        #[cfg(test)]
+        rejections,
+    })
+}
+
+/// Inventory for shared publication. Markdown membership, capture, and parse
+/// happen during the same deterministic traversal that selects code paths;
+/// there is no independent documentation snapshot or later filesystem scan.
+pub fn repository_inventory(
+    root: &Path,
+    documentation: &CorpusOptions,
+) -> Result<RepositoryInventory> {
+    let inventory = crate::docs::corpus::scan_repository(root, documentation)?;
+    Ok(RepositoryInventory {
+        files: inventory.source_files,
+        rejections: inventory
+            .rejections
+            .into_iter()
+            .map(|rejection| WalkRejection {
+                path: rejection.path,
+                stage: rejection.stage,
+                error: rejection.error,
+            })
+            .collect(),
+        documents: inventory.documents,
+        documentation_decisions: inventory.decisions,
+    })
 }
 
 /// Read-only diagnostic callers need the file list but do not publish a
@@ -231,6 +274,52 @@ mod tests {
         assert!(files.contains(&PathBuf::from("packages/app/contracts.d.ts")));
         assert!(!files.contains(&PathBuf::from("build/generated.d.ts")));
         assert!(!files.contains(&PathBuf::from("packages/app/dist/generated.d.ts")));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_inventory_admits_markdown_without_widening_code_inputs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join(".github/workflows"))?;
+        fs::write(repo.path().join("main.ts"), "export const main = 1;\n")?;
+        fs::write(repo.path().join("README.md"), "# Guide\n\nCurrent text.\n")?;
+        fs::write(
+            repo.path().join(".github/workflows/help.md"),
+            "# Automation\n\nCurrent workflow.\n",
+        )?;
+        fs::write(
+            repo.path().join(".github/workflows/hidden.ts"),
+            "export const hidden = true;\n",
+        )?;
+
+        let root = repo.path().canonicalize()?;
+        let inventory = repository_inventory(&root, &CorpusOptions::default())?;
+        let code = inventory
+            .files
+            .iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        let docs = inventory
+            .documents
+            .iter()
+            .map(|document| document.file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(code, [PathBuf::from("main.ts")]);
+        assert_eq!(docs, [".github/workflows/help.md", "README.md"]);
+        assert!(inventory.documentation_decisions.iter().any(|decision| {
+            decision.path == ".github/workflows/hidden.ts"
+                && decision.rule == "unsupported-extension"
+        }));
+        let source_names = source_files(repo.path())?
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_names,
+            [std::ffi::OsString::from("main.ts")],
+            "the read-only code inventory remains code-only"
+        );
         Ok(())
     }
 

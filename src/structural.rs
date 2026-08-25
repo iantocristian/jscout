@@ -433,6 +433,21 @@ pub(crate) fn compute_snapshot_with_resolution(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-structural-snapshot-v2\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
+    hasher.update(b"\0documentation-parser-contract\0");
+    hasher.update(crate::docs::CHUNK_FORMAT_VERSION.as_bytes());
+    let documentation_chunk_format = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='documentation_chunk_format_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    // The persisted value describes the contract that produced the currently
+    // stored docs rows. It normally equals the binary constant above; hashing
+    // both also makes an interrupted or pre-upgrade mismatch fail closed.
+    hasher.update(b"\0documentation-published-chunk-format\0");
+    hasher.update(documentation_chunk_format.as_bytes());
     let mut stmt = conn.prepare(
         "SELECT f.path, f.hash, f.role, f.origin, COALESCE(f.package_path, ''),
                 COALESCE(p.origin, ''), COALESCE(p.name, ''),
@@ -478,21 +493,23 @@ pub fn rebuild_projection_with_timing(
     snapshot: &str,
     timing: bool,
 ) -> Result<()> {
-    let files = load_files(conn)?;
-    let graph = ModuleGraph::load_with_contracts(conn)?;
-    let symbols = load_symbols(conn, &files)?;
-    let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
-    for symbol in &symbols {
-        if symbol.scope.is_empty() {
-            root_symbol
-                .entry((symbol.file_id, symbol.name.clone()))
-                .or_default()
-                .push(symbol);
-        }
-    }
-
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // A savepoint makes projection replacement atomic both on its own and as
+    // one stage of the indexer's outer publication transaction.
+    conn.execute_batch("SAVEPOINT jscout_structural_projection")?;
     let result = (|| -> Result<()> {
+        let files = load_files(conn)?;
+        let graph = ModuleGraph::load_with_contracts(conn)?;
+        let symbols = load_symbols(conn, &files)?;
+        let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
+        for symbol in &symbols {
+            if symbol.scope.is_empty() {
+                root_symbol
+                    .entry((symbol.file_id, symbol.name.clone()))
+                    .or_default()
+                    .push(symbol);
+            }
+        }
+
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
         conn.execute("DELETE FROM entities", [])?;
@@ -616,9 +633,11 @@ pub fn rebuild_projection_with_timing(
         Ok(())
     })();
     match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
+        Ok(()) => conn.execute_batch("RELEASE jscout_structural_projection")?,
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_structural_projection; RELEASE jscout_structural_projection",
+            );
             return Err(error);
         }
     }

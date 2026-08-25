@@ -1,4 +1,5 @@
 mod core;
+mod docs;
 mod scout;
 
 use std::path::Path;
@@ -6,7 +7,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::cli::{
-    CheckerCommand, Command, ConfigCommand, InferenceCommand, LlmCommand, ScoutCommand,
+    CheckerCommand, Command, ConfigCommand, DocsCommand, InferenceCommand, LlmCommand, ScoutCommand,
 };
 use crate::{
     agent, calls, checker, config, embed, inference, llm, mcp, scout as source_view, scouting,
@@ -72,6 +73,7 @@ impl Command {
             | Self::WhoUses { root, .. }
             | Self::Neighborhood { root, .. }
             | Self::Enrich { root, .. } => Some(root),
+            Self::Docs { command } => Some(command.root()),
             Self::Checker {
                 command: CheckerCommand::Doctor { root, .. },
             } => Some(root),
@@ -82,6 +84,16 @@ impl Command {
             Self::Llm { .. } | Self::Inference { .. } => Some(Path::new(".")),
             Self::AgentGuide { install: None } => None,
             Self::Config { command } => Some(command.root()),
+        }
+    }
+}
+
+impl DocsCommand {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Embed { root, .. } | Self::Search { root, .. } | Self::Status { root, .. } => {
+                root
+            }
         }
     }
 }
@@ -154,6 +166,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
     let configured_database = runtime.effective.database.path.as_path();
     match command {
         Command::Config { .. } => unreachable!("configuration commands are dispatched first"),
+        Command::Docs { command } => docs::run(command, runtime),
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),
         Command::Index {
@@ -173,6 +186,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
                 &dependencies,
+                &runtime.effective.docs,
                 &runtime.effective.diagnostics,
             )
         }
@@ -600,6 +614,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     provider: provider.as_ref(),
                     embed_product_only: product,
                     dependencies: &dependencies,
+                    docs_include: &runtime.effective.docs.include,
+                    docs_exclude: &runtime.effective.docs.exclude,
                     enrich_on_change: enrich,
                     enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
                     checker_sidecar: sidecar_path.as_deref().or(runtime

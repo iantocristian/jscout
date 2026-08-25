@@ -703,7 +703,13 @@ pub(crate) fn validate_annotate_input(
         let anchor_file: Option<String> = conn
             .query_row(
                 "SELECT f.path FROM graph_nodes g LEFT JOIN files f ON g.file_id=f.id
-                 WHERE g.node_key=?1",
+                 WHERE g.node_key=?1
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM chunks chunk
+                     JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+                     WHERE chunk.file_id=f.id
+                   )",
                 [&anchor],
                 |row| row.get(0),
             )

@@ -712,6 +712,12 @@ pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, Stri
         "SELECT file.id, file.path, file.origin, package.origin, package.locator
          FROM files file
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM chunks chunk
+           JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+           WHERE chunk.file_id=file.id
+         )
          ORDER BY file.id",
     )?;
     let rows = files.query_map([], |row| {
@@ -758,9 +764,15 @@ fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result
     match selector {
         SubjectSelector::RepositoryArea { scope, direct_only } => {
             let mut statement = conn.prepare(
-                "SELECT id, path, hash FROM files
-                 WHERE origin='repository' AND package_instance_id IS NULL
-                 ORDER BY path",
+                "SELECT file.id, file.path, file.hash FROM files file
+                 WHERE file.origin='repository' AND file.package_instance_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM chunks chunk
+                     JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+                     WHERE chunk.file_id=file.id
+                   )
+                 ORDER BY file.path",
             )?;
             let rows = statement.query_map([], member_row)?;
             for row in rows {
@@ -780,6 +792,12 @@ fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result
                  FROM files file
                  JOIN package_instances package ON package.id=file.package_instance_id
                  WHERE package.origin='workspace' AND package.locator=?1
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM chunks chunk
+                     JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+                     WHERE chunk.file_id=file.id
+                   )
                  ORDER BY file.path",
             )?;
             let rows = statement.query_map([package_root], member_row)?;

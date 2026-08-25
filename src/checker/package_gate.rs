@@ -9,9 +9,15 @@ use serde_json::Value;
 use super::protocol::FileOwnership;
 
 const ABSENT_INPUT_HASH: &str = "absent:v1";
-const INVENTORY_SQL: &str = "SELECT id, path, role FROM files
-     WHERE origin IN ('repository', 'workspace')
-     ORDER BY path";
+const INVENTORY_SQL: &str = "SELECT file.id, file.path, file.role FROM files file
+     WHERE file.origin IN ('repository', 'workspace')
+       AND NOT EXISTS (
+         SELECT 1
+         FROM chunks chunk
+         JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+         WHERE chunk.file_id=file.id
+       )
+     ORDER BY file.path";
 const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const OUTPUT_DIRECTORIES: &[&str] = &["dist", "out", "build", "lib"];
 const OUTPUT_FLAVORS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "lib", "types"];
@@ -885,6 +891,13 @@ mod tests {
                    from_file INTEGER NOT NULL,
                    to_file INTEGER,
                    type_only INTEGER NOT NULL
+                 );
+                 CREATE TABLE chunks(
+                   id INTEGER PRIMARY KEY,
+                   file_id INTEGER NOT NULL
+                 );
+                 CREATE TABLE doc_chunk_meta(
+                   chunk_id INTEGER PRIMARY KEY
                  );",
             )?;
             Ok(Self {
@@ -917,6 +930,16 @@ mod tests {
             Ok(())
         }
 
+        fn mark_documentation(&self, file_id: i64) -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO chunks(id,file_id) VALUES(?1,?2)",
+                params![file_id, file_id],
+            )?;
+            self.conn
+                .execute("INSERT INTO doc_chunk_meta(chunk_id) VALUES(?1)", [file_id])?;
+            Ok(())
+        }
+
         fn ownership(&self, configured: &[&str]) -> Result<Vec<FileOwnership>> {
             let configured = configured.iter().copied().collect::<BTreeSet<_>>();
             Ok(inventory_paths(&self.conn)?
@@ -933,6 +956,21 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    #[test]
+    fn checker_inventory_excludes_documentation_corpus_files() -> Result<()> {
+        let mut fixture = Fixture::new("{}")?;
+        let code = fixture.file("src/main.ts", "production")?;
+        let docs = fixture.file("README.md", "documentation")?;
+        fixture.mark_documentation(docs)?;
+
+        assert_eq!(inventory_paths(&fixture.conn)?, vec!["src/main.ts"]);
+        let ownership = fixture.ownership(&["src/main.ts"])?;
+        assert_eq!(ownership.len(), 1);
+        assert_eq!(ownership[0].file, "src/main.ts");
+        assert_ne!(code, docs);
+        Ok(())
     }
 
     #[test]

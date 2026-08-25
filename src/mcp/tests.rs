@@ -6,12 +6,85 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile, call_tool,
-    definition_source_metrics, duration_ms, expansion_role_metrics, log_request,
-    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, tool_defs,
+    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
+    call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
+    expansion_role_metrics, log_request, render_bounded_items, render_tool_result,
+    search_options_from_args, semantic_artifact_metrics, server_instructions, sum_durations,
+    tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
+
+#[test]
+fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the blue release channel.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::refresh_repo_with_options(repo.path(), &conn, &indexer::IndexOptions::default())?;
+
+    let defaults = config::DocsSettings {
+        include: vec!["**/*.md".into()],
+        exclude: Vec::new(),
+        search: config::DocsSearchSettings {
+            vector: false,
+            rerank: false,
+            limit: 10,
+            response_bytes: 24_000,
+        },
+    };
+    let rendered = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &json!({ "query": "blue release" }),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["hits"][0]["path"], "README.md");
+    assert_eq!(value["hits"][0]["heading"], "Deployment");
+    assert_eq!(value["hits"][0]["source_state"], "current");
+    assert_eq!(value["retrieval"]["vector"], "disabled");
+    assert!(
+        tool_defs(ToolProfile::Baseline)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "documentation_search")
+    );
+    assert!(
+        server_instructions(ToolProfile::Structural).contains("shares the repository snapshot")
+    );
+    let outline = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "file_outline",
+        &json!({ "path": "README.md" }),
+    )?;
+    assert!(!outline.contains("README.md"));
+    assert!(!outline.contains("markdown_section"));
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the red release channel.\n",
+    )?;
+    let stale = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &json!({ "query": "blue release" }),
+    )?;
+    let stale: serde_json::Value = serde_json::from_str(&stale)?;
+    assert_eq!(stale["hits"][0]["source_state"], "source_mismatch");
+    assert_eq!(stale["hits"][0]["source_detail"], "hash_mismatch");
+    assert_eq!(stale["hits"][0]["content"], "Use the blue release channel.");
+    Ok(())
+}
 
 #[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
