@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 const CACHE_KEY_DOMAIN: &[u8] = b"jscout-doc-blame-cache-v1\0";
+const INDEX_MEMBERSHIP_DOMAIN: &[u8] = b"jscout-doc-git-index-membership-v1\0";
 const PATH_SCOPE_DOMAIN: &[u8] = b"jscout-doc-git-path-scope-v1\0";
 const SHALLOW_SET_DOMAIN: &[u8] = b"jscout-doc-shallow-set-v1\0";
 
@@ -20,6 +21,7 @@ pub(crate) struct GitRepository {
     root: PathBuf,
     path_scope: String,
     head: String,
+    index: IndexState,
     shallow: ShallowState,
 }
 
@@ -69,6 +71,7 @@ impl BlameCacheKey {
 pub(crate) struct BlameRequest {
     pub cache_key: BlameCacheKey,
     recorded_head: String,
+    recorded_index_fingerprint: String,
 }
 
 /// An untracked or newly staged path is an expected unknown result and does
@@ -139,6 +142,8 @@ pub(crate) enum PublicationValidation {
 pub(crate) struct RepositoryDrift {
     pub recorded_head: String,
     pub current_head: String,
+    pub recorded_index_fingerprint: String,
+    pub current_index_fingerprint: String,
     pub recorded_shallow_fingerprint: String,
     pub current_shallow_fingerprint: String,
 }
@@ -146,6 +151,12 @@ pub(crate) struct RepositoryDrift {
 #[derive(Debug, Clone)]
 struct ShallowState {
     oids: BTreeSet<String>,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct IndexState {
+    paths: BTreeSet<Vec<u8>>,
     fingerprint: String,
 }
 
@@ -172,11 +183,13 @@ impl GitRepository {
         ensure_work_tree(root).context("verify indexed root is inside a Git worktree")?;
         let path_scope = read_path_scope(root).context("record Git path scope")?;
         let head = read_head(root).context("record checked-out HEAD")?;
+        let index = read_index_state(root).context("record current index membership")?;
         let shallow = read_shallow_state(root).context("record shallow set")?;
         Ok(Self {
             root: root.to_path_buf(),
             path_scope,
             head,
+            index,
             shallow,
         })
     }
@@ -202,9 +215,7 @@ impl GitRepository {
 
     fn try_prepare_document(&self, path: &str, bytes: &[u8]) -> Result<Option<BlameRequest>> {
         validate_repository_relative_path(path)?;
-        if !path_exists_in_index(&self.root, path)
-            .with_context(|| format!("check current index membership for {path}"))?
-        {
+        if !self.index.paths.contains(path.as_bytes()) {
             // `git rm --cached` leaves a physical file that is untracked even
             // though the recorded HEAD still contains a blob at the path.
             return Ok(None);
@@ -233,6 +244,7 @@ impl GitRepository {
                 shallow_fingerprint: self.shallow.fingerprint.clone(),
             },
             recorded_head: self.head.clone(),
+            recorded_index_fingerprint: self.index.fingerprint.clone(),
         }))
     }
 
@@ -256,6 +268,10 @@ impl GitRepository {
             "blame request was prepared for a different recorded HEAD"
         );
         ensure!(
+            request.recorded_index_fingerprint == self.index.fingerprint,
+            "blame request was prepared for a different index membership"
+        );
+        ensure!(
             request.cache_key.shallow_fingerprint == self.shallow.fingerprint,
             "blame request was prepared for a different shallow set"
         );
@@ -275,18 +291,25 @@ impl GitRepository {
         })
     }
 
-    /// Re-read both state inputs immediately before publication. Callers must
+    /// Re-read all state inputs immediately before publication. Callers must
     /// abort and retry the whole immutable capture when this reports drift.
     pub(crate) fn validate_before_publication(&self) -> Result<PublicationValidation> {
         let current_head = read_head(&self.root).context("re-read checked-out HEAD")?;
+        let current_index =
+            read_index_state(&self.root).context("re-read current index membership")?;
         let current_shallow =
             read_shallow_state(&self.root).context("re-read resolved shallow file")?;
-        if current_head == self.head && current_shallow.fingerprint == self.shallow.fingerprint {
+        if current_head == self.head
+            && current_index.fingerprint == self.index.fingerprint
+            && current_shallow.fingerprint == self.shallow.fingerprint
+        {
             return Ok(PublicationValidation::Stable);
         }
         Ok(PublicationValidation::Drift(RepositoryDrift {
             recorded_head: self.head.clone(),
             current_head,
+            recorded_index_fingerprint: self.index.fingerprint.clone(),
+            current_index_fingerprint: current_index.fingerprint,
             recorded_shallow_fingerprint: self.shallow.fingerprint.clone(),
             current_shallow_fingerprint: current_shallow.fingerprint,
         }))
@@ -469,17 +492,15 @@ fn path_exists_at_head(root: &Path, head: &str, path: &str) -> Result<bool> {
     Ok(fields[1] == b"blob")
 }
 
-fn path_exists_in_index(root: &Path, path: &str) -> Result<bool> {
-    let args = vec![
+fn read_index_state(root: &Path) -> Result<IndexState> {
+    let args = [
         OsString::from("--no-replace-objects"),
         OsString::from("ls-files"),
         OsString::from("--stage"),
         OsString::from("-z"),
-        OsString::from("--"),
-        OsString::from(path),
     ];
     let output = run_git(root, &args, None)?;
-    let expected = path.as_bytes();
+    let mut paths = BTreeSet::new();
     for record in output.split(|byte| *byte == b'\0') {
         if record.is_empty() {
             continue;
@@ -492,11 +513,17 @@ fn path_exists_in_index(root: &Path, path: &str) -> Result<bool> {
             .split(|byte| *byte == b' ')
             .collect::<Vec<_>>();
         ensure!(fields.len() == 3, "Git returned invalid ls-files metadata");
-        if &record[metadata_end + 1..] == expected {
-            return Ok(true);
-        }
+        paths.insert(record[metadata_end + 1..].to_vec());
     }
-    Ok(false)
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(INDEX_MEMBERSHIP_DOMAIN);
+    for path in &paths {
+        hash_field(&mut hasher, path);
+    }
+    Ok(IndexState {
+        paths,
+        fingerprint: hasher.finalize().to_hex().to_string(),
+    })
 }
 
 fn read_shallow_state(root: &Path) -> Result<ShallowState> {
@@ -1347,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn prepublication_validation_detects_head_and_shallow_drift() -> Result<()> {
+    fn prepublication_validation_detects_head_index_and_shallow_drift() -> Result<()> {
         let Some(repository) = TestRepository::new()? else {
             return Ok(());
         };
@@ -1370,6 +1397,14 @@ mod tests {
             before_head_change.validate_before_publication()?,
             PublicationValidation::Drift(_)
         ));
+
+        let before_index_change = captured_git(&repository)?;
+        repository.git(&["rm", "--cached", "--quiet", "guide.md"])?;
+        assert!(matches!(
+            before_index_change.validate_before_publication()?,
+            PublicationValidation::Drift(_)
+        ));
+        repository.git(&["add", "guide.md"])?;
 
         let before_shallow_change = captured_git(&repository)?;
         fs::write(repository.shallow_path(), format!("{root_oid}\n"))?;

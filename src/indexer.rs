@@ -868,9 +868,11 @@ fn validate_documentation_provenance_publication(repository: &RepositoryCapture)
         Ok(PublicationValidation::Stable) => Ok(()),
         Ok(PublicationValidation::Drift(drift)) => {
             Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
-                "Git documentation provenance drifted before publication: HEAD {} -> {}, shallow {} -> {}",
+                "Git documentation provenance drifted before publication: HEAD {} -> {}, index membership {} -> {}, shallow {} -> {}",
                 drift.recorded_head,
                 drift.current_head,
+                drift.recorded_index_fingerprint,
+                drift.current_index_fingerprint,
                 drift.recorded_shallow_fingerprint,
                 drift.current_shallow_fingerprint,
             ))))

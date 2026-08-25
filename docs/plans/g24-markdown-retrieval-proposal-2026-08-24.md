@@ -558,11 +558,13 @@ retrieval chunks. Rules:
 - Git absence or a per-file blame failure emits a diagnostic and degrades
   that file to observed/unknown provenance without failing the scan.
 
-Immediately before publication, the attempt re-reads `HEAD` and the resolved
-shallow file and compares them with the recorded head and shallow-set
-fingerprint. Drift from a concurrent checkout or clone deepening aborts that
+Immediately before publication, the attempt re-reads `HEAD`, exact index path
+membership, and the resolved shallow file and compares them with the recorded
+head, index-membership fingerprint, and shallow-set fingerprint. Drift from a
+concurrent checkout, staging membership change, or clone deepening aborts that
 attempt and retries from a new immutable corpus capture; no mixed provenance
-snapshot is published.
+snapshot is published. Staging content at an already tracked path does not
+change the membership fingerprint.
 
 Git history is metadata for current chunks only; previous file revisions are
 never ingested.
