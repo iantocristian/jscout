@@ -603,8 +603,16 @@ fn event_filter_applies_the_configured_documentation_policy() -> Result<()> {
     fs::create_dir_all(root.join("docs"))?;
     fs::create_dir_all(root.join("private"))?;
     fs::create_dir_all(root.join(".github"))?;
+    fs::create_dir_all(root.join(".github/.private"))?;
+    fs::create_dir_all(root.join(".claude"))?;
+    fs::create_dir_all(root.join(".agents"))?;
     fs::create_dir_all(root.join(".hidden"))?;
-    fs::write(root.join(".gitignore"), "/docs/\n")?;
+    fs::create_dir_all(root.join(".source-visible"))?;
+    fs::create_dir_all(root.join("packages/app/.github"))?;
+    fs::write(
+        root.join(".gitignore"),
+        "/docs/\n/.claude/\n!.source-visible/\n",
+    )?;
     fs::write(root.join("docs/ignored.md"), "ignored\n")?;
     fs::write(root.join("private/excluded.md"), "excluded\n")?;
     fs::write(root.join(".github/guide.mdx"), "visible\n")?;
@@ -636,9 +644,76 @@ fn event_filter_applies_the_configured_documentation_policy() -> Result<()> {
             "documentation:.github/guide.mdx"
         ))
     );
+    assert_eq!(
+        classifier.classify(&[root.join(".github")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.github"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".agents")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.agents"
+        ))
+    );
+    assert!(classifier.classify(&[root.join(".claude")]).is_none());
+    assert!(
+        classifier
+            .classify(&[root.join(".github/.private")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join("packages/app/.github")])
+            .is_none()
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".source-visible")]),
+        Some(DirtySignal::inventory("inventory:directory-event"))
+    );
+    fs::remove_dir_all(root.join(".github"))?;
+    fs::remove_dir_all(root.join(".agents"))?;
+    fs::remove_dir_all(root.join(".claude"))?;
+    fs::remove_dir_all(root.join(".hidden"))?;
+    fs::remove_dir_all(root.join(".source-visible"))?;
+    assert_eq!(
+        classifier.classify(&[root.join(".github")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.github"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".agents")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.agents"
+        ))
+    );
+    assert!(classifier.classify(&[root.join(".claude")]).is_none());
+    assert!(classifier.classify(&[root.join(".hidden")]).is_none());
+    assert_eq!(
+        classifier.classify(&[root.join(".source-visible")]),
+        Some(DirtySignal::inventory("inventory:directory-event"))
+    );
+
+    let disabled = crate::docs::corpus::CorpusOptions {
+        include: Vec::new(),
+        ..Default::default()
+    };
+    let disabled_classifier = EventClassifier::new(root, &root.join("disabled.db"), &disabled)?;
+    assert!(
+        disabled_classifier
+            .classify(&[root.join(".github")])
+            .is_none()
+    );
 
     fs::write(root.join(".gitignore"), "")?;
     classifier.reload_path_policies()?;
+    assert_eq!(
+        classifier.classify(&[root.join(".claude")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.claude"
+        ))
+    );
     assert_eq!(
         classifier.classify(&[root.join("docs/deleted.md")]),
         Some(DirtySignal::documentation("documentation:docs/deleted.md"))
@@ -946,6 +1021,57 @@ fn incremental_inventory_refresh_removes_a_deleted_documentation_subtree() -> Re
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     assert_eq!(remaining, vec![("stable.ts".into(), "code".into())]);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM docs_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn hidden_documentation_directory_event_removes_its_subtree_incrementally() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join(".github/guides"))?;
+    fs::write(
+        directory.path().join(".github/guides/guide.md"),
+        "# Guide\n\nCurrent documentation.\n",
+    )?;
+    fs::write(
+        directory.path().join("stable.ts"),
+        "export const stable = true;\n",
+    )?;
+    let database = directory.path().join("watch.db");
+    run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Full,
+    )?;
+    let classifier = EventClassifier::new(
+        directory.path(),
+        &database,
+        &crate::docs::corpus::CorpusOptions::default(),
+    )?;
+
+    fs::remove_dir_all(directory.path().join(".github"))?;
+    let signal = classifier
+        .classify(&[directory.path().join(".github")])
+        .expect("deleted hidden documentation directory must schedule refresh");
+    assert_eq!(signal.scope, RefreshScope::Incremental);
+    assert!(signal.source_paths.is_empty());
+    let refreshed = run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        signal.scope,
+    )?;
+    assert_eq!(refreshed.outcome.unchanged, 1);
+    assert_eq!(refreshed.outcome.removed, 1);
+    assert!(!refreshed.outcome.extraction_reset);
+
+    let conn = crate::store::open_path_read_only(&database)?;
     assert_eq!(
         conn.query_row("SELECT count(*) FROM docs_fts", [], |row| {
             row.get::<_, i64>(0)

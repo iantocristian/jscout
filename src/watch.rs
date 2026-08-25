@@ -576,10 +576,12 @@ impl EventClassifier {
                 );
                 continue;
             }
+            let is_directory = path.is_dir();
+            let is_file = path.is_file();
             if self
                 .documentation_policy
                 .borrow_mut()
-                .is_admitted(&path, path.is_dir())
+                .is_admitted(&path, is_directory)
             {
                 let relative = display_path(&self.root, &path);
                 merge_signal(
@@ -588,14 +590,38 @@ impl EventClassifier {
                 );
                 continue;
             }
-            if self
+            let source_ignored = self
                 .source_policy
                 .borrow_mut()
-                .is_ignored(&path, path.is_dir())
-            {
+                .is_ignored(&path, is_directory);
+            if source_ignored {
+                // A missing path may have been a directory. Re-query it with
+                // directory semantics before suppressing the event: a
+                // directory-only whitelist can reopen a hidden source tree,
+                // while querying the vanished path as a file cannot observe
+                // that whitelist.
+                if !is_file && !self.source_policy.borrow_mut().is_ignored(&path, true) {
+                    merge_signal(
+                        &mut signal,
+                        DirtySignal::inventory("inventory:directory-event"),
+                    );
+                    continue;
+                }
+                if (is_directory || !is_file)
+                    && self
+                        .documentation_policy
+                        .borrow_mut()
+                        .may_contain_document(&path)
+                {
+                    let relative = display_path(&self.root, &path);
+                    merge_signal(
+                        &mut signal,
+                        DirtySignal::documentation(format!("documentation-directory:{relative}")),
+                    );
+                }
                 continue;
             }
-            if path.is_dir() {
+            if is_directory {
                 merge_signal(
                     &mut signal,
                     DirtySignal::inventory("inventory:directory-event"),
@@ -615,7 +641,7 @@ impl EventClassifier {
             // Missing paths and directories remain conservative because a
             // backend may be reporting a delete, rename, or rescan without
             // enough type information to classify it safely.
-            if !path.is_file() {
+            if !is_file {
                 merge_signal(
                     &mut signal,
                     DirtySignal::inventory("inventory:unknown-event"),

@@ -97,6 +97,26 @@ impl DocumentationPathPolicy {
         let (matched, error) = self.ignore.matched_with_errors(relative, false);
         error.is_some() || !matched.is_ignore()
     }
+
+    /// Whether a directory-shaped path could contain visible documentation.
+    /// This is deliberately independent of include/exclude file globs: the
+    /// authoritative inventory descends every visible directory and applies
+    /// arbitrary globs to files. The watcher uses this only after the source
+    /// plane ignored an existing directory or a missing path, so it closes the
+    /// allowlisted-hidden-root gap without stealing source-file affinity.
+    pub fn may_contain_document(&mut self, path: &Path) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative.as_os_str().is_empty() || hidden_path_is_excluded(relative) {
+            return false;
+        }
+        let (matched, error) = self.ignore.matched_with_errors(relative, true);
+        error.is_some() || !matched.is_ignore()
+    }
 }
 
 fn documentation_ignore(root: &Path) -> Result<IncrementalIgnore> {
