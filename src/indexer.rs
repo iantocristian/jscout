@@ -8,11 +8,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
-use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision, DocFile};
+use crate::docs::corpus::{self, CapturedDocument, CorpusOptions, Decision, DocFile};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
-use crate::{file_role, io_policy, parse, store, walk};
+use crate::{file_role, io_policy, parse, store};
 
 const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
 const CODE_CORPUS: &str = "code";
@@ -382,7 +382,7 @@ fn index_repo_impl<F: FileSystem>(
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory_started = std::time::Instant::now();
-    let inventory = walk::repository_inventory(
+    let inventory = corpus::repository_inventory(
         &root,
         &CorpusOptions {
             include: options.docs_include.clone(),
@@ -489,7 +489,7 @@ fn index_repo_impl<F: FileSystem>(
             outcome.extraction_reset = true;
         }
 
-        replace_documentation_inventory(conn, &inventory.documentation_decisions)?;
+        replace_documentation_inventory(conn, &inventory.decisions)?;
         let mut seen = std::collections::HashSet::new();
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {

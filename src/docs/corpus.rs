@@ -63,10 +63,10 @@ pub struct CapturedDocument {
 /// Results of the one repository traversal used by shared indexing. Code
 /// paths remain a code-only input to workspace discovery; Markdown carries
 /// its captured bytes and its visible membership decisions beside them.
-#[cfg(test)]
 #[derive(Debug)]
-pub struct RepositoryCorpus {
-    pub source_files: Vec<PathBuf>,
+pub(crate) struct RepositoryCorpus {
+    pub files: Vec<PathBuf>,
+    pub rejections: Vec<crate::walk::WalkRejection>,
     pub documents: Vec<CapturedDocument>,
     pub decisions: Vec<Decision>,
 }
@@ -153,14 +153,11 @@ pub fn validate_patterns(include: &[String], exclude: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn scan_repository(root: &Path, options: &CorpusOptions) -> Result<RepositoryCorpus> {
-    let inventory = crate::walk::repository_inventory(root, options)?;
-    Ok(RepositoryCorpus {
-        source_files: inventory.files,
-        documents: inventory.documents,
-        decisions: inventory.documentation_decisions,
-    })
+pub(crate) fn repository_inventory(
+    root: &Path,
+    options: &CorpusOptions,
+) -> Result<RepositoryCorpus> {
+    repository_inventory_with_consumer(root, options, &capture_file)
 }
 
 #[cfg(test)]
@@ -169,12 +166,31 @@ fn scan_repository_with_capture(
     options: &CorpusOptions,
     capture: &dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
 ) -> Result<RepositoryCorpus> {
-    let inventory = crate::walk::repository_inventory_with_capture(root, options, capture)?;
+    repository_inventory_with_consumer(root, options, capture)
+}
+
+fn repository_inventory_with_consumer(
+    root: &Path,
+    options: &CorpusOptions,
+    capture: &dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
+) -> Result<RepositoryCorpus> {
+    let documentation = DocumentationCollector::new(options, capture)?;
+    let inventory = crate::walk::repository_inventory(root, documentation)?;
+    let DocumentationCollection {
+        documents,
+        decisions,
+    } = inventory.consumer;
     Ok(RepositoryCorpus {
-        source_files: inventory.files,
-        documents: inventory.documents,
-        decisions: inventory.documentation_decisions,
+        files: inventory.files,
+        rejections: inventory.rejections,
+        documents,
+        decisions,
     })
+}
+
+#[cfg(test)]
+fn scan_repository(root: &Path, options: &CorpusOptions) -> Result<RepositoryCorpus> {
+    repository_inventory(root, options)
 }
 
 /// Parser-focused compatibility helper. Production indexing uses the shared
@@ -1872,7 +1888,7 @@ mod tests {
                 ..CorpusOptions::default()
             },
         )?;
-        assert_eq!(inventory.source_files, [root.join("main.ts")]);
+        assert_eq!(inventory.files, [root.join("main.ts")]);
         assert!(inventory.documents.is_empty());
         assert!(inventory.decisions.is_empty());
         Ok(())
@@ -1921,7 +1937,7 @@ mod tests {
         assert_eq!(result, 0);
 
         let inventory = scan_repository(repo.path(), &CorpusOptions::default())?;
-        assert!(inventory.source_files.is_empty());
+        assert!(inventory.files.is_empty());
         assert!(inventory.documents.is_empty());
 
         let markdown_repo = tempfile::tempdir()?;
@@ -1956,7 +1972,7 @@ mod tests {
 
         assert_eq!(
             inventory
-                .source_files
+                .files
                 .iter()
                 .map(|path| path.file_name().unwrap())
                 .collect::<Vec<_>>(),
@@ -2032,7 +2048,7 @@ mod tests {
         fs::write(directory.join("deep.mdx"), "# Deep\n\nContent.\n")?;
 
         let inventory = scan_repository(&root, &CorpusOptions::default())?;
-        assert_eq!(inventory.source_files, [directory.join("deep.ts")]);
+        assert_eq!(inventory.files, [directory.join("deep.ts")]);
         assert_eq!(inventory.documents.len(), 1);
         assert!(inventory.documents[0].file.path.ends_with("deep.mdx"));
         Ok(())

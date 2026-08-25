@@ -3,9 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
-use crate::docs::corpus::{
-    CapturedDocument, CorpusOptions, Decision, DocumentationCollection, DocumentationCollector,
-};
 use crate::io_policy;
 
 mod inventory;
@@ -46,15 +43,13 @@ pub struct SourceInventory {
     pub rejections: Vec<WalkRejection>,
 }
 
-/// The shared index pass walks the repository once and returns two extraction
-/// inputs with separate ranking semantics. `files` remains code-only so
-/// workspace and dependency discovery retain their existing contract.
+/// The shared index pass returns the code-file inventory beside one
+/// plane-specific consumer output without teaching the walk layer its shape.
 #[derive(Debug)]
-pub struct RepositoryInventory {
+pub(crate) struct RepositoryInventory<T> {
     pub files: Vec<PathBuf>,
     pub rejections: Vec<WalkRejection>,
-    pub documents: Vec<CapturedDocument>,
-    pub documentation_decisions: Vec<Decision>,
+    pub consumer: T,
 }
 
 /// One plane that consumes entries from the shared repository traversal.
@@ -187,42 +182,13 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
     Ok(SourceInventory { files, rejections })
 }
 
-/// Inventory for shared publication. Markdown membership, capture, and parse
-/// happen during the same deterministic traversal that selects code paths;
-/// there is no independent documentation snapshot or later filesystem scan.
-pub fn repository_inventory(
+/// Run one deterministic repository traversal for code paths and another
+/// inventory consumer. The consumer owns its output and extraction policy.
+pub(crate) fn repository_inventory<C: RepositoryInventoryConsumer>(
     root: &Path,
-    documentation: &CorpusOptions,
-) -> Result<RepositoryInventory> {
-    repository_inventory_with_consumer(root, documentation, &crate::docs::corpus::capture_file)
-}
-
-#[cfg(test)]
-pub(crate) fn repository_inventory_with_capture(
-    root: &Path,
-    documentation: &CorpusOptions,
-    capture: &dyn Fn(&Path, u64) -> std::io::Result<crate::docs::corpus::CapturedFile>,
-) -> Result<RepositoryInventory> {
-    repository_inventory_with_consumer(root, documentation, capture)
-}
-
-fn repository_inventory_with_consumer(
-    root: &Path,
-    documentation: &CorpusOptions,
-    capture: &dyn Fn(&Path, u64) -> std::io::Result<crate::docs::corpus::CapturedFile>,
-) -> Result<RepositoryInventory> {
-    let documentation = DocumentationCollector::new(documentation, capture)?;
-    let inventory = inventory::repository_inventory(root, documentation)?;
-    let DocumentationCollection {
-        documents,
-        decisions,
-    } = inventory.consumer;
-    Ok(RepositoryInventory {
-        files: inventory.files,
-        rejections: inventory.rejections,
-        documents,
-        documentation_decisions: decisions,
-    })
+    consumer: C,
+) -> Result<RepositoryInventory<C::Output>> {
+    inventory::repository_inventory(root, consumer)
 }
 
 /// Read-only diagnostic callers need the file list but do not publish a
@@ -275,6 +241,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::docs::corpus::{self, CorpusOptions};
 
     #[test]
     fn authored_build_directories_and_declarations_are_indexable() -> Result<()> {
@@ -337,7 +304,7 @@ mod tests {
         )?;
 
         let root = repo.path().canonicalize()?;
-        let inventory = repository_inventory(&root, &CorpusOptions::default())?;
+        let inventory = corpus::repository_inventory(&root, &CorpusOptions::default())?;
         let code = inventory
             .files
             .iter()
@@ -356,7 +323,7 @@ mod tests {
         );
         assert!(
             inventory
-                .documentation_decisions
+                .decisions
                 .iter()
                 .all(|decision| decision.path != ".github/workflows/hidden.ts")
         );
@@ -443,15 +410,15 @@ mod tests {
 
         let canonical_root = repo.path().canonicalize()?;
         let legacy = source_inventory(&canonical_root)?;
-        let shared = repository_inventory(&canonical_root, &CorpusOptions::default())?;
+        let shared = corpus::repository_inventory(&canonical_root, &CorpusOptions::default())?;
         assert_eq!(shared.files, legacy.files);
         assert!(shared.files.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(shared.documentation_decisions.iter().any(|decision| {
+        assert!(shared.decisions.iter().any(|decision| {
             decision.path == ".source-visible" && decision.rule == "hidden-not-allowlisted"
         }));
         assert!(
             shared
-                .documentation_decisions
+                .decisions
                 .iter()
                 .all(|decision| !decision.path.starts_with(".source-visible/")),
             "documentation remains pruned even when the code plane must descend"
@@ -492,7 +459,7 @@ mod tests {
 
         let canonical_root = repo.path().canonicalize()?;
         let legacy = source_inventory(&canonical_root)?;
-        let shared = repository_inventory(&canonical_root, &CorpusOptions::default())?;
+        let shared = corpus::repository_inventory(&canonical_root, &CorpusOptions::default())?;
         assert_eq!(shared.files, legacy.files);
         assert_eq!(
             shared

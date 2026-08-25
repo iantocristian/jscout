@@ -4,13 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
 
-use super::{RepositoryInventoryConsumer, SKIP_DIRS, WalkRejection, is_indexable};
-
-pub(super) struct InventoryOutput<T> {
-    pub files: Vec<PathBuf>,
-    pub rejections: Vec<WalkRejection>,
-    pub consumer: T,
-}
+use super::{
+    RepositoryInventory, RepositoryInventoryConsumer, SKIP_DIRS, WalkRejection, is_indexable,
+};
 
 enum WalkTask {
     Directory {
@@ -32,7 +28,7 @@ enum WalkTask {
 pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
     root: &Path,
     mut consumer: C,
-) -> Result<InventoryOutput<C::Output>> {
+) -> Result<RepositoryInventory<C::Output>> {
     let canonical_root = root
         .canonicalize()
         .with_context(|| format!("canonicalize repository root {}", root.display()))?;
@@ -216,7 +212,7 @@ pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
             .then_with(|| left.stage.cmp(right.stage))
     });
     let consumer = consumer.finish(&canonical_root)?;
-    Ok(InventoryOutput {
+    Ok(RepositoryInventory {
         files,
         rejections,
         consumer,
