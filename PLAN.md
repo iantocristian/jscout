@@ -26,7 +26,8 @@
 > retrieval is proposed: docs in the main index as a separate ranking corpus
 > and surface, with code ranked content, statistics, and order byte-identical
 > modulo the shared snapshot identifier. G25 multi-format admission is proposed
-> behind it.
+> behind it. G26 Rust code indexing is proposed as G25's first code-corpus
+> format, motivated by self-indexing this repository.
 
 ## Document policy
 
@@ -3399,6 +3400,58 @@ string-keyed identities already make these one-store questions; producers for
 non-code kinds are the payoff that justifies every admission above the text
 tier. No implementation milestone is assigned and no current goal is
 displaced.
+
+## Proposed G26 — Rust code indexing
+
+jscout is a Rust program that cannot index itself. Admitting Rust makes this
+repository its own standing evaluation corpus, makes jscout useful for its
+own development, and is the first exercise of G25's registry for a second
+code-corpus format. The decisions:
+
+1. Rust is `files.format='rust'`, `files.corpus='code'`, admitted through the
+   shared index pass, snapshot, and publication. The dependency walker does
+   not widen, and `walk::SKIP_DIRS` gains `target` — Cargo build output is
+   excluded deterministically, not only by gitignore, matching how
+   `node_modules` is handled.
+2. The parser is `ra_ap_syntax` (rust-analyzer's standalone syntax crate),
+   pinned: lossless spans so chunks slice back to source exactly,
+   error-tolerant so watch-mode mid-edit files still index, pure Rust so no C
+   toolchain enters the build. `syn` fails the error-tolerance and comment
+   requirements; tree-sitter stays rejected — this goal explicitly does not
+   fire G25's revisit trigger, because a single language has a pure-Rust
+   lossless alternative. Macro expansion is out of scope; the Rust chunk
+   format is contract-hashed like Markdown's.
+3. Rust climbs the tier ladder in phases, because it joins the code ranking
+   economy: unlike docs there is no byte-identity gate — new corpus content
+   changes code search by design — so acceptance is evaluation-based.
+   Phase 1 admits text-tier chunks (no names, `chunks.kind='rust_text'`, no
+   exact-tier interaction) and measures on this repository: index time,
+   database size, and a fixed JS/TS query set compared before and after.
+   Phase 2 adds named item chunks (`fn`, `struct`, `enum`, `trait`, `impl`
+   per associated item, `mod`, `const`, `static`, unexpanded `macro_rules!`)
+   with doc comments attached and module-path scope chains; it is accepted
+   only after exact-tier collision measurement, because Rust's name
+   distribution is exact-tier-hostile (`new`, `from`, `default` everywhere).
+   Phase 3 adds deterministic module edges from the `mod` tree, `use` paths,
+   and `cargo metadata` — file-granularity `who-uses`/`neighborhood`, no
+   trait or method resolution.
+4. Out of scope: entity extraction, events, member calls, checker
+   enrichment, macro expansion, dependency-crate indexing, and rust-analyzer
+   semantics — full semantics belong to a future enrichment sidecar on the
+   tsserver pattern, a separate goal if ever. Inline `#[cfg(test)]` modules
+   indexing as production is a recorded role-granularity limitation.
+
+Acceptance: `.rs` under `target/` is never indexed even without gitignore;
+the dependency walker is byte-identical; spans slice exactly on multibyte,
+raw-string, and CRLF content; files with syntax errors still index their
+parseable items and are visibly counted; phase 1 leaves exact tiers
+byte-identical and the fixed JS/TS query set within agreed tolerance;
+phase 2 ships only with recorded collision measurements; a self-index of
+this repository lands its timing and size in `eval/results/` as the dogfood
+baseline. The detail document
+[docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
+is subordinate and non-normative, this entry winning on any disagreement. No
+implementation milestone is assigned and no current goal is displaced.
 
 ## Evaluation decisions already made
 
