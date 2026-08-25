@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
-use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision};
+use crate::docs::corpus::{
+    CapturedDocument, CorpusOptions, Decision, DocumentationCollection, DocumentationCollector,
+};
 use crate::io_policy;
+
+mod inventory;
 
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
 
@@ -51,6 +55,26 @@ pub struct RepositoryInventory {
     pub rejections: Vec<WalkRejection>,
     pub documents: Vec<CapturedDocument>,
     pub documentation_decisions: Vec<Decision>,
+}
+
+/// One plane that consumes entries from the shared repository traversal.
+/// Implementations own their membership, hidden-path, and extraction policy;
+/// the inventory engine owns filesystem traversal and ignore handling.
+pub(crate) trait RepositoryInventoryConsumer: Sized {
+    type Output;
+
+    fn is_active(&self) -> bool;
+    fn path_relevant(&self, relative: &Path) -> bool;
+    fn hidden_path_is_excluded(&self, relative: &Path) -> bool;
+    fn record_decision(&mut self, path: &Path, subject: &str, rule: &str, detail: Option<String>);
+    fn inspect_special_file(
+        &self,
+        relative: &Path,
+        absolute: &Path,
+        file_type: std::fs::FileType,
+    ) -> Result<()>;
+    fn inspect_regular_file(&mut self, relative: PathBuf);
+    fn finish(self, root: &Path) -> Result<Self::Output>;
 }
 
 /// Path matcher configured from the same ignore policy as the source walker.
@@ -170,26 +194,40 @@ pub fn repository_inventory(
     root: &Path,
     documentation: &CorpusOptions,
 ) -> Result<RepositoryInventory> {
-    let inventory = crate::docs::corpus::scan_repository(root, documentation)?;
+    repository_inventory_with_consumer(root, documentation, &crate::docs::corpus::capture_file)
+}
+
+#[cfg(test)]
+pub(crate) fn repository_inventory_with_capture(
+    root: &Path,
+    documentation: &CorpusOptions,
+    capture: &dyn Fn(&Path, u64) -> std::io::Result<crate::docs::corpus::CapturedFile>,
+) -> Result<RepositoryInventory> {
+    repository_inventory_with_consumer(root, documentation, capture)
+}
+
+fn repository_inventory_with_consumer(
+    root: &Path,
+    documentation: &CorpusOptions,
+    capture: &dyn Fn(&Path, u64) -> std::io::Result<crate::docs::corpus::CapturedFile>,
+) -> Result<RepositoryInventory> {
+    let documentation = DocumentationCollector::new(documentation, capture)?;
+    let inventory = inventory::repository_inventory(root, documentation)?;
+    let DocumentationCollection {
+        documents,
+        decisions,
+    } = inventory.consumer;
     Ok(RepositoryInventory {
-        files: inventory.source_files,
-        rejections: inventory
-            .rejections
-            .into_iter()
-            .map(|rejection| WalkRejection {
-                path: rejection.path,
-                stage: rejection.stage,
-                error: rejection.error,
-            })
-            .collect(),
-        documents: inventory.documents,
-        documentation_decisions: inventory.decisions,
+        files: inventory.files,
+        rejections: inventory.rejections,
+        documents,
+        documentation_decisions: decisions,
     })
 }
 
 /// Read-only diagnostic callers need the file list but do not publish a
-/// structural snapshot. Indexing uses [`source_inventory`] so rejections stay
-/// visible in its outcome.
+/// structural snapshot. These callers use [`source_inventory`] so traversal
+/// rejections remain visible instead of being reduced to a bare file list.
 pub fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(source_inventory(root)?.files)
 }
