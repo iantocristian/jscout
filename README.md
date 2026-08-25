@@ -542,14 +542,25 @@ does not imply that checker configuration was unchanged.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
 project-batched, resumable checker pass for the resulting snapshot. Across a
-changed snapshot it may carry an unchanged project when its configuration
-chain, membership, checker identity, and protocol fingerprint match. Each fact
-is rebound to the current member-call row only when its source hash and exact
-call/receiver/property spans still match and its target fingerprint remains
-current. If any owner of a multi-project occurrence cannot carry, all owners
-are re-queried. Dirty projects and occurrences run first; fully carried
-projects construct no TypeScript Program. The old batch remains non-public and
-is deleted when the new current-snapshot batch activates.
+changed snapshot it first considers each fully completed project in the newest
+reusable superseded staging source, then falls back project-by-project to the
+active publication. An empty newer destination left by a crash cannot displace
+that source. Pending, partial, failed, or coverage-incomplete staging rows are
+never carried. Configuration chain, membership, checker identity, protocol,
+external inputs, and exact occurrence/target fingerprints are all revalidated.
+If any owner of a multi-project occurrence cannot carry, all owners are
+re-queried. Dirty projects and occurrences run first; fully carried projects
+construct no TypeScript Program. Validated copies and predecessor-staging
+retirement commit atomically, and neither old source is projected for the new
+snapshot.
+
+Source dirty affinity is a watcher backlog rather than generation-local state.
+It accumulates code paths across supersession, cancellation, retries, and
+terminal partial publication, and clears only after a non-superseded checker
+publication succeeds. Documentation changes remain refresh-only. Enrichment
+reports distinguish exact-batch reuse, durable staging resume, staging resets,
+unique carried occurrences, project-occurrence carry, and carry sourced from
+superseded staging versus the active publication.
 
 External checker inputs remain watched for carried projects. An independent
 daily-scale deadline schedules `enrich --full` semantics inside the watcher;
@@ -595,11 +606,11 @@ coalesced generation.
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
 needed. Manual indexing clears checker facts. Watch may reuse an exact-snapshot
-batch or keep one changed-snapshot batch hidden as input to the following
-validated carry pass. A deterministic extraction
-rejection or non-retryable read failure is reported and excluded; an old row
-for that path is not served as current. The refresh still succeeds over the
-indexable corpus.
+batch or keep the active publication plus the newest reusable superseded
+staging source hidden as inputs to the following validated carry pass. A
+deterministic extraction rejection or non-retryable read failure is reported
+and excluded; an old row for that path is not served as current. The refresh
+still succeeds over the indexable corpus.
 The classified workspace map is built first. Workspace globs are expanded
 against the filesystem, so a declared package keeps first-party identity even
 when it contains only excluded build output or gitignored source. Indexed
@@ -1159,6 +1170,12 @@ a fully cached pass therefore reports reuse rather than `embedded=0/0`.
 `watch --embed` also repairs and tops up semantic-artifact vectors after the
 checker phase. Manual `jscout index` always remains a full disposable-snapshot
 rebuild.
+The startup line records the jscout version, executable-byte fingerprint,
+loaded non-secret runtime-config fingerprint, whether a config file was loaded,
+restart-required config semantics, checker-policy fingerprint, and a separate
+non-secret fingerprint of the effective watch invocation after CLI overrides
+alongside the effective watch flags. These identities make logs from different
+binaries or policies comparable without exposing credentials.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

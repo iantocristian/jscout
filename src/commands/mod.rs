@@ -628,6 +628,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     debug: runtime.effective.diagnostics.debug,
                     debounce: std::time::Duration::from_millis(debounce_ms),
                     reconcile_interval: std::time::Duration::from_secs(reconcile_seconds),
+                    config_fingerprint: &runtime.fingerprint,
+                    config_loaded: runtime.config_loaded,
                 },
             )
         }

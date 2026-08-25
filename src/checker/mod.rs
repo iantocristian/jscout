@@ -6,6 +6,40 @@ pub mod protocol;
 pub(crate) use enrich::target_fingerprint;
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
 
+/// Stable identity for the checker semantics and fixed watcher policy. It is
+/// intentionally independent of repository state, project membership, paths,
+/// timeouts, and the per-generation carry-free override.
+pub fn watch_policy_fingerprint() -> String {
+    fn component(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    for value in [
+        b"jscout-checker-watch-policy-v1".as_slice(),
+        enrich::CHECKER_SEMANTICS_FINGERPRINT,
+        enrich::PROJECT_PLAN_FINGERPRINT_DOMAIN,
+        enrich::ENRICH_PLAN_FINGERPRINT_DOMAIN,
+        package_gate::POLICY_FINGERPRINT_DOMAIN.as_bytes(),
+    ] {
+        component(&mut hasher, value);
+    }
+    component(
+        &mut hasher,
+        protocol::PROTOCOL_VERSION.to_string().as_bytes(),
+    );
+    component(
+        &mut hasher,
+        enrich::INFERRED_ROOT_CAP.to_string().as_bytes(),
+    );
+    component(
+        &mut hasher,
+        b"selection=files:;packages:;members:;roles:;max_occurrences:none;include_all:false;carry=project-validated;drift-flush=daily",
+    );
+    hasher.finalize().to_hex().to_string()
+}
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -111,4 +145,19 @@ pub fn doctor(
     }
     println!("ready: {}", capabilities.question);
     Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    #[test]
+    fn watch_policy_identity_is_stable_lowercase_hex() {
+        let fingerprint = super::watch_policy_fingerprint();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(
+            fingerprint
+                .bytes()
+                .all(|byte| { byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') })
+        );
+        assert_eq!(fingerprint, super::watch_policy_fingerprint());
+    }
 }

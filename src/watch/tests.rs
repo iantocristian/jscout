@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +10,8 @@ use crate::indexer;
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
     RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
-    clear_reconciliation_deadline_if_dirty, is_refresh_boundary, run_refresh, validate_options,
+    clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
+    is_refresh_boundary, run_refresh, validate_options, watch_startup_log,
 };
 
 fn rejection(path: &str, stage: &'static str, error: &str) -> crate::indexer::IndexRejection {
@@ -288,6 +290,105 @@ fn source_event_superseding_a_drift_flush_keeps_the_full_enrichment_requirement(
     assert!(successor.force_full_enrichment);
     assert!(coordinator.dirty_reasons.contains("checker-drift-flush"));
     assert!(coordinator.dirty_reasons.contains("source:changed.ts"));
+}
+
+#[test]
+fn checker_dirty_paths_survive_supersession_until_successor_publication() {
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+
+    coordinator.mark_dirty(seconds(1), source_signal("src/a.ts"));
+    let refresh_a = coordinator.next_work(seconds(3)).expect("refresh A");
+    assert_eq!(coordinator.finish_refresh(refresh_a), FinishState::Continue);
+    let enrich_a = coordinator.next_work(seconds(3)).expect("enrich A");
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/a.ts".to_string()])
+    );
+
+    coordinator.mark_dirty(seconds(4), source_signal("src/b.ts"));
+    assert_eq!(
+        coordinator.finish_enrichment_success(enrich_a),
+        FinishState::Superseded
+    );
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/a.ts".to_string(), "src/b.ts".to_string()])
+    );
+
+    let refresh_b = coordinator.next_work(seconds(6)).expect("refresh B");
+    assert_eq!(coordinator.finish_refresh(refresh_b), FinishState::Continue);
+    let enrich_b = coordinator.next_work(seconds(6)).expect("enrich B");
+    assert_eq!(
+        coordinator.finish_enrichment_success(enrich_b),
+        FinishState::Complete
+    );
+    assert!(coordinator.checker_dirty_source_paths.is_empty());
+}
+
+#[test]
+fn checker_dirty_paths_survive_partial_and_retryable_enrichment() {
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+
+    coordinator.mark_dirty(seconds(1), source_signal("src/partial.ts"));
+    let refresh = coordinator.next_work(seconds(3)).expect("refresh");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(seconds(3)).expect("enrich");
+    assert_eq!(
+        coordinator.finish_optional_partial(enrich),
+        FinishState::Partial
+    );
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/partial.ts".to_string()])
+    );
+
+    coordinator.mark_dirty(seconds(4), source_signal("src/retry.ts"));
+    let refresh = coordinator.next_work(seconds(6)).expect("refresh");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(seconds(6)).expect("enrich");
+    assert!(matches!(
+        coordinator.finish_error(seconds(6), enrich),
+        FinishState::Retry { .. }
+    ));
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/partial.ts".to_string(), "src/retry.ts".to_string()])
+    );
+}
+
+#[test]
+fn documentation_and_disabled_enrichment_never_grow_checker_dirty_paths() {
+    let mut enriched = Coordinator::new(seconds(2), false, true);
+    let startup = enriched.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(enriched.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = enriched.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        enriched.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+    enriched.mark_dirty(
+        seconds(1),
+        DirtySignal::documentation("documentation:README.md"),
+    );
+    assert!(enriched.checker_dirty_source_paths.is_empty());
+
+    let mut structural_only = Coordinator::new(seconds(2), false, false);
+    structural_only.mark_dirty(seconds(1), source_signal("src/main.ts"));
+    assert!(structural_only.checker_dirty_source_paths.is_empty());
 }
 
 #[test]
@@ -602,6 +703,8 @@ fn reconciliation_interval_must_exceed_debounce() {
         debug: false,
         debounce: seconds(2),
         reconcile_interval: seconds(2),
+        config_fingerprint: "config-test",
+        config_loaded: true,
     };
     let error = validate_options(&options).expect_err("invalid interval");
     assert!(error.to_string().contains("must exceed"));
@@ -625,9 +728,99 @@ fn product_embedding_requires_embedding_phase() {
         debug: false,
         debounce: seconds(2),
         reconcile_interval: seconds(600),
+        config_fingerprint: "config-test",
+        config_loaded: false,
     };
     let error = validate_options(&options).expect_err("product needs embedding");
     assert_eq!(error.to_string(), "--product requires --embed");
+}
+
+#[test]
+fn startup_log_records_runtime_identities_and_effective_watch_flags() {
+    let options = WatchOptions {
+        database: None,
+        embed_on_change: true,
+        provider: None,
+        embed_product_only: true,
+        dependencies: &[],
+        docs_include: &[],
+        docs_exclude: &[],
+        enrich_on_change: true,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "runtime-config",
+        config_loaded: true,
+    };
+    let line = watch_startup_log(
+        Path::new("/repo"),
+        Path::new("/repo/.jscout.db"),
+        &options,
+        "binary-id",
+        "checker-policy-id",
+        "watch-policy-id",
+    );
+    for expected in [
+        "jscout_version=",
+        "binary_fingerprint=binary-id",
+        "config_fingerprint=runtime-config",
+        "config_loaded=true",
+        "config_reload=restart-required",
+        "checker_policy_fingerprint=checker-policy-id",
+        "watch_policy_fingerprint=watch-policy-id",
+        "debounce_ms=2000",
+        "reconcile_seconds=600",
+        "embed=true",
+        "product=true",
+        "enrich=true",
+    ] {
+        assert!(line.contains(expected), "missing {expected:?} from {line}");
+    }
+}
+
+#[test]
+fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
+    let dependencies = Vec::<String>::new();
+    let mut options = WatchOptions {
+        database: None,
+        embed_on_change: false,
+        provider: None,
+        embed_product_only: false,
+        dependencies: &dependencies,
+        docs_include: &[],
+        docs_exclude: &[],
+        enrich_on_change: true,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "same-baseline",
+        config_loaded: true,
+    };
+    let baseline = effective_watch_policy_fingerprint(&options);
+    assert_eq!(baseline.len(), 64);
+
+    let selected_dependencies = vec!["@scope/runtime".to_string()];
+    options.dependencies = &selected_dependencies;
+    let dependencies_changed = effective_watch_policy_fingerprint(&options);
+    assert_ne!(baseline, dependencies_changed);
+
+    options.enrich_timeout = seconds(301);
+    let timeout_changed = effective_watch_policy_fingerprint(&options);
+    assert_ne!(dependencies_changed, timeout_changed);
+
+    options.checker_sidecar = Some(Path::new("checker/custom.mjs"));
+    assert_ne!(
+        timeout_changed,
+        effective_watch_policy_fingerprint(&options)
+    );
 }
 
 #[test]

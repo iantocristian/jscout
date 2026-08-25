@@ -103,13 +103,14 @@ Semantic artifacts are returned as `fresh`, `degraded`, `stale`, or
 **Amendment — disposable snapshot boundary (2026-08-13), watcher carry-forward
 (2026-08-20).** This section is authoritative over older text. Manual
 `jscout index` always clears checker facts, including on an identical rebuild.
-Only `watch --enrich` may retain the prior active batch as a hidden input while
-it constructs a newly validated batch for the current snapshot. jscout uses
+Only `watch --enrich` may retain the prior active batch plus the newest reusable
+superseded staging source as hidden inputs while it constructs a newly
+validated batch for the current snapshot. jscout uses
 one SQLite database with three logical lifecycles, not three physical databases:
 
 | Plane | Contents | Lifecycle |
 |---|---|---|
-| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Manual indexing clears checker batches. Watch may retain one old batch non-public long enough to carry unchanged projects/facts into a new current-snapshot batch. |
+| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Manual indexing clears checker batches. Watch may retain the active publication and newest reusable superseded staging source non-public long enough to carry validated completed projects/facts into a new current-snapshot batch. |
 | **Durable content cache** | Embedding profiles and content-hash-keyed embedding vectors | Preserved across snapshot rebuilds. Current chunk occurrences are rematerialized from cached vectors; only unseen content is embedded. |
 | **Durable semantic memory** | Scout runs/classifications and `semantic_*` artifacts, relations, and evidence supports | Preserved across snapshot rebuilds. Evidence hashes and current anchors determine whether a claim is fresh, degraded, stale, or superseded. |
 
@@ -1520,10 +1521,18 @@ durations.
 `jscout embed --product`; a product-only vector cache must not be silently
 widened by the watcher. Plain watch performs no model calls, does not start the
 TypeScript checker, and never serves checker facts from a different structural
-snapshot. It may retain one such batch hidden as future carry input, but only
-`watch --enrich` can publish a replacement bound to the current snapshot. An
+snapshot. It may retain the active publication and newest reusable superseded
+staging source hidden as future carry inputs, but only `watch --enrich` can
+publish a replacement bound to the current snapshot. An
 exact-snapshot batch remains a no-op reuse. Dependency selectors remain
 authoritative and must be supplied to watch exactly as they are to index.
+
+Watcher startup telemetry records the jscout version, executable-byte
+fingerprint, non-secret loaded runtime-config fingerprint, config-loaded and
+restart-required semantics, checker-policy fingerprint, effective-watch-policy
+fingerprint after CLI overrides, and effective phase flags. Repository
+snapshots and dirty paths remain per-generation state rather than part of those
+runtime identities.
 
 Code embedding remains ahead of checker enrichment because its document and
 selection inputs are chunk content plus current repository policy; checker
@@ -1694,11 +1703,22 @@ enrichment phases, while SQLite remains the arbiter when another jscout
 process writes concurrently. G12 does not introduce an application-level
 lease until a demonstrated concurrent-writer failure requires one.
 
-A watcher structural refresh removes inactive checker staging but may retain
-one prior active batch as a hidden carry source. Projection still requires an
-exact source-snapshot match:
+A watcher structural refresh bounds inactive checker staging to the newest
+reusable superseded source and may retain it beside the prior active
+publication as hidden carry sources. An empty newer destination left by a crash
+cannot displace a completed source. The successor prefers a valid fully
+completed staging project, falls back to the active project, and never carries
+incomplete project rows. Validated copying and predecessor retirement are
+atomic. Projection still requires an exact source-snapshot match:
 
 - plain `watch` starts no checker work and never projects a retained old batch;
+- checker-dirty code paths accumulate across supersession, cancellation,
+  retries, and terminal partial publication, and clear only after a
+  non-superseded successful checker publication; documentation paths never
+  enter this backlog;
+- enrichment telemetry separates exact-batch reuse, staging resume/reset,
+  unique occurrence carry, owner-occurrence carry, and active-versus-staging
+  carry sources;
 - `watch --enrich` reuses an exact-snapshot batch as a no-op, or carries only
   projects whose config-chain/membership/checker fingerprint is unchanged and
   facts whose source occurrence and target fingerprint still validate;

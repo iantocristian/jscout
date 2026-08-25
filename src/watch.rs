@@ -37,6 +37,10 @@ pub struct WatchOptions<'a> {
     pub debug: bool,
     pub debounce: Duration,
     pub reconcile_interval: Duration,
+    /// Fingerprint of the loaded non-secret runtime configuration baseline.
+    /// CLI overrides are rendered separately in the effective watch flags.
+    pub config_fingerprint: &'a str,
+    pub config_loaded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -175,6 +179,7 @@ struct Coordinator {
     retry_attempts: BTreeMap<Phase, u32>,
     dirty_reasons: BTreeSet<String>,
     dirty_source_paths: BTreeSet<String>,
+    checker_dirty_source_paths: BTreeSet<String>,
     refresh_scope: RefreshScope,
     debounce: Duration,
     retry_initial: Duration,
@@ -198,6 +203,7 @@ impl Coordinator {
             retry_attempts: BTreeMap::new(),
             dirty_reasons: BTreeSet::new(),
             dirty_source_paths: BTreeSet::new(),
+            checker_dirty_source_paths: BTreeSet::new(),
             refresh_scope: RefreshScope::Full,
             debounce,
             retry_initial: DEFAULT_RETRY_INITIAL,
@@ -213,6 +219,14 @@ impl Coordinator {
     }
 
     fn mark_dirty(&mut self, now: Duration, signal: DirtySignal) {
+        // Checker affinity spans generations. A source edit observed while an
+        // older enrichment is running must remain dirty until a non-superseded
+        // checker publication succeeds. Documentation signals intentionally
+        // carry no source paths and therefore never enter this backlog.
+        if self.enrich {
+            self.checker_dirty_source_paths
+                .extend(signal.source_paths.iter().cloned());
+        }
         // A failed structural refresh has not consumed its inventory/config
         // requirement. If a newer source event supersedes its parked retry,
         // carry the old scope and reasons into the successor generation.
@@ -365,6 +379,17 @@ impl Coordinator {
             return FinishState::Superseded;
         }
         self.retry_attempts.remove(&work.phase);
+        self.advance(work)
+    }
+
+    fn finish_enrichment_success(&mut self, work: Work) -> FinishState {
+        debug_assert_eq!(work.phase, Phase::Enrich);
+        self.clear_active(work);
+        if work.generation != self.desired_generation {
+            return FinishState::Superseded;
+        }
+        self.retry_attempts.remove(&work.phase);
+        self.checker_dirty_source_paths.clear();
         self.advance(work)
     }
 
@@ -732,6 +757,9 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     validate_options(options)?;
     let root = root.canonicalize()?;
     let database = absolute_database_path(&root, options.database);
+    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint()?;
+    let checker_policy_fingerprint = checker::watch_policy_fingerprint();
+    let watch_policy_fingerprint = effective_watch_policy_fingerprint(options);
     let provider = if options.embed_on_change {
         Some(Arc::new(
             options
@@ -783,14 +811,15 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     let mut checker_flush_pending = false;
 
     eprintln!(
-        "watch root={} database={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={}",
-        root.display(),
-        database.display(),
-        options.debounce.as_millis(),
-        options.reconcile_interval.as_secs(),
-        options.embed_on_change,
-        options.embed_product_only,
-        options.enrich_on_change
+        "{}",
+        watch_startup_log(
+            &root,
+            &database,
+            options,
+            &binary_fingerprint,
+            &checker_policy_fingerprint,
+            &watch_policy_fingerprint,
+        )
     );
     if options.reconcile_interval.is_zero() {
         eprintln!(
@@ -994,14 +1023,26 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     match result {
                         Ok(report) => {
                             eprintln!(
-                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} projects={} projects_carried={} occurrences_carried={} files_without_configured_project={} occurrences_skipped_inferred_project={} elapsed_ms={}",
+                                "watch generation={} phase=enrich status=succeeded snapshot={} facts={} occurrences={} occurrences_queried={} projects={} exact_batch_reused={} projects_resumed={} occurrences_resumed={} projects_reset={} occurrences_reset={} projects_carried={} projects_carried_from_staging={} projects_carried_from_active={} projects_partially_carried={} occurrences_carried={} project_occurrences_carried={} checker_version={} checker_source={} files_without_configured_project={} occurrences_skipped_inferred_project={} elapsed_ms={}",
                                 work.generation,
                                 report.snapshot,
                                 report.facts_published,
                                 report.occurrences_queried,
+                                report.occurrences_queried,
                                 report.projects,
+                                report.exact_batch_reused,
+                                report.projects_resumed,
+                                report.occurrences_resumed,
+                                report.projects_reset,
+                                report.occurrences_reset,
                                 report.projects_carried,
+                                report.projects_carried_from_staging,
+                                report.projects_carried_from_active,
+                                report.projects_partially_carried,
                                 report.occurrences_carried,
+                                report.project_occurrences_carried,
+                                report.checker_version,
+                                report.checker_source,
                                 report.files_without_configured_project,
                                 report.occurrences_skipped_inferred_project,
                                 phase_started.elapsed().as_millis()
@@ -1017,7 +1058,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             registry.reconcile(&mut watcher, &root, &targets);
                             report_finish(
                                 work,
-                                coordinator.finish_optional(work),
+                                coordinator.finish_enrichment_success(work),
                                 started.elapsed(),
                                 options.reconcile_interval,
                                 &mut next_reconcile,
@@ -1157,6 +1198,96 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     }
 }
 
+fn watch_startup_log(
+    root: &Path,
+    database: &Path,
+    options: &WatchOptions<'_>,
+    binary_fingerprint: &str,
+    checker_policy_fingerprint: &str,
+    watch_policy_fingerprint: &str,
+) -> String {
+    format!(
+        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=restart-required checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={}",
+        root.display(),
+        database.display(),
+        env!("CARGO_PKG_VERSION"),
+        binary_fingerprint,
+        options.config_fingerprint,
+        options.config_loaded,
+        checker_policy_fingerprint,
+        watch_policy_fingerprint,
+        options.debounce.as_millis(),
+        options.reconcile_interval.as_secs(),
+        options.embed_on_change,
+        options.embed_product_only,
+        options.enrich_on_change,
+    )
+}
+
+/// Hash the effective, non-secret watch invocation after config defaults and
+/// CLI overrides have been resolved. The baseline config fingerprint remains
+/// separately visible; this identity closes the gap where two invocations
+/// with different dependency selectors, timeout, or sidecar override would
+/// otherwise produce identical startup identities.
+fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
+    fn field(hasher: &mut blake3::Hasher, name: &str, value: &str) {
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    fn list(hasher: &mut blake3::Hasher, name: &str, values: &[String]) {
+        let mut values = values.to_vec();
+        values.sort();
+        values.dedup();
+        field(hasher, name, &values.join("\0"));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    field(&mut hasher, "domain", "jscout-watch-effective-policy-v1");
+    field(&mut hasher, "config", options.config_fingerprint);
+    field(&mut hasher, "embed", &options.embed_on_change.to_string());
+    field(
+        &mut hasher,
+        "product",
+        &options.embed_product_only.to_string(),
+    );
+    if let Some(provider) = options.provider {
+        field(&mut hasher, "embed_provider", &provider.name);
+        field(&mut hasher, "embed_model", &provider.model);
+    }
+    list(&mut hasher, "dependencies", options.dependencies);
+    list(&mut hasher, "docs_include", options.docs_include);
+    list(&mut hasher, "docs_exclude", options.docs_exclude);
+    field(&mut hasher, "enrich", &options.enrich_on_change.to_string());
+    field(
+        &mut hasher,
+        "enrich_timeout_ms",
+        &options.enrich_timeout.as_millis().to_string(),
+    );
+    field(
+        &mut hasher,
+        "checker_sidecar",
+        &options
+            .checker_sidecar
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+    );
+    field(&mut hasher, "checker_node", options.checker_node);
+    field(&mut hasher, "timing", &options.timing.to_string());
+    field(&mut hasher, "debug", &options.debug.to_string());
+    field(
+        &mut hasher,
+        "debounce_ms",
+        &options.debounce.as_millis().to_string(),
+    );
+    field(
+        &mut hasher,
+        "reconcile_ms",
+        &options.reconcile_interval.as_millis().to_string(),
+    );
+    hasher.finalize().to_hex().to_string()
+}
+
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
     if options.embed_product_only && !options.embed_on_change {
         bail!("--product requires --embed");
@@ -1261,7 +1392,7 @@ fn run_enrichment_interruptible(
     let force_full = monitor.work.force_full_enrichment;
     let dirty_files = monitor
         .coordinator
-        .dirty_source_paths
+        .checker_dirty_source_paths
         .iter()
         .cloned()
         .collect();
