@@ -347,8 +347,14 @@ during implementation):
   `doc_block_observations`): deferred with the supersession product. They
   are append-only and therefore durable-plane when they ship, owing the
   explicit cache-compatibility decision PLAN.md requires for durable
-  changes; their matching, lifecycle, and failure semantics remain as
-  specified under History and continuity. Any corpus-level failure —
+  changes. Because the main index keeps no snapshot history and the
+  disposable plane is wiped on full rebuild, the ledger mints and durably
+  stores its own observation sequence and timestamps (a clock row only when
+  a scan observes a docs change) and durably carries the last-observed
+  corpus state as its matching baseline; their matching, lifecycle, and
+  failure semantics remain as specified under History and continuity.
+  References to "snapshot sequence" in those sections mean this ledger-owned
+  observation sequence. Any corpus-level failure —
   retryable I/O, database, transaction, configuration, discovery, inventory,
   or cancellation — publishes no replacement; only a classified permanent
   subject-local open/read rejection may be recorded in a successfully

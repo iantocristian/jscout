@@ -3237,9 +3237,17 @@ The revised decisions:
    resolution under watch; it ships with the supersession product if that
    product is built. Append-only history is not rebuildable from the
    checkout, so the ledger is durable-plane and owes the explicit
-   cache-compatibility decision durable changes require; it anchors to the
-   shared snapshot sequence, and unchanged blocks add no rows, so code churn
-   advances the clock without growing it. When built, it stays separate from
+   cache-compatibility decision durable changes require. Two consequences of
+   the unified lifecycle are part of that decision: the main index keeps no
+   snapshot history — `meta.snapshot` is a replaced digest, not a timeline —
+   so the ledger must mint and durably store its own observation sequence and
+   timestamps, writing a clock row only when a scan observes a documentation
+   change; and its comparison baseline ("last successfully parsed state")
+   cannot live in the disposable plane, which full rebuild wipes by design,
+   so the ledger durably carries the last-observed corpus state itself —
+   otherwise every `jscout index` would fabricate a whole-corpus
+   removed-and-added event. Unchanged blocks add no rows, so code churn
+   advances nothing. When built, it stays separate from
    the current size-merged retrieval-chunk projection. Matching
    is conservative and one-to-one — exact content first, then uniquely
    neighbor-anchored edited blocks; ordinal position alone never establishes
