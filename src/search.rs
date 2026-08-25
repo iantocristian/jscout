@@ -595,8 +595,8 @@ fn exact_definition_chunks(
     let mut named_chunks = conn.prepare_cached(
         "SELECT chunk.id, 0 AS name_priority, 1 AS export_priority,
                 chunk.end-chunk.start AS span, file.path, chunk.start
-         FROM chunks chunk
-         JOIN files file ON file.id=chunk.file_id
+         FROM code_chunks chunk
+         JOIN code_files file ON file.id=chunk.file_id
          WHERE chunk.name=?1 COLLATE BINARY
            AND ((?2 AND file.origin='repository')
              OR (?3 AND file.origin='workspace')
@@ -637,8 +637,8 @@ fn exact_definition_chunks(
                 CASE WHEN symbol.exported=1 THEN 0 ELSE 1 END AS export_priority,
                 chunk.end-chunk.start AS span, file.path, chunk.start
          FROM symbols symbol
-         JOIN files file ON file.id=symbol.file_id
-         JOIN chunks chunk ON chunk.file_id=symbol.file_id
+         JOIN code_files file ON file.id=symbol.file_id
+         JOIN code_chunks chunk ON chunk.file_id=symbol.file_id
            AND chunk.start<=symbol.decl_start AND symbol.decl_start<chunk.end
          WHERE symbol.name=?1 COLLATE BINARY
            AND ((?2 AND file.origin='repository')
@@ -1542,7 +1542,11 @@ impl Reranker {
         })
     }
 
-    fn rerank(&self, query: &str, candidates: &[(i64, String)]) -> Result<Vec<(i64, f64)>> {
+    pub(crate) fn rerank(
+        &self,
+        query: &str,
+        candidates: &[(i64, String)],
+    ) -> Result<Vec<(i64, f64)>> {
         let body = serde_json::json!({
             "model": self.model,
             "query": query,
@@ -1576,8 +1580,24 @@ impl Reranker {
         if out.len() != candidates.len() || returned != expected {
             anyhow::bail!("reranker did not return every candidate exactly once");
         }
-        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let incoming = candidates
+            .iter()
+            .enumerate()
+            .map(|(position, (id, _))| (*id, position))
+            .collect::<HashMap<_, _>>();
+        out.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| incoming[&a.0].cmp(&incoming[&b.0]))
+        });
         Ok(out)
+    }
+
+    pub(crate) const fn candidate_limit(&self) -> usize {
+        self.pool
+    }
+
+    pub(crate) fn truncate_document(&self, document: &mut String) {
+        truncate_utf8(document, self.max_chars);
     }
 }
 
@@ -2186,7 +2206,10 @@ fn candidate_pool_limits(limit: usize, role_filtered: bool) -> (usize, usize) {
     (pool, vector_pool)
 }
 
-fn merge_reranked_prefix(fused: &[(i64, f64)], mut reranked: Vec<(i64, f64)>) -> Vec<(i64, f64)> {
+pub(crate) fn merge_reranked_prefix(
+    fused: &[(i64, f64)],
+    mut reranked: Vec<(i64, f64)>,
+) -> Vec<(i64, f64)> {
     let reranked_ids = reranked
         .iter()
         .map(|(chunk_id, _)| *chunk_id)

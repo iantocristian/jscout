@@ -27,6 +27,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveConfig {
     pub database: DatabaseSettings,
+    pub docs: DocsSettings,
     pub search: SearchSettings,
     pub embedding: EmbeddingSettings,
     pub inference: InferenceSettings,
@@ -43,6 +44,32 @@ pub struct EffectiveConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct DatabaseSettings {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocsSettings {
+    pub enabled: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub search: DocsSearchSettings,
+}
+
+impl DocsSettings {
+    pub fn indexing_include(&self) -> &[String] {
+        if self.enabled { &self.include } else { &[] }
+    }
+
+    pub fn indexing_exclude(&self) -> &[String] {
+        if self.enabled { &self.exclude } else { &[] }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocsSearchSettings {
+    pub vector: bool,
+    pub rerank: bool,
+    pub limit: usize,
+    pub response_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

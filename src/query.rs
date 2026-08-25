@@ -95,7 +95,7 @@ impl ModuleGraph {
         }
 
         let mut paths = HashMap::new();
-        let mut stmt = conn.prepare("SELECT id, path FROM files")?;
+        let mut stmt = conn.prepare("SELECT id, path FROM code_files")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, path) = row?;
@@ -560,7 +560,7 @@ pub fn find_symbols_in_origins(
     let mut out = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT f.path, f.origin, f.id, s.name, s.kind, s.line, s.exported
-         FROM symbols s JOIN files f ON s.file_id = f.id
+         FROM symbols s JOIN code_files f ON s.file_id = f.id
          WHERE s.name = ?1
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
@@ -591,7 +591,7 @@ pub fn find_symbols_in_origins(
     if out.is_empty() {
         let mut stmt = conn.prepare(
             "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain
-             FROM chunks c JOIN files f ON c.file_id = f.id
+             FROM code_chunks c JOIN code_files f ON c.file_id = f.id
              WHERE c.name = ?1 AND c.kind = 'method'
                AND ((?2 AND f.origin='repository')
                  OR (?3 AND f.origin='workspace')

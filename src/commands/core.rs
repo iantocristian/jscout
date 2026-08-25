@@ -272,6 +272,7 @@ pub(super) fn cmd_index(
     root: &Path,
     database: Option<&Path>,
     dependencies: &[String],
+    docs: &config::DocsSettings,
     diagnostics: &config::DiagnosticsSettings,
 ) -> Result<()> {
     let started = std::time::Instant::now();
@@ -281,6 +282,8 @@ pub(super) fn cmd_index(
         &conn,
         &indexer::IndexOptions {
             dependencies: dependencies.to_vec(),
+            docs_include: docs.indexing_include().to_vec(),
+            docs_exclude: docs.indexing_exclude().to_vec(),
             timing: diagnostics.timing,
             debug: diagnostics.debug,
             ..Default::default()

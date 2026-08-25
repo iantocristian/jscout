@@ -28,6 +28,85 @@ use crate::{
 };
 
 #[test]
+fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const note = 'shared ranking calibration';\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let options = SearchOptions {
+        rerank: false,
+        include_memory: false,
+        expand: false,
+        compact: true,
+        ..SearchOptions::default()
+    };
+    let before = search(&conn, None, "shared ranking calibration", &options)?;
+    assert!(!before.hits.is_empty());
+    let before_json = serde_json::to_string(&before)?.replace(&before.snapshot, "<snapshot>");
+
+    fs::write(
+        repo.path().join("README.md"),
+        format!(
+            "# Ranking noise\n\n{}\n",
+            "shared ranking calibration ".repeat(200)
+        ),
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let after = search(&conn, None, "shared ranking calibration", &options)?;
+    let after_json = serde_json::to_string(&after)?.replace(&after.snapshot, "<snapshot>");
+
+    assert_ne!(before.snapshot, after.snapshot);
+    assert_eq!(before_json, after_json);
+    Ok(())
+}
+
+#[test]
+fn docs_corpus_named_chunks_cannot_enter_code_exact_lookup() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const codeOnly = 1;\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    conn.execute(
+        "INSERT INTO files(path,hash,corpus,format,role)
+         VALUES('reference.md','docs-file','docs','markdown','documentation')",
+        [],
+    )?;
+    let file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks(
+           file_id,kind,name,start,end,start_line,end_line,hash,content
+         ) VALUES(?1,'method','docsOnlyNamedChunk',0,18,1,1,
+                  'docs-chunk','docsOnlyNamedChunk')",
+        [file_id],
+    )?;
+
+    let result = search(
+        &conn,
+        None,
+        "docsOnlyNamedChunk",
+        &SearchOptions {
+            rerank: false,
+            include_memory: false,
+            expand: false,
+            ..SearchOptions::default()
+        },
+    )?;
+    assert!(result.hits.is_empty());
+    assert!(
+        crate::query::find_symbols_in_origins(
+            &conn,
+            "docsOnlyNamedChunk",
+            &crate::origin::defaults(),
+        )?
+        .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn local_reranker_uses_resolved_inference_endpoint_and_pool_policy() {
     let reranker = Reranker::from_settings(
         &RerankerSettings {

@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::indexer;
+
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
     RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
@@ -531,6 +533,8 @@ fn reconciliation_interval_must_exceed_debounce() {
         provider: None,
         embed_product_only: false,
         dependencies: &[],
+        docs_include: &[],
+        docs_exclude: &[],
         enrich_on_change: false,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -552,6 +556,8 @@ fn product_embedding_requires_embedding_phase() {
         provider: None,
         embed_product_only: true,
         dependencies: &[],
+        docs_include: &[],
+        docs_exclude: &[],
         enrich_on_change: false,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -573,10 +579,8 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
     let first = run_refresh(
         directory.path(),
         &database,
-        &[],
+        &indexer::IndexOptions::default(),
         RefreshScope::Full,
-        false,
-        false,
     )?;
     assert_eq!(first.outcome.indexed, 1);
     fs::remove_file(directory.path().join("a.ts"))?;
@@ -584,10 +588,8 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
     let second = run_refresh(
         directory.path(),
         &database,
-        &[],
+        &indexer::IndexOptions::default(),
         RefreshScope::Incremental,
-        false,
-        false,
     )?;
     assert_eq!(second.outcome.indexed, 1);
     assert_eq!(second.outcome.removed, 1);
@@ -609,10 +611,8 @@ fn refresh_with_an_unreadable_source_succeeds_with_a_rejection() -> Result<()> {
     let result = run_refresh(
         directory.path(),
         &database,
-        &[],
+        &indexer::IndexOptions::default(),
         RefreshScope::Full,
-        false,
-        false,
     )?;
 
     assert_eq!(result.outcome.rejected, 1);
@@ -630,20 +630,16 @@ fn incremental_refresh_reuses_unchanged_source_rows() -> Result<()> {
     run_refresh(
         directory.path(),
         &database,
-        &[],
+        &indexer::IndexOptions::default(),
         RefreshScope::Full,
-        false,
-        false,
     )?;
 
     fs::write(directory.path().join("a.ts"), "export const a = 3;\n")?;
     let refreshed = run_refresh(
         directory.path(),
         &database,
-        &[],
+        &indexer::IndexOptions::default(),
         RefreshScope::Incremental,
-        false,
-        false,
     )?;
 
     assert_eq!(

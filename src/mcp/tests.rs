@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
@@ -6,12 +7,368 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile, call_tool,
-    definition_source_metrics, duration_ms, expansion_role_metrics, log_request,
-    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, tool_defs,
+    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
+    call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
+    expansion_role_metrics, log_request, render_bounded_items, render_tool_result,
+    search_options_from_args, semantic_artifact_metrics, server_instructions, sum_durations,
+    tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
+
+fn capture_code_read_surfaces(
+    root: &Path,
+    conn: &Connection,
+) -> Result<(
+    String,
+    BTreeMap<&'static str, String>,
+    BTreeSet<&'static str>,
+)> {
+    let snapshot = structural::current_snapshot(conn)?;
+    let finish_anchor: String = conn.query_row(
+        "SELECT node_key FROM graph_nodes
+         WHERE node_kind='symbol' AND display_name='finish'
+         ORDER BY node_key LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let start_anchor: String = conn.query_row(
+        "SELECT node_key FROM graph_nodes
+         WHERE node_kind='symbol' AND display_name='start'
+         ORDER BY node_key LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let sentinel = "s".repeat(snapshot.len());
+    let mut surfaces = BTreeMap::new();
+    let mut covered_tools = BTreeSet::new();
+    let mut capture = |label: &'static str,
+                       tool: &'static str,
+                       arguments: serde_json::Value,
+                       expected_fragment: &str|
+     -> Result<()> {
+        let rendered = call_tool(
+            root,
+            conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            tool,
+            &arguments,
+        )?;
+        assert!(
+            rendered.contains(expected_fragment),
+            "MCP differential probe `{label}` did not exercise `{expected_fragment}`: {rendered}"
+        );
+        covered_tools.insert(tool);
+        surfaces.insert(label, rendered.replace(&snapshot, &sentinel));
+        Ok(())
+    };
+
+    capture(
+        "search/ranked",
+        "semantic_search",
+        json!({
+            "query": "finish API_KEY",
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "expand": false,
+            "limit": 20,
+            "response_bytes": 100_000
+        }),
+        "finish",
+    )?;
+    capture(
+        "search/exhaustive",
+        "semantic_search",
+        json!({
+            "query": "finish API_KEY",
+            "exhaustive": true,
+            "limit": 200,
+            "response_bytes": 100_000
+        }),
+        "finish",
+    )?;
+    capture(
+        "search/expanded",
+        "semantic_search",
+        json!({
+            "query": "finish",
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "expand": true,
+            "expand_mode": "paths",
+            "limit": 20,
+            "response_bytes": 100_000
+        }),
+        "finish",
+    )?;
+    let exact = json!({
+        "anchor": finish_anchor,
+        "snapshot": snapshot,
+        "origins": ["repository"],
+        "response_bytes": 100_000
+    });
+    capture("definition", "definition", exact.clone(), "finish")?;
+    capture("who_uses", "who_uses", exact.clone(), "start")?;
+    capture("neighborhood", "neighborhood", exact, "finish")?;
+    capture(
+        "file_outline",
+        "file_outline",
+        json!({ "path": "src/service.ts", "response_bytes": 100_000 }),
+        "finish",
+    )?;
+    capture(
+        "events",
+        "events",
+        json!({ "name": "ready", "response_bytes": 100_000 }),
+        "ready",
+    )?;
+    capture(
+        "calls",
+        "calls",
+        json!({
+            "method": "insert",
+            "args": ["merge=replace"],
+            "response_bytes": 100_000
+        }),
+        "insert",
+    )?;
+    capture(
+        "entities",
+        "entities",
+        json!({ "query": "API_KEY", "response_bytes": 100_000 }),
+        "API_KEY",
+    )?;
+    capture(
+        "paths",
+        "paths",
+        json!({
+            "from": start_anchor,
+            "to": finish_anchor,
+            "snapshot": snapshot,
+            "direction": "out",
+            "response_bytes": 100_000
+        }),
+        "finish",
+    )?;
+    capture(
+        "repository_overview",
+        "repository_overview",
+        json!({
+            "include_semantic": false,
+            "reconnaissance_limit": 0,
+            "response_bytes": 100_000
+        }),
+        "\"files\": 2",
+    )?;
+
+    Ok((snapshot, surfaces, covered_tools))
+}
+
+fn assert_code_read_surfaces_equal(
+    expected: &BTreeMap<&'static str, String>,
+    actual: &BTreeMap<&'static str, String>,
+    arm: &str,
+) {
+    assert_eq!(
+        expected.keys().collect::<Vec<_>>(),
+        actual.keys().collect::<Vec<_>>()
+    );
+    for (surface, expected) in expected {
+        assert_eq!(
+            actual.get(surface),
+            Some(expected),
+            "Markdown changed normalized MCP code surface `{surface}` in {arm}"
+        );
+    }
+}
+
+#[test]
+fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the blue release channel.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::refresh_repo_with_options(repo.path(), &conn, &indexer::IndexOptions::default())?;
+
+    let defaults = config::DocsSettings {
+        enabled: true,
+        include: vec!["**/*.md".into()],
+        exclude: Vec::new(),
+        search: config::DocsSearchSettings {
+            vector: false,
+            rerank: false,
+            limit: 10,
+            response_bytes: 24_000,
+        },
+    };
+    let rendered = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &json!({ "query": "blue release" }),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["hits"][0]["path"], "README.md");
+    assert_eq!(value["hits"][0]["heading"], "Deployment");
+    assert_eq!(value["hits"][0]["source_state"], "current");
+    assert_eq!(value["retrieval"]["vector"], "disabled");
+    assert!(
+        tool_defs(ToolProfile::Baseline, true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "documentation_search")
+    );
+    assert!(
+        server_instructions(ToolProfile::Structural, true)
+            .contains("shares the repository snapshot")
+    );
+    let outline = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "file_outline",
+        &json!({ "path": "README.md" }),
+    )?;
+    assert!(!outline.contains("README.md"));
+    assert!(!outline.contains("markdown_section"));
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Deployment\n\nUse the red release channel.\n",
+    )?;
+    let stale = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &json!({ "query": "blue release" }),
+    )?;
+    let stale: serde_json::Value = serde_json::from_str(&stale)?;
+    assert_eq!(stale["hits"][0]["source_state"], "source_mismatch");
+    assert_eq!(stale["hits"][0]["source_detail"], "hash_mismatch");
+    assert_eq!(stale["hits"][0]["content"], "Use the blue release channel.");
+    Ok(())
+}
+
+#[test]
+fn disabled_documentation_is_absent_and_rejected_at_the_mcp_boundary() -> Result<()> {
+    for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
+        let tools = tool_defs(profile, false);
+        assert!(
+            tools
+                .as_array()
+                .expect("tool definitions")
+                .iter()
+                .all(|tool| tool["name"] != "documentation_search")
+        );
+        assert!(!server_instructions(profile, false).contains("documentation_search"));
+    }
+
+    let repo = tempfile::tempdir()?;
+    let conn = Connection::open_in_memory()?;
+    let error = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "documentation_search",
+        &json!({ "query": "stale guidance" }),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unavailable without documentation retrieval configuration")
+    );
+    Ok(())
+}
+
+#[test]
+fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let state = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("src/service.ts"),
+        "export function finish() { return process.env.API_KEY; }\n\
+         export function start(db: any, bus: any) {\n\
+           bus.emit('ready');\n\
+           bus.on('ready', finish);\n\
+           db.items.insert({ merge: 'replace' });\n\
+           return finish();\n\
+         }\n",
+    )?;
+    fs::write(
+        repo.path().join("src/main.ts"),
+        "import { start } from './service';\n\
+         export function boot(db: any, bus: any) { return start(db, bus); }\n",
+    )?;
+
+    let incremental = store::open_path(&state.path().join("incremental.db"))?;
+    indexer::index_repo(repo.path(), &incremental)?;
+    let (code_snapshot, code_surfaces, covered_tools) =
+        capture_code_read_surfaces(repo.path(), &incremental)?;
+
+    fs::write(
+        repo.path().join("README.md"),
+        format!(
+            "# finish API_KEY ready insert\n\n{}\n",
+            "`finish` calls `start`; `process.env.API_KEY`; \
+             `bus.emit('ready')`; `db.items.insert({ merge: 'replace' })`.\n\n"
+                .repeat(100)
+        ),
+    )?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        "# start finish API_KEY ready insert\n\n\
+         import { start } from './src/service';\n\n\
+         export const Guidance = () => <code>finish API_KEY ready insert</code>;\n",
+    )?;
+    indexer::index_repo(repo.path(), &incremental)?;
+    let (incremental_snapshot, incremental_surfaces, _) =
+        capture_code_read_surfaces(repo.path(), &incremental)?;
+    assert_ne!(code_snapshot, incremental_snapshot);
+    assert_code_read_surfaces_equal(
+        &code_surfaces,
+        &incremental_surfaces,
+        "incremental docs admission",
+    );
+
+    let fresh = store::open_path(&state.path().join("fresh.db"))?;
+    indexer::index_repo(repo.path(), &fresh)?;
+    let (fresh_snapshot, fresh_surfaces, _) = capture_code_read_surfaces(repo.path(), &fresh)?;
+    assert_eq!(incremental_snapshot, fresh_snapshot);
+    assert_code_read_surfaces_equal(&code_surfaces, &fresh_surfaces, "fresh docs index");
+
+    let structural_tools = tool_defs(ToolProfile::Structural, true);
+    let defined_tools = structural_tools
+        .as_array()
+        .expect("structural tool definitions")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    let deliberately_excluded =
+        BTreeSet::from(["annotate", "documentation_search", "semantic_memory"]);
+    let accounted_tools = covered_tools
+        .union(&deliberately_excluded)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        accounted_tools, defined_tools,
+        "every structural MCP tool must be probed or deliberately excluded"
+    );
+    Ok(())
+}
 
 #[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
@@ -208,10 +565,10 @@ fn baseline_ranked_search_forces_unavailable_configured_stages_off() -> Result<(
 
 #[test]
 fn profile_instructions_encode_g23_workflows_and_capabilities() {
-    let baseline = server_instructions(ToolProfile::Baseline);
-    let structural = server_instructions(ToolProfile::Structural);
+    let baseline = server_instructions(ToolProfile::Baseline, true);
+    let structural = server_instructions(ToolProfile::Structural, true);
 
-    for instructions in [baseline, structural] {
+    for instructions in [&baseline, &structural] {
         for marker in [
             "Investigation loop",
             "exhaustive=true",
@@ -280,7 +637,7 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
     assert!(structural.contains("expand=false and include_memory=false"));
 
     for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
-        let tools = tool_defs(profile);
+        let tools = tool_defs(profile, true);
         let search = tools
             .as_array()
             .expect("tool definitions")
@@ -421,7 +778,7 @@ fn request_log_records_order_and_exact_tool_arguments() -> Result<()> {
 
 #[test]
 fn paths_schema_caps_graph_scope() {
-    let structural = tool_defs(ToolProfile::Structural);
+    let structural = tool_defs(ToolProfile::Structural, true);
     let paths = structural
         .as_array()
         .expect("tool definitions")
@@ -435,7 +792,7 @@ fn paths_schema_caps_graph_scope() {
 
 #[test]
 fn neighborhood_schema_has_a_whole_response_budget() {
-    let structural = tool_defs(ToolProfile::Structural);
+    let structural = tool_defs(ToolProfile::Structural, true);
     let neighborhood = structural
         .as_array()
         .expect("tool definitions")
@@ -519,7 +876,7 @@ fn neighborhood_schema_has_a_whole_response_budget() {
 
 #[test]
 fn annotate_schema_exposes_workflow_participant_scope() {
-    let structural = tool_defs(ToolProfile::Structural);
+    let structural = tool_defs(ToolProfile::Structural, true);
     let annotate = structural
         .as_array()
         .expect("tool definitions")
@@ -561,7 +918,7 @@ fn annotate_parse_error_returns_the_complete_workflow_shape() {
 
 #[test]
 fn baseline_profile_removes_structural_tools_and_expansion_controls() {
-    let baseline = tool_defs(ToolProfile::Baseline);
+    let baseline = tool_defs(ToolProfile::Baseline, true);
     let tools = baseline.as_array().expect("tool definitions");
     assert!(!tools.iter().any(|tool| tool["name"] == "neighborhood"));
     assert!(!tools.iter().any(|tool| tool["name"] == "annotate"));
@@ -637,7 +994,7 @@ fn baseline_profile_removes_structural_tools_and_expansion_controls() {
             .is_some()
     );
 
-    let structural = tool_defs(ToolProfile::Structural);
+    let structural = tool_defs(ToolProfile::Structural, true);
     let tools = structural.as_array().expect("tool definitions");
     assert!(tools.iter().any(|tool| tool["name"] == "neighborhood"));
     assert!(tools.iter().any(|tool| tool["name"] == "annotate"));

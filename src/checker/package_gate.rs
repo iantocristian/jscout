@@ -9,9 +9,9 @@ use serde_json::Value;
 use super::protocol::FileOwnership;
 
 const ABSENT_INPUT_HASH: &str = "absent:v1";
-const INVENTORY_SQL: &str = "SELECT id, path, role FROM files
-     WHERE origin IN ('repository', 'workspace')
-     ORDER BY path";
+const INVENTORY_SQL: &str = "SELECT file.id, file.path, file.role FROM code_files file
+     WHERE file.origin IN ('repository', 'workspace')
+     ORDER BY file.path";
 const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const OUTPUT_DIRECTORIES: &[&str] = &["dist", "out", "build", "lib"];
 const OUTPUT_FLAVORS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "lib", "types"];
@@ -873,20 +873,7 @@ mod tests {
         fn new(manifest: &str) -> Result<Self> {
             let root = tempfile::tempdir()?;
             fs::write(root.path().join("package.json"), manifest)?;
-            let conn = Connection::open_in_memory()?;
-            conn.execute_batch(
-                "CREATE TABLE files(
-                   id INTEGER PRIMARY KEY,
-                   path TEXT UNIQUE NOT NULL,
-                   role TEXT NOT NULL,
-                   origin TEXT NOT NULL
-                 );
-                 CREATE TABLE module_edges(
-                   from_file INTEGER NOT NULL,
-                   to_file INTEGER,
-                   type_only INTEGER NOT NULL
-                 );",
-            )?;
+            let conn = crate::store::open(root.path())?;
             Ok(Self {
                 root,
                 conn,
@@ -902,17 +889,47 @@ mod tests {
             fs::write(&absolute, "export const value = 1;\n")?;
             let id = self.next_id;
             self.next_id += 1;
+            let (corpus, format) = if path.ends_with(".md") {
+                ("docs", "markdown")
+            } else if [".ts", ".tsx", ".mts", ".cts"]
+                .iter()
+                .any(|suffix| path.ends_with(suffix))
+            {
+                ("code", "typescript")
+            } else {
+                ("code", "javascript")
+            };
             self.conn.execute(
-                "INSERT INTO files(id,path,role,origin) VALUES(?1,?2,?3,'repository')",
-                params![id, path, role],
+                "INSERT INTO files(id,path,hash,role,origin,corpus,format)
+                 VALUES(?1,?2,'fixture',?3,'repository',?4,?5)",
+                params![id, path, role, corpus, format],
             )?;
             Ok(id)
         }
 
         fn edge(&self, from: i64, to: i64, type_only: bool) -> Result<()> {
             self.conn.execute(
-                "INSERT INTO module_edges(from_file,to_file,type_only) VALUES(?1,?2,?3)",
+                "INSERT INTO module_edges(from_file,request,to_file,type_only)
+                 VALUES(?1,'fixture',?2,?3)",
                 params![from, to, i64::from(type_only)],
+            )?;
+            Ok(())
+        }
+
+        fn mark_documentation(&self, file_id: i64) -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO chunks(
+                   id,file_id,kind,name,scope_chain,symbols,start,end,
+                   start_line,end_line,hash,content
+                 ) VALUES(?1,?2,'markdown_document',NULL,'','',0,0,1,1,'fixture','')",
+                params![file_id, file_id],
+            )?;
+            self.conn.execute(
+                "INSERT INTO doc_chunk_meta(
+                   chunk_id,title,breadcrumb,nearest_heading,ordinal,
+                   embedding_identity,front_matter_state
+                 ) VALUES(?1,'fixture','',NULL,0,NULL,'absent')",
+                [file_id],
             )?;
             Ok(())
         }
@@ -933,6 +950,21 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    #[test]
+    fn checker_inventory_excludes_documentation_corpus_files() -> Result<()> {
+        let mut fixture = Fixture::new("{}")?;
+        let code = fixture.file("src/main.ts", "production")?;
+        let docs = fixture.file("README.md", "documentation")?;
+        fixture.mark_documentation(docs)?;
+
+        assert_eq!(inventory_paths(&fixture.conn)?, vec!["src/main.ts"]);
+        let ownership = fixture.ownership(&["src/main.ts"])?;
+        assert_eq!(ownership.len(), 1);
+        assert_eq!(ownership[0].file, "src/main.ts");
+        assert_ne!(code, docs);
+        Ok(())
     }
 
     #[test]

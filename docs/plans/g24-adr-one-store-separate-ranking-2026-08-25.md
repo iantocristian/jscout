@@ -6,7 +6,7 @@
 
 ## The question
 
-Should Markdown (and later YAML, TOML, Groovy) go through the main index pass, or stay a separate product with a separate database?
+Should Markdown and MDX (and later YAML, TOML, Groovy) go through the main index pass, or stay a separate product with a separate database?
 
 ## Why this shape
 
@@ -16,24 +16,25 @@ Code and docs also have different truth models. Code's temporal model is already
 
 ## Decision
 
-1. **One database, one lifecycle.** One snapshot, one walker, one watcher, one entity plane. Docs are ordinary rows in `files`/`chunks`, produced by the same index pass through the existing extraction funnel (a file-kind dispatch in one function; non-code kinds return chunks with an empty graph).
+1. **One database, one lifecycle.** One snapshot, one walker, one watcher, one entity plane. Docs are ordinary rows in `files`/`chunks`, captured by the shared repository inventory and published by the same index pass; Markdown and MDX extraction emit no code graph rows, including no `file:` graph node. Every admitted `files` row records `corpus` (`code` or `docs`) independently from `format` (the parser/format identity). `[docs].enabled` independently disables docs admission without disabling code indexing.
 
-2. **Ranking corpora are per file kind.** Code keeps `chunks_fts` exactly as it is — same table, same term statistics, same pipeline; results stay byte-identical to today. Docs get their own FTS table and their own candidate pipeline. Vector candidates are materialized per corpus over the shared content-addressed embedding cache.
+2. **Ranking corpus is explicit file identity, not inferred metadata.** `files.corpus` determines ranking-corpus membership. Code keeps `chunks_fts` exactly as it is — same table, same term statistics, same pipeline; ranked content and statistics stay byte-identical modulo the shared snapshot identifier. Docs get their own FTS table and their own candidate pipeline. Vector candidates are materialized per corpus over the shared content-addressed embedding cache. `files.format` selects parser/format behavior, while `chunks.kind` describes structure within a parsed file; neither substitutes for `files.corpus`.
 
-3. **Docs are their own surface.** The `documentation_search` tool and CLI from G24, with its hit shape and ranking. If a combined view is ever wanted, it is an explicit interleave of two ranked lists — never statistical fusion.
+3. **Docs are their own surface.** The `documentation_search` tool and CLI from G24, with its hit shape and ranking. Disabled docs expose neither retrieval surface. If a combined view is ever wanted, it is an explicit interleave of two ranked lists — never statistical fusion. Documentation vector generation is also separate: only `jscout docs embed` creates missing docs vectors; indexing and the code embedding path do not.
 
-4. **Temporal ranking belongs to the docs corpus only, and it splits into three pieces with different homes.** (a) Git author time and working-tree state — the primary basis — are recomputed from the checkout by blame at index time: disposable columns on `doc_chunk_meta`, shipped in the freshness phase. (b) The bounded reorder is a query-time stage that only `documentation_search` runs; it cannot affect code search. (c) The block observation ledger is not a freshness feature: its reasons are supersession lineage ("this passage replaced that one" — the backbone of the contradiction story), an ordering clock that survives git history rewriting, and finer-than-commit resolution under watch. It is append-only and therefore durable-plane, not disposable; it ships with the supersession/contradiction product if that product is built and owes the explicit cache-compatibility decision PLAN.md requires for durable changes. Two consequences of the unified lifecycle belong to that decision — this is the one genuine conflict between temporal history and one-database-one-snapshot: the main index keeps no snapshot history (`meta.snapshot` is a replaced digest, not a timeline), so the ledger must mint and durably store its own observation sequence and timestamps, writing a clock row only when a scan observes a docs change; and its comparison baseline cannot live in the disposable plane, which full rebuild wipes by design, so the ledger durably carries the last-observed corpus state itself — otherwise every full rebuild would fabricate a whole-corpus removed-and-added event. Unchanged blocks add no rows, so code churn advances nothing.
+4. **Temporal ranking belongs to the docs corpus only, and it splits into three pieces with different homes.** (a) Git author time and working-tree state — the primary basis — are recomputed from the checkout by blame at index time: disposable columns on `doc_chunk_meta`, shipped in the freshness phase. (b) The bounded reorder is a query-time stage that only `documentation_search` runs; it cannot affect code search. (c) The block observation ledger is not a freshness feature: its reasons are supersession lineage ("this passage replaced that one" — the backbone of the contradiction story), an ordering clock that survives git history rewriting, and finer-than-commit resolution under watch. It is append-only and therefore durable-plane, not disposable; it ships with the supersession/contradiction product if that product is built and owes the explicit cache-compatibility decision PLAN.md requires for durable changes. The one genuine conflict between temporal history and one-database-one-snapshot — the main index keeps no snapshot history, and full rebuild wipes the disposable plane — is resolved by gluing two durable pieces onto the existing mechanism rather than changing it: a whole-codebase `snapshot_log` (sequence, digest, published-at; appended in the publication transaction when the digest changed) gives the index an ordered snapshot timeline that observations reference, and a rolling `doc_block_state` baseline (per block: content hash, position, heading context, occurrence ID — no bodies) is replaced at each observing scan so matching always compares last-observed against current, even across a full rebuild. Matching needs only the previous state — accumulated history is its output, never its input. History recording is a per-format registry property, on for Markdown and MDX only. Unchanged blocks add no rows; whole-codebase snapshots tighten observation intervals for free.
 
-5. **One list decides, per file type: how much we understand it (plain text → named sections → full AST) and which search it appears in (code or docs).** The list gives a new file type a defined place to plug in, so adding one never reopens the storage or ranking architecture — and that is all it buys. Each format still needs its own parser or scanner and its own chunking rules (Markdown's alone took a full design cycle), and anything joining code search additionally pays the ranking and exact-tier integration that docs deliberately avoid. Text-only kinds are cheap; languages are real work. Groovy would join code search; YAML/TOML stay out until Markdown has shipped and been measured.
+5. **One list decides, per format: how much we understand it (plain text → named sections → full AST) and which `files.corpus` value it receives.** The list gives a new format a defined place to plug in, so adding one never reopens the storage or ranking architecture — and that is all it buys. Each format still needs its own parser or scanner and its own chunking rules (Markdown's alone took a full design cycle), and anything joining code search additionally pays the ranking and exact-tier integration that docs deliberately avoid. Text-only formats are cheap; languages are real work. Groovy would be a distinct `files.format` in the `code` corpus; Markdown is the `markdown` format and MDX is the `mdx` format in the `docs` corpus; YAML/TOML stay out until the initial documentation corpus has shipped and been measured.
 
 ## Terminology
 
 In PLAN.md's storage-plane table, docs content joins the existing *disposable
 structural snapshot* row; `docs_fts` is one more disposable projection inside
-it. "Corpus" is the one new term this proposal introduces: the set of chunks
-that share ranking statistics and a retrieval pipeline. Code and docs are two
-corpora in one plane. No new plane is created; if the observation ledger ever
-ships, it is a durable-plane addition and owes the explicit
+it. `files.corpus` is the ranking membership (`code` or `docs`),
+`files.format` is parser/format identity, and `chunks.kind` is the structural
+role of one chunk within its file. These are independent dimensions. Code and
+docs are two corpora in one plane. No new plane is created; if the observation
+ledger ever ships, it is a durable-plane addition and owes the explicit
 cache-compatibility decision PLAN.md already requires for those.
 
 ## Why one store
@@ -49,14 +50,15 @@ The monorepo questions worth having — an env var read in code but declared now
 
 | table | status | holds |
 |---|---|---|
-| `files` | shared, unchanged | the docs file row — snapshot membership, walker, entity plane |
-| `chunks` | shared, unchanged schema | one row per docs section: `kind='markdown_section'` (free text, no CHECK), `name=NULL`, `symbols=''`, exact source slice, spans/hash |
+| `files` | shared, disposable | every admitted file; `corpus` is `code` or `docs`, and `format` records parser/format identity; a G24 docs row has `corpus='docs'` and `format='markdown'` or `format='mdx'` according to its extension |
+| `chunks` | shared, disposable | one row per parsed structural unit: `kind` is its intra-file structural role; a docs section uses `kind='markdown_section'`, `name=NULL`, `symbols=''`, exact source slice, spans/hash |
+| `code_files`, `code_chunks` | new disposable views | `code_files` is `files WHERE corpus='code'`; `code_chunks` joins through `code_files`, providing the explicit code-corpus boundary for canonical-row consumers |
 | `docs_fts` | new FTS5 | the docs ranking corpus — G24's field table as columns: title, meta, breadcrumb, body (rendered), path; rowid = chunk id |
-| `doc_chunk_meta` | new, chunk-id keyed | breadcrumb, nearest heading, ordinal, embedding identity; later the freshness columns |
+| `doc_chunk_meta` | new, chunk-id keyed | documentation retrieval metadata: title, description, lossless tags, breadcrumb, nearest heading, same-heading ordinal, embedding identity; later the freshness columns. It does not define corpus membership. |
 | `vec_doc_embeddings_{dimensions}` | new | docs vector candidates — separate because sqlite-vec applies KNN's k before any join filter can run, so vector corpus isolation cannot be done with a predicate |
 | `embeddings` | shared, durable | content-addressed cache; a docs embedding identity is just another hash in it |
 
-`chunks.content` stays the exact source slice (spans always slice back to the file); `docs_fts.body` holds the rendered text that is actually searched. `name=NULL` is what makes docs invisible to the exact-definition tier with no predicate. Two write-point routings are the only places that know docs exist: the FTS mirror (docs rows skip `chunks_fts`) and vector materialization. Everything above the cache line is disposable — dropped and recreated on rebuild like `chunks_fts` already is.
+`chunks.content` stays the exact source slice (spans always slice back to the file); `docs_fts.body` holds the rendered text that is actually searched. `name=NULL` makes docs invisible to the exact-definition tier. Broad `files`/`chunks` consumers are made corpus-safe by the explicit `files.corpus` classification and the central `code_files`/`code_chunks` views; they never infer membership from `chunks.kind` or the presence of `doc_chunk_meta`. FTS and vector materialization remain explicit write-point routings. Everything above the cache line is disposable — dropped and recreated on rebuild like `chunks_fts` already is. Deferred with the ledger, all durable: `snapshot_log`, `doc_block_state`, and `doc_block_observations` — the trio described in decision 4.
 
 ## What this does to G24
 
@@ -67,14 +69,14 @@ The monorepo questions worth having — an env var read in code but declared now
 
 ## Accepted costs
 
-- Docs rows are shaped to be inert to the code plane, not guarded by predicates: they mirror into the docs FTS table (never `chunks_fts`), carry no `name`/`symbols` in shared rows (headings live in the docs corpus tables), and materialize their own vector candidates. Existing consumers stay ignorant; `documentation_search` is the only reader that knows docs exist. What remains: one real filter (the checker file inventory reads `files` unfiltered and feeds tsserver), routing at the write points, and a one-time audit confirming nothing else keys off `files` rows in a breaking way. Consumers become kind-aware only if a kind later joins the code corpus (Groovy).
+- Docs rows mirror into the docs FTS table (never `chunks_fts`), carry no `name`/`symbols` in shared rows (headings live in the docs corpus tables), and materialize their own vector candidates. Empty structural fields protect exact tiers but do not protect broad canonical-table consumers. The disposable code-corpus views therefore filter explicit `files.corpus` membership for checker inventory, code embeddings, structural support, reconnaissance, and scouting; they replace scattered negative documentation predicates. A future parser such as Groovy adds a `files.format` value and chooses a corpus without adding another membership sidecar.
 - Docs edits rotate the shared snapshot: full projection rebuild, checker batch invalidation, held anchors re-resolve. Accepted for v1 and instrumented; if measurement says it hurts, the fix is digest-splitting inside the one index — not a second database.
 - One embedding model for both corpora, for now.
 
 ## First pass
 
-Markdown only, at the named-sections tier, no schema change. The checker inventory filter and the write-point routing land in the same PR. Nothing temporal ships in the first pass — docs search launches as pure relevance, and hits may display the git timestamp as inert metadata so decay can be judged before it is built. Measure rebuild time and docs-corpus retrieval quality before any YAML decision. Reversal is cheap by design: the snapshot is disposable — drop the extension and reindex.
+Markdown and MDX, at the named-sections tier. Both use the same inert pinned CommonMark/GFM-table scanner. Raw MDX JSX, props, expressions, inner text, and non-leading ESM remain authored text, never evaluated or projected into the code corpus or graph. A narrow leading-block classifier suppresses only a contiguous import/export-only preamble, and exact JSX comments are removed outside protected code ranges consistently with HTML comments. The first pass adds `files.corpus` and `files.format`, the central corpus views, and write-point routing in the same PR. Nothing temporal ships in the first pass — docs search launches as pure relevance, and hits may display the git timestamp as inert metadata so decay can be judged before it is built. Measure rebuild time and docs-corpus retrieval quality before any YAML decision. Reversal is cheap by design: disable docs admission and reindex.
 
 ## Out of scope
 
-Tree-sitter, Helm template semantics, cross-path rename history, a combined interleaved surface, per-kind embedding profiles.
+Tree-sitter, Helm template semantics, cross-path rename history, a combined interleaved surface, per-format embedding profiles.
