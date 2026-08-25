@@ -34,7 +34,7 @@ pub fn install(root: &Path) -> Result<PathBuf> {
         .open(&target)
         .with_context(|| format!("create agent guide {}", target.display()))?;
     file.write_all(GUIDE.as_bytes())?;
-    file.flush()?;
+    file.sync_all()?;
     Ok(target)
 }
 
