@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-24.
+> Status: authoritative plan as of 2026-08-25.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -23,11 +23,11 @@
 > is implemented, with its production replay still pending. Neither triggers
 > G16 or widens the semantic product surface, and no retrieval default changes
 > without a same-binary, same-snapshot comparison. G24 repository documentation
-> retrieval is proposed: docs in the main index as a separate ranking corpus
-> and surface, with code ranked content, statistics, and order byte-identical
-> modulo the shared snapshot identifier. G25 multi-format admission is proposed
-> behind it. G26 Rust code indexing is proposed as G25's first code-corpus
-> format, motivated by self-indexing this repository.
+> retrieval phases 1, 2, and 4 are implemented; git-basis freshness remains
+> gated on a retrieval evaluation corpus. G25 multi-format admission is
+> scheduled as G26 phase 0. G26 Rust code indexing is the current implementation
+> goal and the first additional code-corpus format, motivated by self-indexing this
+> repository.
 
 ## Document policy
 
@@ -3214,7 +3214,7 @@ links-iteration investigation following the skill reaches the
 missed gold chunks, false completeness claims, calls, bytes, and telemetry's
 exact-anchor definition success rate.
 
-## Proposed G24 — repository documentation retrieval
+## G24 — repository documentation retrieval (phases 1, 2, and 4 implemented; phase 3 gated)
 
 Repository Markdown and MDX are authored source material that agents currently cannot
 retrieve through jscout. It is the wrong shape for the code structural and
@@ -3394,20 +3394,26 @@ and the decision record
 are incorporated by reference, this entry winning on any explicit
 disagreement.
 
-## Proposed G25 — multi-format admission
+## G25 — multi-format admission (scheduled through G26 phase 0)
 
-One registry decides, per format, two things: how much jscout understands
-it (plain text → named sections → full AST) and which `files.corpus` value it
-receives (`code` or `docs`). Its parser/format identity is persisted separately
-as `files.format`; `chunks.kind` remains the intra-file structural role emitted
-by that parser. The registry gives a new format a defined place
-to plug in, so adding one never reopens the storage or ranking architecture —
-and that is all it buys. Each format still needs its own scanner and its own
-chunking contract (Markdown's took a full design cycle), and a format joining
-the code corpus additionally pays the ranking and exact-tier integration that
-docs deliberately avoid: its chunks do enter `chunks_fts`, do carry names,
-and do compete in the exact tiers, so that integration must be measured, not
-assumed. Text-only formats are cheap; languages are real work.
+One registry owns every format decision that otherwise leaks into walkers,
+watch classification, extraction, ranking, checker selection, and resolution.
+For each format it fixes the persisted `files.format`, `files.corpus`,
+comprehension tier (plain text → named sections → full AST), repository and
+dependency admission, extractor contract identity, lexical/vector projection,
+exact-definition and exact-occurrence eligibility and scanner, checker
+eligibility and watch affinity, and resolver strategy.
+`chunks.kind` remains the intra-file structural role emitted by the parser.
+Callers consume registry capabilities; they do not infer them from
+`corpus='code'`, copy extension lists, or maintain independent format switches.
+
+The registry gives a new format a defined place to plug in and prevents one
+capability from silently enabling another; that is all it buys. Each format
+still needs its own scanner and chunking contract (Markdown's took a full design
+cycle). A format joining the code corpus additionally pays BM25/vector
+integration, while exact tiers, checker participation, dependency admission,
+and structural projections remain separately gated capabilities. Text-only
+formats are cheap; languages are real work.
 
 MDX is already admitted by G24 as `format='mdx'` in the docs corpus, using the
 same inert named-sections scanner as Markdown: JSX, props, expressions, inner
@@ -3433,57 +3439,66 @@ non-code kinds are the payoff that justifies every admission above the text
 tier. No implementation milestone is assigned and no current goal is
 displaced.
 
-## Proposed G26 — Rust code indexing
+## In progress G26 — Rust code indexing
 
-jscout is a Rust program that cannot index itself. Admitting Rust makes this
-repository its own standing evaluation corpus, makes jscout useful for its
-own development, and is the first exercise of G25's registry for a second
-code-corpus format. The decisions:
+jscout is a Rust program that cannot index itself. G26 makes this repository a
+standing evaluation corpus and implements G25 against a real second code
+format. The decisions:
 
-1. Rust is `files.format='rust'`, `files.corpus='code'`, admitted through the
-   shared index pass, snapshot, and publication. The dependency walker does
-   not widen, and `walk::SKIP_DIRS` gains `target` — Cargo build output is
-   excluded deterministically, not only by gitignore, matching how
-   `node_modules` is handled.
-2. The parser is `ra_ap_syntax` (rust-analyzer's standalone syntax crate),
-   pinned: lossless spans so chunks slice back to source exactly,
-   error-tolerant so watch-mode mid-edit files still index, pure Rust so no C
-   toolchain enters the build. `syn` fails the error-tolerance and comment
-   requirements; tree-sitter stays rejected — this goal explicitly does not
-   fire G25's revisit trigger, because a single language has a pure-Rust
-   lossless alternative. Macro expansion is out of scope; the Rust chunk
-   format is contract-hashed like Markdown's.
-3. Rust climbs the tier ladder in phases, because it joins the code ranking
-   economy: unlike docs there is no byte-identity gate — new corpus content
-   changes code search by design — so acceptance is evaluation-based.
-   Phase 1 admits text-tier chunks (no names, `chunks.kind='rust_text'`, no
-   exact-tier interaction) and measures on this repository: index time,
-   database size, and a fixed JS/TS query set compared before and after.
-   Phase 2 adds named item chunks (`fn`, `struct`, `enum`, `trait`, `impl`
-   per associated item, `mod`, `const`, `static`, unexpanded `macro_rules!`)
-   with doc comments attached and module-path scope chains; it is accepted
-   only after exact-tier collision measurement, because Rust's name
-   distribution is exact-tier-hostile (`new`, `from`, `default` everywhere).
-   Phase 3 adds deterministic module edges from the `mod` tree, `use` paths,
-   and `cargo metadata` — file-granularity `who-uses`/`neighborhood`, no
-   trait or method resolution.
-4. Out of scope: entity extraction, events, member calls, checker
-   enrichment, macro expansion, dependency-crate indexing, and rust-analyzer
-   semantics — full semantics belong to a future enrichment sidecar on the
-   tsserver pattern, a separate goal if ever. Inline `#[cfg(test)]` modules
-   indexing as production is a recorded role-granularity limitation.
+1. Phase 0 installs the registry and routes the current JavaScript, TypeScript,
+   Markdown, and MDX behavior through it without changing any published row,
+   ranking, checker input, dependency input, watch signal, or snapshot. The
+   registry is the only extension/capability authority after this phase.
+2. Phase 1 registers exact-lowercase `.rs` as `files.format='rust'`,
+   `files.corpus='code'`, repository-admitted and lexical-ranking-eligible.
+   Rust is not dependency-admitted, exact-definition-eligible,
+   exact-occurrence-eligible, checker-eligible, or resolver-enabled. Rust watch
+   events schedule shared incremental refresh but carry no checker dirty path.
+   `target` is not added to global `walk::SKIP_DIRS`; only a directory named
+   `target` whose parent contains `Cargo.toml` is a Cargo-output root in phase 1.
+3. The pinned parser is `ra_ap_syntax`: lossless byte ranges, error tolerance,
+   and no C toolchain. Phase-1 chunks form a non-overlapping, gap-free partition
+   of the source, carry `kind='rust_text'`, no name/symbol/scope, and an empty
+   graph. Top-level syntax ranges are preferred boundaries; residual text is
+   retained, and oversized ranges split only at a newline or UTF-8 boundary.
+   Parse errors do not reject the file and are counted in index/watch refresh
+   diagnostics. The Rust extractor contract is versioned per format; changing
+   it does not invalidate unchanged JavaScript or TypeScript rows.
+4. Phase 2 replaces the text projection with a non-overlapping partition of
+   named item chunks plus residual unnamed chunks—never duplicate full-text and
+   named rows. It adds exact definitions only after a committed mixed-corpus
+   collision protocol passes. Rust-aware exact occurrences are a separate
+   capability and do not turn on merely because names exist.
+5. Phase 3 adds Rust module edges. Before code begins, its contract must fix the
+   exact `cargo metadata` invocation, no-network/no-mutation policy, tool and
+   input identity, failure behavior, supported path forms, and unresolved-edge
+   reporting. Cargo manifests/configuration and every other declared metadata
+   input become watch refresh boundaries in the same phase.
+6. Out of scope: entity extraction, events, member calls, checker enrichment,
+   macro expansion, dependency-crate indexing, and rust-analyzer semantics.
+   Inline `#[cfg(test)]` modules indexing with their containing file's role is a
+   recorded role-granularity limitation.
 
-Acceptance: `.rs` under `target/` is never indexed even without gitignore;
-the dependency walker is byte-identical; spans slice exactly on multibyte,
-raw-string, and CRLF content; files with syntax errors still index their
-parseable items and are visibly counted; phase 1 leaves exact tiers
-byte-identical and the fixed JS/TS query set within agreed tolerance;
-phase 2 ships only with recorded collision measurements; a self-index of
-this repository lands its timing and size in `eval/results/` as the dogfood
-baseline. The detail document
+Phase 0 acceptance: a differential fixture indexes the same JS/TS/Markdown/MDX
+repository before and after the registry refactor and compares every public
+code/docs surface and canonical row byte-for-byte except newly introduced
+format-contract metadata—the refactor must otherwise be a complete no-op.
+Phase 1 acceptance: repository `.rs` files
+index while selected dependency `.rs` files do not; authored non-Rust content
+under an ordinary `target/` remains admitted; Cargo-output `target/` is pruned;
+Rust rows never enter exact tiers, checker inventory, checker dirty affinity,
+JS-specific fact tables, or module edges; spans slice exactly on multibyte,
+raw-string, and CRLF content; malformed Rust remains searchable and reports its
+parse-error count; and a Rust-only change preserves all JS/TS canonical rows
+and checker carry inputs. A committed query manifest supplies gold JS/TS hits:
+all remain recall@10, no first-gold rank worsens by more than five positions,
+and exact-tier candidates/order remain byte-identical. Self-index timing,
+database size, chunk counts, parse diagnostics, and query results land in
+`eval/results/`. Phase 2 and 3 remain blocked until their own preregistered
+collision and edge-correctness protocols are committed. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
-is subordinate and non-normative, this entry winning on any disagreement. No
-implementation milestone is assigned and no current goal is displaced.
+is subordinate and non-normative, this entry winning on any disagreement.
+Phases 0 and 1 are the current implementation milestone.
 
 ## Evaluation decisions already made
 

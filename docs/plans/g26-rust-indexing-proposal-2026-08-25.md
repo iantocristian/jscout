@@ -1,135 +1,247 @@
 # G26 Rust code indexing — design detail
 
 - Date: 2026-08-25
-- Status: subordinate, non-normative detail for the Proposed G26 entry in
+- Status: subordinate, non-normative detail for the G26 entry in
   [PLAN.md](../../PLAN.md); that entry wins any explicit disagreement.
-- Motivation: dogfood. jscout is a Rust program that cannot index itself.
-  Admitting Rust makes this repository its own standing evaluation corpus and
-  makes jscout useful for its own development. It is also the first exercise
-  of G25's registry claims for a second code-corpus format — the honest test
-  of "adding a format never reopens the architecture".
+- Current milestone: phases 0 and 1.
 
-## Decision summary
+## Motivation and boundary
 
-Rust is admitted as `files.format='rust'`, `files.corpus='code'`, through the
-same shared index pass, snapshot, and publication as everything else. It
-climbs the G25 tier ladder in phases: text chunks first (no names, no
-exact-tier interaction — safely measurable), named item chunks second (the
-paid integration), module edges third. The parser is `ra_ap_syntax`. No
-tree-sitter, no rust-analyzer semantics in the index path, no entity or
-checker participation in this goal.
+jscout cannot currently index its own Rust source. G26 adds Rust as the first
+second-language member of the code corpus, but only after implementing the G25
+format registry that prevents one kind of admission from silently enabling
+unrelated consumers.
 
-Unlike Markdown, Rust deliberately joins the code ranking economy: its chunks
-enter `chunks_fts` and, once named, compete in the exact tiers. There is no
-byte-identity gate — new corpus content changes code search *by design* — so
-acceptance is evaluation-based instead: JS/TS-query behavior must not regress
-materially, and the exact-tier interaction is measured before names ship.
+Rust phase 1 is deliberately lexical. It publishes repository files and exact
+source-backed text chunks to the ordinary code FTS projection. It does not
+publish vectors, definitions, occurrences, graph facts, checker inputs,
+dependency inputs, or resolver inputs. Later phases may enable those
+capabilities independently after their own tests and evaluations pass.
 
-## The seams (all exist after G24)
+## Phase 0 — implement the G25 registry
 
-1. `code_format()` in `src/indexer.rs` gains `Some("rs") => Ok(RUST_FORMAT)`.
-2. `walk::is_indexable` admits `.rs`; `walk::SKIP_DIRS` gains `"target"` —
-   today only gitignore excludes Cargo build output, and a `target/` tree can
-   be gigabytes; deterministic skips are how `node_modules` is handled and
-   Rust deserves the same floor.
-3. `extract_file()` gains a `rust::extract(rel, source)` arm returning the
-   standard `FileData { chunks, graph, lines }`; `FileGraph::default()` is
-   the phase 1 and 2 graph.
-4. A new `src/rust_lang/` extractor module — the actual work.
+One static registry is the sole authority for:
 
-The dependency walker (`dependency::collect_indexable_files`) does not widen:
-crate sources under `~/.cargo` and vendored trees are out of scope for this
-goal, exactly as G24 kept dependency Markdown out.
+- persisted format identity and recognized extensions;
+- corpus (`code` or `docs`) and understanding tier;
+- repository and dependency admission, independently;
+- format-specific directory exclusion;
+- parser/chunker identity and extraction-contract version;
+- lexical and vector projection eligibility;
+- exact-definition and exact-occurrence eligibility, independently;
+- exact-occurrence scanner identity;
+- graph, checker, resolver, and watch/checker-affinity eligibility.
 
-## Parser: `ra_ap_syntax`, pinned
+Inventory, dependency discovery, extraction dispatch, ranked-projection
+routing, exact-tier queries, checker inventory, watch classification, and
+resolver dispatch consume the descriptor. They may not infer a capability
+from `files.corpus`, `files.format`, a filename extension, a chunk name, or an
+empty projection. A repository-admission helper must not be reused as a
+dependency, checker, exact-tier, or resolver predicate.
 
-rust-analyzer's syntax crate, published standalone. Chosen on three
-requirements the chunk contract already imposes:
+The initial capability matrix is:
 
-- **lossless spans** — the CST covers every source byte, comments included,
-  so chunk spans slice back to the original file exactly, as the G24 harness
-  pinned for Markdown and the code plane requires everywhere;
-- **error tolerance** — watch mode indexes mid-edit working trees; a parser
-  that fails a whole file on one syntax error makes in-progress code vanish
-  from search. `ra_ap_syntax` parses broken files and marks error nodes;
-- **pure Rust** — no C toolchain enters the build.
+| Format | Corpus | Repository | Dependency | Ranked projection | Exact definition | Exact occurrence | Checker | Structural projection | Resolver |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- | --- |
+| JavaScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | existing | existing |
+| TypeScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | existing | existing |
+| Markdown | docs | docs policy | no | existing docs lexical/vector | no | no | no | docs metadata only | none |
+| MDX | docs | docs policy | no | existing docs lexical/vector | no | no | no | docs metadata only | none |
+| Rust, phase 1 | code | yes | no | code lexical only | no | no | no | none | none |
 
-Why not `syn`: built for proc-macro token streams — not error-tolerant (one
-bad token fails the file), drops non-doc comments, and byte spans are an
-afterthought behind a feature flag. Why not `tree-sitter-rust`: G25 rejected
-tree-sitter with a named revisit trigger, and this goal explicitly does not
-fire it — tree-sitter's advantage is many grammars under one framework, and
-for a single language a pure-Rust lossless alternative dominates. The trigger
-remains what G25 says it is.
+The registry contains typed policies or behavior identifiers, not booleans
+that callers subsequently override. JavaScript and TypeScript may share a
+policy implementation while retaining distinct persisted format identities.
+Markdown and MDX keep their existing include/exclude and hidden-directory
+membership policy; the registry identifies them and routes them to that
+policy rather than replacing it.
 
-`ra_ap_syntax` tracks rust-analyzer releases and its API churns; the version
-is pinned and bumped deliberately. Macro *expansion* is out of scope — items
-inside `macro_rules!` bodies and attribute-macro output are not chunked;
-`extractor_version`-style contract hashing covers the chunker like Markdown's
-chunk format hash does.
+Extraction contracts are versioned and persisted per format. Changing the Rust
+parser or chunk contract invalidates Rust extraction without invalidating
+unchanged JavaScript, TypeScript, Markdown, or MDX rows. Tests must prove that
+one format-version change alters the published contract identity and schedules
+only files of that format for re-extraction.
 
-## Phases
+### Phase 0 acceptance
 
-### Phase 1 — text tier, dogfood measurement
+A fixed JavaScript/TypeScript/Markdown/MDX fixture is indexed before and after
+the registry refactor. Inventories, canonical rows, FTS rows, vector
+candidates, exact-tier results, checker membership, watch signals, graph rows,
+and public query responses must be byte-identical, except for newly introduced
+format-contract metadata. Table-driven tests pin every descriptor and reject
+duplicate format identities or extensions. Consumer tests must demonstrate
+that repository admission does not imply dependency, exact-tier, checker, or
+resolver admission.
 
-`.rs` files admitted as `corpus='code'`, chunked by the existing byte-budget
-splitter with **no chunk names** (`chunks.kind='rust_text'`). Zero exact-tier
-interaction, no symbols, `FileGraph::default()`. Rust content becomes
-lexically searchable beside JS/TS immediately.
+## Phase 1 — Rust lexical retrieval
 
-Measured on this repository before phase 2: index time delta, corpus and
-database size delta, and a fixed JS/TS query set run before and after
-admission — same queries, ranked output compared, regressions explained or
-fixed. `--timing` already prints the projection cost.
+Exact-lowercase `.rs` is registered as `files.format='rust'` and
+`files.corpus='code'` for repository inventory. Rust dependency admission is
+false, including selected npm trees, vendored trees, and Cargo caches. Rust
+chunks enter `chunks_fts`; code-vector materialization remains disabled.
 
-### Phase 2 — named item chunks
+The pinned `ra_ap_syntax` parser supplies error-tolerant, lossless syntax
+ranges. The phase-1 projection is limited to:
 
-`ra_ap_syntax` item walk: `fn`, `struct`, `enum`, `trait`, `impl` (chunked
-per associated item with the impl header as context), `mod`, `const`,
-`static`, `macro_rules!` (as one named chunk, body unexpanded). Doc comments
-attach to their item's chunk like leading comments do for JS. `chunks.kind`
-carries the item kind (`rust_fn`, `rust_struct`, …); `chunks.name` carries
-the item name; `scope_chain` carries the module path (`store::open`).
+- `files`;
+- unnamed `chunks` with `kind='rust_text'`;
+- the corresponding `chunks_fts` rows.
 
-This is the paid integration. Known hazard to measure before accepting:
-Rust's name distribution is exact-tier-hostile — every type has `new`,
-`default`, `from`, `len`. The per-identifier limits and path ordering of
-`exact_definition_chunks` are the existing mitigations; the phase 2
-evaluation measures collision behavior on mixed JS+Rust corpora (this
-repository plus one JS monorepo) and phase 2 is accepted only on those
-numbers. Inline `#[cfg(test)]` modules are a known role-granularity gap:
-`file_role` classifies files, so test modules inside production files index
-as production — recorded as a limitation, not solved here.
+Each chunk has `name=NULL`, empty symbols and scope, and an exact source-backed
+byte span. Rust emits no symbols, imports, exports, refs, member calls, events,
+entities, contracts, graph nodes or edges, semantic artifacts, checker inputs,
+or resolver inputs.
 
-### Phase 3 — module edges
+### Chunk contract
 
-Deterministic, hand-rolled resolution at the fidelity the JS plane had before
-the checker existed: the `mod` tree (`mod foo;` → `foo.rs` / `foo/mod.rs`),
-`use crate::…` paths resolved against it, workspace/package layout from
-`cargo metadata` (via the `cargo_metadata` crate). Produces module edges and
-file-granularity `who-uses`/`neighborhood` for Rust. No trait or method
-resolution — full semantics belong to a future rust-analyzer enrichment
-sidecar following the tsserver pattern, explicitly out of this goal.
+The chunks are sorted, non-overlapping, and form a gap-free partition of every
+non-empty source file. Top-level syntax ranges are preferred boundaries;
+interstitial comments, whitespace, malformed regions, and other residual text
+are retained. Adjacent ranges may be coalesced toward a 4,800-byte target.
+No chunk may exceed 8,000 bytes. Oversized ranges split at the last newline
+before the hard bound, or at the last UTF-8 boundary when no newline exists.
+CRLF is never split. Empty files emit no chunks.
+
+For every chunk, `content.as_bytes()` equals the source slice at its stored
+byte range. Line coordinates are derived from the same source and range.
+Contract tests cover LF, CRLF, multibyte UTF-8, raw and byte strings, nested
+block comments, lifetimes, and mid-edit syntax errors.
+
+Parser errors do not reject the file. Recoverable errors publish all
+source-backed chunks and contribute to explicit
+`rust_files_with_parse_errors` and `rust_parse_error_count` diagnostics in the
+index/watch outcome and human status. An extractor panic, invalid UTF-8 input,
+or lossless-span invariant failure aborts publication rather than publishing a
+partial snapshot. The diagnostics describe the current indexed snapshot, not
+only work performed by the latest incremental run.
+
+### Exact-tier isolation
+
+`exact_definition_chunks` and every branch of `exact_occurrence_chunks`,
+including the `chunks_fts` fallback, filter by registry eligibility. Rust is
+ineligible for both in phase 1, so the JavaScript-oriented occurrence scanner
+never examines Rust chunks. The absence of Rust names is not relied on as the
+filter.
+
+### Repository, dependency, and `target` policy
+
+`target` is not a global skipped directory. A directory named `target` whose
+parent contains a repository-visible `Cargo.toml` is a Cargo-output root for
+Rust admission only. Rust files below that root are excluded, while registered
+JavaScript, TypeScript, Markdown, and MDX files below the same directory keep
+their existing policies. A different directory component named `target`, such
+as `src/target/`, does not exclude authored Rust merely because of its name.
+
+The shared inventory may carry per-format descent or admission state to make
+this deterministic without pruning traversal for every format. Repository and
+dependency admission remain separate registry capabilities.
+
+### Watch and checker isolation
+
+An admitted `.rs` create, edit, rename, or delete schedules the same
+incremental shared-inventory refresh as another repository source. Its dirty
+signal has no checker affinity. Watch state therefore distinguishes paths that
+require an index refresh from paths that may enter the TypeScript checker
+backlog. A Rust-only generation cannot create a checker plan or provider call.
+Directory and unknown events remain conservative.
+
+Incremental Rust changes must converge to the same canonical database state as
+a full refresh. JavaScript and TypeScript events retain their current refresh
+and checker behavior exactly.
+
+### Phase 1 acceptance
+
+The committed suite must prove:
+
+1. exact source slices and chunk invariants for LF, CRLF, multibyte UTF-8, raw
+   strings, byte strings, nested comments, lifetimes, and malformed edits;
+2. zero Rust rows in every projection except `files`, `chunks`, and
+   `chunks_fts`;
+3. zero Rust paths in dependency and checker inventories;
+4. identical JavaScript/TypeScript exact-definition and exact-occurrence
+   candidates and ordering before and after Rust admission;
+5. `.rs` watch parity with full refresh and an empty checker-dirty set for a
+   Rust-only generation;
+6. Rust below a Cargo-output `target` excluded while other formats there keep
+   their existing policies, and authored Rust below an unrelated `target`
+   remains admitted;
+7. malformed Rust searchable with current-snapshot parse diagnostics; and
+8. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
+   their input contains no Rust.
+
+Before evaluation results are run, commit a manifest containing at least 24
+Rust retrieval questions and 24 frozen JavaScript/TypeScript controls, their
+gold files, query mode, `k`, and baseline output. Phase 1 passes when Rust file
+Recall@10 is at least 90%, JavaScript/TypeScript Recall@10 does not decrease,
+mean reciprocal rank drops by no more than 0.02, and no previously top-five
+gold file falls outside the top ten. Record wall time, peak RSS, indexed bytes,
+chunk count, database bytes, and parse diagnostics for both arms. Performance
+numbers are reported separately from the retrieval gate.
+
+## Phase 2 — named Rust chunks and exact tiers
+
+Phase 2 replaces the text projection with a non-overlapping partition of named
+item chunks and residual unnamed chunks. It adds names for functions, structs,
+enums, traits, modules, constants, statics, `macro_rules!`, and associated
+items. An associated-item chunk includes bounded enclosing `impl` or `trait`
+header context; doc comments attach to their item; scope is the lexical
+module/type path; macro bodies remain unexpanded.
+
+Rust exact definitions and a Rust-specific exact-occurrence scanner are
+separate registry capabilities. Neither turns on merely because named chunks
+exist. The occurrence scanner must understand Rust comments, nested block
+comments, normal/raw/byte strings, character literals, raw identifiers, and
+lifetimes. The JavaScript scanner remains JavaScript/TypeScript-only.
+
+Before either exact capability ships, a committed collision fixture contains
+at least eight Rust and eight JavaScript/TypeScript definitions for each of
+`new`, `from`, and `default`. When both formats are eligible, each must appear
+within the first four definition candidates and neither may consume the whole
+definition allowance. A Rust-absent fixture must retain byte-identical existing
+exact results. The phase-1 retrieval thresholds remain gates.
+
+## Phase 3 — Rust module edges and Cargo lifecycle
+
+Local Rust resolution covers declared module structure and explicit `use`
+paths only. Trait selection, method dispatch, macro expansion, generated code,
+build-script output, and rust-analyzer semantics remain out of scope.
+
+Cargo discovery runs once per discovered workspace root with the equivalent
+of:
+
+```text
+cargo metadata --format-version 1 --no-deps --offline --locked \\
+  --manifest-path <absolute Cargo.toml>
+```
+
+It may not access the network, update a lockfile, write repository files, or
+index dependency sources. Missing Cargo, a missing or outdated lockfile, a
+non-zero exit, timeout, or malformed JSON is a visible degraded result: Rust
+lexical/named rows still publish, metadata-derived edges for that workspace
+are empty, and status records the workspace and reason. Failed metadata from
+an earlier snapshot is never carried forward.
+
+The Cargo input fingerprint contains sorted path-and-byte hashes for every
+observed workspace and member `Cargo.toml`, `Cargo.lock`, `.cargo/config`,
+`.cargo/config.toml`, `rust-toolchain`, and `rust-toolchain.toml`, plus the Cargo
+executable version and normalized metadata output used for projection. It
+participates in projection reuse and published snapshot identity.
+
+Creating, modifying, renaming, or deleting any listed input is a watch refresh
+boundary. A successful refresh recomputes all Rust module edges atomically. A
+Rust source edit may remain incremental but must rebuild its derived module
+projection before publication.
+
+Committed single-crate, nested-module, workspace, renamed-module,
+path-attribute, broken-manifest, unavailable-Cargo, and locked/offline fixtures
+pin the exact expected edge sets and degraded states. Incremental and full
+refreshes must produce identical canonical rows, module edges, status, and
+snapshot identity.
 
 ## Out of scope
 
-Entity extraction for Rust (heur/value_flow are JS-idiom scanners), events,
-member-call facts, checker enrichment, macro expansion, dependency-crate
-indexing, a rust-analyzer sidecar, and any docs-corpus or freshness
-interaction — Rust is `corpus='code'` and current-only like all code.
-
-## Validation
-
-- registry admission: `.rs` under `target/` is never indexed even without a
-  gitignore; the dependency walker is unchanged byte-for-byte;
-- spans slice back exactly on files with multibyte UTF-8, raw strings
-  (`r#"…"#`), and CRLF;
-- a file with syntax errors still yields chunks for its parseable items and
-  is visibly counted, never silently dropped;
-- phase 1 admission leaves a fixed JS/TS query set's ranked output within the
-  agreed tolerance, and exact tiers byte-identical (no named Rust chunks
-  exist yet);
-- phase 2: exact-tier collision measurements on `new`/`from`/`default`
-  recorded before names are accepted;
-- self-index: this repository indexes end to end with timing and size
-  recorded in `eval/results/` as the dogfood baseline.
+Dependency crates, checker facts, entities, events, member calls, macro
+expansion, build-script output, trait or method resolution, procedural-macro
+output, and a rust-analyzer sidecar are separate goals. Inline `#[cfg(test)]`
+modules retain their containing file role and are reported as a known
+role-granularity limitation.
