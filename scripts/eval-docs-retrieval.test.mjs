@@ -133,7 +133,7 @@ test("runner fixes the response budget and requires complete pinned Phase 2 trea
     "/repo",
     "query",
     "/index.db",
-    { id: "disabled", enabled: false, bound: 0 },
+    { id: "disabled", enabled: false, bound: 1 },
   );
   assert.ok(disabledArgs.includes("--no-freshness"));
 

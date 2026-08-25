@@ -31,7 +31,7 @@ const PHASE2_PROFILES = ["lexical", "fallback", "hybrid", "hybrid-rerank"];
 const PHASE3_PROFILES = ["lexical", "hybrid", "hybrid-rerank"];
 const PROVIDER_FREE_PROFILES = ["lexical", "fallback"];
 const FRESHNESS_TREATMENTS = [
-  { id: "disabled", enabled: false, bound: 0 },
+  { id: "disabled", enabled: false, bound: 1 },
   { id: "bound-1", enabled: true, bound: 1 },
   { id: "bound-2", enabled: true, bound: 2 },
   { id: "bound-3", enabled: true, bound: 3 },
@@ -1137,7 +1137,7 @@ export function configWithFreshness(source, treatment) {
     (line) => !/^\s*(?:freshness|max_rank_movement)\s*=/.test(line),
   );
   body.push(`freshness = ${treatment.enabled ? "true" : "false"}`);
-  body.push(`max_rank_movement = ${treatment.bound || 1}`);
+  body.push(`max_rank_movement = ${treatment.bound}`);
   lines.splice(header + 1, end - header - 1, ...body);
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
@@ -1250,7 +1250,7 @@ async function main() {
         for (const kind of ["baseline", "provider"]) {
           const docsSearch = configurations.phase3_treatments[treatment.id][kind].docs.search;
           if (docsSearch.freshness !== treatment.enabled
-              || docsSearch.max_rank_movement !== (treatment.bound || 1)) {
+              || docsSearch.max_rank_movement !== treatment.bound) {
             throw new Error(`${treatment.id}/${kind}: effective freshness treatment differs from the matrix`);
           }
         }
@@ -1352,7 +1352,7 @@ async function main() {
             }
             if (options.runKind === "phase3-candidate") {
               const expectedFreshness = treatment.enabled ? "active" : "disabled";
-              const expectedBound = treatment.bound || 1;
+              const expectedBound = treatment.bound;
               if (response.value.diagnostics.freshness_status !== expectedFreshness
                   || response.value.diagnostics.max_rank_movement !== expectedBound
                   || repeated.value.diagnostics.freshness_status !== expectedFreshness
