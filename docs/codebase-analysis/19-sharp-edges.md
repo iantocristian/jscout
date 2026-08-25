@@ -1,117 +1,144 @@
 # Sharp edges, complexity hotspots, and risks
 
-This document collects the places where jscout's behavior diverges from what its own interfaces imply: computations that approximate but are rendered as facts, invariants that hold only because two or three files happen to agree, code paths that abort where a degraded answer would serve better, and modules that carry no tests at all. It is organized by failure theme rather than by subsystem, because most of these edges cut across the pipeline — a single hardcoded literal in `src/store.rs` is a migration hazard, a packaging hazard, and a schema hazard at once. Everything here is a property of commit `854bff1`; nothing is speculative.
+jscout's risk profile is not distributed evenly across its 82 Rust files. It concentrates in four places: two modules that have grown past the point where a reader can hold them in one pass (`src/checker/enrich.rs` at 3,934 lines and `src/search.rs` at 3,508), a set of facts that are authored in several files at once and cross-checked in none, a layer of deterministic approximations whose output is indistinguishable at read time from a proof, and a boundary where CLI flags, `.jscout.toml`, and MCP arguments silently overrule each other. The catalog below is organized by theme rather than by subsystem, because the same failure shape recurs across subsystems. Every entry names the file and, where the exact line is load-bearing, the line; severity ordering inside each theme is by what breaks, not by how ugly the code looks.
 
 ## Complexity hotspots
 
-The largest production file is now `src/structural.rs` at 3,751 lines, holding module-edge projection, reference resolution, entity and contract projection, member-call hubs, checker-fact projection, event projection, neighborhood and workflow traversal, path search, and every graph key format — six projection stages plus three traversal algorithms in one module. `src/main.rs` has left the list entirely at 79 lines; the clap surface moved to `src/cli.rs` (878 lines) and dispatch to `src/commands/` (1,827 lines). Second is `src/scouting/mod.rs` at 3,365 lines, where the four generative executors (`execute_prepared_workflow` at `src/scouting/mod.rs:1199`, `_card` at `:1509`, `_concept` at `:1825`, `_summary` at `:2397`) plus `repository::execute_one` (`src/scouting/repository.rs:1141`) repeat the same ~250-line skeleton five times: gateway-error block, usage accounting, billing-path correction, tool-name check, deserialization check, validation check, incomplete branch, publication transaction. The duplication is structural, not textual — the publication rechecks genuinely differ per family (summaries re-verify every child's pinned fingerprint at `src/scouting/mod.rs:2592-2611`; concepts re-derive `expected_concept_child_ids`; the card path is the thin one) — which is why the shared helper has not been extracted, and why any change to the call-and-publish contract has to land five times.
+Six modules carry most of the reading cost. The sizes below are at `4de5622`; the two largest both grew in the last two days of work.
 
-Third is `src/checker/enrich.rs` at 3,073 lines, which after the carry-forward rewrite holds planning, project ordering, staging, carry authorization, activation, and re-verification. Its cheapest-to-fix cost is `plan_members`: a single unchunked frame containing every eligible file plus every dirty file (`src/checker/enrich.rs:387-388`) against a 4 MiB line cap (`checker/src/protocol.mjs:4`). An oversized line is answered with `id: ""`, which Rust's `receive_for` treats as a wrong-id reply, poisoning the client with `message for unexpected request id` instead of reporting a size problem. `src/scouting/repository.rs:394` already chunks the same call at 512 files; enrichment does not. That is a ten-line fix.
+| Module | Lines | What makes it hard | Where the tests live |
+|---|---|---|---|
+| `src/checker/enrich.rs` | 3,934 | Two ownership planning passes, staging/resume/carry, per-project execution with two distinct restart paths, and a nine-predicate activation transaction (`src/checker/enrich.rs:3308`) in one file | `src/checker/enrich/tests.rs`, 3,614 lines / 44 tests |
+| `src/structural.rs` | 3,799 | Seven projection stages with load-bearing inter-stage ordering (`src/structural.rs:542-604`), plus key encoding and neighborhood traversal | `src/structural/tests.rs`, 2,438 lines / 38 tests |
+| `src/scouting/mod.rs` | 3,365 | Six generative families sharing a claim/prepare/execute/publish skeleton with per-family divergences | `src/scouting/tests.rs`, 3,267 lines / 43 tests |
+| `src/search.rs` | 3,508 | Two retrieval modes in one function: ranked hybrid plus the new exhaustive locator pager, sharing a triple-nested byte-budget fixed point | `src/search/tests.rs`, 2,099 lines / 29 tests |
+| `src/mcp.rs` | 2,093 | Twelve tool arms, three rendering paths, two byte-budget families, two JSONL streams | `src/mcp/tests.rs`, 1,534 lines / 24 tests |
+| `src/checker/package_gate.rs` | 1,398 | Manifest reachability heuristics: shell tokenizer, `exports` condition walk, dist→src mirror guessing, hand-rolled glob | inline `#[cfg(test)]` at `:858`, 14 tests |
 
-Expansion admission in retrieval is quadratic by construction: every trial clones the current node and edge vectors and re-serializes the whole set through `expansion_parts_bytes` (`src/search.rs:2065`), once per candidate, for up to `edge_limit` (default 120) candidates. `apply_repository_policy_penalty` issues one SQL query per fused candidate — up to 50 at default limit — and runs after the reranker, so its cost is paid on every unfiltered search whether or not a single policy row exists (`src/search.rs:1503-1504`). Neither is a correctness problem; both are unconditional per-query costs that no flag disables.
+Two structural observations follow. First, `src/search.rs` now holds ranked and exhaustive retrieval in the same call path, and they shed bytes differently at the same limit: `exhaustive_locator_only` is guarded by `compact` (`src/search.rs:2554`), so a diagnostic-transport request falls straight through to popping whole hits and reports a different minimum floor than the compact one for identical input. Second, the crate has no `lib` target and no `tests/` directory, so all 474 `#[test]` functions compile into the one binary and none of them exercises a public seam. Refactoring any of the six modules above means recompiling and rerunning everything.
 
-## Availability cliffs: hard failure where degradation was available
+The newest large module broke the tree's own convention. `src/checker/package_gate.rs` puts its 14 tests inline while the other five hotspots use sibling `tests.rs` files, and the two newest modules of all — `src/value_flow.rs` (838) and `src/structural/receiver_flow.rs` (936) — contain **zero** `#[test]` functions between them. Their coverage is entirely end-to-end through index-a-temp-repo tests in `src/structural/tests.rs`. A pure-function defect in `statement_terminates` or `mutated_members` is only visible if some behavioral test happens to hit that shape.
 
-```mermaid
-flowchart TD
-  START["Refresh generation begins"] --> PREP["prepare_dependency_files reads<br/>every selected dependency into memory"]
-  PREP --> DEL["DELETE snapshot, projection_version,<br/>resolution_hash from meta"]
-  DEL --> COMMIT["COMMIT extraction rows"]
-  COMMIT --> DEPS["dependency sync"]
-  DEPS --> EDGES["resolve_module_edges<br/>DELETE + full re-resolve"]
-  EDGES --> SNAP["compute snapshot + resolution hash"]
-  SNAP --> PROJ["projection rebuild or fast-path republish"]
-  PROJ --> PUB["Re-publish markers"]
-  DEL -.->|"window open"| READER["store::open_path_read_only refuses"]
-  PUB -.->|"window closed"| READER2["reads succeed"]
-  READER --> FAIL["CLI query and MCP client<br/>get a hard error, not stale data"]
-```
+## Facts authored in several places, cross-checked in none
 
-Look at the dashed edges: the window between marker deletion and republication is where every reader fails. `src/indexer.rs:494-497` deletes the three publication markers inside the committed transaction, and `store::open_path_read_only` refuses to hand out a connection while either `meta.snapshot` or `meta.projection_version` is absent (`src/store.rs:83-96`). That is the intended invariant — no reader ever sees a half-built graph — but the window spans dependency sync, a full `module_edges` DELETE-and-re-resolve (`src/indexer.rs:1161-1236`), snapshot computation, and projection, and it opens even on a no-op incremental generation that will end on the `projection_rebuilt = false` fast path. There is no read-your-last-good-snapshot mode. Under `jscout watch` on a busy repository, an MCP client's `semantic_search` can fail outright because someone saved a file. Fixing this properly means versioned publication (write new markers, swap, delete old) rather than delete-then-rebuild — a substantial change to the projection contract described in [05-storage-schema.md](05-storage-schema.md).
+These are ranked by what a missed edit costs.
 
-Second: one drifted file aborts an entire `calls` query. `src/calls.rs:119-124` `bail!`s on the *first* candidate whose on-disk blake3 differs from `files.hash`, even when the edit is in an unrelated file and even when that file is a dependency pulled in by `--origin dependency`. This is the only place in the read path that re-reads source from disk, and it is a hard availability property of the subsystem. Downgrading to a per-file skip with a `stale_files` field in the result would be a contained change.
-
-Third: `busy_timeout` is unset — zero milliseconds — on every connection except the watcher's (`src/watch.rs:1314` is the only call site in the crate). A second CLI invocation, or an MCP `annotate` landing while an index runs, gets an immediate `SQLITE_BUSY` rather than waiting. A one-line default on `store::open_path` would remove most of this.
-
-Fourth: byte budgets fail closed everywhere. A too-small `response_bytes` is a hard error in `attach_symbol_resolution`, `symbol_content_byte_limit`, `who_uses_string`, `definition_string`, `render_neighborhood`, and `render_bounded_object_arrays` alike; `attach_symbol_resolution` bails with `response byte limit … is below the exact-anchor response envelope` (`src/mcp.rs:1530-1535`). For an agent that guessed a budget, an error is strictly worse than a truncated answer with a `truncated: true` flag — which the same code already emits in other paths.
-
-Fifth: `cmd_who_uses` calls `std::process::exit(1)` when no symbol matches (`src/commands/core.rs:387`). This bypasses the anyhow chain, runs no destructors, and prints a bare stderr line instead of `Error: …`. Two more direct exits are reachable from ordinary commands: the Ctrl-C handlers at `src/llm/process.rs:85` and `src/checker/process.rs:157`. Related, `ctrlc::set_handler` can only succeed once per process, and each client keeps its own `INTERRUPT_HANDLER` OnceLock (`src/checker/process.rs:21`, `src/llm/process.rs:29`) — whichever subsystem registers first owns SIGINT, so `scout repository`, which uses both sidecars, routes interrupts to only one of them.
-
-## Approximations presented as facts
-
-These are the entries most likely to mislead a consumer reading the output at face value.
-
-| Field / behavior | Site | What it actually is |
+| Fact | Authored in | What breaks on a partial edit |
 |---|---|---|
-| `Hit.score` | `src/search.rs:876` | Not a ranking key. Exact-tier hits absent from the hybrid pool report `0.0` while ranked first; after reranking the hybrid tail mixes raw cross-encoder values with RRF values near 0.016. Sorting a response by `score` inverts the intended order. |
-| Exact-identifier tier case handling | `src/search.rs` exact-tier SQL vs `chunks_fts` | Exact chunk lookup uses `COLLATE BINARY`; FTS5 uses `unicode61` with case folding. `usestate` BM25-matches `useState` but can never enter the exact tier — the two legs of one query disagree on case sensitivity. |
-| Exact tier vs repository policy | `src/search.rs:1503-1506` | The exact tier bypasses `apply_repository_policy_penalty` entirely, so an exact definition in a `generated` or `test` scope outranks every hybrid hit — surfacing exactly the code the policy plane was built to demote. |
-| Scouting "token" budget | `src/scouting/mod.rs:2994-3027` | `enforce_context_budget` uses UTF-8 byte length as an upper bound on input tokens: roughly 3-4x conservative, and the error message quotes a byte count as a token count. |
-| `E###` citation line ranges | `src/scouting/repository.rs:587` | `MAX_DISK_EVIDENCE_CHARS = 12_000` truncates repository configuration evidence, and `line_count` is computed from the truncated content — the reported range describes the truncation, not the file. |
-| `files_scanned` in `calls` | `src/calls.rs:170` | `files.len()`, the candidate count computed before the loop, which may have broken early on `--limit`. Overstates work done. |
-| `--arg` filter completeness | `src/calls.rs:236-259` | The FTS pre-filter drops candidate files whose indexed chunks do not FTS-match every alphanumeric term. A call that exists in the AST but is not covered by an indexed chunk is a silent false negative — a soundness risk, not an optimization. |
-| `elided` source representation | `src/scout.rs:110-113` | `render_elided` falls back to the full span whenever oxc reports any diagnostic. A file with one type error gets no elision, and the representation still reads `elided`. |
-| `entity_occurrences` in overview | `src/surface.rs:446` vs `:503` | The per-file total is counted from `entity_sites` while `entity_inventory` counts `entity_occurrences` — two tables behind similarly named numbers, 1:1 only for sites whose file id is still present. |
-| `rendered_bytes` | `src/mcp.rs:1647-1656`, `src/surface.rs:1073-1082`, `src/compact.rs:447-474` | Every settle loop caps at 8 iterations and returns the last value without asserting equality. A non-converging document reports a `rendered_bytes` that disagrees with its real length. |
+| Schema version `29` | `src/store.rs:8` (const), `:246` (migration `UPDATE`), `:264` (`init_schema` seed) | Missing the `UPDATE` leaves migrated databases stamped at the old version, so they re-enter the legacy rebuild on every open, forever |
+| FTS5 column order `(content, name, symbols, path)` | `CHUNKS_FTS_CREATE` at `src/store.rs:31`; addressed positionally by `bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0)` at `src/search.rs:998` and `highlight(chunks_fts, 0, …)` at `src/search.rs:1114` | Reordering columns silently reweights ranking and highlights the wrong column. No compile or runtime error |
+| The 3-target closed-candidate threshold | `src/checker/enrich.rs:3644` (`map_occurrence`) and `:3448` (activation SQL) | Divergence admits or drops `likely` checker facts asymmetrically between staging and publication; changing either also requires bumping `CHECKER_SEMANTICS_FINGERPRINT` |
+| Crate version `0.4.0` | `Cargo.toml`; re-authored in `npm/cli/package.json:3` and its four `optionalDependencies` pins (`:44-47`), and in `checker/package.json:4` | `scripts/npm-package.mjs:149-154` only **warns** on wrapper mismatch before overwriting, and copies `checker/package.json` verbatim (`:180-183`) with no rewrite — the checker sidecar ships whatever it authored |
+| Rust toolchain `1.97.1` | `rust-toolchain.toml:2`, `ci.yml:15`, `ci.yml:68`, `release-npm.yml:23`, and the container tag `release-npm.yml:76` | Bumping the toolchain file alone leaves every CI and release build on the previous compiler with no signal |
+| `SKIP_DIRS` | Consulted from eight sites: `src/walk.rs:78`, `src/watch.rs:498`, `src/workspace.rs:544`, `:884`, `:980`, `:1044`, `:1120`, `:1193` | Each has different surrounding logic, so changing the list has non-obvious blast radius |
+| Node `22.19.0`, glibc `2.31` | Nine and four places respectively; only `MINIMUM_NODE_VERSION` (`src/llm/config.rs:14`) is checked against a running process | Documentation and launcher gates drift apart from the enforced one |
 
-Two more are worth stating in prose. `contains_code_identifier` (`src/search.rs:705-784`) is a naive byte-state lexer with no model of regex literals, JSX text, or `${}` substitutions; an apostrophe inside a regex flips it into `SingleQuoted` and swallows the following code. It is also applied only to the FTS5 fallback leg, not to the structured UNION over `refs`/`member_calls`/`entity_sites` — the "no string literal can produce an exact occurrence" property holds there because those columns are parser-derived, not because this function checked them. And `who_uses` pass 1 has no kind predicate (`src/query.rs:320-335`), so an `import` or `use` edge is reported as a "usage" beside real calls, while tier 3 has no receiver predicate at all (`src/query.rs:553`) — `who-uses get` returns every `.get()` in the allowed origins as `possible`.
+The version literal at `src/store.rs:246` has a second, subtler hazard: `rebuild_legacy_disposable_schema` writes `UPDATE meta SET value='29'` as a hardcoded string rather than interpolating `SCHEMA_VERSION`. The gate that decides whether to run the rebuild is also string-inequality-first — `version != "29"` and then a numeric bounds check — so a non-canonical stamp like `"029"` parses to 29, passes bounds, and runs the full rebuild anyway.
 
-## Invariants enforced only by convention
+## Invariants held by convention only
+
+- **`chunks_fts.rowid == chunks.id`.** FTS5 does not participate in SQLite foreign keys, so every deletion path must remove the mirror row by hand. Exactly two do: `store::delete_file` (`src/store.rs:1122`) and the drop-and-recreate in `reset_extraction_state` (`src/store.rs:1078`). A third deletion path added anywhere would leave orphaned FTS rows that surface as hits for deleted code. Hard to fix properly; easy to violate.
+- **Children-first deletion.** `reset_extraction_state` deletes `files` (`src/store.rs:1075`) *before* `resolved_edges` and `graph_nodes`. It is safe only because `graph_nodes.file_id` (`src/store.rs:627`) carries no foreign key. The invariant is upheld by a missing constraint, not by the ordering it appears to rely on. Likewise the legacy migration's drop ordering runs before `foreign_keys=ON` is applied (`src/store.rs:166`), so it is unenforced.
+- **`ledger::claim_run` callers must not hold a transaction.** It opens its own `BEGIN IMMEDIATE` and documents the constraint in a comment (`src/scouting/ledger.rs:69-72`). Nothing enforces it.
+- **The plan_members session reuses one request id** for begin/add/finish/next, breaking the otherwise universal one-id-per-frame rule in the checker protocol. A stray frame carrying that id would poison the reused Rust client; the Node side guards it with `canceledPlanId` (`checker/src/main.mjs:242-247`), which drops *every* subsequent frame with that id until a new `plan_members_begin` arrives.
+- **`MAX_PROTOCOL_LINE_BYTES` is outbound-only in Rust.** The check lives in `Writer::send_with_id` (`src/checker/process.rs:122-127`); the stdout reader (`:330-344`) is a plain `BufReader::lines()` with no cap. Only Node caps inbound frames.
+- **Watch cancellation contracts are `debug_assert!` only.** `src/watch.rs:857` and `:996` assert that a canceled embed report implies a superseded generation. In a release build a spurious canceled report is recorded as a clean generation.
+
+## Approximations that read like answers
+
+Three planes can close a member call. Their precedence is enforced by two vetoes, both of which remove evidence rather than add it — which is what makes a false positive in the cheapest plane expensive.
 
 ```mermaid
 flowchart LR
-  CARGO["Cargo.toml version"] --> NPMPKG["scripts/npm-package.mjs"]
-  CARGO --> BOOT["scripts/npm-bootstrap-publish.mjs"]
-  CARGO --> RELSH["scripts/package-release.sh"]
-  CARGO --> TAG["release-npm.yml tag check"]
-  RTOOL["rust-toolchain.toml 1.97.1"] -.->|"no cross-check"| CI1["ci.yml:15"]
-  RTOOL -.-> CI2["ci.yml:68"]
-  RTOOL -.-> REL1["release-npm.yml:23"]
-  RTOOL -.-> REL2["release-npm.yml:76 container tag"]
-  GLIBC["MINIMUM_GLIBC 2.31"] -.-> L1["npm/cli/bin/jscout.mjs:21"]
-  GLIBC -.-> L2["scripts/npm-package.mjs:19"]
-  GLIBC -.-> L3["release-npm.yml:93"]
-  GLIBC -.-> L4["npm/cli/README.md:64"]
-  SCHEMA["store.rs SCHEMA_VERSION"] -.-> S1["store.rs:220 migration UPDATE"]
-  SCHEMA -.-> S2["store.rs:238 init seed"]
+  CALL["member call site x.run()"] --> VF["value_flow + receiver_flow<br/>bounded lexical proof"]
+  VF -->|fact| EVF["resolved_edges<br/>provenance receiver-value-flow<br/>always likely"]
+  VF -->|refuses| CHK["checker projection<br/>likely or possible"]
+  CHK -->|fact| ECHK["resolved_edges<br/>provenance checker"]
+  CHK -->|refuses| HUB["project_member_calls hub<br/>global name match"]
+  HUB -->|prop matches no symbol| NONE["no edge at all"]
+  HUB --> ECAND["member_candidate edges<br/>always possible"]
+  EVF -.->|veto at projection<br/>structural.rs:2286| CHK
+  EVF -.->|veto at read time<br/>query.rs:516-523| ECAND
+  ECHK -.->|veto only when certain or likely| ECAND
 ```
 
-Solid arrows are checked couplings; dashed arrows are duplicated literals with no verification. The crate version is the one identity that is actually enforced — `scripts/npm-package.mjs` and `scripts/npm-bootstrap-publish.mjs` read it by regex, `scripts/package-release.sh:8` by awk, and `release-npm.yml:141-149` fails a *tag* release when the git tag disagrees. Everything dashed can drift silently. Bumping `rust-toolchain.toml:2` alone leaves CI and the release on the old compiler. `SCHEMA_VERSION` at `src/store.rs:8` is repeated in the migration's `UPDATE meta SET value='26'` (`src/store.rs:220`) and the `init_schema` seed insert (`src/store.rs:238`); bumping only the constant leaves migrated databases stamped at the old value and re-enters the migration on every open.
+The dashed edges are the risk. `EVF` vetoes `CHK` unconditionally and at projection time, so a wrong value-flow answer is never corrected by the TypeScript sidecar — not even with `enrich --all`, which gates on `!occurrence.value_flow_resolved` outside its `include_all` disjunction (`src/checker/enrich.rs:1204`). `EVF` and `ECHK` also veto `ECAND` at read time through a `NOT EXISTS` on `$.memberCallId` (`src/query.rs:516-523`), and that gate carries no `kind` predicate: any future edge kind that writes `memberCallId` would silently blank hub candidates. The `NONE` branch matters too — `project_member_calls` bails before minting anything when the property name matches no indexed symbol (`src/structural.rs:2039-2041`), so "the occurrence keeps its `possible` hub edge" is false for those calls; they keep nothing.
 
-Inside the crate the same pattern recurs. `file_role::penalty` maps any unrecognized role to `0.0` (`src/file_role.rs:103`), so adding a value to `file_role::ALL` without touching `penalty` silently zeroes those files out of ranking. `SearchSettings::default()` and `ExpansionSettings::default()` (`src/config/model.rs:63-113`) restate the defaults `RuntimeConfig::load` applies and are used by MCP tests — nothing forces the two to agree. `chunks_fts.rowid == chunks.id` is maintained by hand on insert, per-file delete, and drop/recreate, because FTS5 has no foreign-key awareness. Every `vec_*` statement in `src/embed.rs` is a `format!`-built string; safety rests on a `1..=8192` range check on a `usize` (`src/embed.rs:1104`) and a digits-only re-validation in the migration (`src/store.rs:176-180`). `reset_extraction_state` explicitly deletes 19 tables but omits `symbols`, relying on FK cascade from `files` — which breaks the children-before-parents discipline stated in the comment directly above it (`src/store.rs:933-935`) and makes adding a new `files`-referencing table easy to get wrong.
+The value-flow plane's own bounds are worth stating plainly, because its output carries `likely` with no marker of them. It is branch-insensitive by construction: `conditional(kind) { return kind ? new A() : new B() }` is rejected as an expression shape, but an `if`-chain factory unions its branches, so `openDatabase(path, {driver})` emits both adapters at `likely`. `this.method()` resolves against the enclosing class's own or inherited method and skips the construction-identity check entirely (`src/structural/receiver_flow.rs:851`); a subclass override is not modelled. One `eval` identifier or one `with` statement anywhere in a file zeroes that file's flow facts. And only `StaticMemberExpression` callees produce a receiver flow (`src/value_flow.rs:617`), so `obj["run"]()` is outside the plane. Measured on ai-pipe, 499 of 557 answered occurrences are in tests and 9 in `server/` — the plane answers construction sites, and construction sites are mostly tests.
 
-Two schema asymmetries are latent bugs rather than conventions. `semantic_relations.dst_artifact_id` references `semantic_artifacts(id)` without `ON DELETE CASCADE` while `src_artifact_id` has it (`src/store.rs:775-776`): deleting a summarized child fails, deleting the summarizing parent succeeds. And `repository_current_classifications.subject_kind` allows only `('package','area')` while the durable `repository_classifications.subject_kind` also allows `'project'` (`src/store.rs:723` vs `:676`) — a project-kind classification can be recorded but never projected as current.
+Elsewhere the approximations are cheaper but equally invisible:
 
-## Footguns for a new contributor
+- `should_skip_minified` inspects only the first five lines (`src/dependency.rs:297`); a bundle whose banner comment occupies line one escapes, and a legitimately long single-line data file is dropped.
+- `pnpm_workspace_globs` (`src/workspace.rs:278`) is a hand-rolled YAML subset. Anchors, multi-line scalars, or a nested `packages:` key are mis-parsed rather than reported.
+- `file_role::has_file_marker` (`src/file_role.rs:135`) is a substring test over the whole filename, so `manifest.test.helpers.ts` classifies as `test`.
+- `contains_code_identifier` (`src/search.rs:807`) models neither regex literals, JSX text, nor `${}` substitutions: an apostrophe inside a regex flips the lexer into single-quote state and swallows following code.
+- `reranker.max_chars` (default 4000) is applied by `truncate_utf8` as a **byte** budget (`src/search.rs:2291`), as is `embed_text`'s 24,000 (`src/embed.rs:506`). Multibyte source gets materially less context than either name implies.
+- The scouting context ceiling is UTF-8 byte length (`src/scouting/mod.rs:3016`), which systematically over-refuses evidence packs that would fit the model's window.
+- `is_in_skipped_directory` matches `SKIP_DIRS` against every root-relative component (`src/walk.rs:74-79`), so an authored source directory named `out` or `dist` is invisible to indexing regardless of gitignore.
 
-`register_sqlite_vec` uses `std::mem::transmute` on a function pointer inside `unsafe` and installs the result as a *process-wide* SQLite auto-extension (`src/store.rs:13-25`). Every connection opened anywhere in the process after the first `store::open*` inherits vec0, including ones that never asked for it. Separately, `ensure_vector_table` is called from inside `delete_vector_rows_for_file` and `clear_vector_rows` (`src/embed.rs:1804`, `:1818`), so a code path whose job is deletion can CREATE a virtual table as a side effect.
+Chunking carries two boundary properties that the code comments assert and the code does not deliver. `with_leading_comment` (`src/chunk.rs:388-402`) absorbs a comment backward into the following unit even though `units_for_statement` already emitted a header unit whose span reaches the first body member — so adjacent chunks *can* share bytes, and offset-containment attribution is ambiguous over that overlap. And type erasure is asymmetric: `units_for_function` returns early on `f.declare` (`src/chunk.rs:205`), but `units_for_class` (`:273`) and `units_for_var` (`:318`) have no such check, so `declare class C {}` and `export declare const x: T` do produce chunks with names. A fully ambient `.d.ts` is not empty.
 
-Every savepoint error arm swallows its unwind: `let _ = conn.execute_batch("ROLLBACK TO …; RELEASE …")` at `src/store.rs:869`, `src/embed.rs:1136-1139`, `:1319-1323`, `:1355-1358`, `:1471-1474`, and elsewhere. A failure to unwind leaves an open savepoint on the connection with no diagnostic.
+## Silent overrides at the user boundary
 
-The module layout will surprise anyone navigating by grep. Eighteen modules are `foo.rs` plus a sibling `foo/tests.rs` (18 files named `tests.rs`, 19,253 lines), with `src/main_tests.rs` a nineteenth sibling file under a different name, while `src/store.rs`, `src/calls.rs`, `src/chunk.rs`, `src/dependency.rs` and others keep inline `#[cfg(test)] mod tests`. `src/commands/` has no `tests.rs` at all; its coverage comes from `src/main_tests.rs` reached through a `#[cfg(test)] use` re-export block at `src/main.rs:70-76` that exists purely so the test file can see `resolve_flag`, `or_configured`, `effective_search_response_byte_limit`, `render_cli_neighborhood`, and `render_semantic_memory_text`.
+Ranked by how surprising the outcome is.
 
-Configuration has two contributor traps. `--config` is `global = true` (`src/cli.rs:15`) and is the only path resolved against the process cwd rather than the canonical repository root, so `jscout config init /repo --config rel.toml` writes relative to cwd (`src/config/load.rs:919-925`). And `main.rs` dispatches `Command::Config` at `src/main.rs:53-54` *before* `RuntimeConfig::load`, so `jscout config show|validate|init` never emits the legacy-env migration warning at `src/main.rs:57-64` — the exact command you would reach for to debug a broken config deliberately skips the warning path. One key has two behaviors for one value: `reranker.top > 100` is a hard error from the config file but is silently clamped to 100 when it arrives via `JSCOUT_RERANK_TOP` (`src/config/load.rs:691-697`). The non-loopback bind guard fires only when `inference.host` came from the config file (`src/config/load.rs:649-655`), so `JSCOUT_INFERENCE_HOST=0.0.0.0` bypasses the Rust check entirely and leaves the Python service's own `JSCOUT_INFERENCE_ALLOW_REMOTE` check as the only guard. See [12-configuration.md](12-configuration.md) for the full precedence model.
+1. **`--exhaustive` overrules configuration, not just flags.** `src/commands/mod.rs:240-247` computes `vector`, `rerank`, `include_memory`, and `expand` as `!exhaustive && resolve_flag(...)`. A user with `search.vector = true` in `.jscout.toml` gets a purely lexical result with no diagnostic saying the config was ignored. Clap only *conflicts* the explicit flags (`src/cli.rs:98`).
+2. **`inference.host` loopback enforcement is provenance-dependent.** The guard fires only when `resolver.sources["inference.host"] == ValueSource::Config` (`src/config/load.rs:649`). `JSCOUT_INFERENCE_HOST=0.0.0.0` binds remotely without tripping `allow_remote`; only `inference/service.py:430-436` still catches it.
+3. **The MCP request log records complete unredacted tool `arguments`,** including natural-language queries, and is enableable from `.jscout.toml` alone via `telemetry.request_log` (`src/mcp.rs:362-370`) — no flag required.
+4. **MCP structured transport is client-sniffed.** `ResultTransportPolicy::Auto` resolves to Structured only for `clientInfo.name == "codex-mcp-client"` at version ≥ 0.147.0 (`src/mcp.rs:117-126`). Every other client, and any session where `initialize` never arrived, silently stays on text.
+5. **`reranker.top = 150` errors from the config file but clamps to 100 from legacy env** (`src/config/load.rs:691-697`).
+6. **Three commands have no `--database` flag** — `events` (`src/commands/mod.rs:317`), `who-uses` (`:623`), `neighborhood` (`:640`) — yet they use `runtime.effective.database.path`. An eval harness that points `search` at a database cannot point these three at the same file.
+7. **`cmd_who_uses` calls `std::process::exit(1)` on "no symbol found"** (`src/commands/core.rs:421`). It is the only command in the binary that reports an empty result as process failure, it runs no destructors, and it prints a bare stderr line instead of an `anyhow` chain.
+8. **CLI and MCP resolve `who_uses` differently.** The CLI upgrades a plain name spec to an exact anchor via `unique_anchor_for_symbol_target` (`src/commands/core.rs:474`); MCP's `symbol_targets` (`src/mcp.rs:1515-1543`) does so only when the caller passed `anchor`. Same tool name, two hub-suppression behaviors.
+9. **`file_outline` resolves `path` with `f.path = ?1 OR f.path LIKE '%' || ?1`** (`src/mcp.rs:1218`), so a short suffix matches several files and the outline interleaves them. "Unique suffix" is schema prose only.
+10. **`--exhaustive --limit 500` is not a clap error.** It fails at `src/search.rs:1623-1627` after the database is already open; only the *omitted*-limit path is clamped by `resolve_search_limit`.
+
+## Durability, concurrency, and operational risk
+
+```mermaid
+stateDiagram-v2
+  [*] --> Extracting
+  Extracting --> MarkersDeleted: delete snapshot markers, indexer.rs 495-498
+  MarkersDeleted --> Committed: COMMIT, indexer.rs 508
+  Committed --> Unpublished
+  Unpublished --> Republished: identity unchanged, publish all three atomically
+  Unpublished --> Rebuilt: rebuild_projection_with_timing commits two markers
+  Rebuilt --> HashWritten: resolution_hash upserted separately, indexer.rs 568-572
+  Republished --> Serving
+  HashWritten --> Serving
+  Serving --> [*]
+```
+
+The `Unpublished` state is the operational sharp edge. Between the `COMMIT` and marker republication, `store::open_path_read_only` hard-fails, so queries and MCP clients get an error rather than the last good snapshot — and this applies to every generation, including a completely no-op incremental refresh. The two exits from `Unpublished` are not symmetric: only the reuse path publishes all three markers inside one `BEGIN IMMEDIATE`, while the rebuild path commits `snapshot` and `projection_version` in the projection transaction and upserts `resolution_hash` afterward as a separate autocommit statement. No reader observes the difference because `open_path_read_only` gates on the first two only (`src/store.rs:84-98`).
+
+Around that: no `busy_timeout` is set anywhere in `src/store.rs` — the only caller that sets one is `src/watch.rs:1314`, on its own writer connection — so with WAL and a concurrent watch, MCP, and CLI on one database, a contending writer gets `SQLITE_BUSY` immediately rather than backing off. There is no `VACUUM`, no `ANALYZE`, and no `INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')` anywhere in the crate: repeated resets leave the file at its high-water page count, the FTS b-tree unmerged, and the planner running without statistics. Watch retry backoff is uncapped in attempt count (`src/watch.rs:371-386`) — a permanently failing refresh retries forever at 30s with no escalation. `register_sqlite_vec` (`src/store.rs:13-25`) installs the vec0 entry point process-wide under a `Once`, so after the first `store::open*` every `Connection::open` in the process has vec0 loaded, including in-memory test fixtures that never asked.
+
+Two silent-degradation paths are worth naming because their symptom is "worse results", not "an error". Any semantic artifact write clears the sync markers for *all* embedding profiles (`src/semantic.rs:860` → `src/embed.rs:1180-1186`), so a scout run leaves semantic vector retrieval in lexical order until `jscout embed --semantic` runs. And vector search does not refuse when unready: `record_vector_ranking` (`src/search.rs:2295-2311`) prints `vector search unavailable: …` and completes BM25-only, so the `bail!`s inside `ready_search_profile` never reach the user as a failed search.
 
 ## Dead and vestigial code
 
-There are zero `TODO`, `FIXME`, `XXX`, or `HACK` comments in `src/`, `checker/src/`, `gateway/src/`, or `inference/`. What exists instead is unreachable surface:
-
-| Item | Site | Status |
+| Item | Location | Status |
 |---|---|---|
-| `clear_checker_plane` | `src/structural.rs:615` | `#[cfg(test)]`, sole caller `src/structural/tests.rs:1416`. Its doc comment at `:611-614` still says "Watch uses this before an explicit enrichment cycle" — stale. |
-| `scout_workflows` | `src/scouting/mod.rs:302` | `#[cfg(test)]`-only; production always uses `scout_workflow_plan`. |
-| `compute_snapshot` | `src/structural.rs:373` | `#[cfg(test)]`; production uses `compute_snapshot_with_resolution`. |
-| `cache_retention` | `gateway/src/completion.mjs:379-380` | Reads a request field that `CompleteRequest` (`src/llm/protocol.rs:26-42`) does not have. Unreachable from Rust. |
-| `validate_inputs` | `checker/src/main.mjs:110`, `checker/src/worker.mjs:838` | A wire request kind with no Rust `Outbound` variant at all. `resolve_member` is likewise Rust-side `#[cfg(test)]` only. |
-| `names_concept` | `src/store.rs:781` | A reserved CHECK value with no writer; the comment says current concepts use `related_to` in the opposite direction. |
-| `config_explicit` | `src/config/load.rs:910`, `src/config/model.rs:21` | Set and serialized, read nowhere in the crate; reaches users only through `config show --json`. |
-| `checker_input_files` | `src/store.rs` migration drop list | A `DROP TABLE IF EXISTS` for a table `init_schema` no longer creates. |
-| `DependencyLimits` overrides | `src/dependency.rs` | Every construction uses `Default`, so the 10,000-file / 100 MiB / 2 MiB budgets are effectively hardcoded with a struct's worth of ceremony. |
-| musl launcher branch | `npm/cli/bin/jscout.mjs:42-51` | `platformKey` returns `linux-<cpu>-musl`, and no `@jscout/linux-*-musl` package is ever built — musl users get a missing-optional-dependency message rather than the glibc error the code was written to produce. |
-| `ProcessGateway::poisoned()` | `src/llm/process.rs:390-393` | `#[cfg(test)]`. Neither client restarts a sidecar; "a poisoned client is never reused" is enforced by construction (a fresh sidecar per project), not by any production check. |
+| `checker_input_files` drop | `src/store.rs:210` | Table is not created by `init_schema`. Harmless, but reads as if it exists |
+| `validate_inputs` protocol op | `checker/src/main.mjs:263`, `checker/src/worker.mjs:1197-1219` | Implemented on both Node sides; `Outbound` (`src/checker/protocol.rs:7-38`) has no such variant, so Rust never sends it |
+| `resolve_member` | `src/checker/protocol.rs:21-24` | `#[cfg(test)]`-only in Rust; the worker's implementation duplicates ~50 lines of `resolveInProject` |
+| musl launcher branch | `npm/cli/bin/jscout.mjs:42-51` | `platformKey` can return `linux-x64-musl`, but no musl package is built or declared, so a musl user gets a missing-optional-dependency error instead of the informative glibc message |
+| `"unknown"` file role | `src/file_role.rs:11`, `:14`, `:98`; default at `src/store.rs:285` | `classify` never returns it. Rows get it only from a default-valued insert, so `DEFAULT_EXPANSION` carries a slot the classifier cannot fill |
+| Method-chunk fallback in `find_symbols_in_origins` | `src/query.rs:590-627` | `src/graph.rs:220-231` already registers every method of a *named* class in `symbols`, and method chunks exist only for oversized classes. Reachable only for methods of anonymous classes |
+| `scout_workflows` | `src/scouting/mod.rs:301-326` | `#[cfg(test)]` only; production goes through `scout_workflow_plan` |
+| `entity_inventory_truncated` | `src/surface.rs:563` | Hardcoded `false` at construction; there is no inventory limit option, so it flips only via byte-budget shedding at `:1037` |
+| `start < 0` cursor guard | `src/search.rs`, `decode_exhaustive_cursor` | Unreachable: `i64::from_str_radix` over 16 unsigned hex digits rejects out-of-range values one line earlier |
+| `--arg-position` without `--arg` | `src/calls.rs:337-338` | `match_arguments` returns before the position loop, so `--arg-position 3` alone matches every call |
 
 ## Testing gaps
 
-409 `#[test]` functions cover 78 `.rs` files, but the distribution is uneven in a way that tracks risk poorly. Six modules have no tests whatsoever: `src/heur.rs` (305 lines, the AST heuristics every extractor depends on), `src/graph.rs` (369 lines, the extraction entry point), `src/query.rs` (646 lines, export-chain resolution and all three `who_uses` tiers), `src/checker/mod.rs` (113), `src/llm/mod.rs` (236), and `src/scouting/workflow.rs` (448, the only scouting file without a test module). `src/cli.rs` (878) and `src/commands/` (1,827) contain zero `#[test]` and are reached only through the 11 tests in `src/main_tests.rs`. `src/query.rs` is the sharpest of these: the inferred-flag save/restore, the export-chain visited set, and the hub-attributed dedup are covered only transitively — for instance by `src/mcp/tests.rs:1104-1125`, which pins one `possible` row.
+The Rust suite is dense — 474 tests over 82 files — and its gaps are specific rather than general.
 
-Around the crate: `cargo test` and `cargo clippy` in `ci.yml` do not pass `--locked`, so lock drift surfaces only in the release-package job. `cargo test --all-targets --all-features` runs `--all-features` over an empty feature set — `Cargo.toml` has no `[features]` section, so the flag is inert. No workflow invokes the root `npm test` or `npm run test:inference`, leaving the eval-script cases, demo cases, and Python cases outside the merge gate; and `package.json:9` hand-enumerates test paths instead of globbing, so `scripts/eval-workflow-scope-report.test.mjs` exists on disk and runs nowhere. There is no JavaScript linting or formatting anywhere — no eslint, no prettier — for roughly 30 `.mjs` files, while Rust gets `fmt` plus `clippy -D warnings`. No Rust test exercises the legacy-env branch of the config `Resolver`: `set_var` appears nowhere under `src/`, so all 30 legacy variable mappings in `src/config/load.rs` and the migration warning at `src/main.rs:57-64` are untested. Edition 2024 makes env mutation `unsafe`, which is the reason and also the thing that makes this gap hard to close without a process-spawning integration test. Finally, the scouting prompt strings (`src/scouting/mod.rs:2698-2708`, `:2755-2769`, `:2874-2889`, `:2926-2937`, `src/scouting/repository.rs:826`) are never asserted on anywhere, so a prompt edit that contradicts its own JSON schema would pass the entire suite.
+- **`src/value_flow.rs` and `src/structural/receiver_flow.rs` have no unit tests at all.** 1,774 lines whose only coverage is behavioral, through temp-repo indexing in `src/structural/tests.rs`. This is the newest plane and the one with veto power over the checker.
+- **`scripts/eval-workflow-scope-report.test.mjs` runs nowhere.** The root `package.json` `test` script hand-enumerates twenty `.test.mjs` paths and omits it. Worse, no workflow invokes the root `npm test` at all — `ci.yml:36` and `:50` run `npm test --prefix gateway` and `--prefix checker` only — so all 60 `scripts/*.test.mjs` cases, the 4 `examples/graph-memory` cases, and the 7 `inference/test_service.py` cases are ungated.
+- **No JavaScript lint or format check exists** for the ~30 `.mjs` files across `gateway/`, `checker/`, `npm/`, `bench/`, `examples/`, and `scripts/`, while Rust gets `cargo fmt --check` plus `clippy -D warnings`.
+- **`x86_64-apple-darwin` is cross-compiled and never executed.** The macOS smoke step is gated `if: matrix.native` (`release-npm.yml:56`), and the only architecture check in the repo — `EXPECTED_ARCHITECTURE` in `scripts/npm-bootstrap-publish.mjs:29-34` — runs exclusively in the one-time bootstrap path.
+- **Neither `cargo test` nor `cargo clippy` passes `--locked`** (`ci.yml:20,22`), so lockfile drift is caught only in `release-package`, where `scripts/package-release.sh:22,26` builds `--locked`.
+- **No test asserts workflow reuse across an unrelated index change**, unlike the card and summary equivalents — which matters because workflow fingerprints fold in `structural::current_snapshot` (`src/scouting/mod.rs:3039`) while cards, summaries, and concepts are snapshot-free. Every re-index, of any file, invalidates every completed workflow run's reuse.
+- **The erasure test at `src/chunk.rs:549` does not cover `declare class` or `declare const`**, which is why the asymmetry above went unnoticed.
+- **`ResponseBudgetTooSmall` is downcast only in tests.** `grep` finds `downcast_ref::<ResponseBudgetTooSmall>` nowhere in production; at the MCP boundary the machine-readable `minimum_bytes` floor degrades to a `Display` string.

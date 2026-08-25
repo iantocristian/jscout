@@ -1,172 +1,225 @@
 # End-to-end execution traces
 
-This document follows four control paths from process entry to the byte the user or agent sees, in the order the code actually runs them, rather than describing subsystems in isolation. The point is to locate the seams: where configuration stops being consulted, where a transaction opens, where readers become able to observe a new snapshot, and where an error kills the command versus where it is recorded as an exclusion and the run continues. Each trace ends with the failure modes reachable along that specific path.
+Four control paths carry almost all of jscout's behaviour: a cold index that walks a repository and publishes a structural snapshot, an exhaustive lexical query that pages a complete match set under a byte budget, a ranked query whose exact tier runs ahead of the hybrid pipeline, and a single-file edit arriving through `notify` while `watch` runs. Each is followed step by step at commit `4de5622`, naming the function and line that does the work, and each ends with where the path breaks. The traces are deliberately concrete about ordering — several correctness properties (transaction boundaries, cursor stability, tier-before-fusion) are properties of *when* things happen, not of what they compute.
 
-## Trace 1 — cold index of a fresh repository
+---
 
-`jscout index <root>` on a repository with no `.jscout.db` and no `.jscout.toml`. What to look for in the diagram: configuration is resolved once, in `main`, before any command body exists; and the single long transaction that spans source extraction *and* dependency reads.
+## Trace 1 — Cold index: `jscout index /repo`
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Shell
-    participant Main as main
-    participant Cfg as RuntimeConfig
-    participant Disp as run_command
-    participant Store as store
-    participant Idx as index_repo_impl
-    participant Proj as structural
-    Shell->>Main: argv
-    Main->>Main: Cli::parse
-    Main->>Cfg: load(command.root(), cli.config)
-    Cfg-->>Main: EffectiveConfig plus ValueSource map
-    Main->>Main: warn on LegacyEnv keys
-    Main->>Disp: run_command(command, runtime)
-    Disp->>Store: open_path(database)
-    Store-->>Disp: connection at schema v26
-    Disp->>Idx: refresh_repo_with_options
-    Idx->>Idx: BEGIN — walk, extract, deps
-    Idx->>Store: COMMIT — snapshot keys deleted
-    Idx->>Idx: resolve_module_edges
-    Idx->>Proj: rebuild_projection_with_timing
-    Proj->>Store: BEGIN IMMEDIATE — write snapshot last
-    Idx-->>Disp: IndexOutcome
-    Disp-->>Shell: indexed N files ...
-```
-
-1. `main` calls `Cli::parse()` (`src/main.rs:52`) over the clap tree in `src/cli.rs`. `Command::Config` is dispatched *before* configuration loads (`src/main.rs:54`) — it is the one command allowed to run against an unparseable file.
-2. `RuntimeConfig::load(command.root(), cli.config.as_deref())` (`src/main.rs:56`, `src/config/load.rs:343`). **This is the only place configuration resolves.** It canonicalizes the root, reads `root/.jscout.toml` (`FILE_NAME`, `src/config.rs:16`) unless `--config` names another path, requires `version = 1` (`src/config.rs:17`), and then resolves every key through a `Resolver` (`src/config/load.rs:206`) with three tiers: file value, then `JSCOUT_*` legacy environment variable, then built-in default. Each key records a `ValueSource`.
-3. The resolved struct is serialized and `blake3`-hashed into `runtime.fingerprint` (`src/config/load.rs:905`). Nothing downstream re-reads the environment or the file; every command body treats `runtime.effective.*` as plain data.
-4. `runtime.legacy_environment_keys()` filters for `ValueSource::LegacyEnv`; a non-empty list prints `warning: legacy environment configuration supplied …; migrate these settings to .jscout.toml` on stderr (`src/main.rs:57-64`). Non-fatal.
-5. `run_command` (`src/commands/mod.rs:153`) binds `configured_database = runtime.effective.database.path` and enters the `Index` arm (`:159-178`). Dependency selection is decided here: `--no-deps` wins, an empty `--deps` falls back to `runtime.effective.index.dependencies`, and a non-empty `--deps` replaces the configured list wholesale rather than appending.
-6. `cmd_index` (`src/commands/core.rs:237`) starts a wall clock and calls `open_database_for_write` (`:11`) → `store::open_path` (`src/store.rs:105`). This registers the sqlite-vec extension, creates the file, sets `journal_mode=WAL` / `synchronous=NORMAL` / `foreign_keys=ON`, runs `init_schema` (`:234`) for the base tables plus the `chunks_fts` virtual table, and stamps `meta.schema_version = "26"` (`src/store.rs:8`).
-7. `indexer::refresh_repo_with_options` (`src/indexer.rs:227`) enters `index_repo_impl` with `IndexMode::FullRefresh`, `CheckerRetention::Drop`, and `IndexOperation::new(&OsFileSystem)` — the filesystem seam from `src/fs_ops.rs` that lets tests substitute failing reads.
-8. `walk::source_inventory` (`src/indexer.rs:317`, `src/walk.rs:98`) traverses with `ignore::WalkBuilder`, rejects anything under `SKIP_DIRS` (`src/walk.rs:11`), keeps the eight JS/TS extensions (`src/walk.rs:8`), and sorts the result. The sort is what makes chunk ids and therefore the snapshot digest reproducible.
-9. `conn.execute_batch("BEGIN")` (`src/indexer.rs:356`). The comment above it states the intent: source extraction and every selected-dependency read happen before the publication boundary, so a transient corpus failure rolls back and leaves the previously published snapshot intact.
-10. Because `mode == FullRefresh`, the loaded `path → (id, hash, role)` map is discarded (`src/indexer.rs:378-382`) and `store::reset_snapshot_state` truncates the disposable plane instead of cascading per-file deletes (`src/indexer.rs:391-401`). Content-addressed `embeddings`, `semantic_*`, and `scout_runs` survive.
-11. Per file: `operation.fs.read_to_string`, then a three-way error triage (`src/indexer.rs:412-423`) — `io_policy::is_inventory_race` skips silently (the inventory was never atomic), `is_retryable` aborts the phase, anything else becomes a `read` rejection. Surviving files go through `extract_file` (`:440`) — one `oxc` arena, `Parser::parse`, `SemanticBuilder`, `Chunker`, `graph::extract` — and `insert_file` (`:453`), which writes `files`, the fact tables, and a parallel explicit row into `chunks_fts` because FTS5 is not foreign-key aware.
-12. Dependency discovery, planning, and file preparation run inside the same transaction (`src/indexer.rs:489-492`), then the three publication meta keys are deleted and `COMMIT` runs (`:494-510`).
-13. `dependency::synchronize_instances` and `index_dependency_files` take their own transactions (`src/indexer.rs:512-513`); `embed::materialize_cached_embeddings` (`:515`) rebuilds the `vec0` tables from the surviving embedding cache, which is why a full re-index does not force re-embedding.
-14. `resolve_module_edges` (`src/indexer.rs:521`) rebuilds `module_edges` from scratch with three resolvers — first-party with workspace aliases, a no-tsconfig fallback so a broken `extends` degrades instead of dropping every edge, and an alias-free resolver for dependency importers.
-15. `compute_resolution_hash` and `compute_snapshot_with_resolution` (`src/indexer.rs:526-527`, `src/structural.rs:383`, `:427`) produce the identity pair. The resolution hash exists separately because module resolution reads tsconfigs, manifests, and `node_modules` layout — inputs that are not indexed content and therefore not covered by the file digest.
-16. `rebuild_projection_with_timing` (`src/indexer.rs:566`, `src/structural.rs:474`) opens `BEGIN IMMEDIATE`, deletes and rebuilds `graph_nodes` / `resolved_edges` / `entities`, runs six projection stages, and writes `meta.snapshot` and `meta.projection_version` as the **last two statements before COMMIT** (`src/structural.rs:589-598`). Readers require both keys (`src/store.rs:83-97`), so this is the moment a concurrent reader can observe the new index.
-17. `recon::reconcile_file_policy_after_index` (`src/indexer.rs:578`) rebuilds the reconnaissance acceleration tables and swallows its own errors by design. `cmd_index` then prints `indexed N files (removed=R, rejected=J) — C chunks, F refs in …` and, since `extraction_reset` is always true here, `snapshot refresh: rebuilt disposable structural state` (`src/commands/core.rs:258-268`).
-
-### Where this fails
-
-A non-existent root fails in step 2 with `repository root does not exist: <path>`, before SQLite is touched. Unparseable TOML, an unknown key (every config struct is `deny_unknown_fields`), or a wrong `version` also fail in step 2. An existing database below `DURABLE_SCHEMA_FLOOR = 16` or above 26 fails in step 6 with a message that tells the user to preserve the old file if its embedding cache matters (`src/store.rs:129-139`). A retryable read error anywhere between steps 9 and 12 rolls the whole transaction back, so the previously published snapshot survives a partial run. Corpus-level problems are deliberately *not* failures: an unreadable file, an unparseable file, or an inaccessible subtree become rejection rows printed to stderr by `indexer::report_rejections` (`src/indexer.rs:79`) and counted in `rejected`. The `unchanged` counter is deliberately not printed here — the comment at `src/commands/core.rs:255-257` notes it would always read 0 and misreport a rebuild as broken change detection.
-
-## Trace 2 — an identifier-shaped query
-
-`jscout search "getUserProfile"`. The interesting part is that the exact-identifier tier (G17) is the *first* thing the ranker does, and its output occupies the head of the result list regardless of what BM25, the vector index, or the cross-encoder produced.
-
-1. Same `main` preamble; the `Search` arm destructures roughly thirty flags (`src/commands/mod.rs:205-236`). Each tri-state pair resolves through `resolve_flag(enable, disable, configured)` (`:115`) where disable wins; `--lexical-only` folds into both `no_vector` and `no_rerank` (`:237-238`). List arguments *replace* the configured default via `or_configured` (`:121`); they never append.
-2. `embed::Provider::from_settings` is constructed only if vector retrieval survived (`src/commands/mod.rs:245-251`). `effective_search_response_byte_limit` (`:129`) yields `usize::MAX` for `--debug-json` without an explicit `--response-bytes`, otherwise the configured `search.response_bytes` (default 24 000, `src/search.rs:11`).
-3. `cmd_search` opens read-only (`src/commands/core.rs:124`, `src/store.rs:53`). This path never creates or migrates: the schema version must equal 26 exactly, and both `meta.snapshot` and `meta.projection_version` must exist (`src/store.rs:83-97`).
-4. `search::search` (`src/search.rs:1024`) validates arguments and wraps the entire multi-statement read in `store::with_read_snapshot` — `SAVEPOINT jscout_search` (`src/search.rs:1047`) — pinning one SQLite snapshot across ranking, memory attachment, and expansion.
-5. `ranked_hits` (`src/search.rs:1428`) computes pool sizes (`candidate_pool_limits`, `:1560`) and then calls `exact_intent_candidates` (`:1436`, defined `:428`) **before** `bm25_ranking` and before any vector call.
-6. `exact_intent_tokens` (`src/search.rs:371`) splits the query on anything outside `[A-Za-z0-9_$]`. A single-token query that starts with a letter, `_`, or `$` is a pure identifier intent (`is_identifier_token`, `:402`), so every token is admitted. In a mixed natural-language query only `is_code_shaped_identifier` tokens qualify (`:413`) — leading or embedded `_`/`$`, a leading capital, or an internal capital — so plain English words never enter this tier.
-7. `occurrence_limit` is the full per-identifier window for a pure identifier lookup and `1` otherwise (`src/search.rs:440-444`). The comment there names the tradeoff: a bare identifier is an explicit request for every exact usage, but in a mixed query one occurrence per identifier establishes coverage without letting a common incidental type consume the result budget.
-8. `exact_definition_chunks` (`src/search.rs:481`) runs two `COLLATE BINARY` queries — chunks whose `name` equals the identifier, and chunks containing a `symbols` declaration of that name — then sorts by name priority, export priority, and span so the smallest enclosing exported declaration wins.
-9. `exact_occurrence_chunks` (`src/search.rs:596`) unions `refs.target_name`, `member_calls.prop`, and `entity_sites.target_name`, ordered by path and position so results are deterministic rather than score-dependent. If that yields fewer rows than requested, an FTS5 candidate window runs and each candidate is verified by `contains_code_identifier` (`:705`) — a hand-rolled six-state lexer that admits a match only in code state, outside strings and comments, with non-identifier bytes on both sides. Occurrences are fetched at the full window and only truncated *after* definition chunks are subtracted (`:456-470`), because limiting first could hide a real occurrence behind a definition-overlapping row.
-10. Only now do `bm25_ranking` (`src/search.rs:884`), `record_vector_ranking` (`:1679`), RRF fusion at k=60 (`:1012`), the optional cross-encoder rerank (`:1472-1502`), and the repository-policy penalty (`:1503-1505`) run. Vector and reranker failures degrade rather than abort: stderr carries `vector search unavailable: …` or `rerank unavailable, using RRF order: …` and the response records a degraded status.
-11. `tiered_candidates` (`src/search.rs:790`) assembles the final order. Exact occurrence lists are stably re-sorted so peers that also survived the hybrid pool inherit reranker order among themselves, while exact-only chunks keep their structural order. `append_exact_tier` (`:847`) emits all `ExactDefinition` chunks, then all `ExactOccurrence` chunks, walking breadth-first over depth then identifier so multi-identifier queries stay fair. Remaining fused hits are appended last with `MatchReason::Hybrid` (`:832-843`). Scores on exact hits are inherited from the hybrid map when available and `0.0` otherwise — descriptive, not the ordering key.
-12. `apply_response_budget` (`src/search.rs:1793`) sheds content in a fixed order until the rendered payload fits: semantic artifacts, then expansion edges before nodes, then follow-up argument objects, then lower-ranked hits — never the top hit (`:1881-1887`) — then `used_by`/`uses`/anchors, then snippet truncation.
-
-### Where this fails
-
-A missing or stale database fails at step 3 with an explicit `run 'jscout index'` instruction. A configured embedding provider with a missing API key fails at step 2, naming the exact environment variable. The exact tier's precision has a cost that is not a failure but is worth stating: it is byte-exact and case-sensitive, so `getuserprofile` matches nothing in tiers 1 and 2 and falls through to hybrid retrieval alone. The FTS fallback in step 9 is bounded at `clamp(limit*32, 32, 4096)` candidates, so an identifier that appears thousands of times can have real occurrences outside the window. And if the byte limit is below what the minimum envelope needs, step 12 gives up and returns `response byte limit <N> is below the minimum search envelope (<M> bytes)` (`src/search.rs:1936-1938`).
-
-## Trace 3 — an MCP `semantic_search` call
-
-What to look for: the server holds one read-only connection for its whole life, and the byte budget is enforced against the *compact* rendering — the same bytes that actually go back over the wire.
+Look for two boundaries: config resolves once in `main`, before any database file exists, and everything that can fail on I/O sits inside a single `BEGIN` so a transient read never destroys a published snapshot.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Agent
-    participant Loop as serve loop
-    participant Args as search_options_from_args
-    participant Search as search::search
-    participant Budget as apply_response_budget
-    participant Render as render_tool_result
-    Agent->>Loop: tools/call semantic_search
-    Loop->>Loop: log_request with full arguments
-    Loop->>Args: profile, args, runtime.effective.search
-    Args-->>Loop: SearchOptions with response_byte_limit
-    Loop->>Search: read-only connection
-    Search->>Budget: shed until compact bytes fit
-    Budget-->>Search: ResponseBudget counters
-    Search-->>Loop: SearchResult
-    Loop->>Loop: compact::search_section_bytes
-    Loop->>Render: transport policy resolve
-    Render-->>Loop: content plus structuredContent
-    Loop-->>Agent: rpc_ok with wire bytes recorded
+    participant M as main
+    participant C as RuntimeConfig
+    participant S as store
+    participant I as index_repo_impl
+    participant G as graph plus value_flow
+    participant P as structural projection
+    M->>C: load(root, --config)
+    C-->>M: EffectiveConfig plus blake3 fingerprint
+    M->>S: open_path(database)
+    S-->>M: WAL conn, schema v29 ensured
+    M->>I: refresh_repo_with_options
+    I->>I: source_inventory, workspace discover
+    I->>S: BEGIN acquisition transaction
+    loop per source file
+        I->>G: extract_file: oxc parse, chunk, graph extract
+        G-->>I: chunks, symbols, refs, member_calls, value flows
+        I->>S: insert_file
+    end
+    I->>S: dependency corpus read, DELETE markers, COMMIT
+    I->>I: resolve_module_edges, snapshot plus resolution hash
+    I->>P: rebuild_projection_with_timing
+    P-->>I: resolved_edges, graph_nodes, entities republished
 ```
 
-1. `serve` (`src/mcp.rs:145`) canonicalizes the root and opens `store::open_path_read_only(database_path)` once (`:160`). A retrieval-only session therefore never takes a writer lock and never migrates schema.
-2. The provider, reranker, telemetry file, and request log are constructed once from `runtime` (`src/mcp.rs:161-187`), then the process enters a single-threaded loop over `stdin.lock().lines()` (`:196`) handling one newline-delimited JSON-RPC message at a time.
-3. A malformed line becomes `rpc_error(Null, -32700, "parse error: …")` (`src/mcp.rs:206`) and the loop continues — the connection is not dropped. `log_request` (`:345`) appends a JSONL record containing the **full arguments**, unlike telemetry, which carries no queries.
-4. `tools/call` extracts the name and arguments (`src/mcp.rs:265-267`). Only `annotate` under the structural profile opens a second, write-capable connection (`:270-273`); everything else runs on the shared read-only one.
-5. `search_options_from_args` (`src/mcp.rs:827`) resolves every field as `args[...].unwrap_or(defaults.<field>)` against `runtime.effective.search`. An omitted MCP argument means "use repository configuration", not "use a hardcoded default". Two hard gates: `expand` under the baseline profile bails (`:835-836`), and `include_memory` is forced false unless the profile is structural (`:857-860`).
-6. **Byte budgeting enters here**: `response_byte_limit = args["response_bytes"].as_u64().unwrap_or(defaults.response_bytes)` (`src/mcp.rs:875-878`). Expansion carries its own nested `byte_limit`.
-7. `call_tool_with_config` injects the server reranker and calls `search::search` (`src/mcp.rs:966-972`) — the identical pipeline as Trace 2, exact-identifier tier included. Because `compact = !debug` (`src/mcp.rs:873`), `rendered_bytes` measures `compact::search_rendered_bytes` (`src/search.rs:2048-2053`, `src/compact.rs:19`), so the budgeted number is the returned number.
-8. `compact::search_section_bytes` (`src/compact.rs:23`) then splits the rendered value into `hits_bytes` / `graph_bytes` / `memory_bytes` / `envelope_bytes` by serializing each sub-value, and the counts land in a `RetrievalStageMetrics` cell (`src/mcp.rs:1000-1026`).
-9. `render_tool_result` (`src/mcp.rs:405`) resolves the transport: `auto` picks structured content only when the declared client name and version support it, and silently falls back to text if the payload does not parse as JSON. A tool `Err` becomes `{"isError": true}` with `error: <chain>` as text — an in-band tool error, not a JSON-RPC error.
-10. `rpc_response_wire_bytes` is measured on the final envelope (`src/mcp.rs:314-315`), so the recorded count includes JSON-RPC framing and the duplicated text-plus-structured payload. `log_tool_call` (`:1675`) then appends the privacy-minimal telemetry record.
+`RuntimeConfig` resolves before `store` is touched, so a malformed `.jscout.toml` fails without creating a database file. `graph plus value_flow` runs inside the per-file loop — receiver value flow is extraction-time data, not a later pass. `structural projection` runs *after* `COMMIT`, on committed canonical tables, which is why the checker plane can re-run it independently.
+
+| # | Step | Location |
+|---|---|---|
+| 1 | `Cli::parse()` builds the command from `enum Command`; `--deps`/`--no-deps` are `conflicts_with`, so contradictions are clap errors. `Command::Config` dispatches *before* config load — the one command that must work on a broken config file. | `src/main.rs:53-55`, `src/cli.rs:42` |
+| 2 | **Config resolves here, once.** `RuntimeConfig::load(command.root(), cli.config.as_deref())` canonicalizes the root, reads `ROOT/.jscout.toml`, rejects on `version != SCHEMA_VERSION`, records a `ValueSource` per key, validates every enumerated value, and materializes `EffectiveConfig` — which is then blake3-hashed into `fingerprint` with provenance labels excluded, so the fingerprint tracks policy, not origin. | `src/main.rs:57`, `src/config/load.rs:343-905` |
+| 3 | `cmd_index` → `store::open_path`: `create_dir_all` on the parent, register sqlite-vec, open, then the one-boundary migration — if `meta.schema_version != "29"` and the parsed version falls below `DURABLE_SCHEMA_FLOOR` or above 29, hard bail; otherwise `rebuild_legacy_disposable_schema`. Then WAL, `foreign_keys=ON`, `init_schema`. | `src/commands/core.rs:271-277`, `src/store.rs:111-167` |
+| 4 | `refresh_repo_with_options` → `index_repo_impl(..., IndexMode::FullRefresh, CheckerRetention::Drop)`. Manual `index` is always a full snapshot refresh, which is why its printed line carries no "unchanged" count. Then `root.canonicalize()`, `walk::source_inventory` (`ignore::WalkBuilder` pruning `node_modules, dist, .next, coverage, out`), and `WorkspaceMap::discover_with_fs`. | `src/indexer.rs:228`, `:317-321`, `src/walk.rs:98-140` |
+| 5 | `conn.execute_batch("BEGIN")` opens the acquisition transaction; source reads *and* the dependency corpus both live inside it. `ensure_extraction_version` follows: on `extraction_version != "7"` it blanks every `files.hash` and drops the graph tables, inside the caller's transaction so a later failure restores extractor version and snapshot together. | `src/indexer.rs:357-359`, `:634` |
+| 6 | `files` where `origin!='dependency'` is read; `FullRefresh` sets `existing` empty and makes `extraction_reset` unconditional → `store::reset_snapshot_state`. Semantic memory, the embedding cache, and checker facts survive. | `src/indexer.rs:368-400`, `src/store.rs:1091` |
+| 7 | Per-file loop: `fs.read_to_string`; `io_policy::is_inventory_race` → silent skip; `is_retryable` → abort the whole phase; anything else → a `"read"` rejection row and continue. Then `blake3::hash(source)` and `file_role::classify`. | `src/indexer.rs:403-441`, `src/io_policy.rs:6,16` |
+| 8 | `extract_file` → `parse::with_parsed`: one `oxc_allocator::Allocator` per file, `Parser::parse`, then `SemanticBuilder::new().with_build_nodes(true)` — the node store is required because reference classification walks ancestors. A parser panic becomes an `"extract"` rejection. Inside the arena: `Chunker::chunk_program`, then `graph::extract`. | `src/indexer.rs:663-675` |
+| 9 | **Value flow runs here**, inside `graph::extract`: `value_flow::extract(semantic)`, splayed into `receiver_flows / function_flows / binding_flows / class_flows`. It bails on the *whole file* given a `WithStatement` or any `eval` identifier reference — sloppy-mode dynamic scoping can invalidate every binding conclusion. Then `collect_member_writes` → `collect_function_returns` → `extract_classes` → `extract_functions` → `extract_bindings` → `extract_receivers`, each output sorted. | `src/graph.rs:177-181`, `src/value_flow.rs:82-113` |
+| 10 | `insert_file` writes `files`, `chunks` + `chunks_fts` (NUL-scrubbed), `symbols`, imports/exports, `events`, `member_calls`, the value-flow tables, then `entity_sites` and `refs`. A linear `chunk_for(offset)` scan assigns each ref and call to its chunk. | `src/indexer.rs:687-993` |
+| 11 | Files in `existing` but not `seen` are `delete_file`d. `dependency::discover` runs against the just-extracted uncommitted importer rows; `plan_packages` and `prepare_dependency_files` read and hash the corpus — still inside the transaction. Then the three projection markers are deleted from `meta` and the transaction commits; failure rolls back. | `src/indexer.rs:461-511` |
+| 12 | Post-commit: `synchronize_instances` → `index_dependency_files` → `embed::materialize_cached_embeddings`. Then `resolve_module_edges` builds three `oxc_resolver::Resolver`s — workspace-aliased with tsconfig auto-discovery, a no-tsconfig fallback (a broken `extends` degrades resolution rather than dropping a file's edge set), and an alias-free resolver for third-party source. | `src/indexer.rs:512-518`, `:1173-1190` |
+| 13 | `compute_resolution_hash` (blake3 over ordered `module_edges` joined to `package_instances`) → `compute_snapshot_with_resolution` (blake3 over `PROJECTION_VERSION = "12"`, ordered file identity, package identity, and the resolution hash). `CheckerRetention::Drop` clears every checker batch. | `src/indexer.rs:525-536`, `src/structural.rs:385`, `:429` |
+| 14 | `rebuild_projection_with_timing`: in one `BEGIN IMMEDIATE`, delete `resolved_edges`/`graph_nodes`/`entities`, insert file and symbol nodes, then the fixed stage order `project_module_edges` → `project_references` → `project_entities` → `project_member_calls` → **`receiver_flow::project_receiver_value_flows`** → `project_checker_enrichments` → `project_events`, then upsert the markers and `COMMIT`. | `src/structural.rs:476-624`, `:577` |
+| 15 | That stage joins `receiver_value_flows` to `member_calls` on exact `(file_id, call_start, call_end)`. `resolve_receiver_classes` walks the module/export graph at depth ≤ 2, abandoning above 3 candidate classes; non-`this` receivers also require `construction_identity_is_safe`. `resolve_flow_methods` demands `class_chain_allows_property`, exactly one own method per class, and no blocker row. Survivors emit `member_call` edges at `likely`, provenance `"receiver-value-flow"`, `source_ref_id` = the member-call rowid. | `src/structural/receiver_flow.rs:740`, `:586`, `:292`, `:655`, `:927` |
+| 16 | `meta.resolution_hash` upsert, then `recon::reconcile_file_policy_after_index` — a policy failure clears the policy tables and warns rather than failing the index. | `src/indexer.rs:568-579` |
+
+The flow edge is *additive*: `project_member_calls` still emits a `member_hub` node and a `possible` edge for every member call. Suppression is read-side and happens three times — `load_occurrences` excludes flow-resolved member calls from the checker's candidate set (`src/checker/enrich.rs:1109-1116`), `project_checker_enrichments` drops checker facts already flow-resolved (`src/structural.rs:2192-2199`), and `who_uses` carries a `NOT EXISTS` hiding `member_candidate` hops already closed at `certain`/`likely` (`src/query.rs:515-523`). Three places must stay in agreement; each sits on a different plane and none sees the others' inputs.
 
 ### Where this fails
 
-The budget in step 6 governs the compact payload, not the wire envelope measured in step 10 — under the structured transport the payload is serialized twice, so actual bytes on the wire roughly double a value the agent set expecting a ceiling. An unknown method returns `-32601`. Anything raised inside the tool — unpublished snapshot, a byte limit below the minimum envelope, baseline-profile expansion — arrives as `isError: true`, which means an agent that only checks for JSON-RPC errors will treat a failure as a successful result. Degraded vector or reranker stages are not errors at all; they surface as a `retrieval` block inside an otherwise successful payload, and `compact::search_value` suppresses that block entirely when every stage succeeded (`src/compact.rs:60-62`).
+| Failure | Behaviour |
+|---|---|
+| Root missing, or `.jscout.toml` malformed / wrong `version` | Hard bail before any DB open (`src/config/load.rs:343-366`). |
+| Existing DB at unsupported durable schema | Bail advising the user to preserve the old file and index fresh (`src/store.rs:143-157`). |
+| Retryable read (EMFILE/ENOMEM/EAGAIN) on a source or dependency file | The acquisition transaction rolls back; the published snapshot is untouched (`src/indexer.rs:409-411`, `:501-506`). |
+| Permission-denied or non-UTF8 read | A `"read"` rejection; the file's old rows are dropped; the index continues. |
+| oxc parse panic | An `"extract"` rejection; the index continues. |
+| Ignore-file read error at depth 0, or a retryable walk error | The whole inventory aborts. |
+| `with` or `eval` anywhere in a file | Zero value-flow rows from it; its member calls stay on the hub/checker path. |
 
-## Trace 4 — one file edited under `jscout watch`
+---
 
-This is the real incremental path. It is a latency optimization, not a scope reduction: the doc comment at `src/indexer.rs:204-208` states that the incremental refresh still scans and hashes the complete source tree, re-evaluates dependency ownership and module resolution, and publishes the same snapshot contract as a full refresh. What it skips is parsing unchanged files.
+## Trace 2 — Exhaustive query with paging: `jscout search /repo "createSession" --exhaustive -k 50 --cursor …`
+
+Look for the two guards that make paging honest: the cursor is bound to both the snapshot and a query+scope fingerprint, and the byte budget re-derives `next_cursor` *after* shedding so a shed tail is re-served rather than lost.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as commands search arm
+    participant SR as search
+    participant EH as exhaustive_hits
+    participant DB as SQLite plus FTS5
+    participant BU as apply_response_budget
+    CLI->>SR: SearchOptions mode Exhaustive with cursor
+    SR->>SR: validate page size 1..200, posture all-off
+    SR->>DB: with_read_snapshot SAVEPOINT
+    SR->>EH: query, scope, snapshot, cursor
+    EH->>EH: scope normalize, fingerprint, column-scoped FTS
+    EH->>DB: decode cursor then re-resolve to one live chunk
+    EH->>DB: COUNT star gives total_chunks
+    EH->>DB: keyset page ORDER BY path, start, id LIMIT k plus 1
+    EH->>DB: highlight over exactly the selected rowids
+    EH-->>SR: bare locator hits with absolute match_lines
+    SR->>BU: envelope plus baseline clone
+    BU->>BU: shed, refresh next_cursor, or binary-search the floor
+    BU-->>CLI: page or ResponseBudgetTooSmall with minimum_bytes
+```
+
+`with_read_snapshot` wraps the count, the page, the cursor re-resolution, and the highlight pass in one savepoint, so `total_chunks` and the page cannot disagree. `highlight over exactly the selected rowids` is a hard requirement, not best-effort. `binary-search the floor` is the fallback when every shedding lever is exhausted.
+
+| # | Step | Location |
+|---|---|---|
+| 1 | clap declares `--exhaustive` `conflicts_with_all = ["vector","rerank","expand","memory"]` and `--cursor` `requires = "exhaustive"`. The `Search` arm then forces posture: each of `vector`, `rerank`, `include_memory`, `expand` is `!exhaustive && resolve_flag(...)`, so even a *configured* `search.vector = true` is overridden. No provider is constructed — no network I/O at all. | `src/cli.rs:97-102`, `src/commands/mod.rs:239-257` |
+| 2 | `resolve_search_limit(true, requested, configured)` clamps an *omitted* `-k` to `MAX_EXHAUSTIVE_PAGE_SIZE = 200` and passes an explicit `-k` through unclamped so the validator can reject it. `open_database_read_only` refuses to create a file, sets `query_only=ON`, and rejects a wrong `schema_version`, a missing `snapshot`, or `projection_version != "12"`. | `src/search.rs:13`, `:22-33`, `src/store.rs:53-105` |
+| 3 | In `search`: page size must be in `[1, 200]`; a provider, `rerank`, `expand`, or `include_memory` each bail — belt-and-braces behind the CLI and MCP filtering. Then `store::with_read_snapshot(conn, "jscout_search", …)` and `structural::current_snapshot`. | `src/search.rs:1620-1636`, `src/store.rs:974` |
+| 4 | `exhaustive_scope` normalizes roles/origins into canonical order; selecting *all* roles normalizes to "no role filter", so the echoed scope is byte-identical to an unfiltered request. `exhaustive_request_fingerprint` blake3-hashes a domain-separated prefix plus the raw query, roles, and origins. `exhaustive_fts_query` builds `content:"tok" OR …` — **column-scoped**, matching stored source content only, never `name`/`symbols`/`path`. | `src/search.rs:1350-1352`, `:1159-1204` |
+| 5 | `decode_exhaustive_cursor` requires six dot-separated parts: prefix `jscout-exhaustive-v2`, 64-hex snapshot, 64-hex fingerprint, hex path, 16-hex start, 64-hex chunk hash. `exhaustive_cursor_position` then re-resolves it against the live index — exactly one row must match `(path, start, hash)` **and** still satisfy the FTS match, origin flags, and role filter. | `src/search.rs:1044`, `:1245-1341` |
+| 6 | `COUNT(*)` over `chunks_fts ⋈ chunks ⋈ files` under the same predicates gives `total_chunks`, the completeness denominator returned on every page. The page query adds `LEFT JOIN repository_file_policy`, the keyset predicate `(file.path, chunk.start, chunk.id) > (?,?,?)`, matching `ORDER BY`, and `LIMIT limit + 1` — the one-row over-fetch decides `has_more` without a second count. | `src/search.rs:1379-1458` |
+| 7 | `exhaustive_highlights` issues one `highlight(chunks_fts, 0, ?, ?)` over exactly the selected rowids. Markers start at `\u{1e}jscout-match-start\u{1f}` and grow a `-` suffix until no selected chunk's source contains them. **If the highlight set misses any selected chunk the whole search fails** rather than under-reporting. | `src/search.rs:1079-1127` |
+| 8 | `exhaustive_match_lines` counts newlines between consecutive start markers from `chunk.start_line`, deduping — absolute, unique, ascending source lines. `project_exhaustive_anchors` batches chunks→symbols→`graph_nodes`, preferring symbols whose name *and* scope chain match, else all overlaps, else `file:<path>`. Each `Hit` is then a bare locator: `score = 0.0`, empty snippet, no `uses`/`used_by`; only the first page marks one single-anchor hit with `include_followups = true`. | `src/search.rs:1130-1150`, `:2842-2888`, `:1468-1500` |
+| 9 | `apply_response_budget` clones the whole result into `exhaustive_baseline` **before** any shedding. `apply_response_budget_once` recomputes `returned`, `truncated`, and `next_cursor = encode_exhaustive_cursor(snapshot, fingerprint, selected_positions[returned-1])` on every turn — the cursor always names the last hit that survived the byte budget. | `src/search.rs:2435-2463` |
+| 10 | Shedding order: semantic artifacts → artifact supports → expansion edges then orphan nodes → non-seed nodes → follow-up hints → `exhaustive_locator_only = true` (one-shot) → pop hits from the tail, never below one → `used_by`/`uses` → *(ranked only)* anchors → truncate the longest snippet. An exhaustive page never shortens an anchor. Each turn re-settles the exact transport via `settle_search_response`. | `src/search.rs:2478-2610`, `:2712-2737` |
+| 11 | **Budget floor.** When every lever is exhausted, `minimum_exhaustive_response_bytes` probes at `usize::MAX` for an upper bound, then binary-searches `[1, upper]`, replaying `apply_response_budget_once` on a fresh clone of the baseline at each candidate. The caller gets `ResponseBudgetTooSmall { byte_limit, minimum_bytes }` — a machine-parseable retry instruction. Ranked search has no such floor. | `src/search.rs:2445-2456`, `:2743-2762` |
+
+Rendering diverges by transport. `--json` forces `default_match: "lexical"` and emits `{at, kind, match_lines, anchor|anchors}`, adding `followups` only when `!locator_only && anchors.len() <= 1` (`src/compact.rs:288-318`). The human CLI prints an `exhaustive: returned=… total_chunks=… truncated=… page_size=…` header, the scope, the next cursor, then two lines per hit and no snippets (`src/commands/core.rs:139-193`). MCP re-applies the same filtering and surfaces the typed budget error as `isError: true` text (`src/mcp.rs:834-880`, `:445-457`).
+
+### Where this fails
+
+| Failure | User-visible |
+|---|---|
+| `-k 0` or `-k 201` | `exhaustive search page size must be between 1 and 200` |
+| Index re-published between pages | `exhaustive search cursor snapshot changed: expected X, current Y` — paging is deliberately not resumed across snapshots |
+| Same snapshot, different query/roles/origins | `exhaustive search cursor does not match the query and scope` |
+| Cursor chunk edited, deleted, or filtered out of scope | `exhaustive search cursor does not identify one matching chunk in scope` (`src/search.rs:1338`) |
+| FTS `highlight()` misses a selected chunk | `exhaustive search could not highlight every selected chunk` — hard fail, not a partial page |
+| `response_bytes` too small | `response_budget_too_small: … minimum_bytes=M` |
+| Query with no identifier-shaped tokens | Empty page, `total_chunks: 0`, `next_cursor: null` |
+
+The cost is real: an agent that reindexes mid-traversal loses its position and must restart, and nothing resumes a partially consumed page against a newer snapshot. The alternative — silently continuing across snapshots — would make `total_chunks` a lie.
+
+---
+
+## Trace 3 — Identifier query through the G17 exact tier: `jscout search /repo "createSession"`
+
+Steps 1–2 of Trace 2 apply, except `mode = SearchMode::Ranked` and an `embed::Provider` is constructed when `vector` resolves true (`src/commands/mod.rs:250-256`). `search` skips the exhaustive validation and calls `ranked_hits` (`src/search.rs:2044`).
+
+| # | Step | Location |
+|---|---|---|
+| 1 | `candidate_pool_limits(limit, role_filtered)` → `pool = max(limit,10) * 5`; `vector_pool = pool * 4` under a role filter, because sqlite-vec applies `k` before `files.role` is visible and a selective filter would otherwise starve the vector arm and tilt RRF toward BM25. | `src/search.rs:2050`, `:2176-2188` |
+| 2 | **`exact_intent_candidates` runs first — before BM25 and before the vector call.** The exact tier is not a re-rank of hybrid output. | `src/search.rs:2051-2057`, `:530` |
+| 3 | `exact_intent_tokens` splits on non-`[A-Za-z0-9_$]`. A single-token query is admitted unconditionally; in a multi-token query only code-shaped tokens qualify — leading or interior `_`/`$`, leading uppercase, or any interior uppercase. Plain English words are never treated as identifiers. | `src/search.rs:473-528` |
+| 4 | `occurrence_limit` is the full per-identifier limit when `is_single_identifier_intent`, otherwise **1**: a pure identifier lookup is an explicit request for every exact usage, while in a mixed query one occurrence per identifier establishes coverage without a common incidental type eating the budget. | `src/search.rs:499`, `:538-545` |
+| 5 | `exact_definition_chunks` unions two `COLLATE BINARY` queries — chunks whose `chunks.name` equals the identifier, and chunks containing a `symbols` row of that name via `chunk.start <= symbol.decl_start < chunk.end` — ordered by `(name_priority, export_priority, span, path, start, id)`. | `src/search.rs:583-694` |
+| 6 | `exact_occurrence_chunks` runs a `UNION ALL` over `refs.target_name`, `member_calls.prop`, and `entity_sites.target_name`, grouped by chunk. Below `limit` chunks, FTS is used **only as a bounded candidate generator** (`limit*32` clamped to `[32, 4096]`) and every candidate must pass `contains_code_identifier` — a lexer walking `Code / SingleQuoted / DoubleQuoted / Template / LineComment / BlockComment` states that requires a case-sensitive, boundary-delimited hit in code. That recovers object-literal keys and non-call member reads the structured tables omit. | `src/search.rs:698-890` |
+| 7 | Occurrences are filtered against the definition set **before** the mixed-query truncation — limiting first could discard the one definition-overlapping row and wrongly hide the next real occurrence. | `src/search.rs:558-571` |
+| 8 | Only now does the hybrid arm run: `bm25_ranking` with column weights `bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0)` over `(content, name, symbols, path)`, plus origin-partitioned sqlite-vec KNN when a provider exists (a failure folds into `vector_degraded` rather than failing the search). Rankings are role-prefiltered, truncated to `pool`, fused by `rrf(&rankings, 60.0)`, optionally cross-encoder reranked (on error the RRF order stands), and — absent an explicit role filter — reordered by `chunk_policy_penalty / (rank+1)`, a rank-decaying nudge rather than a rescore. | `src/search.rs:986-1024`, `:2071-2119`, `:1585-1595`, `:2150-2175` |
+| 9 | **`tiered_candidates` merges.** Occurrence lists are stably re-sorted by hybrid position (`(0, position)` if the hybrid pipeline also surfaced the chunk, `(1, usize::MAX)` otherwise), so exact-only peers keep structural order while hybrid-visible peers inherit the reranker's judgment *within their tier*. `append_exact_tier` round-robins `ExactDefinition` across identifiers by depth, then `ExactOccurrence`, then remaining fused ids as `Hybrid`. **Rank is tier-then-position, never score.** | `src/search.rs:892-982` |
+| 10 | `load_hit` per candidate until `limit`: chunk row plus policy join, `project_chunk_anchors`, `uses` (distinct `certain` call/render/extend refs, ≤6), and `used_by` computed **only** when the chunk resolves to exactly one `sym:` anchor, cross-file, via `query::who_uses_anchor_in_origins`. A repo-wide same-name count is refused as `used_by`. Snippet is the first 4 lines. | `src/search.rs:2313-2408` |
+
+A `score=0.0000` on a top hit in text output is the visible signature of an exact-tier chunk the hybrid pool never produced (`src/commands/core.rs:194-217`).
+
+### Where this fails
+
+| Failure | Behaviour |
+|---|---|
+| Vector provider unreachable or dimension mismatch | `retrieval.vector = "degraded"` plus a `vector_action`; BM25 and the exact tier still serve the query. |
+| Reranker unreachable | `reranker = "degraded"`, stderr note, RRF order retained. |
+| Identifier appears only in comments or string literals | `contains_code_identifier` rejects it; no false exact-occurrence hit. |
+| Query is a lowercase English word inside a sentence | Not code-shaped; no exact tier, pure hybrid. |
+| Identifier with tens of thousands of occurrences | FTS candidate generation capped at 4096 rows, per-identifier results at `limit` — the exact tier is *bounded*, not exhaustive. That is what `--exhaustive` exists for. |
+| `--response-bytes` too small | A generic envelope message; ranked search has no binary-searched floor. |
+
+---
+
+## Trace 4 — One file edited under `jscout watch /repo --enrich`
+
+Look for where an edit stops being a filesystem event and becomes a generation: `classify` decides scope, `mark_dirty` folds it into a generation, and `next_work` releases it only after the debounce.
 
 ```mermaid
 flowchart TD
-    EV["notify event for src/services/user.ts"] --> CL["EventClassifier::classify"]
-    CL -->|"is_refresh_boundary or git or external"| FULL["DirtySignal::full — scope Full"]
-    CL -->|"walk::is_indexable"| SRC["DirtySignal::source — scope Incremental"]
-    SRC --> MD["Coordinator::mark_dirty"]
-    FULL --> MD
-    MD -->|"256 distinct paths"| PROMO["promote to Full, reason mass-source-change"]
-    MD --> NW["next_work after debounce"]
-    PROMO --> NW
-    NW --> RR["run_refresh"]
-    RR -->|"Incremental"| INC["incremental_refresh_repo_with_options"]
-    RR -->|"Full"| FR["watch_full_refresh_repo_with_options"]
-    INC --> WALK["full walk plus workspace discovery"]
-    WALK --> HASH["per file blake3 vs existing hash"]
-    HASH -->|"equal"| REUSE["unchanged plus 1, keep rows"]
-    HASH -->|"differs"| REDO["delete_file, extract_file, insert_file"]
-    REUSE --> RES["resolve_module_edges — always full"]
-    REDO --> RES
-    RES --> ID["compute resolution hash and snapshot"]
-    ID -->|"identity unchanged"| REPUB["republish meta keys, projection reused"]
-    ID -->|"identity changed"| REBUILD["rebuild_projection_with_timing"]
-    REPUB --> DONE["status succeeded"]
-    REBUILD --> DONE
-    DONE --> ENR["enrich phase consumes dirty_source_paths"]
+    EV["notify event paths"] --> CL["EventClassifier classify"]
+    CL -->|"DB, ignored, or skipped dir"| DROP["dropped"]
+    CL -->|"manifest, tsconfig, gitignore, d.ts"| FULL["DirtySignal full boundary"]
+    CL -->|"indexable source"| SRC["DirtySignal source path"]
+    FULL --> MD["Coordinator mark_dirty"]
+    SRC --> MD
+    MD -->|"over 256 paths"| PROMOTE["scope promoted to Full"]
+    PROMOTE --> NW["next_work after debounce"]
+    MD --> NW
+    NW --> RF["run_refresh incremental_refresh_repo_with_options"]
+    RF --> HASH["walk and hash entire tree"]
+    HASH --> ONE["one file re-parsed, re-chunked, value flow re-extracted"]
+    ONE --> SNAP["compute resolution hash and snapshot"]
+    SNAP -->|"identity unchanged"| REUSE["republish markers, projection_rebuilt false"]
+    SNAP -->|"changed"| PROJ["full projection rebuild"]
+    PROJ --> ADV["advance to Embed then Enrich then SemanticEmbed"]
+    REUSE --> ADV
 ```
 
-1. `watch` (`src/watch.rs:648`) canonicalizes the root and subscribes `notify::recommended_watcher` to the tree **before** the startup refresh (`:669`), so edits during a long first pass are queued and force a later generation.
-2. `Coordinator::new` (`src/watch.rs:166`) seeds a full-scope dirty signal for generation 1; `EventClassifier::new` (`src/watch.rs:440-454`) excludes the database and its `-wal`/`-shm`/`-journal` siblings (`:441-445`) and builds a `walk::SourcePathPolicy` from the same ignore configuration the walker uses (`:452`). Both are constructed in the watch loop prologue (`src/watch.rs:672-677`).
-3. The loop blocks in `receiver.recv_timeout` against the minimum of the phase, reconcile, and checker-flush deadlines (`src/watch.rs:1039-1047`), then hands the event to `ingest_event` (`:1053`).
-4. `EventClassifier::classify` (`src/watch.rs:465`) runs ordered gates. For an ordinary `.ts` edit the path clears the database, git-control, external-target, skipped-directory, refresh-boundary, and ignore gates and reaches `walk::is_indexable`, producing `DirtySignal::source` with `RefreshScope::Incremental` (`:519-525`). A `package.json`, lockfile, `tsconfig*.json`, `.gitignore`, or any `.d.ts` would instead hit `is_refresh_boundary` (`:1338`) and force `Full`.
-5. `Coordinator::mark_dirty` (`src/watch.rs:192`) takes `refresh_scope = max(current, signal.scope)`, so a single full-scope event in the same debounce window promotes the whole generation. Paths accumulate in `dirty_source_paths`; at `MAX_INCREMENTAL_SOURCE_PATHS = 256` (`:22`) the generation is promoted to `Full` with reason `mass-source-change` (`:235-244`).
-6. `next_work` (`src/watch.rs:265`) withholds work until `now >= last_dirty_at + debounce` (`:296`), then emits one `Work` carrying the generation, phase, and scope. Every event queued in between has already been folded in by `drain_events` (`:1256`).
-7. `run_refresh` (`src/watch.rs:1076`) opens a write connection with a five-second busy timeout and dispatches on scope: `Incremental` → `indexer::incremental_refresh_repo_with_options` (`src/indexer.rs:209`), `Full` → `watch_full_refresh_repo_with_options` (`:246`). Both are `pub`, non-`cfg(test)`, and reachable from the watch loop.
-8. Inside `index_repo_impl`, `mode == IndexMode::Incremental` means the `path → (id, hash, role)` map is **kept** (`src/indexer.rs:378-382`), and `extraction_reset` fires only when at least half the existing rows have an empty hash — an extractor-version bump, not a one-file edit (`:388-397`).
-9. **The reuse itself** is `src/indexer.rs:427-436`: if `existing[rel].hash == blake3(source)`, only `files.role` is updated when `file_role::classify` now disagrees, `unchanged` increments, and the loop continues without parsing. The edited file falls through to `store::delete_file` plus `extract_file` plus `insert_file` (`:440-458`). One edit costs one `oxc` parse.
-10. Dependency synchronization, embedding materialization, and `resolve_module_edges` still run in full (`src/indexer.rs:512-521`), because tsconfigs, manifests, and `node_modules` layout are not indexed content and cannot be diffed from the file hashes.
-11. `CheckerRetention::PreserveActiveForWatch` deletes only inactive checker staging rows (`src/indexer.rs:531`, `src/store.rs:991`), keeping the one active batch as a hidden carry source for the enrichment phase.
-12. If `previous == current` — same snapshot, same `PROJECTION_VERSION`, same resolution hash — and checker batches were unchanged, the projection is provably identical and only the three meta keys are republished under `BEGIN IMMEDIATE` (`src/indexer.rs:541-563`). Otherwise `rebuild_projection_with_timing` runs (`:566`). Either way the snapshot key is written atomically with the graph it describes.
-13. The watcher prints `watch generation=N phase=refresh refresh_scope=incremental status=succeeded snapshot=… indexed=1 unchanged=842 removed=0 … projection=rebuilt|reused elapsed_ms=…` (`src/watch.rs:756-772`), re-collects watch targets from the freshly published database, and calls `classifier.reload_source_policy()` so ignore-file edits take effect at the same publication boundary as the new inventory.
-14. The dirty-path set is consumed later, in enrichment: `dirty_files` is copied out of the coordinator (`src/watch.rs:1170-1175`) and passed into `checker::enrich`, where `current_dirty_source_files` intersects it with indexed files (`src/checker/enrich.rs:381`), `dirty_projects` marks the owning TypeScript projects (`:463`), those projects move to the front of the execution order (`:598`, `:611`), and pending occurrences in dirty files sort first within a project (`:633-634`).
+`classify` is the only place scope is decided, and it consults `walk::is_in_skipped_directory` *before* boundary detection so a `node_modules/**/package.json` write cannot promote to a full refresh. `walk and hash entire tree` is the honest shape of "incremental" here: incremental mode narrows re-extraction, not the walk. `full projection rebuild` has no partial path — the projection is a pure function of the canonical tables.
+
+| # | Step | Location |
+|---|---|---|
+| 1 | The `Watch` arm resolves flags and timeouts, enforcing cross-field rules (product requires embed; non-zero reconcile must exceed debounce; `src/commands/mod.rs:543-615`). `watch::watch` canonicalizes root, builds the `notify` watcher, and **subscribes recursively before** the startup refresh so edits during a long first pass are queued. `Coordinator::new` marks generation 1 dirty with `refresh_immediate = true`. `EventClassifier::new` excludes the DB and its `-wal`/`-shm`/`-journal` siblings, snapshots git control paths, and builds a `walk::SourcePathPolicy` from the same ignore configuration as the inventory walker. | `src/watch.rs:648-684`, `:166-190` |
+| 2 | On the edit, `classify` walks the paths in order — excluded DB paths ignored, git control paths → `full("git:…")`, selected external roots → `full("external:…")`, anything inside a skipped directory ignored, `is_refresh_boundary` (manifests, lockfiles, `tsconfig.*`/`jsconfig.*`, `.gitignore`, `.gitmodules`, any `.d.ts`) → `full("boundary:…")`, ignore-file match ignored, directories → `full("unknown-directory-event")`, `walk::is_indexable` → **`DirtySignal::source("source:src/a.ts", "src/a.ts")`**. | `src/watch.rs:465-537` |
+| 3 | `mark_dirty`: if the current generation already has work, bump `desired_generation`, clear reasons/paths, reset scope to `Incremental` — **unless** a *failed* refresh retry is parked on this generation, in which case its scope and reasons carry into the successor, since a failed refresh has not consumed its requirement. `refresh_scope = max(current, signal.scope)`. Past `MAX_INCREMENTAL_SOURCE_PATHS = 256` distinct paths, scope is promoted to `Full` with reason `mass-source-change`. | `src/watch.rs:192-249`, `:22` |
+| 4 | `next_work` refuses while a phase is active, drops stale work from superseded generations, honours a parked retry's `due`, and otherwise requires `desired > completed` and `now >= last_dirty_at + debounce`. `run_refresh` then opens a fresh phase connection and calls `incremental_refresh_repo_with_options` → `index_repo_impl(..., IndexMode::Incremental, CheckerRetention::PreserveActiveForWatch)`. | `src/watch.rs:265-308`, `:1076-1099`, `src/indexer.rs:210-226` |
+| 5 | `Incremental` keeps `stored` as `existing`. It **still walks and hashes the complete tree** and re-evaluates dependency ownership and module resolution — a latency optimization, not a narrowed contract. Hash-matched files bump `unchanged` and update only `files.role` if reclassified; the edited file takes `delete_file` + `extract_file` + `insert_file`, so it is re-parsed by oxc, re-chunked, and **its value-flow rows are re-extracted**. | `src/indexer.rs:368-461`, `src/graph.rs:177` |
+| 6 | `extraction_reset` fires here only when `cleared * 2 >= existing.len()` — an extractor-version bump that blanked at least half the hashes, at which point per-file replacement is pathological and `reset_extraction_state` truncates instead. `CheckerRetention::PreserveActiveForWatch` deletes only `active=0` batches, keeping the previously active batch hidden as a carry source for the enrich phase. | `src/indexer.rs:389-400`, `:531-536`, `src/store.rs:1047`, `:1113` |
+| 7 | Because one file's content hash changed, the new snapshot differs and the **full** projection rebuilds, including `project_receiver_value_flows` over the whole repository. If identity is unchanged and no checker batch changed, the `previous == current` branch republishes the three markers in a `BEGIN IMMEDIATE` and reports `projection_rebuilt = false`. | `src/indexer.rs:544-567`, `src/structural.rs:577` |
+| 8 | Post-refresh: recollect watch targets (falling back to git targets on read failure), re-add checker-sourced targets when enrich is on, re-reconcile the registry, and **`classifier.reload_source_policy()`** — a `.gitignore` edit takes effect at exactly the same publication boundary as the new inventory. Then `drain_events` immediately, so events that arrived during the refresh are folded in before `finish_refresh` decides supersession. | `src/watch.rs:779-800`, `:456` |
+| 9 | `finish_refresh` → `advance` walks `Refresh → Embed → Enrich → SemanticEmbed`, skipping disabled phases. Both optional phases run interruptibly: a worker thread with its own connection and an `AtomicBool` cancel flag, polled every 100 ms while the main thread keeps ingesting events. | `src/watch.rs:326-416`, `:1101-1128` |
+| 10 | Enrichment receives `dirty_files = coordinator.dirty_source_paths`. Inside `checker::enrich`: `load_occurrences` (excluding deterministically resolved *and* receiver-flow-resolved member calls) → `select_eligible` → Node sidecar → `plan_inventory_ownership` → `package_gate::evaluate` → `gate_inferred_projects` → a second `plan_members_cached` over the admitted scope, which must return identical TypeScript identity and ownership or the run bails. | `src/watch.rs:1158-1207`, `src/checker/enrich.rs:374-500`, `:1099-1116` |
+| 11 | `plan_fingerprint` folds snapshot, selection, project plan, per-project fingerprints, TS identity, protocol version, the package-gate fingerprint, and options; `reusable_completed_batch` can return an existing batch outright without spawning project work. Otherwise a staging batch opens, `carry_forward_projects` reuses answers whose freshness manifest still holds, and `projects_in_execution_order` runs **dirty projects first**. | `src/checker/enrich.rs:560-614`, `:688-722` |
+| 12 | After all projects, `revalidate_package_gate` re-checks the gate, then `activate_staging_batch`; if publication changed, `structural::rebuild_projection` republishes the graph with the new checker facts. Partial failure activates the healthy subset first, then returns `PartialEnrichmentError`. | `src/checker/enrich.rs:833-872` |
+| 13 | `advance` on the last phase sets `completed_generation`, clears dirty state, and anchors the next reconciliation deadline **from completion, not from timer fire** — a long generation cannot create a back-to-back refresh loop. | `src/watch.rs:388-416` |
+
+Two ambient timers sit outside the event path. Periodic reconciliation injects `full("periodic-reconciliation")` only when the coordinator is clean, and any ordinary generation clears the pending deadline so retry-waits do not poll at the 1 ms floor. `CHECKER_DRIFT_FLUSH_INTERVAL = 24 h` sets `force_full_enrichment`, which survives generation bumps via `preserve_checker_flush_requirement` — it bounds how long carry-forward can ignore ambient type drift (`src/watch.rs:20`, `:194-218`).
 
 ### Where this fails
 
-The incremental path does not reduce I/O — it still stats and reads every source file in the tree to compute hashes, so on a very large repository the floor is a full read pass regardless of how few files changed. Module resolution is re-run in full every generation, which for a repository with many tsconfig projects can dominate the saved parse time. A refresh error prints `status=failed` and `finish_error` schedules an exponential retry capped at 30 seconds (`src/watch.rs:807-820`); the database still holds the previous consistent snapshot because the extraction transaction rolled back. Missed filesystem notifications are covered only by the periodic `reconcile_interval` full refresh, and setting `reconcile_seconds = 0` disables that safety net — the watcher warns about exactly this at startup (`src/watch.rs:706-710`). Checker carry-forward can ignore ambient type drift indefinitely; the bound is `CHECKER_DRIFT_FLUSH_INTERVAL = 24 h` (`src/watch.rs:20`), which issues an incremental-scope generation with `force_full_enrichment = true`.
+| Failure | Behaviour |
+|---|---|
+| Refresh error (retryable read, etc.) | `phase=refresh status=failed`; `schedule_retry` with `500ms << (attempts-1)` capped at 30 s (`src/watch.rs:371-386`). |
+| A new edit lands during a retry-wait | The generation bumps but the failed refresh's scope and reasons carry forward. |
+| A new edit lands mid-phase | The cancel flag or sidecar cancellation fires; the phase reports `canceled`, `finish_optional` sees a generation mismatch and returns `Superseded`; the newer generation restarts from `Refresh`. |
+| Ctrl-C during enrichment | `checker::process::interrupt_pending()` → `watch status=stopped reason=interrupt` and a clean exit; staged checker work is retained for resume. |
+| More than 256 distinct dirty source paths | Scope promoted to `Full`; refresh uses `watch_full_refresh_repo_with_options`. |
+| Any `.gitignore`, manifest, tsconfig, or `.d.ts` touched | `is_refresh_boundary` forces `RefreshScope::Full` regardless of how small the edit was. |
+| `notify` channel disconnects | Clean `Ok(())` exit — the watcher does not attempt to re-establish. |
 
-Related: [02-ingestion.md](02-ingestion.md), [07-retrieval.md](07-retrieval.md), [11-mcp-surface.md](11-mcp-surface.md), [13-incremental-and-watch.md](13-incremental-and-watch.md).
+The dominant cost is step 7: a one-character edit rebuilds the entire projection, including receiver-flow resolution across every member call in the repository. The tradeoff is deliberate — a partial projection would need its own invalidation model, and the snapshot/resolution-hash pair exists precisely so the *no-op* case stays cheap. Edits that genuinely change content pay full projection cost every time.

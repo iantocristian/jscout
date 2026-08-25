@@ -1,176 +1,161 @@
 # Cross-cutting concerns
 
-Some of jscout's behavior belongs to no module. The process has no async runtime, so every long operation is a blocking call on a thread that something else must poll to interrupt; sidecar child processes need drained pipes, so reader threads exist whether or not anything else is concurrent; stdout is a JSON-RPC frame stream under `jscout mcp`, so the entire library writes to stderr by convention rather than by type; a Ctrl-C during enrichment must reach a Node subprocess and then, if pressed again, kill the process outright. This document covers those seams — threading, signals and cancellation, the two telemetry sinks, error conventions, transaction and read-snapshot discipline, hard resource ceilings, the injected filesystem, and the source conventions the recent restructure settled on. Configuration precedence is not covered here; see [12-configuration.md](12-configuration.md).
+jscout has no framework layer: there is no async runtime, no logging crate, no error type hierarchy, no dependency-injection container. What holds the twenty-odd modules together is a small set of repeated decisions — one blocking thread of control per command, two process-global Ctrl-C registries at the sidecar seams, `anyhow::Result` everywhere except those seams, byte budgets declared as named constants next to the code that spends them, hand-rolled `BEGIN IMMEDIATE` transactions instead of RAII, and observability that goes to stderr because stdout is the JSON-RPC frame stream. Several of those decisions are implemented twice in different places, and several are enforced by nothing but habit. Configuration precedence — how a CLI flag, an environment variable, a `.jscout.toml` key, and a built-in default resolve against one another — belongs to [13-configuration.md](13-configuration.md).
 
-## There is no async runtime
+## Two observability streams under `jscout mcp`
 
-`Cargo.toml` lists 22 runtime dependencies and none of them is `tokio`, `async-std`, `smol`, or `futures`; `src/` contains zero `async fn` and zero `.await`. Every I/O call in the crate blocks: `rusqlite` (bundled SQLite) blocks, `ureq` blocks, `oxc` parsing is CPU-bound and synchronous, and both sidecars are ordinary child processes talking newline-delimited JSON over pipes. There is also no work-stealing pool — no `rayon`, no `std::thread::scope` fan-out — so indexing walks and parses files one at a time on the main thread. That is a real throughput ceiling on large repositories and it is not mitigated anywhere in the crate; the design buys determinism and a single `&Connection` threaded through every function signature instead.
+Telemetry is not a crate-wide facility. It exists in exactly one place: the MCP server loop in `src/mcp.rs`, and only when the operator supplies a path. `serve` opens two append-mode files up front, one for tool-call telemetry and one for a raw request log (`src/mcp.rs:168-186`), and each remains `None` when its path is absent. The two are deliberately asymmetric in what they record.
 
-Threads exist for exactly two reasons: a child process's `stdout` and `stderr` must be drained or the child blocks on write, and a blocking phase that the watcher may need to abandon must run somewhere the watcher can outlive. Seven `thread::spawn` calls exist in production code — three in `src/watch.rs` (`:1112`, `:1140`, `:1176`), two in `src/llm/process.rs` (`:228`, `:245`), two in `src/checker/process.rs` (`:259`, `:274`) — plus whatever backend thread the `notify` crate starts for filesystem events.
+| | Telemetry (`--telemetry`) | Request log (`--request-log`) |
+|---|---|---|
+| Written by | `log_tool_call` (`src/mcp.rs:1713`) | `log_request` (`src/mcp.rs:345`) |
+| Trigger | after each `tools/call` completes | before dispatching *every* JSON-RPC message |
+| Records arguments | no | yes, verbatim (`src/mcp.rs:370`) |
+| Records result text | no — only `result_bytes`, `ok`, section byte splits | no |
+| CLI help wording | "privacy-minimal tool-call metrics as JSONL (no queries or results)" (`src/cli.rs:228`) | "including tool arguments" (`src/cli.rs:231`) |
+| Failure mode | `eprintln!("warning: …")`, never fatal (`src/mcp.rs:1914`) | same (`src/mcp.rs:376`) |
 
-Look at where the arrows fan out below: every branch from `MAIN` is a mode, and only the `watch` and sidecar branches produce additional threads at all.
+The telemetry record (`src/mcp.rs:1841-1912`) is a single flat JSON object per call, flushed line by line. It carries build and configuration identity (`binary_fingerprint` is a blake3 of the running executable computed at startup, alongside `config_fingerprint`, `database`, `snapshot`); session identity read from the environment (`JSCOUT_SESSION_ID`, falling back to `pid-<pid>`, plus optional `JSCOUT_TASK_ID` and `JSCOUT_PROFILE_LABEL` at `src/mcp.rs:1735-1737`, `:1810`); and measurement — elapsed milliseconds, result bytes, per-stage retrieval timings, transport section byte splits, expansion node counts by file role, semantic-artifact freshness counts, and result-transport metrics. The environment indirection exists so the evaluation harness can tag every call from an agent session without changing the server's arguments; `scripts/eval-run-memory.mjs:349-351` sets all three through the MCP client's env block.
+
+Two consequences follow from the shape rather than the content. First, `collect_telemetry` is a boolean threaded into every `ToolContext` (`src/mcp.rs:178`, `:286`, `:305`), because some metrics cost a query to produce — the name-only usage count runs an extra lookup and is skipped entirely when telemetry is off, warning rather than failing if it errors (`src/mcp.rs:1028-1033`). Second, both writers are best-effort: a full disk degrades the server to a warning on stderr, never an RPC error. Nothing rotates, size-caps, or garbage-collects either file.
+
+Outside MCP there is no structured logging at all. The tree contains 169 `println!` (stdout — the actual command output) against 62 `eprintln!` (stderr — diagnostics), and the stderr side has four uncoordinated dialects: three `warning: …` lines, all in `src/mcp.rs`; structured `key=value` lines used only by the watcher (`watch generation={} phase=enrich status=… elapsed_ms=…` at `src/watch.rs:896`, `watch status=stopped reason=interrupt` at `:945`); timing lines in two spellings, `timing: bm25 {:?}` in search (`src/search.rs:2069`) versus `timing project-modules={:?}` in the structural projection, both gated on `diagnostics.timing` (`src/config/load.rs:832-834`, threaded to MCP at `src/mcp.rs:285`); and sidecar passthrough, where a reader thread prefixes each child stderr line with `pi-ai-gateway: ` (`src/llm/process.rs:248`) or `typescript-checker: ` (`src/checker/process.rs:347`). Everything diagnostic goes to stderr because under `jscout mcp` stdout carries newline-delimited JSON-RPC frames (`src/mcp.rs:380-385`); a stray `println!` in any module reachable from a tool call would corrupt the stream. That constraint is enforced by convention alone — no wrapper, no lint.
+
+## Threading model
+
+There is no async runtime. `src/` contains zero `async fn` and zero `.await`, and `Cargo.toml`'s 22 runtime dependencies include neither tokio nor rayon. Every command is one blocking thread that owns a `rusqlite::Connection` and threads `&Connection` through every function signature; the payoff is that indexing produces byte-identical output run to run, with no interleaving to reason about. The cost is that a multi-core machine indexes no faster than a single-core one, and that the only way to make a long phase abandonable is to move it onto a thread and poll it.
+
+Seven `thread::spawn` calls exist in production code, serving exactly two purposes.
+
+| Site | Purpose | Lifetime |
+|---|---|---|
+| `src/llm/process.rs:228` | drain gateway stdout, decode `Inbound`, forward over an `mpsc` channel | until EOF or first decode error |
+| `src/llm/process.rs:245` | drain gateway stderr, prefix and re-emit | until EOF |
+| `src/checker/process.rs:330` | drain checker stdout, same shape | until EOF or first error |
+| `src/checker/process.rs:345` | drain checker stderr, same shape | until EOF |
+| `src/watch.rs:1112` | run a code-embedding pass abandonably | joined by the watch loop |
+| `src/watch.rs:1140` | run a semantic-embedding pass abandonably | joined by the watch loop |
+| `src/watch.rs:1176` | run a checker enrichment pass abandonably | joined by the watch loop |
+
+The `notify` crate contributes one more, its own backend watcher thread, whose callback does nothing but forward events into an `mpsc::channel` (`src/watch.rs:663-666`) so all classification happens on the watch thread.
+
+The reader threads exist because a child process can block writing to a full pipe while the parent blocks waiting for a reply — draining both pipes concurrently is the only way to avoid the deadlock. They are strictly one-way: the stdout reader owns the `Sender` half and returns on the first `Err`, so an EOF or a malformed frame reaches the main thread as a channel disconnect, which `receive_for` reports as `ChildExited` (`src/llm/process.rs:238-243`). The stderr reader never sends anything; it only prints.
+
+The three watcher workers exist for a different reason: `embed::embed_missing_interruptible` and `checker::enrich` are blocking calls that can run for minutes, and the watcher must keep ingesting filesystem events during them or lose edits. `run_embedding_interruptible` (`src/watch.rs:1101`) spawns the pass with its own database connection, then spins on `worker.is_finished()` at a 100 ms cadence (`OPTIONAL_PHASE_POLL`, `src/watch.rs:21`), calling `monitor.poll()` each round to drain events and, if the generation has been superseded, flipping an `AtomicBool` the embedding loop checks between batches. Enrichment is cancelled differently — through `checker::process::cancel_active_operation()` (`src/watch.rs:1202`) — because the work is inside a child process. Each worker opens its own connection via `open_phase_database` with a 5-second busy timeout (`src/watch.rs:1308-1314`, `:17`), the only place in the crate where two connections to one database are live at once.
+
+The diagram below shows one `jscout watch` process at the moment an enrichment phase is running. Look for which arrows are channels, which are shared atomics, and which cross a process boundary.
 
 ```mermaid
 flowchart TD
-  MAIN["Main thread: clap parse, config load, dispatch"]
-  CLIRUN["CLI bodies: index, embed, search, scout, overview"]
-  MCPLOOP["mcp: stdin line loop, owns the locked stdout"]
-  WATCHLOOP["watch: generation loop"]
-  NOTIFY["notify backend thread"]
-  CHAN["mpsc channel of notify events"]
-  WORKER["Optional-phase worker: own SQLite connection"]
-  POLL["Parent poll every 100 ms"]
-  CKPROC["Node checker child process"]
-  GWPROC["Node gateway child process"]
-  CKOUT["Checker stdout reader thread"]
-  CKERR["Checker stderr pump thread"]
-  GWOUT["Gateway stdout reader thread"]
-  GWERR["Gateway stderr pump thread"]
-  SIG["ctrlc handler thread"]
-
-  MAIN --> CLIRUN
-  MAIN --> MCPLOOP
-  MAIN --> WATCHLOOP
-  WATCHLOOP --> NOTIFY
-  NOTIFY --> CHAN
-  CHAN --> WATCHLOOP
-  WATCHLOOP --> WORKER
-  WATCHLOOP --> POLL
-  POLL --> WORKER
-  WORKER --> CKPROC
-  CLIRUN --> CKPROC
-  CLIRUN --> GWPROC
-  CKPROC --> CKOUT
-  CKPROC --> CKERR
-  GWPROC --> GWOUT
-  GWPROC --> GWERR
-  SIG --> CKPROC
-  SIG --> GWPROC
+  subgraph WatchProc["jscout watch process"]
+    NOTIFY["notify backend thread"]
+    MAIN["watch loop thread<br/>owns Coordinator + targets"]
+    WORKER["phase worker thread<br/>checker::enrich"]
+    RDOUT["checker stdout reader"]
+    RDERR["checker stderr reader"]
+  end
+  CHILD["node checker sidecar<br/>child process"]
+  NOTIFY -->|"mpsc events"| MAIN
+  MAIN -->|"spawn + poll is_finished"| WORKER
+  MAIN -->|"cancel_active_operation"| FLAGS["CANCELLATION_FLAGS<br/>3 AtomicBool"]
+  FLAGS --> WORKER
+  WORKER -->|"spawn"| CHILD
+  CHILD -->|"stdout pipe"| RDOUT
+  CHILD -->|"stderr pipe"| RDERR
+  RDOUT -->|"mpsc Inbound"| WORKER
+  RDERR -->|"eprintln typescript-checker:"| STDERR["stderr"]
+  WORKER -->|"join"| MAIN
 ```
 
-`MAIN` is `src/main.rs:51-68`: parse, split `Command::Config` out before any config load, otherwise load `RuntimeConfig`, warn about legacy environment keys, dispatch. `NOTIFY` and `CHAN` come from `src/watch.rs:663-668`, where a `mpsc::channel::<notify::Result<notify::Event>>()` is created and the watcher subscribes to the root *before* the startup refresh, so edits during a long first pass are queued rather than lost. `WORKER` and `POLL` are the interruptible-phase shape: `run_embedding_interruptible` (`src/watch.rs:1101`) moves owned `PathBuf`s and an `Arc<embed::Provider>` into a thread that opens its *own* database handle (`open_phase_database`, `src/watch.rs:1113`) and passes `embed_missing_interruptible` a `|| worker_canceled.load(Ordering::SeqCst)` closure; the parent then spins `while !worker.is_finished()`, calling `monitor.poll()` and sleeping `OPTIONAL_PHASE_POLL = 100ms` (`src/watch.rs:21`). `run_semantic_embedding_interruptible` (`:1131`) is the same shape, and `run_enrichment_interruptible` (`:1159`) is the same loop with a different cancel action. A worker panic is converted, not propagated: `.map_err(|_| anyhow::anyhow!("embedding worker panicked"))`.
+`MAIN` never blocks on `WORKER` except at `join`, and it never touches `CHILD` directly — the cancel path goes through `FLAGS` and the process-global control slot, not through a handle the watch loop owns. `RDOUT` and `RDERR` are owned by `WORKER`'s sidecar client and die with the child. `NOTIFY` is the only thread jscout does not create itself.
 
-The consequence nobody states in the code: a watch generation running embedding, semantic embedding, and enrichment holds up to four SQLite connections to the same WAL database — the coordinator's plus one per worker — and burns a thread spinning at 10 Hz for the duration. That is the price of not having a runtime with cancellation tokens.
+## Signals and cancellation
 
-## stdout is a protocol; stderr is the log
+`ctrlc::set_handler` can succeed at most once per process. jscout installs it from two places with near-identical implementations and no shared abstraction.
 
-`jscout mcp` takes `std::io::stdout().lock()` once at `src/mcp.rs:192-194` and holds it for the life of the server, framing JSON-RPC through `write_msg` (`src/mcp.rs:380`). Any library module that printed a line to stdout would corrupt a frame. The discipline is enforced by convention only — no newtype, no `#[deny]` — but it holds: real `println!` calls exist in exactly six files, `src/commands/core.rs` (43), `src/commands/scout.rs` (23), `src/llm/mod.rs` (11), `src/commands/mod.rs` (10), `src/checker/mod.rs` (9), and `src/inference.rs` (6). The last three are `doctor` subcommand bodies that live next to their protocol clients rather than under `commands/`. Every retrieval, indexing, and storage module writes only to stderr.
+| | `src/llm/process.rs` | `src/checker/process.rs` |
+|---|---|---|
+| Handler once-cell | `INTERRUPT_HANDLER: OnceLock<Result<(),String>>` (`:30`) | same (`:28`) |
+| Cancel target slot | `Mutex<Option<GatewayControl>>` (`:31`) | `Mutex<Option<CheckerControl>>` (`:29`) |
+| Pending state | one `AtomicBool` (`:32`) | `CancellationFlags`: interrupt / operation / operation_delivered (`:30-56`) |
+| Installer | `install_interrupt_handler` (`:72`) | `install_interrupt_handler` (`:215`) |
+| First Ctrl-C | cancel the active request (`:83-90`) | same (`:226-236`) |
+| Second Ctrl-C | `exit(130)` (`:85`) | `exit(130)` (`:228`) |
+| Registration point | unconditional in `launch` (`:300`) | explicit `register_interrupts()` (`:392-395`) |
 
-There is no logging crate. Sixty `eprintln!` calls in production code are the entire logging system, and they speak three incompatible dialects: `timing <key>=<value>` (`src/structural.rs:543,555,568,573,586`, `src/indexer.rs:561`), `timing: <label> <value>` (`src/search.rs:1453,1462,1498`), and a watch-specific `key=value` line shape (`src/watch.rs:1277`, `:777`). Both timing dialects are gated on `runtime.effective.diagnostics.timing`, threaded into MCP at `src/mcp.rs:285,304` and into the CLI at `src/commands/mod.rs:276,600`. Only seven stderr writes carry a `warning: ` prefix (`src/main.rs:60`, `src/watch.rs:708`, `src/mcp.rs:376,994,1876`, `src/commands/scout.rs:57,81`); the rest are unprefixed, so machine-parsing jscout's stderr means matching per-site shapes.
+The duplication is real but currently harmless, and the reason is disjointness rather than design. `checker::process` installs its handler only through `begin_interrupt_scope` / `register_interrupts`, which are reached from `checker::enrich` (`src/checker/enrich.rs:428`, `:434`, `:1598`, `:2721`) — that is, from `jscout enrich` (`src/commands/mod.rs:680`) and from the watcher (`src/watch.rs:1176`), neither of which launches a gateway. `ProcessGateway::launch` registers unconditionally (`src/llm/process.rs:300`), so `jscout scout` installs the gateway handler. The repository scout is the one command that runs both sidecars in one process — a gateway from `src/commands/scout.rs:32` and a checker from `src/scouting/repository.rs:385` — but it calls `crate::checker::launch` without `register_interrupts()`, so the second install never happens. If it ever did, the loser would surface as `Spawn("failed to install Ctrl-C handler: …")`. Nothing in the code states or tests that invariant.
 
-## Signals and the two-stage interrupt
+The checker's three-flag structure exists because the watcher needs a cancellation that is not an operator interrupt. `cancel_active_operation` (`src/checker/process.rs:252-263`) sets the `operation` bit and, if a cancel has not already been delivered, forwards a `Cancel` frame to the sidecar; enrichment separately checks `cancellation_pending()` at project boundaries (`src/checker/enrich.rs:726`, `:830`) so a superseded generation stops even when no request is in flight. `interrupt_pending()` stays distinct so the watch loop can tell an operator Ctrl-C (print `watch status=stopped reason=interrupt` and return, `src/watch.rs:944-946`) from a supersession (record `canceled` and continue). `begin_interrupt_scope` resets all three once per enrichment pass (`:268-274`), while `register_interrupts` deliberately does *not* — a per-project worker re-registering must not erase an interrupt that already cancelled an earlier project, a subtlety documented only in the comment at `src/checker/process.rs:390-394`.
 
-Both sidecar clients install a `ctrlc` handler exactly once, through a `OnceLock` that memoizes the installation *result* so a second attempt reports the original failure rather than re-registering (`src/checker/process.rs:144-152`, `src/llm/process.rs:72-81`). The handler itself is four lines and identical in both: if `request_interrupt_cancellation()` returns false — meaning the pending bit was already set — call `std::process::exit(130)` (`src/checker/process.rs:155-159`, `src/llm/process.rs:83-86`; `INTERRUPTED_EXIT_CODE` at `src/checker/process.rs:19` and `src/llm/process.rs:26`). First Ctrl-C sends a `Cancel` frame to the child and lets the request unwind through `CheckerError::Canceled` / `GatewayError::Canceled`; second Ctrl-C abandons cleanup.
-
-Trace the two `request_interrupt` messages below — the first returns true and reaches the sidecar, the second returns false and the handler exits the process.
+The sequence below is one Ctrl-C arriving while a gateway completion is outstanding. Look at where the mutex is held.
 
 ```mermaid
 sequenceDiagram
-  participant Op as Operator
-  participant H as ctrlc handler
-  participant F as CancellationFlags
-  participant C as CheckerControl
-  participant S as Node sidecar
-  participant W as Watch loop
-  Op->>H: SIGINT (first)
-  H->>F: request_interrupt
-  F-->>H: true (was clear)
-  H->>C: cancel_active
-  C->>S: Cancel frame with target_id
-  S-->>C: canceled reason=requested
-  Op->>H: SIGINT (second)
-  H->>F: request_interrupt
-  F-->>H: false (already pending)
-  H->>H: process exit 130
-  W->>F: cancel_active_operation on supersession
-  F-->>W: operation bit set, not interrupt
-  W->>C: cancel_active
-  C->>S: Cancel frame with target_id
+  participant OS as OS signal
+  participant H as ctrlc handler thread
+  participant M as main thread
+  participant G as gateway child
+  M->>M: lock active_request
+  M->>G: complete frame id=r7
+  M->>M: store active=r7, unlock
+  M->>M: block on recv_timeout
+  OS->>H: SIGINT
+  H->>H: swap INTERRUPT_PENDING true
+  H->>G: cancel target_id=r7
+  G-->>M: cancel_result active=true
+  M->>M: consume ack, keep deadline
+  G-->>M: error code=canceled id=r7
+  M->>M: return GatewayError::Canceled
 ```
 
-The checker's state is not one boolean. `CancellationFlags` (`src/checker/process.rs:25-29`) holds three `AtomicBool`s — `interrupt`, `operation`, `operation_delivered` — in a `static`, and the separation is documented at `src/checker/process.rs:179-181`: the watcher must cancel a superseded generation *without* impersonating an operator SIGINT, because an operator SIGINT means "stop the whole process on the next one." `cancel_active_operation()` (`:182`) sets the `operation` bit, returns early if the cancel was already delivered, and marks delivery on success — which is what stops a 10 Hz polling loop from spamming `Cancel` frames at the sidecar. `begin_interrupt_scope()` (`:197`) resets all three at the start of a top-level operation so per-project sidecars can replace the cancel target without clearing an interrupt that already canceled an earlier project. `cancellation_pending()` (`:207`) is the OR of both bits, and enrichment consults it at project boundaries so a generation can stop even when no sidecar request is in flight.
+`send_complete` writes the frame and publishes the cancel target under the same lock (`src/llm/process.rs:313-325`), so the handler can never see a sent completion without also seeing the id it must cancel. `receive_for` consumes the acknowledgement inline rather than treating it as an out-of-order message, and preserves the completion's original deadline while doing so (`src/llm/process.rs:330-360`); an acknowledgement that reports `active` for a *different* id is a protocol violation that poisons the client. Both clients' `Drop` impls unregister the control slot, send `shutdown` unless poisoned, poll `try_wait` for 500 ms, then `kill()` and `wait()` (`src/llm/process.rs:488-504` at 20 ms intervals; `src/checker/process.rs:797-813` at 10 ms) — the child never outlives its client.
 
-The gateway client is the simpler half: a single `INTERRUPT_PENDING: AtomicBool` (`src/llm/process.rs:32`), no operation tier, because nothing supersedes an LLM call from inside the process. Pure-Rust phases have no sidecar to cancel at all, which is why embedding gets the polled `AtomicBool` closure described above — three unrelated cancellation mechanisms, chosen by what the phase happens to be blocked on.
+## Error conventions
 
-## Telemetry and the request log
+`anyhow::Result` is the crate-wide return type, with `.with_context(|| format!(…))` at every I/O boundary; the resulting messages are the operator's only diagnostic for most failures. Exactly two typed error enums exist, both at sidecar seams, both with the same seven variants — `Spawn`, `Protocol`, `Io`, `ChildExited`, `Timeout`, `Canceled`, `Remote { code, message }` — and both exposing a stable short `code()` string that is persisted into the scouting run ledger: `GatewayError` (`src/llm/mod.rs:40-53`) and `CheckerError` (`src/checker/process.rs:79-87`). The reason for the typing is that these two failures need to be *classified* downstream — a timeout should be retried, a `Protocol` error should poison the client, a `Canceled` should not be recorded as a failure — and a string message cannot carry that.
 
-Two append-only JSONL sinks exist, both opt-in, both opened once at MCP startup with `OpenOptions::new().create(true).append(true)` (`src/mcp.rs:168-187`). They differ in what they are allowed to contain.
+Between the two sits `src/io_policy.rs` (106 lines), the only place in the crate that distinguishes an *inventory race* from a *retryable resource failure*. `is_inventory_race` matches `NotFound`, `IsADirectory`, `NotADirectory` and means "the file went away after we listed it — treat it as absent and let the next reconciliation converge." `is_retryable` matches transport and resource kinds plus a Unix `errno` allowlist including `EMFILE`, `ENFILE`, `ENOMEM`, `EIO` and `ESTALE`, and means "abort the phase rather than publish a clean-but-random subset." `PermissionDenied` and `InvalidData` fall through both and are treated as durable facts about the file. That policy governs ingestion, workspace discovery, and dependency planning, and is documented only in that file's doc comments.
 
-| Sink | Flag / config | Written by | Fields | Contains arguments? |
-|---|---|---|---|---|
-| Telemetry | `--telemetry PATH`, or `telemetry.file` | `log_tool_call`, `src/mcp.rs:1675` | 62 | No — counts, timings, byte totals |
-| Request log | `--request-log PATH`, or `telemetry.request_log` | `log_request`, `src/mcp.rs:345` | 8 | Yes — full `arguments` object |
-
-The CLI flag and the config value are OR'd at `src/commands/mod.rs:355-360`, flag first. The telemetry record (`src/mcp.rs:1808-1872`) stamps `jscout_version` from `env!("CARGO_PKG_VERSION")`, `binary_fingerprint` (a 64 KiB-chunked blake3 of `current_exe()`, `src/mcp.rs:1880`), `config_fingerprint` from the loaded `RuntimeConfig`, the database path, the current snapshot hash, MCP client name and version, the applied result transport and four wire-byte counts, per-stage retrieval timings, expansion and semantic-artifact counts, and the four canonical section byte totals (`hits_bytes`, `graph_bytes`, `memory_bytes`, `envelope_bytes`) plus `canonical_rendered_bytes`. The checked-in sample at `.jscout-telemetry.jsonl` is one line with seven fields, so it is a shape hint, not a schema.
-
-Session identity is the one place the environment still wins. `JSCOUT_SESSION_ID` (defaulting to `pid-<pid>`), `JSCOUT_TASK_ID`, and `JSCOUT_PROFILE_LABEL` are read directly at `src/mcp.rs:357-361` and again at `:1697-1699,1772`, produce no legacy-migration warning, and have no `.jscout.toml` equivalent. `.env.example:16-18` gives the reason: these "describe an invocation and are intentionally not durable repository policy" — an evaluation arm relabels telemetry rows without changing behavior. Note also that jscout never loads `.env` itself; there is no `dotenv` dependency.
-
-Both writers fail soft. A serialization or write error prints one `warning:` line to stderr (`src/mcp.rs:376`, `:1876`) and the tool call still returns its result. Both `flush()` on every record, so a killed process loses at most the line in flight — at the cost of an fsync-shaped syscall per tool call.
-
-## Error handling
-
-`anyhow::Result` is the only result type in the crate. There is no `thiserror`, zero `ensure!`, 418 `bail!` in production code, and 150 `.context()` / `.with_context()` calls. Six concrete error types exist across five files, and every one of them is reached by `downcast_ref` for *control flow*, not for display.
-
-| Type | Defined | Downcast at | Decides |
-|---|---|---|---|
-| `CheckerError` | `src/checker/process.rs:72` | `src/checker/enrich.rs:753,758` | terminal vs retryable sidecar failure |
-| `GatewayError` | `src/llm/mod.rs:40` | matched directly; `code()` at `:59` | the stable ledger error code |
-| `VectorFailure` | `src/embed.rs:66` | `src/embed.rs:114` | which repair hint to print |
-| `PartialEnrichmentError` | `src/checker/enrich.rs:86` | `src/checker/enrich.rs:130` | whether a partial batch is terminal |
-| `ContextBudgetExceeded` | `src/scouting/mod.rs:277` | 7 sites in `scouting/{mod,repository}.rs` | degrade or fail an automatic run |
-| `UnresolvableRefresh` | `src/scouting/mod.rs:290` | `src/scouting/mod.rs:959` | whether a refresh is skippable |
-
-`VectorFailure` carries a `plane: &'static str` ("code" or "semantic") alongside a `kind` of `Inference | Index`, and `vector_failure_action` (`src/embed.rs:112`) maps that kind to operator instructions: an `Inference` failure yields "start or repair the configured embedding service, then retry", anything else falls back to the plane-specific repair command (`src/embed.rs:128-134`). It implements `Error::source()` so the anyhow chain still reaches the transport error underneath. `GatewayError::code()` (`src/llm/mod.rs:59-74`) exists so the scouting run ledger stores a stable string per failure class and a ledger row survives message-text edits.
-
-Panics are nearly absent from production paths. Five real `.unwrap()` calls survive outside test modules, all in `src/structural.rs` on `confidence_rank`: `:2466` is total only because `src/structural.rs:2446-2448` already `bail!`ed on an unrecognized value, and `:2724`, `:2809`, `:2889`, `:2972` unwrap `confidence_rank("likely")` on a literal the same file's match arm defines. The crate's only `unsafe` block is the sqlite-vec registration at `src/store.rs:14-24`, which `transmute`s the extension's C init symbol into `sqlite3_auto_extension` behind a `static SQLITE_VEC: Once`.
-
-## Transactions, snapshots, and connection policy
-
-`rusqlite`'s RAII `Transaction` type is never used — zero occurrences of `.transaction()` or `unchecked_transaction()`. All 24 write transactions are hand-rolled in one shape: `conn.execute_batch("BEGIN IMMEDIATE")?`, an immediately-invoked closure returning `Result<()>` so `?` works inside, then a `match` that runs `COMMIT` or `ROLLBACK`. The reason is structural rather than stylistic: `Transaction` borrows the connection mutably, and every function in the crate takes `&Connection`. Adopting RAII would mean rewriting those signatures.
-
-Multi-statement reads get a separate primitive. `store::with_read_snapshot(conn, savepoint, read)` (`src/store.rs:858-874`) wraps the read in a named `SAVEPOINT`, `RELEASE`s on success, and `ROLLBACK TO … ; RELEASE`s on error. Its doc comment names why savepoints and not `BEGIN`: they nest safely "when search expansion calls neighborhood traversal." Eight call sites use seven distinct hardcoded names — `jscout_search` (`src/search.rs:1047`), `jscout_neighborhood` (`src/structural.rs:2433`), `jscout_semantic_query` (`src/semantic_query.rs:530`), `jscout_repository_overview_pack` (`src/surface.rs:590`), and four planner scopes in `src/scouting/plan.rs:70,264,608,1448` — so a nested pair is unambiguous in a SQLite trace. `store::open_path_read_only` (`src/store.rs:53`) refuses to create a file, opens `SQLITE_OPEN_READ_ONLY`, sets `query_only=ON`, then hard-fails on a schema-version mismatch against `SCHEMA_VERSION = "26"` (`src/store.rs:8`).
+`std::process::exit` appears three times: the two second-Ctrl-C paths with code 130, and `src/commands/core.rs:421`, where `jscout who-uses` exits 1 after printing `no symbol found for '<spec>'`. Everything else propagates to `main`, which returns `Result<()>` and lets anyhow print the chain (`src/main.rs:50-69`).
 
 ## Resource limits
 
-Ceilings are `const`s scattered across the modules that enforce them; there is no policy object and most are not configurable.
+Budgets are named constants next to the code that spends them rather than magic numbers or configuration. The set that matters across modules:
 
-| Ceiling | Value | Site |
+| Constant | Value | Meaning |
 |---|---|---|
-| Search response bytes | 24,000 | `src/search.rs:11` |
-| Semantic query response bytes | 24,000 | `src/semantic_query.rs:19` |
-| Scout source render bytes | 12,000 | `src/scout.rs:12` |
-| Semantic source bytes (default / max) | 2,000 / 16,000 | `src/semantic_query.rs:20`, `:26` |
-| Semantic artifact body bytes | 12,000 | `src/semantic.rs:11` |
-| Workflow traversal nodes / edges | 100 / 400 | `src/semantic.rs:16-17` |
-| Path traversal nodes / edges / states | 200 / 800 / 50,000 | `src/structural.rs:296-298` |
-| Memory graph nodes (default / max) | 2,000 / 20,000 | `src/search.rs:14,16` |
-| Dependency ingestion bytes / per file | 100 MiB / 2 MiB | `src/dependency.rs:23-24` |
-| Watch busy timeout, retry floor / ceiling | 5 s, 500 ms / 30 s | `src/watch.rs:17-19` |
-| Optional-phase poll | 100 ms | `src/watch.rs:21` |
-| Sidecar hello timeout / shutdown grace | 30 s / 500 ms | `src/llm/process.rs:24-25` |
+| `src/checker/process.rs:22` `MAX_PROTOCOL_LINE_BYTES` | 4 MiB | largest checker frame accepted |
+| `src/checker/process.rs:23-26` `PLAN_FRAME_MAX_BYTES` / `PLAN_FILE_PAYLOAD_BYTES` | 1 MiB / 900 KiB | payload headroom for the JSON envelope and escaping |
+| `gateway/src/protocol.mjs:9` `MAX_LINE_BYTES` | 16 MiB | gateway line cap; overflow is unrecoverable |
+| `src/scout.rs:12` `DEFAULT_SOURCE_BYTE_LIMIT` | 12,000 | rendered source per `definition` result |
+| `src/semantic.rs:11` `MAX_BODY_BYTES` | 12,000 | annotation body |
+| `src/search.rs:11` / `src/semantic_query.rs:19` `DEFAULT_RESPONSE_BYTE_LIMIT` | 24,000 | search and memory response transport |
+| `src/dependency.rs:22-24` | 10,000 files / 100 MiB / 2 MiB per file | dependency ingestion ceilings |
+| `src/structural.rs:298-300` | 200 nodes / 800 edges / 50,000 states | path search bounds |
+| `src/watch.rs:22` `MAX_INCREMENTAL_SOURCE_PATHS` | 256 | above this an incremental pass becomes a full one |
 
-The two 24,000-byte response limits are independent constants that happen to agree; so are the two 125-second HTTP deadlines. There is no shared HTTP layer at all — three `ureq::Agent`s are built at three sites with unrelated policies: `src/inference.rs:105` uses a flat 10 s for `inference doctor`; `src/embed.rs:332` uses `DEFAULT_LOCAL_DEADLINE_MS + 5_000` (125 s) with the crate's only retry ladder; `src/search.rs:982` hardcodes 125 s with `"deadline_ms": 120_000` in the request body (`:976`) and no retry. The ladder at `src/embed.rs:326-331` is protocol-conditional: `Local` gets `[(0,0)]`, a single attempt, while remote gets `[(0,0),(1,2000),(2,8000),(3,20000)]`. The implicit rationale is that a local sidecar that is down stays down, whereas a remote provider is rate-limited — reasonable, but it means a transient local hiccup fails the whole embedding pass.
+Response budgeting is the one case where the accounting is part of the payload it measures, so it is solved by iteration rather than arithmetic. `settle_search_response` (`src/search.rs:2712`) alternates between computing compact section byte splits and re-rendering, up to 8 rounds, bailing out to a final render if it has not converged; `capture_unbudgeted_bytes` (`src/search.rs:2729`) wraps that in another 8-round loop, and `settle_value_rendered_bytes` (`src/mcp.rs:1685`) does the same for the MCP envelope. The exhaustive mode's advertised retry floor is a binary search over that same fitting function (`minimum_exhaustive_response_bytes`, `src/search.rs:2741`) — it clones the baseline result and probes byte limits until it finds the smallest one where budgeting still succeeds, which is more expensive than an estimate but cannot advertise a floor the server would then reject.
 
-One budget is deliberately removable: `effective_search_response_byte_limit` (`src/commands/mod.rs:129-135`) resolves to `usize::MAX` when `--debug-json` is set, so debugging output is unbounded by design.
+## Transactions
 
-## The injected filesystem and I/O classification
+The crate never uses `rusqlite::Transaction`. Every write batch is hand-rolled: `conn.execute_batch("BEGIN IMMEDIATE")`, a closure returning `Result<T>` so `?` is safe inside it, then `COMMIT` on `Ok` and a best-effort `ROLLBACK` on `Err`. There are 26 such sites in production code across 11 modules — 11 in `src/checker/enrich.rs`, 5 in `src/scouting/mod.rs`, 2 each in `src/structural.rs` and `src/embed.rs`, and singletons in `store.rs`, `recon.rs`, `semantic.rs`, `indexer.rs`, `scouting/ledger.rs` and `scouting/repository.rs`. `IMMEDIATE` rather than `DEFERRED` takes the write lock at `BEGIN`, so a second writer fails fast at the busy timeout instead of mid-batch. Against RAII the tradeoff is visibility versus omission: the rollback path is spelled out at every site, and it can be forgotten at any of them. One site deviates — `src/checker/enrich.rs:1844-1845` assigns a single `conn.execute(...)` result directly instead of wrapping a closure.
 
-`fs_ops::FileSystem` (`src/fs_ops.rs:16-21`) is a four-method trait — `read_to_string`, `metadata`, `read_dir`, `file_type` — threaded as `&impl FileSystem` (monomorphized, never `dyn`, never thread-local) through `indexer.rs`, `workspace.rs`, and `dependency.rs`. Its doc comment enumerates what it excludes and why: canonicalization, existence probes, diagnostic entry-path traversal, resolver internals, and repository walking through `ignore` "retain their existing owners and error policies" (`src/fs_ops.rs:11-15`). The exclusion is visible — 14 direct `std::fs::read_to_string` calls survive outside the seam, and several of them are freshness re-reads (`src/calls.rs:117`, `src/semantic.rs:732`, `src/semantic_query.rs:1639`, `src/mcp.rs:1109`, `src/scouting/evidence.rs:63`) where reading the *live* file is the entire point and a fake would defeat the check.
+## Conventions
 
-`test_fs::FaultFileSystem` (`src/test_fs.rs:22-25`) is the other half, gated `#[cfg(test)]` at `src/main.rs:39-40`, and `io_policy` (`src/io_policy.rs`, 64 lines of logic ahead of its inline test module) classifies the errors that result into inventory race, retryable, and permanent. Both are described in full in [12-configuration.md](12-configuration.md), which owns this seam. The property that matters at this level is that the three dispositions are process-wide policy rather than per-module habit: the same two predicates decide whether a failed read is skipped, aborts the phase, or is recorded as a rejection, at every call site in [02-ingestion.md](02-ingestion.md) and [13-incremental-and-watch.md](13-incremental-and-watch.md). One asymmetry follows the crate everywhere: `retryable_os_error` is `#[cfg(not(unix))] → false` (`src/io_policy.rs:60-63`), so Windows loses the errno tier entirely.
+**Test layout.** Modules with small test bodies use an inline `#[cfg(test)] mod tests { … }`; modules whose tests grow past roughly 300 lines declare `#[cfg(test)] mod tests;` and move them into a sibling file. There are 19 such declarations, 18 resolving to a `foo/tests.rs` beside `foo.rs` (`src/search.rs:3508` → `src/search/tests.rs`, `src/checker/enrich.rs:3934` → `src/checker/enrich/tests.rs`, and so on). The nineteenth uses an explicit `#[path = "core_tests.rs"]` (`src/commands/core.rs:481-483`). `src/main.rs` is the exception in kind: it declares `mod main_tests;` and re-imports crate-private helpers under `#[cfg(test)]` (`src/main.rs:70-80`) purely so `src/main_tests.rs` can exercise CLI flag resolution against private functions. The 474 `#[test]` functions all compile into one binary; there is no `tests/` integration directory. Filesystem faults are injected through the `FileSystem` trait in `src/fs_ops.rs:16-21`, whose test double stores one-shot path-addressed failures in `RefCell` (`src/test_fs.rs:22-25`) — thread-local state would be unnecessary given that nothing under test is multi-threaded.
 
-## Conventions after the restructure
+**Doc comments state constraints, not restatements.** Nearly every module opens with the reason its design has the shape it does: `src/llm/mod.rs:1-6` ("Rust owns prompts, schemas, validation, persistence, and lifecycle; the Node sidecar owns providers, credentials, and request execution"), `src/fs_ops.rs:11-15` on what the seam deliberately *excludes*, `src/io_policy.rs:3-6` on why a race is not a failure. Negative-space comments — what is not done and why — are pervasive.
 
-The crate is a binary with no `src/lib.rs`, no `[lib]`, and no `tests/` directory. `src/main.rs` is 79 lines: `#![recursion_limit = "256"]` for clap's derive depth (`:1`), a production-only `warn(clippy::redundant_clone)` (`:3`), 37 production `mod` declarations plus `#[cfg(test)] mod test_fs`, and a `main` that dispatches. Five directory modules carry real submodules (`checker/`, `commands/`, `config/`, `llm/`, `scouting/`), plus directories that exist only to hold a sibling test file.
+**Lints force justified exceptions.** `Cargo.toml:41-42` sets `allow_attributes = "warn"` and `allow_attributes_without_reason = "warn"`, so the tree contains zero `#[allow(...)]` and 31 `#[expect(..., reason = "…")]`, each with prose. The clippy list is 35 opt-in lints rather than `pedantic = "warn"`, and `Cargo.toml:33-38` explains why: the group emits roughly 780 warnings here, dominated by i64/usize casts inherent to the rusqlite boundary, and blanket-silencing those hides the real findings. `clippy.toml` exists solely to teach `doc_markdown` that SQLite, CommonJS, JavaScript, TypeScript and WebAssembly are prose.
 
-The dominant test layout is now `foo.rs` + `foo/tests.rs`, declared with a bare `mod tests;` at the bottom of `foo.rs`. Eighteen modules use it; twenty-five still carry inline `#[cfg(test)] mod tests { … }` blocks, and the split was made on size rather than principle. `src/main_tests.rs` is the one exception to the sibling rule, and for a mechanical reason: `main.rs` is the crate root, so `mod main_tests;` resolves to `src/main_tests.rs`, not `src/main/main_tests.rs`. A second trap: not everything under `#[cfg(test)]` is a test. Several *production* helpers are gated on it because only tests call them — `indexer::index_repo` and its three siblings (`src/indexer.rs:155,161,178,187`), `structural::compute_snapshot` (`:374`), `structural::clear_checker_plane` (`:616`), `semantic::search` (`:1209`), `semantic::concept_child_set_current` (`:1476`).
+**Determinism is structural.** `BTreeMap`/`BTreeSet` appear in 27 modules against `HashMap` in 19 (generally for interior lookup, not iteration); SQL statements whose order can matter carry `ORDER BY`; `serde_json` is compiled with `preserve_order` because package.json `exports` condition order is semantically significant.
 
-Test reach is bought with visibility ladders rather than widened APIs. `src/main.rs:70-76` re-imports five names from `cli` and `commands` under `#[cfg(test)]` so `main_tests.rs` can reach them through `super::`; those names are `pub(super)` in `src/commands/mod.rs:115,121,129`, visible to the crate root and nothing else. `src/commands/mod.rs:137-151` adds two `#[cfg(test)] pub(super) fn` shims that forward to `core::render_cli_neighborhood` and `core::render_semantic_memory_text`, keeping `core`'s real functions private to `commands`. Declaration and behavior are also split: `src/cli.rs` is 878 lines of clap derives with **zero** `impl` blocks, and the `root()` accessors `main.rs:53` needs live in `src/commands/mod.rs:56-105`.
+**Content identity is blake3 with a versioned domain tag.** Nineteen distinct tags exist — `jscout-structural-snapshot-v2`, `jscout-resolution-hash-v2`, `jscout-checker-plan-v5`, `jscout-checker-package-gate-v1`, `jscout-exhaustive-request-v1`, `jscout-semantic-artifact`, `jscout-workflow-candidates-v1`, and so on — hashed by 22 modules. The convention goes past a prefix: `evidence_fingerprint` (`src/recon.rs:189-225`) separates fields with `\0` and marks section boundaries with `\x02` and `\x01`, so a member-path list and a representative-file list cannot be confused for one another. The rule that a semantic change to any producer must bump its tag's `-vN` is stated nowhere central and is enforced only by review.
 
-The lint policy is a ratchet, not a blanket. `Cargo.toml` lists 35 individual `[lints.clippy]` rules in seven commented groups, with a header explaining that `pedantic = "warn"` would emit roughly 780 warnings "dominated by i64/usize casts that are inherent to the rusqlite boundary." Two of the 35 make the rest self-enforcing: `allow_attributes` and `allow_attributes_without_reason`. The verified consequence is 0 `#[allow(...)]` anywhere in `src/` and 23 `#[expect(...)]`, each carrying a `reason` string — for example `reason = "response builder keeps result selection and complete byte-budget accounting explicit"` (`src/compact.rs:478-481`). Because `#[expect]` warns when its lint stops firing, a stale suppression becomes a build warning. `clippy.toml` extends `doc-valid-idents` with `SQLite, CommonJS, JavaScript, TypeScript, WebAssembly` plus `".."`, which preserves clippy's defaults rather than replacing them. The toolchain is pinned to 1.97.1 in `rust-toolchain.toml`; there is no `rustfmt.toml`, and import grouping is therefore unenforceable since `group_imports` remains nightly-only.
+**Version constants are independent.** Thirteen of them coexist, each covering a different contract: `SCHEMA_VERSION = "29"` (`src/store.rs:8`), `PROJECTION_VERSION = "12"` (`src/structural.rs:13`), `EXTRACTION_VERSION = "7"` (`src/entity.rs:14`), config `SCHEMA_VERSION = 1` (`src/config.rs:16`), gateway `PROTOCOL_VERSION = 1` (`src/llm/protocol.rs:8`), checker `PROTOCOL_VERSION = 4` (`src/checker/protocol.rs:3`), `EVIDENCE_ALGORITHM` (`src/recon.rs:13`), five scouting `PROMPT_VERSION` constants, and a concept `NORMALIZER_VERSION`. Only two are enforced mechanically: `open_path_read_only` rejects a schema mismatch and a projection mismatch with distinct "run `jscout index`" errors (`src/store.rs:78-83`, `:99-105`). The rest fail at the seam they describe, or silently do not fail at all.
 
-Naming leans on full-sentence test names that read as specifications — `inventory_races_are_not_phase_failures` (`src/io_policy.rs:71`), `javascript_extensions_enable_jsx_but_typescript_remains_extension_strict` (`src/parse.rs:59`), `flag_resolution_covers_every_truth_table_row` (`src/main_tests.rs:13`) — and comments that record the failure a design prevents rather than restating the mechanism. Twenty-four of the 78 `.rs` files open with a `//!` header. String enums are hand-rolled `as_str() -> &'static str` plus `parse(&str) -> Result<Self>` rather than serde-derived, because the same strings are both persisted in SQLite and emitted in JSON, and a derive would couple those two lifetimes.
+**Naming.** Identifiers are unabbreviated (`gateway_client`, `deterministic_counts`, `selected_keep`) and loop variables spelled out. Single-letter bindings survive only in `src/graph.rs`, the oldest module.
 
-The restructure also created coverage holes. Fourteen files carry no test module at all, inline or sibling, totaling roughly 5,200 lines — including the entire new `commands/` tree (`mod.rs` 982, `core.rs` 533, `scout.rs` 312), `src/cli.rs` (878), and `src/config/{load,model,display}.rs`. Most are covered indirectly at a facade: `config/tests.rs` exercises `RuntimeConfig::load`, `main_tests.rs` round-trips `Cli::parse`. Two are not covered even indirectly in any meaningful sense: `src/graph.rs` (369 lines, three oxc visitors) is referenced by name in no test file, and `src/query.rs` (646 lines of export-chain resolution) is reached only transitively. Both are load-bearing for [03-structural-extraction.md](03-structural-extraction.md) and [04-call-graph-and-surface.md](04-call-graph-and-surface.md).
+## Where the seams are thin
 
-One last trap for anyone grepping this repository: `find . -name '*.rs'` returns roughly 1,198 files while `find src -name '*.rs'` returns 78. The difference is 17 full checkouts under `.claude/worktrees/`, excluded through `.git/info/exclude` rather than `.gitignore`, so `git status` stays clean and nothing warns. Any tooling that walks the repository root reports about 15× the true match count, against stale source.
+The interrupt duplication is the clearest one: two ~90-line registries that must never both install, guarded by nothing. The `sqlite-vec` extension registration is process-global through a `Once` (`src/store.rs:11-25`) and involves a `transmute` of a function pointer — correct, but a second such extension would need the same hand-written dance. Both observability streams are unbounded append-only files with no rotation. And the whole-crate rule that keeps `jscout mcp` usable — nothing may write to stdout below the RPC loop — is a convention with no compile-time or test-time guard, which is exactly the kind of rule that survives until the module that breaks it is written by someone who has not read this page.
