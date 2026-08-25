@@ -492,11 +492,14 @@ pub(super) enum Command {
         #[arg(long)]
         debug_json: bool,
     },
-    /// Print or install the jscout agent-integration skill
+    /// Print, install, or update the jscout agent-integration skill
     AgentGuide {
         /// Install into ROOT/.agents/skills/jscout/SKILL.md; print when omitted
-        #[arg(long)]
+        #[arg(long, conflicts_with = "update")]
         install: Option<PathBuf>,
+        /// Replace ROOT/.agents/skills/jscout/SKILL.md with the shipped guide
+        #[arg(long, conflicts_with = "install")]
+        update: Option<PathBuf>,
     },
     /// Enrich exact member-call occurrences with bounded TypeScript checker facts
     Enrich {
