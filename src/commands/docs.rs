@@ -127,6 +127,7 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
             lexical_only,
             rerank,
             no_rerank,
+            no_freshness,
             response_bytes,
             json,
             debug_json,
@@ -185,6 +186,8 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                     vector: use_vector,
                     vector_required: vector,
                     rerank: use_reranker,
+                    freshness: defaults.freshness && !no_freshness,
+                    max_rank_movement: defaults.max_rank_movement,
                     reranker: reranker.flatten(),
                 },
             )?;

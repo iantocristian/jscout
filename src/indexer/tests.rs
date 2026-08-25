@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -28,6 +29,270 @@ type MarkdownChunkRow = (
     Option<String>,
     String,
 );
+
+fn git_test_command(root: &std::path::Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git").args(args).current_dir(root).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn git_test_commit(root: &std::path::Path, message: &str, date: &str) -> Result<()> {
+    git_test_command(root, &["add", "--all"])?;
+    let output = Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(root)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() -> Result<()> {
+    if Command::new("git").arg("--version").output().is_err() {
+        return Ok(());
+    }
+    let repo = tempfile::tempdir()?;
+    git_test_command(repo.path(), &["init", "--quiet"])?;
+    git_test_command(
+        repo.path(),
+        &["config", "user.email", "jscout@example.invalid"],
+    )?;
+    git_test_command(repo.path(), &["config", "user.name", "jscout test"])?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nCurrent guidance.\n\n<!-- private note one -->\n",
+    )?;
+    fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
+    git_test_commit(repo.path(), "initial", "2001-01-01T00:00:00+00:00")?;
+
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let read_provenance = || -> Result<(String, Option<i64>, String, i64)> {
+        conn.query_row(
+            "SELECT metadata.freshness_basis, metadata.freshness_author_time,
+                    provenance.status, chunk.id
+             FROM files file
+             JOIN chunks chunk ON chunk.file_id=file.id
+             JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+             JOIN doc_file_provenance provenance ON provenance.file_id=file.id
+             WHERE file.path='README.md'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(Into::into)
+    };
+    let initial = read_provenance()?;
+    assert_eq!(initial.0, "git");
+    assert_eq!(initial.1, Some(978_307_200));
+    assert_eq!(initial.2, "resolved");
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM doc_blame_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+
+    fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
+    git_test_commit(repo.path(), "unrelated code", "2010-01-01T00:00:00+00:00")?;
+    let unrelated = index_repo(repo.path(), &conn)?;
+    assert!(unrelated.unchanged >= 1);
+    assert_eq!(read_provenance()?.3, initial.3);
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nCurrent guidance.\n\n<!-- private note two -->\n",
+    )?;
+    index_repo(repo.path(), &conn)?;
+    let dirty_comment = read_provenance()?;
+    assert_eq!(
+        (dirty_comment.0.as_str(), dirty_comment.1),
+        ("git", initial.1)
+    );
+    let dirty_comment_snapshot = structural::current_snapshot(&conn)?;
+
+    git_test_commit(repo.path(), "comment only", "2020-01-01T00:00:00+00:00")?;
+    index_repo(repo.path(), &conn)?;
+    assert_eq!(read_provenance()?.1, initial.1);
+    assert_eq!(
+        structural::current_snapshot(&conn)?,
+        dirty_comment_snapshot,
+        "committing only stripped comments must not rename the search snapshot"
+    );
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nNew guidance.\n\n<!-- private note two -->\n",
+    )?;
+    index_repo(repo.path(), &conn)?;
+    let dirty_body = read_provenance()?;
+    assert_eq!(dirty_body.0, "working_tree");
+    assert_eq!(dirty_body.1, None);
+
+    git_test_commit(repo.path(), "current guidance", "2024-01-01T00:00:00+00:00")?;
+    index_repo(repo.path(), &conn)?;
+    let committed_body = read_provenance()?;
+    assert_eq!(committed_body.0, "git");
+    assert_eq!(committed_body.1, Some(1_704_067_200));
+    Ok(())
+}
+
+#[test]
+fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() -> Result<()> {
+    if Command::new("git").arg("--version").output().is_err() {
+        return Ok(());
+    }
+    let repo = tempfile::tempdir()?;
+    git_test_command(repo.path(), &["init", "--quiet"])?;
+    git_test_command(
+        repo.path(),
+        &["config", "user.email", "jscout@example.invalid"],
+    )?;
+    git_test_command(repo.path(), &["config", "user.name", "jscout test"])?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# First\n\nShared retrieval phrase in the first section.\n\n\
+         # Second\n\nShared retrieval phrase in the second section.\n",
+    )?;
+    git_test_commit(repo.path(), "initial", "2001-01-01T00:00:00+00:00")?;
+
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let initial = {
+        let mut statement = conn.prepare(
+            "SELECT file.id, chunk.id, metadata.embedding_identity,
+                    metadata.freshness_author_time,
+                    metadata.freshness_committer_time
+             FROM files file
+             JOIN chunks chunk ON chunk.file_id=file.id
+             JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+             WHERE file.path='README.md'
+             ORDER BY chunk.start, chunk.end, chunk.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    assert_eq!(initial.len(), 2);
+    assert_eq!(initial[0].0, initial[1].0);
+
+    let profile_config = serde_json::json!({
+        "document_text": docs::CHUNK_FORMAT_VERSION,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','docs-amend-profile',2,?1)",
+        [profile_config],
+    )?;
+    let profile_id = conn.last_insert_rowid();
+    for (_, _, embedding_identity, _, _) in &initial {
+        conn.execute(
+            "INSERT OR IGNORE INTO embeddings(chunk_hash,profile_id,vec)
+             VALUES(?1,?2,X'0000803F00000000')",
+            rusqlite::params![embedding_identity, profile_id],
+        )?;
+    }
+    docs::retrieval::rematerialize_cached_generations(&conn, &snapshot)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM doc_vector_generations
+             WHERE snapshot=?1 AND profile_id=?2",
+            rusqlite::params![snapshot, profile_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+
+    let amend = Command::new("git")
+        .args(["commit", "--amend", "--no-edit", "--quiet"])
+        .current_dir(repo.path())
+        .env("GIT_COMMITTER_DATE", "2002-01-01T00:00:00+00:00")
+        .output()?;
+    anyhow::ensure!(
+        amend.status.success(),
+        "git amend failed: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+
+    let refreshed = index_repo(repo.path(), &conn)?;
+    assert_eq!((refreshed.indexed, refreshed.unchanged), (1, 0));
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    let current = {
+        let mut statement = conn.prepare(
+            "SELECT file.id, chunk.id, metadata.embedding_identity,
+                    metadata.freshness_author_time,
+                    metadata.freshness_committer_time
+             FROM files file
+             JOIN chunks chunk ON chunk.file_id=file.id
+             JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+             WHERE file.path='README.md'
+             ORDER BY chunk.start, chunk.end, chunk.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    assert_eq!(
+        current
+            .iter()
+            .map(|row| (&row.0, &row.1, &row.2, &row.3))
+            .collect::<Vec<_>>(),
+        initial
+            .iter()
+            .map(|row| (&row.0, &row.1, &row.2, &row.3))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        current
+            .iter()
+            .zip(&initial)
+            .all(|(after, before)| after.4 != before.4)
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM doc_vector_generations
+             WHERE snapshot=?1 AND profile_id=?2",
+            rusqlite::params![snapshot, profile_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM doc_embedding_index_entries WHERE profile_id=?1",
+            [profile_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        2
+    );
+    Ok(())
+}
 
 #[test]
 fn shared_index_routes_markdown_without_polluting_code_search_or_graphs() -> Result<()> {

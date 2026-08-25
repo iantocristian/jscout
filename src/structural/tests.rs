@@ -80,6 +80,179 @@ fn snapshot_hashes_file_corpus_and_parser_format() -> Result<()> {
 }
 
 #[test]
+fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(repo.path(), "main.ts", "export const value = 1;\n")?;
+    write(repo.path(), "README.md", "# Guide\n\nCurrent guidance.\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    conn.execute(
+        "INSERT INTO meta(key,value)
+         VALUES('documentation_provenance_format_version',?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [crate::docs::PROVENANCE_FORMAT_VERSION],
+    )?;
+    let (file_id, chunk_id): (i64, i64) = conn.query_row(
+        "SELECT f.id, c.id
+         FROM files f JOIN chunks c ON c.file_id=f.id
+         WHERE f.path='README.md'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    conn.execute(
+        "INSERT INTO doc_file_provenance(file_id,projection_hash,status,detail)
+         VALUES(?1,'projection-a','resolved','diagnostic-a')
+         ON CONFLICT(file_id) DO UPDATE SET
+           projection_hash=excluded.projection_hash,
+           status=excluded.status,
+           detail=excluded.detail",
+        [file_id],
+    )?;
+    conn.execute(
+        "UPDATE doc_chunk_meta
+         SET freshness_basis='git', freshness_author_time=100,
+             freshness_committer_time=200, freshness_detail='diagnostic-a'
+         WHERE chunk_id=?1",
+        [chunk_id],
+    )?;
+    let stable = compute_snapshot(&conn)?;
+    assert_eq!(compute_snapshot(&conn)?, stable);
+
+    conn.execute(
+        "UPDATE doc_file_provenance
+         SET projection_hash='projection-b', detail='diagnostic-b'
+         WHERE file_id=?1",
+        [file_id],
+    )?;
+    conn.execute(
+        "UPDATE doc_chunk_meta
+         SET freshness_committer_time=201, freshness_detail='diagnostic-b'
+         WHERE chunk_id=?1",
+        [chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO doc_blame_cache(
+           path,bytes_hash,path_tip,shallow_fingerprint,
+           attribution_json,format_version
+         ) VALUES('README.md','bytes-a','tip-a','shallow-a','[]','cache-v1')",
+        [],
+    )?;
+    assert_eq!(
+        compute_snapshot(&conn)?,
+        stable,
+        "diagnostics, committer time, projection caches, and blame cache identity are not search snapshot state"
+    );
+
+    conn.execute(
+        "UPDATE doc_blame_cache
+         SET bytes_hash='bytes-b', path_tip='tip-b',
+             shallow_fingerprint='shallow-b',
+             attribution_json='[{\"basis\":\"working_tree\"}]'",
+        [],
+    )?;
+    assert_eq!(compute_snapshot(&conn)?, stable);
+
+    conn.execute(
+        "UPDATE doc_chunk_meta SET freshness_author_time=101 WHERE chunk_id=?1",
+        [chunk_id],
+    )?;
+    let newer_author = compute_snapshot(&conn)?;
+    assert_ne!(newer_author, stable);
+
+    conn.execute(
+        "UPDATE doc_chunk_meta
+         SET freshness_basis='working_tree', freshness_author_time=100
+         WHERE chunk_id=?1",
+        [chunk_id],
+    )?;
+    let working_tree = compute_snapshot(&conn)?;
+    assert_ne!(working_tree, stable);
+    assert_ne!(working_tree, newer_author);
+
+    conn.execute(
+        "UPDATE doc_chunk_meta
+         SET freshness_basis='git', freshness_author_time=100
+         WHERE chunk_id=?1",
+        [chunk_id],
+    )?;
+    conn.execute(
+        "UPDATE doc_file_provenance SET status='blame_failed' WHERE file_id=?1",
+        [file_id],
+    )?;
+    assert_ne!(compute_snapshot(&conn)?, stable);
+
+    conn.execute(
+        "UPDATE doc_file_provenance SET status='resolved' WHERE file_id=?1",
+        [file_id],
+    )?;
+    conn.execute(
+        "UPDATE meta SET value='documentation-provenance-v0'
+         WHERE key='documentation_provenance_format_version'",
+        [],
+    )?;
+    assert_ne!(compute_snapshot(&conn)?, stable);
+    Ok(())
+}
+
+#[test]
+fn docs_provenance_snapshot_orders_by_source_identity_not_row_id() -> Result<()> {
+    let snapshot_for_order = |paths: &[&str]| -> Result<String> {
+        let repo = tempfile::tempdir()?;
+        let conn = store::open(repo.path())?;
+        conn.execute_batch(&format!(
+            "INSERT INTO meta(key,value) VALUES
+               ('extraction_version','{}'),
+               ('documentation_chunk_format_version','{}'),
+               ('documentation_provenance_format_version','{}');",
+            crate::entity::EXTRACTION_VERSION,
+            crate::docs::CHUNK_FORMAT_VERSION,
+            crate::docs::PROVENANCE_FORMAT_VERSION,
+        ))?;
+        for (offset, path) in paths.iter().enumerate() {
+            let id = offset as i64 + 1;
+            let (status, basis, author_time) = if *path == "a.md" {
+                ("resolved", "git", Some(10_i64))
+            } else {
+                ("untracked_or_new", "unknown", None)
+            };
+            conn.execute(
+                "INSERT INTO files(id,path,hash,corpus,format,role,origin)
+                 VALUES(?1,?2,?3,'docs','markdown','documentation','repository')",
+                rusqlite::params![id, path, format!("file-{path}")],
+            )?;
+            conn.execute(
+                "INSERT INTO chunks(
+                   id,file_id,kind,name,scope_chain,symbols,start,end,
+                   start_line,end_line,hash,content
+                 ) VALUES(?1,?1,'markdown_section',NULL,'','',0,4,1,1,?2,'body')",
+                rusqlite::params![id, format!("chunk-{path}")],
+            )?;
+            conn.execute(
+                "INSERT INTO doc_chunk_meta(
+                   chunk_id,title,breadcrumb,ordinal,front_matter_state,
+                   freshness_basis,freshness_author_time
+                 ) VALUES(?1,?2,'',0,'absent',?3,?4)",
+                rusqlite::params![id, path, basis, author_time],
+            )?;
+            conn.execute(
+                "INSERT INTO doc_file_provenance(
+                   file_id,projection_hash,status,detail
+                 ) VALUES(?1,?2,?3,NULL)",
+                rusqlite::params![id, format!("projection-{path}"), status],
+            )?;
+        }
+        compute_snapshot(&conn)
+    };
+
+    assert_eq!(
+        snapshot_for_order(&["a.md", "b.md"])?,
+        snapshot_for_order(&["b.md", "a.md"])?
+    );
+    Ok(())
+}
+
+#[test]
 fn neighborhood_orders_parallel_edges_deterministically() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(

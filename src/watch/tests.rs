@@ -10,7 +10,7 @@ use crate::indexer;
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
     RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
-    clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
+    clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint, git_control_paths,
     is_refresh_boundary, run_refresh, validate_options, watch_enrich_options, watch_startup_log,
 };
 
@@ -463,6 +463,55 @@ fn event_classifier_excludes_only_the_exact_database_family() {
             .classify(&[root.join(".jscout-notes.ts")])
             .is_some_and(|signal| signal.scope == RefreshScope::Incremental)
     );
+}
+
+#[test]
+fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    fs::create_dir_all(repository.path().join(".git/logs/refs/heads"))?;
+    fs::create_dir_all(repository.path().join(".git/refs/heads"))?;
+    fs::write(
+        repository.path().join(".git/HEAD"),
+        "ref: refs/heads/main\n",
+    )?;
+    let canonical_root = repository.path().canonicalize()?;
+    let root = canonical_root.as_path();
+
+    let controls = git_control_paths(root);
+    for relative in [
+        ".git/HEAD",
+        ".git/logs/HEAD",
+        ".git/refs/heads/main",
+        ".git/logs/refs/heads/main",
+        ".git/packed-refs",
+        ".git/shallow",
+    ] {
+        assert!(
+            controls.contains(&root.join(relative)),
+            "missing Git provenance control {relative}"
+        );
+    }
+
+    let classifier = EventClassifier::new(root, &root.join("watch.db"), &Default::default())?;
+    for relative in [".git/refs/heads/main", ".git/logs/HEAD", ".git/shallow"] {
+        let signal = classifier
+            .classify(&[root.join(relative)])
+            .expect("Git provenance metadata must schedule a refresh");
+        assert_eq!(signal.scope, RefreshScope::Full);
+    }
+
+    let nested = root.join("packages/app");
+    fs::create_dir_all(&nested)?;
+    let nested_controls = git_control_paths(&nested);
+    assert!(nested_controls.contains(&root.join(".git/HEAD")));
+    assert!(nested_controls.contains(&root.join(".git/logs/HEAD")));
+    let nested_classifier =
+        EventClassifier::new(&nested, &nested.join("watch.db"), &Default::default())?;
+    let signal = nested_classifier
+        .classify(&[root.join(".git/refs/heads/main")])
+        .expect("parent Git metadata must schedule a nested-root refresh");
+    assert_eq!(signal.scope, RefreshScope::Full);
+    Ok(())
 }
 
 #[test]

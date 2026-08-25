@@ -90,6 +90,7 @@ jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only witho
                                #   --json is compact; --debug-json retains diagnostics
 jscout docs search <root> Q    # Markdown/MDX BM25 plus ready shared-profile vectors
                                #   --lexical-only needs no embedding provider
+                               #   --no-freshness preserves pure relevance order
 jscout docs embed <root>       # embed missing Markdown/MDX representations
 jscout docs status <root>      # corpus decisions and vector readiness
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
@@ -185,13 +186,17 @@ enabled = false
 
 [docs.search]
 vector = true
+freshness = false
+max_rank_movement = 2
 ```
 
 With `enabled = false`, the shared index admits no documentation rows,
 `docs status` reports the feature as disabled, and the CLI/MCP documentation
 retrieval surfaces are unavailable. The `docs.search.vector` setting controls
 only vector participation during documentation search; it does not enable
-corpus admission or generate vectors.
+corpus admission or generate vectors. `docs.search.freshness` enables the
+bounded Git-authorship reorder; `max_rank_movement` selects its one-to-three
+position bound.
 
 ```bash
 jscout index /path/to/repo
@@ -213,8 +218,9 @@ description, tags, heading context, exact source spans, and the indexed file
 hash. The MCP `documentation_search` tool exposes the same isolated ranking
 corpus.
 Membership defaults to exact lowercase `**/*.md` and `**/*.mdx` and is
-configured with `[docs]`. Temporal ranking is deferred; this release ranks by
-relevance only.
+configured with `[docs]`. Git provenance is reported independently of ranking;
+`docs.search.freshness` controls the bounded temporal reorder, and
+`--no-freshness` preserves the relevance order for comparison.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:

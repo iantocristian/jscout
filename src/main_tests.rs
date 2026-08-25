@@ -230,6 +230,7 @@ fn documentation_commands_and_required_vector_controls_parse() {
         "release guide",
         "--vector",
         "--no-rerank",
+        "--no-freshness",
         "--limit",
         "7",
     ])
@@ -240,6 +241,7 @@ fn documentation_commands_and_required_vector_controls_parse() {
                 query,
                 vector,
                 no_rerank,
+                no_freshness,
                 limit,
                 ..
             },
@@ -250,6 +252,7 @@ fn documentation_commands_and_required_vector_controls_parse() {
     assert_eq!(query, "release guide");
     assert!(vector);
     assert!(no_rerank);
+    assert!(no_freshness);
     assert_eq!(limit, Some(7));
 
     assert!(

@@ -68,6 +68,8 @@ impl DocsSettings {
 pub struct DocsSearchSettings {
     pub vector: bool,
     pub rerank: bool,
+    pub freshness: bool,
+    pub max_rank_movement: usize,
     pub limit: usize,
     pub response_bytes: usize,
 }

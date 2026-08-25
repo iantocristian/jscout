@@ -52,6 +52,15 @@ pub struct SearchHit {
     pub file_hash: String,
     #[serde(skip_serializing, default)]
     pub embedding_identity: Option<String>,
+    pub freshness_basis: String,
+    #[serde(skip_serializing, default)]
+    pub freshness_author_time: Option<i64>,
+    #[serde(skip_serializing, default)]
+    pub freshness_committer_time: Option<i64>,
+    // Operational Git failures are emitted by indexing. They are not part of
+    // a hit's stable retrieval contract or the shared snapshot identity.
+    #[serde(skip_serializing, default)]
+    pub freshness_detail: Option<String>,
     pub score: f64,
     pub stub: bool,
 }
@@ -195,7 +204,9 @@ pub fn lexical_search(
         "SELECT c.id, f.path, m.title, m.description, m.tags_json,
                 m.breadcrumb, m.nearest_heading, docs_fts.body,
                 c.start, c.end, c.start_line, c.end_line,
-                f.hash, m.embedding_identity,
+                f.hash, m.embedding_identity, m.freshness_basis,
+                m.freshness_author_time, m.freshness_committer_time,
+                m.freshness_detail,
                 -bm25(docs_fts, 4.0, 2.0, 2.0, 1.0, 0.25) AS score,
                 c.kind
          FROM docs_fts
@@ -205,7 +216,7 @@ pub fn lexical_search(
          WHERE docs_fts MATCH ?1 AND f.corpus='docs'",
     )?;
     let rows = statement.query_map([query.as_str()], |row| {
-        row_to_hit(row, snapshot, 0.0, Some(14))
+        row_to_hit(row, snapshot, 0.0, Some(18))
     })?;
     let mut hits = rows
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -225,7 +236,9 @@ pub(crate) fn load_hit(
         "SELECT c.id, f.path, m.title, m.description, m.tags_json,
                 m.breadcrumb, m.nearest_heading, docs_fts.body,
                 c.start, c.end, c.start_line, c.end_line,
-                f.hash, m.embedding_identity, c.kind
+                f.hash, m.embedding_identity, m.freshness_basis,
+                m.freshness_author_time, m.freshness_committer_time,
+                m.freshness_detail, c.kind
          FROM chunks c
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
@@ -259,11 +272,15 @@ fn row_to_hit(
         end_line: row_u32(row, 11)?,
         file_hash: row.get(12)?,
         embedding_identity: row.get(13)?,
+        freshness_basis: row.get(14)?,
+        freshness_author_time: row.get(15)?,
+        freshness_committer_time: row.get(16)?,
+        freshness_detail: row.get(17)?,
         score: match score_index {
             Some(index) => row.get(index)?,
             None => fallback_score,
         },
-        stub: row.get::<_, String>(score_index.map_or(14, |_| 15))? == "markdown_document",
+        stub: row.get::<_, String>(score_index.map_or(18, |_| 19))? == "markdown_document",
     })
 }
 
@@ -355,6 +372,11 @@ mod tests {
             "INSERT INTO meta(key,value)
              VALUES('documentation_chunk_format_version',?1)",
             [crate::docs::CHUNK_FORMAT_VERSION],
+        )?;
+        conn.execute(
+            "INSERT INTO meta(key,value)
+             VALUES('documentation_provenance_format_version',?1)",
+            [crate::docs::PROVENANCE_FORMAT_VERSION],
         )?;
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('root',?1)",

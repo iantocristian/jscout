@@ -1177,6 +1177,8 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                     vector: use_vector,
                     vector_required: require_vector,
                     rerank: use_reranker,
+                    freshness: defaults.search.freshness,
+                    max_rank_movement: defaults.search.max_rank_movement,
                     reranker: if use_reranker {
                         context.reranker.cloned()
                     } else {

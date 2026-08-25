@@ -1653,10 +1653,18 @@ fn is_refresh_boundary(path: &Path) -> bool {
 
 fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::from([root.join(".gitmodules")]);
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        Some(dot_git)
-    } else {
+    // Git itself discovers a worktree by walking upward. Watch must use the
+    // same ownership boundary when the indexed root is a repository subtree;
+    // otherwise a commit can change blame state without touching bytes below
+    // the watched root.
+    let dot_git = root
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .find(|candidate| candidate.is_dir() || candidate.is_file());
+    let git_dir = dot_git.and_then(|dot_git| {
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
         fs::read_to_string(&dot_git).ok().and_then(|contents| {
             contents
                 .trim()
@@ -1668,14 +1676,59 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
                     if path.is_absolute() {
                         path
                     } else {
-                        root.join(path)
+                        dot_git
+                            .parent()
+                            .map_or_else(|| root.join(&path), |parent| parent.join(&path))
                     }
                 })
         })
-    };
+    });
     if let Some(git_dir) = git_dir {
         let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
-        paths.insert(git_dir.join("HEAD"));
+        let common_dir = fs::read_to_string(git_dir.join("commondir"))
+            .ok()
+            .map(|contents| contents.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    git_dir.join(path)
+                }
+            })
+            .map_or_else(
+                || git_dir.clone(),
+                |path| path.canonicalize().unwrap_or(path),
+            );
+        let head = git_dir.join("HEAD");
+        paths.extend([
+            head.clone(),
+            git_dir.join("logs/HEAD"),
+            git_dir.join("shallow"),
+            common_dir.join("packed-refs"),
+            common_dir.join("shallow"),
+        ]);
+        if let Some(reference) = fs::read_to_string(&head)
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .trim()
+                    .strip_prefix("ref:")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            })
+            .filter(|reference| {
+                let path = Path::new(reference);
+                !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_)))
+            })
+        {
+            paths.insert(common_dir.join(&reference));
+            paths.insert(common_dir.join("logs").join(reference));
+        }
     }
     paths
 }

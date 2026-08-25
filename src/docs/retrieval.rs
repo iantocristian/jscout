@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::CHUNK_FORMAT_VERSION;
 use super::corpus::{CapturedFile, capture_file};
+use super::freshness::{FreshnessBasis, FreshnessValue};
 use super::store::{self, SearchHit};
 use crate::embed::{
     ProfileSpec, Provider, ResolvedProfile, validate_response_profile, vec_to_blob,
@@ -43,6 +44,8 @@ pub struct SearchOptions {
     pub vector: bool,
     pub vector_required: bool,
     pub rerank: bool,
+    pub freshness: bool,
+    pub max_rank_movement: usize,
     #[serde(skip_serializing)]
     pub reranker: Option<Reranker>,
 }
@@ -56,6 +59,8 @@ impl Default for SearchOptions {
             vector: true,
             vector_required: false,
             rerank: true,
+            freshness: false,
+            max_rank_movement: 2,
             reranker: None,
         }
     }
@@ -89,6 +94,13 @@ pub enum RerankerStatus {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessStatus {
+    Disabled,
+    Active,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RetrievalDiagnostics {
     pub lexical_candidates: usize,
@@ -102,6 +114,9 @@ pub struct RetrievalDiagnostics {
     pub reranker_status: RerankerStatus,
     pub reranker_candidates: usize,
     pub reranker_detail: Option<String>,
+    pub freshness_status: FreshnessStatus,
+    pub max_rank_movement: usize,
+    pub freshness_changed_candidates: usize,
     pub total_candidates: usize,
     pub budget_dropped: usize,
 }
@@ -113,6 +128,12 @@ pub struct RetrievalHit {
     pub rank: usize,
     pub lexical_score: Option<f64>,
     pub vector_score: Option<f64>,
+    pub freshness_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_secondary_value: Option<String>,
+    pub base_rank: usize,
+    /// `base_rank - rank`; positive values are promotions.
+    pub movement: i64,
     pub content: String,
     pub source_state: SourceState,
     pub source_detail: Option<String>,
@@ -149,6 +170,8 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
         .map(|hit| {
             json!({
                 "rank": hit.rank,
+                "base_rank": hit.base_rank,
+                "movement": hit.movement,
                 "path": hit.document.path,
                 "title": hit.document.title,
                 "description": hit.document.description,
@@ -157,6 +180,9 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
                 "lines": [hit.document.start_line, hit.document.end_line],
                 "source_bytes": [hit.document.source_start, hit.document.source_end],
                 "content": hit.content,
+                "freshness_basis": hit.document.freshness_basis,
+                "freshness_value": hit.freshness_value,
+                "freshness_secondary_value": hit.freshness_secondary_value,
                 "snapshot": hit.document.snapshot,
                 "file_hash": hit.document.file_hash,
                 "source_state": hit.source_state,
@@ -171,17 +197,21 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
         "retrieval": {
             "vector": result.diagnostics.vector_status,
             "reranker": result.diagnostics.reranker_status,
+            "freshness": result.diagnostics.freshness_status,
+            "max_rank_movement": result.diagnostics.max_rank_movement,
         },
     }))?)
 }
 
 pub fn human_search_string(result: &SearchResponse) -> String {
     let mut output = format!(
-        "documentation snapshot {}: {} hits (vector={:?}, reranker={:?}, truncated={}, budget_dropped={})\n",
+        "documentation snapshot {}: {} hits (vector={:?}, reranker={:?}, freshness={:?}, max_rank_movement={}, truncated={}, budget_dropped={})\n",
         result.snapshot,
         result.hits.len(),
         result.diagnostics.vector_status,
         result.diagnostics.reranker_status,
+        result.diagnostics.freshness_status,
+        result.diagnostics.max_rank_movement,
         result.truncated,
         result.diagnostics.budget_dropped,
     );
@@ -190,7 +220,7 @@ pub fn human_search_string(result: &SearchResponse) -> String {
             .expect("documentation string tags always serialize as JSON");
         let _ = writeln!(
             output,
-            "\n{}. {}:{}-{}  {}\ntitle={} description={} tags={}\nsnapshot={} file_hash={} source_state={}{}\n{}",
+            "\n{}. {}:{}-{}  {}\ntitle={} description={} tags={}\nfreshness={} changed={} base_rank={} movement={}{}\nsnapshot={} file_hash={} source_state={}{}\n{}",
             hit.rank,
             hit.document.path,
             hit.document.start_line,
@@ -199,6 +229,13 @@ pub fn human_search_string(result: &SearchResponse) -> String {
             hit.document.title,
             hit.document.description.as_deref().unwrap_or("-"),
             tags,
+            hit.document.freshness_basis,
+            hit.freshness_value.as_deref().unwrap_or("unknown"),
+            hit.base_rank,
+            hit.movement,
+            hit.freshness_secondary_value
+                .as_deref()
+                .map_or_else(String::new, |value| format!(" previous={value}")),
             hit.document.snapshot,
             hit.document.file_hash,
             hit.source_state.as_str(),
@@ -223,6 +260,75 @@ fn reranker_document(hit: &SearchHit) -> String {
         hit.breadcrumb,
         hit.rendered_body,
     )
+}
+
+fn freshness_basis_for_hit(hit: &SearchHit) -> FreshnessBasis {
+    let basis = match hit.freshness_basis.as_str() {
+        "git" => hit
+            .freshness_author_time
+            .map_or(FreshnessBasis::Unknown, |author_time| FreshnessBasis::Git {
+                author_time,
+            }),
+        "working_tree" => FreshnessBasis::WorkingTree {
+            latest_committed_author_time: hit.freshness_author_time,
+        },
+        // Observation history is deliberately deferred. Keeping the wire name
+        // reserved does not make rows without its clock comparable.
+        "observed" | "unknown" => FreshnessBasis::Unknown,
+        _ => FreshnessBasis::Unknown,
+    };
+    debug_assert!(
+        basis.wire_name() == hit.freshness_basis || matches!(basis, FreshnessBasis::Unknown)
+    );
+    basis
+}
+
+fn freshness_values(hit: &SearchHit) -> (Option<String>, Option<String>) {
+    let basis = freshness_basis_for_hit(hit);
+    match (basis.value(), basis) {
+        (Some(FreshnessValue::GitAuthorTime(author_time)), _) => {
+            (Some(format_unix_seconds(author_time)), None)
+        }
+        (
+            Some(FreshnessValue::Uncommitted),
+            FreshnessBasis::WorkingTree {
+                latest_committed_author_time,
+            },
+        ) => (
+            Some("uncommitted".to_owned()),
+            latest_committed_author_time.map(format_unix_seconds),
+        ),
+        (Some(FreshnessValue::Observed { .. }) | None, _) => (None, None),
+        (Some(FreshnessValue::Uncommitted), _) => (None, None),
+    }
+}
+
+fn format_unix_seconds(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+// Gregorian civil date conversion for days since 1970-01-01. This is kept
+// local so the wire format does not depend on process locale or Git's display
+// settings.
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +479,10 @@ pub fn search(
         options.response_bytes > 0,
         "documentation response byte limit must be positive"
     );
+    ensure!(
+        (1..=3).contains(&options.max_rank_movement),
+        "documentation max rank movement must be between 1 and 3"
+    );
     if options.vector_required && !options.vector {
         bail!("vector participation cannot be both required and disabled");
     }
@@ -398,6 +508,11 @@ fn search_inner(
         .limit
         .saturating_mul(8)
         .max(reranker_pool)
+        .max(options.limit.saturating_add(if options.freshness {
+            options.max_rank_movement
+        } else {
+            0
+        }))
         .max(options.limit);
     let lexical_hits = store::lexical_search(conn, &snapshot, query, candidate_limit)?;
     let lexical_ranking = lexical_hits
@@ -579,16 +694,33 @@ fn finish_search(
         }
     }
 
+    let freshness_status = if options.freshness {
+        FreshnessStatus::Active
+    } else {
+        FreshnessStatus::Disabled
+    };
+    let movement = super::freshness::reorder(
+        &mut ranked,
+        if options.freshness {
+            options.max_rank_movement
+        } else {
+            0
+        },
+        |(chunk_id, _)| freshness_basis_for_hit(&hits_by_id[chunk_id]),
+    );
+    let freshness_changed_candidates = movement.iter().filter(|rank| rank.movement != 0).count();
     let total_candidates = ranked.len();
     let mut hits = ranked
         .into_iter()
+        .zip(movement)
         .take(options.limit)
         .enumerate()
-        .map(|(position, (chunk_id, score))| {
+        .map(|(position, ((chunk_id, score), rank_movement))| {
             let mut document = hits_by_id
                 .remove(&chunk_id)
                 .expect("ranked documentation hit was loaded");
             document.score = score;
+            let (freshness_value, freshness_secondary_value) = freshness_values(&document);
             RetrievalHit {
                 content: document.rendered_body.clone(),
                 source_state: SourceState::SourceMismatch,
@@ -597,6 +729,10 @@ fn finish_search(
                 rank: position + 1,
                 lexical_score: lexical_scores.get(&chunk_id).copied(),
                 vector_score: vector_scores.get(&chunk_id).copied(),
+                freshness_value,
+                freshness_secondary_value,
+                base_rank: rank_movement.base_rank,
+                movement: rank_movement.movement,
             }
         })
         .collect::<Vec<_>>();
@@ -614,6 +750,9 @@ fn finish_search(
         reranker_status,
         reranker_candidates,
         reranker_detail,
+        freshness_status,
+        max_rank_movement: options.max_rank_movement,
+        freshness_changed_candidates,
         total_candidates,
         budget_dropped: 0,
     };
@@ -1335,6 +1474,10 @@ mod tests {
             end_line: 1,
             file_hash: blake3::hash(b"body").to_hex().to_string(),
             embedding_identity: Some(format!("id-{id}")),
+            freshness_basis: "unknown".into(),
+            freshness_author_time: None,
+            freshness_committer_time: None,
+            freshness_detail: None,
             score: 0.0,
             stub: false,
         }
@@ -1350,6 +1493,10 @@ mod tests {
             rank: id as usize,
             lexical_score: Some(1.0 / id as f64),
             vector_score: None,
+            freshness_value: None,
+            freshness_secondary_value: None,
+            base_rank: id as usize,
+            movement: 0,
             content: content.to_owned(),
             source_state: SourceState::SourceMismatch,
             source_detail: Some("hash_mismatch".into()),
@@ -1369,6 +1516,9 @@ mod tests {
             reranker_status: RerankerStatus::Disabled,
             reranker_candidates: 0,
             reranker_detail: None,
+            freshness_status: FreshnessStatus::Disabled,
+            max_rank_movement: 2,
+            freshness_changed_candidates: 0,
             total_candidates: 2,
             budget_dropped: 0,
         }
@@ -1654,6 +1804,86 @@ mod tests {
             expected
         );
         assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn freshness_runs_after_relevance_and_can_promote_the_limit_boundary() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("obsolete.md"), "body")?;
+        std::fs::write(root.path().join("current.md"), "body")?;
+        let mut obsolete = hit(1, "obsolete.md");
+        obsolete.freshness_basis = "git".into();
+        obsolete.freshness_author_time = Some(10);
+        let mut current = hit(2, "current.md");
+        current.freshness_basis = "git".into();
+        current.freshness_author_time = Some(20);
+        let state = || SearchState {
+            lexical_ranking: vec![(1, 2.0), (2, 1.0)],
+            vector_ranking: Vec::new(),
+            hits_by_id: [(1, obsolete.clone()), (2, current.clone())]
+                .into_iter()
+                .collect(),
+            vector_status: VectorStatus::Disabled,
+            vector_profile_id: None,
+            vector_dimensions: None,
+            vector_detail: None,
+        };
+        let enabled = finish_search(
+            root.path(),
+            "guidance",
+            &SearchOptions {
+                limit: 1,
+                response_bytes: usize::MAX,
+                output: SearchOutput::Pretty,
+                vector: false,
+                rerank: false,
+                freshness: true,
+                max_rank_movement: 1,
+                ..SearchOptions::default()
+            },
+            "snapshot".into(),
+            state(),
+        )?;
+        assert_eq!(enabled.hits[0].document.path, "current.md");
+        assert_eq!(enabled.hits[0].rank, 1);
+        assert_eq!(enabled.hits[0].base_rank, 2);
+        assert_eq!(enabled.hits[0].movement, 1);
+        assert_eq!(
+            enabled.diagnostics.freshness_status,
+            FreshnessStatus::Active
+        );
+
+        let disabled = finish_search(
+            root.path(),
+            "guidance",
+            &SearchOptions {
+                limit: 1,
+                response_bytes: usize::MAX,
+                output: SearchOutput::Pretty,
+                vector: false,
+                rerank: false,
+                freshness: false,
+                max_rank_movement: 1,
+                ..SearchOptions::default()
+            },
+            "snapshot".into(),
+            state(),
+        )?;
+        assert_eq!(disabled.hits[0].document.path, "obsolete.md");
+        assert_eq!(disabled.hits[0].base_rank, 1);
+        assert_eq!(disabled.hits[0].movement, 0);
+        assert_eq!(
+            disabled.diagnostics.freshness_status,
+            FreshnessStatus::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn freshness_timestamp_wire_format_is_utc_and_locale_independent() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_unix_seconds(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(format_unix_seconds(951_782_400), "2000-02-29T00:00:00Z");
     }
 
     #[test]
@@ -1955,6 +2185,10 @@ mod tests {
             rank: 1,
             lexical_score: Some(1.0),
             vector_score: None,
+            freshness_value: None,
+            freshness_secondary_value: None,
+            base_rank: 1,
+            movement: 0,
             content: "rendered".into(),
             source_state: SourceState::SourceMismatch,
             source_detail: Some("not_resolved".into()),
@@ -2013,6 +2247,11 @@ mod tests {
             "INSERT INTO meta(key,value)
              VALUES('documentation_chunk_format_version',?1)",
             [CHUNK_FORMAT_VERSION],
+        )?;
+        conn.execute(
+            "INSERT INTO meta(key,value)
+             VALUES('documentation_provenance_format_version',?1)",
+            [crate::docs::PROVENANCE_FORMAT_VERSION],
         )?;
         conn.execute(
             "INSERT INTO files(path,hash,role,corpus,format)

@@ -69,6 +69,8 @@ struct DocsFileConfig {
 struct DocsSearchFileConfig {
     vector: Option<bool>,
     rerank: Option<bool>,
+    freshness: Option<bool>,
+    max_rank_movement: Option<usize>,
     limit: Option<usize>,
     response_bytes: Option<usize>,
 }
@@ -425,6 +427,27 @@ impl RuntimeConfig {
             search: DocsSearchSettings {
                 vector: resolver.bool("docs.search.vector", raw.docs.search.vector, None, true)?,
                 rerank: resolver.bool("docs.search.rerank", raw.docs.search.rerank, None, true)?,
+                // The preregistered Phase 3 evaluation chooses whether this
+                // ships enabled. Candidate runs set the treatment explicitly.
+                freshness: resolver.bool(
+                    "docs.search.freshness",
+                    raw.docs.search.freshness,
+                    None,
+                    false,
+                )?,
+                max_rank_movement: {
+                    let value = resolver.usize(
+                        "docs.search.max_rank_movement",
+                        raw.docs.search.max_rank_movement,
+                        None,
+                        2,
+                    )?;
+                    anyhow::ensure!(
+                        (1..=3).contains(&value),
+                        "docs.search.max_rank_movement must be between 1 and 3"
+                    );
+                    value
+                },
                 limit: resolver.usize("docs.search.limit", raw.docs.search.limit, None, 10)?,
                 response_bytes: resolver.usize(
                     "docs.search.response_bytes",
