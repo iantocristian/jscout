@@ -23,8 +23,9 @@
 > is implemented, with its production replay still pending. Neither triggers
 > G16 or widens the semantic product surface, and no retrieval default changes
 > without a same-binary, same-snapshot comparison. G24 repository documentation
-> retrieval is proposed: a separate documentation database and corpus that
-> changes no code-retrieval behavior.
+> retrieval is proposed: docs in the main index as a separate ranking corpus
+> and surface, with code retrieval byte-identical. G25 multi-format admission
+> is proposed behind it.
 
 ## Document policy
 
@@ -3186,22 +3187,32 @@ retrieve through jscout. It is the wrong shape for the structural index — a
 JavaScript parser cannot manufacture documentation chunks, and prose changes
 must not couple to structural snapshots — and the wrong shape for semantic
 memory, whose artifacts carry code-evidence chains that authored prose does
-not acquire by being indexed. The first proposal round (PR #96) additionally
-established that the shared database cannot host an independent plane — one
+not acquire by being indexed. The review rounds on PR #96 established that
+the shared database cannot host a second lifecycle behind its gate — one
 global schema version and structural-snapshot-gated opens — and that a
 multiplicative score decay is not bounded in effect once applied to
-rank-fusion scores. The revised decisions:
+rank-fusion scores. Storage and ranking are independent axes, so the
+resolution is one lifecycle with a separate ranking corpus, not a second
+database, which the storage-planes contract rejects; the decision record is
+[docs/plans/g24-adr-one-store-separate-ranking-2026-08-25.md](docs/plans/g24-adr-one-store-separate-ranking-2026-08-25.md).
+The revised decisions:
 
-1. Documentation lives in a separately configured database, defaulting to
-   `<root>/.jscout-docs.db`, with its own schema version, migration lifecycle,
-   docs application identity, canonical-root binding, readiness gate,
-   last-good snapshot publication, and retry state. Path and same-file checks
-   reject aliases with the main database or another root's docs store.
-   `[docs.database].path` overrides that default independently of the main
-   database path. The main database, structural snapshots, configuration
-   fingerprints, watch generations, and semantic freshness are untouched by
-   every docs operation. Compatibility of a committed `[docs]` configuration
-   section with pre-docs binaries is not a requirement.
+1. Documentation lives in the main database and the disposable structural
+   snapshot: docs files are ordinary `files` rows produced by the same index
+   pass, and docs sections are `chunks` rows shaped to be inert to the code
+   plane — free-text kinds, no `name`, no symbols — so the exact tiers cannot
+   match them and no existing consumer needs a kind predicate. Ranking is a
+   separate corpus: docs rows mirror into a new `docs_fts` table with its own
+   BM25 statistics and never into `chunks_fts`; docs vectors materialize into
+   `vec_doc_embeddings_{dimensions}` because sqlite-vec applies KNN's k
+   before any join filter; the durable content-addressed embedding cache is
+   shared; docs metadata lives in a `doc_chunk_meta` sidecar keyed by chunk
+   id. Code search reads the same tables, statistics, and pipeline as today
+   and its results stay byte-identical. The one real consumer filter is the
+   TypeScript checker file inventory, which reads `files` unfiltered and must
+   exclude non-code kinds. Physical database splitting stays rejected per the
+   storage-planes contract. Compatibility of a committed `[docs]`
+   configuration section with pre-docs binaries is not a requirement.
 2. Corpus: ignore-aware `.md` inventory with a fixed root-level hidden
    allowlist (`.github`, `.claude`, `.agents`); Markdown block chunking that
    never crosses heading boundaries; one document-stub row for body-empty
@@ -3219,8 +3230,17 @@ rank-fusion scores. The revised decisions:
    bm25()` and deterministic source-key tie-breaks; the CLI contract is defined directly,
    with `--vector` meaning required vector participation and no vector-only mode
    existing.
-4. History: an append-only block-observation ledger inside the docs database,
-   separate from the current size-merged retrieval-chunk projection. Matching
+4. History: an append-only block-observation ledger, deferred out of the
+   numbered phases. Its reasons are supersession lineage ("this passage
+   replaced that one" — the backbone of the contradiction story), an ordering
+   clock that survives git history rewriting, and finer-than-commit
+   resolution under watch; it ships with the supersession product if that
+   product is built. Append-only history is not rebuildable from the
+   checkout, so the ledger is durable-plane and owes the explicit
+   cache-compatibility decision durable changes require; it anchors to the
+   shared snapshot sequence, and unchanged blocks add no rows, so code churn
+   advances the clock without growing it. When built, it stays separate from
+   the current size-merged retrieval-chunk projection. Matching
    is conservative and one-to-one — exact content first, then uniquely
    neighbor-anchored edited blocks; ordinal position alone never establishes
    continuity and ambiguous matches receive no predecessor. `removed` is
@@ -3265,24 +3285,67 @@ rank-fusion scores. The revised decisions:
    retired hashes, transition metadata, and content-addressed vectors may
    remain. Version one adds no retention controls.
 
-Delivery: phase 1 is the corpus, BM25, `docs index`/`status`/`search
---lexical-only`, the MCP documentation-search surface, and ledger recording;
-phase 2 adds vectors from the shared profile; phase 3 adds Git/observed
-freshness only after the retrieval evaluation corpus exists and reports;
-phase 4 adds documentation-only watch. No implementation milestone is
-assigned and no current goal is displaced.
+Delivery: phase 1 admits Markdown at the named-sections tier through the
+shared index pass — `docs_fts`, `doc_chunk_meta`, the MCP
+documentation-search surface and `docs search --lexical-only`, with the
+checker inventory filter and the two write-point routings in the same change,
+rebuild timing instrumented, and nothing temporal (hits may display git
+timestamps as inert metadata); phase 2 adds docs vectors from the shared
+`[embedding]` profile into the docs vector tables; phase 3 adds git-basis
+freshness and the bounded reorder only after the retrieval evaluation corpus
+exists and reports; phase 4 adds documentation-aware watch classification.
+The observation ledger is unscheduled and ships only with the supersession
+product. No implementation milestone is assigned and no current goal is
+displaced.
 
-Acceptance: a code reindex and any docs operation are mutually invisible,
-with foreign-plane state byte-identical either way; inserting one uniquely
+Acceptance: code search is byte-identical after docs admission —
+`chunks_fts` contains no docs rows, its term statistics are unchanged, and
+the exact tiers match no docs chunk; the checker file inventory contains no
+non-code files; docs publish inside the shared snapshot publication;
+inserting one uniquely
 distinguishable paragraph produces one `added` block observation and no
 succession rows for untouched blocks; globally unique copied content and
 Git-detected renames receive no cross-path predecessor; freshness movement
 never exceeds its configured bound and never crosses provenance bases; a
 repository with no `[embedding]` provider retains full lexical documentation
-search; crash recovery exposes exactly one complete old or replacement docs
-snapshot, never a partial mixture; and the detailed implementation contract
+search; crash recovery exposes exactly one complete old or replacement
+shared snapshot, never a partial mixture; and the detailed implementation
+contract
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
-is incorporated by reference, this entry winning on any explicit disagreement.
+and the decision record
+[docs/plans/g24-adr-one-store-separate-ranking-2026-08-25.md](docs/plans/g24-adr-one-store-separate-ranking-2026-08-25.md)
+are incorporated by reference, this entry winning on any explicit
+disagreement.
+
+## Proposed G25 — multi-format admission
+
+One registry decides, per file type, two things: how much jscout understands
+it (plain text → named sections → full AST) and which ranking corpus it
+appears in (code or docs). The registry gives a new file type a defined place
+to plug in, so adding one never reopens the storage or ranking architecture —
+and that is all it buys. Each format still needs its own scanner and its own
+chunking contract (Markdown's took a full design cycle), and a kind joining
+the code corpus additionally pays the ranking and exact-tier integration that
+docs deliberately avoid: its chunks do enter `chunks_fts`, do carry names,
+and do compete in the exact tiers, so that integration must be measured, not
+assumed. Text-only kinds are cheap; languages are real work.
+
+Positions: Groovy/Jenkinsfiles join the code corpus as plain text first —
+identifier-shaped searches want them beside TypeScript hits. YAML and TOML
+are current-like-code (the checkout is truth; no freshness) but stay out
+until G24's Markdown pass has shipped and been measured. Helm templates are
+not valid YAML and are treated as text if admitted. Tree-sitter is not
+adopted; the named revisit trigger is a kind that genuinely needs call-shape
+extraction, such as Groovy at the AST tier, where regex extraction would
+poison the entity plane.
+
+The north star is the cross-file string-reference plane: an environment
+variable read in code but declared nowhere, a Helm value naming a missing
+service, a file loaded but never supplied to anything. The entity plane's
+string-keyed identities already make these one-store questions; producers for
+non-code kinds are the payoff that justifies every admission above the text
+tier. No implementation milestone is assigned and no current goal is
+displaced.
 
 ## Evaluation decisions already made
 

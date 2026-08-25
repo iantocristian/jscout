@@ -1,21 +1,24 @@
 # G24 Markdown retrieval and temporal history — design detail
 
-- Date: 2026-08-24, revised the same day after review.
+- Date: 2026-08-24; revised 2026-08-25 — storage moved into the main index
+  per [g24-adr-one-store-separate-ranking-2026-08-25.md](g24-adr-one-store-separate-ranking-2026-08-25.md).
 - Status: implementation contract incorporated by reference from the Proposed
   G24 entry in [PLAN.md](../../PLAN.md). It has authority only through that
   entry; PLAN.md remains the roadmap and wins any explicit conflict. Review
   findings and decisions are recorded on PR #96.
-- Scope: a standalone repository-documentation corpus with lexical/vector
-  retrieval and bounded, order-based freshness.
+- Scope: a repository-documentation corpus inside the main index, with its
+  own lexical/vector ranking corpus, surface, and bounded, order-based
+  freshness.
 
 ## Decision summary
 
-Jscout treats repository Markdown as a separate retrieval product with its own
-database. It is not a source extension of the structural index and not
+Jscout treats repository Markdown as a separate retrieval product inside the
+main index. It is not a source extension of the structural chunker and not
 semantic memory. The surface is `jscout docs`: it owns its inventory,
-Markdown-aware chunks, BM25 index, vector index, search results, snapshot,
-and observation ledger inside the configured documentation database, which
-defaults to `<root>/.jscout-docs.db`.
+Markdown-aware chunks, its own BM25 corpus and vector candidates, and its
+search results — all in the main database, published with the shared
+structural snapshot. The observation ledger is deferred to the supersession
+product.
 
 BM25 always builds. Vector retrieval reuses the repository's existing
 `[embedding]` provider and model; when that provider is absent, documentation
@@ -42,25 +45,33 @@ Normal documentation search indexes only the current checkout. Retired block
 content and retired cached vectors never enter BM25 or vector candidate
 generation.
 
-## Separate documentation database
+## Storage in the main index
 
-The first review round showed the shared store cannot host an independent
-plane: it has one global schema version whose upgrade path rebuilds
-source-derived tables, and every read-only open requires a published
-structural snapshot. Documentation therefore lives in a separately configured
-database, defaulting to `<root>/.jscout-docs.db`, with:
+The first review round showed the shared store cannot host a second
+lifecycle behind its gate: one global schema version and
+structural-snapshot-gated opens. The resolution is not a second database —
+the storage-planes contract already rejects physical splitting — but one
+lifecycle with a separate ranking corpus. Docs are ordinary rows of the
+disposable structural snapshot, shaped to be inert to the code plane:
 
-- its own schema version, migration lifecycle, and readiness gate (a
-  published documentation snapshot only);
-- its own last-good snapshot publication and retry state;
-- its own embedding-profile row, resolved from the shared `[embedding]`
-  settings;
-- no participation in structural snapshots, code config fingerprints, watch
-  generations, or semantic freshness.
+- docs files are `files` rows: same walker, same snapshot hash, same
+  publication, same entity plane;
+- docs sections are `chunks` rows with `kind='markdown_section'` or
+  `'markdown_document'`, no `name`, no symbols — the exact tiers cannot
+  match them and no existing consumer needs a kind predicate;
+- ranking is a separate corpus: docs rows mirror into `docs_fts` and never
+  into `chunks_fts`, so code BM25 statistics never contain a docs term; docs
+  vectors materialize into `vec_doc_embeddings_{dimensions}` and never the
+  code vector tables, because sqlite-vec applies KNN's k before any join
+  filter can run;
+- the durable content-addressed `embeddings` cache is shared;
+- the one real consumer filter is the TypeScript checker file inventory,
+  which reads `files` unfiltered and must exclude non-code kinds.
 
-A code reindex cannot disrupt documentation search, and a
-documentation migration failure cannot affect the main database. The history
-is local and is never a replacement for repository version control.
+Code search reads the same tables, statistics, and pipeline as today; its
+results stay byte-identical. Docs search availability follows the shared
+snapshot lifecycle. Observation history, when built, is local and never a
+replacement for repository version control.
 
 ## Configuration
 
@@ -73,9 +84,6 @@ exclude = []
 freshness = true
 max_rank_movement = 2
 
-[docs.database]
-path = ".jscout-docs.db"
-
 [docs.search]
 vector = true
 rerank = true
@@ -83,13 +91,6 @@ limit = 10
 response_bytes = 24000
 ```
 
-`[docs.database]` is optional; its path defaults to `.jscout-docs.db` and is
-resolved relative to the indexed root. It is independent of `[database].path`.
-The docs store carries SQLite application ID `0x4A53444F` (`JSDO`) and a
-canonical indexed-root binding. Opening rejects a non-docs database, a docs
-database bound to another root, or a docs path that resolves to the main
-database by normalized path or same-file identity; literal, `..`, symlink, and
-hard-link aliases do not bypass separation.
 There is no `[docs.embedding]` or `[docs.reranker]` section: vectors use the
 repository `[embedding]` provider, model, and service, and reranking uses the
 repository `[reranker]` profile. Compatibility of a committed `[docs]` section
@@ -314,65 +315,55 @@ chunks.
 
 ## Storage model
 
-Within the configured documentation database, responsibilities (names may
-change during implementation):
+Docs storage lives in the main database's disposable plane (names may change
+during implementation):
 
-- `doc_store_meta`: the docs application ID, schema version, and canonical
-  indexed-root binding used to enforce store identity and repository ownership.
-- `doc_snapshots`: one immutable row per successfully published scan —
-  monotonic local sequence, observation timestamp, corpus fingerprint,
-  optional Git worktree/commit identity with author and committer times,
-  chunk-format version, inventory and rejection counts. Any corpus-level
-  failure — including retryable I/O, database, transaction, configuration,
-  discovery, inventory, or cancellation failure — publishes no replacement
-  and does not advance the sequence. Only a classified permanent subject-local
-  open/read rejection may be recorded in a successfully published
-  replacement with that file omitted.
-- `doc_files`: current admitted documents — repository-relative path, indexed
-  full-file content hash, byte and line accounting, and document metadata.
-- `doc_block_contents`: content-addressed source blocks — raw-body hash and
-  body text only while a current block occurrence references it.
-- `doc_block_occurrences`: current source-backed history units — path,
-  stable logical-occurrence ID, current-observation ID, structural order,
-  exact source span, content hash, heading context, and Git provenance when
-  available.
-- `doc_block_observations`: immutable append-only block events — lifecycle
-  event, logical-occurrence ID, predecessor-observation ID when uniquely
-  established, zero or more change flags, snapshot sequence, content hash,
-  match confidence, and provenance. Unchanged blocks add no rows and retain
-  their last current-observation reference. The current occurrence projection,
-  not the event ledger, defines what is active in the published snapshot.
-- `doc_chunks`: the current searchable projection built from ordered current
-  blocks — path, breadcrumb, source spans, rendered body, embedding identity,
-  and aggregated freshness provenance. FTS rows and vector index entries
-  reference these chunks.
-- retrieval projections: `doc_chunks_fts`, content-addressed
-  `doc_embeddings` keyed by embedding-identity hash and profile,
-  `doc_embedding_index_entries`, and `vec_doc_embeddings_{dimensions}`.
-- `doc_vector_generations`: readiness keyed by documentation snapshot,
-  embedding profile, dimensions, and chunk-format version. A readiness row is
-  inserted only after every current embeddable chunk has both a cached vector
-  and matching vector-index entry. Search may query vectors only through that
-  exact ready generation; otherwise it reports degraded vector status and uses
-  BM25.
+- `files` (shared): one row per admitted document — repository-relative path
+  and a full-file BLAKE3 hash over the exact original bytes, including any
+  BOM. The shared structural snapshot already hashes every `files` row, so
+  docs corpus identity is covered by the existing snapshot with no separate
+  fingerprint or sequence.
+- `chunks` (shared, unchanged schema): one row per retrieval chunk in the
+  inert shape — free-text `kind` (`markdown_section`, `markdown_document`),
+  `name` NULL, empty symbols, exact source span and slice, content hash.
+- `doc_chunk_meta` (new, chunk-id keyed): title, heading breadcrumb, nearest
+  heading, same-heading ordinal, embedding identity
+  (`hash(format_version, nearest_heading, rendered_body)`), and, in the
+  freshness phase, the basis and value columns.
+- `docs_fts` (new FTS5): the docs ranking corpus — title, description/tags,
+  breadcrumb, rendered body, path; rowid is the chunk id. Weighted at query
+  time; its statistics never mix with `chunks_fts`.
+- `doc_embedding_index_entries` and `vec_doc_embeddings_{dimensions}` (new):
+  docs vector candidate materialization, separate from the code vector
+  tables. Cached vectors live in the shared content-addressed `embeddings`
+  table, keyed by the docs embedding-identity hash.
+- `doc_vector_generations` (new): vector readiness keyed by the shared
+  snapshot, embedding profile, dimensions, and chunk-format version. A
+  readiness row is inserted only after every current embeddable chunk has
+  both a cached vector and a matching index entry. Search may query vectors
+  only through that exact ready generation; otherwise it reports degraded
+  vector status and uses BM25.
+- block ledger tables (`doc_block_contents`, `doc_block_occurrences`,
+  `doc_block_observations`): deferred with the supersession product. They
+  are append-only and therefore durable-plane when they ship, owing the
+  explicit cache-compatibility decision PLAN.md requires for durable
+  changes; their matching, lifecycle, and failure semantics remain as
+  specified under History and continuity. Any corpus-level failure —
+  retryable I/O, database, transaction, configuration, discovery, inventory,
+  or cancellation — publishes no replacement; only a classified permanent
+  subject-local open/read rejection may be recorded in a successfully
+  published replacement with that file omitted.
 
-Publication is transactional within the docs database: snapshot insertion,
-replacement of every current table and FTS projection, and mutation of the
-current-snapshot pointer occur in one SQLite transaction. A failure or
-failpoint strictly before commit leaves the previous snapshot active. After a
-crash at the commit boundary, recovery may expose either the complete previous
-snapshot or the complete replacement snapshot, never a partial mixture.
+Docs rows publish inside the shared structural snapshot publication — same
+index pass, same transaction boundaries, same last-good semantics. A failure
+before commit leaves the previous snapshot active for docs and code alike;
+crash recovery exposes exactly one complete previous or replacement
+snapshot, never a partial mixture.
 
-Before acquisition, inventory candidates are sorted by their
-slash-normalized repository-relative UTF-8 path in ascending raw UTF-8 byte
-order. The fingerprint `file_count` and entries include only final `indexed`
-`doc_files`, in that same order; rejected candidates have no fingerprint entry.
-Each full-file hash is BLAKE3 over the exact original file bytes,
-including any BOM. The corpus fingerprint is BLAKE3 over
-`"jscout-doc-corpus-v1\0"`, `u64::to_be_bytes(file_count)`, then for each sorted
-file `u64::to_be_bytes(path_utf8.len() as u64)`, its path bytes, and its 32-byte
-full-file BLAKE3 digest. Filesystem enumeration and database insertion order
-therefore cannot change the fingerprint or published ordering.
+Before chunking, inventory candidates are sorted by their slash-normalized
+repository-relative UTF-8 path in ascending raw byte order, so filesystem
+enumeration and database insertion order cannot change chunk ordinals or
+published content.
 
 ## History and continuity
 
@@ -591,7 +582,6 @@ follow the same complete-response accounting as code search.
 - Provider failure during `docs embed`: completed cached batches are kept;
   no readiness row is published, and search reports degraded vector status and
   uses BM25. A previous vector projection is cache, never queryable as current.
-- Docs database migration failure: the main database is unaffected.
 - History matching ambiguity: new occurrence, never a guessed successor.
 
 Further failure-state machinery is deferred until the base feature is in use.
@@ -669,14 +659,14 @@ Deterministic tests:
   path-history rewrite, and clone deepening; two identical files with distinct
   path histories use distinct cache entries; configured ignore-revs and
   replacement refs do not alter attribution;
-- literal, `..`, symlink, and hard-link attempts to alias the docs store with
-  the main database are rejected, as is opening a docs store bound to another
-  canonical root; a code reindex leaves documentation search available and
-  vice versa; a retryable docs scan failure leaves the prior snapshot searchable;
-- a failpoint or process kill during documentation projection construction or
-  before commit leaves the complete previous snapshot searchable; a kill at
-  the commit boundary recovers exactly one complete previous or replacement
-  snapshot and never a partial mixture;
+- code search is byte-identical after docs admission: `chunks_fts` contains
+  no docs rows, its term statistics are unchanged, and the exact tiers match
+  no docs chunk; the checker file inventory contains no non-code files; a
+  retryable docs scan failure leaves the prior snapshot searchable;
+- docs and code share one publication: a failpoint or process kill before
+  commit leaves the complete previous snapshot searchable for both, and a
+  kill at the commit boundary recovers exactly one complete previous or
+  replacement snapshot, never a partial mixture;
 - a permanent per-file open/read failure is visibly rejected without emitting
   `removed` or another block lifecycle event; a later successful read starts new
   baseline logical occurrences and cannot inherit freshness across the gap;
