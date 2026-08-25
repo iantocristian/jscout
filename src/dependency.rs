@@ -12,11 +12,11 @@ use oxc_resolver::{Resolver, TsconfigDiscovery};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+use crate::formats;
 use crate::fs_ops::FileSystem;
 use crate::indexer::{package_name, resolver_options};
 use crate::package_exports::collect_active_targets;
 use crate::store;
-use crate::walk;
 use crate::workspace::{WorkspaceMap, WorkspacePackage};
 
 pub const DEFAULT_MAX_FILES: usize = 10_000;
@@ -547,7 +547,7 @@ fn collect_indexable_files(
     fs: &impl FileSystem,
 ) -> Result<()> {
     if root.is_file() {
-        if walk::is_indexable(root) {
+        if formats::dependency_code_for_path(root).is_some() {
             out.push(root.to_path_buf());
         }
         return Ok(());
@@ -569,7 +569,7 @@ fn collect_indexable_files(
         let path = entry.path();
         if file_type.is_dir() {
             collect_indexable_files(&path, out, fs)?;
-        } else if file_type.is_file() && walk::is_indexable(&path) {
+        } else if file_type.is_file() && formats::dependency_code_for_path(&path).is_some() {
             out.push(path);
         }
     }
@@ -600,6 +600,7 @@ fn normalized_selectors(selectors: &[String]) -> Result<BTreeSet<String>> {
 }
 
 fn importer_requests(root: &Path, conn: &Connection) -> Result<Vec<(PathBuf, String)>> {
+    let eligible_formats = formats::eligible_ids_json(formats::Capability::Dependency);
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.path, requests.request
          FROM code_files f
@@ -609,9 +610,10 @@ fn importer_requests(root: &Path, conn: &Connection) -> Result<Vec<(PathBuf, Str
            UNION SELECT file_id, target_request FROM refs WHERE target_request IS NOT NULL
          ) requests ON requests.file_id = f.id
          WHERE f.origin IN ('repository', 'workspace')
+           AND f.format IN (SELECT value FROM json_each(?1))
          ORDER BY f.path, requests.request",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([eligible_formats], |row| {
         Ok((
             root.join(row.get::<_, String>(0)?),
             row.get::<_, String>(1)?,
@@ -899,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn documentation_facts_cannot_seed_dependency_discovery() -> Result<()> {
+    fn ineligible_format_facts_cannot_seed_dependency_discovery() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let root = repo.path();
         let conn = store::open(root)?;
@@ -914,6 +916,32 @@ mod tests {
             "INSERT INTO imports(file_id,local_name,imported_name,request)
              VALUES(?1,'example','default','docs-example-package')",
             [docs_file],
+        )?;
+        write(
+            &root.join("src/poison.rs"),
+            "pub fn dependency_poison() {}\n",
+        )?;
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role)
+             VALUES('src/poison.rs','rust','code','rust','production')",
+            [],
+        )?;
+        let rust_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imports(file_id,local_name,imported_name,request)
+             VALUES(?1,'first','default','rust-import-package')",
+            [rust_file],
+        )?;
+        conn.execute(
+            "INSERT INTO exports(file_id,export_name,from_request,from_name)
+             VALUES(?1,'second','rust-export-package','default')",
+            [rust_file],
+        )?;
+        conn.execute(
+            "INSERT INTO refs(
+               file_id,start,line,kind,confidence,target_request,target_name,local
+             ) VALUES(?1,0,1,'use','certain','rust-ref-package','default',0)",
+            [rust_file],
         )?;
 
         let requests = super::importer_requests(root, &conn)?;
@@ -1076,6 +1104,10 @@ mod tests {
             r#"{"name":"dep","version":"1.0.0","exports":{"./*":"./dist/*.js"}}"#,
         )?;
         write(&package_root.path().join("dist/a.js"), "exports.a = 1;\n")?;
+        write(
+            &package_root.path().join("dist/native.rs"),
+            "pub fn dependency_only() {}\n",
+        )?;
         write(
             &package_root.path().join("src/a.ts"),
             "export const a = 1;\n",

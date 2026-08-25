@@ -69,14 +69,22 @@ pub fn status(conn: &Connection) -> Result<Status> {
 
 fn status_inner(conn: &Connection) -> Result<Status> {
     let snapshot = current_snapshot(conn)?;
+    let metadata_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationMetadata);
+    let vector_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
     let canonical_root = conn
         .query_row("SELECT value FROM meta WHERE key='root'", [], |row| {
             row.get(0)
         })
         .optional()?;
     let inventory_count = count_query(conn, "SELECT COUNT(*) FROM doc_inventory", [])?;
-    let indexed_file_count =
-        count_query(conn, "SELECT COUNT(*) FROM files WHERE corpus='docs'", [])?;
+    let indexed_file_count = count_query(
+        conn,
+        "SELECT COUNT(*) FROM files
+         WHERE format IN (SELECT value FROM json_each(?1))",
+        [&metadata_formats],
+    )?;
     let rejection_count = count_query(
         conn,
         "SELECT COUNT(*) FROM doc_inventory WHERE rule!='indexed'",
@@ -86,8 +94,8 @@ fn status_inner(conn: &Connection) -> Result<Status> {
         conn,
         "SELECT COUNT(*)
          FROM chunks c JOIN files f ON f.id=c.file_id
-         WHERE f.corpus='docs'",
-        [],
+         WHERE f.format IN (SELECT value FROM json_each(?1))",
+        [&metadata_formats],
     )?;
     let embeddable_chunk_count = count_query(
         conn,
@@ -95,8 +103,9 @@ fn status_inner(conn: &Connection) -> Result<Status> {
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.corpus='docs' AND m.embedding_identity IS NOT NULL",
-        [],
+         WHERE f.format IN (SELECT value FROM json_each(?1))
+           AND m.embedding_identity IS NOT NULL",
+        [&vector_formats],
     )?;
     let cached_embedding_count = count_query(
         conn,
@@ -107,9 +116,10 @@ fn status_inner(conn: &Connection) -> Result<Status> {
            FROM doc_chunk_meta m
            JOIN chunks c ON c.id=m.chunk_id
            JOIN files f ON f.id=c.file_id
-           WHERE f.corpus='docs' AND m.embedding_identity=e.chunk_hash
+           WHERE f.format IN (SELECT value FROM json_each(?1))
+             AND m.embedding_identity=e.chunk_hash
          )",
-        [],
+        [&vector_formats],
     )?;
     let ready_vector_generation_count = count_query(
         conn,
@@ -155,16 +165,18 @@ pub fn decisions(conn: &Connection) -> Result<Vec<Decision>> {
 }
 
 fn front_matter_status(conn: &Connection) -> Result<Vec<FrontMatterStatus>> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationMetadata);
     let mut statement = conn.prepare(
         "SELECT f.path, MIN(m.front_matter_state)
          FROM files f
          JOIN chunks c ON c.file_id=f.id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
-         WHERE f.corpus='docs'
+         WHERE f.format IN (SELECT value FROM json_each(?1))
          GROUP BY f.id, f.path
          ORDER BY f.path COLLATE BINARY",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([&eligible_formats], |row| {
         Ok(FrontMatterStatus {
             path: row.get(0)?,
             state: row.get(1)?,
@@ -191,6 +203,8 @@ pub fn lexical_search(
         return Ok(Vec::new());
     }
 
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationLexical);
     let mut statement = conn.prepare(
         "SELECT c.id, f.path, m.title, m.description, m.tags_json,
                 m.breadcrumb, m.nearest_heading, docs_fts.body,
@@ -202,9 +216,10 @@ pub fn lexical_search(
          JOIN chunks c ON c.id=docs_fts.rowid
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
-         WHERE docs_fts MATCH ?1 AND f.corpus='docs'",
+         WHERE docs_fts MATCH ?1
+           AND f.format IN (SELECT value FROM json_each(?2))",
     )?;
-    let rows = statement.query_map([query.as_str()], |row| {
+    let rows = statement.query_map([query.as_str(), eligible_formats.as_str()], |row| {
         row_to_hit(row, snapshot, 0.0, Some(14))
     })?;
     let mut hits = rows
@@ -221,6 +236,8 @@ pub(crate) fn load_hit(
     chunk_id: i64,
     score: f64,
 ) -> Result<SearchHit> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationLexical);
     conn.query_row(
         "SELECT c.id, f.path, m.title, m.description, m.tags_json,
                 m.breadcrumb, m.nearest_heading, docs_fts.body,
@@ -230,8 +247,9 @@ pub(crate) fn load_hit(
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
          JOIN docs_fts ON docs_fts.rowid=c.id
-         WHERE c.id=?1 AND f.corpus='docs'",
-        [chunk_id],
+         WHERE c.id=?1
+           AND f.format IN (SELECT value FROM json_each(?2))",
+        rusqlite::params![chunk_id, eligible_formats],
         |row| row_to_hit(row, snapshot, score, None),
     )
     .with_context(|| format!("load documentation chunk {chunk_id}"))
@@ -356,6 +374,15 @@ mod tests {
              VALUES('documentation_chunk_format_version',?1)",
             [crate::docs::CHUNK_FORMAT_VERSION],
         )?;
+        for format in crate::formats::ALL {
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                params![
+                    crate::formats::contract_meta_key(format),
+                    format.extractor_version
+                ],
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('root',?1)",
             [root.path().to_string_lossy()],

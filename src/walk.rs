@@ -1,25 +1,15 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
-use crate::io_policy;
+use crate::{formats, io_policy};
 
 mod inventory;
 
-const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
-
 /// Directories that are almost never worth indexing even when not gitignored.
 pub const SKIP_DIRS: &[&str] = &["node_modules", "dist", ".next", "coverage", "out"];
-
-pub fn is_indexable(path: &Path) -> bool {
-    // Authored declaration files are part of the contract plane. Generated
-    // declarations under dependency/output directories are excluded by the
-    // directory walker and origin policy rather than by their extension.
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.contains(&e))
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkRejection {
@@ -102,6 +92,35 @@ impl SourcePathPolicy {
         let (matched, error) = self.matcher.matched_with_errors(relative, is_dir);
         error.is_none() && matched.is_ignore()
     }
+
+    /// Apply a format's directory policy to a watch path using current source
+    /// visibility. Cargo membership requires a regular, non-symlink manifest
+    /// that is admitted by the same ignore/hidden policy as the source walk.
+    pub fn directory_admitted(&mut self, path: &Path, format: &formats::FormatSpec) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        if format.directory != formats::DirectoryPolicy::CargoTarget {
+            return true;
+        }
+        let mut cargo_roots = BTreeSet::new();
+        let mut parent = PathBuf::new();
+        for component in relative.components() {
+            if component.as_os_str() == "target" {
+                let manifest = self.root.join(&parent).join("Cargo.toml");
+                let regular = std::fs::symlink_metadata(&manifest)
+                    .is_ok_and(|metadata| metadata.file_type().is_file());
+                if regular
+                    && !is_in_skipped_directory(&self.root, &manifest)
+                    && !self.is_ignored(&manifest, false)
+                {
+                    cargo_roots.insert(parent.clone());
+                }
+            }
+            parent.push(component.as_os_str());
+        }
+        formats::repository_directory_admitted(format, relative, &cargo_roots)
+    }
 }
 
 /// Whether a path is under a directory the source walker excludes
@@ -136,7 +155,8 @@ fn source_walk_builder(root: &Path) -> WalkBuilder {
 /// reported and excluded so one inaccessible directory cannot wedge the
 /// entire repository.
 pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
-    let mut files = Vec::new();
+    let mut candidates = Vec::new();
+    let mut cargo_roots = BTreeSet::new();
     let mut rejections = Vec::new();
     let walker = source_walk_builder(root).build();
     for entry in walker {
@@ -174,10 +194,27 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
                 });
             }
         }
-        if entry.file_type().is_some_and(|t| t.is_file()) && is_indexable(entry.path()) {
-            files.push(entry.into_path());
+        if entry.file_type().is_some_and(|t| t.is_file()) {
+            let path = entry.into_path();
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            if relative
+                .file_name()
+                .is_some_and(|name| name == "Cargo.toml")
+            {
+                cargo_roots.insert(relative.parent().unwrap_or(Path::new("")).to_path_buf());
+            }
+            if let Some(format) = formats::repository_code_for_path(&path) {
+                candidates.push((path, format));
+            }
         }
     }
+    let mut files = candidates
+        .into_iter()
+        .filter_map(|(path, format)| {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            formats::repository_directory_admitted(format, relative, &cargo_roots).then_some(path)
+        })
+        .collect::<Vec<_>>();
     files.sort();
     Ok(SourceInventory { files, rejections })
 }
@@ -236,12 +273,36 @@ fn ignore_error_path(error: &IgnoreError) -> Option<&Path> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
 
     use anyhow::Result;
 
     use super::*;
     use crate::docs::corpus::{self, CorpusOptions};
+
+    fn relative_code_inventory(
+        root: &Path,
+    ) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>, BTreeSet<String>)> {
+        let root = root.canonicalize()?;
+        let source = source_inventory(&root)?
+            .files
+            .into_iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<BTreeSet<_>>();
+        let shared = corpus::repository_inventory(&root, &CorpusOptions::default())?;
+        let shared_code = shared
+            .files
+            .into_iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<BTreeSet<_>>();
+        let shared_docs = shared
+            .documents
+            .into_iter()
+            .map(|document| document.file.path)
+            .collect::<BTreeSet<_>>();
+        Ok((source, shared_code, shared_docs))
+    }
 
     #[test]
     fn authored_build_directories_and_declarations_are_indexable() -> Result<()> {
@@ -250,10 +311,18 @@ mod tests {
         let declarations = repo.path().join("packages/app");
         let ignored_build = repo.path().join("build");
         let generated_dist = repo.path().join("packages/app/dist");
+        let cargo_target = repo.path().join("target/debug");
+        let authored_target = repo.path().join("src/target");
         fs::create_dir_all(repo.path().join(".git"))?;
         fs::create_dir_all(&source_build)?;
         fs::create_dir_all(&ignored_build)?;
         fs::create_dir_all(&generated_dist)?;
+        fs::create_dir_all(&cargo_target)?;
+        fs::create_dir_all(&authored_target)?;
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\n",
+        )?;
         fs::write(repo.path().join(".gitignore"), "/build/\n")?;
         fs::write(source_build.join("plugin.ts"), "export const plugin = 1\n")?;
         fs::write(
@@ -268,6 +337,12 @@ mod tests {
             generated_dist.join("generated.d.ts"),
             "export interface Generated {}\n",
         )?;
+        fs::write(cargo_target.join("generated.rs"), "pub fn generated() {}\n")?;
+        fs::write(
+            cargo_target.join("authored.ts"),
+            "export const authored = 1;\n",
+        )?;
+        fs::write(authored_target.join("module.rs"), "pub fn authored() {}\n")?;
 
         let files = source_files(repo.path())?
             .into_iter()
@@ -281,6 +356,107 @@ mod tests {
         assert!(files.contains(&PathBuf::from("packages/app/contracts.d.ts")));
         assert!(!files.contains(&PathBuf::from("build/generated.d.ts")));
         assert!(!files.contains(&PathBuf::from("packages/app/dist/generated.d.ts")));
+        assert!(!files.contains(&PathBuf::from("target/debug/generated.rs")));
+        assert!(files.contains(&PathBuf::from("target/debug/authored.ts")));
+        assert!(files.contains(&PathBuf::from("src/target/module.rs")));
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_targets_require_a_visible_regular_manifest_in_both_inventories() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        for directory in [
+            "target",
+            "src/target",
+            "packages/member/target",
+            "packages/member/src/target",
+            "packages/no-manifest/target",
+        ] {
+            fs::create_dir_all(repo.path().join(directory))?;
+        }
+        fs::write(repo.path().join("Cargo.toml"), "[package]\nname='root'\n")?;
+        fs::write(
+            repo.path().join("packages/member/Cargo.toml"),
+            "[package]\nname='member'\n",
+        )?;
+        for path in ["target/generated.rs", "packages/member/target/generated.rs"] {
+            fs::write(repo.path().join(path), "pub fn generated() {}\n")?;
+        }
+        for path in [
+            "src/target/authored.rs",
+            "packages/member/src/target/authored.rs",
+            "packages/no-manifest/target/authored.rs",
+        ] {
+            fs::write(repo.path().join(path), "pub fn authored() {}\n")?;
+        }
+        fs::write(
+            repo.path().join("target/authored.ts"),
+            "export const authored = true;\n",
+        )?;
+        fs::write(
+            repo.path().join("target/guide.md"),
+            "# Authored documentation\n",
+        )?;
+
+        let (source, shared, docs) = relative_code_inventory(repo.path())?;
+        let expected = BTreeSet::from([
+            PathBuf::from("packages/member/src/target/authored.rs"),
+            PathBuf::from("packages/no-manifest/target/authored.rs"),
+            PathBuf::from("src/target/authored.rs"),
+            PathBuf::from("target/authored.ts"),
+        ]);
+        assert_eq!(source, expected);
+        assert_eq!(shared, expected);
+        assert!(docs.contains("target/guide.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_cargo_manifest_does_not_turn_target_into_an_output_root() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir(repo.path().join(".git"))?;
+        fs::create_dir(repo.path().join("target"))?;
+        fs::write(repo.path().join(".gitignore"), "/Cargo.toml\n")?;
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname='ignored'\n",
+        )?;
+        fs::write(
+            repo.path().join("target/authored.rs"),
+            "pub fn authored() {}\n",
+        )?;
+
+        let (source, shared, _) = relative_code_inventory(repo.path())?;
+        let expected = BTreeSet::from([PathBuf::from("target/authored.rs")]);
+        assert_eq!(source, expected);
+        assert_eq!(shared, expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cargo_manifest_does_not_turn_target_into_an_output_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir()?;
+        fs::create_dir(repo.path().join("target"))?;
+        fs::write(
+            repo.path().join("manifest-source.toml"),
+            "[package]\nname='linked'\n",
+        )?;
+        symlink(
+            repo.path().join("manifest-source.toml"),
+            repo.path().join("Cargo.toml"),
+        )?;
+        fs::write(
+            repo.path().join("target/authored.rs"),
+            "pub fn authored() {}\n",
+        )?;
+
+        let (source, shared, _) = relative_code_inventory(repo.path())?;
+        let expected = BTreeSet::from([PathBuf::from("target/authored.rs")]);
+        assert_eq!(source, expected);
+        assert_eq!(shared, expected);
         Ok(())
     }
 
@@ -289,6 +465,7 @@ mod tests {
         let repo = tempfile::tempdir()?;
         fs::create_dir_all(repo.path().join(".github/workflows"))?;
         fs::write(repo.path().join("main.ts"), "export const main = 1;\n")?;
+        fs::write(repo.path().join("lib.rs"), "pub fn main() {}\n")?;
         fs::write(repo.path().join("README.md"), "# Guide\n\nCurrent text.\n")?;
         fs::write(
             repo.path().join("component.mdx"),
@@ -316,7 +493,7 @@ mod tests {
             .map(|document| document.file.path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(code, [PathBuf::from("main.ts")]);
+        assert_eq!(code, [PathBuf::from("lib.rs"), PathBuf::from("main.ts")]);
         assert_eq!(
             docs,
             [".github/workflows/help.md", "README.md", "component.mdx"]
@@ -333,7 +510,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             source_names,
-            [std::ffi::OsString::from("main.ts")],
+            [
+                std::ffi::OsString::from("lib.rs"),
+                std::ffi::OsString::from("main.ts")
+            ],
             "the read-only code inventory remains code-only"
         );
         Ok(())

@@ -121,6 +121,61 @@ fn documentation_rows_do_not_change_code_scope_evidence() -> Result<()> {
 }
 
 #[test]
+fn rust_never_enters_recon_membership_or_repository_file_policy() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    std::fs::create_dir_all(repo.path().join("src"))?;
+    std::fs::write(repo.path().join("src/run.ts"), "export const run = 1;\n")?;
+    std::fs::write(repo.path().join("src/native.rs"), "pub fn native() {}\n")?;
+    let conn = store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let selector = SubjectSelector::RepositoryArea {
+        scope: "src".into(),
+        direct_only: false,
+    };
+    let state = build_scope_state(repo.path(), &conn, "area:repository:src".into(), selector)?;
+
+    assert_eq!(
+        state
+            .members
+            .iter()
+            .map(|member| member.path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/run.ts"]
+    );
+    classify(
+        &conn,
+        &state,
+        None,
+        0,
+        "runtime",
+        "likely",
+        "rust-recon-boundary",
+    )?;
+    assert_eq!(reconcile_file_policy(repo.path(), &conn)?, 1);
+    assert!(file_policy_by_path(&conn, "src/run.ts")?.is_some());
+    assert!(file_policy_by_path(&conn, "src/native.rs")?.is_none());
+    let memberships = super::current_scope_memberships(&conn)?;
+    let rust_file_id = conn.query_row(
+        "SELECT id FROM files WHERE path='src/native.rs'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    assert!(!memberships.contains_key(&rust_file_id));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*)
+             FROM repository_file_policy policy
+             JOIN files file ON file.id=policy.file_id
+             WHERE file.format='rust'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn policy_reuses_exact_subject_evidence_and_stales_only_changed_scope() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::create_dir_all(repo.path().join("docs"))?;

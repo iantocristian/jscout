@@ -411,7 +411,9 @@ pub struct Hit {
     pub snippet_truncated: bool,
     /// Snapshot-scoped structural handles projected from this retrieval chunk.
     pub anchors: Vec<String>,
-    pub file_anchor: String,
+    /// Present only when the file is projected into the structural graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_anchor: Option<String>,
     /// Graph context: symbols this chunk calls / renders (resolved names).
     pub uses: Vec<String>,
     /// Symbols declared here that other files use, with usage counts.
@@ -589,6 +591,8 @@ fn exact_definition_chunks(
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
     let row_limit = limit.max(1) as i64;
     let mut rows = Vec::<(i64, i64, i64, i64, String, i64)>::new();
 
@@ -602,8 +606,9 @@ fn exact_definition_chunks(
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           AND file.format IN (SELECT value FROM json_each(?7))
          ORDER BY file.path, chunk.start, chunk.id
-         LIMIT ?7",
+         LIMIT ?8",
     )?;
     let named = named_chunks.query_map(
         rusqlite::params![
@@ -613,6 +618,7 @@ fn exact_definition_chunks(
             flags.2,
             file_roles.is_empty(),
             roles_json,
+            eligible_formats,
             row_limit,
         ],
         |row| {
@@ -631,6 +637,8 @@ fn exact_definition_chunks(
     }
 
     let roles_json = serde_json::to_string(file_roles)?;
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
     let mut containing_chunks = conn.prepare_cached(
         "SELECT chunk.id,
                 CASE WHEN chunk.name=?1 COLLATE BINARY THEN 0 ELSE 1 END AS name_priority,
@@ -645,8 +653,9 @@ fn exact_definition_chunks(
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           AND file.format IN (SELECT value FROM json_each(?7))
          ORDER BY name_priority, export_priority, span, file.path, chunk.start, chunk.id
-         LIMIT ?7",
+         LIMIT ?8",
     )?;
     let containing = containing_chunks.query_map(
         rusqlite::params![
@@ -656,6 +665,7 @@ fn exact_definition_chunks(
             flags.2,
             file_roles.is_empty(),
             roles_json,
+            eligible_formats,
             row_limit,
         ],
         |row| {
@@ -704,6 +714,8 @@ fn exact_occurrence_chunks(
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::ExactOccurrence);
     let mut statement = conn.prepare_cached(
         "SELECT candidate.chunk_id
          FROM (
@@ -716,6 +728,7 @@ fn exact_occurrence_chunks(
                OR (?3 AND file.origin='workspace')
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+             AND file.format IN (SELECT value FROM json_each(?7))
            UNION ALL
            SELECT call.chunk_id, file.path, call.start
            FROM member_calls call
@@ -726,6 +739,7 @@ fn exact_occurrence_chunks(
                OR (?3 AND file.origin='workspace')
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+             AND file.format IN (SELECT value FROM json_each(?7))
            UNION ALL
            SELECT site.chunk_id, file.path, site.start
            FROM entity_sites site
@@ -736,10 +750,11 @@ fn exact_occurrence_chunks(
                OR (?3 AND file.origin='workspace')
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+             AND file.format IN (SELECT value FROM json_each(?7))
          ) candidate
          GROUP BY candidate.chunk_id
          ORDER BY MIN(candidate.path), MIN(candidate.position), candidate.chunk_id
-         LIMIT ?7",
+         LIMIT ?8",
     )?;
     let rows = statement.query_map(
         rusqlite::params![
@@ -749,6 +764,7 @@ fn exact_occurrence_chunks(
             flags.2,
             file_roles.is_empty(),
             roles_json,
+            eligible_formats,
             limit.max(1) as i64,
         ],
         |row| row.get::<_, i64>(0),
@@ -764,6 +780,8 @@ fn exact_occurrence_chunks(
     // candidate generator, then enforce case-sensitive identifier boundaries
     // against the stored source chunk before admitting an exact occurrence.
     if result.len() < limit {
+        let eligible_formats =
+            crate::formats::eligible_ids_json(crate::formats::Capability::ExactOccurrence);
         let mut textual = conn.prepare_cached(
             "SELECT chunk.id, chunk.content
              FROM chunks_fts
@@ -774,8 +792,9 @@ fn exact_occurrence_chunks(
                  OR (?3 AND file.origin='workspace')
                  OR (?4 AND file.origin='dependency'))
                AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+               AND file.format IN (SELECT value FROM json_each(?7))
              ORDER BY file.path, chunk.start, chunk.id
-             LIMIT ?7",
+             LIMIT ?8",
         )?;
         let candidate_limit = limit.saturating_mul(32).clamp(32, 4_096) as i64;
         let rows = textual.query_map(
@@ -786,6 +805,7 @@ fn exact_occurrence_chunks(
                 flags.2,
                 file_roles.is_empty(),
                 roles_json,
+                eligible_formats,
                 candidate_limit,
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
@@ -994,6 +1014,8 @@ fn bm25_ranking(
     if fq.is_empty() {
         return Ok(vec![]);
     }
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
     let mut stmt = conn.prepare(
         "SELECT chunks_fts.rowid, bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0) AS r
          FROM chunks_fts
@@ -1004,7 +1026,8 @@ fn bm25_ranking(
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
-         ORDER BY r LIMIT ?7",
+           AND file.format IN (SELECT value FROM json_each(?7))
+         ORDER BY r LIMIT ?8",
     )?;
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
@@ -1015,7 +1038,8 @@ fn bm25_ranking(
             flags.1,
             flags.2,
             file_roles.is_empty(),
-            roles_json,
+            &roles_json,
+            &eligible_formats,
             limit as i64
         ],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
@@ -1071,6 +1095,7 @@ struct ExhaustiveHitRow {
     end_line: i64,
     repository_role: Option<String>,
     content: String,
+    format: String,
 }
 
 const EXHAUSTIVE_MATCH_START: &str = "\u{1e}jscout-match-start\u{1f}";
@@ -1310,6 +1335,8 @@ fn exhaustive_cursor_position(
 ) -> Result<i64> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
     let (chunk_id, matches): (Option<i64>, i64) = conn.query_row(
         "SELECT MIN(chunk.id), COUNT(*)
              FROM chunks_fts
@@ -1320,7 +1347,8 @@ fn exhaustive_cursor_position(
                AND ((?5 AND file.origin='repository')
                  OR (?6 AND file.origin='workspace')
                  OR (?7 AND file.origin='dependency'))
-               AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))",
+               AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))
+               AND file.format IN (SELECT value FROM json_each(?10))",
         rusqlite::params![
             fts_query,
             position.path,
@@ -1331,6 +1359,7 @@ fn exhaustive_cursor_position(
             flags.2,
             file_roles.is_empty(),
             roles_json,
+            eligible_formats,
         ],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1376,6 +1405,8 @@ fn exhaustive_hits(
 
     let flags = origin_flags(&scope.origins);
     let roles_json = serde_json::to_string(&file_roles)?;
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
     let total: i64 = conn.query_row(
         "SELECT count(*)
          FROM chunks_fts
@@ -1385,14 +1416,16 @@ fn exhaustive_hits(
            AND ((?2 AND file.origin='repository')
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
-           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))",
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           AND file.format IN (SELECT value FROM json_each(?7))",
         rusqlite::params![
             query,
             flags.0,
             flags.1,
             flags.2,
             file_roles.is_empty(),
-            roles_json,
+            &roles_json,
+            &eligible_formats,
         ],
         |row| row.get(0),
     )?;
@@ -1406,7 +1439,7 @@ fn exhaustive_hits(
         "SELECT chunk.id, file.path, chunk.start, chunk.hash,
                 file.role, file.origin, chunk.kind, chunk.name,
                 chunk.start_line, chunk.end_line, policy.effective_role,
-                chunk.content
+                chunk.content, file.format
          FROM chunks_fts
          JOIN chunks chunk ON chunk.id=chunks_fts.rowid
          JOIN files file ON file.id=chunk.file_id
@@ -1416,9 +1449,10 @@ fn exhaustive_hits(
              OR (?3 AND file.origin='workspace')
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
-           AND (?7 IS NULL OR (file.path,chunk.start,chunk.id)>(?7,?8,?9))
+           AND file.format IN (SELECT value FROM json_each(?7))
+           AND (?8 IS NULL OR (file.path,chunk.start,chunk.id)>(?8,?9,?10))
          ORDER BY file.path,chunk.start,chunk.id
-         LIMIT ?10",
+         LIMIT ?11",
     )?;
     let rows = statement.query_map(
         rusqlite::params![
@@ -1427,7 +1461,8 @@ fn exhaustive_hits(
             flags.1,
             flags.2,
             file_roles.is_empty(),
-            roles_json,
+            &roles_json,
+            &eligible_formats,
             cursor_path,
             cursor_start,
             cursor_chunk_id,
@@ -1449,6 +1484,7 @@ fn exhaustive_hits(
                 end_line: row.get(9)?,
                 repository_role: row.get(10)?,
                 content: row.get(11)?,
+                format: row.get(12)?,
             })
         },
     )?;
@@ -1461,15 +1497,16 @@ fn exhaustive_hits(
     let mut hits = Vec::with_capacity(selected.len());
     let mut selected_positions = Vec::with_capacity(selected.len());
     for row in selected {
-        let file_anchor = format!("file:{}", row.position.path);
+        let structurally_eligible =
+            crate::formats::by_id(&row.format).is_some_and(|format| format.structural_eligible());
+        let file_anchor = structurally_eligible.then(|| format!("file:{}", row.position.path));
+        let include_neighborhood_followup = file_anchor.is_some();
         let highlighted_content = highlighted
             .remove(&row.chunk_id)
             .ok_or_else(|| anyhow::anyhow!("missing exhaustive highlight for selected chunk"))?;
         let match_lines =
             exhaustive_match_lines(&highlighted_content, row.start_line, &start_marker);
-        let projected_anchors = anchors
-            .remove(&row.chunk_id)
-            .unwrap_or_else(|| vec![file_anchor.clone()]);
+        let projected_anchors = anchors.remove(&row.chunk_id).unwrap_or_default();
         hits.push(Hit {
             chunk_id: row.chunk_id,
             file: row.position.path.clone(),
@@ -1491,7 +1528,7 @@ fn exhaustive_hits(
             uses: Vec::new(),
             used_by: Vec::new(),
             include_followups: false,
-            include_neighborhood_followup: true,
+            include_neighborhood_followup,
         });
         selected_positions.push(row.position);
     }
@@ -1778,7 +1815,7 @@ fn select_attached_memory(
     let mut hit_files = HashSet::new();
     for hit in hits {
         hit_files.insert(hit.file.as_str());
-        for anchor in hit.anchors.iter().chain(std::iter::once(&hit.file_anchor)) {
+        for anchor in hit.anchors.iter().chain(hit.file_anchor.iter()) {
             if seen_seeds.insert(anchor.as_str()) {
                 seed_keys.push(anchor.clone());
             }
@@ -2344,7 +2381,7 @@ fn load_hit(
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
-                    c.content, policy.effective_role
+                    c.content, policy.effective_role, f.format
              FROM chunks c
              JOIN files f ON c.file_id = f.id
              LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
@@ -2361,20 +2398,38 @@ fn load_hit(
                     r.get::<_, i64>(6)?,
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<String>>(8)?,
+                    r.get::<_, String>(9)?,
                 ))
             },
         )
         .ok();
-    let Some((file, role, file_origin, kind, name, start_line, end_line, content, repository_role)) =
-        row
+    let Some((
+        file,
+        role,
+        file_origin,
+        kind,
+        name,
+        start_line,
+        end_line,
+        content,
+        repository_role,
+        format,
+    )) = row
     else {
         return Ok(None);
     };
-    let anchors = project_chunk_anchors(conn, chunk_id, &file, name.as_deref())?;
-    let file_anchor = format!("file:{file}");
+    let structurally_eligible =
+        crate::formats::by_id(&format).is_some_and(|format| format.structural_eligible());
+    let anchors = if structurally_eligible {
+        project_chunk_anchors(conn, chunk_id, &file, name.as_deref())?
+    } else {
+        Vec::new()
+    };
+    let file_anchor = structurally_eligible.then(|| format!("file:{file}"));
+    let include_neighborhood_followup = file_anchor.is_some();
 
     // Outgoing: what this chunk calls/renders (top few, certain only).
-    let uses: Vec<String> = {
+    let uses: Vec<String> = if structurally_eligible {
         let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT target_name || ' (' || kind || ')' FROM refs
              WHERE chunk_id = ?1 AND kind IN ('call','render','extend') AND confidence='certain'
@@ -2382,6 +2437,8 @@ fn load_hit(
         )?;
         let rows = stmt.query_map([chunk_id], |r| r.get::<_, String>(0))?;
         rows.filter_map(|r| r.ok()).collect()
+    } else {
+        Vec::new()
     };
 
     // Only label anchor-resolved incoming edges as `used_by`. Repository-wide
@@ -2426,7 +2483,7 @@ fn load_hit(
         uses,
         used_by,
         include_followups: false,
-        include_neighborhood_followup: true,
+        include_neighborhood_followup,
     }))
 }
 
@@ -2871,16 +2928,20 @@ fn project_exhaustive_anchors(
     }
     let chunk_ids =
         serde_json::to_string(&rows.iter().map(|row| row.chunk_id).collect::<Vec<_>>())?;
+    let structural_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut stmt = conn.prepare(
         "SELECT c.id, g.node_key, s.name, s.scope_chain, c.scope_chain
          FROM chunks c
+         JOIN files f ON f.id=c.file_id
          JOIN symbols s ON s.file_id=c.file_id
            AND s.decl_start < c.end AND s.decl_end > c.start
          JOIN graph_nodes g ON g.native_table='symbols' AND g.native_id=s.id
          WHERE c.id IN (SELECT value FROM json_each(?1))
+           AND f.format IN (SELECT value FROM json_each(?2))
          ORDER BY c.id, s.decl_start, s.decl_end, g.node_key",
     )?;
-    let candidates = stmt.query_map([chunk_ids], |r| {
+    let candidates = stmt.query_map(rusqlite::params![chunk_ids, structural_formats], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -2899,13 +2960,19 @@ fn project_exhaustive_anchors(
     }
     let mut projected = HashMap::with_capacity(rows.len());
     for row in rows {
+        let structurally_eligible =
+            crate::formats::by_id(&row.format).is_some_and(|format| format.structural_eligible());
         projected.insert(
             row.chunk_id,
-            select_chunk_anchors(
-                &row.position.path,
-                row.name.as_deref(),
-                by_chunk.remove(&row.chunk_id).unwrap_or_default(),
-            ),
+            if structurally_eligible {
+                select_chunk_anchors(
+                    &row.position.path,
+                    row.name.as_deref(),
+                    by_chunk.remove(&row.chunk_id).unwrap_or_default(),
+                )
+            } else {
+                Vec::new()
+            },
         );
     }
     Ok(projected)
@@ -2917,16 +2984,20 @@ fn project_chunk_anchors(
     file: &str,
     chunk_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    let structural_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut stmt = conn.prepare(
         "SELECT g.node_key, s.name, s.scope_chain, c.scope_chain
          FROM chunks c
+         JOIN files f ON f.id=c.file_id
          JOIN symbols s ON s.file_id=c.file_id
            AND s.decl_start < c.end AND s.decl_end > c.start
          JOIN graph_nodes g ON g.native_table='symbols' AND g.native_id=s.id
          WHERE c.id=?1
+           AND f.format IN (SELECT value FROM json_each(?2))
          ORDER BY s.decl_start, s.decl_end, g.node_key",
     )?;
-    let rows = stmt.query_map([chunk_id], |r| {
+    let rows = stmt.query_map(rusqlite::params![chunk_id, structural_formats], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,

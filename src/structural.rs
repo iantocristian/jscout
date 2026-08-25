@@ -385,6 +385,7 @@ pub fn compute_snapshot(conn: &Connection) -> Result<String> {
 pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-resolution-hash-v2\0");
+    let resolver_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Resolver);
     let mut stmt = conn.prepare(
         "SELECT source.path, edge.request, COALESCE(target.path, ''),
                 COALESCE(edge.package, ''), COALESCE(edge.resolution, ''),
@@ -393,11 +394,14 @@ pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
          JOIN files source ON source.id=edge.from_file
          LEFT JOIN files target ON target.id=edge.to_file
          LEFT JOIN package_instances package ON package.id=edge.package_instance_id
+         WHERE source.format IN (SELECT value FROM json_each(?1))
+           AND (edge.to_file IS NULL
+                OR target.format IN (SELECT value FROM json_each(?1)))
          ORDER BY source.path, edge.request, COALESCE(target.path, ''),
                   COALESCE(edge.package, ''), COALESCE(edge.resolution, ''),
                   COALESCE(package.canonical_root, ''), edge.type_only",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([resolver_formats], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -462,6 +466,39 @@ pub(crate) fn compute_snapshot_with_resolution(
     // both also makes an interrupted or pre-upgrade mismatch fail closed.
     hasher.update(b"\0documentation-published-chunk-format\0");
     hasher.update(documentation_chunk_format.as_bytes());
+    for format in crate::formats::ALL {
+        let present = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
+            [format.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !present {
+            continue;
+        }
+        let key = crate::formats::contract_meta_key(format);
+        let persisted = conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .unwrap_or_default();
+        // Preserve the byte-exact phase-0 digest while the per-format marker
+        // is only a spelling of an existing legacy snapshot input. As soon as
+        // one format's producer diverges from that shared contract, its own
+        // producer/published pair extends the snapshot independently.
+        if format
+            .legacy_snapshot_contract()
+            .is_some_and(|legacy| format.extractor_version == legacy && persisted == legacy)
+        {
+            continue;
+        }
+        hasher.update(b"\0active-format-contract\0");
+        hasher.update(format.id.as_bytes());
+        hasher.update(b"\0producer\0");
+        hasher.update(format.extractor_version.as_bytes());
+        hasher.update(b"\0published\0");
+        hasher.update(persisted.as_bytes());
+    }
     let mut stmt = conn.prepare(
         "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
                 COALESCE(f.package_path, ''),
@@ -685,8 +722,15 @@ pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
 
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
     let mut files = HashMap::new();
-    let mut stmt = conn.prepare("SELECT id, path FROM code_files ORDER BY path")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let formats = crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM code_files
+         WHERE format IN (SELECT value FROM json_each(?1))
+         ORDER BY path",
+    )?;
+    let rows = stmt.query_map([formats], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
     for row in rows {
         let (id, path) = row?;
         files.insert(id, path);
@@ -714,7 +758,10 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
         ))
     })?;
     for row in rows {
-        raw.push(row?);
+        let symbol = row?;
+        if files.contains_key(&symbol.1) {
+            raw.push(symbol);
+        }
     }
     raw.sort_by(|a, b| {
         let a_path = files.get(&a.1).map_or("", String::as_str);
@@ -728,7 +775,7 @@ fn load_symbols(conn: &Connection, files: &HashMap<i64, String>) -> Result<Vec<S
         let path = files
             .get(&file_id)
             .cloned()
-            .with_context(|| format!("symbol {id} refers to missing file {file_id}"))?;
+            .with_context(|| format!("eligible symbol {id} refers to missing file {file_id}"))?;
         let ordinal = ordinals
             .entry((file_id, scope.clone(), name.clone()))
             .and_modify(|n| *n += 1)
@@ -2787,9 +2834,11 @@ fn workflow_logical_steps(
     entity_degree_cache: &mut HashMap<String, usize>,
 ) -> Result<Vec<WorkflowLogicalStep>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT src_key, dst_key, kind, confidence
-         FROM resolved_edges
-         WHERE src_key=?1 OR dst_key=?1",
+        "SELECT edge.src_key, edge.dst_key, edge.kind, edge.confidence,
+                edge.source_file_id, source.format
+         FROM resolved_edges edge
+         LEFT JOIN files source ON source.id=edge.source_file_id
+         WHERE edge.src_key=?1 OR edge.dst_key=?1",
     )?;
     let incident = stmt
         .query_map([node], |row| {
@@ -2798,12 +2847,16 @@ fn workflow_logical_steps(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut by_target: HashMap<String, WorkflowLogicalStep> = HashMap::new();
-    for (source, target, kind, confidence) in incident {
-        if confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap() {
+    for (source, target, kind, confidence, source_file_id, source_format) in incident {
+        if !structural_edge_source_eligible(source_file_id, source_format.as_deref())
+            || confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
+        {
             continue;
         }
         let other_key = if source == node { &target } else { &source };
@@ -2867,9 +2920,11 @@ fn workflow_logical_steps(
             continue;
         }
         let mut entity_stmt = conn.prepare_cached(
-            "SELECT src_key, dst_key, kind, confidence
-             FROM resolved_edges
-             WHERE src_key=?1 OR dst_key=?1",
+            "SELECT edge.src_key, edge.dst_key, edge.kind, edge.confidence,
+                    edge.source_file_id, source.format
+             FROM resolved_edges edge
+             LEFT JOIN files source ON source.id=edge.source_file_id
+             WHERE edge.src_key=?1 OR edge.dst_key=?1",
         )?;
         let entity_edges = entity_stmt
             .query_map([&other.key], |row| {
@@ -2878,10 +2933,17 @@ fn workflow_logical_steps(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (peer_source, peer_target, peer_kind, peer_confidence) in entity_edges {
+        for (peer_source, peer_target, peer_kind, peer_confidence, source_file_id, source_format) in
+            entity_edges
+        {
+            if !structural_edge_source_eligible(source_file_id, source_format.as_deref()) {
+                continue;
+            }
             let Some((peer_family, peer_side)) = workflow_runtime_boundary_kind(&peer_kind) else {
                 continue;
             };
@@ -2952,9 +3014,11 @@ fn collect_general_workflow_steps(
         return Ok(());
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT src_key, dst_key, kind, confidence
-         FROM resolved_edges
-         WHERE src_key=?1 OR dst_key=?1",
+        "SELECT edge.src_key, edge.dst_key, edge.kind, edge.confidence,
+                edge.source_file_id, source.format
+         FROM resolved_edges edge
+         LEFT JOIN files source ON source.id=edge.source_file_id
+         WHERE edge.src_key=?1 OR edge.dst_key=?1",
     )?;
     let peers = stmt
         .query_map([&entity.key], |row| {
@@ -2963,11 +3027,14 @@ fn collect_general_workflow_steps(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (source, target, peer_kind, peer_confidence) in peers {
-        if workflow_general_association_kind(&peer_kind) != Some(family)
+    for (source, target, peer_kind, peer_confidence, source_file_id, source_format) in peers {
+        if !structural_edge_source_eligible(source_file_id, source_format.as_deref())
+            || workflow_general_association_kind(&peer_kind) != Some(family)
             || confidence_rank(&peer_confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
@@ -3035,9 +3102,11 @@ fn workflow_direct_degree(
     allowed_origins: &HashSet<&str>,
 ) -> Result<usize> {
     let mut stmt = conn.prepare_cached(
-        "SELECT src_key, dst_key, kind, confidence
-         FROM resolved_edges
-         WHERE src_key=?1 OR dst_key=?1",
+        "SELECT edge.src_key, edge.dst_key, edge.kind, edge.confidence,
+                edge.source_file_id, source.format
+         FROM resolved_edges edge
+         LEFT JOIN files source ON source.id=edge.source_file_id
+         WHERE edge.src_key=?1 OR edge.dst_key=?1",
     )?;
     let incident = stmt.query_map([node], |row| {
         Ok((
@@ -3045,12 +3114,15 @@ fn workflow_direct_degree(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut neighbors = HashSet::new();
     for row in incident {
-        let (source, target, kind, confidence) = row?;
-        if !workflow_direct_kind(&kind)
+        let (source, target, kind, confidence, source_file_id, source_format) = row?;
+        if !structural_edge_source_eligible(source_file_id, source_format.as_deref())
+            || !workflow_direct_kind(&kind)
             || confidence_rank(&confidence).unwrap_or(0) < confidence_rank("likely").unwrap()
         {
             continue;
@@ -3331,7 +3403,8 @@ fn enqueue_ranked_steps(
     for direction in directions {
         let sql = if *direction == "out" {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json, other_file.role, other_file.origin
+                    f.path, e.line, e.detail_json, other_file.role, other_file.origin,
+                    e.source_file_id, f.format
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.dst_key
@@ -3339,7 +3412,8 @@ fn enqueue_ranked_steps(
              WHERE e.src_key = ?1"
         } else {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
-                    f.path, e.line, e.detail_json, other_file.role, other_file.origin
+                    f.path, e.line, e.detail_json, other_file.role, other_file.origin,
+                    e.source_file_id, f.format
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.src_key
@@ -3364,11 +3438,21 @@ fn enqueue_ranked_steps(
                 },
                 r.get::<_, Option<String>>(9)?,
                 r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, Option<String>>(12)?,
             ))
         })?;
         for row in rows {
-            let (edge_id, mut edge, other_file_role, other_file_origin) = row?;
-            if confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
+            let (
+                edge_id,
+                mut edge,
+                other_file_role,
+                other_file_origin,
+                source_file_id,
+                source_format,
+            ) = row?;
+            if !structural_edge_source_eligible(source_file_id, source_format.as_deref())
+                || confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
                 || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
                 || (!allowed_file_roles.is_empty()
                     && other_file_role
@@ -3385,6 +3469,9 @@ fn enqueue_ranked_steps(
             } else {
                 edge.source.clone()
             };
+            if !structural_graph_node_exists(conn, &other)? {
+                continue;
+            }
             let degree = match degree_cache.get(&other) {
                 Some(degree) => *degree,
                 None => {
@@ -3429,12 +3516,30 @@ fn enqueue_ranked_steps(
 }
 
 fn graph_degree(conn: &Connection, node: &str) -> Result<usize> {
-    let degree: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM resolved_edges WHERE src_key=?1 OR dst_key=?1",
-        [node],
-        |row| row.get(0),
+    let mut statement = conn.prepare_cached(
+        "SELECT CASE WHEN edge.src_key=?1 THEN edge.dst_key ELSE edge.src_key END,
+                edge.source_file_id, source.format
+         FROM resolved_edges edge
+         LEFT JOIN files source ON source.id=edge.source_file_id
+         WHERE edge.src_key=?1 OR edge.dst_key=?1",
     )?;
-    Ok(degree.max(0) as usize)
+    let neighbors = statement.query_map([node], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut degree = 0usize;
+    for neighbor in neighbors {
+        let (neighbor, source_file_id, source_format) = neighbor?;
+        if structural_edge_source_eligible(source_file_id, source_format.as_deref())
+            && structural_graph_node_exists(conn, &neighbor)?
+        {
+            degree += 1;
+        }
+    }
+    Ok(degree)
 }
 
 fn confidence_weight(confidence: &str) -> f64 {
@@ -3547,7 +3652,7 @@ fn resolve_anchor(
         )?;
         return unique_anchor(anchor, candidates, "re-resolved");
     }
-    if graph_node_exists(conn, anchor)? {
+    if structural_graph_node_exists(conn, anchor)? {
         if !node_origin_allowed(conn, anchor, allowed_origins)? {
             bail!("anchor `{anchor}` is outside the requested file origins");
         }
@@ -3597,12 +3702,40 @@ fn unique_anchor(anchor: &str, candidates: Vec<String>, status: &str) -> Result<
     }
 }
 
-fn graph_node_exists(conn: &Connection, key: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM graph_nodes WHERE node_key=?1)",
-        [key],
-        |r| r.get::<_, i64>(0),
-    )? != 0)
+fn structural_graph_node_exists(conn: &Connection, key: &str) -> Result<bool> {
+    let identity = conn
+        .query_row(
+            "SELECT node.file_id,file.format
+             FROM graph_nodes node
+             LEFT JOIN files file ON file.id=node.file_id
+             WHERE node.node_key=?1",
+            [key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match identity {
+        None => false,
+        Some((None, _)) => true,
+        Some((Some(_), Some(format))) => {
+            crate::formats::by_id(&format).is_some_and(|format| format.structural_eligible())
+        }
+        Some((Some(_), None)) => false,
+    })
+}
+
+fn structural_edge_source_eligible(
+    source_file_id: Option<i64>,
+    source_format: Option<&str>,
+) -> bool {
+    source_file_id.is_none()
+        || source_format
+            .and_then(crate::formats::by_id)
+            .is_some_and(|format| format.structural_eligible())
 }
 
 fn node_origin_allowed(
@@ -3610,6 +3743,9 @@ fn node_origin_allowed(
     key: &str,
     allowed_origins: &HashSet<&str>,
 ) -> Result<bool> {
+    if !structural_graph_node_exists(conn, key)? {
+        return Ok(false);
+    }
     let origin = conn
         .query_row(
             "SELECT file.origin
@@ -3683,6 +3819,9 @@ fn file_candidates(conn: &Connection, path: &str) -> Result<Vec<String>> {
 }
 
 fn load_node(conn: &Connection, key: &str) -> Result<Option<GraphNode>> {
+    if !structural_graph_node_exists(conn, key)? {
+        return Ok(None);
+    }
     let mut stmt = conn.prepare(
         "SELECT g.node_key, g.node_kind, g.display_name, f.path, f.role, f.origin,
                 g.line, g.meta_json

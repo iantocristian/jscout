@@ -371,6 +371,182 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
 }
 
 #[test]
+fn poisoned_rust_facts_do_not_cross_structural_mcp_boundaries() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("src/service.ts"),
+        "export function sharedNeedle(db: any, bus: any) {\n\
+           bus.emit('shared-event');\n\
+           db.items.sharedCall({ marker: true });\n\
+           return sharedNeedle(db, bus);\n\
+         }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let anchor: String = conn.query_row(
+        "SELECT node_key FROM graph_nodes
+         WHERE node_kind='symbol' AND display_name='sharedNeedle'",
+        [],
+        |row| row.get(0),
+    )?;
+    let typescript_file: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='src/service.ts'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let rust_source = "db.items.sharedCall({ marker: true });\n";
+    fs::write(repo.path().join("poison.rs"), rust_source)?;
+    conn.execute(
+        "INSERT INTO files(path,hash,corpus,format,role,origin)
+         VALUES('poison.rs',?1,'code','rust','production','repository')",
+        [blake3::hash(rust_source.as_bytes()).to_hex().to_string()],
+    )?;
+    let rust_file = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks(
+           file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(?1,'method','sharedNeedle','','sharedNeedle',0,39,1,1,
+                  'rust-poison-chunk',?2)",
+        rusqlite::params![rust_file, rust_source],
+    )?;
+    let rust_chunk = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'sharedNeedle','function',0,12,0,39,'',1,1)",
+        [rust_file],
+    )?;
+    conn.execute(
+        "INSERT INTO refs(
+           file_id,chunk_id,start,line,kind,confidence,target_request,target_name,local
+         ) VALUES(?1,?2,0,91,'call','certain','./src/service','sharedNeedle',0)",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+    conn.execute(
+        "INSERT INTO module_edges(from_file,request,to_file,resolution)
+         VALUES(?1,'./src/service',?2,'resolver')",
+        rusqlite::params![rust_file, typescript_file],
+    )?;
+    conn.execute(
+        "INSERT INTO events(file_id,chunk_id,line,role,name,method)
+         VALUES(?1,?2,92,'listen','shared-event','on')",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+    conn.execute(
+        "INSERT INTO member_calls(file_id,chunk_id,start,end,line,prop,object)
+         VALUES(?1,?2,0,39,93,'sharedCall','items')",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+
+    for (tool, arguments) in [
+        (
+            "definition",
+            json!({
+                "symbol": "sharedNeedle",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "who_uses",
+            json!({
+                "anchor": anchor,
+                "snapshot": snapshot,
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "events",
+            json!({
+                "name": "shared-event",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "calls",
+            json!({
+                "method": "sharedCall",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+    ] {
+        let rendered = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            tool,
+            &arguments,
+        )?;
+        assert!(
+            rendered.contains("src/service.ts"),
+            "{tool} did not exercise the eligible TypeScript control: {rendered}"
+        );
+        assert!(
+            !rendered.contains("poison.rs"),
+            "{tool} leaked a checker-ineligible Rust fact: {rendered}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_semantic_search_expand_stays_lexical_at_mcp_boundary() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn lexical_native_marker() { println!(\"native marker\"); }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rendered = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "lexical native marker",
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "expand": true,
+            "expand_mode": "paths",
+            "limit": 10,
+            "response_bytes": 100_000
+        }),
+    )?;
+    let response: serde_json::Value = serde_json::from_str(&rendered)?;
+    let hit = response["hits"]
+        .as_array()
+        .and_then(|hits| hits.iter().find(|hit| hit["at"] == "native.rs:1"))
+        .unwrap_or_else(|| panic!("missing compact Rust hit: {rendered}"));
+
+    assert!(hit.get("anchor").is_none());
+    let calls = hit["followups"]["calls"]
+        .as_array()
+        .expect("file-compatible follow-up calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "file_outline");
+    assert_eq!(calls[0]["arguments"]["path"], "native.rs");
+
+    assert_eq!(response["graph"]["projection"], "paths");
+    assert_eq!(response["graph"]["seeds"], json!([]));
+    assert_eq!(response["graph"]["nodes"], json!({}));
+    assert_eq!(response["graph"]["edges"], json!([]));
+    Ok(())
+}
+
+#[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
     let defaults = config::SearchSettings {
         vector: false,

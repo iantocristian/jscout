@@ -281,6 +281,8 @@ pub fn persist_classification(
 /// does not mask an older exact match, which is what makes branch-return reuse
 /// work without mutating immutable history.
 pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     let candidates = {
         let mut statement = conn.prepare(
             "SELECT classification.id, classification.subject_key,
@@ -398,8 +400,12 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         conn.execute("DELETE FROM repository_file_policy", [])?;
         conn.execute("DELETE FROM repository_current_classifications", [])?;
         let file_roles = {
-            let mut statement = conn.prepare("SELECT id, role FROM code_files ORDER BY id")?;
-            let rows = statement.query_map([], |row| {
+            let mut statement = conn.prepare(
+                "SELECT id, role FROM code_files
+                 WHERE format IN (SELECT value FROM json_each(?1))
+                 ORDER BY id",
+            )?;
+            let rows = statement.query_map([&reconnaissance_formats], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
             rows.collect::<std::result::Result<BTreeMap<_, _>, _>>()?
@@ -535,14 +541,17 @@ fn actionable(candidate: &PolicyCandidate) -> bool {
 }
 
 pub fn file_policy_by_path(conn: &Connection, path: &str) -> Result<Option<FilePolicy>> {
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     Ok(conn
         .query_row(
             "SELECT policy.classification_id, policy.subject_key,
                     policy.scope_role, policy.effective_role, policy.depth
              FROM repository_file_policy policy
              JOIN files file ON file.id=policy.file_id
-             WHERE file.path=?1",
-            [path],
+             WHERE file.path=?1
+               AND file.format IN (SELECT value FROM json_each(?2))",
+            params![path, reconnaissance_formats],
             |row| {
                 Ok(FilePolicy {
                     classification_id: row.get(0)?,
@@ -622,13 +631,17 @@ pub fn project_policy(
 }
 
 pub fn chunk_policy_penalty(conn: &Connection, chunk_id: i64) -> Result<f64> {
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     let role = conn
         .query_row(
             "SELECT policy.effective_role
              FROM chunks chunk
+             JOIN files file ON file.id=chunk.file_id
              JOIN repository_file_policy policy ON policy.file_id=chunk.file_id
-             WHERE chunk.id=?1",
-            [chunk_id],
+             WHERE chunk.id=?1
+               AND file.format IN (SELECT value FROM json_each(?2))",
+            params![chunk_id, reconnaissance_formats],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -682,6 +695,8 @@ pub fn current_subject_members(conn: &Connection, subject_key: &str) -> Result<V
 /// enter `repository_file_policy`, allowing coverage accounting without
 /// turning those classifications into hard retrieval policy.
 pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, String>> {
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     let mut statement = conn.prepare(
         "SELECT current.subject_key, current.depth, classification.selector_json
          FROM repository_current_classifications current
@@ -712,9 +727,10 @@ pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, Stri
         "SELECT file.id, file.path, file.origin, package.origin, package.locator
          FROM code_files file
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         WHERE file.format IN (SELECT value FROM json_each(?1))
          ORDER BY file.id",
     )?;
-    let rows = files.query_map([], |row| {
+    let rows = files.query_map([&reconnaissance_formats], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -754,15 +770,18 @@ pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, Stri
 }
 
 fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result<Vec<MemberFile>> {
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     let mut members = Vec::new();
     match selector {
         SubjectSelector::RepositoryArea { scope, direct_only } => {
             let mut statement = conn.prepare(
                 "SELECT file.id, file.path, file.hash FROM code_files file
                  WHERE file.origin='repository' AND file.package_instance_id IS NULL
+                   AND file.format IN (SELECT value FROM json_each(?1))
                  ORDER BY file.path",
             )?;
-            let rows = statement.query_map([], member_row)?;
+            let rows = statement.query_map([&reconnaissance_formats], member_row)?;
             for row in rows {
                 let member = row?;
                 if path_in_scope(&member.path, scope, *direct_only) {
@@ -780,9 +799,11 @@ fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result
                  FROM code_files file
                  JOIN package_instances package ON package.id=file.package_instance_id
                  WHERE package.origin='workspace' AND package.locator=?1
+                   AND file.format IN (SELECT value FROM json_each(?2))
                  ORDER BY file.path",
             )?;
-            let rows = statement.query_map([package_root], member_row)?;
+            let rows =
+                statement.query_map(params![package_root, &reconnaissance_formats], member_row)?;
             for row in rows {
                 let member = row?;
                 if path_in_scope(&member.path, scope, *direct_only) {

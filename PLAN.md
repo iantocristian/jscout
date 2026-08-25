@@ -3402,7 +3402,8 @@ For each format it fixes the persisted `files.format`, `files.corpus`,
 comprehension tier (plain text → named sections → full AST), repository and
 dependency admission, extractor contract identity, lexical/vector projection,
 exact-definition and exact-occurrence eligibility and scanner, checker
-eligibility and watch affinity, and resolver strategy.
+eligibility and watch affinity, repository-reconnaissance/file-policy
+eligibility, and resolver strategy.
 `chunks.kind` remains the intra-file structural role emitted by the parser.
 Callers consume registry capabilities; they do not infer them from
 `corpus='code'`, copy extension lists, or maintain independent format switches.
@@ -3412,8 +3413,8 @@ capability from silently enabling another; that is all it buys. Each format
 still needs its own scanner and chunking contract (Markdown's took a full design
 cycle). A format joining the code corpus additionally pays BM25/vector
 integration, while exact tiers, checker participation, dependency admission,
-and structural projections remain separately gated capabilities. Text-only
-formats are cheap; languages are real work.
+repository reconnaissance, and structural projections remain separately gated
+capabilities. Text-only formats are cheap; languages are real work.
 
 MDX is already admitted by G24 as `format='mdx'` in the docs corpus, using the
 same inert named-sections scanner as Markdown: JSX, props, expressions, inner
@@ -3456,6 +3457,9 @@ format. The decisions:
    events schedule shared incremental refresh but carry no checker dirty path.
    `target` is not added to global `walk::SKIP_DIRS`; only a directory named
    `target` whose parent contains `Cargo.toml` is a Cargo-output root in phase 1.
+   Rust is also excluded from repository reconnaissance membership and its
+   disposable file-policy projection; lexical code-corpus admission does not
+   imply semantic-policy admission.
 3. The pinned parser is `ra_ap_syntax`: lossless byte ranges, error tolerance,
    and no C toolchain. Phase-1 chunks form a non-overlapping, gap-free partition
    of the source, carry `kind='rust_text'`, no name/symbol/scope, and an empty
@@ -3481,8 +3485,10 @@ format. The decisions:
 
 Phase 0 acceptance: a differential fixture indexes the same JS/TS/Markdown/MDX
 repository before and after the registry refactor and compares every public
-code/docs surface and canonical row byte-for-byte except newly introduced
-format-contract metadata—the refactor must otherwise be a complete no-op.
+code/docs surface and pre-existing canonical column byte-for-byte. The only
+normalized additions are newly introduced format-contract metadata and the
+phase-1 `files.parse_error_count` diagnostic column, whose zero default is
+asserted separately—the refactor must otherwise be a complete no-op.
 Phase 1 acceptance: repository `.rs` files
 index while selected dependency `.rs` files do not; authored non-Rust content
 under an ordinary `target/` remains admitted; Cargo-output `target/` is pruned;
@@ -3494,7 +3500,11 @@ and checker carry inputs. A committed query manifest supplies gold JS/TS hits:
 all remain recall@10, no first-gold rank worsens by more than five positions,
 and exact-tier candidates/order remain byte-identical. Self-index timing,
 database size, chunk counts, parse diagnostics, and query results land in
-`eval/results/`. Phase 2 and 3 remain blocked until their own preregistered
+`eval/results/`. Retrieval evaluation overfetches 100 ranked chunks, preserves
+that raw order, deduplicates by first file occurrence, and then computes file
+Recall@10/MRR. Exact-identifier and genuine multi-token BM25 strata are gated
+and reported separately through the committed provider-free runner. Phase 2
+and 3 remain blocked until their own preregistered
 collision and edge-correctness protocols are committed. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
 is subordinate and non-normative, this entry winning on any disagreement.

@@ -1,12 +1,11 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ignore::WalkBuilder;
 
-use super::{
-    RepositoryInventory, RepositoryInventoryConsumer, SKIP_DIRS, WalkRejection, is_indexable,
-};
+use super::{RepositoryInventory, RepositoryInventoryConsumer, SKIP_DIRS, WalkRejection};
 
 enum WalkTask {
     Directory {
@@ -50,7 +49,8 @@ pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
     let mut ignore = matchers
         .pop()
         .ok_or_else(|| anyhow!("repository ignore matcher was not built"))?;
-    let mut files = Vec::new();
+    let mut code_candidates = Vec::new();
+    let mut cargo_roots = BTreeSet::new();
     let mut rejections = Vec::new();
     let mut pending = vec![WalkTask::Directory {
         relative: PathBuf::new(),
@@ -196,14 +196,29 @@ pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
             continue;
         }
 
-        if source_entry_active && is_indexable(&absolute) {
-            files.push(absolute);
+        if source_entry_active {
+            if relative
+                .file_name()
+                .is_some_and(|name| name == "Cargo.toml")
+            {
+                cargo_roots.insert(relative.parent().unwrap_or(Path::new("")).to_path_buf());
+            }
+            if let Some(format) = crate::formats::repository_code_for_path(&absolute) {
+                code_candidates.push((absolute, relative.clone(), format));
+            }
         }
         if consumer_entry_active {
             consumer.inspect_regular_file(relative);
         }
     }
 
+    let mut files = code_candidates
+        .into_iter()
+        .filter_map(|(absolute, relative, format)| {
+            crate::formats::repository_directory_admitted(format, &relative, &cargo_roots)
+                .then_some(absolute)
+        })
+        .collect::<Vec<_>>();
     files.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
     rejections.sort_by(|left, right| {
         left.path

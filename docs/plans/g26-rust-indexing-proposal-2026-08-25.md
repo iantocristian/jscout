@@ -15,7 +15,8 @@ unrelated consumers.
 Rust phase 1 is deliberately lexical. It publishes repository files and exact
 source-backed text chunks to the ordinary code FTS projection. It does not
 publish vectors, definitions, occurrences, graph facts, checker inputs,
-dependency inputs, or resolver inputs. Later phases may enable those
+dependency inputs, resolver inputs, reconnaissance subjects, or disposable
+repository file-policy rows. Later phases may enable those
 capabilities independently after their own tests and evaluations pass.
 
 ## Phase 0 — implement the G25 registry
@@ -31,6 +32,7 @@ One static registry is the sole authority for:
 - exact-definition and exact-occurrence eligibility, independently;
 - exact-occurrence scanner identity;
 - graph, checker, resolver, and watch/checker-affinity eligibility.
+- repository-reconnaissance membership and file-policy eligibility.
 
 Inventory, dependency discovery, extraction dispatch, ranked-projection
 routing, exact-tier queries, checker inventory, watch classification, and
@@ -41,13 +43,13 @@ dependency, checker, exact-tier, or resolver predicate.
 
 The initial capability matrix is:
 
-| Format | Corpus | Repository | Dependency | Ranked projection | Exact definition | Exact occurrence | Checker | Structural projection | Resolver |
-| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- | --- |
-| JavaScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | existing | existing |
-| TypeScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | existing | existing |
-| Markdown | docs | docs policy | no | existing docs lexical/vector | no | no | no | docs metadata only | none |
-| MDX | docs | docs policy | no | existing docs lexical/vector | no | no | no | docs metadata only | none |
-| Rust, phase 1 | code | yes | no | code lexical only | no | no | no | none | none |
+| Format | Corpus | Repository | Dependency | Ranked projection | Exact definition | Exact occurrence | Checker | Checker watch affinity | Recon policy | Structural projection | Resolver |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| JavaScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | yes | yes | existing | existing |
+| TypeScript | code | yes | yes | existing code lexical/vector | yes | JavaScript scanner | yes | yes | yes | existing | existing |
+| Markdown | docs | docs policy | no | existing docs lexical/vector | no | no | no | no | no | docs metadata only | none |
+| MDX | docs | docs policy | no | existing docs lexical/vector | no | no | no | no | no | docs metadata only | none |
+| Rust, phase 1 | code | yes | no | code lexical only | no | no | no | no | no | none | none |
 
 The registry contains typed policies or behavior identifiers, not booleans
 that callers subsequently override. JavaScript and TypeScript may share a
@@ -65,10 +67,11 @@ only files of that format for re-extraction.
 ### Phase 0 acceptance
 
 A fixed JavaScript/TypeScript/Markdown/MDX fixture is indexed before and after
-the registry refactor. Inventories, canonical rows, FTS rows, vector
+the registry refactor. Inventories, pre-existing canonical columns, FTS rows, vector
 candidates, exact-tier results, checker membership, watch signals, graph rows,
 and public query responses must be byte-identical, except for newly introduced
-format-contract metadata. Table-driven tests pin every descriptor and reject
+format-contract metadata and the phase-1 `files.parse_error_count` column. Its
+zero default is asserted separately. Table-driven tests pin every descriptor and reject
 duplicate format identities or extensions. Consumer tests must demonstrate
 that repository admission does not imply dependency, exact-tier, checker, or
 resolver admission.
@@ -77,8 +80,11 @@ resolver admission.
 
 Exact-lowercase `.rs` is registered as `files.format='rust'` and
 `files.corpus='code'` for repository inventory. Rust dependency admission is
-false, including selected npm trees, vendored trees, and Cargo caches. Rust
-chunks enter `chunks_fts`; code-vector materialization remains disabled.
+false: dependency-origin inventories, including selected npm packages, never
+admit `.rs`, and Cargo caches are outside the repository inventory. A checked-in
+directory is not classified as vendored from its name alone; Cargo vendor/source
+replacement discovery belongs to the phase-3 Cargo input contract. Rust chunks
+enter `chunks_fts`; code-vector materialization remains disabled.
 
 The pinned `ra_ap_syntax` parser supplies error-tolerant, lossless syntax
 ranges. The phase-1 projection is limited to:
@@ -90,7 +96,7 @@ ranges. The phase-1 projection is limited to:
 Each chunk has `name=NULL`, empty symbols and scope, and an exact source-backed
 byte span. Rust emits no symbols, imports, exports, refs, member calls, events,
 entities, contracts, graph nodes or edges, semantic artifacts, checker inputs,
-or resolver inputs.
+resolver inputs, reconnaissance members, or repository file-policy rows.
 
 ### Chunk contract
 
@@ -171,7 +177,10 @@ The committed suite must prove:
 
 Before evaluation results are run, commit a manifest containing at least 24
 Rust retrieval questions and 24 frozen JavaScript/TypeScript controls, their
-gold files, query mode, `k`, and baseline output. Phase 1 passes when Rust file
+gold files, query stratum, retrieval depth, file cutoff, and baseline output.
+The provider-free runner retains 100 raw ranked chunk hits, deduplicates files
+by first occurrence, and then truncates to the first 10 files. Exact-identifier
+and genuine multi-token BM25 strata are reported separately. Phase 1 passes when Rust file
 Recall@10 is at least 90%, JavaScript/TypeScript Recall@10 does not decrease,
 mean reciprocal rank drops by no more than 0.02, and no previously top-five
 gold file falls outside the top ten. Record wall time, peak RSS, indexed bytes,

@@ -669,6 +669,139 @@ fn documentation_hash_collision_never_materializes_in_code_vectors() -> anyhow::
 }
 
 #[test]
+fn rust_chunks_are_not_code_embedding_candidates_or_vector_entries() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    let mut chunk_ids = std::collections::BTreeMap::new();
+    for (path, format, hash, content) in [
+        (
+            "src/eligible.ts",
+            "typescript",
+            "typescript-hash",
+            "export const collisionNeedle = true;",
+        ),
+        (
+            "src/ineligible.rs",
+            "rust",
+            "rust-hash",
+            "pub const collisionNeedle: bool = true;",
+        ),
+    ] {
+        connection.execute(
+            "INSERT INTO files(path,hash,role,origin,corpus,format)
+             VALUES(?1,?2,'production','repository','code',?3)",
+            rusqlite::params![path, format!("file-{hash}"), format],
+        )?;
+        let file_id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO chunks(
+               file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(?1,'module','collisionNeedle','','collisionNeedle',0,40,1,1,?2,?3)",
+            rusqlite::params![file_id, hash, content],
+        )?;
+        chunk_ids.insert(format, connection.last_insert_rowid());
+    }
+
+    let candidates = missing_embedding_documents(
+        &connection,
+        "missing-profile",
+        None,
+        &["repository".into()],
+        false,
+    )?;
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|document| document.hash.as_str())
+            .collect::<Vec<_>>(),
+        ["typescript-hash"]
+    );
+
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    for (hash, vector) in [
+        ("typescript-hash", [0.0_f32, 1.0]),
+        ("rust-hash", [1.0_f32, 0.0]),
+    ] {
+        connection.execute(
+            "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+            rusqlite::params![hash, profile.id, vec_to_blob(&vector)],
+        )?;
+    }
+
+    materialize_cached_embeddings(&connection)?;
+    let indexed_formats = || -> anyhow::Result<Vec<String>> {
+        let mut statement = connection.prepare(
+            "SELECT file.format
+             FROM embedding_index_entries entry
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             WHERE entry.profile_id=?1
+             ORDER BY file.path",
+        )?;
+        let rows = statement.query_map([profile.id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    assert_eq!(indexed_formats()?, ["typescript"]);
+
+    sync_vector_index(&connection, Some(profile.id))?;
+    assert_eq!(indexed_formats()?, ["typescript"]);
+    let table = vector_table(profile.dimensions)?;
+    assert_eq!(
+        connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        1
+    );
+
+    connection.execute(
+        "INSERT INTO embedding_index_entries(chunk_id,profile_id) VALUES(?1,?2)",
+        rusqlite::params![chunk_ids["rust"], profile.id],
+    )?;
+    let stale_row_id = connection.last_insert_rowid();
+    connection.execute(
+        &format!(
+            "INSERT INTO {table}(rowid,embedding,profile_id,origin)
+             VALUES(?1,?2,?3,'repository')"
+        ),
+        rusqlite::params![stale_row_id, vec_to_blob(&[1.0, 0.0]), profile.id],
+    )?;
+    let surfaced = exact_vector_search(
+        &connection,
+        &profile,
+        &[1.0, 0.0],
+        2,
+        &["repository".into()],
+    )?;
+    assert_eq!(
+        surfaced
+            .iter()
+            .map(|(chunk_id, _)| *chunk_id)
+            .collect::<Vec<_>>(),
+        [chunk_ids["typescript"]]
+    );
+    assert!(vector_index_needs_sync(&connection, profile.id)?);
+
+    synchronize_vector_index(&connection, &profile, false)?;
+    assert_eq!(indexed_formats()?, ["typescript"]);
+    assert_eq!(
+        connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        1
+    );
+    assert!(!vector_index_needs_sync(&connection, profile.id)?);
+    Ok(())
+}
+
+#[test]
 fn documentation_file_deletion_purges_only_its_vector_occurrence() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;

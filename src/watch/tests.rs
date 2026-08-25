@@ -27,7 +27,7 @@ fn seconds(value: u64) -> Duration {
 }
 
 fn source_signal(path: &str) -> DirtySignal {
-    DirtySignal::source(format!("source:{path}"), path)
+    DirtySignal::source(format!("source:{path}"), path, true)
 }
 
 #[test]
@@ -448,6 +448,52 @@ fn a_large_source_batch_promotes_to_full_refresh() {
 }
 
 #[test]
+fn rust_only_overflow_uses_full_rebind_and_never_schedules_enrichment() {
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+
+    for index in 0..=MAX_INCREMENTAL_SOURCE_PATHS {
+        let path = format!("src/file-{index}.rs");
+        coordinator.mark_dirty(
+            seconds(1),
+            DirtySignal::source(format!("source:{path}"), path, false),
+        );
+    }
+    let rust = coordinator.next_work(seconds(3)).expect("Rust refresh");
+    assert_eq!(rust.refresh_scope, RefreshScope::Full);
+    assert!(rust.rebind_checker);
+    assert_eq!(coordinator.finish_refresh(rust), FinishState::Complete);
+    assert!(coordinator.next_work(seconds(3)).is_none());
+
+    for index in 0..=MAX_INCREMENTAL_SOURCE_PATHS {
+        let path = format!("src/file-{index}.ts");
+        coordinator.mark_dirty(
+            seconds(4),
+            DirtySignal::source(format!("source:{path}"), path, true),
+        );
+    }
+    let typescript = coordinator
+        .next_work(seconds(6))
+        .expect("TypeScript refresh");
+    assert_eq!(typescript.refresh_scope, RefreshScope::Full);
+    assert!(!typescript.rebind_checker);
+    assert_eq!(
+        coordinator.finish_refresh(typescript),
+        FinishState::Continue
+    );
+    assert_eq!(
+        coordinator.next_work(seconds(6)).expect("enrich").phase,
+        Phase::Enrich
+    );
+}
+
+#[test]
 fn event_classifier_excludes_only_the_exact_database_family() {
     let root = PathBuf::from("/repo");
     let database = root.join(".jscout.db");
@@ -463,6 +509,254 @@ fn event_classifier_excludes_only_the_exact_database_family() {
             .classify(&[root.join(".jscout-notes.ts")])
             .is_some_and(|signal| signal.scope == RefreshScope::Incremental)
     );
+}
+
+#[test]
+fn event_classifier_separates_index_refresh_paths_from_checker_affinity() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src/main.ts"), "export const main = 1;\n")?;
+    fs::write(root.join("src/legacy.js"), "exports.legacy = 1;\n")?;
+    fs::write(root.join("src/lib.rs"), "pub fn library() {}\n")?;
+    fs::write(root.join("README.md"), "# Repository\n")?;
+    fs::write(root.join("guide.mdx"), "# Component guide\n")?;
+    let classifier =
+        EventClassifier::new(root, &root.join("watch.db"), &Default::default()).unwrap();
+
+    for relative in ["src/main.ts", "src/legacy.js"] {
+        let signal = classifier
+            .classify(&[root.join(relative)])
+            .expect("ECMAScript source event");
+        assert_eq!(signal.scope, RefreshScope::Incremental);
+        assert_eq!(signal.source_paths, BTreeSet::from([relative.to_string()]));
+        assert_eq!(
+            signal.checker_source_paths,
+            BTreeSet::from([relative.to_string()])
+        );
+    }
+
+    let rust_signal = classifier
+        .classify(&[root.join("src/lib.rs")])
+        .expect("Rust source event");
+    assert_eq!(rust_signal.scope, RefreshScope::Incremental);
+    assert_eq!(
+        rust_signal.source_paths,
+        BTreeSet::from(["src/lib.rs".to_string()])
+    );
+    assert!(rust_signal.checker_source_paths.is_empty());
+
+    let mut documentation_signals = Vec::new();
+    for relative in ["README.md", "guide.mdx"] {
+        let documentation = classifier
+            .classify(&[root.join(relative)])
+            .expect("documentation event");
+        assert!(documentation.source_paths.is_empty());
+        assert!(documentation.checker_source_paths.is_empty());
+        documentation_signals.push(documentation);
+    }
+
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+    coordinator.mark_dirty(seconds(1), rust_signal);
+    assert_eq!(
+        coordinator.dirty_source_paths,
+        BTreeSet::from(["src/lib.rs".to_string()])
+    );
+    assert!(coordinator.checker_dirty_source_paths.is_empty());
+    let rust_work = coordinator.next_work(seconds(3)).expect("Rust refresh");
+    assert_eq!(rust_work.refresh_scope, RefreshScope::Incremental);
+    assert!(rust_work.rebind_checker);
+    assert_eq!(coordinator.finish_refresh(rust_work), FinishState::Complete);
+    assert!(coordinator.next_work(seconds(3)).is_none());
+
+    coordinator.mark_dirty(seconds(4), documentation_signals.remove(0));
+    let docs_work = coordinator
+        .next_work(seconds(6))
+        .expect("documentation refresh");
+    assert!(!docs_work.rebind_checker);
+    assert_eq!(coordinator.finish_refresh(docs_work), FinishState::Continue);
+    assert_eq!(
+        coordinator.next_work(seconds(6)).expect("enrich").phase,
+        Phase::Enrich
+    );
+    Ok(())
+}
+
+#[test]
+fn event_classifier_applies_cargo_target_policy_only_to_rust() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::write(root.join("Cargo.toml"), "[package]\nname='fixture'\n")?;
+    fs::create_dir_all(root.join("target"))?;
+    fs::create_dir_all(root.join("src/target"))?;
+    fs::create_dir_all(root.join("packages/member/target"))?;
+    fs::create_dir_all(root.join("packages/member/src/target"))?;
+    fs::create_dir_all(root.join("packages/no-manifest/target"))?;
+    fs::write(
+        root.join("packages/member/Cargo.toml"),
+        "[package]\nname='member'\n",
+    )?;
+    fs::write(root.join("target/out.rs"), "generated!();\n")?;
+    fs::write(
+        root.join("packages/member/target/out.rs"),
+        "generated!();\n",
+    )?;
+    fs::write(root.join("target/authored.ts"), "export const kept = 1;\n")?;
+    fs::write(root.join("target/guide.md"), "# Kept documentation\n")?;
+    fs::write(
+        root.join("src/target/authored.rs"),
+        "pub fn authored() {}\n",
+    )?;
+    fs::write(
+        root.join("packages/member/src/target/authored.rs"),
+        "pub fn authored() {}\n",
+    )?;
+    fs::write(
+        root.join("packages/no-manifest/target/authored.rs"),
+        "pub fn authored() {}\n",
+    )?;
+    let classifier = EventClassifier::new(root, &root.join("watch.db"), &Default::default())?;
+
+    assert!(classifier.classify(&[root.join("target/out.rs")]).is_none());
+    assert!(
+        classifier
+            .classify(&[root.join("packages/member/target/out.rs")])
+            .is_none()
+    );
+
+    let typescript = classifier
+        .classify(&[root.join("target/authored.ts")])
+        .expect("TypeScript below target remains admitted");
+    assert_eq!(
+        typescript.source_paths,
+        BTreeSet::from(["target/authored.ts".to_string()])
+    );
+    assert_eq!(
+        typescript.checker_source_paths,
+        BTreeSet::from(["target/authored.ts".to_string()])
+    );
+
+    let documentation = classifier
+        .classify(&[root.join("target/guide.md")])
+        .expect("documentation below target remains admitted");
+    assert!(documentation.source_paths.is_empty());
+    assert!(documentation.checker_source_paths.is_empty());
+
+    let authored_rust = classifier
+        .classify(&[root.join("src/target/authored.rs")])
+        .expect("Rust below an unrelated target remains admitted");
+    assert_eq!(
+        authored_rust.source_paths,
+        BTreeSet::from(["src/target/authored.rs".to_string()])
+    );
+    assert!(authored_rust.checker_source_paths.is_empty());
+
+    for relative in [
+        "packages/member/src/target/authored.rs",
+        "packages/no-manifest/target/authored.rs",
+    ] {
+        assert_eq!(
+            classifier.classify(&[root.join(relative)]),
+            Some(DirtySignal::source(
+                format!("source:{relative}"),
+                relative,
+                false,
+            ))
+        );
+    }
+
+    assert_eq!(
+        classifier.classify(&[root.join("Cargo.toml")]),
+        Some(DirtySignal::rust_membership("rust-membership:Cargo.toml"))
+    );
+
+    fs::remove_file(root.join("Cargo.toml"))?;
+    assert_eq!(
+        classifier.classify(&[root.join("Cargo.toml")]),
+        Some(DirtySignal::rust_membership("rust-membership:Cargo.toml")),
+        "a deleted manifest may remove a previously published Cargo output root"
+    );
+    assert_eq!(
+        classifier.classify(&[root.join("target/out.rs")]),
+        Some(DirtySignal::source(
+            "source:target/out.rs",
+            "target/out.rs",
+            false,
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn event_classifier_ignores_an_ignored_cargo_manifest_for_target_membership() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::create_dir(root.join(".git"))?;
+    fs::create_dir(root.join("target"))?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname='fixture'\n")?;
+    fs::write(root.join("target/authored.rs"), "pub fn authored() {}\n")?;
+    let mut classifier = EventClassifier::new(root, &root.join("watch.db"), &Default::default())?;
+
+    assert!(
+        classifier
+            .classify(&[root.join("target/authored.rs")])
+            .is_none()
+    );
+
+    fs::write(root.join(".gitignore"), "/Cargo.toml\n")?;
+    classifier.reload_path_policies()?;
+    assert_eq!(
+        classifier.classify(&[root.join("target/authored.rs")]),
+        Some(DirtySignal::source(
+            "source:target/authored.rs",
+            "target/authored.rs",
+            false,
+        ))
+    );
+    assert!(
+        classifier.classify(&[root.join("Cargo.toml")]).is_none(),
+        "an ignored manifest cannot change published Cargo-target membership"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn event_classifier_does_not_follow_a_symlinked_cargo_manifest() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::create_dir(root.join("target"))?;
+    fs::write(
+        root.join("manifest-source.toml"),
+        "[package]\nname='linked'\n",
+    )?;
+    symlink(root.join("manifest-source.toml"), root.join("Cargo.toml"))?;
+    fs::write(root.join("target/authored.rs"), "pub fn authored() {}\n")?;
+    let classifier = EventClassifier::new(root, &root.join("watch.db"), &Default::default())?;
+
+    assert_eq!(
+        classifier.classify(&[root.join("target/authored.rs")]),
+        Some(DirtySignal::source(
+            "source:target/authored.rs",
+            "target/authored.rs",
+            false,
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join("Cargo.toml")]),
+        Some(DirtySignal::rust_membership("rust-membership:Cargo.toml")),
+        "a symlink event may be replacement of a previously regular manifest"
+    );
+    Ok(())
 }
 
 #[test]
@@ -556,7 +850,8 @@ fn event_filter_uses_walker_ignore_policy_without_excluding_authored_build_dirs(
         classifier.classify(&[root.join("src/build/plugin.ts")]),
         Some(DirtySignal::source(
             "source:src/build/plugin.ts",
-            "src/build/plugin.ts"
+            "src/build/plugin.ts",
+            true,
         ))
     );
     assert!(
@@ -957,6 +1252,7 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Full,
+        false,
     )?;
     assert_eq!(first.outcome.indexed, 1);
     fs::remove_file(directory.path().join("a.ts"))?;
@@ -966,6 +1262,7 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Incremental,
+        false,
     )?;
     assert_eq!(second.outcome.indexed, 1);
     assert_eq!(second.outcome.removed, 1);
@@ -1000,6 +1297,7 @@ fn incremental_inventory_refresh_removes_a_deleted_documentation_subtree() -> Re
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Full,
+        false,
     )?;
 
     fs::remove_dir_all(directory.path().join("removed"))?;
@@ -1008,6 +1306,7 @@ fn incremental_inventory_refresh_removes_a_deleted_documentation_subtree() -> Re
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Incremental,
+        false,
     )?;
     assert_eq!(refreshed.outcome.unchanged, 1);
     assert_eq!(refreshed.outcome.removed, 2);
@@ -1048,6 +1347,7 @@ fn hidden_documentation_directory_event_removes_its_subtree_incrementally() -> R
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Full,
+        false,
     )?;
     let classifier = EventClassifier::new(
         directory.path(),
@@ -1066,6 +1366,7 @@ fn hidden_documentation_directory_event_removes_its_subtree_incrementally() -> R
         &database,
         &indexer::IndexOptions::default(),
         signal.scope,
+        false,
     )?;
     assert_eq!(refreshed.outcome.unchanged, 1);
     assert_eq!(refreshed.outcome.removed, 1);
@@ -1092,6 +1393,7 @@ fn refresh_with_an_unreadable_source_succeeds_with_a_rejection() -> Result<()> {
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Full,
+        false,
     )?;
 
     assert_eq!(result.outcome.rejected, 1);
@@ -1111,6 +1413,7 @@ fn incremental_refresh_reuses_unchanged_source_rows() -> Result<()> {
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Full,
+        false,
     )?;
 
     fs::write(directory.path().join("a.ts"), "export const a = 3;\n")?;
@@ -1119,6 +1422,7 @@ fn incremental_refresh_reuses_unchanged_source_rows() -> Result<()> {
         &database,
         &indexer::IndexOptions::default(),
         RefreshScope::Incremental,
+        false,
     )?;
 
     assert_eq!(

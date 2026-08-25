@@ -107,6 +107,141 @@ fn docs_corpus_named_chunks_cannot_enter_code_exact_lookup() -> Result<()> {
 }
 
 #[test]
+fn rust_identifier_collisions_do_not_change_ecmascript_exact_candidates() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("definition.ts"),
+        "export function collisionNeedle() { return true; }\n",
+    )?;
+    fs::write(
+        repo.path().join("caller.js"),
+        "import { collisionNeedle } from './definition';\n\
+         export const result = collisionNeedle();\n\
+         export const state = { collisionNeedle: result };\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let before =
+        super::exact_intent_candidates(&conn, "collisionNeedle", 32, &[], &origin::defaults())?;
+    assert!(!before.definitions[0].is_empty());
+    assert!(!before.occurrences[0].is_empty());
+
+    conn.execute(
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('000-collision.rs','rust-file','production','repository','code','rust')",
+        [],
+    )?;
+    let rust_file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks(
+           file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(?1,'function','collisionNeedle','','collisionNeedle',0,80,1,3,
+                  'rust-chunk','fn collisionNeedle() { collisionNeedle(); }')",
+        [rust_file_id],
+    )?;
+    let rust_chunk_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks_fts(rowid,content,name,symbols,path)
+         VALUES(?1,'fn collisionNeedle() { collisionNeedle(); }',
+                'collisionNeedle','collisionNeedle','000-collision.rs')",
+        [rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'collisionNeedle','function',3,18,0,40,'',1,1)",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO refs(
+           file_id,chunk_id,start,line,kind,confidence,target_name,local
+         ) VALUES(?1,?2,24,1,'use','certain','collisionNeedle',1)",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO member_calls(file_id,chunk_id,start,line,prop)
+         VALUES(?1,?2,25,1,'collisionNeedle')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO entity_sites(
+           file_id,chunk_id,start,end,line,end_line,plane,entity_type,role,
+           identity_kind,identity_name,identity_start,target_name,target_start,
+           extractor,provenance,confidence
+         ) VALUES(?1,?2,26,41,1,1,'general','symbol','use','reference',
+                  'collisionNeedle',26,'collisionNeedle',26,
+                  'fixture','fixture','certain')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+
+    let after =
+        super::exact_intent_candidates(&conn, "collisionNeedle", 32, &[], &origin::defaults())?;
+    assert_eq!(after.identifiers, before.identifiers);
+    assert_eq!(after.definitions, before.definitions);
+    assert_eq!(after.occurrences, before.occurrences);
+    assert!(
+        !after
+            .definitions
+            .iter()
+            .chain(&after.occurrences)
+            .flatten()
+            .any(|chunk_id| *chunk_id == rust_chunk_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_lexical_hits_do_not_advertise_or_seed_structural_graph_calls() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn lexical_native_marker() { println!(\"native marker\"); }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let result = search(
+        &conn,
+        None,
+        "lexical native marker",
+        &SearchOptions {
+            rerank: false,
+            include_memory: false,
+            expand: true,
+            compact: true,
+            include_neighborhood_followups: true,
+            ..SearchOptions::default()
+        },
+    )?;
+    let hit = result
+        .hits
+        .iter()
+        .find(|hit| hit.file == "native.rs")
+        .expect("Rust lexical hit");
+    assert!(hit.anchors.is_empty());
+    assert!(hit.file_anchor.is_none());
+    assert!(!hit.include_neighborhood_followup);
+    let expansion = result.expansion.as_ref().expect("requested expansion");
+    assert!(expansion.seeds.is_empty());
+    assert!(expansion.nodes.is_empty());
+    assert!(expansion.edges.is_empty());
+
+    let compact = crate::compact::search_value(&result);
+    let rendered_hit = compact["hits"]
+        .as_array()
+        .and_then(|hits| hits.iter().find(|hit| hit["at"] == "native.rs:1"))
+        .expect("compact Rust hit");
+    assert!(rendered_hit.get("anchor").is_none());
+    let calls = rendered_hit["followups"]["calls"]
+        .as_array()
+        .expect("file follow-up calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "file_outline");
+    Ok(())
+}
+
+#[test]
 fn local_reranker_uses_resolved_inference_endpoint_and_pool_policy() {
     let reranker = Reranker::from_settings(
         &RerankerSettings {
@@ -1289,7 +1424,7 @@ fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
         .iter()
         .find(|hit| hit.file == "a.ts" && hit.name.as_deref() == Some("greet"))
         .expect("greet definition hit");
-    assert_eq!(definition.file_anchor, "file:a.ts");
+    assert_eq!(definition.file_anchor.as_deref(), Some("file:a.ts"));
     assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
     assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
     assert!(approximate_name_usage_occurrences(&conn, &result.hits)? > 0);
@@ -1676,7 +1811,7 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
         snippet: "entry() { return nearby(); }".into(),
         snippet_truncated: false,
         anchors: vec![entry.clone()],
-        file_anchor: "file:entry.ts".into(),
+        file_anchor: Some("file:entry.ts".into()),
         uses: Vec::new(),
         used_by: Vec::new(),
         include_followups: true,
@@ -1835,7 +1970,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
             snippet: "x".repeat(8_000),
             snippet_truncated: false,
             anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
-            file_anchor: "file:src/large.ts".into(),
+            file_anchor: Some("file:src/large.ts".into()),
             uses: vec!["helper (call)".into()],
             used_by: vec!["caller: 1 site".into()],
             include_followups: true,
@@ -1911,7 +2046,7 @@ fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
             snippet: "export function target() { return 1; }".into(),
             snippet_truncated: false,
             anchors: vec!["sym:src/target.ts#::target@1".into()],
-            file_anchor: "file:src/target.ts".into(),
+            file_anchor: Some("file:src/target.ts".into()),
             uses: Vec::new(),
             used_by: Vec::new(),
             include_followups: true,

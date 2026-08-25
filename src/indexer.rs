@@ -9,18 +9,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
 use crate::docs::corpus::{self, CapturedDocument, CorpusOptions, Decision, DocFile};
+use crate::formats::{self, Capability, Extractor};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
 use crate::{file_role, io_policy, parse, store};
 
 const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
-const CODE_CORPUS: &str = "code";
-const DOCS_CORPUS: &str = "docs";
-const JAVASCRIPT_FORMAT: &str = "javascript";
-const TYPESCRIPT_FORMAT: &str = "typescript";
-const MARKDOWN_FORMAT: &str = "markdown";
-const MDX_FORMAT: &str = "mdx";
+const CODE_CORPUS: &str = formats::Corpus::Code.as_str();
+const DOCS_CORPUS: &str = formats::Corpus::Docs.as_str();
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -65,6 +62,14 @@ pub struct IndexOutcome {
     pub dependency_skipped: usize,
     pub dependency_skipped_bytes: u64,
     pub dependency_plans: Vec<String>,
+    /// Current-snapshot Rust files that contain one or more recoverable parser
+    /// diagnostics. These files remain indexed and searchable.
+    pub rust_files_with_parse_errors: usize,
+    /// Current-snapshot recoverable parser diagnostics across Rust files.
+    pub rust_parse_error_count: usize,
+    /// True when a validated active checker publication was rebound to this
+    /// snapshot without planning or invoking the checker provider.
+    pub checker_rebound: bool,
     /// False when the structural projection was provably identical (same
     /// snapshot, projection version, and module resolution) and was kept.
     pub projection_rebuilt: bool,
@@ -116,6 +121,7 @@ struct FileData {
     chunks: Vec<Chunk>,
     graph: FileGraph,
     lines: LineIndex,
+    parse_error_count: usize,
 }
 
 struct PreparedDependencyFile {
@@ -157,26 +163,13 @@ pub(crate) fn resolver_options(
         // Workspace package names -> in-repo source, so monorepo cross-package
         // imports resolve to indexed files instead of missing/dist targets.
         alias,
-        extensions: vec![
-            ".ts".into(),
-            ".tsx".into(),
-            ".mts".into(),
-            ".cts".into(),
-            ".js".into(),
-            ".jsx".into(),
-            ".mjs".into(),
-            ".cjs".into(),
-            ".json".into(),
-        ],
+        extensions: formats::ecmascript_resolution_extensions()
+            .into_iter()
+            .map(|extension| format!(".{extension}"))
+            .chain(std::iter::once(".json".to_string()))
+            .collect(),
         // TS convention: `./x.js` in source may mean `./x.ts` on disk.
-        extension_alias: vec![
-            (
-                ".js".into(),
-                vec![".ts".into(), ".tsx".into(), ".js".into(), ".jsx".into()],
-            ),
-            (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
-            (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
-        ],
+        extension_alias: formats::ecmascript_resolver_extension_aliases(),
         condition_names: RESOLVE_CONDITIONS
             .iter()
             .map(|c| (*c).to_string())
@@ -259,6 +252,27 @@ pub fn incremental_refresh_repo_with_options(
     )
 }
 
+/// Incremental watcher refresh for a generation known to contain only
+/// checker-ineligible source changes. When the complete checker-eligible
+/// canonical identity and module-resolution identity are unchanged, the
+/// active checker batch is rebound to the replacement shared snapshot without
+/// planning or launching the checker.
+pub fn incremental_refresh_repo_rebinding_checker(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::Incremental,
+        CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
+        IndexOperation::new(&OsFileSystem),
+    )
+}
+
 /// Rebuild every repository-derived row for the current checkout while
 /// preserving content-addressed embeddings and semantic memory.
 pub fn refresh_repo_with_options(
@@ -296,6 +310,26 @@ pub fn watch_full_refresh_repo_with_options(
     )
 }
 
+/// Full watcher refresh for a generation classified as checker-ineligible.
+/// Canonical rows are rebuilt from scratch, while an active checker batch is
+/// rebound only after its complete canonical and recorded-input identity is
+/// proven unchanged.
+pub fn watch_full_refresh_repo_rebinding_checker(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+) -> Result<IndexOutcome> {
+    index_repo_impl(
+        root,
+        conn,
+        options,
+        true,
+        IndexMode::FullRefresh,
+        CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
+        IndexOperation::new(&OsFileSystem),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IndexMode {
     Incremental,
@@ -306,6 +340,7 @@ enum IndexMode {
 enum CheckerRetention {
     Drop,
     PreserveActiveForWatch,
+    RebindActiveIfCheckerInputsUnchanged,
 }
 
 /// Environment capabilities shared by every filesystem-sensitive phase of a
@@ -414,6 +449,9 @@ fn index_repo_impl<F: FileSystem>(
         dependency_skipped: 0,
         dependency_skipped_bytes: 0,
         dependency_plans: Vec::new(),
+        rust_files_with_parse_errors: 0,
+        rust_parse_error_count: 0,
+        checker_rebound: false,
         projection_rebuilt: true,
         extraction_reset: false,
     };
@@ -438,9 +476,19 @@ fn index_repo_impl<F: FileSystem>(
     // the last-good committed snapshot while this writer is active, and any
     // failure below rolls the replacement back as a unit.
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let preparation = (|| -> Result<(_, _, _)> {
-        ensure_extraction_version(conn)?;
-        let documentation_format_changed = ensure_documentation_chunk_format(conn)?;
+    let preparation = (|| -> Result<(_, _, _, _, _, _)> {
+        let previous_checker_identity = (checker_retention
+            == CheckerRetention::RebindActiveIfCheckerInputsUnchanged)
+            .then(|| checker_canonical_identity(conn))
+            .transpose()?;
+        let rebind_source = (checker_retention
+            == CheckerRetention::RebindActiveIfCheckerInputsUnchanged)
+            .then(|| ProjectionIdentity::read(conn))
+            .transpose()?;
+        let changed_formats = ensure_format_contracts(conn)?;
+        let checker_contract_changed = formats::eligible_ids(Capability::Checker)
+            .into_iter()
+            .any(|format| changed_formats.contains(format));
         let stored: HashMap<String, (i64, String, String, String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT path, id, hash, role, corpus, format
@@ -470,15 +518,22 @@ fn index_repo_impl<F: FileSystem>(
             stored
         };
 
-        // Extractor-version changes force re-extraction by clearing file
-        // hashes. At that scale, per-file replacement is pathological, so
-        // truncate the disposable plane once and insert like a fresh index.
-        let cleared = existing
+        // A format-contract change clears hashes only for that format. Keep
+        // that replacement selective even when one format dominates the
+        // repository. Explicit/pre-existing empty hashes retain the legacy
+        // bulk-reset optimization because they do not encode that boundary.
+        let independently_cleared = existing
             .values()
-            .filter(|(_, hash, _, corpus, _)| corpus == CODE_CORPUS && hash.is_empty())
+            .filter(|(_, hash, _, corpus, format)| {
+                corpus == CODE_CORPUS
+                    && hash.is_empty()
+                    && !changed_formats.contains(format.as_str())
+            })
             .count();
         let extraction_reset = mode == IndexMode::FullRefresh
-            || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
+            || (allow_extraction_reset
+                && !existing.is_empty()
+                && independently_cleared * 2 >= existing.len());
         if extraction_reset {
             if mode == IndexMode::FullRefresh {
                 store::reset_snapshot_state(conn)?;
@@ -494,12 +549,25 @@ fn index_repo_impl<F: FileSystem>(
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {
             let rel = display_repository_path(&root, file);
+            let format = formats::repository_code_for_path(file).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "repository inventory admitted unsupported code file `{}`",
+                    file.display()
+                )
+            })?;
             let source = match operation.fs.read_to_string(file) {
                 Ok(source) => {
                     seen.insert(rel.clone());
                     source
                 }
                 Err(error) if io_policy::is_inventory_race(&error) => continue,
+                Err(error)
+                    if format.id == formats::RUST
+                        && error.kind() == std::io::ErrorKind::InvalidData =>
+                {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("invalid UTF-8 in Rust source `{rel}`")));
+                }
                 Err(error) if io_policy::is_retryable(&error) => {
                     return Err(retryable_read_failure(&rel, error));
                 }
@@ -514,11 +582,10 @@ fn index_repo_impl<F: FileSystem>(
             };
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
             let role = file_role::classify(Path::new(&rel), &source);
-            let format = code_format(file)?;
             if let Some((id, old_hash, old_role, old_corpus, old_format)) = existing.get(&rel)
                 && *old_hash == hash
                 && old_corpus == CODE_CORPUS
-                && old_format == format
+                && old_format == format.id
             {
                 if old_role != role {
                     conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
@@ -530,7 +597,7 @@ fn index_repo_impl<F: FileSystem>(
             if options.debug {
                 eprintln!("extracting {rel}");
             }
-            match extract_file(file, &rel, &source) {
+            match extract_file(file, &rel, &source, format) {
                 Ok(data) => {
                     if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
                         store::delete_file(conn, *old_id)?;
@@ -539,7 +606,7 @@ fn index_repo_impl<F: FileSystem>(
                         path: &rel,
                         hash: &hash,
                         corpus: CODE_CORPUS,
-                        format,
+                        format: format.id,
                         role,
                         origin: "repository",
                         package_instance_id: None,
@@ -550,6 +617,11 @@ fn index_repo_impl<F: FileSystem>(
                     outcome.chunks += chunks;
                     outcome.refs += refs;
                     published.insert(rel);
+                }
+                Err(error) if format.id == formats::RUST => {
+                    return Err(error.context(format!(
+                        "Rust lossless extraction invariant failed for `{rel}`"
+                    )));
                 }
                 Err(error) => {
                     if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
@@ -566,11 +638,11 @@ fn index_repo_impl<F: FileSystem>(
             let hash = document.file.content_hash.as_str();
             let format = documentation_format(Path::new(&rel))?;
             let role = "documentation";
-            if !documentation_format_changed
+            if !changed_formats.contains(format.id)
                 && let Some((id, old_hash, old_role, old_corpus, old_format)) = existing.get(&rel)
                 && old_hash == hash
                 && old_corpus == DOCS_CORPUS
-                && old_format == format
+                && old_format == format.id
             {
                 if old_role != role {
                     conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
@@ -589,7 +661,7 @@ fn index_repo_impl<F: FileSystem>(
                 path: &document.file.path,
                 hash,
                 corpus: DOCS_CORPUS,
-                format,
+                format: format.id,
                 role,
                 origin: "repository",
                 package_instance_id: None,
@@ -637,9 +709,23 @@ fn index_repo_impl<F: FileSystem>(
             "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
             [],
         )?;
-        Ok((previous, plans, prepared))
+        Ok((
+            previous,
+            plans,
+            prepared,
+            previous_checker_identity,
+            rebind_source,
+            checker_contract_changed,
+        ))
     })();
-    let (previous, plans, prepared) = match preparation {
+    let (
+        previous,
+        plans,
+        prepared,
+        previous_checker_identity,
+        rebind_source,
+        checker_contract_changed,
+    ) = match preparation {
         Ok(preparation) => preparation,
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -675,6 +761,38 @@ fn index_repo_impl<F: FileSystem>(
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {
                 store::preserve_checker_carry_source_for_watch(conn)?
+            }
+            CheckerRetention::RebindActiveIfCheckerInputsUnchanged => {
+                let current_checker_identity = checker_canonical_identity(conn)?;
+                let source = rebind_source.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("checker rebind source identity was not captured")
+                })?;
+                let can_rebind = !checker_contract_changed
+                    && previous_checker_identity.as_deref()
+                        == Some(current_checker_identity.as_str())
+                    && source.resolution_hash.as_deref() == Some(resolution.as_str())
+                    && match source.snapshot.as_deref() {
+                        Some(old_snapshot) => {
+                            crate::checker::active_batch_inputs_fresh(&root, conn, old_snapshot)?
+                        }
+                        None => false,
+                    };
+                let rebound = if can_rebind {
+                    match source.snapshot.as_deref() {
+                        Some(old_snapshot) => {
+                            store::rebind_active_checker_batch(conn, old_snapshot, &snapshot)?
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let deactivated = !can_rebind
+                    && source.snapshot.as_deref() == Some(snapshot.as_str())
+                    && store::deactivate_active_checker_batch_for_snapshot(conn, &snapshot)?;
+                outcome.checker_rebound = rebound;
+                let retention_changed = store::preserve_checker_carry_source_for_watch(conn)?;
+                retention_changed || rebound || deactivated
             }
         };
         let current = ProjectionIdentity {
@@ -719,6 +837,17 @@ fn index_repo_impl<F: FileSystem>(
         if snapshot_changed {
             crate::docs::retrieval::rematerialize_cached_generations(conn, &snapshot)?;
         }
+        let (rust_files_with_errors, rust_error_count): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(parse_error_count), 0)
+             FROM files
+             WHERE format=?1 AND parse_error_count>0",
+            [formats::RUST],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        outcome.rust_files_with_parse_errors = usize::try_from(rust_files_with_errors)
+            .map_err(|_| anyhow::anyhow!("Rust parse-error file count exceeded this platform"))?;
+        outcome.rust_parse_error_count = usize::try_from(rust_error_count)
+            .map_err(|_| anyhow::anyhow!("Rust parse-error count exceeded this platform"))?;
         Ok(())
     })();
     match publication {
@@ -742,6 +871,49 @@ fn display_repository_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
+}
+
+fn checker_canonical_identity(conn: &Connection) -> Result<String> {
+    let eligible = formats::eligible_ids_json(Capability::Checker);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-checker-canonical-identity-v1\0");
+    let mut statement = conn.prepare(
+        "SELECT file.path, file.hash, file.role, file.origin, file.format,
+                COALESCE(file.package_path, ''),
+                COALESCE(package.origin, ''), COALESCE(package.name, ''),
+                COALESCE(package.version, ''), COALESCE(package.canonical_root, ''),
+                COALESCE(package.locator, ''), COALESCE(package.manifest_hash, ''),
+                COALESCE(package.status, '')
+         FROM files file
+         LEFT JOIN package_instances package ON package.id=file.package_instance_id
+         WHERE file.origin IN ('repository','workspace')
+           AND file.format IN (SELECT value FROM json_each(?1))
+         ORDER BY file.path",
+    )?;
+    let rows = statement.query_map([eligible], |row| {
+        Ok([
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+        ])
+    })?;
+    for row in rows {
+        for value in row? {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// The three meta values that must all match for the previous projection to
@@ -788,92 +960,141 @@ impl ProjectionIdentity {
     }
 }
 
-fn ensure_extraction_version(conn: &Connection) -> Result<()> {
-    let current = conn
+fn ensure_format_contracts(conn: &Connection) -> Result<std::collections::HashSet<&'static str>> {
+    let mut changed = std::collections::HashSet::new();
+    let mut code_changed = false;
+    let legacy_code = conn
         .query_row(
             "SELECT value FROM meta WHERE key='extraction_version'",
             [],
             |row| row.get::<_, String>(0),
         )
-        .ok();
-    if current.as_deref() == Some(crate::entity::EXTRACTION_VERSION) {
-        return Ok(());
-    }
-    // The caller owns the refresh transaction. Keeping this invalidation
-    // inside it ensures a later source/dependency acquisition failure restores
-    // the previously published extractor version and snapshot together.
-    conn.execute("UPDATE files SET hash='' WHERE corpus='code'", [])?;
-    conn.execute("DELETE FROM resolved_edges", [])?;
-    conn.execute("DELETE FROM graph_nodes", [])?;
-    conn.execute(
-        "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [crate::entity::EXTRACTION_VERSION],
-    )?;
-    Ok(())
-}
-
-/// Persist the Markdown-family chunk/admission contract independently from
-/// the code extractor contract. A contract change reprocesses unchanged
-/// documentation without needlessly invalidating unchanged code rows.
-fn ensure_documentation_chunk_format(conn: &Connection) -> Result<bool> {
-    let current = conn
+        .optional()?;
+    let legacy_documentation = conn
         .query_row(
             "SELECT value FROM meta WHERE key=?1",
             [DOC_CHUNK_FORMAT_META_KEY],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    if current.as_deref() == Some(crate::docs::CHUNK_FORMAT_VERSION) {
-        return Ok(false);
+    for format in formats::ALL {
+        let key = formats::contract_meta_key(format);
+        let current = conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if current.as_deref() == Some(format.extractor_version) {
+            continue;
+        }
+        let has_rows = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
+            [format.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_rows {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, format.extractor_version],
+            )?;
+            continue;
+        }
+        let covered_by_legacy = match format.snapshot_contract {
+            formats::SnapshotContractPolicy::LegacyCode => {
+                legacy_code.as_deref() == Some(format.extractor_version)
+            }
+            formats::SnapshotContractPolicy::LegacyDocumentation => {
+                legacy_documentation.as_deref() == Some(format.extractor_version)
+            }
+            formats::SnapshotContractPolicy::PerFormatWhenPresent => false,
+        };
+        let bootstrap_only = current.is_none() && (!has_rows || covered_by_legacy);
+        if bootstrap_only {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                params![key, format.extractor_version],
+            )?;
+            continue;
+        }
+        changed.insert(format.id);
+        if format.corpus == formats::Corpus::Code {
+            code_changed = true;
+            conn.execute(
+                "UPDATE files SET hash='' WHERE corpus='code' AND format=?1",
+                [format.id],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, format.extractor_version],
+        )?;
     }
+    if code_changed {
+        conn.execute("DELETE FROM resolved_edges", [])?;
+        conn.execute("DELETE FROM graph_nodes", [])?;
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [crate::entity::EXTRACTION_VERSION],
+    )?;
+    // Keep the existing docs marker as the public compatibility diagnostic;
+    // the per-format keys above are the selective invalidation authority.
     conn.execute(
         "INSERT INTO meta(key, value) VALUES(?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![DOC_CHUNK_FORMAT_META_KEY, crate::docs::CHUNK_FORMAT_VERSION],
     )?;
-    Ok(true)
+    Ok(changed)
 }
 
-fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
-    parse::with_parsed(source, abs, |ret, semantic| {
-        let chunker = Chunker::new(Path::new(rel), source, ret);
-        let chunks = chunker.chunk_program(&ret.program, &ret.program.comments);
-        let graph = graph::extract(ret, semantic);
-        FileData {
-            chunks,
-            graph,
-            lines: LineIndex::new(source),
+fn extract_file(
+    abs: &Path,
+    rel: &str,
+    source: &str,
+    format: &formats::FormatSpec,
+) -> Result<FileData> {
+    match format.extractor {
+        Extractor::EcmaScript => parse::with_parsed(source, abs, |ret, semantic| {
+            let chunker = Chunker::new(Path::new(rel), source, ret);
+            let chunks = chunker.chunk_program(&ret.program, &ret.program.comments);
+            let graph = graph::extract(ret, semantic);
+            FileData {
+                chunks,
+                graph,
+                lines: LineIndex::new(source),
+                parse_error_count: 0,
+            }
+        }),
+        Extractor::RustText => {
+            let extraction = crate::rust_lang::extract(Path::new(rel), source)?;
+            Ok(FileData {
+                chunks: extraction.chunks,
+                graph: FileGraph::default(),
+                lines: LineIndex::new(source),
+                parse_error_count: extraction.parse_error_count,
+            })
         }
+        Extractor::Documentation => anyhow::bail!(
+            "documentation format `{}` cannot enter the code extractor",
+            format.id
+        ),
+    }
+}
+
+fn documentation_format(path: &Path) -> Result<&'static formats::FormatSpec> {
+    formats::documentation_for_path(path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "indexed documentation file `{}` has an unsupported format",
+            path.display()
+        )
     })
-}
-
-fn code_format(path: &Path) -> Result<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("js" | "jsx" | "mjs" | "cjs") => Ok(JAVASCRIPT_FORMAT),
-        Some("ts" | "tsx" | "mts" | "cts") => Ok(TYPESCRIPT_FORMAT),
-        extension => Err(anyhow::anyhow!(
-            "indexed code file `{}` has unsupported format extension `{}`",
-            path.display(),
-            extension.unwrap_or("<none>")
-        )),
-    }
-}
-
-fn documentation_format(path: &Path) -> Result<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("md") => Ok(MARKDOWN_FORMAT),
-        Some("mdx") => Ok(MDX_FORMAT),
-        extension => Err(anyhow::anyhow!(
-            "indexed documentation file `{}` has unsupported format extension `{}`",
-            path.display(),
-            extension.unwrap_or("<none>")
-        )),
-    }
 }
 
 fn fts_content(content: &str) -> Cow<'_, str> {
@@ -913,12 +1134,14 @@ fn insert_documentation_file(
     captured: &CapturedDocument,
 ) -> Result<usize> {
     let file = &captured.file;
+    let format = formats::by_id(identity.format)
+        .ok_or_else(|| anyhow::anyhow!("unknown documentation format `{}`", identity.format))?;
     ensure!(
         identity.path == file.path,
         "documentation file identity path does not match captured document"
     );
     ensure!(
-        identity.corpus == DOCS_CORPUS && matches!(identity.format, MARKDOWN_FORMAT | MDX_FORMAT),
+        identity.corpus == DOCS_CORPUS && format.documentation(),
         "documentation file identity has an invalid corpus or format"
     );
     ensure!(
@@ -968,10 +1191,15 @@ fn insert_documentation_file(
            nearest_heading, ordinal, embedding_identity, front_matter_state
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
-    let mut insert_fts = conn.prepare_cached(
-        "INSERT INTO docs_fts(rowid, title, metadata, breadcrumb, body, path)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
+    let mut insert_fts = format
+        .lexical_eligible()
+        .then(|| {
+            conn.prepare_cached(
+                "INSERT INTO docs_fts(rowid, title, metadata, breadcrumb, body, path)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+        })
+        .transpose()?;
 
     for (position, chunk) in file.chunks.iter().enumerate() {
         ensure!(
@@ -1043,14 +1271,16 @@ fn insert_documentation_file(
             file.front_matter_state,
         ])?;
         let breadcrumb_fts = fts_content(&chunk.breadcrumb);
-        insert_fts.execute(params![
-            chunk_id,
-            title_fts.as_ref(),
-            metadata_fts.as_ref(),
-            breadcrumb_fts.as_ref(),
-            chunk.rendered_body,
-            path_fts.as_ref(),
-        ])?;
+        if let Some(insert_fts) = insert_fts.as_mut() {
+            insert_fts.execute(params![
+                chunk_id,
+                title_fts.as_ref(),
+                metadata_fts.as_ref(),
+                breadcrumb_fts.as_ref(),
+                chunk.rendered_body,
+                path_fts.as_ref(),
+            ])?;
+        }
     }
     Ok(file.chunks.len())
 }
@@ -1073,15 +1303,19 @@ fn insert_file(
     identity: &FileIdentity<'_>,
     data: &FileData,
 ) -> Result<(usize, usize)> {
+    let format = formats::by_id(identity.format)
+        .ok_or_else(|| anyhow::anyhow!("unknown code format `{}`", identity.format))?;
     ensure!(
-        identity.corpus == CODE_CORPUS,
+        identity.corpus == CODE_CORPUS && format.corpus == formats::Corpus::Code,
         "code file identity has an invalid corpus"
     );
+    let parse_error_count = i64::try_from(data.parse_error_count)
+        .map_err(|_| anyhow::anyhow!("parse-error count exceeded SQLite integer range"))?;
     conn.execute(
         "INSERT INTO files(
            path, hash, corpus, format, role, origin,
-           package_instance_id, package_path
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+           package_instance_id, package_path, parse_error_count
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             identity.path,
             identity.hash,
@@ -1091,6 +1325,7 @@ fn insert_file(
             identity.origin,
             identity.package_instance_id,
             identity.package_path,
+            parse_error_count,
         ],
     )?;
     let file_id = conn.last_insert_rowid();
@@ -1102,9 +1337,11 @@ fn insert_file(
             "INSERT INTO chunks(file_id, kind, name, scope_chain, symbols, start, end, start_line, end_line, hash, content)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
-        let mut ins_fts = conn.prepare_cached(
-            "INSERT INTO chunks_fts(rowid, content, name, symbols, path) VALUES(?1, ?2, ?3, ?4, ?5)",
-        )?;
+        let mut ins_fts = format.lexical_eligible().then(|| {
+            conn.prepare_cached(
+                "INSERT INTO chunks_fts(rowid, content, name, symbols, path) VALUES(?1, ?2, ?3, ?4, ?5)",
+            )
+        }).transpose()?;
         for c in &data.chunks {
             let kind = serde_json::to_value(c.kind)?
                 .as_str()
@@ -1125,14 +1362,16 @@ fn insert_file(
             ])?;
             let chunk_id = conn.last_insert_rowid();
             chunk_ids.push((c.start, c.end, chunk_id));
-            let searchable_content = fts_content(&c.content);
-            ins_fts.execute(params![
-                chunk_id,
-                searchable_content.as_ref(),
-                c.name.as_deref().unwrap_or(""),
-                c.symbols.join(" "),
-                identity.path,
-            ])?;
+            if let Some(ins_fts) = ins_fts.as_mut() {
+                let searchable_content = fts_content(&c.content);
+                ins_fts.execute(params![
+                    chunk_id,
+                    searchable_content.as_ref(),
+                    c.name.as_deref().unwrap_or(""),
+                    c.symbols.join(" "),
+                    identity.path,
+                ])?;
+            }
         }
     }
     let chunk_for = |offset: u32| -> Option<i64> {
@@ -1495,11 +1734,16 @@ fn index_dependency_files(
                 anyhow::anyhow!("dependency package instance was not synchronized")
             })?;
             seen.insert(file.display.clone());
-            let format = code_format(&file.source_path)?;
+            let format = formats::dependency_code_for_path(&file.source_path).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "dependency plan admitted unsupported code file `{}`",
+                    file.source_path.display()
+                )
+            })?;
             if let Some(old) = existing.get(&file.display)
                 && old.hash == file.hash
                 && old.corpus == CODE_CORPUS
-                && old.format == format
+                && old.format == format.id
                 && old.package_instance_id == package_id
                 && old.package_path == file.package_path
             {
@@ -1516,13 +1760,13 @@ fn index_dependency_files(
             if let Some(old) = existing.get(&file.display) {
                 store::delete_file(conn, old.id)?;
             }
-            match extract_file(&file.source_path, &file.display, &file.source) {
+            match extract_file(&file.source_path, &file.display, &file.source, format) {
                 Ok(data) => {
                     let identity = FileIdentity {
                         path: &file.display,
                         hash: &file.hash,
                         corpus: CODE_CORPUS,
-                        format,
+                        format: format.id,
                         role: file.role,
                         origin: "dependency",
                         package_instance_id: Some(package_id),
@@ -1588,6 +1832,7 @@ pub fn resolve_module_edges(
     // workspace aliases inside it can redirect a dependency's own imports to
     // an unrelated first-party package with the same name.
     let dependency_resolver = Resolver::new(resolver_options(Vec::new(), None));
+    let resolver_formats = formats::eligible_ids_json(Capability::Resolver);
     conn.execute_batch("SAVEPOINT jscout_module_edges")?;
     let result = (|| -> Result<()> {
         let (file_ids, importer_paths) = {
@@ -1595,9 +1840,10 @@ pub fn resolve_module_edges(
                 "SELECT f.id, f.path, f.origin, f.package_path, f.package_instance_id,
                         p.canonical_root
                  FROM code_files f
-                 LEFT JOIN package_instances p ON p.id=f.package_instance_id",
+                 LEFT JOIN package_instances p ON p.id=f.package_instance_id
+                 WHERE f.format IN (SELECT value FROM json_each(?1))",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map([&resolver_formats], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1658,9 +1904,10 @@ pub fn resolve_module_edges(
                    SELECT file_id, from_request, 0 FROM contract_exports
                      WHERE from_request IS NOT NULL
                  ) requests ON requests.file_id = f.id
+                 WHERE f.format IN (SELECT value FROM json_each(?1))
                  GROUP BY f.id, requests.request",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map([&resolver_formats], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,

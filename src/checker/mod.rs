@@ -3,8 +3,8 @@ mod package_gate;
 pub mod process;
 pub mod protocol;
 
-pub(crate) use enrich::target_fingerprint;
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
+pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
 /// Stable identity for the checker semantics and the actual watcher selection
 /// policy. It is intentionally independent of repository state, project

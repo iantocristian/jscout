@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use notify::{RecursiveMode, Watcher};
 use rusqlite::Connection;
 
-use crate::{checker, docs, embed, indexer, store, structural, walk};
+use crate::{checker, docs, embed, formats, indexer, store, structural, walk};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
@@ -82,6 +82,8 @@ struct DirtySignal {
     scope: RefreshScope,
     reasons: BTreeSet<String>,
     source_paths: BTreeSet<String>,
+    checker_source_paths: BTreeSet<String>,
+    checker_refresh_required: bool,
     force_full_enrichment: bool,
 }
 
@@ -91,15 +93,20 @@ impl DirtySignal {
             scope: RefreshScope::Full,
             reasons: [reason.into()].into(),
             source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            checker_refresh_required: true,
             force_full_enrichment: false,
         }
     }
 
-    fn source(reason: impl Into<String>, path: impl Into<String>) -> Self {
+    fn source(reason: impl Into<String>, path: impl Into<String>, checker_eligible: bool) -> Self {
+        let path = path.into();
         Self {
             scope: RefreshScope::Incremental,
             reasons: [reason.into()].into(),
-            source_paths: [path.into()].into(),
+            source_paths: [path.clone()].into(),
+            checker_source_paths: checker_eligible.then_some(path).into_iter().collect(),
+            checker_refresh_required: checker_eligible,
             force_full_enrichment: false,
         }
     }
@@ -109,6 +116,22 @@ impl DirtySignal {
             scope: RefreshScope::Incremental,
             reasons: [reason.into()].into(),
             source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            // Preserve G24's established shared-snapshot behavior: docs
+            // changes refresh checker publication. Only checker-ineligible
+            // code formats use the no-provider rebind path.
+            checker_refresh_required: true,
+            force_full_enrichment: false,
+        }
+    }
+
+    fn rust_membership(reason: impl Into<String>) -> Self {
+        Self {
+            scope: RefreshScope::Incremental,
+            reasons: [reason.into()].into(),
+            source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            checker_refresh_required: false,
             force_full_enrichment: false,
         }
     }
@@ -122,6 +145,8 @@ impl DirtySignal {
             scope: RefreshScope::Incremental,
             reasons: [reason.into()].into(),
             source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            checker_refresh_required: true,
             force_full_enrichment: false,
         }
     }
@@ -131,6 +156,8 @@ impl DirtySignal {
             scope: RefreshScope::Incremental,
             reasons: ["checker-drift-flush".to_string()].into(),
             source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            checker_refresh_required: true,
             force_full_enrichment: true,
         }
     }
@@ -143,6 +170,8 @@ impl DirtySignal {
             scope: RefreshScope::Incremental,
             reasons: ["periodic-reconciliation".to_string()].into(),
             source_paths: BTreeSet::new(),
+            checker_source_paths: BTreeSet::new(),
+            checker_refresh_required: true,
             force_full_enrichment: false,
         }
     }
@@ -151,6 +180,8 @@ impl DirtySignal {
         self.scope = self.scope.max(other.scope);
         self.reasons.extend(other.reasons);
         self.source_paths.extend(other.source_paths);
+        self.checker_source_paths.extend(other.checker_source_paths);
+        self.checker_refresh_required |= other.checker_refresh_required;
         self.force_full_enrichment |= other.force_full_enrichment;
     }
 }
@@ -161,6 +192,7 @@ struct Work {
     phase: Phase,
     refresh_scope: RefreshScope,
     force_full_enrichment: bool,
+    rebind_checker: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -193,6 +225,7 @@ struct Coordinator {
     dirty_reasons: BTreeSet<String>,
     dirty_source_paths: BTreeSet<String>,
     checker_dirty_source_paths: BTreeSet<String>,
+    checker_refresh_required: bool,
     refresh_scope: RefreshScope,
     debounce: Duration,
     retry_initial: Duration,
@@ -217,6 +250,7 @@ impl Coordinator {
             dirty_reasons: BTreeSet::new(),
             dirty_source_paths: BTreeSet::new(),
             checker_dirty_source_paths: BTreeSet::new(),
+            checker_refresh_required: false,
             refresh_scope: RefreshScope::Full,
             debounce,
             retry_initial: DEFAULT_RETRY_INITIAL,
@@ -234,11 +268,12 @@ impl Coordinator {
     fn mark_dirty(&mut self, now: Duration, signal: DirtySignal) {
         // Checker affinity spans generations. A source edit observed while an
         // older enrichment is running must remain dirty until a non-superseded
-        // checker publication succeeds. Documentation signals intentionally
-        // carry no source paths and therefore never enter this backlog.
+        // checker publication succeeds. Documentation and checker-ineligible
+        // code signals carry no checker source paths and never enter this backlog.
         if self.enrich {
             self.checker_dirty_source_paths
-                .extend(signal.source_paths.iter().cloned());
+                .extend(signal.checker_source_paths.iter().cloned());
+            self.checker_refresh_required |= signal.checker_refresh_required;
         }
         // A failed structural refresh has not consumed its inventory/config
         // requirement. If a newer source event supersedes its parked retry,
@@ -352,6 +387,7 @@ impl Coordinator {
             phase: Phase::Refresh,
             refresh_scope: self.refresh_scope,
             force_full_enrichment: self.force_full_enrichment,
+            rebind_checker: self.enrich && !self.needs_enrichment(),
         };
         self.active = Some(work);
         Some(work)
@@ -392,6 +428,10 @@ impl Coordinator {
             return FinishState::Superseded;
         }
         self.retry_attempts.remove(&work.phase);
+        if work.phase == Phase::Enrich {
+            self.checker_dirty_source_paths.clear();
+            self.checker_refresh_required = false;
+        }
         self.advance(work)
     }
 
@@ -403,6 +443,7 @@ impl Coordinator {
         }
         self.retry_attempts.remove(&work.phase);
         self.checker_dirty_source_paths.clear();
+        self.checker_refresh_required = false;
         self.advance(work)
     }
 
@@ -449,8 +490,8 @@ impl Coordinator {
     fn advance(&mut self, work: Work) -> FinishState {
         let next = match work.phase {
             Phase::Refresh if self.embed => Some(Phase::Embed),
-            Phase::Refresh if self.enrich => Some(Phase::Enrich),
-            Phase::Embed if self.enrich => Some(Phase::Enrich),
+            Phase::Refresh if self.needs_enrichment() => Some(Phase::Enrich),
+            Phase::Embed if self.needs_enrichment() => Some(Phase::Enrich),
             Phase::Embed => Some(Phase::SemanticEmbed),
             Phase::Enrich if self.embed => Some(Phase::SemanticEmbed),
             _ => None,
@@ -461,14 +502,18 @@ impl Coordinator {
                 phase,
                 refresh_scope: work.refresh_scope,
                 force_full_enrichment: work.force_full_enrichment,
+                rebind_checker: work.rebind_checker,
             });
             FinishState::Continue
         } else {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
             self.dirty_source_paths.clear();
-            self.force_full_enrichment = false;
-            if std::mem::take(&mut self.partial_generation) {
+            let partial = std::mem::take(&mut self.partial_generation);
+            if !partial {
+                self.force_full_enrichment = false;
+            }
+            if partial {
                 FinishState::Partial
             } else {
                 FinishState::Complete
@@ -478,6 +523,13 @@ impl Coordinator {
 
     fn is_superseded(&self, work: Work) -> bool {
         self.desired_generation != work.generation
+    }
+
+    fn needs_enrichment(&self) -> bool {
+        self.enrich
+            && (self.checker_refresh_required
+                || self.force_full_enrichment
+                || !self.checker_dirty_source_paths.is_empty())
     }
 
     fn is_clean(&self) -> bool {
@@ -621,6 +673,16 @@ impl EventClassifier {
                 }
                 continue;
             }
+            if path.file_name().is_some_and(|name| name == "Cargo.toml") {
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::rust_membership(format!(
+                        "rust-membership:{}",
+                        display_path(&self.root, &path)
+                    )),
+                );
+                continue;
+            }
             if is_directory {
                 merge_signal(
                     &mut signal,
@@ -628,11 +690,22 @@ impl EventClassifier {
                 );
                 continue;
             }
-            if walk::is_indexable(&path) {
+            if let Some(format) = formats::repository_code_for_path(&path) {
+                if !self
+                    .source_policy
+                    .borrow_mut()
+                    .directory_admitted(&path, format)
+                {
+                    continue;
+                }
                 let relative = display_path(&self.root, &path);
                 merge_signal(
                     &mut signal,
-                    DirtySignal::source(format!("source:{relative}"), relative),
+                    DirtySignal::source(
+                        format!("source:{relative}"),
+                        relative,
+                        format.checker_watch_affinity(),
+                    ),
                 );
                 continue;
             }
@@ -921,7 +994,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         debug: options.debug,
                         ..Default::default()
                     };
-                    match run_refresh(&root, &database, &index_options, work.refresh_scope) {
+                    match run_refresh(
+                        &root,
+                        &database,
+                        &index_options,
+                        work.refresh_scope,
+                        work.rebind_checker,
+                    ) {
                         Ok(result) => {
                             match rejection_report_latch.observe(&result.outcome.rejections) {
                                 RejectionReportDecision::Silent => {}
@@ -935,7 +1014,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 }
                             }
                             eprintln!(
-                                "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} rejected={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
+                                "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} rejected={} extracted_chunks={} extracted_refs={} rust_parse_error_files={} rust_parse_errors={} projection={} elapsed_ms={}",
                                 work.generation,
                                 work.refresh_scope,
                                 result.snapshot,
@@ -945,6 +1024,8 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 result.outcome.rejected,
                                 result.outcome.chunks,
                                 result.outcome.refs,
+                                result.outcome.rust_files_with_parse_errors,
+                                result.outcome.rust_parse_error_count,
                                 if result.outcome.projection_rebuilt {
                                     "rebuilt"
                                 } else {
@@ -1361,11 +1442,19 @@ fn run_refresh(
     database: &Path,
     options: &indexer::IndexOptions,
     scope: RefreshScope,
+    rebind_checker: bool,
 ) -> Result<RefreshResult> {
     let conn = open_phase_database(root, database)?;
     let outcome = match scope {
         RefreshScope::Incremental => {
-            indexer::incremental_refresh_repo_with_options(root, &conn, options)?
+            if rebind_checker {
+                indexer::incremental_refresh_repo_rebinding_checker(root, &conn, options)?
+            } else {
+                indexer::incremental_refresh_repo_with_options(root, &conn, options)?
+            }
+        }
+        RefreshScope::Full if rebind_checker => {
+            indexer::watch_full_refresh_repo_rebinding_checker(root, &conn, options)?
         }
         RefreshScope::Full => indexer::watch_full_refresh_repo_with_options(root, &conn, options)?,
     };

@@ -1330,6 +1330,7 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
                   LEFT JOIN repository_file_policy target_policy
                     ON target_policy.file_id=target_file.id
                   WHERE target.name=call.prop
+                    AND target_file.format IN (SELECT value FROM json_each(?3))
                     AND (target_policy.effective_role='runtime'
                       OR (target_policy.file_id IS NULL
                         AND target_file.role IN ('production', 'unknown')))
@@ -1338,15 +1339,22 @@ fn load_occurrences(conn: &Connection) -> Result<Vec<Occurrence>> {
          JOIN files file ON file.id=call.file_id
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
          WHERE file.origin IN ('repository', 'workspace')
+           AND file.format IN (SELECT value FROM json_each(?3))
            AND call.end > call.start
            AND call.receiver_end > call.receiver_start
            AND call.property_end > call.property_start
-           AND EXISTS(SELECT 1 FROM symbols target WHERE target.name=call.prop)
+           AND EXISTS(
+             SELECT 1 FROM symbols target
+             JOIN files target_file ON target_file.id=target.file_id
+             WHERE target.name=call.prop
+               AND target_file.format IN (SELECT value FROM json_each(?3))
+           )
          ORDER BY file.path, call.start, call.rowid",
     )?;
     let globals = serde_json::to_string(BUILTIN_RECEIVER_GLOBALS)?;
     let core_modules = serde_json::to_string(NODE_CORE_MODULES)?;
-    let rows = statement.query_map(params![globals, core_modules], |row| {
+    let checker_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+    let rows = statement.query_map(params![globals, core_modules, checker_formats], |row| {
         Ok(Occurrence {
             id: row.get(0)?,
             file_id: row.get(1)?,
@@ -1724,9 +1732,11 @@ fn current_dirty_source_files(
     let mut statement = conn.prepare(
         "SELECT file.path FROM code_files file
          WHERE file.origin IN ('repository', 'workspace')
+           AND file.format IN (SELECT value FROM json_each(?1))
          ORDER BY file.path",
     )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let checker_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+    let rows = statement.query_map([checker_formats], |row| row.get::<_, String>(0))?;
     Ok(rows
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
@@ -2041,6 +2051,46 @@ fn deactivate_stale_active_batch(
             Err(error.into())
         }
     }
+}
+
+/// Read-only authorization used by Rust-only watch refreshes before rebinding
+/// an active checker publication to a replacement shared snapshot. Every
+/// publishable project must still match the exact repository/absolute inputs
+/// recorded by the checker; missing or unreadable inputs fail closed.
+pub(crate) fn active_batch_inputs_fresh(
+    root: &Path,
+    conn: &Connection,
+    snapshot: &str,
+) -> Result<bool> {
+    let Some(batch_id) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE active=1 AND source_snapshot=?1",
+            [snapshot],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let projects = conn
+        .prepare(
+            "SELECT project_id FROM checker_project_runs
+             WHERE batch_id=?1 AND status IN ('completed','partial')
+             ORDER BY project_id",
+        )?
+        .query_map([batch_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if projects.is_empty() {
+        return Ok(false);
+    }
+    let mut freshness = InputFreshnessCache::new(root);
+    for project in projects {
+        if !project_inputs_fresh(conn, batch_id, &project, &mut freshness)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> {

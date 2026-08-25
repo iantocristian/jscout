@@ -262,11 +262,17 @@ fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchRe
             value.insert("anchors".into(), json!(anchors));
         }
         _ => {
-            value.insert("anchor".into(), json!(hit.file_anchor));
+            if let Some(file_anchor) = &hit.file_anchor {
+                value.insert("anchor".into(), json!(file_anchor));
+            }
         }
     }
     if hit.anchors.len() <= 1 {
-        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
+        let anchor = hit
+            .anchors
+            .first()
+            .or(hit.file_anchor.as_ref())
+            .map_or("", String::as_str);
         value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
     if !hit.uses.is_empty() {
@@ -308,11 +314,17 @@ fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str, locator_only: bool)
             value.insert("anchors".into(), json!(anchors));
         }
         _ => {
-            value.insert("anchor".into(), json!(hit.file_anchor));
+            if let Some(file_anchor) = &hit.file_anchor {
+                value.insert("anchor".into(), json!(file_anchor));
+            }
         }
     }
     if !locator_only && hit.anchors.len() <= 1 {
-        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
+        let anchor = hit
+            .anchors
+            .first()
+            .or(hit.file_anchor.as_ref())
+            .map_or("", String::as_str);
         value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
     }
     Value::Object(value)

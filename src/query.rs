@@ -34,11 +34,17 @@ impl ModuleGraph {
     }
 
     fn load_inner(conn: &Connection, include_contracts: bool) -> Result<Self> {
+        let resolver_formats =
+            crate::formats::eligible_ids_json(crate::formats::Capability::Resolver);
         let mut exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT file_id, export_name, local_name, from_request, from_name FROM exports",
+            "SELECT export.file_id, export.export_name, export.local_name,
+                    export.from_request, export.from_name
+             FROM exports export
+             JOIN code_files file ON file.id=export.file_id
+             WHERE file.format IN (SELECT value FROM json_each(?1))",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([&resolver_formats], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 ExportEntry {
@@ -57,10 +63,13 @@ impl ModuleGraph {
         let mut contract_exports: HashMap<i64, Vec<ExportEntry>> = HashMap::new();
         if include_contracts {
             let mut stmt = conn.prepare(
-                "SELECT file_id, export_name, local_name, from_request, from_name
-                 FROM contract_exports",
+                "SELECT export.file_id, export.export_name, export.local_name,
+                        export.from_request, export.from_name
+                 FROM contract_exports export
+                 JOIN code_files file ON file.id=export.file_id
+                 WHERE file.format IN (SELECT value FROM json_each(?1))",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map([&resolver_formats], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     ExportEntry {
@@ -78,9 +87,16 @@ impl ModuleGraph {
         }
 
         let mut edges: HashMap<(i64, String), (Option<i64>, bool)> = HashMap::new();
-        let mut stmt =
-            conn.prepare("SELECT from_file, request, to_file, resolution FROM module_edges")?;
-        let rows = stmt.query_map([], |r| {
+        let mut stmt = conn.prepare(
+            "SELECT edge.from_file, edge.request, edge.to_file, edge.resolution
+             FROM module_edges edge
+             JOIN code_files importer ON importer.id=edge.from_file
+             LEFT JOIN code_files target ON target.id=edge.to_file
+             WHERE importer.format IN (SELECT value FROM json_each(?1))
+               AND (edge.to_file IS NULL
+                    OR target.format IN (SELECT value FROM json_each(?1)))",
+        )?;
+        let rows = stmt.query_map([&resolver_formats], |r| {
             Ok((
                 (r.get::<_, i64>(0)?, r.get::<_, String>(1)?),
                 (
@@ -95,8 +111,13 @@ impl ModuleGraph {
         }
 
         let mut paths = HashMap::new();
-        let mut stmt = conn.prepare("SELECT id, path FROM code_files")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, path FROM code_files
+             WHERE format IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt.query_map([&resolver_formats], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
         for row in rows {
             let (id, path) = row?;
             paths.insert(id, path);
@@ -401,6 +422,8 @@ pub fn find_symbol_by_anchor_in_origins(
     expected_snapshot: Option<&str>,
     file_origins: &[String],
 ) -> Result<(SymbolTarget, SymbolAnchorResolution)> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
     let snapshot = crate::structural::current_snapshot(conn)?;
     let (resolved_anchor, anchor_status) = crate::structural::resolve_anchor_in_origins(
         conn,
@@ -416,8 +439,9 @@ pub fn find_symbol_by_anchor_in_origins(
              JOIN symbols symbol
                ON node.native_table='symbols' AND node.native_id=symbol.id
              JOIN files file ON file.id=symbol.file_id
-             WHERE node.node_key=?1 AND node.node_kind='symbol'",
-            [&resolved_anchor],
+             WHERE node.node_key=?1 AND node.node_kind='symbol'
+               AND file.format IN (SELECT value FROM json_each(?2))",
+            rusqlite::params![&resolved_anchor, eligible_formats],
             |row| {
                 Ok(SymbolTarget {
                     file: row.get(0)?,
@@ -460,6 +484,8 @@ pub fn who_uses_anchor_in_origins(
 ) -> Result<Vec<Usage>> {
     crate::origin::validate_all(file_origins)?;
     let origins_json = serde_json::to_string(file_origins)?;
+    let occurrence_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut statement = conn.prepare(
         "SELECT file.path,file.origin,COALESCE(edge.line,source.line),
                 edge.kind,edge.confidence,
@@ -471,22 +497,26 @@ pub fn who_uses_anchor_in_origins(
          JOIN files file ON file.id=COALESCE(edge.source_file_id,source.file_id)
          WHERE edge.dst_key=?1
            AND file.origin IN (SELECT value FROM json_each(?2))
+           AND file.format IN (SELECT value FROM json_each(?3))
            AND COALESCE(edge.line,source.line) IS NOT NULL
          ORDER BY
            CASE edge.confidence WHEN 'certain' THEN 0 WHEN 'likely' THEN 1 ELSE 2 END,
            file.path,COALESCE(edge.line,source.line),edge.kind,edge.id",
     )?;
-    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
-        Ok(Usage {
-            file: row.get(0)?,
-            file_origin: row.get(1)?,
-            line: row.get(2)?,
-            kind: row.get(3)?,
-            confidence: row.get(4)?,
-            detail: row.get(5)?,
-            chunk_name: row.get(6)?,
-        })
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params![anchor, &origins_json, &occurrence_formats],
+        |row| {
+            Ok(Usage {
+                file: row.get(0)?,
+                file_origin: row.get(1)?,
+                line: row.get(2)?,
+                kind: row.get(3)?,
+                confidence: row.get(4)?,
+                detail: row.get(5)?,
+                chunk_name: row.get(6)?,
+            })
+        },
+    )?;
     let mut usages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Deterministic extraction represents an unresolved member call as two
@@ -512,6 +542,7 @@ pub fn who_uses_anchor_in_origins(
          JOIN files file ON file.id=COALESCE(call.source_file_id,source.file_id)
          WHERE candidate.dst_key=?1 AND candidate.kind='member_candidate'
            AND file.origin IN (SELECT value FROM json_each(?2))
+           AND file.format IN (SELECT value FROM json_each(?3))
            AND call.line IS NOT NULL
            AND NOT EXISTS(
              SELECT 1 FROM resolved_edges resolved
@@ -523,17 +554,20 @@ pub fn who_uses_anchor_in_origins(
            )
          ORDER BY file.path,call.line,call.id,candidate.id",
     )?;
-    let rows = statement.query_map(rusqlite::params![anchor, origins_json], |row| {
-        Ok(Usage {
-            file: row.get(0)?,
-            file_origin: row.get(1)?,
-            line: row.get(2)?,
-            kind: row.get(3)?,
-            confidence: row.get(4)?,
-            detail: row.get(5)?,
-            chunk_name: row.get(6)?,
-        })
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params![anchor, &origins_json, &occurrence_formats],
+        |row| {
+            Ok(Usage {
+                file: row.get(0)?,
+                file_origin: row.get(1)?,
+                line: row.get(2)?,
+                kind: row.get(3)?,
+                confidence: row.get(4)?,
+                detail: row.get(5)?,
+                chunk_name: row.get(6)?,
+            })
+        },
+    )?;
     for row in rows {
         let usage = row?;
         if seen_sites.insert((usage.file.clone(), usage.line)) {
@@ -553,6 +587,8 @@ pub fn find_symbols_in_origins(
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
     let (path_filter, name) = match spec.rsplit_once(':') {
         Some((p, n)) => (Some(p.to_string()), n.to_string()),
         None => (None, spec.to_string()),
@@ -565,10 +601,11 @@ pub fn find_symbols_in_origins(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?5))
          ORDER BY s.exported DESC, f.path, s.line, s.kind",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![&name, repository, workspace, dependency],
+        rusqlite::params![&name, repository, workspace, dependency, &eligible_formats],
         |r| {
             Ok(SymbolTarget {
                 file: r.get(0)?,
@@ -596,10 +633,11 @@ pub fn find_symbols_in_origins(
                AND ((?2 AND f.origin='repository')
                  OR (?3 AND f.origin='workspace')
                  OR (?4 AND f.origin='dependency'))
+               AND f.format IN (SELECT value FROM json_each(?5))
              ORDER BY f.path, c.start_line, c.scope_chain",
         )?;
         let rows = stmt.query_map(
-            rusqlite::params![&name, repository, workspace, dependency],
+            rusqlite::params![&name, repository, workspace, dependency, &eligible_formats],
             |r| {
                 Ok((
                     SymbolTarget {
@@ -640,6 +678,8 @@ pub fn who_uses_in_origins(
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
+    let occurrence_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut usages = Vec::new();
 
     // Same-file references.
@@ -650,10 +690,18 @@ pub fn who_uses_in_origins(
          WHERE r.local = 1 AND r.file_id = ?1 AND r.target_name = ?2
            AND ((?3 AND f.origin='repository')
              OR (?4 AND f.origin='workspace')
-             OR (?5 AND f.origin='dependency'))",
+             OR (?5 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?6))",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![file_id, name, repository, workspace, dependency],
+        rusqlite::params![
+            file_id,
+            name,
+            repository,
+            workspace,
+            dependency,
+            &occurrence_formats
+        ],
         row_to_usage,
     )?;
     usages.extend(rows.filter_map(|r| r.ok()));
@@ -667,16 +715,20 @@ pub fn who_uses_in_origins(
          WHERE r.local = 0 AND r.target_request IS NOT NULL
            AND ((?1 AND f.origin='repository')
              OR (?2 AND f.origin='workspace')
-             OR (?3 AND f.origin='dependency'))",
+             OR (?3 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?4))",
     )?;
-    let rows = stmt.query_map(rusqlite::params![repository, workspace, dependency], |r| {
-        Ok((
-            row_to_usage(r)?,
-            r.get::<_, i64>(7)?,
-            r.get::<_, String>(8)?,
-            r.get::<_, String>(9)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![repository, workspace, dependency, &occurrence_formats],
+        |r| {
+            Ok((
+                row_to_usage(r)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+            ))
+        },
+    )?;
     for row in rows {
         let (usage, ref_file, request, target_name) = row?;
         if target_name == "*" {
@@ -706,10 +758,11 @@ pub fn who_uses_in_origins(
          WHERE m.prop = ?1
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
-             OR (?4 AND f.origin='dependency'))",
+             OR (?4 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?5))",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![name, repository, workspace, dependency],
+        rusqlite::params![name, repository, workspace, dependency, &occurrence_formats],
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -759,6 +812,8 @@ pub fn events_in_origins(
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut stmt = conn.prepare(
         "SELECT f.path, f.origin, e.line, e.role, e.name, e.method, c.name
          FROM events e JOIN files f ON e.file_id = f.id
@@ -767,10 +822,11 @@ pub fn events_in_origins(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?5))
          ORDER BY e.name, e.role DESC, f.path, e.line",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![filter, repository, workspace, dependency],
+        rusqlite::params![filter, repository, workspace, dependency, eligible_formats],
         |r| {
             Ok(EventSite {
                 file: r.get(0)?,
@@ -796,4 +852,126 @@ fn row_to_usage(r: &rusqlite::Row<'_>) -> rusqlite::Result<Usage> {
         detail: r.get(5)?,
         chunk_name: r.get(6)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+
+    #[test]
+    fn poisoned_rust_facts_stay_out_of_exact_and_event_queries() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let conn = crate::store::open(directory.path())?;
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('snapshot','registry-boundary')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role,origin)
+             VALUES('main.ts','typescript','code','typescript','production','repository')",
+            [],
+        )?;
+        let typescript_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(
+               file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(?1,'function','sharedNeedle','','sharedNeedle',0,80,1,4,
+                      'typescript-chunk','export function sharedNeedle() {}')",
+            [typescript_file],
+        )?;
+        let typescript_chunk = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbols(
+               file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+             ) VALUES(?1,'sharedNeedle','function',16,28,0,40,'',1,1)",
+            [typescript_file],
+        )?;
+        conn.execute(
+            "INSERT INTO refs(
+               file_id,chunk_id,start,line,kind,confidence,target_name,local
+             ) VALUES(?1,?2,45,2,'call','certain','sharedNeedle',1)",
+            rusqlite::params![typescript_file, typescript_chunk],
+        )?;
+        conn.execute(
+            "INSERT INTO member_calls(file_id,chunk_id,start,end,line,prop,object)
+             VALUES(?1,?2,50,70,3,'sharedNeedle','service')",
+            rusqlite::params![typescript_file, typescript_chunk],
+        )?;
+        conn.execute(
+            "INSERT INTO events(file_id,chunk_id,line,role,name,method)
+             VALUES(?1,?2,4,'emit','shared-event','emit')",
+            rusqlite::params![typescript_file, typescript_chunk],
+        )?;
+
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role,origin)
+             VALUES('poison.rs','rust','code','rust','production','repository')",
+            [],
+        )?;
+        let rust_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(
+               file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(?1,'method','rustOnlyMethod','','sharedNeedle rustOnlyMethod',0,80,1,4,
+                      'rust-chunk','fn sharedNeedle() {}')",
+            [rust_file],
+        )?;
+        let rust_chunk = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO symbols(
+               file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+             ) VALUES(?1,'sharedNeedle','function',3,15,0,40,'',1,1)",
+            [rust_file],
+        )?;
+        conn.execute(
+            "INSERT INTO refs(
+               file_id,chunk_id,start,line,kind,confidence,target_request,target_name,local
+             ) VALUES(?1,?2,20,99,'call','certain','./main','sharedNeedle',0)",
+            rusqlite::params![rust_file, rust_chunk],
+        )?;
+        conn.execute(
+            "INSERT INTO module_edges(from_file,request,to_file,resolution)
+             VALUES(?1,'./main',?2,'resolver')",
+            rusqlite::params![rust_file, typescript_file],
+        )?;
+        conn.execute(
+            "INSERT INTO member_calls(file_id,chunk_id,start,end,line,prop,object)
+             VALUES(?1,?2,30,50,100,'sharedNeedle','poison')",
+            rusqlite::params![rust_file, rust_chunk],
+        )?;
+        conn.execute(
+            "INSERT INTO events(file_id,chunk_id,line,role,name,method)
+             VALUES(?1,?2,101,'listen','shared-event','on')",
+            rusqlite::params![rust_file, rust_chunk],
+        )?;
+
+        let definitions =
+            find_symbols_in_origins(&conn, "sharedNeedle", &crate::origin::defaults())?;
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].file, "main.ts");
+        assert!(
+            find_symbols_in_origins(&conn, "rustOnlyMethod", &crate::origin::defaults(),)?
+                .is_empty()
+        );
+
+        let graph = ModuleGraph::load(&conn)?;
+        assert!(!graph.paths.contains_key(&rust_file));
+        assert!(graph.edge(rust_file, "./main").is_none());
+        let usages = who_uses_in_origins(
+            &conn,
+            &graph,
+            typescript_file,
+            "sharedNeedle",
+            &crate::origin::defaults(),
+        )?;
+        assert_eq!(usages.len(), 2);
+        assert!(usages.iter().all(|usage| usage.file == "main.ts"));
+
+        let events = events_in_origins(&conn, Some("shared-event"), &crate::origin::defaults())?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].file, "main.ts");
+        Ok(())
+    }
 }

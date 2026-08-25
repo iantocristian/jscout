@@ -671,13 +671,12 @@ fn hidden_path_is_excluded(path: &Path) -> bool {
 }
 
 fn is_document_path(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| {
-        extension == std::ffi::OsStr::new("md") || extension == std::ffi::OsStr::new("mdx")
-    })
+    crate::formats::documentation_for_path(path).is_some()
 }
 
 fn is_mdx_path(path: &Path) -> bool {
-    path.extension() == Some(std::ffi::OsStr::new("mdx"))
+    crate::formats::documentation_for_path(path)
+        .is_some_and(|format| format.id == crate::formats::MDX)
 }
 
 #[cfg(unix)]
