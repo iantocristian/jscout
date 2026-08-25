@@ -503,6 +503,15 @@ export function summarizeProfile(runs) {
   };
 }
 
+export function hasConflictTreatmentOpportunity(runs) {
+  return runs.some((run) => {
+    if (run.query.category !== "conflict") return false;
+    const { current_rank: currentRank, older_conflict_rank: olderRank } = run.score;
+    return currentRank !== null && olderRank !== null
+      && olderRank < currentRank && currentRank - olderRank <= 3;
+  });
+}
+
 function hitIdentity(hit) {
   return `${hit.path}\0${hit.heading}\0${hit.source_bytes[0]}\0${hit.source_bytes[1]}\0${hit.file_hash}`;
 }
@@ -930,6 +939,16 @@ async function main() {
         ])),
       ]),
     );
+    const conflictTreatmentOpportunity = Object.fromEntries(
+      options.profiles.map((profile) => [
+        profile,
+        hasConflictTreatmentOpportunity(scoredRuns.filter((run) => run.profile === profile)),
+      ]),
+    );
+    if (options.runKind === "phase2-baseline"
+        && Object.values(conflictTreatmentOpportunity).some((value) => !value)) {
+      throw new Error("phase2-baseline has no obsolete-first conflict within the tested movement bounds");
+    }
     const comparisons = [];
     for (const profile of options.profiles.filter((profile) => profile !== "lexical")) {
       comparisons.push(compareProfiles(
@@ -988,6 +1007,7 @@ async function main() {
         repeated_orders_stable: runs.every((run) => run.repeated_exact_order),
         source_tree_clean: sourceStatus.length === 0,
         phase2_complete: PHASE2_PROFILES.every((profile) => options.profiles.includes(profile)),
+        conflict_treatment_opportunity: conflictTreatmentOpportunity,
         required_profiles_present: (options.runKind === "phase2-baseline" ? PHASE2_PROFILES : PROVIDER_FREE_PROFILES)
           .every((profile) => options.profiles.includes(profile)),
         hybrid_measured: options.profiles.includes("hybrid"),

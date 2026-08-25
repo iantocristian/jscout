@@ -130,6 +130,40 @@
       ]
     },
     {
+      "id": "ambiguous-api-key-header",
+      "query": "What API-key HTTP header should an Atlas Relay publisher send with publish requests?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "conflict",
+      "current": [
+        {
+          "answer_id": "atlas.auth.publish-header.v2",
+          "path": "docs/guides/authentication.md",
+          "heading": "Authentication > Relay v2 requests"
+        }
+      ],
+      "older_conflicts": [
+        {
+          "answer_id": "atlas.auth.publish-header.v1",
+          "path": "docs/legacy/relay-v1-authentication.md",
+          "heading": "Relay v1 authentication > API-key header"
+        }
+      ],
+      "recent_irrelevant": [
+        {
+          "answer_id": "noise.changelog.auth-metric",
+          "path": "docs/changelog.md",
+          "heading": "Atlas Relay changelog > 2025-02-20"
+        }
+      ]
+    },
+    {
       "id": "evergreen-partition-assignment",
       "query": "How does Atlas Relay assign an event to a partition from its route key?",
       "variants": [

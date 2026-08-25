@@ -8,6 +8,9 @@ implemented. The corpus is declared in
 [`fixtures/docs-retrieval/manifest.json`](fixtures/docs-retrieval/manifest.json),
 and the treatment and default-selection rules are pre-registered in
 [`prereg/g24-documentation-freshness-2026-08-25.md`](prereg/g24-documentation-freshness-2026-08-25.md).
+The
+[`conflict-arm addendum`](prereg/g24-documentation-freshness-addendum-2026-08-25.md)
+records the one pre-Phase-3 corpus correction.
 
 Build the release binary and run the provider-free lexical/fallback check:
 

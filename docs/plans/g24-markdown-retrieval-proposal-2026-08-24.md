@@ -791,6 +791,7 @@ against movement bounds of 1–3.
 
 The fixed [corpus](../../eval/fixtures/docs-retrieval/manifest.json),
 [pre-registration](../../eval/prereg/g24-documentation-freshness-2026-08-25.md),
+[conflict-arm addendum](../../eval/prereg/g24-documentation-freshness-addendum-2026-08-25.md),
 and Phase 2 [human](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.md)
 and [machine](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.json)
 reports record the entry gate. They do not select a freshness default; that

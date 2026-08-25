@@ -3365,7 +3365,8 @@ search. Phase 2 adds docs vectors from the shared `[embedding]` profile. Phase
 4 adds documentation-aware watch classification through the shared
 incremental watcher. The fixed
 [retrieval corpus](eval/fixtures/docs-retrieval/manifest.json),
-[pre-registration](eval/prereg/g24-documentation-freshness-2026-08-25.md), and
+[pre-registration](eval/prereg/g24-documentation-freshness-2026-08-25.md),
+[conflict-arm addendum](eval/prereg/g24-documentation-freshness-addendum-2026-08-25.md), and
 Phase 2 [human](eval/results/g24-docs-retrieval-phase2-2026-08-25.md) and
 [machine](eval/results/g24-docs-retrieval-phase2-2026-08-25.json) reports
 satisfy Phase 3's entry prerequisite. Phase 3 — Git-basis provenance and the

@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   compareProfiles,
   docsSearchArguments,
+  hasConflictTreatmentOpportunity,
   materializeRepositories,
   parseArguments,
   scoreRun,
@@ -42,6 +43,17 @@ test("scorer separates current recall, older visibility, and evergreen inversion
   assert.equal(conflictScore.current_recall[3], 1);
   assert.equal(conflictScore.older_conflict_visible_at_5, true);
   assert.equal(conflictScore.current_ahead_of_older, false);
+  assert.equal(hasConflictTreatmentOpportunity([{
+    query: conflict,
+    score: conflictScore,
+  }]), true);
+  assert.equal(hasConflictTreatmentOpportunity([{
+    query: conflict,
+    score: scoreRun(conflict, [
+      hit("docs/current.md", "Deploy > Rollout", 1),
+      hit("docs/old.md", "Deploy > Rollout", 2),
+    ]),
+  }]), false);
 
   const evergreen = {
     id: "identity",
