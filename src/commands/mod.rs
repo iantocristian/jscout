@@ -80,9 +80,16 @@ impl Command {
             Self::Scout { command } => Some(command.root()),
             Self::AgentGuide {
                 install: Some(root),
+                ..
+            } => Some(root),
+            Self::AgentGuide {
+                update: Some(root), ..
             } => Some(root),
             Self::Llm { .. } | Self::Inference { .. } => Some(Path::new(".")),
-            Self::AgentGuide { install: None } => None,
+            Self::AgentGuide {
+                install: None,
+                update: None,
+            } => None,
             Self::Config { command } => Some(command.root()),
         }
     }
@@ -672,10 +679,13 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 file_origins,
             },
         ),
-        Command::AgentGuide { install } => {
+        Command::AgentGuide { install, update } => {
             if let Some(root) = install {
                 let target = agent::install(&root)?;
                 println!("installed {}", target.display());
+            } else if let Some(root) = update {
+                let target = agent::update(&root)?;
+                println!("updated {}", target.display());
             } else {
                 print!("{}", agent::GUIDE);
             }

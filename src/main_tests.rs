@@ -77,6 +77,37 @@ fn config_commands_and_global_selector_parse() {
 }
 
 #[test]
+fn agent_guide_update_is_explicit_rooted_and_exclusive_with_install() {
+    let Cli { command, .. } =
+        Cli::try_parse_from(["jscout", "agent-guide", "--update", "/tmp/repo"])
+            .expect("agent-guide update parses");
+    assert_eq!(command.root(), Some(std::path::Path::new("/tmp/repo")));
+    assert!(matches!(
+        command,
+        Command::AgentGuide {
+            install: None,
+            update: Some(root),
+        } if root == std::path::Path::new("/tmp/repo")
+    ));
+
+    assert!(
+        Cli::try_parse_from([
+            "jscout",
+            "agent-guide",
+            "--install",
+            "/tmp/repo",
+            "--update",
+            "/tmp/repo",
+        ])
+        .is_err()
+    );
+
+    let Cli { command, .. } =
+        Cli::try_parse_from(["jscout", "agent-guide"]).expect("agent-guide print parses");
+    assert!(command.root().is_none());
+}
+
+#[test]
 fn text_search_memory_is_renderable_without_code_hits() -> Result<()> {
     let rendered = render_semantic_memory_text(&[SemanticArtifact {
         id: 7,

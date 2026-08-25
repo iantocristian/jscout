@@ -3180,38 +3180,59 @@ ceiling. The evaluation record adds the invented-anchor failure class and one
 anchoring event in which a delivered analog shaped architecture without
 supplying the missing behavior.
 
+A later production investigation exposed the opposite failure: exhaustive
+`history.cache` became the FTS terms `history OR cache`, and the skill's
+unqualified cursor-completion rule drove eight pages across 1,496 chunks even
+after the agent recognized the query was wrong. Correct exhaustive operation
+therefore needs both a completion contract for an intended evidence set and an
+explicit abandonment contract for a mis-specified one.
+
 Skill and MCP guidance plus one profile-correctness fix: Baseline now forces
 configured expansion off, matching its existing forced-off attached-memory
 posture, while still rejecting an explicitly enabled expansion. There are no
-schema, Structural retrieval, or product-default changes.
+schema, retrieval-ranking, or product-default changes.
 
-1. Two loops, and the inquiry loop is conditional. Investigation, for known
-   identifiers: `exhaustive: true` lexical search first, `definition` on
-   anchors copied verbatim, widen by cursor until `truncated` is false;
-   switch to `vector: true` or `who_uses`/`neighborhood` only when hunting
-   aliases of a value rather than reading them off snippets. Inquiry, for
-   causal, workflow, and cross-file behaviour questions: `semantic_memory`
-   leads; `repository_overview` is a once-per-cold-repository orientation
-   call, not a step in every inquiry; one orientation expansion;
-   `include_memory` off once useful memory is known. A convention check on a
-   known identifier starts in the investigation loop directly.
-2. Completeness answers state the scope object and separate convention from
-   correctness: "other code does this" establishes a repository habit, not
-   that the change is safe.
-3. The exhaustive cursor loop is sequential, as are expanded searches and
-   artifact details; independent small lexical queries may run in
-   parallel; expansion once per investigation, after localization.
-4. A changed response snapshot mid-session means re-verifying the evidence
-   boundary before continuing.
-5. The skill is rewritten around the two loops rather than extended with
-   rules, and both MCP server instruction strings are updated in the same
-   change so agents on either surface receive the same guidance.
+1. Routing precedence is explicit. A usable code identifier, exact anchor, or
+   file localizes through the Investigation loop first, even when the eventual
+   question is causal or cross-file. Broad memory leads only for genuinely
+   anchor-free architecture or workflow questions.
+2. An intended exhaustive evidence set still traverses sequentially until
+   `truncated` is false, with query, filters, and cursor preserved. A query the
+   agent recognizes as mis-specified may be abandoned immediately; its partial
+   pages cannot support a completeness claim, and cursor presence is not a
+   reason to continue. The replacement query starts a new traversal.
+3. After identifier/file localization, `semantic_memory` is queried with the
+   exact returned anchor or file only when a causal or cross-file question
+   remains. Simple occurrence and convention questions skip memory. Exact
+   identifier follow-ups keep vector retrieval and reranking off unless
+   lexical evidence is insufficient.
+4. A computed-dispatch conclusion requires current-source inspection of both
+   the selection predicate and the selected subject's metadata, registry key,
+   or equivalent identity.
+5. On the first exhaustive page only, core metadata emits `broad_or_query`
+   when tokenization yields at least two distinct effective FTS terms and the
+   scoped match set contains at least 200 chunks. The warning reports terms,
+   `total_chunks`, and a refine-or-abandon message while preserving every
+   result and cursor; no cap is added. MCP telemetry records exhaustive total,
+   returned, truncated, and warning fields on every successful exhaustive page.
+6. Completeness answers state the scope object and separate convention from
+   correctness. Exhaustive cursor traversal, expansion, and artifact detail
+   reads stay sequential; independent small lexical queries may run in
+   parallel. A changed snapshot requires repeating the affected evidence.
+7. The shipped skill and both MCP server instruction strings carry the same
+   routing. `agent-guide --install` remains non-overwriting, while explicit
+   `agent-guide --update ROOT` replaces only the fixed project-local skill path
+   so existing installations can opt into corrected guidance.
 
 Acceptance: the skill ships with the G22 fields; a replay of the
 links-iteration investigation following the skill reaches the
 `rg -w`-listed occurrences and states scope; recorded before and after:
 missed gold chunks, false completeness claims, calls, bytes, and telemetry's
-exact-anchor definition success rate.
+exact-anchor definition success rate. A `history.cache`-shaped query over at
+least 200 matching chunks warns only on page one and may be abandoned without
+a completeness claim; telemetry retains its exhaustive counts and warning.
+Install refuses an existing guide, while update replaces that exact guide and
+leaves unrelated agent-specific copies untouched.
 
 ## Proposed G24 — repository documentation retrieval
 

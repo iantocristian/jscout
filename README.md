@@ -155,6 +155,7 @@ jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
 jscout agent-guide --install R # install a project-local jscout skill
+jscout agent-guide --update R  # replace it with the current shipped skill
 ```
 
 ### Markdown and MDX documentation retrieval
@@ -1391,8 +1392,14 @@ jscout agent-guide --install /path/to/repo
 ```
 
 The command creates `.agents/skills/jscout/SKILL.md` and refuses to overwrite
-an existing guide. Use `jscout agent-guide` to print the same text for clients
-that consume `AGENTS.md` or another instruction format.
+an existing guide. Existing installations are deliberately not changed during
+an upgrade of the jscout binary; run `jscout agent-guide --update /path/to/repo`
+to stage a complete sibling file and replace that exact project-local file in
+one rename with the current shipped guide. `--update` also creates the fixed
+target when it is missing, but it does not discover or alter copies under
+other agent-specific directories. Use
+`jscout agent-guide` to print the same text for clients that consume `AGENTS.md`
+or another instruction format.
 
 For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
 semantic memory, `annotate`, `neighborhood`, or search expansion) and
