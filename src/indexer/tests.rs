@@ -1832,11 +1832,14 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
     const SECTIONS: &[(&str, &str)] = &[
         (
             "counts",
-            "SELECT (SELECT count(*) FROM chunks), (SELECT count(*) FROM chunks_fts)",
+            "SELECT (SELECT count(*) FROM chunks),
+                    (SELECT count(*) FROM chunks_fts),
+                    (SELECT count(*) FROM doc_chunk_meta),
+                    (SELECT count(*) FROM docs_fts)",
         ),
         (
             "files",
-            "SELECT f.path, f.hash, f.role, f.origin, f.package_path,
+            "SELECT f.path, f.hash, f.corpus, f.format, f.role, f.origin, f.package_path,
                     p.origin, p.name, p.version, p.canonical_root, p.locator,
                     p.manifest_hash, p.status
              FROM files f LEFT JOIN package_instances p ON p.id=f.package_instance_id",
@@ -1853,6 +1856,30 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
              FROM chunks_fts fts
              JOIN chunks c ON c.id=fts.rowid
              JOIN files f ON f.id=c.file_id",
+        ),
+        (
+            "doc_inventory",
+            "SELECT path, subject, rule, detail, path_base64, path_encoding
+             FROM doc_inventory",
+        ),
+        (
+            "doc_chunk_meta",
+            "SELECT file.path, chunk.start, metadata.title,
+                    metadata.description, metadata.tags_json,
+                    metadata.breadcrumb, metadata.nearest_heading,
+                    metadata.ordinal, metadata.embedding_identity,
+                    metadata.front_matter_state
+             FROM doc_chunk_meta metadata
+             JOIN chunks chunk ON chunk.id=metadata.chunk_id
+             JOIN files file ON file.id=chunk.file_id",
+        ),
+        (
+            "docs_fts",
+            "SELECT file.path, chunk.start, fts.title, fts.metadata,
+                    fts.breadcrumb, fts.body, fts.path
+             FROM docs_fts fts
+             JOIN chunks chunk ON chunk.id=fts.rowid
+             JOIN files file ON file.id=chunk.file_id",
         ),
         (
             "symbols",
@@ -2149,7 +2176,7 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
 }
 
 #[test]
-fn watcher_incremental_refresh_preserves_old_checker_batch_as_hidden_carry_source() -> Result<()> {
+fn watcher_incremental_refresh_preserves_active_and_newest_staging_carry_sources() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
     let conn = store::open(repo.path())?;
@@ -2163,18 +2190,38 @@ fn watcher_incremental_refresh_preserves_old_checker_batch_as_hidden_carry_sourc
                   '2026-01-01T00:00:00Z', 1)",
         [&snapshot],
     )?;
+    let active_batch = conn.last_insert_rowid();
+    conn.execute_batch(
+        "INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           created_at, active
+         ) VALUES('superseded-a', '5.9.3', 'test', '', 1, 'plan-a',
+                  '2026-01-02T00:00:00Z', 0);
+         INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           created_at, active
+         ) VALUES('superseded-b', '5.9.3', 'test', '', 1, 'plan-b',
+                  '2026-01-03T00:00:00Z', 0);",
+    )?;
+    let newest_staging = conn.last_insert_rowid();
 
     fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
     incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
     let current = structural::current_snapshot(&conn)?;
-    let retained: (i64, i64) = conn.query_row(
-        "SELECT count(*), count(*) FILTER (WHERE source_snapshot=?1)
-         FROM checker_enrichment_batches",
-        [&current],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    assert_eq!(retained, (1, 0));
+    let retained = conn
+        .prepare("SELECT id, active FROM checker_enrichment_batches ORDER BY id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        retained,
+        vec![(active_batch, true), (newest_staging, false)]
+    );
+    assert_ne!(snapshot, current);
     Ok(())
 }
 
@@ -2206,13 +2253,27 @@ fn incremental_read_failure_removes_the_stale_file_row() -> Result<()> {
 #[test]
 fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result<()> {
     let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join(".git"))?;
     fs::write(
         repo.path().join("main.ts"),
-        "import { stable } from './stable';\n\
+        "import { aliased } from '@alias';\n\
+         import { stable } from './stable';\n\
          import { edited } from './edited';\n\
          import { removed } from './removed';\n\
          import { renamed } from './old-name';\n\
-         export const total = stable + edited + removed + renamed;\n",
+         export const total = aliased + stable + edited + removed + renamed;\n",
+    )?;
+    fs::write(
+        repo.path().join("alias-a.ts"),
+        "export const aliased = 10;\n",
+    )?;
+    fs::write(
+        repo.path().join("alias-b.ts"),
+        "export const aliased = 20;\n",
+    )?;
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@alias":["alias-a.ts"]}}}"#,
     )?;
     fs::write(repo.path().join("stable.ts"), "export const stable = 1;\n")?;
     fs::write(repo.path().join("edited.ts"), "export const edited = 2;\n")?;
@@ -2223,6 +2284,23 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
     fs::write(
         repo.path().join("old-name.ts"),
         "export const renamed = 4;\n",
+    )?;
+    fs::write(
+        repo.path().join("guide.md"),
+        "# Existing guide\n\nBefore documentation.\n",
+    )?;
+    fs::write(
+        repo.path().join("removed.md"),
+        "# Removed guide\n\nThis disappears.\n",
+    )?;
+    fs::write(repo.path().join(".gitignore"), "later-visible.ts\n")?;
+    fs::write(
+        repo.path().join("later-visible.ts"),
+        "export const admittedAfterIgnoreChange = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("later-hidden.md"),
+        "# Hidden later\n\nInitially admitted documentation.\n",
     )?;
 
     let incremental = store::open_path(&repo.path().join("incremental.db"))?;
@@ -2238,12 +2316,27 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
     )?;
     fs::write(repo.path().join("added.ts"), "export const added = 5;\n")?;
     fs::write(
+        repo.path().join("guide.md"),
+        "# Existing guide\n\nAfter documentation.\n",
+    )?;
+    fs::remove_file(repo.path().join("removed.md"))?;
+    fs::write(
+        repo.path().join("added.mdx"),
+        "# Added guide\n\nNew MDX documentation.\n",
+    )?;
+    fs::write(repo.path().join(".gitignore"), "later-hidden.md\n")?;
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@alias":["alias-b.ts"]}}}"#,
+    )?;
+    fs::write(
         repo.path().join("main.ts"),
-        "import { stable } from './stable';\n\
+        "import { aliased } from '@alias';\n\
+         import { stable } from './stable';\n\
          import { edited } from './edited';\n\
          import { added } from './added';\n\
          import { renamed } from './renamed';\n\
-         export const total = stable + edited + added + renamed;\n",
+         export const total = aliased + stable + edited + added + renamed;\n",
     )?;
 
     let incremental_outcome =
@@ -2255,9 +2348,19 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
             incremental_outcome.unchanged,
             incremental_outcome.removed,
         ),
-        (4, 1, 2)
+        (7, 3, 4)
     );
-    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (5, 0));
+    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (10, 0));
+
+    let incremental_alias_target: Option<String> = incremental.query_row(
+        "SELECT target.path FROM module_edges edge
+         JOIN files source ON source.id=edge.from_file
+         LEFT JOIN files target ON target.id=edge.to_file
+         WHERE source.path='main.ts' AND edge.request='@alias'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(incremental_alias_target.as_deref(), Some("alias-b.ts"));
 
     let incremental_resolution = structural::compute_resolution_hash(&incremental)?;
     let full_resolution = structural::compute_resolution_hash(&full)?;

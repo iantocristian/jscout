@@ -8,11 +8,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
-use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision, DocFile};
+use crate::docs::corpus::{self, CapturedDocument, CorpusOptions, Decision, DocFile};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
-use crate::{file_role, io_policy, parse, store, walk};
+use crate::{file_role, io_policy, parse, store};
 
 const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
 const CODE_CORPUS: &str = "code";
@@ -278,8 +278,8 @@ pub fn refresh_repo_with_options(
 }
 
 /// Full structural refresh for the watcher. Unlike manual `jscout index`, it
-/// keeps only the previous active checker batch as a hidden carry source for
-/// the following enrichment phase.
+/// keeps the previous active checker batch and newest superseded staging batch
+/// as hidden carry sources for the following enrichment phase.
 pub fn watch_full_refresh_repo_with_options(
     root: &Path,
     conn: &Connection,
@@ -382,7 +382,7 @@ fn index_repo_impl<F: FileSystem>(
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
     let inventory_started = std::time::Instant::now();
-    let inventory = walk::repository_inventory(
+    let inventory = corpus::repository_inventory(
         &root,
         &CorpusOptions {
             include: options.docs_include.clone(),
@@ -489,7 +489,7 @@ fn index_repo_impl<F: FileSystem>(
             outcome.extraction_reset = true;
         }
 
-        replace_documentation_inventory(conn, &inventory.documentation_decisions)?;
+        replace_documentation_inventory(conn, &inventory.decisions)?;
         let mut seen = std::collections::HashSet::new();
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {
@@ -668,12 +668,13 @@ fn index_repo_impl<F: FileSystem>(
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
         // Manual indexing always resets the optional checker plane. Watch keeps
-        // one old active batch hidden for the immediately following per-project
-        // carry step; projection still rejects a mismatched source snapshot.
+        // the old active batch and newest superseded staging batch hidden for
+        // the following per-project carry step; projection still rejects a
+        // mismatched source snapshot.
         let checker_batches_changed = match checker_retention {
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {
-                store::preserve_active_checker_batch_for_watch(conn)?
+                store::preserve_checker_carry_source_for_watch(conn)?
             }
         };
         let current = ProjectionIdentity {

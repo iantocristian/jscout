@@ -104,13 +104,14 @@ Semantic artifacts are returned as `fresh`, `degraded`, `stale`, or
 **Amendment — disposable snapshot boundary (2026-08-13), watcher carry-forward
 (2026-08-20).** This section is authoritative over older text. Manual
 `jscout index` always clears checker facts, including on an identical rebuild.
-Only `watch --enrich` may retain the prior active batch as a hidden input while
-it constructs a newly validated batch for the current snapshot. jscout uses
+Only `watch --enrich` may retain the prior active batch plus the newest reusable
+superseded staging source as hidden inputs while it constructs a newly
+validated batch for the current snapshot. jscout uses
 one SQLite database with three logical lifecycles, not three physical databases:
 
 | Plane | Contents | Lifecycle |
 |---|---|---|
-| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Manual indexing clears checker batches. Watch may retain one old batch non-public long enough to carry unchanged projects/facts into a new current-snapshot batch. |
+| **Disposable structural snapshot** | Files, chunks/FTS, symbols, imports/exports, references, events, member calls, contracts, entities, package instances, checker batches/facts, graph projection, and materialized vector occurrences | Rebuilt from the current checkout. Manual indexing clears checker batches. Watch may retain the active publication and newest reusable superseded staging source non-public long enough to carry validated completed projects/facts into a new current-snapshot batch. |
 | **Durable content cache** | Embedding profiles and content-hash-keyed embedding vectors | Preserved across snapshot rebuilds. Current chunk occurrences are rematerialized from cached vectors; only unseen content is embedded. |
 | **Durable semantic memory** | Scout runs/classifications and `semantic_*` artifacts, relations, and evidence supports | Preserved across snapshot rebuilds. Evidence hashes and current anchors determine whether a claim is fresh, degraded, stale, or superseded. |
 
@@ -1482,11 +1483,13 @@ full or incremental structural refresh
   -> optionally embed/sync current semantic artifacts (`--embed`)
 ```
 
-Startup and reconciliation generations run a full disposable-plane refresh.
-An ordinary bounded batch of JavaScript/TypeScript source paths uses
-incremental extraction: it still walks and hashes the complete current source
-tree, but preserves unchanged first-party rows and parses/replaces only changed
-or missing files. Dependency discovery, module resolution, snapshot
+Startup and structural-boundary generations run a full disposable-plane
+refresh. An ordinary bounded batch of JavaScript/TypeScript source paths, an
+admitted Markdown/MDX event, or periodic reconciliation uses incremental
+extraction: it still walks and hashes the complete current shared code-and-doc
+inventory, but preserves unchanged rows and parses/replaces only changed or
+missing files. Documentation events do not enter checker dirty affinity.
+Dependency discovery, module resolution, snapshot
 calculation, hidden old-checker-batch retention/retirement, vector occurrence
 rematerialization, and projection publication still run against the complete
 resulting snapshot. `jscout index` remains a full rebuild and always clears
@@ -1496,14 +1499,16 @@ optimizations, not a second correctness model.
 A source batch is promoted to full refresh when it contains more than 256
 distinct paths. Git HEAD or submodule controls, source-inventory ignore files,
 package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
-inputs, selected dependency roots, external checker inputs, directories,
-backend errors, and unclassifiable missing paths also require full refresh.
-Full scope is sticky within a generation, so a mixed event cannot be downgraded
-by later source notifications. A changed file with a non-retryable read or
-deterministic extraction failure is reported and excluded rather than leaving
-its previous structural row live. The operation still publishes the indexable
-corpus successfully. A recognized transient read failure instead rolls back
-the transaction and fails the refresh for retry.
+inputs, selected dependency roots, external checker inputs, pathless events,
+and backend errors also require full refresh. Non-boundary directory and
+uncertain missing-path events select complete-inventory incremental refresh;
+the full inventory, not the event path, remains authoritative. Full scope is
+sticky within a generation, so a mixed event cannot be downgraded by later
+source notifications. A changed file with a non-retryable read or deterministic
+extraction failure is reported and excluded rather than leaving its previous
+structural row live. The operation still publishes the indexable corpus
+successfully. A recognized transient read failure instead rolls back the
+transaction and fails the refresh for retry.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1519,10 +1524,20 @@ durations.
 `jscout embed --product`; a product-only vector cache must not be silently
 widened by the watcher. Plain watch performs no model calls, does not start the
 TypeScript checker, and never serves checker facts from a different structural
-snapshot. It may retain one such batch hidden as future carry input, but only
-`watch --enrich` can publish a replacement bound to the current snapshot. An
+snapshot. It may retain the active publication and newest reusable superseded
+staging source hidden as future carry inputs, but only `watch --enrich` can
+publish a replacement bound to the current snapshot. An
 exact-snapshot batch remains a no-op reuse. Dependency selectors remain
 authoritative and must be supplied to watch exactly as they are to index.
+
+Watcher startup telemetry records the jscout version, executable-byte
+fingerprint, non-secret loaded runtime-config fingerprint, config-loaded and
+restart-required semantics, checker-policy fingerprint derived from the actual
+watcher enrichment selection, effective-watch-policy fingerprint after CLI
+overrides, and effective phase flags. Repository snapshots and dirty paths
+remain per-generation state rather than part of those runtime identities.
+Executable fingerprint acquisition is best-effort: failure is logged and
+rendered as `unavailable`, never promoted into a watcher or MCP startup error.
 
 Code embedding remains ahead of checker enrichment because its document and
 selection inputs are chunk content plus current repository policy; checker
@@ -1612,14 +1627,15 @@ required.
 
 ### Trigger and reconciliation policy
 
-Relevant events carry a typed refresh scope. Indexed source-file create,
-update, delete, and rename paths select incremental extraction while all
-resolution, ownership, checkout, dependency, and uncertain boundaries select
-full refresh. Scopes coalesce during debounce, full scope dominates and remains
-sticky for the generation, and more than 256 distinct source paths promotes
-the generation to full refresh. The incremental executor still scans the
-complete source tree and runs complete resolution and publication, so event
-paths are optimization hints rather than the correctness inventory.
+Relevant events carry a typed refresh scope. Indexed source-file and admitted
+Markdown/MDX create, update, delete, and rename paths select incremental
+extraction while all resolution, ownership, checkout, dependency, and
+uncertain boundaries select full refresh. Scopes coalesce during debounce,
+full scope dominates and remains sticky for the generation, and more than 256
+distinct source paths promotes the generation to full refresh. The incremental
+executor still scans the complete shared code-and-doc inventory and runs
+complete resolution and publication, so event paths are optimization hints
+rather than the correctness inventory.
 
 Jscout-owned output paths are excluded before relevance classification and
 before the unknown-event escalation rule. The exclusion set is exact, not a
@@ -1649,9 +1665,12 @@ Triggers include:
 - notification overflow, backend errors, or unknown non-excluded event shapes.
 
 Existing regular files that fail every relevance rule are ignored rather than
-escalated: documentation, editor metadata, and other unindexed files therefore
-do not rebuild the repository. Pathless/rescan events, directories, and
-otherwise uncertain missing paths remain conservative full-refresh triggers.
+escalated: documentation excluded by the configured corpus policy, editor
+metadata, and other unindexed files therefore do not rebuild the repository.
+Pathless/rescan events remain conservative full-refresh triggers. A directory
+or uncertain missing path that is not already a recognized boundary schedules
+complete-inventory incremental refresh, which discovers all descendant changes
+without resetting unrelated canonical rows.
 
 After each refresh or enrichment, the coordinator reconciles its narrow
 external watches with the newly resolved package instances and checker input
@@ -1666,7 +1685,8 @@ timer. Persistent registration failure does not itself keep the structural
 generation dirty or cause a full-refresh loop.
 
 Notification backends can miss events, so a configurable reconciliation timer
-(default ten minutes) schedules a full refresh even when no event arrived.
+(default ten minutes) schedules a complete-inventory incremental refresh even
+when no event arrived.
 The interval starts when a generation completes, not when its timer fires, so
 a slow refresh cannot cause back-to-back cycles. A nonzero interval must exceed
 the debounce period, and reconciliation starts immediately when due rather
@@ -1690,11 +1710,22 @@ enrichment phases, while SQLite remains the arbiter when another jscout
 process writes concurrently. G12 does not introduce an application-level
 lease until a demonstrated concurrent-writer failure requires one.
 
-A watcher structural refresh removes inactive checker staging but may retain
-one prior active batch as a hidden carry source. Projection still requires an
-exact source-snapshot match:
+A watcher structural refresh bounds inactive checker staging to the newest
+reusable superseded source and may retain it beside the prior active
+publication as hidden carry sources. An empty newer destination left by a crash
+cannot displace a completed source. The successor prefers a valid fully
+completed staging project, falls back to the active project, and never carries
+incomplete project rows. Validated copying and predecessor retirement are
+atomic. Projection still requires an exact source-snapshot match:
 
 - plain `watch` starts no checker work and never projects a retained old batch;
+- checker-dirty code paths accumulate across supersession, cancellation,
+  retries, and terminal partial publication, and clear only after a
+  non-superseded successful checker publication; documentation paths never
+  enter this backlog;
+- enrichment telemetry separates exact-batch reuse, staging resume/reset,
+  unique occurrence carry, owner-occurrence carry, and active-versus-staging
+  carry sources;
 - `watch --enrich` reuses an exact-snapshot batch as a no-op, or carries only
   projects whose config-chain/membership/checker fingerprint is unchanged and
   facts whose source occurrence and target fingerprint still validate;
@@ -1783,9 +1814,10 @@ substitution rather than a completed measurement of that checkout.
   TypeScript runtime, and ambient declaration changes converge;
 - edit -> enrich -> revert cannot reactivate a checker batch created before
   intervening external checker-input changes;
-- bounded source-only generations parse only changed files and report
-  unchanged-file reuse, while startup, reconciliation, branch/config/package,
-  large-batch, and uncertain generations use full refresh;
+- bounded source/doc generations, non-boundary directory or missing-path
+  generations, and periodic reconciliation parse only changed files and report
+  unchanged-file reuse, while startup, branch/config/package, large-batch, and
+  pathless/backend-uncertain generations use full refresh;
 - no refresh mode can project a checker batch from a different snapshot;
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,

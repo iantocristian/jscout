@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use super::protocol::FileOwnership;
 
+pub(super) const POLICY_FINGERPRINT_DOMAIN: &str = "jscout-checker-package-gate-v1";
+
 const ABSENT_INPUT_HASH: &str = "absent:v1";
 const INVENTORY_SQL: &str = "SELECT file.id, file.path, file.role FROM code_files file
      WHERE file.origin IN ('repository', 'workspace')
@@ -789,7 +791,7 @@ fn policy_fingerprint(
     observations: &[ManifestObservation],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hash_value(&mut hasher, "jscout-checker-package-gate-v1");
+    hash_value(&mut hasher, POLICY_FINGERPRINT_DOMAIN);
     hash_value(&mut hasher, if include_all { "all" } else { "default" });
     for source in sources {
         hash_value(&mut hasher, &source.path);

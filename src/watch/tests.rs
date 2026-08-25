@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +10,8 @@ use crate::indexer;
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
     RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
-    clear_reconciliation_deadline_if_dirty, is_refresh_boundary, run_refresh, validate_options,
+    clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
+    is_refresh_boundary, run_refresh, validate_options, watch_enrich_options, watch_startup_log,
 };
 
 fn rejection(path: &str, stage: &'static str, error: &str) -> crate::indexer::IndexRejection {
@@ -240,7 +242,7 @@ fn reconciliation_is_immediate_only_after_the_previous_generation_completes() {
         .next_work(seconds(10))
         .expect("immediate reconciliation");
     assert_eq!(refresh.generation, 2);
-    assert_eq!(refresh.refresh_scope, RefreshScope::Full);
+    assert_eq!(refresh.refresh_scope, RefreshScope::Incremental);
     assert!(!refresh.force_full_enrichment);
 }
 
@@ -288,6 +290,105 @@ fn source_event_superseding_a_drift_flush_keeps_the_full_enrichment_requirement(
     assert!(successor.force_full_enrichment);
     assert!(coordinator.dirty_reasons.contains("checker-drift-flush"));
     assert!(coordinator.dirty_reasons.contains("source:changed.ts"));
+}
+
+#[test]
+fn checker_dirty_paths_survive_supersession_until_successor_publication() {
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+
+    coordinator.mark_dirty(seconds(1), source_signal("src/a.ts"));
+    let refresh_a = coordinator.next_work(seconds(3)).expect("refresh A");
+    assert_eq!(coordinator.finish_refresh(refresh_a), FinishState::Continue);
+    let enrich_a = coordinator.next_work(seconds(3)).expect("enrich A");
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/a.ts".to_string()])
+    );
+
+    coordinator.mark_dirty(seconds(4), source_signal("src/b.ts"));
+    assert_eq!(
+        coordinator.finish_enrichment_success(enrich_a),
+        FinishState::Superseded
+    );
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/a.ts".to_string(), "src/b.ts".to_string()])
+    );
+
+    let refresh_b = coordinator.next_work(seconds(6)).expect("refresh B");
+    assert_eq!(coordinator.finish_refresh(refresh_b), FinishState::Continue);
+    let enrich_b = coordinator.next_work(seconds(6)).expect("enrich B");
+    assert_eq!(
+        coordinator.finish_enrichment_success(enrich_b),
+        FinishState::Complete
+    );
+    assert!(coordinator.checker_dirty_source_paths.is_empty());
+}
+
+#[test]
+fn checker_dirty_paths_survive_partial_and_retryable_enrichment() {
+    let mut coordinator = Coordinator::new(seconds(2), false, true);
+    let startup = coordinator.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(coordinator.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = coordinator.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        coordinator.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+
+    coordinator.mark_dirty(seconds(1), source_signal("src/partial.ts"));
+    let refresh = coordinator.next_work(seconds(3)).expect("refresh");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(seconds(3)).expect("enrich");
+    assert_eq!(
+        coordinator.finish_optional_partial(enrich),
+        FinishState::Partial
+    );
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/partial.ts".to_string()])
+    );
+
+    coordinator.mark_dirty(seconds(4), source_signal("src/retry.ts"));
+    let refresh = coordinator.next_work(seconds(6)).expect("refresh");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(seconds(6)).expect("enrich");
+    assert!(matches!(
+        coordinator.finish_error(seconds(6), enrich),
+        FinishState::Retry { .. }
+    ));
+    assert_eq!(
+        coordinator.checker_dirty_source_paths,
+        BTreeSet::from(["src/partial.ts".to_string(), "src/retry.ts".to_string()])
+    );
+}
+
+#[test]
+fn documentation_and_disabled_enrichment_never_grow_checker_dirty_paths() {
+    let mut enriched = Coordinator::new(seconds(2), false, true);
+    let startup = enriched.next_work(Duration::ZERO).expect("startup");
+    assert_eq!(enriched.finish_refresh(startup), FinishState::Continue);
+    let startup_enrich = enriched.next_work(Duration::ZERO).expect("enrich");
+    assert_eq!(
+        enriched.finish_enrichment_success(startup_enrich),
+        FinishState::Complete
+    );
+    enriched.mark_dirty(
+        seconds(1),
+        DirtySignal::documentation("documentation:README.md"),
+    );
+    assert!(enriched.checker_dirty_source_paths.is_empty());
+
+    let mut structural_only = Coordinator::new(seconds(2), false, false);
+    structural_only.mark_dirty(seconds(1), source_signal("src/main.ts"));
+    assert!(structural_only.checker_dirty_source_paths.is_empty());
 }
 
 #[test]
@@ -350,7 +451,7 @@ fn a_large_source_batch_promotes_to_full_refresh() {
 fn event_classifier_excludes_only_the_exact_database_family() {
     let root = PathBuf::from("/repo");
     let database = root.join(".jscout.db");
-    let classifier = EventClassifier::new(&root, &database);
+    let classifier = EventClassifier::new(&root, &database, &Default::default()).unwrap();
     assert!(classifier.classify(&[database]).is_none());
     assert!(
         classifier
@@ -368,7 +469,8 @@ fn event_classifier_excludes_only_the_exact_database_family() {
 fn selected_external_prefix_overrides_node_modules_noise() {
     let root = PathBuf::from("/repo");
     let dependency = root.join("node_modules/pkg");
-    let mut classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let mut classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
     classifier.set_external(Default::default(), [dependency.clone()].into());
     assert!(
         classifier
@@ -385,7 +487,8 @@ fn selected_external_prefix_overrides_node_modules_noise() {
 #[test]
 fn a_refresh_boundary_dominates_source_paths_in_one_event() {
     let root = PathBuf::from("/repo");
-    let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
 
     let signal = classifier
         .classify(&[root.join("src/main.ts"), root.join("package.json")])
@@ -408,7 +511,8 @@ fn lockfiles_and_configs_are_full_refresh_boundaries() {
     assert!(is_refresh_boundary(Path::new(".ignore")));
 
     let root = PathBuf::from("/repo");
-    let classifier = EventClassifier::new(&root, &root.join(".jscout.db"));
+    let classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
     for boundary in [".gitignore", ".ignore", "pnpm-workspace.yaml"] {
         assert!(
             classifier
@@ -440,7 +544,8 @@ fn event_filter_uses_walker_ignore_policy_without_excluding_authored_build_dirs(
         root.join("node_modules/dep/index.js"),
         "module.exports = 1;\n",
     )?;
-    let classifier = EventClassifier::new(root, &root.join("watch.db"));
+    let classifier =
+        EventClassifier::new(root, &root.join("watch.db"), &Default::default()).unwrap();
 
     assert!(
         classifier
@@ -472,7 +577,8 @@ fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
         root.join("generated/output.ts"),
         "export const output = 1;\n",
     )?;
-    let mut classifier = EventClassifier::new(root, &root.join("watch.db"));
+    let mut classifier =
+        EventClassifier::new(root, &root.join("watch.db"), &Default::default()).unwrap();
 
     assert!(
         classifier
@@ -480,7 +586,7 @@ fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
             .is_some()
     );
     fs::write(root.join(".gitignore"), "/generated/\n")?;
-    classifier.reload_source_policy();
+    classifier.reload_path_policies()?;
     assert!(
         classifier
             .classify(&[root.join("generated/output.ts")])
@@ -490,19 +596,148 @@ fn event_filter_reloads_ignore_rules_after_a_refresh() -> Result<()> {
 }
 
 #[test]
-fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result<()> {
+fn event_filter_applies_the_configured_documentation_policy() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path();
+    fs::create_dir(root.join(".git"))?;
+    fs::create_dir_all(root.join("docs"))?;
+    fs::create_dir_all(root.join("private"))?;
+    fs::create_dir_all(root.join(".github"))?;
+    fs::create_dir_all(root.join(".github/.private"))?;
+    fs::create_dir_all(root.join(".claude"))?;
+    fs::create_dir_all(root.join(".agents"))?;
+    fs::create_dir_all(root.join(".hidden"))?;
+    fs::create_dir_all(root.join(".source-visible"))?;
+    fs::create_dir_all(root.join("packages/app/.github"))?;
+    fs::write(
+        root.join(".gitignore"),
+        "/docs/\n/.claude/\n!.source-visible/\n",
+    )?;
+    fs::write(root.join("docs/ignored.md"), "ignored\n")?;
+    fs::write(root.join("private/excluded.md"), "excluded\n")?;
+    fs::write(root.join(".github/guide.mdx"), "visible\n")?;
+    fs::write(root.join(".hidden/secret.md"), "hidden\n")?;
+    let documentation = crate::docs::corpus::CorpusOptions {
+        exclude: vec!["private/**".to_string()],
+        ..Default::default()
+    };
+    let mut classifier = EventClassifier::new(root, &root.join("watch.db"), &documentation)?;
+
+    assert!(
+        classifier
+            .classify(&[root.join("docs/ignored.md")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join("private/excluded.md")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join(".hidden/secret.md")])
+            .is_none()
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".github/guide.mdx")]),
+        Some(DirtySignal::documentation(
+            "documentation:.github/guide.mdx"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".github")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.github"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".agents")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.agents"
+        ))
+    );
+    assert!(classifier.classify(&[root.join(".claude")]).is_none());
+    assert!(
+        classifier
+            .classify(&[root.join(".github/.private")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join("packages/app/.github")])
+            .is_none()
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".source-visible")]),
+        Some(DirtySignal::inventory("inventory:directory-event"))
+    );
+    fs::remove_dir_all(root.join(".github"))?;
+    fs::remove_dir_all(root.join(".agents"))?;
+    fs::remove_dir_all(root.join(".claude"))?;
+    fs::remove_dir_all(root.join(".hidden"))?;
+    fs::remove_dir_all(root.join(".source-visible"))?;
+    assert_eq!(
+        classifier.classify(&[root.join(".github")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.github"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join(".agents")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.agents"
+        ))
+    );
+    assert!(classifier.classify(&[root.join(".claude")]).is_none());
+    assert!(classifier.classify(&[root.join(".hidden")]).is_none());
+    assert_eq!(
+        classifier.classify(&[root.join(".source-visible")]),
+        Some(DirtySignal::inventory("inventory:directory-event"))
+    );
+
+    let disabled = crate::docs::corpus::CorpusOptions {
+        include: Vec::new(),
+        ..Default::default()
+    };
+    let disabled_classifier = EventClassifier::new(root, &root.join("disabled.db"), &disabled)?;
+    assert!(
+        disabled_classifier
+            .classify(&[root.join(".github")])
+            .is_none()
+    );
+
+    fs::write(root.join(".gitignore"), "")?;
+    classifier.reload_path_policies()?;
+    assert_eq!(
+        classifier.classify(&[root.join(".claude")]),
+        Some(DirtySignal::documentation(
+            "documentation-directory:.claude"
+        ))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join("docs/deleted.md")]),
+        Some(DirtySignal::documentation("documentation:docs/deleted.md"))
+    );
+    Ok(())
+}
+
+#[test]
+fn irrelevant_regular_files_are_ignored_but_inventory_shapes_refresh_incrementally() -> Result<()> {
     let root = tempfile::tempdir()?;
     fs::write(root.path().join("README.md"), "documentation\n")?;
     fs::write(root.path().join(".DS_Store"), "metadata\n")?;
     fs::create_dir(root.path().join("renamed-directory"))?;
     fs::create_dir(root.path().join(".git"))?;
     fs::write(root.path().join(".git/index"), "git metadata\n")?;
-    let classifier = EventClassifier::new(root.path(), &root.path().join("watch.db"));
+    let classifier = EventClassifier::new(
+        root.path(),
+        &root.path().join("watch.db"),
+        &Default::default(),
+    )?;
 
-    assert!(
-        classifier
-            .classify(&[root.path().join("README.md")])
-            .is_none()
+    assert_eq!(
+        classifier.classify(&[root.path().join("README.md")]),
+        Some(DirtySignal::documentation("documentation:README.md"))
     );
     assert!(
         classifier
@@ -516,11 +751,19 @@ fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result
     );
     assert_eq!(
         classifier.classify(&[root.path().join("renamed-directory")]),
-        Some(DirtySignal::full("unknown-directory-event"))
+        Some(DirtySignal::inventory("inventory:directory-event"))
     );
     assert_eq!(
         classifier.classify(&[root.path().join("deleted-unknown-file")]),
-        Some(DirtySignal::full("unknown-event"))
+        Some(DirtySignal::inventory("inventory:unknown-event"))
+    );
+
+    fs::create_dir_all(root.path().join("docs/nested"))?;
+    fs::write(root.path().join("docs/nested/guide.md"), "guide\n")?;
+    fs::remove_dir_all(root.path().join("docs"))?;
+    assert_eq!(
+        classifier.classify(&[root.path().join("docs")]),
+        Some(DirtySignal::inventory("inventory:unknown-event"))
     );
     Ok(())
 }
@@ -543,6 +786,8 @@ fn reconciliation_interval_must_exceed_debounce() {
         debug: false,
         debounce: seconds(2),
         reconcile_interval: seconds(2),
+        config_fingerprint: "config-test",
+        config_loaded: true,
     };
     let error = validate_options(&options).expect_err("invalid interval");
     assert!(error.to_string().contains("must exceed"));
@@ -566,9 +811,140 @@ fn product_embedding_requires_embedding_phase() {
         debug: false,
         debounce: seconds(2),
         reconcile_interval: seconds(600),
+        config_fingerprint: "config-test",
+        config_loaded: false,
     };
     let error = validate_options(&options).expect_err("product needs embedding");
     assert_eq!(error.to_string(), "--product requires --embed");
+}
+
+#[test]
+fn startup_log_records_runtime_identities_and_effective_watch_flags() {
+    let options = WatchOptions {
+        database: None,
+        embed_on_change: true,
+        provider: None,
+        embed_product_only: true,
+        dependencies: &[],
+        docs_include: &[],
+        docs_exclude: &[],
+        enrich_on_change: true,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "runtime-config",
+        config_loaded: true,
+    };
+    let line = watch_startup_log(
+        Path::new("/repo"),
+        Path::new("/repo/.jscout.db"),
+        &options,
+        "binary-id",
+        "checker-policy-id",
+        "watch-policy-id",
+    );
+    for expected in [
+        "jscout_version=",
+        "binary_fingerprint=binary-id",
+        "config_fingerprint=runtime-config",
+        "config_loaded=true",
+        "config_reload=restart-required",
+        "checker_policy_fingerprint=checker-policy-id",
+        "watch_policy_fingerprint=watch-policy-id",
+        "debounce_ms=2000",
+        "reconcile_seconds=600",
+        "embed=true",
+        "product=true",
+        "enrich=true",
+    ] {
+        assert!(line.contains(expected), "missing {expected:?} from {line}");
+    }
+}
+
+#[test]
+fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
+    let dependencies = Vec::<String>::new();
+    let mut options = WatchOptions {
+        database: None,
+        embed_on_change: false,
+        provider: None,
+        embed_product_only: false,
+        dependencies: &dependencies,
+        docs_include: &[],
+        docs_exclude: &[],
+        enrich_on_change: true,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "same-baseline",
+        config_loaded: true,
+    };
+    let baseline = effective_watch_policy_fingerprint(&options);
+    assert_eq!(baseline.len(), 64);
+
+    let selected_dependencies = vec!["@scope/runtime".to_string()];
+    options.dependencies = &selected_dependencies;
+    let dependencies_changed = effective_watch_policy_fingerprint(&options);
+    assert_ne!(baseline, dependencies_changed);
+
+    options.enrich_timeout = seconds(301);
+    let timeout_changed = effective_watch_policy_fingerprint(&options);
+    assert_ne!(dependencies_changed, timeout_changed);
+
+    options.checker_sidecar = Some(Path::new("checker/custom.mjs"));
+    assert_ne!(
+        timeout_changed,
+        effective_watch_policy_fingerprint(&options)
+    );
+}
+
+#[test]
+fn checker_watch_options_factory_owns_selection_and_generation_overrides() {
+    let database = Path::new("/repo/.jscout.db");
+    let normal = watch_enrich_options(
+        database,
+        Some(Path::new("checker/main.mjs")),
+        "node",
+        seconds(300),
+        false,
+        vec!["src/a.ts".into()],
+    );
+    let flush = watch_enrich_options(
+        database,
+        Some(Path::new("checker/main.mjs")),
+        "node",
+        seconds(300),
+        true,
+        vec!["src/b.ts".into()],
+    );
+
+    assert!(normal.files.is_empty());
+    assert!(normal.packages.is_empty());
+    assert!(normal.members.is_empty());
+    assert!(normal.roles.is_empty());
+    assert_eq!(normal.max_occurrences, None);
+    assert!(!normal.include_all);
+    assert!(!normal.dry_run);
+    assert!(normal.carry_forward);
+    assert!(!normal.force_full);
+    assert_eq!(normal.dirty_files, ["src/a.ts"]);
+
+    assert!(!flush.carry_forward);
+    assert!(flush.force_full);
+    assert_eq!(flush.dirty_files, ["src/b.ts"]);
+    assert_eq!(
+        crate::checker::watch_policy_fingerprint(&normal),
+        crate::checker::watch_policy_fingerprint(&flush),
+        "per-generation carry-free work must not change the startup policy identity"
+    );
 }
 
 #[test]
@@ -599,6 +975,109 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     assert_eq!(paths, vec!["b.ts"]);
+    Ok(())
+}
+
+#[test]
+fn incremental_inventory_refresh_removes_a_deleted_documentation_subtree() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join("removed/nested"))?;
+    fs::write(
+        directory.path().join("removed/nested/guide.md"),
+        "# Guide\n\nCurrent documentation.\n",
+    )?;
+    fs::write(
+        directory.path().join("removed/main.ts"),
+        "export const removed = true;\n",
+    )?;
+    fs::write(
+        directory.path().join("stable.ts"),
+        "export const stable = true;\n",
+    )?;
+    let database = directory.path().join("watch.db");
+    run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Full,
+    )?;
+
+    fs::remove_dir_all(directory.path().join("removed"))?;
+    let refreshed = run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(refreshed.outcome.unchanged, 1);
+    assert_eq!(refreshed.outcome.removed, 2);
+    assert!(!refreshed.outcome.extraction_reset);
+
+    let conn = crate::store::open_path_read_only(&database)?;
+    let remaining = conn
+        .prepare("SELECT path, corpus FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(remaining, vec![("stable.ts".into(), "code".into())]);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM docs_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn hidden_documentation_directory_event_removes_its_subtree_incrementally() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join(".github/guides"))?;
+    fs::write(
+        directory.path().join(".github/guides/guide.md"),
+        "# Guide\n\nCurrent documentation.\n",
+    )?;
+    fs::write(
+        directory.path().join("stable.ts"),
+        "export const stable = true;\n",
+    )?;
+    let database = directory.path().join("watch.db");
+    run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Full,
+    )?;
+    let classifier = EventClassifier::new(
+        directory.path(),
+        &database,
+        &crate::docs::corpus::CorpusOptions::default(),
+    )?;
+
+    fs::remove_dir_all(directory.path().join(".github"))?;
+    let signal = classifier
+        .classify(&[directory.path().join(".github")])
+        .expect("deleted hidden documentation directory must schedule refresh");
+    assert_eq!(signal.scope, RefreshScope::Incremental);
+    assert!(signal.source_paths.is_empty());
+    let refreshed = run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        signal.scope,
+    )?;
+    assert_eq!(refreshed.outcome.unchanged, 1);
+    assert_eq!(refreshed.outcome.removed, 1);
+    assert!(!refreshed.outcome.extraction_reset);
+
+    let conn = crate::store::open_path_read_only(&database)?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM docs_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
     Ok(())
 }
 

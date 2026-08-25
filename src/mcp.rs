@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -157,7 +157,7 @@ pub fn serve(
         result_transport,
     } = options;
     let root = root.canonicalize()?;
-    let binary_fingerprint = current_binary_fingerprint()?;
+    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint();
     let conn = store::open_path_read_only(database_path)?;
     let provider =
         embed::Provider::from_settings(&runtime.effective.embedding, &runtime.effective.inference)?;
@@ -2032,24 +2032,6 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     {
         eprintln!("warning: failed to write jscout MCP telemetry");
     }
-}
-
-fn current_binary_fingerprint() -> Result<String> {
-    let path = std::env::current_exe().context("locate current jscout executable")?;
-    let mut file = File::open(&path)
-        .with_context(|| format!("open current jscout executable {}", path.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("read current jscout executable {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn sum_durations<const N: usize>(durations: [Option<Duration>; N]) -> Option<Duration> {
