@@ -566,8 +566,8 @@ never ingested.
 
 Freshness is a bounded reordering, not a score. The pipeline is: BM25 and
 vector retrieval, reciprocal-rank fusion using the shared code-search constant
-`k = 60`, the optional model reranker — which receives path, breadcrumb, and
-content, and never temporal metadata — then freshness reordering, then
+`k = 60`, the optional model reranker — which receives path, title,
+description, tags, breadcrumb, and content, and never temporal metadata — then freshness reordering, then
 truncation to `limit` and response-budget shedding. The lexical component score
 is `-FTS5 bm25()`, making larger values better like vector similarity. Every
 component ranking and the fused ranking therefore sort descending by score and

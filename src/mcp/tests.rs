@@ -10,11 +10,34 @@ use serde_json::json;
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
-    exhaustive_telemetry_metrics, expansion_role_metrics, log_request, render_bounded_items,
-    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
-    sum_durations, tool_defs,
+    exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
+    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
+    server_instructions, sum_durations, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
+
+#[test]
+fn initialize_exposes_effective_documentation_freshness_defaults() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join(".jscout.toml"),
+        "version = 1\n\n[docs.search]\nfreshness = true\nmax_rank_movement = 3\n",
+    )?;
+    let runtime = config::RuntimeConfig::load(Some(repo.path()), None)?;
+    let result = initialize_result(
+        "2025-06-18",
+        "test-binary",
+        &repo.path().join("index.db"),
+        ToolProfile::Structural,
+        ResultTransportPolicy::Text,
+        &McpClientInfo::default(),
+        &runtime,
+    );
+    let defaults = &result["serverInfo"]["documentationRetrievalDefaults"];
+    assert_eq!(defaults["freshness"], json!(true));
+    assert_eq!(defaults["maxRankMovement"], json!(3));
+    Ok(())
+}
 
 fn capture_code_read_surfaces(
     root: &Path,

@@ -3416,7 +3416,8 @@ decisions while leaving every code surface unchanged; indexing and code
 embedding never generate documentation vectors; and crash recovery exposes exactly one complete old or replacement
 shared snapshot, never a partial mixture. Phase 3 acceptance: disabled
 freshness preserves Phase 2 ranked identities; enabled movement never exceeds
-its configured bound, moves unknown provenance, or crosses provenance bases;
+its configured bound, moves unknown provenance, or crosses incomparable
+provenance clocks;
 captured-byte blame is revalidated before publication; and the evaluation
 records the disabled default after rejecting every candidate bound. Deferred
 ledger acceptance: inserting one uniquely distinguishable paragraph produces

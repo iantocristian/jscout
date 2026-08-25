@@ -195,6 +195,14 @@ impl GitRepository {
 
     fn try_prepare_document(&self, path: &str, bytes: &[u8]) -> Result<Option<BlameRequest>> {
         validate_repository_relative_path(path)?;
+        if !path_exists_at_head(&self.root, &self.head, path)
+            .with_context(|| format!("check path membership at recorded HEAD for {path}"))?
+        {
+            // A deleted path can still have log history. If it is recreated in
+            // the worktree without entering HEAD, it is untracked and has no
+            // Git authorship time just like a never-committed path.
+            return Ok(None);
+        }
         let Some(path_tip) = read_path_tip(&self.root, &self.head, path)
             .with_context(|| format!("resolve path-tip commit for {path}"))?
         else {
@@ -378,6 +386,18 @@ fn read_path_tip(root: &Path, head: &str, path: &str) -> Result<Option<String>> 
         return Ok(None);
     }
     parse_single_oid(&output, "path-tip commit").map(Some)
+}
+
+fn path_exists_at_head(root: &Path, head: &str, path: &str) -> Result<bool> {
+    let args = vec![
+        OsString::from("--no-replace-objects"),
+        OsString::from("ls-tree"),
+        OsString::from("-z"),
+        OsString::from(head),
+        OsString::from("--"),
+        OsString::from(path),
+    ];
+    Ok(!run_git(root, &args, None)?.is_empty())
 }
 
 fn read_shallow_state(root: &Path) -> Result<ShallowState> {
@@ -1019,6 +1039,78 @@ mod tests {
         ));
         assert!(matches!(
             git.prepare_document("staged.md", b"staged\n"),
+            DocumentPreparation::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_then_recreated_untracked_path_is_unknown_without_blame() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        repository.write("guide.md", b"tracked\n")?;
+        repository.commit(
+            "add guide",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+        fs::remove_file(repository.path().join("guide.md"))?;
+        repository.commit(
+            "delete guide",
+            "2002-01-01T00:00:00 +0000",
+            "2002-01-01T00:00:00 +0000",
+        )?;
+        repository.write("guide.md", b"untracked replacement\n")?;
+
+        let git = captured_git(&repository)?;
+        assert!(matches!(
+            git.prepare_document("guide.md", b"untracked replacement\n"),
+            DocumentPreparation::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn head_membership_is_relative_to_a_nested_indexed_root() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        repository.write("guide.md", b"root\n")?;
+        repository.write("docs/guide.md", b"nested\n")?;
+        repository.commit(
+            "add guides",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+
+        let nested_root = repository.path().join("docs");
+        let git = match RepositoryCapture::capture(&nested_root) {
+            RepositoryCapture::Git(git) => git,
+            RepositoryCapture::Unknown(diagnostic) => {
+                bail!("expected Git provenance: {}", diagnostic.detail)
+            }
+        };
+        assert!(matches!(
+            git.prepare_document("guide.md", b"nested\n"),
+            DocumentPreparation::Tracked(_)
+        ));
+
+        fs::remove_file(nested_root.join("guide.md"))?;
+        repository.commit(
+            "delete nested guide",
+            "2002-01-01T00:00:00 +0000",
+            "2002-01-01T00:00:00 +0000",
+        )?;
+        repository.write("docs/guide.md", b"untracked nested replacement\n")?;
+        let git = match RepositoryCapture::capture(&nested_root) {
+            RepositoryCapture::Git(git) => git,
+            RepositoryCapture::Unknown(diagnostic) => {
+                bail!("expected Git provenance: {}", diagnostic.detail)
+            }
+        };
+        assert!(matches!(
+            git.prepare_document("guide.md", b"untracked nested replacement\n"),
             DocumentPreparation::Unknown
         ));
         Ok(())

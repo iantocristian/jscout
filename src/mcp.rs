@@ -143,6 +143,57 @@ fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
     [major, minor, patch] >= minimum
 }
 
+fn initialize_result(
+    requested_protocol: &str,
+    binary_fingerprint: &str,
+    database_path: &Path,
+    profile: ToolProfile,
+    result_transport: ResultTransportPolicy,
+    client_info: &McpClientInfo,
+    runtime: &config::RuntimeConfig,
+) -> Value {
+    json!({
+        "protocolVersion": requested_protocol,
+        "capabilities": { "tools": {} },
+        "serverInfo": {
+            "name": "jscout",
+            "version": env!("CARGO_PKG_VERSION"),
+            "binaryFingerprint": binary_fingerprint,
+            "configurationFingerprint": runtime.fingerprint,
+            "database": database_path,
+            "configuration": {
+                "path": runtime.config_path,
+                "loaded": runtime.config_loaded,
+                "reload": "restart-required",
+            },
+            "retrievalDefaults": {
+                "vector": runtime.effective.search.vector,
+                "rerank": runtime.effective.search.rerank,
+                "memory": runtime.effective.search.attach_memory,
+                "expansion": runtime.effective.search.expansion.enabled,
+                "expansionMode": runtime.effective.search.expansion.mode,
+                "limit": runtime.effective.search.limit,
+                "responseBytes": runtime.effective.search.response_bytes,
+            },
+            "documentationRetrievalDefaults": {
+                "enabled": runtime.effective.docs.enabled,
+                "vector": runtime.effective.docs.search.vector,
+                "rerank": runtime.effective.docs.search.rerank,
+                "freshness": runtime.effective.docs.search.freshness,
+                "maxRankMovement": runtime.effective.docs.search.max_rank_movement,
+                "limit": runtime.effective.docs.search.limit,
+                "responseBytes": runtime.effective.docs.search.response_bytes,
+            },
+            "resultTransport": {
+                "policy": result_transport.as_str(),
+                "selected": result_transport.resolve(client_info).as_str(),
+                "textFallback": true,
+            },
+        },
+        "instructions": server_instructions(profile, runtime.effective.docs.enabled)
+    })
+}
+
 pub fn serve(
     root: &Path,
     database_path: &Path,
@@ -228,44 +279,15 @@ pub fn serve(
                     .unwrap_or("2025-06-18");
                 rpc_ok(
                     id,
-                    json!({
-                        "protocolVersion": requested,
-                        "capabilities": { "tools": {} },
-                        "serverInfo": {
-                            "name": "jscout",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "binaryFingerprint": binary_fingerprint,
-                            "configurationFingerprint": runtime.fingerprint,
-                            "database": database_path,
-                            "configuration": {
-                                "path": runtime.config_path,
-                                "loaded": runtime.config_loaded,
-                                "reload": "restart-required",
-                            },
-                            "retrievalDefaults": {
-                                "vector": runtime.effective.search.vector,
-                                "rerank": runtime.effective.search.rerank,
-                                "memory": runtime.effective.search.attach_memory,
-                                "expansion": runtime.effective.search.expansion.enabled,
-                                "expansionMode": runtime.effective.search.expansion.mode,
-                                "limit": runtime.effective.search.limit,
-                                "responseBytes": runtime.effective.search.response_bytes,
-                            },
-                            "documentationRetrievalDefaults": {
-                                "enabled": runtime.effective.docs.enabled,
-                                "vector": runtime.effective.docs.search.vector,
-                                "rerank": runtime.effective.docs.search.rerank,
-                                "limit": runtime.effective.docs.search.limit,
-                                "responseBytes": runtime.effective.docs.search.response_bytes,
-                            },
-                            "resultTransport": {
-                                "policy": result_transport.as_str(),
-                                "selected": result_transport.resolve(&client_info).as_str(),
-                                "textFallback": true,
-                            },
-                        },
-                        "instructions": server_instructions(profile, runtime.effective.docs.enabled)
-                    }),
+                    initialize_result(
+                        requested,
+                        &binary_fingerprint,
+                        database_path,
+                        profile,
+                        result_transport,
+                        &client_info,
+                        runtime,
+                    ),
                 )
             }
             "ping" => rpc_ok(id, json!({})),
