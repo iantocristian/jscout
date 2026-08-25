@@ -3,10 +3,9 @@ use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use oxc_allocator::Allocator;
 use oxc_parser::Parser as OxcParser;
 use oxc_span::SourceType;
@@ -65,18 +64,11 @@ pub struct CapturedDocument {
 /// paths remain a code-only input to workspace discovery; Markdown carries
 /// its captured bytes and its visible membership decisions beside them.
 #[derive(Debug)]
-pub struct RepositoryCorpus {
-    pub source_files: Vec<PathBuf>,
+pub(crate) struct RepositoryCorpus {
+    pub files: Vec<PathBuf>,
+    pub rejections: Vec<crate::walk::WalkRejection>,
     pub documents: Vec<CapturedDocument>,
     pub decisions: Vec<Decision>,
-    pub rejections: Vec<InventoryRejection>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InventoryRejection {
-    pub path: PathBuf,
-    pub stage: &'static str,
-    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,92 +153,48 @@ pub fn validate_patterns(include: &[String], exclude: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub fn scan_repository(root: &Path, options: &CorpusOptions) -> Result<RepositoryCorpus> {
-    scan_repository_with_capture(root, options, &capture_file)
+pub(crate) fn repository_inventory(
+    root: &Path,
+    options: &CorpusOptions,
+) -> Result<RepositoryCorpus> {
+    repository_inventory_with_consumer(root, options, &capture_file)
 }
 
+#[cfg(test)]
 fn scan_repository_with_capture(
     root: &Path,
     options: &CorpusOptions,
     capture: &dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
 ) -> Result<RepositoryCorpus> {
-    validate_patterns(&options.include, &options.exclude)?;
-    let canonical_root = root
-        .canonicalize()
-        .with_context(|| format!("canonicalize documentation root {}", root.display()))?;
-    if !canonical_root.is_dir() {
-        bail!(
-            "documentation root is not a directory: {}",
-            canonical_root.display()
-        );
-    }
+    repository_inventory_with_consumer(root, options, capture)
+}
 
-    let include = build_glob_set(&options.include, "include")?;
-    let exclude = build_glob_set(&options.exclude, "exclude")?;
-    let mut builder = WalkBuilder::new(&canonical_root);
-    builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .follow_links(false);
-    let mut matchers = builder.build_matchers();
-    let mut ignore = matchers
-        .pop()
-        .ok_or_else(|| anyhow!("documentation ignore matcher was not built"))?;
-
-    let mut scanner = Scanner {
-        root: &canonical_root,
-        options,
-        include,
-        exclude,
-        ignore: &mut ignore,
-        candidates: Vec::new(),
-        source_files: Vec::new(),
-        documents: Vec::new(),
-        decisions: Vec::new(),
-        rejections: Vec::new(),
-        capture,
-    };
-    // The code plane and documentation plane share this traversal, but their
-    // hidden-path policies intentionally differ. Keep each plane's descent
-    // state explicit so a docs-only prune cannot narrow the code inventory.
-    scanner.walk_repository()?;
-    scanner.acquire_candidates()?;
-    scanner
-        .source_files
-        .sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
-    scanner
-        .documents
-        .sort_by(|left, right| left.file.path.cmp(&right.file.path));
-    scanner.decisions.sort_by(|left, right| {
-        left.path
-            .as_bytes()
-            .cmp(right.path.as_bytes())
-            .then_with(|| left.subject.cmp(&right.subject))
-            .then_with(|| left.rule.cmp(&right.rule))
-    });
-    scanner.rejections.sort_by(|left, right| {
-        left.path
-            .as_os_str()
-            .cmp(right.path.as_os_str())
-            .then_with(|| left.stage.cmp(right.stage))
-    });
-    let source_files = std::mem::take(&mut scanner.source_files);
-    let documents = std::mem::take(&mut scanner.documents);
-    let decisions = std::mem::take(&mut scanner.decisions);
-    let rejections = std::mem::take(&mut scanner.rejections);
-    drop(scanner);
-    Ok(RepositoryCorpus {
-        source_files,
+fn repository_inventory_with_consumer(
+    root: &Path,
+    options: &CorpusOptions,
+    capture: &dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
+) -> Result<RepositoryCorpus> {
+    let documentation = DocumentationCollector::new(options, capture)?;
+    let inventory = crate::walk::repository_inventory(root, documentation)?;
+    let DocumentationCollection {
         documents,
         decisions,
-        rejections,
+    } = inventory.consumer;
+    Ok(RepositoryCorpus {
+        files: inventory.files,
+        rejections: inventory.rejections,
+        documents,
+        decisions,
     })
 }
 
-/// Parser-focused compatibility helper. Production indexing uses
-/// [`scan_repository`] so Markdown is never published through an independent
+#[cfg(test)]
+fn scan_repository(root: &Path, options: &CorpusOptions) -> Result<RepositoryCorpus> {
+    repository_inventory(root, options)
+}
+
+/// Parser-focused compatibility helper. Production indexing uses the shared
+/// repository inventory so Markdown is never published through an independent
 /// lifecycle or snapshot.
 #[cfg(test)]
 pub fn scan(root: &Path, options: &CorpusOptions) -> Result<Corpus> {
@@ -289,18 +237,22 @@ pub fn embedding_identity(nearest_heading: Option<&str>, rendered_body: &str) ->
     hasher.finalize().to_hex().to_string()
 }
 
-struct Scanner<'a> {
-    root: &'a Path,
+/// Documentation-plane consumer for the shared repository traversal. It owns
+/// Markdown/MDX membership, capture, and parsing; `walk::inventory` owns
+/// directory traversal and code-file selection.
+pub(crate) struct DocumentationCollector<'a> {
     options: &'a CorpusOptions,
     include: GlobSet,
     exclude: GlobSet,
-    ignore: &'a mut ignore::IncrementalIgnore,
     candidates: Vec<InventoryCandidate>,
-    source_files: Vec<PathBuf>,
     documents: Vec<CapturedDocument>,
     decisions: Vec<Decision>,
-    rejections: Vec<InventoryRejection>,
     capture: &'a dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
+}
+
+pub(crate) struct DocumentationCollection {
+    pub documents: Vec<CapturedDocument>,
+    pub decisions: Vec<Decision>,
 }
 
 #[derive(Debug)]
@@ -309,241 +261,101 @@ struct InventoryCandidate {
     normalized: String,
 }
 
-#[derive(Debug)]
-enum WalkTask {
-    Directory {
-        relative: PathBuf,
-        source_active: bool,
-        documentation_active: bool,
-    },
-    Entry {
-        relative: PathBuf,
-        absolute: PathBuf,
-        source_active: bool,
-        documentation_active: bool,
-    },
-}
-
-impl Scanner<'_> {
-    /// Walk with an explicit heap stack. Entry tasks are pushed in reverse
-    /// name order so popping the stack preserves the former sorted recursive
-    /// depth-first order, including each plane's independent descent state.
-    fn walk_repository(&mut self) -> Result<()> {
-        let mut pending = vec![WalkTask::Directory {
-            relative: PathBuf::new(),
-            source_active: true,
-            documentation_active: !self.options.include.is_empty(),
-        }];
-
-        while let Some(task) = pending.pop() {
-            let (relative, absolute, source_active, documentation_active) = match task {
-                WalkTask::Entry {
-                    relative,
-                    absolute,
-                    source_active,
-                    documentation_active,
-                } => (relative, absolute, source_active, documentation_active),
-                WalkTask::Directory {
-                    relative,
-                    source_active,
-                    documentation_active,
-                } => {
-                    let directory = self.root.join(&relative);
-                    let entries = match fs::read_dir(&directory) {
-                        Ok(entries) => entries,
-                        Err(error) => {
-                            self.handle_walk_error(&relative, &directory, error)?;
-                            continue;
-                        }
-                    };
-                    let mut collected = Vec::new();
-                    let mut failed = false;
-                    for entry in entries {
-                        match entry {
-                            Ok(entry) => collected.push(entry),
-                            Err(error) => {
-                                self.handle_walk_error(&relative, &directory, error)?;
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if failed {
-                        continue;
-                    }
-                    collected.sort_by_key(|entry| entry.file_name());
-                    pending.extend(collected.into_iter().rev().map(|entry| WalkTask::Entry {
-                        relative: relative.join(entry.file_name()),
-                        absolute: entry.path(),
-                        source_active,
-                        documentation_active,
-                    }));
-                    continue;
-                }
-            };
-
-            let metadata = match fs::symlink_metadata(&absolute) {
-                Ok(metadata) => metadata,
-                Err(error) if crate::io_policy::is_inventory_race(&error) => continue,
-                Err(error) if crate::io_policy::is_retryable(&error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "inspect documentation inventory entry {}",
-                            absolute.display()
-                        )
-                    });
-                }
-                Err(error) => {
-                    self.rejections.push(InventoryRejection {
-                        path: absolute,
-                        stage: "walk",
-                        error: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            let file_type = metadata.file_type();
-            let is_directory = file_type.is_dir();
-            let documentation_path_relevant = is_document_path(&relative)
-                || normalized_utf8_path(&relative).is_some_and(|path| self.include.is_match(path));
-
-            if is_directory && is_hard_skip(&relative) {
-                if documentation_active {
-                    self.decisions
-                        .push(decision(&relative, "directory", "hard-skip", None));
-                }
-                continue;
-            }
-
-            let (ignored, ignore_error) = self.ignore.matched_with_errors(&relative, is_directory);
-            if let Some(error) = ignore_error {
-                return Err(anyhow!(error.to_string())).with_context(|| {
-                    format!("load ignore rules while matching {}", absolute.display())
-                });
-            }
-            if ignored.is_ignore() {
-                if documentation_active && (is_directory || documentation_path_relevant) {
-                    self.decisions.push(decision(
-                        &relative,
-                        if is_directory { "directory" } else { "file" },
-                        "ignored",
-                        None,
-                    ));
-                }
-                continue;
-            }
-            // `WalkBuilder::hidden(true)` lets an ignore-file whitelist reopen
-            // a hidden entry. Preserve that legacy code-plane behavior while
-            // documentation applies its fixed allowlist independently below.
-            let source_entry_active = source_active
-                && (!relative.file_name().is_some_and(os_str_starts_with_dot)
-                    || ignored.is_whitelist());
-
-            if file_type.is_symlink() {
-                if documentation_active {
-                    self.decisions
-                        .push(decision(&relative, "entry", "symlink-not-followed", None));
-                }
-                continue;
-            }
-
-            let documentation_hidden = documentation_active && hidden_path_is_excluded(&relative);
-            if documentation_hidden && (is_directory || documentation_path_relevant) {
-                self.decisions.push(decision(
-                    &relative,
-                    if is_directory { "directory" } else { "file" },
-                    "hidden-not-allowlisted",
-                    None,
-                ));
-            }
-            let documentation_entry_active = documentation_active && !documentation_hidden;
-
-            if is_directory {
-                if source_entry_active || documentation_entry_active {
-                    pending.push(WalkTask::Directory {
-                        relative,
-                        source_active: source_entry_active,
-                        documentation_active: documentation_entry_active,
-                    });
-                }
-                continue;
-            }
-            if !file_type.is_file() {
-                // The code walker historically ignored non-file entries that
-                // were neither directories nor symlinks. Preserve that
-                // behavior for unrelated extensions, while a Markdown special
-                // file remains a documentation inventory failure.
-                if documentation_entry_active && is_document_path(&relative) {
-                    ensure_regular_inventory_file(&absolute, file_type)?;
-                }
-                continue;
-            }
-
-            if source_entry_active && crate::walk::is_indexable(&absolute) {
-                self.source_files.push(absolute.clone());
-            }
-            if !documentation_entry_active {
-                continue;
-            }
-
-            let Some(path) = normalized_utf8_path(&relative) else {
-                if is_document_path(&relative) {
-                    self.decisions
-                        .push(decision(&relative, "file", "non-utf8-path", None));
-                }
-                continue;
-            };
-            if !is_document_path(&relative) {
-                if self.include.is_match(&path) {
-                    self.decisions
-                        .push(decision(&relative, "file", "unsupported-extension", None));
-                }
-                continue;
-            }
-            if self.exclude.is_match(&path) {
-                self.decisions
-                    .push(decision(&relative, "file", "excluded", None));
-                continue;
-            }
-            if !self.include.is_match(&path) {
-                self.decisions
-                    .push(decision(&relative, "file", "not-included", None));
-                continue;
-            }
-
-            self.candidates.push(InventoryCandidate {
-                relative,
-                normalized: path,
-            });
-        }
-        Ok(())
+impl<'a> DocumentationCollector<'a> {
+    pub(crate) fn new(
+        options: &'a CorpusOptions,
+        capture: &'a dyn Fn(&Path, u64) -> std::io::Result<CapturedFile>,
+    ) -> Result<Self> {
+        validate_patterns(&options.include, &options.exclude)?;
+        Ok(Self {
+            options,
+            include: build_glob_set(&options.include, "include")?,
+            exclude: build_glob_set(&options.exclude, "exclude")?,
+            candidates: Vec::new(),
+            documents: Vec::new(),
+            decisions: Vec::new(),
+            capture,
+        })
     }
 
-    fn handle_walk_error(
-        &mut self,
-        relative_directory: &Path,
-        directory: &Path,
-        error: std::io::Error,
+    fn is_active(&self) -> bool {
+        !self.options.include.is_empty()
+    }
+
+    fn path_relevant(&self, relative: &Path) -> bool {
+        is_document_path(relative)
+            || normalized_utf8_path(relative).is_some_and(|path| self.include.is_match(path))
+    }
+
+    fn hidden_path_is_excluded(&self, relative: &Path) -> bool {
+        hidden_path_is_excluded(relative)
+    }
+
+    fn record_decision(&mut self, path: &Path, subject: &str, rule: &str, detail: Option<String>) {
+        self.decisions.push(decision(path, subject, rule, detail));
+    }
+
+    fn inspect_special_file(
+        &self,
+        relative: &Path,
+        absolute: &Path,
+        file_type: fs::FileType,
     ) -> Result<()> {
-        if relative_directory.as_os_str().is_empty() || crate::io_policy::is_retryable(&error) {
-            return Err(error)
-                .with_context(|| format!("discover repository under {}", directory.display()));
-        }
-        if !crate::io_policy::is_inventory_race(&error) {
-            self.rejections.push(InventoryRejection {
-                path: directory.to_path_buf(),
-                stage: "walk",
-                error: error.to_string(),
-            });
+        if is_document_path(relative) {
+            ensure_regular_inventory_file(absolute, file_type)?;
         }
         Ok(())
     }
 
-    fn acquire_candidates(&mut self) -> Result<()> {
+    fn inspect_regular_file(&mut self, relative: PathBuf) {
+        let Some(path) = normalized_utf8_path(&relative) else {
+            if is_document_path(&relative) {
+                self.record_decision(&relative, "file", "non-utf8-path", None);
+            }
+            return;
+        };
+        if !is_document_path(&relative) {
+            if self.include.is_match(&path) {
+                self.record_decision(&relative, "file", "unsupported-extension", None);
+            }
+            return;
+        }
+        if self.exclude.is_match(&path) {
+            self.record_decision(&relative, "file", "excluded", None);
+            return;
+        }
+        if !self.include.is_match(&path) {
+            self.record_decision(&relative, "file", "not-included", None);
+            return;
+        }
+        self.candidates.push(InventoryCandidate {
+            relative,
+            normalized: path,
+        });
+    }
+
+    fn finish(mut self, root: &Path) -> Result<DocumentationCollection> {
+        self.acquire_candidates(root)?;
+        self.documents
+            .sort_by(|left, right| left.file.path.cmp(&right.file.path));
+        self.decisions.sort_by(|left, right| {
+            left.path
+                .as_bytes()
+                .cmp(right.path.as_bytes())
+                .then_with(|| left.subject.cmp(&right.subject))
+                .then_with(|| left.rule.cmp(&right.rule))
+        });
+        Ok(DocumentationCollection {
+            documents: self.documents,
+            decisions: self.decisions,
+        })
+    }
+
+    fn acquire_candidates(&mut self, root: &Path) -> Result<()> {
         self.candidates
             .sort_by(|left, right| left.normalized.as_bytes().cmp(right.normalized.as_bytes()));
         for candidate in std::mem::take(&mut self.candidates) {
-            let absolute = self.root.join(&candidate.relative);
+            let absolute = root.join(&candidate.relative);
             match (self.capture)(&absolute, self.options.max_file_bytes) {
                 Ok(CapturedFile::Oversized) => {
                     self.decisions
@@ -604,6 +416,43 @@ impl Scanner<'_> {
             }
         }
         Ok(())
+    }
+}
+
+impl crate::walk::RepositoryInventoryConsumer for DocumentationCollector<'_> {
+    type Output = DocumentationCollection;
+
+    fn is_active(&self) -> bool {
+        DocumentationCollector::is_active(self)
+    }
+
+    fn path_relevant(&self, relative: &Path) -> bool {
+        DocumentationCollector::path_relevant(self, relative)
+    }
+
+    fn hidden_path_is_excluded(&self, relative: &Path) -> bool {
+        DocumentationCollector::hidden_path_is_excluded(self, relative)
+    }
+
+    fn record_decision(&mut self, path: &Path, subject: &str, rule: &str, detail: Option<String>) {
+        DocumentationCollector::record_decision(self, path, subject, rule, detail);
+    }
+
+    fn inspect_special_file(
+        &self,
+        relative: &Path,
+        absolute: &Path,
+        file_type: fs::FileType,
+    ) -> Result<()> {
+        DocumentationCollector::inspect_special_file(self, relative, absolute, file_type)
+    }
+
+    fn inspect_regular_file(&mut self, relative: PathBuf) {
+        DocumentationCollector::inspect_regular_file(self, relative);
+    }
+
+    fn finish(self, root: &Path) -> Result<Self::Output> {
+        DocumentationCollector::finish(self, root)
     }
 }
 
@@ -710,15 +559,6 @@ fn contains_unescaped(value: &str, needle: u8) -> bool {
         }
     }
     false
-}
-
-fn is_hard_skip(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| {
-        name == ".git"
-            || name
-                .to_str()
-                .is_some_and(|name| crate::walk::SKIP_DIRS.contains(&name))
-    })
 }
 
 fn hidden_path_is_excluded(path: &Path) -> bool {
@@ -2048,7 +1888,7 @@ mod tests {
                 ..CorpusOptions::default()
             },
         )?;
-        assert_eq!(inventory.source_files, [root.join("main.ts")]);
+        assert_eq!(inventory.files, [root.join("main.ts")]);
         assert!(inventory.documents.is_empty());
         assert!(inventory.decisions.is_empty());
         Ok(())
@@ -2097,7 +1937,7 @@ mod tests {
         assert_eq!(result, 0);
 
         let inventory = scan_repository(repo.path(), &CorpusOptions::default())?;
-        assert!(inventory.source_files.is_empty());
+        assert!(inventory.files.is_empty());
         assert!(inventory.documents.is_empty());
 
         let markdown_repo = tempfile::tempdir()?;
@@ -2132,7 +1972,7 @@ mod tests {
 
         assert_eq!(
             inventory
-                .source_files
+                .files
                 .iter()
                 .map(|path| path.file_name().unwrap())
                 .collect::<Vec<_>>(),
@@ -2208,7 +2048,7 @@ mod tests {
         fs::write(directory.join("deep.mdx"), "# Deep\n\nContent.\n")?;
 
         let inventory = scan_repository(&root, &CorpusOptions::default())?;
-        assert_eq!(inventory.source_files, [directory.join("deep.ts")]);
+        assert_eq!(inventory.files, [directory.join("deep.ts")]);
         assert_eq!(inventory.documents.len(), 1);
         assert!(inventory.documents[0].file.path.ends_with("deep.mdx"));
         Ok(())
