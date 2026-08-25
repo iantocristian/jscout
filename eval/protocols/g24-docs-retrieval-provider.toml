@@ -1,0 +1,28 @@
+version = 1
+
+[docs.search]
+vector = true
+rerank = true
+limit = 20
+response_bytes = 1048576
+
+[embedding]
+provider = "local"
+model = "BAAI/bge-m3"
+revision = "5617a9f61b028005a4858fdac845db406aefb181"
+batch = 64
+
+[inference]
+url = "http://127.0.0.1:8792"
+batch_size = 16
+max_length = 4096
+
+[reranker]
+url = "http://127.0.0.1:8792/rerank"
+model = "BAAI/bge-reranker-v2-m3"
+revision = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
+top = 50
+max_chars = 4000
+
+[llm]
+auth_file = ".jscout-eval-unused-auth.json"

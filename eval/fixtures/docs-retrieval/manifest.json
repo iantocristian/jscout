@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "suite": "g24-atlas-relay-docs-retrieval",
+  "commits": [
+    {
+      "id": "c01-foundation",
+      "date": "2024-01-15T10:00:00Z",
+      "message": "docs: publish Atlas Relay reference",
+      "overlay": {
+        "docs/changelog.md": "layers/c01-foundation/docs/changelog.md",
+        "docs/guides/authentication.md": "layers/c01-foundation/docs/guides/authentication.md",
+        "docs/guides/consumer-control.md": "layers/c01-foundation/docs/guides/consumer-control.md",
+        "docs/legacy/relay-v1-authentication.md": "layers/c01-foundation/docs/legacy/relay-v1-authentication.md",
+        "docs/operations/retries.md": "layers/c01-foundation/docs/operations/retries.md",
+        "docs/reference/delivery.md": "layers/c01-foundation/docs/reference/delivery.md",
+        "docs/reference/filter-expressions.mdx": "layers/c01-foundation/docs/reference/filter-expressions.mdx",
+        "docs/reference/routing.md": "layers/c01-foundation/docs/reference/routing.md",
+        "docs/reference/signatures.md": "layers/c01-foundation/docs/reference/signatures.md"
+      }
+    },
+    {
+      "id": "c02-relay-v2",
+      "date": "2024-06-10T10:00:00Z",
+      "message": "docs: switch publishers to Relay v2 authentication",
+      "overlay": {
+        "docs/guides/authentication.md": "layers/c02-relay-v2/docs/guides/authentication.md"
+      }
+    },
+    {
+      "id": "c03-recent-noise",
+      "date": "2025-02-20T10:00:00Z",
+      "message": "docs: announce console and telemetry updates",
+      "overlay": {
+        "docs/announcements/console-partitions.md": "layers/c03-recent-noise/docs/announcements/console-partitions.md",
+        "docs/changelog.md": "layers/c03-recent-noise/docs/changelog.md"
+      }
+    },
+    {
+      "id": "c04-nonsemantic-edits",
+      "date": "2025-08-12T10:00:00Z",
+      "message": "docs: normalize delivery headings and retry formatting",
+      "overlay": {
+        "docs/operations/retries.md": "layers/c04-nonsemantic-edits/docs/operations/retries.md",
+        "docs/reference/delivery.md": "layers/c04-nonsemantic-edits/docs/reference/delivery.md"
+      }
+    },
+    {
+      "id": "c05-restructure",
+      "date": "2026-01-15T10:00:00Z",
+      "message": "docs: rename signature guide and split consumer controls",
+      "overlay": {
+        "docs/guides/consumer-control.md": "layers/c05-restructure/docs/guides/consumer-control.md",
+        "docs/reference/webhook-signatures.md": "layers/c05-restructure/docs/reference/webhook-signatures.md"
+      },
+      "delete": [
+        "docs/reference/signatures.md"
+      ]
+    }
+  ],
+  "variants": [
+    {
+      "id": "clean",
+      "kind": "clean"
+    },
+    {
+      "id": "shallow",
+      "kind": "shallow",
+      "depth": 2
+    },
+    {
+      "id": "non_git",
+      "kind": "non_git"
+    },
+    {
+      "id": "dirty",
+      "kind": "dirty",
+      "overlay": {
+        "docs/guides/authentication.md": "variants/dirty/docs/guides/authentication.md"
+      }
+    },
+    {
+      "id": "staged",
+      "kind": "staged",
+      "overlay": {
+        "docs/operations/emergency-drain.md": "variants/staged/docs/operations/emergency-drain.md",
+        "docs/operations/retries.md": "variants/staged/docs/operations/retries.md"
+      }
+    },
+    {
+      "id": "untracked",
+      "kind": "untracked",
+      "overlay": {
+        "docs/sdk/token-rollover.mdx": "variants/untracked/docs/sdk/token-rollover.mdx"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "auth-current-vs-v1",
+      "query": "Which HTTP header should an Atlas Relay v2 publisher use to authenticate a publish request?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "conflict",
+      "current": [
+        {
+          "answer_id": "atlas.auth.publish-header.v2",
+          "path": "docs/guides/authentication.md",
+          "heading": "Authentication > Relay v2 requests"
+        }
+      ],
+      "older_conflicts": [
+        {
+          "answer_id": "atlas.auth.publish-header.v1",
+          "path": "docs/legacy/relay-v1-authentication.md",
+          "heading": "Relay v1 authentication > API-key header"
+        }
+      ],
+      "recent_irrelevant": [
+        {
+          "answer_id": "noise.changelog.auth-metric",
+          "path": "docs/changelog.md",
+          "heading": "Atlas Relay changelog > 2025-02-20"
+        }
+      ]
+    },
+    {
+      "id": "ambiguous-api-key-header",
+      "query": "What API-key HTTP header should an Atlas Relay publisher send with publish requests?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "conflict",
+      "current": [
+        {
+          "answer_id": "atlas.auth.publish-header.v2",
+          "path": "docs/guides/authentication.md",
+          "heading": "Authentication > Relay v2 requests"
+        }
+      ],
+      "older_conflicts": [
+        {
+          "answer_id": "atlas.auth.publish-header.v1",
+          "path": "docs/legacy/relay-v1-authentication.md",
+          "heading": "Relay v1 authentication > API-key header"
+        }
+      ],
+      "recent_irrelevant": [
+        {
+          "answer_id": "noise.changelog.auth-metric",
+          "path": "docs/changelog.md",
+          "heading": "Atlas Relay changelog > 2025-02-20"
+        }
+      ]
+    },
+    {
+      "id": "evergreen-partition-assignment",
+      "query": "How does Atlas Relay assign an event to a partition from its route key?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "evergreen",
+      "current": [
+        {
+          "answer_id": "atlas.routing.partition-assignment",
+          "path": "docs/reference/routing.md",
+          "heading": "Routing specification > Partition assignment"
+        }
+      ],
+      "recent_irrelevant": [
+        {
+          "answer_id": "noise.console.partition-panel",
+          "path": "docs/announcements/console-partitions.md",
+          "heading": "Console refresh > Partition activity panel"
+        }
+      ]
+    },
+    {
+      "id": "canonical-retry-after",
+      "query": "After Atlas Relay returns 429 Too Many Requests, when should a producer retry?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "canonical",
+      "current": [
+        {
+          "answer_id": "atlas.retry.rate-limit-delay",
+          "path": "docs/operations/retries.md",
+          "heading": "Retry policy > Rate-limit responses"
+        }
+      ],
+      "recent_irrelevant": [
+        {
+          "answer_id": "noise.changelog.retry-telemetry",
+          "path": "docs/changelog.md",
+          "heading": "Atlas Relay changelog > 2025-02-20"
+        }
+      ]
+    },
+    {
+      "id": "heading-only-acknowledgment-window",
+      "query": "How long may an Atlas Relay consumer wait before acknowledging a delivery?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "continuity",
+      "current": [
+        {
+          "answer_id": "atlas.delivery.acknowledgment-window",
+          "path": "docs/reference/delivery.md",
+          "heading": "Delivery behavior > Acknowledgment window"
+        }
+      ]
+    },
+    {
+      "id": "pure-rename-webhook-signature",
+      "query": "Which bytes does Atlas Relay sign when it creates a webhook signature?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "continuity",
+      "current": [
+        {
+          "answer_id": "atlas.webhook.signature-input",
+          "path": "docs/reference/webhook-signatures.md",
+          "heading": "Webhook signatures > Signature input"
+        }
+      ]
+    },
+    {
+      "id": "split-consumer-controls",
+      "query": "How do operators pause and then resume an Atlas Relay consumer?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "continuity",
+      "current": [
+        {
+          "answer_id": "atlas.consumer.pause",
+          "path": "docs/guides/consumer-control.md",
+          "heading": "Consumer control > Pause a consumer"
+        },
+        {
+          "answer_id": "atlas.consumer.resume",
+          "path": "docs/guides/consumer-control.md",
+          "heading": "Consumer control > Resume a consumer"
+        }
+      ]
+    },
+    {
+      "id": "mdx-filter-operators",
+      "query": "Which operators may an Atlas Relay subscription filter use?",
+      "variants": [
+        "clean",
+        "shallow",
+        "non_git",
+        "dirty",
+        "staged",
+        "untracked"
+      ],
+      "category": "canonical",
+      "current": [
+        {
+          "answer_id": "atlas.filters.supported-operators",
+          "path": "docs/reference/filter-expressions.mdx",
+          "heading": "Filter expressions > Supported operators"
+        }
+      ]
+    },
+    {
+      "id": "dirty-delegated-session-token",
+      "query": "Where does a local Atlas Relay test put a delegated session token?",
+      "variants": [
+        "dirty"
+      ],
+      "category": "working_tree",
+      "current": [
+        {
+          "answer_id": "atlas.auth.delegated-session-token",
+          "path": "docs/guides/authentication.md",
+          "heading": "Authentication > Relay v2 requests"
+        }
+      ]
+    },
+    {
+      "id": "staged-retry-budget",
+      "query": "What is the total retry budget for an Atlas Relay publish request?",
+      "variants": [
+        "staged"
+      ],
+      "category": "working_tree",
+      "current": [
+        {
+          "answer_id": "atlas.retry.total-budget",
+          "path": "docs/operations/retries.md",
+          "heading": "Retry policy > Retry budget"
+        }
+      ]
+    },
+    {
+      "id": "staged-new-emergency-drain",
+      "query": "Which command drains an Atlas Relay consumer without accepting new deliveries?",
+      "variants": [
+        "staged"
+      ],
+      "category": "working_tree",
+      "current": [
+        {
+          "answer_id": "atlas.consumer.emergency-drain",
+          "path": "docs/operations/emergency-drain.md",
+          "heading": "Emergency drain > Drain command"
+        }
+      ]
+    },
+    {
+      "id": "untracked-mdx-token-rollover",
+      "query": "How long do Atlas Relay SDK tokens overlap during rollover?",
+      "variants": [
+        "untracked"
+      ],
+      "category": "working_tree",
+      "current": [
+        {
+          "answer_id": "atlas.sdk.token-rollover-overlap",
+          "path": "docs/sdk/token-rollover.mdx",
+          "heading": "SDK token rollover > Overlap window"
+        }
+      ]
+    }
+  ]
+}

@@ -2,10 +2,11 @@
 
 - Date: 2026-08-24; revised 2026-08-25 — storage moved into the main index
   per [g24-adr-one-store-separate-ranking-2026-08-25.md](g24-adr-one-store-separate-ranking-2026-08-25.md).
-- Status: implementation contract incorporated by reference from the Proposed
-  G24 entry in [PLAN.md](../../PLAN.md). It has authority only through that
-  entry; PLAN.md remains the roadmap and wins any explicit conflict. Review
-  findings and decisions are recorded on PR #96.
+- Status: implementation contract incorporated by reference from the G24 entry
+  in [PLAN.md](../../PLAN.md); phases 1, 2, and 4 are implemented and phase 3
+  is pending. It has authority only through that entry; PLAN.md remains the
+  roadmap and wins any explicit conflict. Review findings and decisions are
+  recorded on PR #96.
 - Scope: a repository-documentation corpus inside the main index, with its
   own lexical/vector ranking corpus, surface, and bounded, order-based
   freshness.
@@ -787,6 +788,14 @@ copies. Measure current-answer top-k recall, older-conflict visibility,
 evergreen regressions, BM25-only parity, vector/hybrid lift, and how many
 result orders change solely due to freshness, comparing `--no-freshness`
 against movement bounds of 1–3.
+
+The fixed [corpus](../../eval/fixtures/docs-retrieval/manifest.json),
+[pre-registration](../../eval/prereg/g24-documentation-freshness-2026-08-25.md),
+[conflict-arm addendum](../../eval/prereg/g24-documentation-freshness-addendum-2026-08-25.md),
+and Phase 2 [human](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.md)
+and [machine](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.json)
+reports record the entry gate. They do not select a freshness default; that
+decision remains part of the Phase 3 candidate evaluation.
 
 ## Open items
 
