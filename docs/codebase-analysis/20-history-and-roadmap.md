@@ -1,6 +1,6 @@
 # Development history and roadmap
 
-jscout's entire history is nineteen calendar days: 527 commits from `Initial js-rag implementation` on 2026-08-07 to `823b836` on 2026-08-25, all authored by one person, with pull requests numbered through #105. The development method is unusual enough to be worth stating mechanically: a single normative document, `PLAN.md` (3,520 lines), holds every design contract; work is organized into numbered gates G1–G25, each of which is a section in that file carrying a status word in its own heading, a contract, and an explicit acceptance clause; evidence for the decisions sits under `eval/` as dated, never-rewritten result files. The consequence — visible at this commit — is that the roadmap's status is a hand-maintained string in a Markdown heading, and it drifts. G24's heading still reads "Proposed" while two of its four delivery phases are compiled into the binary. This document reconstructs the timeline from the commit log, describes how a gate actually works, audits each gate heading against the source tree, and records the directions that were dropped rather than deferred.
+jscout's entire history is nineteen calendar days: 530 commits from `Initial js-rag implementation` on 2026-08-07 to `ebacdf1` on 2026-08-25, all authored by one person, with pull requests numbered through #108 (93 merged). The development method is unusual enough to be worth stating mechanically: a single normative document, `PLAN.md` (3,520 lines), holds every design contract; work is organized into numbered gates G1–G25, each of which is a section in that file carrying a status word in its own heading, a contract, and an explicit acceptance clause; evidence for the decisions sits under `eval/` as dated, never-rewritten result files. The consequence — visible at this commit — is that the roadmap's status is a hand-maintained string in a Markdown heading, and it drifts. G24's heading still reads "Proposed" while two of its four delivery phases are compiled into the binary. This document reconstructs the timeline from the commit log, describes how a gate actually works, audits each gate heading against the source tree, and records the directions that were dropped rather than deferred.
 
 ## Timeline by phase
 
@@ -16,9 +16,9 @@ Commit dates cluster into nine working phases. Counts are commits per day from `
 | 08-18 – 08-19 | 31 | Exact-identifier dominance (G17) and task-directed semantic selection (G18) in #50, v0.3.0, watcher recovery semantics |
 | 08-20 – 08-21 | 111 | Compact transport G20a (#60), path transport G20b (#62), repository runtime configuration G21 (#59), module-split refactor ladder, clippy lint ratchet, filesystem test seams, performance indexes, v0.4.0 (#64) |
 | 08-22 – 08-23 | 37 | Checker precision work (closed candidate sets, grouped scopes, package gate, family semantics, receiver value flow), exhaustive lexical search G22 (#91–#93) |
-| 08-24 – 08-25 | 37 | G23 skill/MCP guidance, configurable scout model concurrency (#97), watch rejection dedup (#98), G24 documentation corpus and retrieval (#104, #102, #105) |
+| 08-24 – 08-25 | 40 | G23 skill/MCP guidance, configurable scout model concurrency (#97), watch rejection dedup (#98), G24 documentation corpus and retrieval (#104, #102, #105), shared repository inventory extracted back into `walk` (#108) |
 
-The shape to notice below: two long build ramps (08-09→08-14 and 08-15→08-21) separated by an evaluation-heavy middle, and a final compressed burst in which an entire subsystem — `src/docs/` at 5,495 lines across four modules — landed in two days.
+The shape to notice below: two long build ramps (08-09→08-14 and 08-15→08-21) separated by an evaluation-heavy middle, and a final compressed burst in which an entire subsystem — `src/docs/` at 5,335 lines across four modules, once PR #108 lifted its traversal engine back into `src/walk/inventory.rs` — landed in two days.
 
 ```mermaid
 gantt
@@ -66,7 +66,7 @@ The weak link is that the status word is edited by hand, in a separate commit fr
 
 ## Gate status audited against the tree
 
-| Gate | Heading in `PLAN.md` | Verified at `823b836` |
+| Gate | Heading in `PLAN.md` | Verified at `ebacdf1` |
 |---|---|---|
 | G1–G5 workflow scouting | `Implemented` (:362) | Built |
 | G6 symbol cards | `Implemented` (:388) | Built |
@@ -96,9 +96,22 @@ Two headings (G11, G12) carry no status word at all, which is why the convention
 
 `git log -S'## Proposed G24 — repository documentation retrieval' -- PLAN.md` returns exactly one commit: `e6891c5`, `docs(plan): add proposed G24 and revise markdown retrieval plan`, dated 2026-08-24. No later commit touched that string. The implementation merged the next day in `c07eaa1` (#104, `codex/g24-docs-indexing`), `23af695` (#102, `g24-snapshot-log`), and `823b836` (#105, `g24-unified-storage`), and the heading was never revisited.
 
-What phases 1 and 2 delivered is checkable. `src/docs/corpus.rs` (2,708 lines), `src/docs/retrieval.rs` (2,299), `src/docs/store.rs` (470), and `src/commands/docs.rs` (214) exist. `src/store.rs` creates `docs_fts`, `doc_chunk_meta`, `doc_inventory`, `doc_embedding_index_entries`, `doc_vector_generations`, and the dimension-named `vec_doc_embeddings_N` family (`src/store.rs:42`, `:225`, `:368`). `SCHEMA_VERSION` is `"31"` (`src/store.rs:8`), three versions past what the plan's own baseline table still records. The ownership inversion is the sharpest evidence that this is not a proposal: `walk::repository_inventory` no longer walks — it calls `crate::docs::corpus::scan_repository` and unpacks the result into code files and documents (`src/walk.rs:169`). The documentation module now owns the single deterministic traversal that produces the code plane's file list.
+What phases 1 and 2 delivered is checkable. `src/docs/corpus.rs` (2,548 lines), `src/docs/retrieval.rs` (2,299), `src/docs/store.rs` (470), and `src/commands/docs.rs` (214) exist. `src/store.rs` creates `docs_fts`, `doc_chunk_meta`, `doc_inventory`, `doc_embedding_index_entries`, `doc_vector_generations`, and the dimension-named `vec_doc_embeddings_N` family (`src/store.rs:42`, `:225`, `:368`). `SCHEMA_VERSION` is `"31"` (`src/store.rs:8`), three versions past what the plan's own baseline table still records. The shared traversal is the sharpest evidence that this is not a proposal: one deterministic walk produces the code file list and the captured documents together, so Markdown is never published through an independent lifecycle. Which module *owns* that walk changed one commit later, in PR #108, covered in the next section.
 
 What phases 3 and 4 did not deliver is equally checkable. Grepping `src/` for `max_rank_movement`, `doc_block_state`, `no_freshness`, and `line-porcelain` returns nothing: the bounded order-based freshness reorder and the git-blame provenance basis are contract text only. `snapshot_log` — the durable ordered snapshot clock that two `docs(plan):` commits on 08-25 adopted specifically to give the observation ledger a baseline — likewise appears nowhere in `src/`, despite the branch name `g24-snapshot-log`. Phase 4, documentation-aware watch classification, is absent in a way that is user-visible: `src/watch.rs:521` still admits filesystem events through `walk::is_indexable`, which accepts only JS/TS extensions, so editing a `.md` file alone triggers no watch generation. Documentation is reindexed only when a code change happens to trigger one.
+
+## The layering inversion and its correction
+
+Phase 1 bought the shared traversal at the price of a backwards dependency. At `823b836`, `walk::repository_inventory` no longer walked: it called `crate::docs::corpus::scan_repository` and unpacked the result into code files and documents, and `src/walk.rs` opened with a module-level `use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision};`. The older, more general module depended on the newer, narrower one, and `walk`'s own result type named documentation types. This is the one G24 consequence that was a layering defect rather than a design choice, and it survived exactly one day.
+
+PR #108 reversed it in two commits, both dated 08-25 and neither touching `PLAN.md`:
+
+| Commit | Change |
+|---|---|
+| `b92485c` "refactor: centralize shared repository inventory" | Moved the traversal engine out of `docs/corpus.rs` into a new `src/walk/inventory.rs` — the explicit `WalkTask` stack, sorted depth-first order, ignore-matcher handling, `io_policy` error classification — and added the `RepositoryInventoryConsumer` trait to `walk.rs`. `corpus.rs` shed 176 lines net (318 removed against 142 added); `inventory.rs` was created at 267. |
+| `03d5b50` "refactor: make repository walk plane-agnostic" | Made `RepositoryInventory<T>` generic over the consumer's output type (`src/walk.rs:49`), deleted `walk`'s `CorpusOptions`-typed wrapper and its test-only capture hook, promoted `RepositoryCorpus` out of `#[cfg(test)]` into a production type, and repointed the call site at `src/indexer.rs:385` from `walk::` to `corpus::repository_inventory`. |
+
+At `ebacdf1` the dependency runs the ordinary way. `src/walk.rs` (506 lines) carries no module-level `use crate::docs`; its only `docs` reference sits inside `#[cfg(test)]` at `src/walk.rs:244`. The trait is declared at `src/walk.rs:58` and the generic entry point at `:187`; `src/walk/inventory.rs` (263 lines) holds the engine; `src/docs/corpus.rs:422` implements the trait for `DocumentationCollector`, and `src/docs/corpus.rs:156` is the wrapper that indexing calls. `docs::corpus::scan_repository` survives only as a `#[cfg(test)]` alias. The trait is `pub(crate)` with exactly one implementor — it exists to invert the dependency edge, not to support plural consumers. G24's single-traversal guarantee is unchanged; only the arrow flipped, which is why no gate status moved.
 
 ## What is planned and unbuilt
 

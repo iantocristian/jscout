@@ -144,13 +144,13 @@ The launcher itself is well covered by comparison. `npm/cli/bin/jscout.mjs` read
 
 ## Test organization
 
-570 `#[test]` functions live in one binary across 87 `.rs` files totalling 91,174 lines. `cargo test --all-targets --all-features` (`ci.yml:20`) compiles exactly one unit-test binary rooted at `src/main.rs`; every test is a private-item test inside it, and `--all-features` is inert because there is no feature table.
+570 `#[test]` functions live in one binary across 88 `.rs` files totalling 91,282 lines. `cargo test --all-targets --all-features` (`ci.yml:20`) compiles exactly one unit-test binary rooted at `src/main.rs`; every test is a private-item test inside it, and `--all-features` is inert because there is no feature table.
 
 | Shape | Modules | Tests | Lines |
 | --- | --- | --- | --- |
 | Sibling `tests.rs` files | 20 | 398 | 25,325 |
 | Inline `#[cfg(test)] mod tests { … }` | 29 | 172 | ~6,950 |
-| **Total Rust** | — | **570** | ~32,300 test lines of 91,174 (~35%) |
+| **Total Rust** | — | **570** | ~31,700 test lines of 91,282 (~35%) |
 
 The largest sibling files are `src/checker/enrich/tests.rs` (45 tests / 3,638 lines), `src/scouting/tests.rs` (45 / 3,428), `src/indexer/tests.rs` (36 / 2,719), `src/structural/tests.rs` (39 / 2,465), `src/search/tests.rs` (31 / 2,178) and `src/mcp/tests.rs` (28 / 1,993). The newest subsystems did not adopt the sibling convention: all 44 docs tests are inline blocks — `src/docs/corpus.rs` (27 tests / 817 lines), `src/docs/retrieval.rs` (14 / 990), `src/docs/store.rs` (3) — and `src/commands/docs.rs` has none. Scout concurrency landed the same way, with 13 inline tests in `src/scouting/repository.rs` and 11 in `src/llm/process.rs`. `src/commands/core.rs:485-486` is the only `#[path]` rename in the tree; `src/main.rs` declares `mod test_fs;` (`:40-41`) and `mod main_tests;` (`:80-81`) by plain name, with `#[cfg(test)] use` re-exports at `:72-78` letting `main_tests` reach `src/cli.rs` and `src/commands/` because neither carries a `#[test]` of its own.
 

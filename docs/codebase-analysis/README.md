@@ -1,8 +1,8 @@
 # jscout codebase analysis
 
-A structural analysis of the jscout codebase as of **2026-08-25**, commit `823b836` on `main`. It describes what the code does and how, from reading the source. Where these documents and `PLAN.md` disagree, they describe the code as it stands — and in one case ([20](20-history-and-roadmap.md)) they say so explicitly, because a `PLAN.md` gate heading is stale.
+A structural analysis of the jscout codebase on `main`, current as of the repository-walk refactors `b92485c` and `03d5b50`. It describes what the code does and how, from reading the source. Where these documents and `PLAN.md` disagree, they describe the code as it stands — and in one case ([20](20-history-and-roadmap.md)) they say so explicitly, because a `PLAN.md` gate heading is stale.
 
-Scope: 87 Rust files and 91,174 lines (570 tests), a documentation corpus subsystem, two Node sidecars, one Python inference service, an npm distribution, and a Node evaluation harness. Crate 0.4.0, schema v31, 47 tables.
+Scope: 88 Rust files and 91,282 lines (570 tests), a documentation corpus subsystem, two Node sidecars, one Python inference service, an npm distribution, and a Node evaluation harness. Crate 0.4.0, schema v31, 47 tables.
 
 > **Replaces `docs/codebase-analysis/`.** Twenty-seven commits and +12,161 lines landed in a day: an entire `src/docs/` subsystem for unified Markdown retrieval, scout model concurrency, and a schema jump from v29 to v31. If you read the earlier set, start at [22](22-delta-since-2026-08-24.md).
 
@@ -37,7 +37,8 @@ Start with the overview. After that the documents are independent.
 
 ## Conventions
 
-- Citations are repo-relative with a line number, `src/file.rs:123`, valid at `823b836`. They drift fast — this codebase moved 12,000 lines in a day.
+- Citations are repo-relative with a line number, `src/file.rs:123`, valid at the tip of `main` when this version was written. They drift fast — this codebase has moved 12,000 lines in a day.
+- Earlier versions of this document set live at this same path in git history; `git log --follow -- docs/codebase-analysis/README.md` lists them.
 - Most modules are `foo.rs` plus a sibling `foo/tests.rs`. A citation into test coverage points at the sibling.
 - **"Corpus"** means `code` or `documentation`, the partition stored in `files.corpus`. `code_files` and `code_chunks` are views over `files` and `chunks` filtered to the code corpus, not tables.
 - **"Mode"** means ranked or exhaustive code retrieval. **"Tier"** means the exact or hybrid lane inside ranked mode. Neither means confidence.

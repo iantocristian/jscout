@@ -1,6 +1,6 @@
 # End-to-end execution traces
 
-Four traces follow one request each from process entry to the bytes the caller reads, naming the function and line that does the work at commit `823b836`. The first walks a cold index of a repository containing both JavaScript and Markdown, where a single filesystem traversal feeds two admission policies and two storage shapes that meet again only at one `meta` row. The second follows a documentation query through the read-only gate, BM25, an optional vector generation, fusion, and a byte budget. The third follows a single-identifier code query through the exact tier computed beside the hybrid pipeline. The fourth follows a scouting wave with `max_concurrency` above one, where exactly one region of the loop overlaps and everything touching the database does not. Each trace ends with how it fails.
+Four traces follow one request each from process entry to the bytes the caller reads, naming the function and line that does the work at commit `03d5b50`. The first walks a cold index of a repository containing both JavaScript and Markdown, where a single filesystem traversal feeds two admission policies and two storage shapes that meet again only at one `meta` row. The second follows a documentation query through the read-only gate, BM25, an optional vector generation, fusion, and a byte budget. The third follows a single-identifier code query through the exact tier computed beside the hybrid pipeline. The fourth follows a scouting wave with `max_concurrency` above one, where exactly one region of the loop overlaps and everything touching the database does not. Each trace ends with how it fails.
 
 ---
 
@@ -22,15 +22,15 @@ Command: `jscout index /repo`, with no `.jscout.db` present.
 
 | # | Step | Location |
 |---|---|---|
-| 6 | `walk::repository_inventory` is a thin adapter that delegates the run's only filesystem traversal to `docs::corpus::scan_repository` | `src/indexer.rs:385`, `src/walk.rs:169` |
-| 7 | `Scanner::walk_repository` uses an explicit heap stack, children pushed in reverse `file_name()` order so popping reproduces sorted DFS. Each task carries two independent descent bits, `source_active` and `documentation_active` | `src/docs/corpus.rs:331` |
-| 8 | Per entry: `symlink_metadata`; an inventory race is skipped silently, a retryable I/O error aborts the whole inventory, anything else records a `walk` rejection. `is_hard_skip` prunes `.git` and `walk::SKIP_DIRS` for both planes | `src/docs/corpus.rs:381`, `:404` |
-| 9 | **Plane divergence, hidden files.** The code plane keeps hidden entries out unless an ignore-file whitelist re-includes them; the documentation plane uses a fixed root allowlist `[".github",".claude",".agents"]` with no whitelist escape | `src/docs/corpus.rs:432`, `:445`, `:724` |
-| 10 | Regular file, code plane: `walk::is_indexable` (extension in `js jsx ts tsx mjs cjs mts cts`) pushes the absolute path into `source_files` | `src/walk.rs:14` |
-| 11 | Regular file, documentation plane: non-UTF-8 path, unsupported extension, `exclude` hit, or no `include` match each become a typed decision; otherwise the path is queued as a candidate | `src/docs/corpus.rs:485` |
-| 12 | `acquire_candidates` sorts by normalized path and captures each with `capture_file` — `O_NOFOLLOW|O_NONBLOCK`, re-verify regular file, read at most `max_file_bytes+1` | `src/docs/corpus.rs:542`, `:626` |
-| 13 | `parse_document` runs on the captured buffer, never a re-read: blake3, BOM strip, front matter, protected code ranges from pulldown-cmark, comment removals, heading-stack breadcrumbs, and for `.mdx` an oxc-checked ESM preamble drop | `src/docs/corpus.rs:1052`, `:1344` |
-| 14 | `build_chunks` merges consecutive blocks inside one heading section under `TARGET_BYTES=2400`, splits anything past `HARD_MAX_BYTES=24000` on parser-native boundaries, and sets `embedding_identity = blake3(domain ‖ heading ‖ body)` — path-independent by construction, so renames reuse cached vectors | `src/docs/corpus.rs:1475`, `:267` |
+| 6 | `corpus::repository_inventory` builds a `DocumentationCollector` and hands it to `walk::repository_inventory`, which is generic over `RepositoryInventoryConsumer` and forwards to the traversal engine in `src/walk/inventory.rs`. The walk owns the run's only filesystem traversal; the documentation module rides it as one consumer | `src/indexer.rs:385`, `src/docs/corpus.rs:156`, `:172`, `src/walk.rs:187`, `src/walk/inventory.rs:28` |
+| 7 | The engine uses an explicit heap stack, children pushed in reverse `file_name()` order so popping reproduces sorted DFS. Each `WalkTask` carries two independent descent bits, `source_active` and `consumer_active` | `src/walk/inventory.rs:11`, `:55`, `:63`, `:99` |
+| 8 | Per entry: `symlink_metadata`; an inventory race is skipped silently, a retryable I/O error aborts the whole inventory, anything else records a `walk` rejection. `is_hard_skip` prunes `.git` and `walk::SKIP_DIRS` for both planes | `src/walk/inventory.rs:110`, `:131`, `:242` |
+| 9 | **Plane divergence, hidden files.** The code plane keeps hidden entries out unless an ignore-file whitelist re-includes them (`src/walk/inventory.rs:158-160`); the consumer applies its own rule through `hidden_path_is_excluded`, which for documentation is a fixed root allowlist `[".github",".claude",".agents"]` with no whitelist escape | `src/walk/inventory.rs:169`, `src/docs/corpus.rs:290`, `:564`, `:25` |
+| 10 | Regular file, code plane: `walk::is_indexable` (extension in `js jsx ts tsx mjs cjs mts cts`) pushes the absolute path into `files` | `src/walk.rs:15`, `src/walk/inventory.rs:199` |
+| 11 | Regular file, documentation plane: `inspect_regular_file` receives the relative path by value; non-UTF-8 path, unsupported extension, `exclude` hit, or no `include` match each become a typed decision; otherwise the path is queued as a candidate. Neither branch is an `else` of the other | `src/docs/corpus.rs:310`, `src/walk/inventory.rs:202` |
+| 12 | `finish` runs after the stack drains, under the canonical root: `acquire_candidates` sorts by normalized path and captures each with `capture_file` — `O_NOFOLLOW|O_NONBLOCK`, re-verify regular file, read at most `max_file_bytes+1`. All documentation I/O is deferred out of the traversal loop | `src/walk/inventory.rs:214`, `src/docs/corpus.rs:337`, `:354`, `:475` |
+| 13 | `parse_document` runs on the captured buffer, never a re-read: blake3, BOM strip, front matter, protected code ranges from pulldown-cmark, comment removals, heading-stack breadcrumbs, and for `.mdx` an oxc-checked ESM preamble drop | `src/docs/corpus.rs:892`, `:1184` |
+| 14 | `build_chunks` merges consecutive blocks inside one heading section under `TARGET_BYTES=2400`, splits anything past `HARD_MAX_BYTES=24000` on parser-native boundaries, and sets `embedding_identity = blake3(domain ‖ heading ‖ body)` — path-independent by construction, so renames reuse cached vectors | `src/docs/corpus.rs:1315`, `:228` |
 | 15 | `WorkspaceMap::discover_with_fs(root, &inventory.files, fs)` sees code paths only, so dependency discovery is untouched by docs admission | `src/indexer.rs:400` |
 
 ### The single publication transaction
@@ -51,19 +51,22 @@ Command: `jscout index /repo`, with no `.jscout.db` present.
 
 Publication is a *replaced* digest, not an appended record. There is no snapshot log in the binary: no `.rs` file mentions `snapshot_log`, and `init_schema` creates no such table. `PLAN.md:3263` scopes that ledger out of the numbered G24 phases.
 
-The diagram below traces where the two planes separate and where they rejoin. Watch that only one arrow leaves `Scan`, and that `DocsFts` and `CodeFts` are distinct destinations that never converge before `Snapshot`.
+The diagram below traces where the two planes separate and where they rejoin. Watch that only one arrow leaves `Walk`, and that `DocsFts` and `CodeFts` are distinct destinations that never converge before `Snapshot`.
 
 ```mermaid
 sequenceDiagram
     participant CLI as cmd_index
-    participant Scan as corpus scan_repository
+    participant Corpus as corpus repository_inventory
+    participant Walk as walk inventory engine
     participant Tx as index_repo_impl txn
     participant CodeFts as chunks_fts
     participant DocsFts as docs_fts
     participant Snapshot as meta snapshot
-    CLI->>Scan: repository_inventory root, CorpusOptions
-    Scan->>Scan: one DFS, two descent bits per task
-    Scan-->>CLI: source_files, documents, decisions
+    CLI->>Corpus: repository_inventory root, CorpusOptions
+    Corpus->>Walk: repository_inventory root, DocumentationCollector
+    Walk->>Walk: one DFS, two descent bits per task
+    Walk->>Corpus: finish canonical root, capture and parse
+    Corpus-->>CLI: files, documents, decisions
     CLI->>Tx: BEGIN IMMEDIATE
     Tx->>Tx: replace_documentation_inventory
     Tx->>CodeFts: insert_file per code path
@@ -73,15 +76,16 @@ sequenceDiagram
     Tx-->>CLI: COMMIT
 ```
 
-`Scan` receives exactly one call and returns both lists; the split into `CodeFts` and `DocsFts` happens after the walk, inside one transaction. `Snapshot` is reached twice by different mechanisms — the digest covers docs rows, the projection rebuild does not read them.
+`Walk` receives exactly one call and returns both lists — the code file list directly, the documentation half through the consumer's `finish`; the split into `CodeFts` and `DocsFts` happens after the walk, inside one transaction. `Snapshot` is reached twice by different mechanisms — the digest covers docs rows, the projection rebuild does not read them.
 
 ### Where this fails
 
 | Failure | Mechanism | Caller sees |
 |---|---|---|
-| Root not a directory | `scan_repository_with_capture` bails | `documentation root is not a directory: …`, exit 1 |
+| Root not a directory | the walk engine bails after canonicalizing (`src/walk/inventory.rs:35-40`) | `repository root is not a directory: …`, exit 1 |
 | Retryable I/O in traversal or capture | `io_policy::is_retryable` returns `Err` before `BEGIN` | context-wrapped error, exit 1, database untouched |
-| One unreadable subdirectory | `handle_walk_error` records a rejection unless it is the root | that subtree missing, plus a stderr rejection line |
+| Unreadable ignore file hit during matching | `matched_with_errors` error is fatal to the pass (`src/walk/inventory.rs:139-143`) | `load ignore rules while matching …`, exit 1 — no membership set is published from rules that could not be read |
+| One unreadable subdirectory | `handle_walk_error` records a rejection unless it is the root (`src/walk/inventory.rs:222-240`) | that subtree missing, plus a stderr rejection line |
 | One oversized, non-UTF-8, or unreadable `.md` | decision row only | `jscout docs status` shows the reason; the index still succeeds |
 | Malformed globs in config | `validate_patterns` at load | fails before the database is opened |
 | Any error inside the transaction | `ROLLBACK` at `src/indexer.rs:730` | the previous complete snapshot stays active; never a partial mixture |

@@ -6,7 +6,7 @@ This document is the map. Every claim is expanded, with citations, in one of the
 
 ## What the system is made of
 
-A binary-only Rust crate — no `src/lib.rs`, and `src/main.rs` is 81 lines: 41 module declarations and a short `fn main`. That fronts 87 `.rs` files and 91,174 lines, roughly half of it test code across 570 tests. Crate version 0.4.0.
+A binary-only Rust crate — no `src/lib.rs`, and `src/main.rs` is 81 lines: 41 module declarations and a short `fn main`. That fronts 88 `.rs` files and 91,282 lines, roughly a third of it test code across 570 tests. Crate version 0.4.0.
 
 | Component | Language | Role |
 |---|---|---|
@@ -19,7 +19,9 @@ A binary-only Rust crate — no `src/lib.rs`, and `src/main.rs` is 81 lines: 41 
 
 ```mermaid
 flowchart TD
-    WALK["docs::corpus::scan_repository - the single traversal"]
+    ENTRY["corpus::repository_inventory - what the indexer calls"]
+    WALK["walk::repository_inventory - generic over the consumer trait"]
+    ENGINE["walk::inventory - the traversal engine"]
     CODE["Code corpus - js, ts, jsx, tsx, mjs, cjs"]
     DOCS["Documentation corpus - md, mdx"]
     OXC["oxc parse and chunk"]
@@ -29,13 +31,14 @@ flowchart TD
     CQ["Code retrieval - exact tier then hybrid"]
     DQ["Documentation retrieval"]
 
-    WALK --> CODE --> OXC --> GRAPH --> DB
-    WALK --> DOCS --> PROSE --> DB
+    ENTRY --> WALK --> ENGINE
+    ENGINE --> CODE --> OXC --> GRAPH --> DB
+    ENGINE --> DOCS --> PROSE --> DB
     DB --> CQ
     DB --> DQ
 ```
 
-Read the top of that diagram carefully, because it inverts what earlier descriptions of this system said. `walk::repository_inventory` no longer walks anything — it delegates to `docs::corpus::scan_repository` (`src/docs/corpus.rs:164`), so the documentation module owns the single traversal that produces the *code* file list as well. The reason is stated in the source: Markdown membership, capture and parse must happen inside the same deterministic walk that selects code, so documentation cannot acquire an independent snapshot or a second filesystem scan. The old `ignore::WalkBuilder` iteration survives only for read-only diagnostics and the watcher's path policy.
+Read the top of that diagram for the layering. `walk::repository_inventory` (`src/walk.rs:187`) is generic over a `RepositoryInventoryConsumer` trait (`src/walk.rs:58`), and the traversal engine lives in `src/walk/inventory.rs` — an explicit `WalkTask` stack that reproduces sorted depth-first order without recursion and without a depth cap. `walk` owns traversal and ignore handling and knows nothing about Markdown: its only reference to `docs` sits inside `#[cfg(test)]`. Each plane owns its own membership, hidden-path policy, capture and extraction, so `DocumentationCollector` (`src/docs/corpus.rs:422`) is simply one consumer. One naming residue is worth knowing before you go looking: there are two functions called `repository_inventory`. The indexer calls `corpus::repository_inventory` (`src/docs/corpus.rs:156`, `src/indexer.rs:385`), which builds the documentation consumer and hands it to the generic `walk::repository_inventory` (`src/walk.rs:187`). The constraint driving the shared walk is unchanged — Markdown membership and capture must happen inside the same deterministic traversal that selects code, so documentation cannot acquire an independent snapshot or a second filesystem scan.
 
 ## Two corpora, one database
 
