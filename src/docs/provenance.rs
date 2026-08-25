@@ -437,7 +437,29 @@ fn path_exists_at_head(root: &Path, head: &str, path: &str) -> Result<bool> {
         OsString::from("--"),
         OsString::from(path),
     ];
-    Ok(!run_git(root, &args, None)?.is_empty())
+    let output = run_git(root, &args, None)?;
+    if output.is_empty() {
+        return Ok(false);
+    }
+    let mut records = output
+        .split(|byte| *byte == b'\0')
+        .filter(|row| !row.is_empty());
+    let record = records
+        .next()
+        .ok_or_else(|| anyhow!("Git returned an empty ls-tree record"))?;
+    ensure!(
+        records.next().is_none(),
+        "Git returned multiple ls-tree records for one documentation path"
+    );
+    let metadata_end = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| anyhow!("Git returned an invalid ls-tree record"))?;
+    let fields = record[..metadata_end]
+        .split(|byte| *byte == b' ')
+        .collect::<Vec<_>>();
+    ensure!(fields.len() == 3, "Git returned invalid ls-tree metadata");
+    Ok(fields[1] == b"blob")
 }
 
 fn read_shallow_state(root: &Path) -> Result<ShallowState> {
@@ -1101,6 +1123,28 @@ mod tests {
             "2002-01-01T00:00:00 +0000",
             "2002-01-01T00:00:00 +0000",
         )?;
+        repository.write("guide.md", b"untracked replacement\n")?;
+
+        let git = captured_git(&repository)?;
+        assert!(matches!(
+            git.prepare_document("guide.md", b"untracked replacement\n"),
+            DocumentPreparation::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn head_directory_replaced_by_untracked_file_is_unknown_without_blame() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        repository.write("guide.md/child.txt", b"tracked child\n")?;
+        repository.commit(
+            "add directory",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+        fs::remove_dir_all(repository.path().join("guide.md"))?;
         repository.write("guide.md", b"untracked replacement\n")?;
 
         let git = captured_git(&repository)?;
