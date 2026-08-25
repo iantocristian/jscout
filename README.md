@@ -194,9 +194,9 @@ With `enabled = false`, the shared index admits no documentation rows,
 `docs status` reports the feature as disabled, and the CLI/MCP documentation
 retrieval surfaces are unavailable. The `docs.search.vector` setting controls
 only vector participation during documentation search; it does not enable
-corpus admission or generate vectors. `docs.search.freshness` enables the
-bounded Git-authorship reorder; `max_rank_movement` selects its one-to-three
-position bound.
+corpus admission or generate vectors. `docs.search.freshness` defaults to
+`false`; when enabled it applies the bounded Git-authorship reorder, and
+`max_rank_movement` selects its one-to-three position bound.
 
 ```bash
 jscout index /path/to/repo

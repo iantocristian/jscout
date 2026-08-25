@@ -1,10 +1,11 @@
 # G24 Markdown and MDX retrieval and temporal history — design detail
 
-- Date: 2026-08-24; revised 2026-08-25 — storage moved into the main index
+- Date: 2026-08-24; revised 2026-08-26 — storage moved into the main index
   per [g24-adr-one-store-separate-ranking-2026-08-25.md](g24-adr-one-store-separate-ranking-2026-08-25.md).
 - Status: implementation contract incorporated by reference from the G24 entry
-  in [PLAN.md](../../PLAN.md); phases 1, 2, and 4 are implemented and phase 3
-  is pending. It has authority only through that entry; PLAN.md remains the
+  in [PLAN.md](../../PLAN.md); all four numbered phases are implemented, with
+  freshness disabled by default after its pre-registered evaluation. It has
+  authority only through that entry; PLAN.md remains the
   roadmap and wins any explicit conflict. Review findings and decisions are
   recorded on PR #96.
 - Scope: a repository-documentation corpus inside the main index, with its
@@ -101,6 +102,8 @@ exclude = []
 [docs.search]
 vector = true
 rerank = true
+freshness = false
+max_rank_movement = 2
 limit = 10
 response_bytes = 24000
 ```
@@ -111,8 +114,9 @@ decisions on the next shared index, while code indexing continues normally.
 before the next shared index pass; MCP omits the `documentation_search` tool
 and rejects a direct call.
 
-Phase 3 may add `freshness` and `max_rank_movement`; they are not phase-1/2
-configuration. There is no `[docs.embedding]` or `[docs.reranker]` section:
+`freshness` controls the bounded temporal reorder and defaults to `false`;
+`max_rank_movement` accepts 1–3 and defaults to 2, but is dormant while
+freshness is disabled. There is no `[docs.embedding]` or `[docs.reranker]` section:
 vectors use the repository `[embedding]` provider, model, and service, and
 reranking uses the repository `[reranker]` profile. Compatibility of a
 committed `[docs]` section with pre-docs jscout binaries is explicitly not a
@@ -795,12 +799,16 @@ The fixed [corpus](../../eval/fixtures/docs-retrieval/manifest.json),
 and Phase 2 [human](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.md)
 and [machine](../../eval/results/g24-docs-retrieval-phase2-2026-08-25.json)
 reports record the entry gate. They do not select a freshness default; that
-decision remains part of the Phase 3 candidate evaluation.
+decision is recorded by the Phase 3
+[human](../../eval/results/g24-docs-retrieval-phase3-2026-08-26.md) and
+[machine](../../eval/results/g24-docs-retrieval-phase3-2026-08-26.json)
+reports. All hard gates passed, but every bound failed an evergreen or recall
+guardrail, so freshness remains disabled by default.
 
 ## Open items
 
-- FTS column weights, target/merge/hard chunk-size bounds, the 4 MiB
-  file-admission bound, and
-  the `max_rank_movement` default are evaluation hypotheses.
+- FTS column weights, target/merge/hard chunk-size bounds, and the 4 MiB
+  file-admission bound remain evaluation hypotheses. The enabled-freshness
+  default was rejected; the dormant opt-in movement default remains 2.
 - Historical search, contradiction detection, remote documentation
   sources, and author-declared supersession remain out of scope.

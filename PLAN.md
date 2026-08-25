@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-25.
+> Status: authoritative plan as of 2026-08-26.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -22,9 +22,10 @@
 > exhaustive lexical search is implemented. G23 investigation/inquiry guidance
 > is implemented, with its production replay still pending. Neither triggers
 > G16 or widens the semantic product surface, and no retrieval default changes
-> without a same-binary, same-snapshot comparison. G24 repository documentation
-> retrieval phases 1, 2, and 4 are implemented; git-basis freshness remains
-> gated on a retrieval evaluation corpus. G25 multi-format admission is
+> without a same-binary, same-snapshot comparison. All four G24 repository
+> documentation retrieval phases are implemented. Git-basis freshness is
+> available as an opt-in, while its pre-registered evaluation rejected every
+> tested movement bound as the default. G25 multi-format admission is
 > scheduled as G26 phase 0. G26 Rust code indexing is the current implementation
 > goal and the first additional code-corpus format, motivated by self-indexing this
 > repository.
@@ -195,7 +196,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v29; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v32; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -609,7 +610,7 @@ and only then compare real agent work with and without it.
 
 ## Implemented post-v1 checker enrichment sidecar (G10)
 
-As implemented, schema v29 stores exact call/receiver/property byte spans and
+As implemented, schema v32 stores exact call/receiver/property byte spans and
 canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
 sidecar explicitly; `jscout checker doctor` reports project/configuration
 readiness. The protocol host isolates compiler work in a terminable worker,
@@ -831,7 +832,7 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 ### Required G10 scale correction
 
 **Implementation status (2026-08-14, amended 2026-08-22).** The correction
-below is implemented in checker protocol v4 and schema v29: complete
+below is implemented in checker protocol v4 and schema v32: complete
 configured-project coverage, package-policy admission of runtime orphan scopes
 by default, exhaustive inferred-project coverage under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
@@ -3235,7 +3236,7 @@ a completeness claim; telemetry retains its exhaustive counts and warning.
 Install refuses an existing guide, while update replaces that exact guide and
 leaves unrelated agent-specific copies untouched.
 
-## G24 — repository documentation retrieval (phase 3 pending)
+## G24 — repository documentation retrieval (implemented; freshness opt-in)
 
 Repository Markdown and MDX are authored source material. G24 makes them
 retrievable through jscout without treating them as code structural evidence.
@@ -3354,8 +3355,9 @@ The revised decisions:
    evaluation arm.
 5. Freshness: order-based and bounded, not a score multiplier. After
    relevance fusion and optional reranking, each candidate's final rank differs
-   from its base rank by at most `max_rank_movement` (candidate value 2;
-   evaluation hypothesis), and swaps
+   from its base rank by at most `max_rank_movement` (the configurable built-in
+   remains 2 but is dormant because evaluation rejected every enabled
+   default), and swaps
    occur only between candidates with comparable provenance: git orders
    against git by latest author time with working-tree lines newest, observed
    orders post-baseline `added` and `body_changed` events by snapshot sequence,
@@ -3378,21 +3380,27 @@ The revised decisions:
    retired hashes, transition metadata, and content-addressed vectors may
    remain. Version one adds no retention controls.
 
-Delivery status: phases 1, 2, and 4 are implemented. Phase 1 admits Markdown
+Delivery status: all four numbered phases are implemented. Phase 1 admits Markdown
 and MDX at the named-sections tier through the shared index pass, with the
 `files.corpus` and `files.format` classifications, `docs_fts`,
 `doc_chunk_meta`, the MCP documentation-search surface, and lexical docs
 search. Phase 2 adds docs vectors from the shared `[embedding]` profile. Phase
-4 adds documentation-aware watch classification through the shared
-incremental watcher. The fixed
+3 adds Git/working-tree provenance, persisted blame caching, bounded temporal
+reordering after relevance and reranking, result diagnostics, and
+`--no-freshness`. Phase 4 adds documentation-aware watch classification
+through the shared incremental watcher. The fixed
 [retrieval corpus](eval/fixtures/docs-retrieval/manifest.json),
 [pre-registration](eval/prereg/g24-documentation-freshness-2026-08-25.md),
 [conflict-arm addendum](eval/prereg/g24-documentation-freshness-addendum-2026-08-25.md), and
 Phase 2 [human](eval/results/g24-docs-retrieval-phase2-2026-08-25.md) and
 [machine](eval/results/g24-docs-retrieval-phase2-2026-08-25.json) reports
-satisfy Phase 3's entry prerequisite. Phase 3 — Git-basis provenance and the
-bounded freshness reorder — remains unimplemented. The observation ledger is
-unscheduled and belongs only to the supersession product.
+satisfy Phase 3's entry prerequisite. The Phase 3
+[human](eval/results/g24-docs-retrieval-phase3-2026-08-26.md) and
+[machine](eval/results/g24-docs-retrieval-phase3-2026-08-26.json) reports
+record that all hard validity gates passed but bounds 1–3 failed the evergreen
+and recall guardrails. Freshness therefore defaults to disabled and remains
+explicitly opt-in. The observation ledger is unscheduled and belongs only to
+the supersession product.
 
 Phase 1/2 acceptance: code-search ranking, content, and statistics are
 byte-identical after docs admission modulo the necessarily changed shared
@@ -3406,12 +3414,15 @@ a repository with no `[embedding]` provider retains full lexical documentation
 search; disabling `[docs].enabled` yields no docs rows or docs-status file
 decisions while leaving every code surface unchanged; indexing and code
 embedding never generate documentation vectors; and crash recovery exposes exactly one complete old or replacement
-shared snapshot, never a partial mixture. Deferred ledger/freshness acceptance:
-inserting one uniquely distinguishable paragraph produces one `added` block
-observation and no succession rows for untouched blocks; globally unique copied
-content and Git-detected renames receive no cross-path predecessor; and
-freshness movement never exceeds its configured bound or crosses provenance
-bases. The detailed implementation
+shared snapshot, never a partial mixture. Phase 3 acceptance: disabled
+freshness preserves Phase 2 ranked identities; enabled movement never exceeds
+its configured bound, moves unknown provenance, or crosses provenance bases;
+captured-byte blame is revalidated before publication; and the evaluation
+records the disabled default after rejecting every candidate bound. Deferred
+ledger acceptance: inserting one uniquely distinguishable paragraph produces
+one `added` block observation and no succession rows for untouched blocks;
+globally unique copied content and Git-detected renames receive no cross-path
+predecessor. The detailed implementation
 contract
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
 and the decision record
