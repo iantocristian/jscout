@@ -13,6 +13,7 @@ import {
   hasConflictTreatmentOpportunity,
   materializeRepositories,
   parseArguments,
+  phase2ValidityForReport,
   scoreRun,
   selectPhase3Default,
   summarizeProfile,
@@ -480,4 +481,23 @@ test("Phase 2 report validation pins corpus hashes, validity, and run cardinalit
     manifestSha256: "manifest",
     fixtureSha256: "fixture",
   }), /corpus fingerprints/);
+
+  assert.deepEqual(
+    phase2ValidityForReport(
+      true,
+      ["lexical", "hybrid", "hybrid-rerank"],
+      null,
+      report,
+    ),
+    { bm25_fallback_exact_order: true, phase2_complete: true },
+  );
+  assert.deepEqual(
+    phase2ValidityForReport(
+      false,
+      ["lexical", "fallback"],
+      { exact_order_parity: true },
+      null,
+    ),
+    { bm25_fallback_exact_order: true, phase2_complete: false },
+  );
 });

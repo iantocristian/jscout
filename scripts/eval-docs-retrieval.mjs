@@ -1046,6 +1046,19 @@ export function validatePhase2Report(report, manifest, fingerprints) {
   return report;
 }
 
+export function phase2ValidityForReport(phase3, profiles, fallbackComparison, phase2Report) {
+  if (phase3) {
+    return {
+      bm25_fallback_exact_order: phase2Report.validity.bm25_fallback_exact_order,
+      phase2_complete: phase2Report.validity.phase2_complete,
+    };
+  }
+  return {
+    bm25_fallback_exact_order: fallbackComparison?.exact_order_parity ?? false,
+    phase2_complete: PHASE2_PROFILES.every((profile) => profiles.includes(profile)),
+  };
+}
+
 async function queryServiceConfiguration(endpointValue) {
   const endpoint = new URL(endpointValue);
   endpoint.pathname = "/configuration";
@@ -1480,6 +1493,12 @@ async function main() {
       : options.runKind === "phase2-baseline"
         ? "phase2-baseline-recorded"
         : "provider-free-check-recorded";
+    const phase2Validity = phase2ValidityForReport(
+      phase3,
+      options.profiles,
+      fallback,
+      phase2Report,
+    );
     const result = {
       schema: "jscout.docs-retrieval-eval.v1",
       schema_version: 1,
@@ -1535,10 +1554,10 @@ async function main() {
       phase2_disabled_identity_parity: phase2IdentityParity,
       default_selection: defaultSelection,
       validity: {
-        bm25_fallback_exact_order: fallback?.exact_order_parity ?? false,
+        bm25_fallback_exact_order: phase2Validity.bm25_fallback_exact_order,
         repeated_orders_stable: runs.every((run) => run.repeated_exact_order),
         source_tree_clean: sourceStatus.length === 0,
-        phase2_complete: PHASE2_PROFILES.every((profile) => options.profiles.includes(profile)),
+        phase2_complete: phase2Validity.phase2_complete,
         phase3_complete: phase3
           && PHASE3_PROFILES.every((profile) => options.profiles.includes(profile))
           && FRESHNESS_TREATMENTS.every((treatment) => runs.some((run) => run.treatment === treatment.id)),
