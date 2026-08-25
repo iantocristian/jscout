@@ -187,6 +187,13 @@ gold file falls outside the top ten. Record wall time, peak RSS, indexed bytes,
 chunk count, database bytes, and parse diagnostics for both arms. Performance
 numbers are reported separately from the retrieval gate.
 
+The first treatment formally failed that frozen gate because relevant new Rust
+files displaced a legacy JS/TS gold file in the shared ranking. Projecting the
+same inspected result to JS/TS paths stayed within the old thresholds, but that
+post-hoc projection is diagnostic only. This phase remains unaccepted pending
+a prospectively frozen replacement control and fresh holdout queries; the
+preserved failure report is the governing evidence until then.
+
 ## Phase 2 — named Rust chunks and exact tiers
 
 Phase 2 replaces the text projection with a non-overlapping partition of named

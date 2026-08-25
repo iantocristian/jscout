@@ -3535,6 +3535,14 @@ collision and edge-correctness protocols are committed. The detail document
 is subordinate and non-normative, this entry winning on any disagreement.
 Phases 0 and 1 are the current implementation milestone.
 
+The first phase-1 treatment formally failed the preregistered mixed-corpus
+control gate: relevant Rust implementations displaced one legacy JS/TS gold
+file from the combined top ten. A post-hoc JS/TS-only projection stayed within
+the numerical thresholds, but it is diagnostic evidence, not a passing result.
+Phase 1 therefore remains unaccepted until a replacement control is frozen
+prospectively and evaluated on fresh holdout queries; the failed report remains
+under `eval/results/`.
+
 ## Evaluation decisions already made
 
 The dated evidence remains under `eval/`; this section records only the design
