@@ -1,0 +1,123 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  deduplicateFiles,
+  evaluateTreatmentGates,
+  scoreQueries,
+  validateManifest,
+} from "./eval-g26-lexical";
+
+function manifest(queries) {
+  return {
+    protocol_version: 2,
+    baseline_revision: "a".repeat(40),
+    retrieval_k: 100,
+    file_k: 10,
+    queries,
+  };
+}
+
+function query(id, cohort, stratum, text, gold, baseline = []) {
+  return {
+    id,
+    cohort,
+    stratum,
+    question: id,
+    query: text,
+    gold_files: [gold],
+    query_mode: "provider_free_ranked_lexical",
+    k: 10,
+    baseline_output: baseline,
+  };
+}
+
+test("file ranking deduplicates raw chunk hits before applying file k", () => {
+  const hits = [
+    { file: "a.rs", chunk_id: 1 },
+    { file: "a.rs", chunk_id: 2 },
+    { file: "b.rs", chunk_id: 3 },
+    { file: "c.rs", chunk_id: 4 },
+  ];
+  assert.deepEqual(deduplicateFiles(hits, 2), ["a.rs", "b.rs"]);
+});
+
+test("scoring reports reciprocal rank from the deduplicated file order", () => {
+  const fixture = manifest([
+    query("rust-01", "rust", "bm25_natural_language", "lossless syntax", "gold.rs", ["old.rs", "gold.rs"]),
+  ]);
+  const report = scoreQueries(fixture, [{
+    id: "rust-01",
+    raw_hits: [
+      { file: "noise.rs", chunk_id: 1 },
+      { file: "noise.rs", chunk_id: 2 },
+      { file: "gold.rs", chunk_id: 3 },
+    ],
+  }]);
+  assert.equal(report.details[0].first_gold_rank, 2);
+  assert.equal(report.details[0].reciprocal_rank, 0.5);
+  assert.equal(report.details[0].baseline_first_gold_rank, 2);
+});
+
+test("manifest validation rejects identifier-shaped BM25 queries", () => {
+  const queries = [];
+  for (const cohort of ["rust", "javascript-typescript-control"]) {
+    for (let index = 0; index < 24; index += 1) {
+      queries.push(query(
+        `${cohort}-${index}`,
+        cohort,
+        index < 12 ? "bm25_natural_language" : "exact_identifier",
+        index < 12 ? "plain words" : `identifier${index}`,
+        "gold.rs",
+      ));
+    }
+  }
+  validateManifest(manifest(queries));
+  queries[0].query = "not_snake_case";
+  assert.throws(() => validateManifest(manifest(queries)), /BM25 queries/);
+});
+
+test("treatment gates are evaluated independently for both strata", () => {
+  const fixture = manifest([]);
+  fixture.gates = {
+    rust_file_recall_at_10_minimum: 0.9,
+    control_mrr_maximum_drop: 0.02,
+    control_top_five_gold_may_not_fall_below_rank: 10,
+  };
+  const summaries = [];
+  for (const stratum of ["exact_identifier", "bm25_natural_language"]) {
+    summaries.push({
+      cohort: "rust",
+      stratum,
+      mean_recall_at_k: 1,
+      mean_reciprocal_rank: 1,
+      baseline_mean_recall_at_k: 0,
+      baseline_mean_reciprocal_rank: 0,
+    }, {
+      cohort: "javascript-typescript-control",
+      stratum,
+      mean_recall_at_k: 1,
+      mean_reciprocal_rank: stratum === "exact_identifier" ? 1 : 0.8,
+      baseline_mean_recall_at_k: 1,
+      baseline_mean_reciprocal_rank: stratum === "exact_identifier" ? 1 : 0.9,
+    });
+  }
+  const gates = evaluateTreatmentGates(fixture, {
+    summaries,
+    details: [{
+      id: "control",
+      cohort: "javascript-typescript-control",
+      stratum: "bm25_natural_language",
+      baseline_first_gold_rank: 2,
+      first_gold_rank: 11,
+      baseline_gold_ranks: [{ file: "gold.ts", rank: 2 }],
+      gold_ranks: [{ file: "gold.ts", rank: null }],
+    }],
+  });
+  assert.equal(gates.decision, "fail");
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "control_mrr_maximum_drop" &&
+    outcome.stratum === "bm25_natural_language" && !outcome.pass));
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "baseline_top_five_gold_stays_within_file_k" && !outcome.pass));
+});

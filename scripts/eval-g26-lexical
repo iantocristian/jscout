@@ -1,0 +1,419 @@
+#!/usr/bin/env node
+
+// This file is intentionally extensionless. It is a Node program, but must
+// not enter only the treatment arm's JavaScript corpus and perturb BM25.
+//
+// Baseline:
+// node scripts/eval-g26-lexical --manifest eval/prereg/g26-rust-lexical-2026-08-25.json \
+//   --repository /clean/baseline --database /tmp/g26-baseline.db \
+//   --arm baseline --output /tmp/g26-baseline.json
+// Treatment adds: --revision <full-clean-checkout-commit>.
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { pathToFileURL } from "node:url";
+
+const COHORTS = new Set(["rust", "javascript-typescript-control"]);
+const STRATA = new Set(["exact_identifier", "bm25_natural_language"]);
+
+function parseArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!flag?.startsWith("--") || value === undefined) {
+      throw new Error("arguments must be --name value pairs");
+    }
+    options[flag.slice(2)] = value;
+  }
+  for (const required of [
+    "manifest",
+    "repository",
+    "database",
+    "arm",
+    "output",
+  ]) {
+    if (!options[required]) throw new Error(`--${required} is required`);
+  }
+  if (!new Set(["baseline", "treatment"]).has(options.arm)) {
+    throw new Error("--arm must be baseline or treatment");
+  }
+  if (options.arm === "treatment" && !options.revision) {
+    throw new Error("--revision is required for the treatment arm");
+  }
+  return options;
+}
+
+function integer(value, label) {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+export function effectiveStratum(manifest, query) {
+  return query.stratum;
+}
+
+export function validateManifest(manifest) {
+  if (manifest.protocol_version !== 2) {
+    throw new Error("manifest protocol_version must be 2");
+  }
+  integer(manifest.retrieval_k, "retrieval_k");
+  integer(manifest.file_k, "file_k");
+  if (manifest.retrieval_k < manifest.file_k) {
+    throw new Error("retrieval_k must be at least file_k");
+  }
+  if (!Array.isArray(manifest.queries)) throw new Error("queries must be an array");
+
+  const ids = new Set();
+  const counts = new Map();
+  for (const query of manifest.queries) {
+    if (!query.id || ids.has(query.id)) throw new Error(`duplicate or empty query id: ${query.id}`);
+    ids.add(query.id);
+    if (!COHORTS.has(query.cohort)) throw new Error(`${query.id}: unknown cohort`);
+    const stratum = effectiveStratum(manifest, query);
+    if (!STRATA.has(stratum)) throw new Error(`${query.id}: unknown stratum ${stratum}`);
+    if (query.query_mode !== "provider_free_ranked_lexical") {
+      throw new Error(`${query.id}: query_mode must be provider_free_ranked_lexical`);
+    }
+    if (query.k !== manifest.file_k) {
+      throw new Error(`${query.id}: k must equal file_k`);
+    }
+    if (!Array.isArray(query.gold_files) || query.gold_files.length === 0) {
+      throw new Error(`${query.id}: gold_files must be non-empty`);
+    }
+    if (!Array.isArray(query.baseline_output)) {
+      throw new Error(`${query.id}: baseline_output must be an array`);
+    }
+    const tokens = query.query.trim().split(/\s+/).filter(Boolean);
+    if (stratum === "exact_identifier" &&
+        (tokens.length !== 1 || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(tokens[0]))) {
+      throw new Error(`${query.id}: exact_identifier queries must contain one identifier`);
+    }
+    if (stratum === "bm25_natural_language" &&
+        (tokens.length < 2 || tokens.some((token) => !/^[a-z]+$/.test(token)))) {
+      throw new Error(`${query.id}: BM25 queries must contain at least two lowercase prose tokens`);
+    }
+    const key = `${query.cohort}\u0000${stratum}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const cohort of COHORTS) {
+    const total = [...counts]
+      .filter(([key]) => key.startsWith(`${cohort}\u0000`))
+      .reduce((sum, [, count]) => sum + count, 0);
+    if (total < 24) throw new Error(`${cohort}: requires at least 24 queries`);
+    if ((counts.get(`${cohort}\u0000bm25_natural_language`) ?? 0) < 12) {
+      throw new Error(`${cohort}: requires at least 12 BM25 natural-language queries`);
+    }
+  }
+  return manifest;
+}
+
+export function deduplicateFiles(hits, fileK) {
+  const seen = new Set();
+  const files = [];
+  for (const hit of hits) {
+    if (typeof hit?.file !== "string" || seen.has(hit.file)) continue;
+    seen.add(hit.file);
+    files.push(hit.file);
+    if (files.length === fileK) break;
+  }
+  return files;
+}
+
+function scoreRanking(goldFiles, rankedFiles) {
+  const goldRanks = goldFiles.map((file) => {
+    const rank = rankedFiles.indexOf(file) + 1;
+    return { file, rank: rank > 0 ? rank : null };
+  });
+  const presentRanks = goldRanks.map(({ rank }) => rank).filter((rank) => rank !== null);
+  const matched = presentRanks.length;
+  const firstGoldRank = presentRanks.length > 0 ? Math.min(...presentRanks) : null;
+  return {
+    matched,
+    gold: goldFiles.length,
+    gold_ranks: goldRanks,
+    recall_at_k: matched / goldFiles.length,
+    first_gold_rank: firstGoldRank,
+    reciprocal_rank: firstGoldRank === null ? 0 : 1 / firstGoldRank,
+  };
+}
+
+function mean(values) {
+  return values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+export function scoreQueries(manifest, queryRuns) {
+  const byId = new Map(queryRuns.map((run) => [run.id, run]));
+  const details = manifest.queries.map((query) => {
+    const run = byId.get(query.id);
+    if (!run) throw new Error(`missing query run: ${query.id}`);
+    const rankedFiles = deduplicateFiles(run.raw_hits, manifest.file_k);
+    const current = scoreRanking(query.gold_files, rankedFiles);
+    const baselineFiles = query.baseline_output.slice(0, manifest.file_k);
+    const baseline = scoreRanking(query.gold_files, baselineFiles);
+    return {
+      id: query.id,
+      cohort: query.cohort,
+      stratum: effectiveStratum(manifest, query),
+      gold_files: query.gold_files,
+      ranked_files: rankedFiles,
+      ...current,
+      baseline_ranked_files: baselineFiles,
+      baseline_recall_at_k: baseline.recall_at_k,
+      baseline_first_gold_rank: baseline.first_gold_rank,
+      baseline_reciprocal_rank: baseline.reciprocal_rank,
+      baseline_gold_ranks: baseline.gold_ranks,
+    };
+  });
+
+  const groups = new Map();
+  for (const detail of details) {
+    const key = `${detail.cohort}\u0000${detail.stratum}`;
+    const group = groups.get(key) ?? [];
+    group.push(detail);
+    groups.set(key, group);
+  }
+  const summaries = [...groups.entries()].map(([key, rows]) => {
+    const [cohort, stratum] = key.split("\u0000");
+    return {
+      cohort,
+      stratum,
+      queries: rows.length,
+      mean_recall_at_k: mean(rows.map((row) => row.recall_at_k)),
+      mean_reciprocal_rank: mean(rows.map((row) => row.reciprocal_rank)),
+      baseline_mean_recall_at_k: mean(rows.map((row) => row.baseline_recall_at_k)),
+      baseline_mean_reciprocal_rank: mean(rows.map((row) => row.baseline_reciprocal_rank)),
+    };
+  }).sort((left, right) =>
+    left.cohort.localeCompare(right.cohort) || left.stratum.localeCompare(right.stratum));
+  return { details, summaries };
+}
+
+export function evaluateTreatmentGates(manifest, scored) {
+  const outcomes = [];
+  const summary = (cohort, stratum) => scored.summaries.find(
+    (row) => row.cohort === cohort && row.stratum === stratum,
+  );
+  for (const stratum of STRATA) {
+    const rust = summary("rust", stratum);
+    const control = summary("javascript-typescript-control", stratum);
+    outcomes.push({
+      gate: "rust_recall_at_file_k",
+      stratum,
+      threshold: manifest.gates.rust_file_recall_at_10_minimum,
+      actual: rust?.mean_recall_at_k ?? null,
+      pass: rust !== undefined &&
+        rust.mean_recall_at_k >= manifest.gates.rust_file_recall_at_10_minimum,
+    });
+    outcomes.push({
+      gate: "control_recall_nondecrease",
+      stratum,
+      baseline: control?.baseline_mean_recall_at_k ?? null,
+      actual: control?.mean_recall_at_k ?? null,
+      pass: control !== undefined &&
+        control.mean_recall_at_k >= control.baseline_mean_recall_at_k,
+    });
+    const mrrDrop = control === undefined
+      ? null
+      : control.baseline_mean_reciprocal_rank - control.mean_reciprocal_rank;
+    outcomes.push({
+      gate: "control_mrr_maximum_drop",
+      stratum,
+      threshold: manifest.gates.control_mrr_maximum_drop,
+      actual_drop: mrrDrop,
+      pass: mrrDrop !== null && mrrDrop <= manifest.gates.control_mrr_maximum_drop,
+    });
+  }
+  const displaced = scored.details.flatMap((row) => {
+    if (row.cohort !== "javascript-typescript-control") return [];
+    const treatmentRanks = new Map(row.gold_ranks.map(({ file, rank }) => [file, rank]));
+    return row.baseline_gold_ranks
+      .filter(({ rank }) => rank !== null && rank <= 5)
+      .filter(({ file }) => {
+        const rank = treatmentRanks.get(file);
+        return rank === null || rank > manifest.gates.control_top_five_gold_may_not_fall_below_rank;
+      })
+      .map(({ file, rank }) => ({
+        id: row.id,
+        stratum: row.stratum,
+        file,
+        baseline_rank: rank,
+        treatment_rank: treatmentRanks.get(file),
+      }));
+  });
+  outcomes.push({
+    gate: "baseline_top_five_gold_stays_within_file_k",
+    threshold: manifest.gates.control_top_five_gold_may_not_fall_below_rank,
+    failures: displaced,
+    pass: displaced.length === 0,
+  });
+  return {
+    decision: outcomes.every((outcome) => outcome.pass) ? "pass" : "fail",
+    outcomes,
+  };
+}
+
+function git(repository, args) {
+  return execFileSync("git", ["-C", repository, ...args], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  }).trim();
+}
+
+function sha256(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function run(binary, args, options = {}) {
+  const result = spawnSync(binary, args, {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+    env: options.env ?? process.env,
+    cwd: options.cwd,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${path.basename(binary)} ${args[0]} failed (${result.status}): ${result.stderr.trim()}`);
+  }
+  return result;
+}
+
+function cleanProviderEnvironment() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("JSCOUT_EMBED_") || key.startsWith("JSCOUT_RERANK_")) delete env[key];
+  }
+  for (const key of ["OPENAI_API_KEY", "VOYAGE_API_KEY", "COHERE_API_KEY"]) delete env[key];
+  return env;
+}
+
+function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const manifestPath = path.resolve(options.manifest);
+  const repository = path.resolve(options.repository);
+  const database = path.resolve(options.database);
+  const output = path.resolve(options.output);
+  const manifest = validateManifest(JSON.parse(fs.readFileSync(manifestPath, "utf8")));
+  const expectedRevision = options.arm === "baseline" ? manifest.baseline_revision : options.revision;
+
+  const repositoryRevision = git(repository, ["rev-parse", "HEAD"]);
+  if (repositoryRevision !== expectedRevision) {
+    throw new Error(`repository revision ${repositoryRevision} does not match ${expectedRevision}`);
+  }
+  const dirty = git(repository, ["status", "--porcelain", "--untracked-files=all"]);
+  if (dirty) throw new Error(`repository must be clean before evaluation:\n${dirty}`);
+  if (fs.existsSync(path.join(repository, ".jscout.toml"))) {
+    throw new Error("repository-local .jscout.toml is not allowed by this provider-free protocol");
+  }
+  if (fs.existsSync(database)) throw new Error(`database already exists: ${database}`);
+  if (fs.existsSync(output)) throw new Error(`output already exists: ${output}`);
+  fs.mkdirSync(path.dirname(database), { recursive: true });
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+
+  const env = cleanProviderEnvironment();
+  run("cargo", ["build", "--release", "--locked"], { env, cwd: repository });
+  const binary = path.join(
+    repository,
+    "target",
+    "release",
+    process.platform === "win32" ? "jscout.exe" : "jscout",
+  );
+  if (!fs.statSync(binary).isFile()) throw new Error(`release build did not produce ${binary}`);
+  fs.accessSync(binary, fs.constants.X_OK);
+  const version = run(binary, ["--version"], { env }).stdout.trim();
+  const binarySha256 = sha256(binary);
+  const started = process.hrtime.bigint();
+  const indexed = run(binary, ["index", repository, "--database", database], { env });
+  const indexDurationMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  const queryRuns = [];
+  for (const query of manifest.queries) {
+    const result = run(binary, [
+      "search",
+      repository,
+      query.query,
+      "--database",
+      database,
+      "--limit",
+      String(manifest.retrieval_k),
+      "--origin",
+      "repository,workspace",
+      "--lexical-only",
+      "--no-memory",
+      "--no-expand",
+      "--debug-json",
+    ], { env });
+    const response = JSON.parse(result.stdout);
+    if (response.retrieval?.vector !== "disabled" || response.retrieval?.reranker !== "disabled") {
+      throw new Error(`${query.id}: search was not provider-free lexical`);
+    }
+    if (!Array.isArray(response.hits) ||
+        response.hits.some((hit) => typeof hit?.file !== "string")) {
+      throw new Error(`${query.id}: debug JSON did not expose file-backed raw hits`);
+    }
+    queryRuns.push({
+      id: query.id,
+      query: query.query,
+      raw_hits: response.hits,
+      retrieval: response.retrieval,
+      snapshot: response.snapshot,
+    });
+  }
+
+  const scored = scoreQueries(manifest, queryRuns);
+  const baselineMismatches = options.arm === "baseline"
+    ? scored.details.filter((row) =>
+      JSON.stringify(row.ranked_files) !== JSON.stringify(row.baseline_ranked_files))
+    : [];
+  const treatmentGates = options.arm === "treatment"
+    ? evaluateTreatmentGates(manifest, scored)
+    : null;
+  const report = {
+    schema_version: 1,
+    arm: options.arm,
+    manifest: path.relative(process.cwd(), manifestPath),
+    repository,
+    revision: repositoryRevision,
+    binary,
+    binary_source: "cargo build --release --locked in the validated repository checkout",
+    binary_sha256: binarySha256,
+    binary_version: version,
+    retrieval_k: manifest.retrieval_k,
+    file_k: manifest.file_k,
+    provider_free: true,
+    index_duration_ms: indexDurationMs,
+    index_stdout: indexed.stdout.trim(),
+    database_bytes: fs.statSync(database).size,
+    baseline_manifest_matches: options.arm === "baseline" ? baselineMismatches.length === 0 : null,
+    baseline_mismatches: baselineMismatches.map((row) => ({
+      id: row.id,
+      expected: row.baseline_ranked_files,
+      actual: row.ranked_files,
+    })),
+    treatment_gates: treatmentGates,
+    metrics: scored.summaries,
+    queries: scored.details.map((detail) => ({
+      ...detail,
+      raw_hits: queryRuns.find((run) => run.id === detail.id).raw_hits,
+    })),
+  };
+  fs.writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+  process.stdout.write(`${JSON.stringify({
+    output,
+    binary_sha256: report.binary_sha256,
+    baseline_manifest_matches: report.baseline_manifest_matches,
+    treatment_decision: treatmentGates?.decision ?? null,
+    metrics: report.metrics,
+  }, null, 2)}\n`);
+  if (baselineMismatches.length > 0 || treatmentGates?.decision === "fail") {
+    process.exitCode = 1;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main();
+}
