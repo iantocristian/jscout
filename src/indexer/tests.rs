@@ -1832,7 +1832,10 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
     const SECTIONS: &[(&str, &str)] = &[
         (
             "counts",
-            "SELECT (SELECT count(*) FROM chunks), (SELECT count(*) FROM chunks_fts)",
+            "SELECT (SELECT count(*) FROM chunks),
+                    (SELECT count(*) FROM chunks_fts),
+                    (SELECT count(*) FROM doc_chunk_meta),
+                    (SELECT count(*) FROM docs_fts)",
         ),
         (
             "files",
@@ -2233,11 +2236,24 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
     fs::create_dir(repo.path().join(".git"))?;
     fs::write(
         repo.path().join("main.ts"),
-        "import { stable } from './stable';\n\
+        "import { aliased } from '@alias';\n\
+         import { stable } from './stable';\n\
          import { edited } from './edited';\n\
          import { removed } from './removed';\n\
          import { renamed } from './old-name';\n\
-         export const total = stable + edited + removed + renamed;\n",
+         export const total = aliased + stable + edited + removed + renamed;\n",
+    )?;
+    fs::write(
+        repo.path().join("alias-a.ts"),
+        "export const aliased = 10;\n",
+    )?;
+    fs::write(
+        repo.path().join("alias-b.ts"),
+        "export const aliased = 20;\n",
+    )?;
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@alias":["alias-a.ts"]}}}"#,
     )?;
     fs::write(repo.path().join("stable.ts"), "export const stable = 1;\n")?;
     fs::write(repo.path().join("edited.ts"), "export const edited = 2;\n")?;
@@ -2290,12 +2306,17 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
     )?;
     fs::write(repo.path().join(".gitignore"), "later-hidden.md\n")?;
     fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@alias":["alias-b.ts"]}}}"#,
+    )?;
+    fs::write(
         repo.path().join("main.ts"),
-        "import { stable } from './stable';\n\
+        "import { aliased } from '@alias';\n\
+         import { stable } from './stable';\n\
          import { edited } from './edited';\n\
          import { added } from './added';\n\
          import { renamed } from './renamed';\n\
-         export const total = stable + edited + added + renamed;\n",
+         export const total = aliased + stable + edited + added + renamed;\n",
     )?;
 
     let incremental_outcome =
@@ -2307,9 +2328,19 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
             incremental_outcome.unchanged,
             incremental_outcome.removed,
         ),
-        (7, 1, 4)
+        (7, 3, 4)
     );
-    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (8, 0));
+    assert_eq!((full_outcome.indexed, full_outcome.unchanged), (10, 0));
+
+    let incremental_alias_target: Option<String> = incremental.query_row(
+        "SELECT target.path FROM module_edges edge
+         JOIN files source ON source.id=edge.from_file
+         LEFT JOIN files target ON target.id=edge.to_file
+         WHERE source.path='main.ts' AND edge.request='@alias'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(incremental_alias_target.as_deref(), Some("alias-b.ts"));
 
     let incremental_resolution = structural::compute_resolution_hash(&incremental)?;
     let full_resolution = structural::compute_resolution_hash(&full)?;
