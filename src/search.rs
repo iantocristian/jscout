@@ -201,6 +201,8 @@ pub struct ExhaustiveSearchMetadata {
     pub returned: usize,
     pub truncated: bool,
     pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ExhaustiveSearchWarning>,
     pub effective: EffectiveSearchPosture,
     pub scope: SearchScope,
     #[serde(skip)]
@@ -209,6 +211,14 @@ pub struct ExhaustiveSearchMetadata {
     selected_positions: Vec<ExhaustiveCursorPosition>,
     #[serde(skip)]
     page_had_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExhaustiveSearchWarning {
+    pub code: &'static str,
+    pub terms: Vec<String>,
+    pub total_chunks: usize,
+    pub message: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,9 +461,15 @@ struct RankedHitCandidate {
 
 /// Build an FTS5 query: each identifier-ish token is quoted and OR-joined, so
 /// any match ranks (BM25 handles weighting) and no user input is FTS syntax.
-fn fts_query_for_column(q: &str, column: Option<&str>) -> String {
+fn fts_terms(q: &str) -> Vec<&str> {
     q.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
-        .filter(|t| !t.is_empty())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn fts_query_for_column(q: &str, column: Option<&str>) -> String {
+    fts_terms(q)
+        .into_iter()
         .map(|term| match column {
             Some(column) => format!("{column}:\"{term}\""),
             None => format!("\"{term}\""),
@@ -468,6 +484,40 @@ fn fts_query(q: &str) -> String {
 
 fn exhaustive_fts_query(q: &str) -> String {
     fts_query_for_column(q, Some("content"))
+}
+
+const BROAD_OR_QUERY_CHUNK_THRESHOLD: usize = 200;
+const BROAD_OR_QUERY_MESSAGE: &str = "Exhaustive search OR-joins FTS terms. Refine or abandon this traversal if that is not the intended evidence set.";
+
+fn exhaustive_effective_terms(q: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    fts_terms(q)
+        .into_iter()
+        .filter_map(|term| {
+            let normalized = term.to_lowercase();
+            seen.insert(normalized).then(|| term.to_string())
+        })
+        .collect()
+}
+
+fn exhaustive_warnings(
+    q: &str,
+    total_chunks: usize,
+    first_page: bool,
+) -> Vec<ExhaustiveSearchWarning> {
+    if !first_page || total_chunks < BROAD_OR_QUERY_CHUNK_THRESHOLD {
+        return Vec::new();
+    }
+    let terms = exhaustive_effective_terms(q);
+    if terms.len() < 2 {
+        return Vec::new();
+    }
+    vec![ExhaustiveSearchWarning {
+        code: "broad_or_query",
+        terms,
+        total_chunks,
+        message: BROAD_OR_QUERY_MESSAGE,
+    }]
 }
 
 fn exact_intent_tokens(query: &str) -> Vec<String> {
@@ -1700,6 +1750,7 @@ pub fn search(
                 returned: hits.len(),
                 truncated: state.has_more,
                 next_cursor: None,
+                warnings: exhaustive_warnings(q, state.total_chunks, exhaustive_cursor.is_none()),
                 effective: EffectiveSearchPosture {
                     vector: false,
                     rerank: false,

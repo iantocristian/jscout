@@ -14,10 +14,10 @@ use super::{
     RetrievalStatus, SearchExpansion, SearchMode, SearchOptions, SearchResult,
     SearchScopeFileRoles, apply_repository_policy_penalty, apply_response_budget,
     approximate_name_usage_occurrences, candidate_pool_limits, contains_code_identifier,
-    edge_identity, exact_intent_tokens, exhaustive_fts_query, merge_reranked_prefix,
-    prefilter_ranking_by_role, record_vector_ranking, reranker_document, resolve_search_limit,
-    search, select_attached_memory, select_neighborhood_projection, select_path_projection,
-    tiered_candidates,
+    edge_identity, exact_intent_tokens, exhaustive_fts_query, exhaustive_warnings,
+    merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
+    resolve_search_limit, search, select_attached_memory, select_neighborhood_projection,
+    select_path_projection, tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -1066,6 +1066,80 @@ fn exhaustive_fts_query_scopes_every_term_to_content() {
         exhaustive_fts_query("alpha beta.gamma"),
         "content:\"alpha\" OR content:\"beta\" OR content:\"gamma\""
     );
+}
+
+#[test]
+fn broad_or_warning_is_first_page_only_and_requires_distinct_terms_and_threshold() {
+    let warnings = exhaustive_warnings("history.cache HISTORY", 200, true);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].code, "broad_or_query");
+    assert_eq!(warnings[0].terms, ["history", "cache"]);
+    assert_eq!(warnings[0].total_chunks, 200);
+    assert_eq!(
+        warnings[0].message,
+        "Exhaustive search OR-joins FTS terms. Refine or abandon this traversal if that is not the intended evidence set."
+    );
+
+    assert!(exhaustive_warnings("history.cache", 199, true).is_empty());
+    assert!(exhaustive_warnings("history.history", 200, true).is_empty());
+    assert!(exhaustive_warnings("history.cache", 200, false).is_empty());
+}
+
+#[test]
+fn exhaustive_search_surfaces_broad_or_warning_only_on_the_initial_page() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    for index in 0..200 {
+        fs::write(
+            repo.path().join(format!("subject-{index:03}.ts")),
+            "export const history = { cache: true };\n",
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let options = |cursor| SearchOptions {
+        mode: SearchMode::Exhaustive { cursor },
+        limit: 1,
+        rerank: false,
+        compact: true,
+        response_byte_limit: 1_000_000,
+        ..Default::default()
+    };
+
+    let first = search(&conn, None, "history.cache", &options(None))?;
+    let metadata = first.exhaustive.as_ref().expect("exhaustive metadata");
+    assert!(metadata.total_chunks >= 200);
+    assert_eq!(metadata.warnings.len(), 1);
+    let compact = crate::compact::search_value(&first);
+    assert_eq!(compact["warnings"][0]["code"], "broad_or_query");
+    assert_eq!(
+        compact["warnings"][0]["terms"],
+        serde_json::json!(["history", "cache"])
+    );
+    assert_eq!(
+        compact["warnings"][0]["total_chunks"],
+        metadata.total_chunks
+    );
+
+    let second = search(
+        &conn,
+        None,
+        "history.cache",
+        &options(metadata.next_cursor.clone()),
+    )?;
+    assert!(
+        second
+            .exhaustive
+            .as_ref()
+            .expect("continuation metadata")
+            .warnings
+            .is_empty()
+    );
+    assert!(
+        crate::compact::search_value(&second)
+            .get("warnings")
+            .is_none()
+    );
+    Ok(())
 }
 
 #[test]
