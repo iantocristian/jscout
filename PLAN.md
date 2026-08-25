@@ -3236,6 +3236,9 @@ The revised decisions:
    `.md`/`.mdx` candidates and for non-document files explicitly selected by
    an `include` glob, plus the deciding rule for each pruned directory; ordinary
    unmatched code and other non-document files do not create docs-status rows.
+   MDX otherwise remains raw authored text, but a contiguous leading
+   import/export-only preamble is not retrieval-bearing and exact JSX comments
+   are removed outside protected code ranges consistently with HTML comments.
 3. Retrieval: BM25 always builds for an enabled docs corpus; vectors reuse the existing `[embedding]`
    provider, model, and service — no second provider section and no second
    local model; reciprocal-rank fusion; embedding identity is exactly
@@ -3374,8 +3377,11 @@ and do compete in the exact tiers, so that integration must be measured, not
 assumed. Text-only formats are cheap; languages are real work.
 
 MDX is already admitted by G24 as `format='mdx'` in the docs corpus, using the
-same inert named-sections scanner as Markdown: JSX, expressions, and ESM are
-authored text, never evaluated or projected into the code graph.
+same inert named-sections scanner as Markdown: JSX, props, expressions, inner
+text, and non-leading ESM remain authored text, never evaluated or projected
+into the code graph. The only MDX-specific retrieval subtractions are a
+contiguous leading ESM-only preamble and exact JSX comments outside protected
+code ranges.
 
 Positions: Groovy/Jenkinsfiles join the code corpus as plain text first —
 identifier-shaped searches want them beside TypeScript hits. YAML and TOML

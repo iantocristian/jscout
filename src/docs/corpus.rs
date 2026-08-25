@@ -7,6 +7,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use oxc_allocator::Allocator;
+use oxc_parser::Parser as OxcParser;
+use oxc_span::SourceType;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value as YamlValue;
@@ -741,6 +744,10 @@ fn is_document_path(path: &Path) -> bool {
     })
 }
 
+fn is_mdx_path(path: &Path) -> bool {
+    path.extension() == Some(std::ffi::OsStr::new("mdx"))
+}
+
 #[cfg(unix)]
 fn os_str_starts_with_dot(value: &std::ffi::OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1053,9 +1060,10 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
     let body_base = bom_bytes + front_matter.body_start;
     let body = &markdown[front_matter.body_start..];
     let options = markdown_options();
+    let is_mdx = is_mdx_path(Path::new(path));
     let protected = protected_code_ranges(body, body_base, options);
-    let removals = comment_removals(bytes, body_base..bytes.len(), &protected);
-    let items = document_items(body, body_base, options);
+    let removals = comment_removals(bytes, body_base..bytes.len(), &protected, is_mdx);
+    let items = document_items(body, body_base, options, bytes, &removals);
     let lines = LineIndex::new(bytes);
 
     let mut heading_levels = vec![None::<String>; 6];
@@ -1066,10 +1074,12 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
     // distinct identity, even when its rendered text repeats an earlier one.
     let mut heading_instance = 0_u64;
     let mut first_h1 = None;
+    let mut mdx_preamble_open = is_mdx;
 
     for item in items {
         match item {
             DocumentItem::Heading { level, text, range } => {
+                mdx_preamble_open = false;
                 section += 1;
                 heading_instance += 1;
                 let slot = usize::from(level.saturating_sub(1)).min(5);
@@ -1096,12 +1106,22 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
                     line_end,
                 });
             }
-            DocumentItem::Boundary => section += 1,
+            DocumentItem::Boundary => {
+                mdx_preamble_open = false;
+                section += 1;
+            }
             DocumentItem::Body { kind, range } => {
                 let rendered_body = render_source_range(bytes, range.clone(), &removals);
                 if rendered_body.is_empty() {
                     continue;
                 }
+                if mdx_preamble_open
+                    && matches!(kind, BlockKind::Paragraph)
+                    && is_esm_only(&rendered_body)
+                {
+                    continue;
+                }
+                mdx_preamble_open = false;
                 let raw = std::str::from_utf8(&bytes[range.clone()])?.to_owned();
                 let nearest_heading = heading_levels.iter().rev().find_map(Clone::clone);
                 let breadcrumb = heading_levels
@@ -1217,11 +1237,12 @@ fn comment_removals(
     bytes: &[u8],
     body_range: Range<usize>,
     protected: &[Range<usize>],
+    strip_jsx_comments: bool,
 ) -> Vec<Range<usize>> {
     let mut removals = Vec::new();
     let mut protected_index = 0;
     let mut cursor = body_range.start;
-    while cursor + 4 <= body_range.end {
+    while cursor < body_range.end {
         while protected_index < protected.len() && protected[protected_index].end <= cursor {
             protected_index += 1;
         }
@@ -1232,15 +1253,30 @@ fn comment_removals(
             cursor = protected[protected_index].end;
             continue;
         }
-        if &bytes[cursor..cursor + 4] != b"<!--" {
+        let delimiter = if bytes[cursor..body_range.end].starts_with(b"<!--") {
+            Some((4_usize, b"-->".as_slice()))
+        } else if strip_jsx_comments && bytes[cursor..body_range.end].starts_with(b"{/*") {
+            Some((3_usize, b"*/}".as_slice()))
+        } else {
+            None
+        };
+        let Some((opener_len, closer)) = delimiter else {
             cursor += 1;
             continue;
+        };
+        let search_start = cursor + opener_len;
+        let search_end = protected
+            .get(protected_index)
+            .map_or(body_range.end, |range| range.start.min(body_range.end));
+        if search_start > search_end {
+            cursor += opener_len;
+            continue;
         }
-        let Some(close_offset) = find_bytes(&bytes[cursor + 4..body_range.end], b"-->") else {
-            cursor += 4;
+        let Some(close_offset) = find_bytes(&bytes[search_start..search_end], closer) else {
+            cursor += opener_len;
             continue;
         };
-        let end = cursor + 4 + close_offset + 3;
+        let end = cursor + opener_len + close_offset + closer.len();
         removals.push(cursor..end);
         cursor = end;
     }
@@ -1253,7 +1289,13 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn document_items(body: &str, base: usize, options: Options) -> Vec<DocumentItem> {
+fn document_items(
+    body: &str,
+    base: usize,
+    options: Options,
+    bytes: &[u8],
+    removals: &[Range<usize>],
+) -> Vec<DocumentItem> {
     let mut items = Vec::new();
     let mut consumed_until = 0;
     for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
@@ -1263,18 +1305,21 @@ fn document_items(body: &str, base: usize, options: Options) -> Vec<DocumentItem
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 let absolute = base + range.start..base + range.end;
+                let rendered = render_source_range(bytes, absolute.clone(), removals);
                 items.push(DocumentItem::Heading {
                     level: heading_level(level),
-                    text: render_heading(&body[range.clone()], options),
+                    text: render_heading(&rendered, options),
                     range: absolute,
                 });
                 consumed_until = range.end;
             }
             Event::Start(tag) => {
-                if let Some(kind) = body_block_kind(&tag, &body[range.clone()], options) {
+                let absolute = base + range.start..base + range.end;
+                let rendered = render_source_range(bytes, absolute.clone(), removals);
+                if let Some(kind) = body_block_kind(&tag, &rendered, options) {
                     items.push(DocumentItem::Body {
                         kind,
-                        range: base + range.start..base + range.end,
+                        range: absolute,
                     });
                     consumed_until = range.end;
                 }
@@ -1294,6 +1339,21 @@ fn document_items(body: &str, base: usize, options: Options) -> Vec<DocumentItem
         }
     }
     items
+}
+
+fn is_esm_only(source: &str) -> bool {
+    let allocator = Allocator::default();
+    let parsed = OxcParser::new(&allocator, source, SourceType::jsx()).parse();
+    !parsed.panicked
+        && parsed.diagnostics.is_empty()
+        && parsed.program.hashbang.is_none()
+        && parsed.program.directives.is_empty()
+        && !parsed.program.body.is_empty()
+        && parsed
+            .program
+            .body
+            .iter()
+            .all(|statement| statement.is_module_declaration())
 }
 
 fn body_block_kind(tag: &Tag<'_>, source: &str, options: Options) -> Option<BlockKind> {
@@ -2297,6 +2357,192 @@ mod tests {
         assert_eq!(
             file.chunks[0].rendered_body,
             "First  paragraph.\n\nSecond `<!--kept-->`.\n\n```html\n<!--also kept-->\n```"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mdx_drops_only_leading_esm_and_unprotected_jsx_comments() -> Result<()> {
+        let source = concat!(
+            "\u{feff}---\n",
+            "tags: [component]\n",
+            "---\n",
+            "import { Badge } from './badge'\n",
+            "export const preambleOnlyNeedle = { title: 'Guide' }\n",
+            "\n",
+            "# Public {/* headingOnlyNeedle */}\n",
+            "\n",
+            "<Badge label=\"Deprecated\" since={version}>\n",
+            "ActualInnerNeedle remains searchable.\n",
+            "</Badge>\n",
+            "\n",
+            "Visible before {/* commentOnlyNeedle */} visible after.\n",
+            "\n",
+            "export const postHeadingNeedle = {version};\n",
+            "\n",
+            "`{/* inlineCodeNeedle */}`\n",
+            "\n",
+            "```mdx\n",
+            "{/* fencedCodeNeedle */}\n",
+            "```\n",
+            "\n",
+            "    {/* indentedCodeNeedle */}\n",
+        );
+        let file = parse_document("guide.mdx", source.as_bytes())?;
+        let rendered = file
+            .chunks
+            .iter()
+            .map(|chunk| chunk.rendered_body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let embedded = file
+            .chunks
+            .iter()
+            .filter_map(|chunk| chunk.embedding_text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        assert_eq!(file.front_matter_state, "valid");
+        assert_eq!(file.title, "Public");
+        assert_eq!(file.tags, ["component"]);
+        for removed in [
+            "preambleOnlyNeedle",
+            "headingOnlyNeedle",
+            "commentOnlyNeedle",
+        ] {
+            assert!(!rendered.contains(removed), "rendered {removed}");
+            assert!(!embedded.contains(removed), "embedded {removed}");
+        }
+        for retained in [
+            "<Badge label=\"Deprecated\" since={version}>",
+            "ActualInnerNeedle",
+            "postHeadingNeedle",
+            "{/* inlineCodeNeedle */}",
+            "{/* fencedCodeNeedle */}",
+            "{/* indentedCodeNeedle */}",
+        ] {
+            assert!(rendered.contains(retained), "missing {retained}");
+            assert!(embedded.contains(retained), "missing embedded {retained}");
+        }
+        assert!(
+            file.blocks
+                .iter()
+                .all(|block| !block.body.contains("preambleOnlyNeedle"))
+        );
+        assert!(
+            file.blocks
+                .iter()
+                .any(|block| block.body.contains("commentOnlyNeedle")),
+            "raw source block must retain the removed JSX comment"
+        );
+
+        let esm_only = parse_document(
+            "module.mdx",
+            b"import Thing from './thing'\nexport const metadata = { title: 'Only ESM' }\n",
+        )?;
+        assert!(esm_only.blocks.is_empty());
+        assert_eq!(esm_only.chunks.len(), 1);
+        assert!(esm_only.chunks[0].is_stub);
+        assert!(esm_only.chunks[0].embedding_identity.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mdx_esm_filter_is_contiguous_leading_and_paragraph_only() -> Result<()> {
+        let split = parse_document(
+            "split.mdx",
+            concat!(
+                "import FirstNeedle from './first'\n",
+                "\n",
+                "export const SecondNeedle = { enabled: true }\n",
+                "\n",
+                "Visible prose closes the preamble.\n",
+                "\n",
+                "export const LaterNeedle = 'retained';\n",
+            )
+            .as_bytes(),
+        )?;
+        let rendered = split
+            .chunks
+            .iter()
+            .map(|chunk| chunk.rendered_body.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(!rendered.contains("FirstNeedle"));
+        assert!(!rendered.contains("SecondNeedle"));
+        assert!(rendered.contains("Visible prose"));
+        assert!(rendered.contains("LaterNeedle"));
+
+        for source in [
+            "import this package before continuing.\n",
+            "import('./dynamicNeedle')\n",
+            "\"use client\";\n",
+            "```js\nimport FencedNeedle from './fenced'\n```\n",
+            "> import QuotedNeedle from './quoted'\n",
+        ] {
+            let file = parse_document("retained.mdx", source.as_bytes())?;
+            assert!(!file.chunks[0].is_stub, "unexpected stub for {source:?}");
+            assert_eq!(file.chunks[0].rendered_body, source.trim_end());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mdx_table_context_does_not_reintroduce_removed_comments() -> Result<()> {
+        use std::fmt::Write as _;
+
+        let mut source =
+            String::from("| Name {/* tableCommentNeedle */} | Value |\n| --- | --- |\n");
+        for index in 0..1_000 {
+            writeln!(source, "| item-{index:04} | {} |", "x".repeat(24))?;
+        }
+        let file = parse_document("table.mdx", source.as_bytes())?;
+        assert!(file.chunks.len() > 1);
+        for chunk in &file.chunks {
+            assert!(chunk.rendered_body.starts_with("[table Name | Value]\n"));
+            assert!(!chunk.rendered_body.contains("tableCommentNeedle"));
+            assert!(
+                !chunk
+                    .embedding_text
+                    .as_deref()
+                    .expect("retrieval chunk")
+                    .contains("tableCommentNeedle")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn jsx_comment_syntax_is_format_gated_and_unclosed_text_is_retained() -> Result<()> {
+        let markdown = parse_document(
+            "literal.md",
+            b"Before {/* markdownLiteralNeedle */} after.\n",
+        )?;
+        assert!(
+            markdown.chunks[0]
+                .rendered_body
+                .contains("{/* markdownLiteralNeedle */}")
+        );
+        let markdown_esm = parse_document(
+            "module.md",
+            b"import MarkdownEsmNeedle from './still-authored'\n",
+        )?;
+        assert!(
+            markdown_esm.chunks[0]
+                .rendered_body
+                .contains("MarkdownEsmNeedle")
+        );
+
+        let mdx = parse_document("unclosed.mdx", b"Before {/* unclosedNeedle after.\n")?;
+        assert!(mdx.chunks[0].rendered_body.contains("{/* unclosedNeedle"));
+
+        let protected_closer = parse_document(
+            "protected-closer.mdx",
+            b"Before {/* unclosed `*/}` protectedCloserNeedle.\n",
+        )?;
+        assert_eq!(
+            protected_closer.chunks[0].rendered_body,
+            "Before {/* unclosed `*/}` protectedCloserNeedle."
         );
         Ok(())
     }

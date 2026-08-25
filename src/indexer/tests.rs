@@ -239,8 +239,13 @@ fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
     fs::write(
         repo.path().join("guide.mdx"),
         concat!(
-            "# Component guide\n\n",
-            "<Widget mode=\"safe\" />\n\n",
+            "import PreambleOnlyNeedle from './preamble-only'\n",
+            "export const preambleMetadataNeedle = { title: 'Guide' }\n\n",
+            "# Component guide {/* headingCommentNeedle */}\n\n",
+            "<Widget mode=\"safe\">ActualInnerNeedle</Widget>\n\n",
+            "<Badge label=\"Deprecated\" since={version} />\n\n",
+            "Visible before {/* jsxCommentNeedle */} visible after.\n\n",
+            "`{/* protectedCommentNeedle */}`\n\n",
             "export const mdxOnlyNeedle = 'documentation text';\n",
         ),
     )?;
@@ -269,6 +274,43 @@ fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
         inert_chunk,
         ("markdown_section".into(), None, String::new())
     );
+
+    let raw_comment_rows: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.mdx' AND chunk.content LIKE '%jsxCommentNeedle%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(raw_comment_rows, 1, "raw source slice lost the JSX comment");
+    let retrieval_chunks: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.mdx'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retrieval_chunks, 1, "ESM preamble became a retrieval unit");
+    for (query, expected) in [
+        ("PreambleOnlyNeedle", 0_i64),
+        ("preambleMetadataNeedle", 0),
+        ("headingCommentNeedle", 0),
+        ("jsxCommentNeedle", 0),
+        ("ActualInnerNeedle", 1),
+        ("Badge", 1),
+        ("label", 1),
+        ("Deprecated", 1),
+        ("version", 1),
+        ("protectedCommentNeedle", 1),
+        ("\"Badge label Deprecated\"", 1),
+    ] {
+        let rows: i64 = conn.query_row(
+            "SELECT count(*) FROM docs_fts WHERE docs_fts MATCH ?1",
+            [query],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, expected, "docs FTS query {query}");
+    }
 
     let snapshot = structural::current_snapshot(&conn)?;
     let docs_hits = docs::store::lexical_search(&conn, &snapshot, "mdxOnlyNeedle", 10)?;

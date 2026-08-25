@@ -162,8 +162,12 @@ jscout agent-guide --install R # install a project-local jscout skill
 Repository Markdown and MDX are admitted by the normal `jscout index` pass
 into the shared snapshot and database. They rank in an isolated BM25/vector
 corpus, so documentation never changes code-search term statistics or vector
-candidates. MDX deliberately uses the same inert Markdown block parser: JSX
-and JavaScript-looking text remain documentation and never enter code graphs.
+candidates. MDX deliberately uses the same inert Markdown block parser: raw
+JSX, props, expressions, and inner text remain searchable documentation and
+never enter code graphs. Two narrow exclusions keep retrieval units useful: a
+contiguous leading import/export-only preamble emits no chunk, and exact JSX
+comments (`{/* ... */}`) are removed outside Markdown code ranges just as HTML
+comments are.
 The disposable `files` inventory records ranking membership in `corpus`
 (`code` or `docs`) separately from parser identity in `format`; Markdown uses
 `corpus='docs'` and `format='markdown'`, while MDX uses `corpus='docs'` and

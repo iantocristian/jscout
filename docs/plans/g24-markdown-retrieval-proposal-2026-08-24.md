@@ -192,11 +192,14 @@ descendants beneath pruned directories. Version one admits exact-lowercase
 them and otherwise remain outside the decision universe.
 
 MDX uses the same pinned CommonMark parser and GFM-table option as Markdown.
-MDX JSX, expressions, and ESM imports/exports are inert authored source: they
-are never evaluated and do not run through the JavaScript/TypeScript parser,
-seed code FTS, emit symbols, or create graph rows. The CommonMark event stream
-determines whether such source is rendered as text or visible HTML; no claim of
-full MDX syntax understanding is made in version one.
+Raw JSX, props, expressions, inner text, and non-leading ESM imports/exports
+remain inert authored source: they are never evaluated, seed no code FTS, emit
+no symbols, and create no graph rows. A narrow leading-block classifier uses
+the pinned JavaScript parser only to recognize a contiguous preamble made
+entirely of import/export declarations; those blocks emit no retrieval chunk
+or embedding identity. The CommonMark event stream otherwise determines
+whether MDX source is rendered as text or visible HTML; no claim of full MDX
+syntax understanding is made in version one.
 
 ### Field composition
 
@@ -277,7 +280,20 @@ indented, and inline-code ranges, rendering removes each byte range beginning
 with exact ASCII `<!--` through the first subsequent exact ASCII `-->`,
 inclusive. An opener without a closer is retained as ordinary text. This
 deterministic non-nesting scan also removes comments contained inside an opaque
-raw-HTML block; comment-looking text in every code range remains literal.
+raw-HTML block. For `.mdx` only, the same scan also removes exact ASCII `{/*`
+through the first subsequent exact ASCII `*/}`, inclusive. Comment-looking
+text in every protected code range remains literal, and `.md` treats JSX
+comment syntax as ordinary authored text. Protected code ranges also terminate
+a comment scan, so an outside opener cannot consume comment-looking code.
+
+Before MDX body-block publication, a preamble gate examines contiguous leading
+paragraph blocks after BOM/front-matter handling and comment removal. A block
+is omitted only when it parses without diagnostics as a non-empty JavaScript
+module containing exclusively import/export declarations. Empty rendered
+comment blocks do not close the gate. A heading, thematic separator,
+non-paragraph block, or first non-ESM paragraph closes it permanently; later
+imports/exports remain raw searchable text. An ESM-only document therefore
+emits the normal lexical-only document stub and no embedding identity.
 Headings establish structure and metadata but are not independent history
 occurrences; thematic separators carry no retrieval text or history occurrence
 and force a chunk boundary. The ledger tracks retrieval-bearing body blocks.
@@ -291,7 +307,7 @@ Retrieval rendering is byte-deterministic:
 
 1. Each source-backed body block starts as its exact original source slice,
    with CRLF and lone CR normalized to LF. Only ranges emitted by the Markdown
-   comment scanner above removes ranges outside fenced, indented, or inline
+   or MDX comment scanner above are removed outside fenced, indented, or inline
    code. Leading and trailing LF bytes are removed and every other byte is
    retained.
 2. A merged chunk joins rendered blocks with exactly two LF bytes (`\n\n`),
@@ -704,7 +720,9 @@ Deterministic tests:
   reordering do not;
 - golden rendering fixtures pin CRLF normalization, `**API**` heading text,
   the two-LF merge separator, exact non-code HTML-comment scanning (including
-  comments inside raw HTML), inline-code comment preservation, and exact
+  comments inside raw HTML), exact MDX JSX-comment scanning, leading ESM-only
+  preamble suppression, raw JSX/prop/expression/inner-text retention,
+  inline-code comment preservation, and exact
   fence/table prefixes on every oversized
   fragment including the first;
 - every oversized block type splits deterministically, final rendered

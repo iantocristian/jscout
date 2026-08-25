@@ -75,7 +75,7 @@ The monorepo questions worth having — an env var read in code but declared now
 
 ## First pass
 
-Markdown and MDX, at the named-sections tier. Both use the same inert pinned CommonMark/GFM-table scanner; MDX JSX, expressions, and ESM are authored text, never evaluated or projected into the code corpus or graph. The first pass adds `files.corpus` and `files.format`, the central corpus views, and write-point routing in the same PR. Nothing temporal ships in the first pass — docs search launches as pure relevance, and hits may display the git timestamp as inert metadata so decay can be judged before it is built. Measure rebuild time and docs-corpus retrieval quality before any YAML decision. Reversal is cheap by design: disable docs admission and reindex.
+Markdown and MDX, at the named-sections tier. Both use the same inert pinned CommonMark/GFM-table scanner. Raw MDX JSX, props, expressions, inner text, and non-leading ESM remain authored text, never evaluated or projected into the code corpus or graph. A narrow leading-block classifier suppresses only a contiguous import/export-only preamble, and exact JSX comments are removed outside protected code ranges consistently with HTML comments. The first pass adds `files.corpus` and `files.format`, the central corpus views, and write-point routing in the same PR. Nothing temporal ships in the first pass — docs search launches as pure relevance, and hits may display the git timestamp as inert metadata so decay can be judged before it is built. Measure rebuild time and docs-corpus retrieval quality before any YAML decision. Reversal is cheap by design: disable docs admission and reindex.
 
 ## Out of scope
 
