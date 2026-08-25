@@ -31,9 +31,9 @@ individual search without removing provenance from results.
 
 ## Inputs and protocol
 
-- Source: clean commit `51eb78d54a75d13090416d86bf808fddb840ab0f`;
+- Source: clean commit `152e62f9f4804867e93f4aa5dee5888a7b1c6a14`;
   `jscout 0.4.0`; binary SHA-256
-  `f3d2ee4509768e42596f4d2d276f36c81ceba61adf8ac657fda85b7190ce4a39`.
+  `b88ada439396e136be287633c373c909249d61cde9d2329f873148a5a9ead023`.
 - Corpus: 12 logical queries and 52 query-by-variant cases across clean,
   depth-2 shallow, non-Git, dirty, staged, and untracked repositories.
 - Matrix: lexical, hybrid, and hybrid-plus-reranker retrieval, each with
@@ -54,7 +54,7 @@ individual search without removing provenance from results.
 - Machine result:
   [`g24-docs-retrieval-phase3-2026-08-26.json`](g24-docs-retrieval-phase3-2026-08-26.json),
   SHA-256
-  `21b15058358249850f16af9e902a8eeee52815e392dc45968ed0a0a55c44dc99`.
+  `a7706097af98d14c4991391b82db9186212b0c174b0dc2cd7160fd2a1b6e7e0f`.
 
 ## Validity gates
 
