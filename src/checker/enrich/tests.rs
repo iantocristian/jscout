@@ -443,7 +443,7 @@ fn mixed_staged_fingerprints_reset_and_rerun_all_occurrences() -> Result<()> {
     );
     let execution = result?;
 
-    assert!(execution.discarded_staging);
+    assert!(execution.staging_occurrences_reset > 0);
     assert_eq!(counters.request_batches, 1);
     assert_eq!(counters.occurrences_queried, 3);
     assert_eq!(counters.unknown_answers, 3);
@@ -516,7 +516,7 @@ fn resumed_fingerprint_drift_resets_and_reruns_all_occurrences() -> Result<()> {
     );
     let execution = result?;
 
-    assert!(execution.discarded_staging);
+    assert!(execution.staging_occurrences_reset > 0);
     assert_eq!(counters.request_batches, 4);
     assert_eq!(counters.occurrences_queried, 5);
     assert_eq!(
@@ -1288,6 +1288,12 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
     let terminal_partial = PartialEnrichmentError {
         batch_id: 1,
         facts_published: 10,
+        projects_carried: 1,
+        occurrences_carried: 2,
+        projects_resumed: 3,
+        occurrences_resumed: 4,
+        projects_reset: 5,
+        occurrences_reset: 6,
         failures: vec![ProjectFailure {
             project_id: "inferred:.#node-esm".into(),
             files: vec![FileFailure {
@@ -1305,12 +1311,21 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
             .to_string()
             .contains("broken.mjs (span_mismatch: indexed occurrence moved)")
     );
+    assert!(terminal_partial.to_string().contains(
+        "projects_carried=1 occurrences_carried=2 projects_resumed=3 occurrences_resumed=4 projects_reset=5 occurrences_reset=6"
+    ));
     let terminal_partial = anyhow::Error::new(terminal_partial);
     assert!(is_terminal_partial_failure(&terminal_partial));
 
     let retryable_partial = anyhow::Error::new(PartialEnrichmentError {
         batch_id: 2,
         facts_published: 10,
+        projects_carried: 0,
+        occurrences_carried: 0,
+        projects_resumed: 0,
+        occurrences_resumed: 0,
+        projects_reset: 0,
+        occurrences_reset: 0,
         failures: vec![ProjectFailure {
             project_id: "tsconfig.json".into(),
             files: Vec::new(),
@@ -2834,6 +2849,156 @@ fn watch_carry_rebinds_unchanged_facts_to_current_member_call_rows() -> Result<(
         )?,
         1
     );
+    Ok(())
+}
+
+#[test]
+fn successor_prefers_complete_staging_projects_and_falls_back_to_active() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export class CardTable { insert(): void {} }\n\
+                  declare const card: CardTable; card.insert();\n";
+    let (conn, hash) = indexed(repo.path(), source)?;
+    let occurrence_v1 = occurrence(&conn)?;
+    let declaration = declaration_at(source, "insert(): void {}", "insert", &hash);
+    let identity = TypeScriptIdentity {
+        version: "5.9.3".into(),
+        source: "bundled".into(),
+    };
+    let fingerprints = BTreeMap::from([
+        ("a/tsconfig.json".to_string(), "stable-a".to_string()),
+        ("b/tsconfig.json".to_string(), "stable-b".to_string()),
+    ]);
+    let active_batch = seed_active_checker_batch(
+        repo.path(),
+        &conn,
+        &hash,
+        &occurrence_v1,
+        &declaration,
+        &fingerprints,
+    )?;
+
+    fs::write(
+        repo.path().join("generation-2.ts"),
+        "export const g2 = 2;\n",
+    )?;
+    crate::indexer::watch_full_refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &crate::indexer::IndexOptions::default(),
+    )?;
+    let occurrence_v2 = occurrence(&conn)?;
+    let projects_v2 = fingerprints
+        .keys()
+        .map(|project| (project.clone(), vec![occurrence_v2.clone()]))
+        .collect::<BTreeMap<_, _>>();
+    let staging_batch = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "superseded-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects_v2,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    let staging_answer = project_answer("a/tsconfig.json", vec![declaration.clone()]);
+    let staging_outcome = map_occurrence(&conn, &occurrence_v2, &[staging_answer])?;
+    stage_batch(
+        &conn,
+        staging_batch,
+        "a/tsconfig.json",
+        std::slice::from_ref(&occurrence_v2),
+        &staging_outcome.facts,
+        &staging_outcome.projects,
+    )?;
+    complete_project(
+        repo.path(),
+        &conn,
+        staging_batch,
+        "a/tsconfig.json",
+        "a-inputs",
+        &[super::super::protocol::CheckerInputFile {
+            path: repo.path().join("main.ts").to_string_lossy().into_owned(),
+            source_hash: hash.clone(),
+        }],
+        1,
+        1,
+    )?;
+    conn.execute(
+        "UPDATE checker_enrichments SET receiver_type='superseded-staging'
+         WHERE batch_id=?1 AND project_id='a/tsconfig.json'",
+        [staging_batch],
+    )?;
+
+    fs::write(
+        repo.path().join("generation-3.ts"),
+        "export const g3 = 3;\n",
+    )?;
+    crate::indexer::watch_full_refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &crate::indexer::IndexOptions::default(),
+    )?;
+    let occurrence_v3 = occurrence(&conn)?;
+    let projects_v3 = fingerprints
+        .keys()
+        .map(|project| (project.clone(), vec![occurrence_v3.clone()]))
+        .collect::<BTreeMap<_, _>>();
+    let destination = open_staging_batch(
+        &conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(&conn)?,
+            plan_fingerprint: "successor-plan",
+            checker: &identity,
+            protocol: 2,
+            selected_occurrences: 1,
+            projects: &projects_v3,
+            project_fingerprints: &fingerprints,
+            force_new: false,
+        },
+    )?;
+    let carried = carry_forward_projects(
+        &conn,
+        destination,
+        &identity,
+        2,
+        &projects_v3,
+        &fingerprints,
+        &mut InputFreshnessCache::new(repo.path()),
+    )?;
+
+    assert_eq!(carried.projects_carried, 2);
+    assert_eq!(carried.projects_carried_from_staging, 1);
+    assert_eq!(carried.projects_carried_from_active, 1);
+    assert_eq!(carried.occurrences_carried, 1);
+    assert_eq!(carried.project_occurrences_carried, 2);
+    assert!(carried.projects_requiring_check.is_empty());
+    let receiver_types = conn
+        .prepare(
+            "SELECT project_id, receiver_type FROM checker_enrichments
+             WHERE batch_id=?1 ORDER BY project_id",
+        )?
+        .query_map([destination], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        receiver_types,
+        vec![
+            ("a/tsconfig.json".into(), "superseded-staging".into()),
+            ("b/tsconfig.json".into(), "CardTable".into()),
+        ]
+    );
+    let batches = conn
+        .prepare("SELECT id, active FROM checker_enrichment_batches ORDER BY id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(batches, vec![(active_batch, true), (destination, false)]);
     Ok(())
 }
 

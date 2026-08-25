@@ -278,8 +278,8 @@ pub fn refresh_repo_with_options(
 }
 
 /// Full structural refresh for the watcher. Unlike manual `jscout index`, it
-/// keeps only the previous active checker batch as a hidden carry source for
-/// the following enrichment phase.
+/// keeps the previous active checker batch and newest superseded staging batch
+/// as hidden carry sources for the following enrichment phase.
 pub fn watch_full_refresh_repo_with_options(
     root: &Path,
     conn: &Connection,
@@ -668,8 +668,9 @@ fn index_repo_impl<F: FileSystem>(
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
         // Manual indexing always resets the optional checker plane. Watch keeps
-        // one old active batch hidden for the immediately following per-project
-        // carry step; projection still rejects a mismatched source snapshot.
+        // the old active batch and newest superseded staging batch hidden for
+        // the following per-project carry step; projection still rejects a
+        // mismatched source snapshot.
         let checker_batches_changed = match checker_retention {
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {

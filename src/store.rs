@@ -1276,12 +1276,21 @@ pub(crate) fn clear_checker_batches(conn: &Connection) -> Result<bool> {
     Ok(changed)
 }
 
-/// A watcher refresh may keep the one previously active batch hidden as a
-/// carry source. Staging rows belong to an interrupted old plan and cannot be
-/// reused after structural refresh; ordinary projection still requires the
-/// batch's source snapshot to equal the current snapshot.
+/// A watcher refresh keeps the active publication plus the newest superseded
+/// staging batch as carry sources. Only completed projects from staging are
+/// eligible later; incomplete rows remain durable solely so the successor can
+/// reject them project-by-project. Ordinary projection still requires the
+/// active batch's source snapshot to equal the current snapshot.
 pub(crate) fn preserve_active_checker_batch_for_watch(conn: &Connection) -> Result<bool> {
-    let changed = conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])? != 0;
+    let changed = conn.execute(
+        "DELETE FROM checker_enrichment_batches
+         WHERE active=0
+           AND id!=(
+             SELECT id FROM checker_enrichment_batches
+             WHERE active=0 ORDER BY id DESC LIMIT 1
+           )",
+        [],
+    )? != 0;
     Ok(changed)
 }
 

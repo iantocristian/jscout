@@ -16,9 +16,11 @@ use super::protocol::{
 /// Checker answer normalization and stored confidence semantics participate in
 /// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
 /// the same inputs could map to different facts or confidence.
-const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v4\0";
+pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v4\0";
+pub(super) const PROJECT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-project-plan-v1\0";
+pub(super) const ENRICH_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-plan-v5\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
-const INFERRED_ROOT_CAP: usize = 150;
+pub(super) const INFERRED_ROOT_CAP: usize = 150;
 
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
@@ -54,7 +56,13 @@ pub struct EnrichReport {
     pub occurrences_omitted: usize,
     pub occurrences_deprioritized_builtin_receiver: usize,
     pub occurrences_skipped_foreign_namesake: usize,
+    /// A current, fully validated completed batch satisfied the whole plan;
+    /// no staging rows were resumed and no cross-snapshot carry was attempted.
+    pub exact_batch_reused: bool,
+    pub projects_resumed: usize,
     pub occurrences_resumed: usize,
+    pub projects_reset: usize,
+    pub occurrences_reset: usize,
     pub request_batches: usize,
     pub unknown_answers: usize,
     pub unknown_projects: Vec<String>,
@@ -66,7 +74,13 @@ pub struct EnrichReport {
     pub checker_source: String,
     pub projects: usize,
     pub projects_carried: usize,
+    pub projects_carried_from_staging: usize,
+    pub projects_carried_from_active: usize,
+    pub projects_partially_carried: usize,
     pub occurrences_carried: usize,
+    /// Owner-occurrence pairs; unlike `occurrences_carried`, this counts one
+    /// shared occurrence once for each TypeScript project that supplied it.
+    pub project_occurrences_carried: usize,
     pub configured_projects: usize,
     pub configuration_problems: usize,
     /// Eligible source files whose member-call candidates have no configured
@@ -99,13 +113,19 @@ struct FileFailure {
 #[derive(Debug, Default)]
 struct ProjectExecution {
     failed_files: BTreeMap<String, super::protocol::RemoteError>,
-    discarded_staging: bool,
+    staging_occurrences_reset: usize,
 }
 
 #[derive(Debug)]
 struct PartialEnrichmentError {
     batch_id: i64,
     facts_published: usize,
+    projects_carried: usize,
+    occurrences_carried: usize,
+    projects_resumed: usize,
+    occurrences_resumed: usize,
+    projects_reset: usize,
+    occurrences_reset: usize,
     failures: Vec<ProjectFailure>,
 }
 
@@ -142,11 +162,17 @@ impl fmt::Display for PartialEnrichmentError {
             .join(", ");
         write!(
             formatter,
-            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project scope(s) had failures: {}; unresolved ownership remains possible",
+            "checker enrichment activated partial batch {} with {} staged fact(s), but {} project scope(s) had failures: {}; reuse projects_carried={} occurrences_carried={} projects_resumed={} occurrences_resumed={} projects_reset={} occurrences_reset={}; unresolved ownership remains possible",
             self.batch_id,
             self.facts_published,
             self.failures.len(),
-            failed
+            failed,
+            self.projects_carried,
+            self.occurrences_carried,
+            self.projects_resumed,
+            self.occurrences_resumed,
+            self.projects_reset,
+            self.occurrences_reset,
         )?;
         if self.retryable() {
             formatter.write_str("; transient failures may be resumed")
@@ -264,8 +290,27 @@ struct CarryFact {
 #[derive(Debug, Default)]
 struct CarryOutcome {
     projects_carried: usize,
+    projects_carried_from_staging: usize,
+    projects_carried_from_active: usize,
+    projects_partially_carried: usize,
     occurrences_carried: usize,
+    project_occurrences_carried: usize,
+    fully_carried_projects: BTreeSet<String>,
+    occurrences_by_project: BTreeMap<String, BTreeSet<i64>>,
     projects_requiring_check: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrySourceKind {
+    SupersededStaging,
+    ActivePublication,
+}
+
+#[derive(Debug)]
+struct CarryProjectSource {
+    batch_id: i64,
+    kind: CarrySourceKind,
+    external_inputs: Vec<ValidatedInput>,
 }
 
 struct StagingPlan<'a> {
@@ -400,7 +445,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_omitted: 0,
             occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
             occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+            exact_batch_reused: false,
+            projects_resumed: 0,
             occurrences_resumed: 0,
+            projects_reset: 0,
+            occurrences_reset: 0,
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects: Vec::new(),
@@ -411,7 +460,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_source: "not-invoked".into(),
             projects: 0,
             projects_carried: 0,
+            projects_carried_from_staging: 0,
+            projects_carried_from_active: 0,
+            projects_partially_carried: 0,
             occurrences_carried: 0,
+            project_occurrences_carried: 0,
             configured_projects: 0,
             configuration_problems: 0,
             files_without_configured_project: 0,
@@ -515,7 +568,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_omitted: occurrences_eligible,
             occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
             occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+            exact_batch_reused: false,
+            projects_resumed: 0,
             occurrences_resumed: 0,
+            projects_reset: 0,
+            occurrences_reset: 0,
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects: Vec::new(),
@@ -526,7 +583,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_source: ownership.typescript.source,
             projects: 0,
             projects_carried: 0,
+            projects_carried_from_staging: 0,
+            projects_carried_from_active: 0,
+            projects_partially_carried: 0,
             occurrences_carried: 0,
+            project_occurrences_carried: 0,
             configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -580,7 +641,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
             occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
             occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+            exact_batch_reused: false,
+            projects_resumed: 0,
             occurrences_resumed: 0,
+            projects_reset: 0,
+            occurrences_reset: 0,
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects: Vec::new(),
@@ -591,7 +656,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_source: ownership.typescript.source,
             projects: project_plan.len(),
             projects_carried: 0,
+            projects_carried_from_staging: 0,
+            projects_carried_from_active: 0,
+            projects_partially_carried: 0,
             occurrences_carried: 0,
+            project_occurrences_carried: 0,
             configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -638,7 +707,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
             occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
             occurrences_skipped_foreign_namesake: selection.foreign_namesake,
-            occurrences_resumed: selected.len(),
+            exact_batch_reused: true,
+            projects_resumed: 0,
+            occurrences_resumed: 0,
+            projects_reset: 0,
+            occurrences_reset: 0,
             request_batches: 0,
             unknown_answers: 0,
             unknown_projects,
@@ -649,7 +722,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             checker_source: ownership.typescript.source,
             projects: project_plan.len(),
             projects_carried: 0,
+            projects_carried_from_staging: 0,
+            projects_carried_from_active: 0,
+            projects_partially_carried: 0,
             occurrences_carried: 0,
+            project_occurrences_carried: 0,
             configured_projects,
             configuration_problems: ownership.configuration_problems.len(),
             files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -709,7 +786,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut priority_projects = dirty_projects;
     priority_projects.extend(carry.projects_requiring_check.iter().cloned());
     let mut occurrences_queried = 0;
+    let mut resumed_projects = BTreeSet::<String>::new();
     let mut occurrences_resumed = 0;
+    let mut projects_reset = 0;
+    let mut occurrences_reset = 0;
     let mut request_batches = 0;
     let mut unknown_answers = 0;
     let mut unmapped_declarations = 0;
@@ -727,14 +807,30 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             bail!("checker enrichment interrupted; staged work retained");
         }
         if project_complete_and_fresh(&conn, batch_id, project_id, &mut input_freshness)? {
-            occurrences_resumed += occurrences.len();
+            if !carry.fully_carried_projects.contains(project_id) {
+                resumed_projects.insert(project_id.clone());
+                occurrences_resumed += occurrences.len();
+            }
             continue;
         }
         let mut completed = completed_occurrences(&conn, batch_id, project_id)?;
         if completed.len() == occurrences.len() {
-            reset_project_staging(&conn, batch_id, project_id)?;
+            let reset = reset_project_staging(&conn, batch_id, project_id)?;
+            if reset != 0 {
+                projects_reset += 1;
+                occurrences_reset += reset;
+            }
             completed.clear();
         }
+        let staging_resumed = completed
+            .iter()
+            .filter(|occurrence| {
+                !carry
+                    .occurrences_by_project
+                    .get(project_id)
+                    .is_some_and(|carried| carried.contains(occurrence))
+            })
+            .count();
         let unchecked = occurrences
             .iter()
             .filter(|occurrence| !completed.contains(&occurrence.id))
@@ -777,8 +873,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         );
         match project_result {
             Ok(execution) if !execution.failed_files.is_empty() => {
-                if !execution.discarded_staging {
-                    occurrences_resumed += completed.len();
+                if execution.staging_occurrences_reset == 0 {
+                    if staging_resumed != 0 {
+                        resumed_projects.insert(project_id.clone());
+                        occurrences_resumed += staging_resumed;
+                    }
+                } else {
+                    projects_reset += 1;
+                    occurrences_reset += execution.staging_occurrences_reset;
                 }
                 let files = execution
                     .failed_files
@@ -801,8 +903,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                 });
             }
             Ok(execution) => {
-                if !execution.discarded_staging {
-                    occurrences_resumed += completed.len();
+                if execution.staging_occurrences_reset == 0 {
+                    if staging_resumed != 0 {
+                        resumed_projects.insert(project_id.clone());
+                        occurrences_resumed += staging_resumed;
+                    }
+                } else {
+                    projects_reset += 1;
+                    occurrences_reset += execution.staging_occurrences_reset;
                 }
             }
             Err(error) => {
@@ -855,6 +963,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         return Err(PartialEnrichmentError {
             batch_id,
             facts_published: activation.facts_published,
+            projects_carried: carry.projects_carried,
+            occurrences_carried: carry.occurrences_carried,
+            projects_resumed: resumed_projects.len(),
+            occurrences_resumed,
+            projects_reset,
+            occurrences_reset,
             failures: failed_projects,
         }
         .into());
@@ -883,7 +997,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         occurrences_omitted: occurrences_eligible.saturating_sub(selected.len()),
         occurrences_deprioritized_builtin_receiver: selection.builtin_receiver,
         occurrences_skipped_foreign_namesake: selection.foreign_namesake,
+        exact_batch_reused: false,
+        projects_resumed: resumed_projects.len(),
         occurrences_resumed,
+        projects_reset,
+        occurrences_reset,
         request_batches,
         unknown_answers,
         unknown_projects: load_unknown_projects(&conn, batch_id)?,
@@ -894,7 +1012,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         checker_source: ownership.typescript.source,
         projects: project_plan.len(),
         projects_carried: carry.projects_carried,
+        projects_carried_from_staging: carry.projects_carried_from_staging,
+        projects_carried_from_active: carry.projects_carried_from_active,
+        projects_partially_carried: carry.projects_partially_carried,
         occurrences_carried: carry.occurrences_carried,
+        project_occurrences_carried: carry.project_occurrences_carried,
         configured_projects,
         configuration_problems: ownership.configuration_problems.len(),
         files_without_configured_project: inferred_coverage.files_without_configured_project,
@@ -1674,7 +1796,7 @@ fn project_planning_fingerprints(
             );
             let config = summary.map_or("", |summary| summary.config_fingerprint.as_str());
             let mut hasher = blake3::Hasher::new();
-            hasher.update(b"jscout-checker-project-plan-v1\0");
+            hasher.update(PROJECT_PLAN_FINGERPRINT_DOMAIN);
             hasher.update(CHECKER_SEMANTICS_FINGERPRINT);
             for value in [
                 project_id.as_str(),
@@ -1711,7 +1833,7 @@ fn plan_fingerprint(
     // checker answer projects must never revive a batch created under the
     // previous single-target-only `likely` rule. Grouped inferred membership
     // also changes the planning boundary independently of that policy.
-    hasher.update(b"jscout-checker-plan-v5\0");
+    hasher.update(ENRICH_PLAN_FINGERPRINT_DOMAIN);
     hasher.update(CHECKER_SEMANTICS_FINGERPRINT);
     for value in [
         snapshot,
@@ -1892,7 +2014,18 @@ fn open_staging_batch(conn: &Connection, plan: &StagingPlan<'_>) -> Result<i64> 
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<i64> {
-        conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])?;
+        // Keep the newest superseded staging batch until the new destination
+        // has copied its valid completed projects. Older inactive plans cannot
+        // beat that source and are bounded here before another row is added.
+        conn.execute(
+            "DELETE FROM checker_enrichment_batches
+             WHERE active=0
+               AND id!=(
+                 SELECT id FROM checker_enrichment_batches
+                 WHERE active=0 ORDER BY id DESC LIMIT 1
+               )",
+            [],
+        )?;
         conn.execute(
             "INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,
@@ -2130,153 +2263,201 @@ fn carry_forward_projects(
     if already_staged != 0 {
         return Ok(CarryOutcome::default());
     }
-    let Some(previous_batch) = conn
-        .query_row(
-            "SELECT id FROM checker_enrichment_batches
-             WHERE active=1 AND id!=?1
-               AND checker_version=?2 AND checker_source=?3
-               AND sidecar_protocol=?4",
-            params![batch_id, checker.version, checker.source, protocol],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-    else {
-        return Ok(CarryOutcome::default());
-    };
-
-    let previous_projects = conn
+    let mut candidate_batches = conn
         .prepare(
-            "SELECT project_id, planning_fingerprint
-             FROM checker_project_runs
-             WHERE batch_id=?1 AND status='completed'",
+            "SELECT id, active FROM checker_enrichment_batches
+             WHERE id!=?1
+               AND checker_version=?2 AND checker_source=?3
+               AND sidecar_protocol=?4
+             ORDER BY active, id DESC",
         )?
-        .query_map([previous_batch], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
-    // Preserve external checker-input watch coverage for fully carried
-    // projects. Repository inputs are deliberately not copied: source edits
-    // are handled fact-by-fact instead of invalidating the entire Program.
-    let mut previous_external_inputs = BTreeMap::<String, Vec<ValidatedInput>>::new();
-    let mut statement = conn.prepare(
-        "SELECT project_id, input_kind, input_path, source_hash
-         FROM checker_project_inputs
-         WHERE batch_id=?1 AND input_kind='absolute'
-         ORDER BY project_id, input_path",
-    )?;
-    for row in statement.query_map([previous_batch], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            ValidatedInput {
-                kind: row.get(1)?,
-                path: row.get(2)?,
-                source_hash: row.get(3)?,
-            },
-        ))
-    })? {
-        let (project, input) = row?;
-        previous_external_inputs
-            .entry(project)
-            .or_default()
-            .push(input);
+        .query_map(
+            params![batch_id, checker.version, checker.source, protocol],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // At most one superseded staging source competes with the active
+    // publication. Prefer that newer completed project, then fall back to the
+    // active project. Older inactive rows are bounded by open/refresh policy.
+    let mut retained_inactive = false;
+    candidate_batches.retain(|(_, active)| {
+        if *active {
+            true
+        } else if retained_inactive {
+            false
+        } else {
+            retained_inactive = true;
+            true
+        }
+    });
+
+    let mut selected_sources = BTreeMap::<String, CarryProjectSource>::new();
+    for (source_batch, active) in candidate_batches {
+        let complete_projects = conn
+            .prepare(
+                "SELECT run.project_id, run.planning_fingerprint
+                 FROM checker_project_runs run
+                 WHERE run.batch_id=?1 AND run.status='completed'
+                   AND run.completed_occurrences=run.selected_occurrences
+                   AND (
+                     SELECT count(*) FROM checker_occurrence_projects coverage
+                     WHERE coverage.batch_id=run.batch_id
+                       AND coverage.project_id=run.project_id
+                   )=run.selected_occurrences
+                   AND NOT EXISTS(
+                     SELECT 1 FROM checker_occurrence_projects coverage
+                     WHERE coverage.batch_id=run.batch_id
+                       AND coverage.project_id=run.project_id
+                       AND coverage.status='failed'
+                   )",
+            )?
+            .query_map([source_batch], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        let mut external_inputs = BTreeMap::<String, Vec<ValidatedInput>>::new();
+        let mut statement = conn.prepare(
+            "SELECT project_id, input_kind, input_path, source_hash
+             FROM checker_project_inputs
+             WHERE batch_id=?1 AND input_kind='absolute'
+             ORDER BY project_id, input_path",
+        )?;
+        for row in statement.query_map([source_batch], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ValidatedInput {
+                    kind: row.get(1)?,
+                    path: row.get(2)?,
+                    source_hash: row.get(3)?,
+                },
+            ))
+        })? {
+            let (project, input) = row?;
+            external_inputs.entry(project).or_default().push(input);
+        }
+        for project in projects.keys() {
+            if selected_sources.contains_key(project)
+                || complete_projects.get(project) != project_fingerprints.get(project)
+            {
+                continue;
+            }
+            let inputs = external_inputs.remove(project).unwrap_or_default();
+            if !inputs.iter().all(|input| input_freshness.matches(input)) {
+                continue;
+            }
+            selected_sources.insert(
+                project.clone(),
+                CarryProjectSource {
+                    batch_id: source_batch,
+                    kind: if active {
+                        CarrySourceKind::ActivePublication
+                    } else {
+                        CarrySourceKind::SupersededStaging
+                    },
+                    external_inputs: inputs,
+                },
+            );
+        }
     }
-    let external_inputs_fresh = projects
-        .keys()
-        .map(|project| {
-            let fresh = previous_external_inputs
-                .get(project)
-                .into_iter()
-                .flatten()
-                .all(|input| input_freshness.matches(input));
-            (project.clone(), fresh)
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut projects_requiring_check = projects
         .keys()
-        .filter(|project| {
-            previous_projects.get(*project) != project_fingerprints.get(*project)
-                || !external_inputs_fresh
-                    .get(*project)
-                    .copied()
-                    .unwrap_or(false)
-        })
+        .filter(|project| !selected_sources.contains_key(*project))
         .cloned()
+        .collect::<BTreeSet<_>>();
+    let source_batches = selected_sources
+        .values()
+        .map(|source| source.batch_id)
         .collect::<BTreeSet<_>>();
 
     let mut previous_coverage = BTreeMap::<(OccurrenceIdentity, String), CarryCoverage>::new();
-    let mut statement = conn.prepare(
-        "SELECT source_file, source_hash, call_start, call_end,
-                receiver_start, receiver_end, property_start, property_end,
-                project_id, checker_input_fingerprint, status
-         FROM checker_occurrence_projects WHERE batch_id=?1
-         ORDER BY source_file, call_start, project_id",
-    )?;
-    for row in statement.query_map([previous_batch], |row| {
-        Ok((
-            OccurrenceIdentity {
-                file: row.get(0)?,
-                hash: row.get(1)?,
-                call_start: row.get(2)?,
-                call_end: row.get(3)?,
-                receiver_start: row.get(4)?,
-                receiver_end: row.get(5)?,
-                property_start: row.get(6)?,
-                property_end: row.get(7)?,
-            },
-            row.get::<_, String>(8)?,
-            CarryCoverage {
-                input_fingerprint: row.get(9)?,
-                status: row.get(10)?,
-            },
-        ))
-    })? {
-        let (identity, project, coverage) = row?;
-        if previous_coverage
-            .insert((identity, project), coverage)
-            .is_some()
-        {
-            bail!("previous checker batch contains duplicate occurrence coverage");
+    for source_batch in &source_batches {
+        let mut statement = conn.prepare(
+            "SELECT source_file, source_hash, call_start, call_end,
+                    receiver_start, receiver_end, property_start, property_end,
+                    project_id, checker_input_fingerprint, status
+             FROM checker_occurrence_projects WHERE batch_id=?1
+             ORDER BY source_file, call_start, project_id",
+        )?;
+        for row in statement.query_map([source_batch], |row| {
+            Ok((
+                OccurrenceIdentity {
+                    file: row.get(0)?,
+                    hash: row.get(1)?,
+                    call_start: row.get(2)?,
+                    call_end: row.get(3)?,
+                    receiver_start: row.get(4)?,
+                    receiver_end: row.get(5)?,
+                    property_start: row.get(6)?,
+                    property_end: row.get(7)?,
+                },
+                row.get::<_, String>(8)?,
+                CarryCoverage {
+                    input_fingerprint: row.get(9)?,
+                    status: row.get(10)?,
+                },
+            ))
+        })? {
+            let (identity, project, coverage) = row?;
+            if selected_sources
+                .get(&project)
+                .is_none_or(|source| source.batch_id != *source_batch)
+            {
+                continue;
+            }
+            if previous_coverage
+                .insert((identity, project), coverage)
+                .is_some()
+            {
+                bail!("checker carry source contains duplicate occurrence coverage");
+            }
         }
     }
 
     let mut previous_facts = BTreeMap::<(OccurrenceIdentity, String), Vec<CarryFact>>::new();
-    let mut statement = conn.prepare(
-        "SELECT source_file, source_hash, call_start, call_end,
-                receiver_start, receiver_end, property_start, property_end,
-                project_id, receiver_type, target_anchor, target_fingerprint,
-                confidence, checker_input_fingerprint
-         FROM checker_enrichments WHERE batch_id=?1
-         ORDER BY source_file, call_start, project_id, target_anchor",
-    )?;
-    for row in statement.query_map([previous_batch], |row| {
-        Ok((
-            OccurrenceIdentity {
-                file: row.get(0)?,
-                hash: row.get(1)?,
-                call_start: row.get(2)?,
-                call_end: row.get(3)?,
-                receiver_start: row.get(4)?,
-                receiver_end: row.get(5)?,
-                property_start: row.get(6)?,
-                property_end: row.get(7)?,
-            },
-            row.get::<_, String>(8)?,
-            CarryFact {
-                receiver_type: row.get(9)?,
-                target: Target {
-                    anchor: row.get(10)?,
-                    fingerprint: row.get(11)?,
+    for source_batch in source_batches {
+        let mut statement = conn.prepare(
+            "SELECT source_file, source_hash, call_start, call_end,
+                    receiver_start, receiver_end, property_start, property_end,
+                    project_id, receiver_type, target_anchor, target_fingerprint,
+                    confidence, checker_input_fingerprint
+             FROM checker_enrichments WHERE batch_id=?1
+             ORDER BY source_file, call_start, project_id, target_anchor",
+        )?;
+        for row in statement.query_map([source_batch], |row| {
+            Ok((
+                OccurrenceIdentity {
+                    file: row.get(0)?,
+                    hash: row.get(1)?,
+                    call_start: row.get(2)?,
+                    call_end: row.get(3)?,
+                    receiver_start: row.get(4)?,
+                    receiver_end: row.get(5)?,
+                    property_start: row.get(6)?,
+                    property_end: row.get(7)?,
                 },
-                confidence: row.get(12)?,
-                input_fingerprint: row.get(13)?,
-            },
-        ))
-    })? {
-        let (identity, project, fact) = row?;
-        previous_facts
-            .entry((identity, project))
-            .or_default()
-            .push(fact);
+                row.get::<_, String>(8)?,
+                CarryFact {
+                    receiver_type: row.get(9)?,
+                    target: Target {
+                        anchor: row.get(10)?,
+                        fingerprint: row.get(11)?,
+                    },
+                    confidence: row.get(12)?,
+                    input_fingerprint: row.get(13)?,
+                },
+            ))
+        })? {
+            let (identity, project, fact) = row?;
+            if selected_sources
+                .get(&project)
+                .is_some_and(|source| source.batch_id == source_batch)
+            {
+                previous_facts
+                    .entry((identity, project))
+                    .or_default()
+                    .push(fact);
+            }
+        }
     }
 
     let mut current_occurrences = BTreeMap::<i64, Occurrence>::new();
@@ -2303,14 +2484,7 @@ fn carry_forward_projects(
         let mut answers = Vec::new();
         let mut can_carry = true;
         for project in owners {
-            let current_fingerprint = project_fingerprints
-                .get(project)
-                .with_context(|| format!("missing planning fingerprint for {project}"))?;
-            if previous_projects.get(project) != Some(current_fingerprint) {
-                can_carry = false;
-                break;
-            }
-            if !external_inputs_fresh.get(project).copied().unwrap_or(false) {
+            if !selected_sources.contains_key(project) {
                 can_carry = false;
                 break;
             }
@@ -2424,6 +2598,10 @@ fn carry_forward_projects(
         }
 
         let mut projects_carried = 0;
+        let mut projects_carried_from_staging = 0;
+        let mut projects_carried_from_active = 0;
+        let mut projects_partially_carried = 0;
+        let mut fully_carried_projects = BTreeSet::new();
         for (project, occurrences) in projects {
             let completed: i64 = conn.query_row(
                 "SELECT count(*) FROM checker_occurrence_projects
@@ -2431,7 +2609,7 @@ fn carry_forward_projects(
                 params![batch_id, project],
                 |row| row.get(0),
             )?;
-            if completed as usize == occurrences.len() {
+            if completed as usize == occurrences.len() && selected_sources.contains_key(project) {
                 let fingerprint = project_fingerprints
                     .get(project)
                     .with_context(|| format!("missing planning fingerprint for {project}"))?;
@@ -2444,6 +2622,15 @@ fn carry_forward_projects(
                     params![batch_id, project, completed, fingerprint],
                 )?;
                 projects_carried += 1;
+                fully_carried_projects.insert(project.clone());
+                match selected_sources[project].kind {
+                    CarrySourceKind::SupersededStaging => {
+                        projects_carried_from_staging += 1;
+                    }
+                    CarrySourceKind::ActivePublication => {
+                        projects_carried_from_active += 1;
+                    }
+                }
             } else {
                 conn.execute(
                     "UPDATE checker_project_runs
@@ -2453,9 +2640,16 @@ fn carry_forward_projects(
                      WHERE batch_id=?1 AND project_id=?2",
                     params![batch_id, project, completed],
                 )?;
+                if completed > 0 {
+                    projects_partially_carried += 1;
+                }
             }
             if completed > 0 {
-                for input in previous_external_inputs.get(project).into_iter().flatten() {
+                for input in selected_sources
+                    .get(project)
+                    .into_iter()
+                    .flat_map(|source| &source.external_inputs)
+                {
                     insert_input.execute(params![
                         batch_id,
                         project,
@@ -2466,9 +2660,29 @@ fn carry_forward_projects(
                 }
             }
         }
+        // The destination now contains every validated carry result. Retire
+        // predecessor staging atomically with those copies; the active
+        // publication remains available until destination activation.
+        conn.execute(
+            "DELETE FROM checker_enrichment_batches WHERE active=0 AND id!=?1",
+            [batch_id],
+        )?;
+        let mut occurrences_by_project = BTreeMap::<String, BTreeSet<i64>>::new();
+        for (occurrence, project, _, _) in &carried {
+            occurrences_by_project
+                .entry(project.clone())
+                .or_default()
+                .insert(occurrence.id);
+        }
         Ok(CarryOutcome {
             projects_carried,
+            projects_carried_from_staging,
+            projects_carried_from_active,
+            projects_partially_carried,
             occurrences_carried,
+            project_occurrences_carried: carried.len(),
+            fully_carried_projects,
+            occurrences_by_project,
             projects_requiring_check,
         })
     })();
@@ -2540,14 +2754,14 @@ fn project_inputs_fresh(
     Ok(inputs.iter().all(|input| input_freshness.matches(input)))
 }
 
-fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> Result<()> {
+fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> Result<usize> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<usize> {
         conn.execute(
             "DELETE FROM checker_enrichments WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
         )?;
-        conn.execute(
+        let reset_occurrences = conn.execute(
             "DELETE FROM checker_occurrence_projects WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
         )?;
@@ -2564,16 +2778,18 @@ fn reset_project_staging(conn: &Connection, batch_id: i64, project_id: &str) -> 
              WHERE batch_id=?1 AND project_id=?2",
             params![batch_id, project_id],
         )?;
-        Ok(())
+        Ok(reset_occurrences)
     })();
     match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
+        Ok(reset_occurrences) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(reset_occurrences)
+        }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
+            Err(error)
         }
     }
-    Ok(())
 }
 
 fn completed_occurrences(
@@ -2691,7 +2907,7 @@ fn execute_project(
         if !restart_available {
             bail!("checker staging contains multiple input fingerprints for {project_id}");
         }
-        reset_project_staging(conn, batch_id, project_id)?;
+        let reset_occurrences = reset_project_staging(conn, batch_id, project_id)?;
         let mut execution = execute_project(
             root,
             options,
@@ -2712,7 +2928,7 @@ fn execute_project(
             false,
             register_interrupts,
         )?;
-        execution.discarded_staging = true;
+        execution.staging_occurrences_reset = reset_occurrences;
         return Ok(execution);
     }
     let mut checker = super::launch(root, options.sidecar, None, options.node)?;
@@ -2798,7 +3014,7 @@ fn execute_project(
             if expected != &result.checker_input_fingerprint {
                 if resumed_fingerprint.is_some() && restart_available {
                     drop(checker);
-                    reset_project_staging(conn, batch_id, project_id)?;
+                    let reset_occurrences = reset_project_staging(conn, batch_id, project_id)?;
                     let mut execution = execute_project(
                         root,
                         options,
@@ -2819,7 +3035,7 @@ fn execute_project(
                         false,
                         register_interrupts,
                     )?;
-                    execution.discarded_staging = true;
+                    execution.staging_occurrences_reset = reset_occurrences;
                     return Ok(execution);
                 }
                 bail!("checker input fingerprint changed during project {project_id}");
@@ -3484,6 +3700,10 @@ fn activate_staging_batch(
             if conn.changes() != 1 {
                 bail!("checker staging batch disappeared before no-op completion");
             }
+            conn.execute(
+                "DELETE FROM checker_enrichment_batches WHERE active=0 AND id!=?1",
+                [batch_id],
+            )?;
             return Ok(ActivationOutcome {
                 facts_published: 0,
                 publication_changed: false,

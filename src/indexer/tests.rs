@@ -2176,7 +2176,7 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
 }
 
 #[test]
-fn watcher_incremental_refresh_preserves_old_checker_batch_as_hidden_carry_source() -> Result<()> {
+fn watcher_incremental_refresh_preserves_active_and_newest_staging_carry_sources() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
     let conn = store::open(repo.path())?;
@@ -2190,18 +2190,38 @@ fn watcher_incremental_refresh_preserves_old_checker_batch_as_hidden_carry_sourc
                   '2026-01-01T00:00:00Z', 1)",
         [&snapshot],
     )?;
+    let active_batch = conn.last_insert_rowid();
+    conn.execute_batch(
+        "INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           created_at, active
+         ) VALUES('superseded-a', '5.9.3', 'test', '', 1, 'plan-a',
+                  '2026-01-02T00:00:00Z', 0);
+         INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           created_at, active
+         ) VALUES('superseded-b', '5.9.3', 'test', '', 1, 'plan-b',
+                  '2026-01-03T00:00:00Z', 0);",
+    )?;
+    let newest_staging = conn.last_insert_rowid();
 
     fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
     incremental_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
 
     let current = structural::current_snapshot(&conn)?;
-    let retained: (i64, i64) = conn.query_row(
-        "SELECT count(*), count(*) FILTER (WHERE source_snapshot=?1)
-         FROM checker_enrichment_batches",
-        [&current],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    assert_eq!(retained, (1, 0));
+    let retained = conn
+        .prepare("SELECT id, active FROM checker_enrichment_batches ORDER BY id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        retained,
+        vec![(active_batch, true), (newest_staging, false)]
+    );
+    assert_ne!(snapshot, current);
     Ok(())
 }
 
