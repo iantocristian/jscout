@@ -3237,17 +3237,22 @@ The revised decisions:
    resolution under watch; it ships with the supersession product if that
    product is built. Append-only history is not rebuildable from the
    checkout, so the ledger is durable-plane and owes the explicit
-   cache-compatibility decision durable changes require. Two consequences of
-   the unified lifecycle are part of that decision: the main index keeps no
-   snapshot history — `meta.snapshot` is a replaced digest, not a timeline —
-   so the ledger must mint and durably store its own observation sequence and
-   timestamps, writing a clock row only when a scan observes a documentation
-   change; and its comparison baseline ("last successfully parsed state")
-   cannot live in the disposable plane, which full rebuild wipes by design,
-   so the ledger durably carries the last-observed corpus state itself —
-   otherwise every `jscout index` would fabricate a whole-corpus
-   removed-and-added event. Unchanged blocks add no rows, so code churn
-   advances nothing. When built, it stays separate from
+   cache-compatibility decision durable changes require. The unified
+   lifecycle resolves its two needs with shared mechanisms rather than a
+   private clock: a durable `snapshot_log` (sequence, digest, published-at),
+   appended in the publication transaction whenever the published digest
+   changes, gives the whole index an ordered snapshot timeline — the
+   snapshot itself stays a disposable replaced digest — and observations
+   reference that shared sequence; a durable rolling `doc_block_state`
+   baseline (per block: content hash, position, heading context,
+   logical-occurrence ID; no bodies), replaced at each observing scan, lets
+   matching always compare last-observed state against current, even across
+   a full rebuild, which wipes the disposable plane by design. Matching
+   needs only the previous state; accumulated history is matching's output,
+   never its input. History recording is a per-kind registry property, on
+   for Markdown only. Unchanged blocks add no observation rows, so code
+   churn grows nothing, while whole-codebase snapshots tighten observation
+   intervals for free. When built, the ledger stays separate from
    the current size-merged retrieval-chunk projection. Matching
    is conservative and one-to-one — exact content first, then uniquely
    neighbor-anchored edited blocks; ordinal position alone never establishes

@@ -343,18 +343,23 @@ during implementation):
   both a cached vector and a matching index entry. Search may query vectors
   only through that exact ready generation; otherwise it reports degraded
   vector status and uses BM25.
-- block ledger tables (`doc_block_contents`, `doc_block_occurrences`,
-  `doc_block_observations`): deferred with the supersession product. They
-  are append-only and therefore durable-plane when they ship, owing the
-  explicit cache-compatibility decision PLAN.md requires for durable
-  changes. Because the main index keeps no snapshot history and the
-  disposable plane is wiped on full rebuild, the ledger mints and durably
-  stores its own observation sequence and timestamps (a clock row only when
-  a scan observes a docs change) and durably carries the last-observed
-  corpus state as its matching baseline; their matching, lifecycle, and
-  failure semantics remain as specified under History and continuity.
-  References to "snapshot sequence" in those sections mean this ledger-owned
-  observation sequence. Any corpus-level failure —
+- history tables (deferred with the supersession product), all durable and
+  owing the explicit cache-compatibility decision PLAN.md requires:
+  `snapshot_log` — a whole-codebase ordered snapshot timeline (sequence,
+  digest, published-at), appended in the publication transaction whenever
+  the published digest changes, while `meta.snapshot` itself stays a
+  disposable replaced digest; `doc_block_state` — a rolling baseline
+  replaced at each observing scan (per block: content hash, position,
+  heading context, logical-occurrence ID; no bodies), so matching always
+  compares last-observed state against current, even across a full rebuild;
+  and `doc_block_observations` — append-only events referencing
+  `snapshot_log` sequence numbers, growing only when a change is observed.
+  Matching needs only the previous state; accumulated history is matching's
+  output, never its input. History recording is a per-kind registry
+  property, on for Markdown only. Matching, lifecycle, and failure semantics
+  remain as specified under History and continuity; references to "snapshot
+  sequence" in those sections mean `snapshot_log` sequence numbers. Retired
+  body retention (`doc_block_contents`) remains the separate opt-in. Any corpus-level failure —
   retryable I/O, database, transaction, configuration, discovery, inventory,
   or cancellation — publishes no replacement; only a classified permanent
   subject-local open/read rejection may be recorded in a successfully
