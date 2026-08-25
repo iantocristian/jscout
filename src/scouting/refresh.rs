@@ -181,7 +181,8 @@ mod tests {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
         conn.execute(
-            "INSERT INTO files(path, hash, role) VALUES('flow.ts','new','production')",
+            "INSERT INTO files(path,hash,role,corpus,format)
+             VALUES('flow.ts','new','production','code','typescript')",
             [],
         )?;
         conn.execute(

@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "29";
+pub const SCHEMA_VERSION: &str = "31";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -31,6 +31,16 @@ fn register_sqlite_vec() {
 const CHUNKS_FTS_CREATE: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   content, name, symbols, path,
+  tokenize="unicode61 tokenchars '_$'"
+);
+"#;
+
+/// Independent BM25 corpus for authored repository documentation. Its rowids
+/// are shared `chunks.id` values, but documentation rows are never mirrored
+/// into `chunks_fts`, so admitting Markdown cannot alter code term statistics.
+const DOCS_FTS_CREATE: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+  title, metadata, breadcrumb, body, path,
   tokenize="unicode61 tokenchars '_$'"
 );
 "#;
@@ -103,7 +113,38 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
             crate::structural::PROJECTION_VERSION,
         );
     }
+    validate_published_contracts(&conn)?;
     Ok(conn)
+}
+
+/// Reject source-derived rows produced by an incompatible binary contract.
+/// Indexing is the only repair path; read and embedding surfaces must not
+/// reinterpret old rows under the current extractor or Markdown format.
+pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
+    let (extraction_version, documentation_chunk_format): (Option<String>, Option<String>) = conn
+        .query_row(
+        "SELECT
+               (SELECT value FROM meta WHERE key='extraction_version'),
+               (SELECT value FROM meta
+                WHERE key='documentation_chunk_format_version')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let extraction_version = extraction_version.as_deref().unwrap_or("missing");
+    if extraction_version != crate::entity::EXTRACTION_VERSION {
+        bail!(
+            "published index uses code extraction contract v{extraction_version}, but this jscout requires v{}; run `jscout index`",
+            crate::entity::EXTRACTION_VERSION,
+        );
+    }
+    let documentation_chunk_format = documentation_chunk_format.as_deref().unwrap_or("missing");
+    if documentation_chunk_format != crate::docs::CHUNK_FORMAT_VERSION {
+        bail!(
+            "published index uses documentation chunk format {documentation_chunk_format}, but this jscout requires {}; run `jscout index`",
+            crate::docs::CHUNK_FORMAT_VERSION,
+        );
+    }
+    Ok(())
 }
 
 /// Open an index database independently of the repository root. Evaluation
@@ -181,6 +222,9 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                (name GLOB 'vec_embeddings_[0-9]*'
                 AND substr(name, length('vec_embeddings_') + 1) NOT GLOB '*[^0-9]*')
                OR
+               (name GLOB 'vec_doc_embeddings_[0-9]*'
+                AND substr(name, length('vec_doc_embeddings_') + 1) NOT GLOB '*[^0-9]*')
+               OR
                (name GLOB 'vec_semantic_embeddings_[0-9]*'
                 AND substr(name, length('vec_semantic_embeddings_') + 1) NOT GLOB '*[^0-9]*')
              )
@@ -194,6 +238,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
         for table in vector_tables {
             let dimensions = table
                 .strip_prefix("vec_semantic_embeddings_")
+                .or_else(|| table.strip_prefix("vec_doc_embeddings_"))
                 .or_else(|| table.strip_prefix("vec_embeddings_"))
                 .unwrap_or_default();
             if dimensions.is_empty() || !dimensions.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -202,7 +247,11 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
             conn.execute(&format!("DELETE FROM {table}"), [])?;
         }
         conn.execute_batch(
-            "DROP TABLE IF EXISTS embedding_index_entries;
+            "DROP VIEW IF EXISTS code_chunks;
+             DROP VIEW IF EXISTS code_files;
+             DROP TABLE IF EXISTS doc_vector_generations;
+             DROP TABLE IF EXISTS doc_embedding_index_entries;
+             DROP TABLE IF EXISTS embedding_index_entries;
              DROP TABLE IF EXISTS semantic_embedding_index_entries;
              DROP TABLE IF EXISTS checker_occurrence_projects;
              DROP TABLE IF EXISTS checker_project_inputs;
@@ -232,7 +281,10 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS member_calls;
              DROP TABLE IF EXISTS imports;
              DROP TABLE IF EXISTS exports;
+             DROP TABLE IF EXISTS docs_fts;
              DROP TABLE IF EXISTS chunks_fts;
+             DROP TABLE IF EXISTS doc_chunk_meta;
+             DROP TABLE IF EXISTS doc_inventory;
              DROP TABLE IF EXISTS chunks;
              DROP TABLE IF EXISTS symbols;
              DROP TABLE IF EXISTS files;
@@ -240,10 +292,10 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DELETE FROM meta
              WHERE key IN (
                'root', 'snapshot', 'projection_version', 'resolution_hash',
-               'extraction_version'
+               'extraction_version', 'documentation_chunk_format_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='29' WHERE key='schema_version';",
+             UPDATE meta SET value='31' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -261,7 +313,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '29')
+INSERT INTO meta(key, value) VALUES('schema_version', '31')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -282,12 +334,15 @@ CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY,
   path TEXT UNIQUE NOT NULL,
   hash TEXT NOT NULL,
+  corpus TEXT NOT NULL CHECK(corpus IN ('code', 'docs')),
+  format TEXT NOT NULL CHECK(length(trim(format)) > 0),
   role TEXT NOT NULL DEFAULT 'unknown',
   origin TEXT NOT NULL DEFAULT 'repository'
     CHECK(origin IN ('repository', 'workspace', 'dependency')),
   package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE CASCADE,
   package_path TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_files_corpus ON files(corpus);
 
 CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY,
@@ -305,6 +360,95 @@ CREATE TABLE IF NOT EXISTS chunks(
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
+
+-- Documentation chunks share files/chunks and the structural snapshot, while
+-- their retrieval-only fields remain in this disposable sidecar. Corpus
+-- membership is an explicit property of `files`; this table cannot make a
+-- code file into documentation by accident or omission.
+CREATE TABLE IF NOT EXISTS doc_chunk_meta(
+  chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  description TEXT,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  breadcrumb TEXT NOT NULL DEFAULT '',
+  nearest_heading TEXT,
+  ordinal INTEGER NOT NULL,
+  embedding_identity TEXT,
+  front_matter_state TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_doc_chunk_embedding_identity
+  ON doc_chunk_meta(embedding_identity);
+
+CREATE TRIGGER IF NOT EXISTS doc_chunk_meta_requires_docs_insert
+BEFORE INSERT ON doc_chunk_meta
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM chunks chunk
+  JOIN files file ON file.id=chunk.file_id
+  WHERE chunk.id=NEW.chunk_id AND file.corpus='docs'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'doc_chunk_meta requires a docs-corpus file');
+END;
+
+CREATE TRIGGER IF NOT EXISTS doc_chunk_meta_requires_docs_update
+BEFORE UPDATE OF chunk_id ON doc_chunk_meta
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM chunks chunk
+  JOIN files file ON file.id=chunk.file_id
+  WHERE chunk.id=NEW.chunk_id AND file.corpus='docs'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'doc_chunk_meta requires a docs-corpus file');
+END;
+
+CREATE TRIGGER IF NOT EXISTS files_docs_sidecar_preserves_corpus
+BEFORE UPDATE OF corpus ON files
+WHEN NEW.corpus!='docs' AND EXISTS (
+  SELECT 1
+  FROM chunks chunk
+  JOIN doc_chunk_meta doc ON doc.chunk_id=chunk.id
+  WHERE chunk.file_id=OLD.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'a file with doc_chunk_meta must remain in the docs corpus');
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_docs_sidecar_preserves_corpus
+BEFORE UPDATE OF file_id ON chunks
+WHEN EXISTS (SELECT 1 FROM doc_chunk_meta doc WHERE doc.chunk_id=OLD.id)
+ AND NOT EXISTS (SELECT 1 FROM files file WHERE file.id=NEW.file_id AND file.corpus='docs')
+BEGIN
+  SELECT RAISE(ABORT, 'a chunk with doc_chunk_meta requires a docs-corpus file');
+END;
+
+-- Keep the code/docs corpus boundary in one schema object instead of asking
+-- every code consumer to reproduce it. Format identifies the parser family;
+-- corpus alone determines which retrieval plane owns the file.
+CREATE VIEW IF NOT EXISTS code_files AS
+SELECT file.*
+FROM files file
+WHERE file.corpus='code';
+
+CREATE VIEW IF NOT EXISTS code_chunks AS
+SELECT chunk.*
+FROM chunks chunk
+JOIN code_files file ON file.id=chunk.file_id;
+
+-- Current-snapshot membership diagnostics. Pruned directories and rejected
+-- files have no files/chunks row, so this projection is intentionally not
+-- foreign-keyed to the admitted corpus.
+CREATE TABLE IF NOT EXISTS doc_inventory(
+  path TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  rule TEXT NOT NULL,
+  detail TEXT,
+  path_base64 TEXT,
+  path_encoding TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_doc_inventory_path_subject
+  ON doc_inventory(path, subject);
 
 CREATE TABLE IF NOT EXISTS symbols(
   id INTEGER PRIMARY KEY,
@@ -617,6 +761,25 @@ CREATE TABLE IF NOT EXISTS embedding_index_entries(
 );
 CREATE INDEX IF NOT EXISTS idx_embedding_entries_profile
   ON embedding_index_entries(profile_id, chunk_id);
+
+-- Documentation vector occurrences use their own sqlite-vec tables because
+-- sqlite-vec applies KNN's k before a relational corpus filter can run.
+CREATE TABLE IF NOT EXISTS doc_embedding_index_entries(
+  id INTEGER PRIMARY KEY,
+  chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  UNIQUE (chunk_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_embedding_entries_profile
+  ON doc_embedding_index_entries(profile_id, chunk_id);
+
+CREATE TABLE IF NOT EXISTS doc_vector_generations(
+  snapshot TEXT NOT NULL,
+  profile_id INTEGER NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+  dimensions INTEGER NOT NULL,
+  chunk_format_version TEXT NOT NULL,
+  PRIMARY KEY (snapshot, profile_id, dimensions, chunk_format_version)
+);
 
 CREATE TABLE IF NOT EXISTS graph_nodes(
   node_key TEXT PRIMARY KEY,
@@ -942,6 +1105,7 @@ CREATE INDEX IF NOT EXISTS idx_semantic_embedding_entries_profile
 ",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    conn.execute_batch(DOCS_FTS_CREATE)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_files_origin ON files(origin);
          CREATE INDEX IF NOT EXISTS idx_files_package_instance ON files(package_instance_id);
@@ -1052,6 +1216,8 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "DELETE FROM repository_file_policy;
          DELETE FROM repository_current_classifications;
+         DELETE FROM doc_vector_generations;
+         DELETE FROM doc_embedding_index_entries;
          DELETE FROM embedding_index_entries;
          DELETE FROM entity_edges;
          DELETE FROM entity_occurrences;
@@ -1071,13 +1237,17 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM contract_imports;
          DELETE FROM contract_exports;
          DELETE FROM module_edges;
+         DELETE FROM doc_chunk_meta;
+         DELETE FROM doc_inventory;
          DELETE FROM chunks;
          DELETE FROM files;
          DELETE FROM resolved_edges;
          DELETE FROM graph_nodes;
+         DROP TABLE docs_fts;
          DROP TABLE chunks_fts;",
     )?;
     conn.execute_batch(CHUNKS_FTS_CREATE)?;
+    conn.execute_batch(DOCS_FTS_CREATE)?;
     Ok(())
 }
 
@@ -1118,7 +1288,20 @@ pub(crate) fn preserve_active_checker_batch_for_watch(conn: &Connection) -> Resu
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
 /// FTS rows are removed explicitly since fts5 isn't FK-aware.
 pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
+    let exists = conn
+        .query_row("SELECT 1 FROM files WHERE id=?1", [file_id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(());
+    }
     crate::embed::delete_vector_rows_for_file(conn, file_id)?;
+    conn.execute(
+        "DELETE FROM docs_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
+        [file_id],
+    )?;
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?1)",
         [file_id],
@@ -1166,14 +1349,20 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DB_FILE, SCHEMA_VERSION, file_source_path, open, open_path, open_path_read_only,
-        open_read_only,
+        DB_FILE, SCHEMA_VERSION, delete_file, file_source_path, open, open_path,
+        open_path_read_only, open_read_only, reset_extraction_state,
     };
 
     fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>> {
         let mut statement =
             conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
         let rows = statement.query_map([index], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    fn relation_columns(conn: &Connection, relation: &str) -> Result<Vec<String>> {
+        let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+        let rows = statement.query_map([relation], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -1235,7 +1424,8 @@ mod tests {
         let database = directory.path().join("floor.db");
         let conn = open_path(&database)?;
         conn.execute_batch(
-            r#"INSERT INTO files(path, hash, role) VALUES('old.ts', 'source', 'production');
+            r#"INSERT INTO files(path, hash, corpus, format, role)
+               VALUES('old.ts', 'source', 'code', 'typescript', 'production');
              INSERT INTO chunks(
                file_id, kind, start, end, start_line, end_line, hash, content
              ) VALUES(1, 'module', 0, 1, 1, 1, 'chunk', 'x');
@@ -1401,6 +1591,15 @@ mod tests {
             "INSERT INTO meta(key, value) VALUES('projection_version', ?1)",
             [crate::structural::PROJECTION_VERSION],
         )?;
+        writer.execute(
+            "INSERT INTO meta(key, value) VALUES('extraction_version', ?1)",
+            [crate::entity::EXTRACTION_VERSION],
+        )?;
+        writer.execute(
+            "INSERT INTO meta(key, value)
+             VALUES('documentation_chunk_format_version', ?1)",
+            [crate::docs::CHUNK_FORMAT_VERSION],
+        )?;
         drop(writer);
 
         let reader = open_path_read_only(&database)?;
@@ -1435,6 +1634,83 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(unchanged, "stale");
+
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "UPDATE meta SET value=?1 WHERE key='projection_version'",
+            [crate::structural::PROJECTION_VERSION],
+        )?;
+        writer.execute(
+            "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
+            [],
+        )?;
+        drop(writer);
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must reject stale extraction contracts");
+        assert!(
+            error
+                .to_string()
+                .contains("code extraction contract vlegacy")
+        );
+
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "UPDATE meta SET value=?1 WHERE key='extraction_version'",
+            [crate::entity::EXTRACTION_VERSION],
+        )?;
+        writer.execute(
+            "UPDATE meta SET value='documentation-v0'
+             WHERE key='documentation_chunk_format_version'",
+            [],
+        )?;
+        drop(writer);
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must reject mismatched documentation contracts");
+        assert!(
+            error
+                .to_string()
+                .contains("documentation chunk format documentation-v0")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v30_rebuild_installs_explicit_file_classification() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v30.db");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '30');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY,
+               path TEXT UNIQUE NOT NULL,
+               hash TEXT NOT NULL,
+               role TEXT NOT NULL DEFAULT 'unknown',
+               origin TEXT NOT NULL DEFAULT 'repository',
+               package_instance_id INTEGER,
+               package_path TEXT
+             );
+             INSERT INTO files(path, hash) VALUES('old.ts', 'old');",
+        )?;
+        drop(legacy);
+
+        let error = open_path_read_only(&database)
+            .expect_err("read-only consumers must reject pre-classification schema v30");
+        assert!(error.to_string().contains("schema v30"));
+
+        let rebuilt = open_path(&database)?;
+        let version: String = rebuilt.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, SCHEMA_VERSION);
+        let columns = relation_columns(&rebuilt, "files")?;
+        assert!(columns.iter().any(|column| column == "corpus"));
+        assert!(columns.iter().any(|column| column == "format"));
+        let files: i64 = rebuilt.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
+        assert_eq!(files, 0);
         Ok(())
     }
 
@@ -1444,7 +1720,8 @@ mod tests {
         let database = directory.path().join("v28.db");
         let conn = open_path(&database)?;
         conn.execute_batch(
-            "INSERT INTO files(id, path, hash, role) VALUES(1, 'old.ts', 'file', 'production');
+            "INSERT INTO files(id, path, hash, corpus, format, role)
+               VALUES(1, 'old.ts', 'file', 'code', 'typescript', 'production');
              INSERT INTO chunks(
                id, file_id, kind, start, end, start_line, end_line, hash, content
              ) VALUES(1, 1, 'module', 0, 1, 1, 1, 'chunk', 'x');
@@ -1603,12 +1880,264 @@ mod tests {
     }
 
     #[test]
+    fn code_corpus_views_are_installed_with_the_shared_table_shapes() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        assert_eq!(index_columns(&conn, "idx_files_corpus")?, ["corpus"]);
+        let views = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='view' AND name IN ('code_files','code_chunks')
+                 ORDER BY name",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(views, ["code_chunks", "code_files"]);
+        assert_eq!(
+            relation_columns(&conn, "code_files")?,
+            relation_columns(&conn, "files")?
+        );
+        assert_eq!(
+            relation_columns(&conn, "code_chunks")?,
+            relation_columns(&conn, "chunks")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn files_require_a_valid_corpus_and_nonempty_format() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format)
+             VALUES('valid.ts','valid','code','typescript')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format)
+             VALUES('valid.md','valid','docs','markdown')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO files(path,hash) VALUES('missing.ts','missing')",
+            [],
+        )
+        .expect_err("corpus and format must be explicit");
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format)
+             VALUES('invalid.txt','invalid','other','text')",
+            [],
+        )
+        .expect_err("unknown corpus must be rejected");
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format)
+             VALUES('empty.ts','empty','code','   ')",
+            [],
+        )
+        .expect_err("empty format must be rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_file_is_idempotent_after_its_rows_are_gone() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        conn.execute_batch(
+            "INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(1,'README.md','doc-file','docs','markdown','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,
+               start_line,end_line,hash,content
+             ) VALUES(1,1,'markdown_section',NULL,'','',0,4,1,1,'doc-chunk','body');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES(1,'README','',NULL,0,NULL,'absent');
+             INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+               VALUES(1,'README','','','body','README.md');",
+        )?;
+
+        delete_file(&conn, 1)?;
+        delete_file(&conn, 1)?;
+
+        let remaining: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM files),
+               (SELECT count(*) FROM chunks),
+               (SELECT count(*) FROM doc_chunk_meta),
+               (SELECT count(*) FROM docs_fts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(remaining, (0, 0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn code_corpus_views_exclude_entire_documentation_files() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        conn.execute_batch(
+            "INSERT INTO files(id,path,hash,corpus,format,role,origin) VALUES
+               (1,'src/main.ts','code-file','code','typescript','production','repository'),
+               (2,'README.md','doc-file','docs','markdown','documentation','repository'),
+               (3,'empty.md','empty-doc','docs','markdown','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,
+               start_line,end_line,hash,content
+             ) VALUES
+               (1,1,'function','run','','run',0,3,1,1,'code-chunk','run'),
+               (2,2,'markdown_section',NULL,'','',0,3,1,1,'doc-chunk','doc'),
+               (3,1,'function','more','','more',4,8,2,2,'more-code','more');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES
+               (2,'README','',NULL,0,NULL,'absent');",
+        )?;
+
+        let code_file_ids = conn
+            .prepare("SELECT id FROM code_files ORDER BY id")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let code_chunk_ids = conn
+            .prepare("SELECT id FROM code_chunks ORDER BY id")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(code_file_ids, [1]);
+        assert_eq!(code_chunk_ids, [1, 3]);
+        let sidecar_error = conn
+            .execute(
+                "INSERT INTO doc_chunk_meta(
+                   chunk_id,title,breadcrumb,ordinal,front_matter_state
+                 ) VALUES(1,'Code','',0,'absent')",
+                [],
+            )
+            .expect_err("documentation metadata must not define corpus membership");
+        assert!(
+            sidecar_error
+                .to_string()
+                .contains("doc_chunk_meta requires a docs-corpus file")
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM files", [], |row| row.get::<_, i64>(0))?,
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM chunks", [], |row| row
+                .get::<_, i64>(0))?,
+            3
+        );
+
+        reset_extraction_state(&conn)?;
+        let visible_after_reset: i64 = conn.query_row(
+            "SELECT (SELECT count(*) FROM code_files)
+                  + (SELECT count(*) FROM code_chunks)",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(visible_after_reset, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_projection_schema_is_disposable_but_cache_survives_reset() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let conn = open(repo.path())?;
+        let meta_columns = conn
+            .prepare("SELECT name FROM pragma_table_info('doc_chunk_meta') ORDER BY cid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            meta_columns,
+            [
+                "chunk_id",
+                "title",
+                "description",
+                "tags_json",
+                "breadcrumb",
+                "nearest_heading",
+                "ordinal",
+                "embedding_identity",
+                "front_matter_state",
+            ]
+        );
+        let fts_columns = conn
+            .prepare("SELECT name FROM pragma_table_info('docs_fts') ORDER BY cid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(
+            fts_columns,
+            ["title", "metadata", "breadcrumb", "body", "path"]
+        );
+
+        conn.execute_batch(
+            "INSERT INTO embedding_profiles(
+               id,provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES(1,'test','tiny','profile',2,'{}');
+             INSERT INTO embeddings(chunk_hash,profile_id,vec)
+               VALUES('doc-identity',1,x'0000000000000000');
+             INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(1,'README.md','file','docs','markdown','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(1,1,'markdown_document',NULL,'','',0,0,1,1,'source','');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES(1,'README','',NULL,0,'doc-identity','absent');
+             INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+               VALUES(1,'README','','','','README.md');
+             INSERT INTO doc_inventory(path,subject,rule)
+               VALUES('README.md','file','indexed');
+             INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+               VALUES(1,1,1);
+             INSERT INTO doc_vector_generations(
+               snapshot,profile_id,dimensions,chunk_format_version
+             ) VALUES('snapshot',1,2,'documentation-v1');
+             CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
+               embedding FLOAT[2] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               snapshot TEXT PARTITION KEY
+             );
+             INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id,snapshot)
+               VALUES(1,x'0000000000000000',1,'snapshot');",
+        )?;
+
+        reset_extraction_state(&conn)?;
+        let state: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM files),
+               (SELECT count(*) FROM docs_fts),
+               (SELECT count(*) FROM doc_chunk_meta),
+               (SELECT count(*) FROM doc_inventory),
+               (SELECT count(*) FROM vec_doc_embeddings_2),
+               (SELECT count(*) FROM embeddings)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(state, (0, 0, 0, 0, 0, 1));
+        Ok(())
+    }
+
+    #[test]
     fn resolves_repository_and_dependency_file_source_paths() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let dependency = tempfile::tempdir()?;
         let conn = open(repo.path())?;
         conn.execute(
-            "INSERT INTO files(path, hash, role) VALUES('src/main.ts', 'a', 'production')",
+            "INSERT INTO files(path, hash, corpus, format, role)
+             VALUES('src/main.ts', 'a', 'code', 'typescript', 'production')",
             [],
         )?;
         let repository_file = conn.last_insert_rowid();
@@ -1621,9 +2150,10 @@ mod tests {
         let package = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO files(
-               path, hash, role, origin, package_instance_id, package_path
-             ) VALUES('dependency:left-pad@1.3.0/index.js', 'b', 'production',
-                      'dependency', ?1, 'index.js')",
+               path, hash, corpus, format, role, origin,
+               package_instance_id, package_path
+             ) VALUES('dependency:left-pad@1.3.0/index.js', 'b',
+                      'code', 'javascript', 'production', 'dependency', ?1, 'index.js')",
             [package],
         )?;
         let dependency_file = conn.last_insert_rowid();

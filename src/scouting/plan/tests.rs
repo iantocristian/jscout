@@ -404,12 +404,14 @@ fn automatic_seed_directions_follow_runtime_boundary_roles() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let conn = store::open(repo.path())?;
     conn.execute(
-        "INSERT INTO files(path, hash, role) VALUES('runtime.ts','h','production')",
+        "INSERT INTO files(path,hash,role,corpus,format)
+         VALUES('runtime.ts','h','production','code','typescript')",
         [],
     )?;
     let production_file = conn.last_insert_rowid();
     conn.execute(
-        "INSERT INTO files(path, hash, role) VALUES('runtime.test.ts','t','test')",
+        "INSERT INTO files(path,hash,role,corpus,format)
+         VALUES('runtime.test.ts','t','test','code','typescript')",
         [],
     )?;
     let test_file = conn.last_insert_rowid();
@@ -658,6 +660,10 @@ fn targeted_card_files_and_recon_subjects_never_widen() -> Result<()> {
         repo.path().join("unrelated.ts"),
         "export function unrelated() { return 2; }\n",
     )?;
+    std::fs::write(
+        repo.path().join("README.md"),
+        "# Target documentation\n\nThis is not a semantic card source.\n",
+    )?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
 
@@ -678,6 +684,16 @@ fn targeted_card_files_and_recon_subjects_never_widen() -> Result<()> {
             .all(|item| item.file == "apps/target/index.ts"
                 && item.selection_scope == "file:apps/target/index.ts")
     );
+    let docs_error = super::cards_with_selectors(
+        repo.path(),
+        &conn,
+        &super::CardSelectors {
+            files: vec!["README.md".into()],
+            ..super::CardSelectors::default()
+        },
+    )
+    .expect_err("documentation must not be accepted as a semantic card file");
+    assert!(docs_error.to_string().contains("not an indexed code file"));
 
     conn.execute(
         "INSERT INTO scout_runs(

@@ -166,7 +166,9 @@ pub fn synchronize_instances(
     workspace: &WorkspaceMap,
     plans: &[PackagePlan],
 ) -> Result<BTreeMap<PathBuf, i64>> {
-    conn.execute_batch("BEGIN")?;
+    // A savepoint preserves standalone atomicity and nests inside the indexer's
+    // all-or-nothing publication transaction.
+    conn.execute_batch("SAVEPOINT jscout_dependency_instances")?;
     let result = (|| {
         conn.execute(
             "UPDATE files
@@ -255,11 +257,13 @@ pub fn synchronize_instances(
     })();
     match result {
         Ok(instances) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch("RELEASE jscout_dependency_instances")?;
             Ok(instances)
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_dependency_instances; RELEASE jscout_dependency_instances",
+            );
             Err(error)
         }
     }
@@ -598,7 +602,7 @@ fn normalized_selectors(selectors: &[String]) -> Result<BTreeSet<String>> {
 fn importer_requests(root: &Path, conn: &Connection) -> Result<Vec<(PathBuf, String)>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.path, requests.request
-         FROM files f
+         FROM code_files f
          JOIN (
            SELECT file_id, request FROM imports
            UNION SELECT file_id, from_request FROM exports WHERE from_request IS NOT NULL
@@ -881,7 +885,8 @@ mod tests {
             &format!("import value from '{request}';\n"),
         )?;
         conn.execute(
-            "INSERT INTO files(path, hash, role) VALUES(?1, 'hash', 'production')",
+            "INSERT INTO files(path, hash, corpus, format, role)
+             VALUES(?1, 'hash', 'code', 'typescript', 'production')",
             [path],
         )?;
         let file_id = conn.last_insert_rowid();
@@ -890,6 +895,30 @@ mod tests {
              VALUES(?1, 'value', 'default', ?2)",
             rusqlite::params![file_id, request],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_facts_cannot_seed_dependency_discovery() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path();
+        let conn = store::open(root)?;
+        importer(&conn, root, "src/main.ts", "code-package")?;
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role)
+             VALUES('README.md','docs','docs','markdown','documentation')",
+            [],
+        )?;
+        let docs_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imports(file_id,local_name,imported_name,request)
+             VALUES(?1,'example','default','docs-example-package')",
+            [docs_file],
+        )?;
+
+        let requests = super::importer_requests(root, &conn)?;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, "code-package");
         Ok(())
     }
 

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::{Error as IgnoreError, IncrementalIgnore, WalkBuilder};
 
+use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision};
 use crate::io_policy;
 
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
@@ -29,7 +30,27 @@ pub struct WalkRejection {
 #[derive(Debug, Default)]
 pub struct SourceInventory {
     pub files: Vec<PathBuf>,
+    // Keep one production/test result shape so callers that publish an
+    // inventory can retain failures; file-list-only diagnostics ignore them.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "file-list-only production diagnostics intentionally ignore rejections"
+        )
+    )]
     pub rejections: Vec<WalkRejection>,
+}
+
+/// The shared index pass walks the repository once and returns two extraction
+/// inputs with separate ranking semantics. `files` remains code-only so
+/// workspace and dependency discovery retain their existing contract.
+#[derive(Debug)]
+pub struct RepositoryInventory {
+    pub files: Vec<PathBuf>,
+    pub rejections: Vec<WalkRejection>,
+    pub documents: Vec<CapturedDocument>,
+    pub documentation_decisions: Vec<Decision>,
 }
 
 /// Path matcher configured from the same ignore policy as the source walker.
@@ -142,6 +163,30 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
     Ok(SourceInventory { files, rejections })
 }
 
+/// Inventory for shared publication. Markdown membership, capture, and parse
+/// happen during the same deterministic traversal that selects code paths;
+/// there is no independent documentation snapshot or later filesystem scan.
+pub fn repository_inventory(
+    root: &Path,
+    documentation: &CorpusOptions,
+) -> Result<RepositoryInventory> {
+    let inventory = crate::docs::corpus::scan_repository(root, documentation)?;
+    Ok(RepositoryInventory {
+        files: inventory.source_files,
+        rejections: inventory
+            .rejections
+            .into_iter()
+            .map(|rejection| WalkRejection {
+                path: rejection.path,
+                stage: rejection.stage,
+                error: rejection.error,
+            })
+            .collect(),
+        documents: inventory.documents,
+        documentation_decisions: inventory.decisions,
+    })
+}
+
 /// Read-only diagnostic callers need the file list but do not publish a
 /// structural snapshot. Indexing uses [`source_inventory`] so rejections stay
 /// visible in its outcome.
@@ -231,6 +276,194 @@ mod tests {
         assert!(files.contains(&PathBuf::from("packages/app/contracts.d.ts")));
         assert!(!files.contains(&PathBuf::from("build/generated.d.ts")));
         assert!(!files.contains(&PathBuf::from("packages/app/dist/generated.d.ts")));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_inventory_admits_docs_without_widening_code_inputs() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join(".github/workflows"))?;
+        fs::write(repo.path().join("main.ts"), "export const main = 1;\n")?;
+        fs::write(repo.path().join("README.md"), "# Guide\n\nCurrent text.\n")?;
+        fs::write(
+            repo.path().join("component.mdx"),
+            "# Component\n\n<Example />\n",
+        )?;
+        fs::write(
+            repo.path().join(".github/workflows/help.md"),
+            "# Automation\n\nCurrent workflow.\n",
+        )?;
+        fs::write(
+            repo.path().join(".github/workflows/hidden.ts"),
+            "export const hidden = true;\n",
+        )?;
+
+        let root = repo.path().canonicalize()?;
+        let inventory = repository_inventory(&root, &CorpusOptions::default())?;
+        let code = inventory
+            .files
+            .iter()
+            .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        let docs = inventory
+            .documents
+            .iter()
+            .map(|document| document.file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(code, [PathBuf::from("main.ts")]);
+        assert_eq!(
+            docs,
+            [".github/workflows/help.md", "README.md", "component.mdx"]
+        );
+        assert!(
+            inventory
+                .documentation_decisions
+                .iter()
+                .all(|decision| decision.path != ".github/workflows/hidden.ts")
+        );
+        let source_names = source_files(repo.path())?
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_names,
+            [std::ffi::OsString::from("main.ts")],
+            "the read-only code inventory remains code-only"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_inventory_preserves_the_source_walker_contract() -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir()?;
+        fs::create_dir_all(repo.path().join(".git"))?;
+        for directory in [
+            "nested/kept",
+            "nested/ignored",
+            "nested/pruned/reincluded",
+            ".github/workflows",
+            ".hidden",
+            ".source-visible",
+            "packages/app/.github",
+            "node_modules/pkg",
+            "packages/app/dist",
+        ] {
+            fs::create_dir_all(repo.path().join(directory))?;
+        }
+        fs::write(
+            repo.path().join(".gitignore"),
+            concat!(
+                "root-ignored.ts\n",
+                "nested/ignored/\n",
+                "nested/pruned/\n",
+                "!nested/pruned/reincluded/\n",
+                "!.source-visible/\n",
+            ),
+        )?;
+        fs::write(
+            repo.path().join("nested/.gitignore"),
+            "*.ts\n!kept/reincluded.ts\n",
+        )?;
+        fs::write(repo.path().join(".ignore"), "ignored-by-dot-ignore.ts\n")?;
+
+        for (path, source) in [
+            ("z.ts", "export const z = 1;\n"),
+            ("a.js", "exports.a = 1;\n"),
+            ("root-ignored.ts", "export const ignored = 1;\n"),
+            ("ignored-by-dot-ignore.ts", "export const ignored = 1;\n"),
+            ("nested/hidden-by-local.ts", "export const ignored = 1;\n"),
+            ("nested/kept/reincluded.ts", "export const included = 1;\n"),
+            ("nested/ignored/no.ts", "export const ignored = 1;\n"),
+            (
+                "nested/pruned/reincluded/no.ts",
+                "export const ignored = 1;\n",
+            ),
+            (".github/workflows/hidden.ts", "export const hidden = 1;\n"),
+            (".hidden/no.ts", "export const hidden = 1;\n"),
+            (
+                ".source-visible/reincluded.ts",
+                "export const visible = 1;\n",
+            ),
+            (".source-visible/private.md", "# Hidden documentation\n"),
+            ("packages/app/.github/no.ts", "export const hidden = 1;\n"),
+            ("node_modules/pkg/no.ts", "export const generated = 1;\n"),
+            ("packages/app/dist/no.ts", "export const generated = 1;\n"),
+        ] {
+            fs::write(repo.path().join(path), source)?;
+        }
+        fs::write(repo.path().join("README.md"), "# Docs\n")?;
+        symlink(repo.path().join("z.ts"), repo.path().join("linked.ts"))?;
+        let fifo = repo.path().join("special.ts");
+        let fifo_native = CString::new(fifo.as_os_str().as_bytes())?;
+        assert_eq!(unsafe { libc::mkfifo(fifo_native.as_ptr(), 0o600) }, 0);
+
+        let canonical_root = repo.path().canonicalize()?;
+        let legacy = source_inventory(&canonical_root)?;
+        let shared = repository_inventory(&canonical_root, &CorpusOptions::default())?;
+        assert_eq!(shared.files, legacy.files);
+        assert!(shared.files.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(shared.documentation_decisions.iter().any(|decision| {
+            decision.path == ".source-visible" && decision.rule == "hidden-not-allowlisted"
+        }));
+        assert!(
+            shared
+                .documentation_decisions
+                .iter()
+                .all(|decision| !decision.path.starts_with(".source-visible/")),
+            "documentation remains pruned even when the code plane must descend"
+        );
+        assert_eq!(
+            shared
+                .files
+                .iter()
+                .map(|path| path.strip_prefix(&canonical_root).unwrap())
+                .collect::<Vec<_>>(),
+            [
+                Path::new(".source-visible/reincluded.ts"),
+                Path::new("a.js"),
+                Path::new("nested/kept/reincluded.ts"),
+                Path::new("z.ts"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_inventory_preserves_gitignore_repository_detection() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        fs::write(repo.path().join(".gitignore"), "ignored-by-git.ts\n")?;
+        fs::write(repo.path().join(".ignore"), "ignored-by-ignore.ts\n")?;
+        fs::write(
+            repo.path().join("ignored-by-git.ts"),
+            "export const keptOutsideGit = true;\n",
+        )?;
+        fs::write(
+            repo.path().join("ignored-by-ignore.ts"),
+            "export const ignored = true;\n",
+        )?;
+        fs::write(
+            repo.path().join("included.ts"),
+            "export const included = true;\n",
+        )?;
+
+        let canonical_root = repo.path().canonicalize()?;
+        let legacy = source_inventory(&canonical_root)?;
+        let shared = repository_inventory(&canonical_root, &CorpusOptions::default())?;
+        assert_eq!(shared.files, legacy.files);
+        assert_eq!(
+            shared
+                .files
+                .iter()
+                .map(|path| path.strip_prefix(&canonical_root).unwrap())
+                .collect::<Vec<_>>(),
+            [Path::new("ignored-by-git.ts"), Path::new("included.ts")]
+        );
         Ok(())
     }
 

@@ -1538,9 +1538,9 @@ fn current_dirty_source_files(
     }
     let requested = dirty_files.iter().collect::<BTreeSet<_>>();
     let mut statement = conn.prepare(
-        "SELECT path FROM files
-         WHERE origin IN ('repository', 'workspace')
-         ORDER BY path",
+        "SELECT file.path FROM code_files file
+         WHERE file.origin IN ('repository', 'workspace')
+         ORDER BY file.path",
     )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows

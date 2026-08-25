@@ -431,10 +431,40 @@ pub(crate) fn compute_snapshot_with_resolution(
     resolution_hash: &str,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-structural-snapshot-v2\0");
+    hasher.update(b"jscout-structural-snapshot-v4\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
+    hasher.update(b"\0code-extraction-contract\0");
+    hasher.update(crate::entity::EXTRACTION_VERSION.as_bytes());
+    let extraction_version = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='extraction_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    // Hash the producer contract and the marker that describes the published
+    // rows. A mismatch therefore cannot preserve an apparently current digest.
+    hasher.update(b"\0code-published-extraction-contract\0");
+    hasher.update(extraction_version.as_bytes());
+    hasher.update(b"\0documentation-parser-contract\0");
+    hasher.update(crate::docs::CHUNK_FORMAT_VERSION.as_bytes());
+    let documentation_chunk_format = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='documentation_chunk_format_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    // The persisted value describes the contract that produced the currently
+    // stored docs rows. It normally equals the binary constant above; hashing
+    // both also makes an interrupted or pre-upgrade mismatch fail closed.
+    hasher.update(b"\0documentation-published-chunk-format\0");
+    hasher.update(documentation_chunk_format.as_bytes());
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.hash, f.role, f.origin, COALESCE(f.package_path, ''),
+        "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
+                COALESCE(f.package_path, ''),
                 COALESCE(p.origin, ''), COALESCE(p.name, ''),
                 COALESCE(p.version, ''), COALESCE(p.locator, ''),
                 COALESCE(p.manifest_hash, ''), COALESCE(p.status, '')
@@ -455,6 +485,8 @@ pub(crate) fn compute_snapshot_with_resolution(
             r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
             r.get::<_, String>(10)?,
+            r.get::<_, String>(11)?,
+            r.get::<_, String>(12)?,
         ])
     })?;
     for row in rows {
@@ -478,21 +510,23 @@ pub fn rebuild_projection_with_timing(
     snapshot: &str,
     timing: bool,
 ) -> Result<()> {
-    let files = load_files(conn)?;
-    let graph = ModuleGraph::load_with_contracts(conn)?;
-    let symbols = load_symbols(conn, &files)?;
-    let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
-    for symbol in &symbols {
-        if symbol.scope.is_empty() {
-            root_symbol
-                .entry((symbol.file_id, symbol.name.clone()))
-                .or_default()
-                .push(symbol);
-        }
-    }
-
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // A savepoint makes projection replacement atomic both on its own and as
+    // one stage of the indexer's outer publication transaction.
+    conn.execute_batch("SAVEPOINT jscout_structural_projection")?;
     let result = (|| -> Result<()> {
+        let files = load_files(conn)?;
+        let graph = ModuleGraph::load_with_contracts(conn)?;
+        let symbols = load_symbols(conn, &files)?;
+        let mut root_symbol: HashMap<(i64, String), Vec<&SymbolNode>> = HashMap::new();
+        for symbol in &symbols {
+            if symbol.scope.is_empty() {
+                root_symbol
+                    .entry((symbol.file_id, symbol.name.clone()))
+                    .or_default()
+                    .push(symbol);
+            }
+        }
+
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
         conn.execute("DELETE FROM entities", [])?;
@@ -616,9 +650,11 @@ pub fn rebuild_projection_with_timing(
         Ok(())
     })();
     match result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
+        Ok(()) => conn.execute_batch("RELEASE jscout_structural_projection")?,
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_structural_projection; RELEASE jscout_structural_projection",
+            );
             return Err(error);
         }
     }
@@ -649,7 +685,7 @@ pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
 
 fn load_files(conn: &Connection) -> Result<HashMap<i64, String>> {
     let mut files = HashMap::new();
-    let mut stmt = conn.prepare("SELECT id, path FROM files ORDER BY path")?;
+    let mut stmt = conn.prepare("SELECT id, path FROM code_files ORDER BY path")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (id, path) = row?;

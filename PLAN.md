@@ -24,8 +24,9 @@
 > G16 or widens the semantic product surface, and no retrieval default changes
 > without a same-binary, same-snapshot comparison. G24 repository documentation
 > retrieval is proposed: docs in the main index as a separate ranking corpus
-> and surface, with code retrieval byte-identical. G25 multi-format admission
-> is proposed behind it.
+> and surface, with code ranked content, statistics, and order byte-identical
+> modulo the shared snapshot identifier. G25 multi-format admission is proposed
+> behind it.
 
 ## Document policy
 
@@ -3182,12 +3183,13 @@ exact-anchor definition success rate.
 
 ## Proposed G24 — repository documentation retrieval
 
-Repository Markdown is authored source material that agents currently cannot
-retrieve through jscout. It is the wrong shape for the structural index — a
-JavaScript parser cannot manufacture documentation chunks, and prose changes
-must not couple to structural snapshots — and the wrong shape for semantic
-memory, whose artifacts carry code-evidence chains that authored prose does
-not acquire by being indexed. The review rounds on PR #96 established that
+Repository Markdown and MDX are authored source material that agents currently cannot
+retrieve through jscout. It is the wrong shape for the code structural and
+ranking corpus — a JavaScript parser cannot manufacture documentation chunks,
+and prose must not become structural evidence — while still sharing the same
+publication snapshot. It is also the wrong shape for semantic memory, whose
+artifacts carry code-evidence chains that authored prose does not acquire by
+being indexed. The review rounds on PR #96 established that
 the shared database cannot host a second lifecycle behind its gate — one
 global schema version and structural-snapshot-gated opens — and that a
 multiplicative score decay is not bounded in effect once applied to
@@ -3198,28 +3200,46 @@ database, which the storage-planes contract rejects; the decision record is
 The revised decisions:
 
 1. Documentation lives in the main database and the disposable structural
-   snapshot: docs files are ordinary `files` rows produced by the same index
-   pass, and docs sections are `chunks` rows shaped to be inert to the code
-   plane — free-text kinds, no `name`, no symbols — so the exact tiers cannot
-   match them and no existing consumer needs a kind predicate. Ranking is a
-   separate corpus: docs rows mirror into a new `docs_fts` table with its own
-   BM25 statistics and never into `chunks_fts`; docs vectors materialize into
+   snapshot. Every admitted `files` row carries two independent identities:
+   `corpus` is ranking-corpus membership (`code` or `docs`), while `format` is
+   the parser/format identity (`markdown` for `.md`, `mdx` for `.mdx`).
+   Documentation files are ordinary rows with `corpus='docs'` and the matching
+   format, produced by the
+   same index pass. Documentation sections are `chunks` rows whose `kind`
+   describes their intra-file structural role (`markdown_section` or
+   `markdown_document`), not their file's corpus or format; they carry no
+   `name` or symbols, so the exact tiers cannot match them. Disposable
+   `code_files` filters `files.corpus = 'code'`, and `code_chunks` admits only
+   chunks joined through `code_files`; code-plane consumers that enumerate
+   canonical rows read through those views. `doc_chunk_meta` contains
+   documentation-retrieval metadata keyed by chunk id and is not a corpus
+   membership marker. Ranking is a separate corpus: docs rows mirror into a new `docs_fts`
+   table with their own BM25 statistics and never into `chunks_fts`; docs
+   vectors materialize into
    `vec_doc_embeddings_{dimensions}` because sqlite-vec applies KNN's k
    before any join filter; the durable content-addressed embedding cache is
-   shared; docs metadata lives in a `doc_chunk_meta` sidecar keyed by chunk
-   id. Code search reads the same tables, statistics, and pipeline as today
-   and its results stay byte-identical. The one real consumer filter is the
-   TypeScript checker file inventory, which reads `files` unfiltered and must
-   exclude non-code kinds. Physical database splitting stays rejected per the
-   storage-planes contract. Compatibility of a committed `[docs]`
+   shared. Code search keeps the same statistics and pipeline as today and its
+   ranked content stays byte-identical modulo the shared snapshot identifier.
+   The checker, structural support, reconnaissance, scouting, and embedding
+   paths use the same central corpus boundary rather than scattered negative
+   documentation predicates. Physical database splitting stays rejected per
+   the storage-planes contract. Compatibility of a committed `[docs]`
    configuration section with pre-docs binaries is not a requirement.
-2. Corpus: ignore-aware `.md` inventory with a fixed root-level hidden
-   allowlist (`.github`, `.claude`, `.agents`); Markdown block chunking that
+   `[docs].enabled` independently controls admission (default `true`); disabling
+   it admits no documentation files on the next shared index and does not
+   disable or otherwise alter code indexing.
+2. Corpus: ignore-aware exact-lowercase `.md` and `.mdx` inventory with a fixed root-level hidden
+   allowlist (`.github`, `.claude`, `.agents`); Markdown-compatible block chunking that
    never crosses heading boundaries; one document-stub row for body-empty
    documents; deterministic file-only config globs, BOM handling, symlink
-   exclusion, sorted publication, and `docs status` reporting the deciding rule
-   for every encountered file and pruned directory.
-3. Retrieval: BM25 always builds; vectors reuse the existing `[embedding]`
+   exclusion, and sorted publication. `docs status` reports file decisions for
+   `.md`/`.mdx` candidates and for non-document files explicitly selected by
+   an `include` glob, plus the deciding rule for each pruned directory; ordinary
+   unmatched code and other non-document files do not create docs-status rows.
+   MDX otherwise remains raw authored text, but a contiguous leading
+   import/export-only preamble is not retrieval-bearing and exact JSX comments
+   are removed outside protected code ranges consistently with HTML comments.
+3. Retrieval: BM25 always builds for an enabled docs corpus; vectors reuse the existing `[embedding]`
    provider, model, and service — no second provider section and no second
    local model; reciprocal-rank fusion; embedding identity is exactly
    `hash(format_version, nearest_heading, rendered_body)`, with the exact
@@ -3229,7 +3249,11 @@ The revised decisions:
    generation; RRF reuses `k = 60`, with lexical score defined as `-FTS5
    bm25()` and deterministic source-key tie-breaks; the CLI contract is defined directly,
    with `--vector` meaning required vector participation and no vector-only mode
-   existing.
+   existing. Documentation vector generation is separately opt-in: only
+   `jscout docs embed` materializes missing docs vectors; the normal index pass
+   and code `embed` path make no docs-provider requests. `[docs.search].vector`
+   controls whether docs search attempts to use a complete docs-vector
+   generation and does not itself create one.
 4. History: an append-only block-observation ledger, deferred out of the
    numbered phases. Its reasons are supersession lineage ("this passage
    replaced that one" — the backbone of the contradiction story), an ordering
@@ -3249,8 +3273,8 @@ The revised decisions:
    matching always compare last-observed state against current, even across
    a full rebuild, which wipes the disposable plane by design. Matching
    needs only the previous state; accumulated history is matching's output,
-   never its input. History recording is a per-kind registry property, on
-   for Markdown only. Unchanged blocks add no observation rows, so code
+   never its input. History recording is a per-format registry property, on
+   for Markdown and MDX only. Unchanged blocks add no observation rows, so code
    churn grows nothing, while whole-codebase snapshots tighten observation
    intervals for free. When built, the ledger stays separate from
    the current size-merged retrieval-chunk projection. Matching
@@ -3298,10 +3322,11 @@ The revised decisions:
    retired hashes, transition metadata, and content-addressed vectors may
    remain. Version one adds no retention controls.
 
-Delivery: phase 1 admits Markdown at the named-sections tier through the
-shared index pass — `docs_fts`, `doc_chunk_meta`, the MCP
+Delivery: phase 1 admits Markdown and MDX at the named-sections tier through the
+shared index pass — the `files.corpus` and `files.format` classifications,
+`docs_fts`, `doc_chunk_meta`, the MCP
 documentation-search surface and `docs search --lexical-only`, with the
-checker inventory filter and the two write-point routings in the same change,
+central corpus views and the FTS/vector write-point routings in the same change,
 rebuild timing instrumented, and nothing temporal (hits may display git
 timestamps as inert metadata); phase 2 adds docs vectors from the shared
 `[embedding]` profile into the docs vector tables; phase 3 adds git-basis
@@ -3311,18 +3336,24 @@ The observation ledger is unscheduled and ships only with the supersession
 product. No implementation milestone is assigned and no current goal is
 displaced.
 
-Acceptance: code search is byte-identical after docs admission —
+Phase 1/2 acceptance: code-search ranking, content, and statistics are
+byte-identical after docs admission modulo the necessarily changed shared
+snapshot identifier —
+every admitted file has an explicit corpus and format; `code_files` is exactly
+the `corpus='code'` subset and does not infer membership from a format sidecar;
 `chunks_fts` contains no docs rows, its term statistics are unchanged, and
 the exact tiers match no docs chunk; the checker file inventory contains no
 non-code files; docs publish inside the shared snapshot publication;
-inserting one uniquely
-distinguishable paragraph produces one `added` block observation and no
-succession rows for untouched blocks; globally unique copied content and
-Git-detected renames receive no cross-path predecessor; freshness movement
-never exceeds its configured bound and never crosses provenance bases; a
-repository with no `[embedding]` provider retains full lexical documentation
-search; crash recovery exposes exactly one complete old or replacement
-shared snapshot, never a partial mixture; and the detailed implementation
+a repository with no `[embedding]` provider retains full lexical documentation
+search; disabling `[docs].enabled` yields no docs rows or docs-status file
+decisions while leaving every code surface unchanged; indexing and code
+embedding never generate documentation vectors; and crash recovery exposes exactly one complete old or replacement
+shared snapshot, never a partial mixture. Deferred ledger/freshness acceptance:
+inserting one uniquely distinguishable paragraph produces one `added` block
+observation and no succession rows for untouched blocks; globally unique copied
+content and Git-detected renames receive no cross-path predecessor; and
+freshness movement never exceeds its configured bound or crosses provenance
+bases. The detailed implementation
 contract
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
 and the decision record
@@ -3332,21 +3363,30 @@ disagreement.
 
 ## Proposed G25 — multi-format admission
 
-One registry decides, per file type, two things: how much jscout understands
-it (plain text → named sections → full AST) and which ranking corpus it
-appears in (code or docs). The registry gives a new file type a defined place
+One registry decides, per format, two things: how much jscout understands
+it (plain text → named sections → full AST) and which `files.corpus` value it
+receives (`code` or `docs`). Its parser/format identity is persisted separately
+as `files.format`; `chunks.kind` remains the intra-file structural role emitted
+by that parser. The registry gives a new format a defined place
 to plug in, so adding one never reopens the storage or ranking architecture —
 and that is all it buys. Each format still needs its own scanner and its own
-chunking contract (Markdown's took a full design cycle), and a kind joining
+chunking contract (Markdown's took a full design cycle), and a format joining
 the code corpus additionally pays the ranking and exact-tier integration that
 docs deliberately avoid: its chunks do enter `chunks_fts`, do carry names,
 and do compete in the exact tiers, so that integration must be measured, not
-assumed. Text-only kinds are cheap; languages are real work.
+assumed. Text-only formats are cheap; languages are real work.
+
+MDX is already admitted by G24 as `format='mdx'` in the docs corpus, using the
+same inert named-sections scanner as Markdown: JSX, props, expressions, inner
+text, and non-leading ESM remain authored text, never evaluated or projected
+into the code graph. The only MDX-specific retrieval subtractions are a
+contiguous leading ESM-only preamble and exact JSX comments outside protected
+code ranges.
 
 Positions: Groovy/Jenkinsfiles join the code corpus as plain text first —
 identifier-shaped searches want them beside TypeScript hits. YAML and TOML
 are current-like-code (the checkout is truth; no freshness) but stay out
-until G24's Markdown pass has shipped and been measured. Helm templates are
+until G24's documentation pass has shipped and been measured. Helm templates are
 not valid YAML and are treated as text if admitted. Tree-sitter is not
 adopted; the named revisit trigger is a kind that genuinely needs call-shape
 extraction, such as Groovy at the AST tier, where regex extraction would

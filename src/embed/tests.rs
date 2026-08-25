@@ -311,6 +311,14 @@ fn embedding_profile_versions_the_document_text_format() -> anyhow::Result<()> {
     let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
     assert_eq!(config["document_text"], DOCUMENT_TEXT_FORMAT);
 
+    let markdown_profile = provider.profile_for(crate::docs::CHUNK_FORMAT_VERSION)?;
+    let markdown_config: serde_json::Value = serde_json::from_str(&markdown_profile.config_json)?;
+    assert_eq!(
+        markdown_config["document_text"],
+        crate::docs::CHUNK_FORMAT_VERSION
+    );
+    assert_ne!(profile.fingerprint, markdown_profile.fingerprint);
+
     let old_config = serde_json::json!({
         "protocol": "openai-embeddings-v1",
         "url": "https://example.test/v1/embeddings",
@@ -334,7 +342,8 @@ fn missing_embeddings_are_selected_once_per_content_hash() -> anyhow::Result<()>
         ("b.ts", "other", "export const y = 2;"),
     ] {
         connection.execute(
-            "INSERT INTO files(path, hash, role, origin) VALUES(?1, ?2, 'production', 'repository')",
+            "INSERT INTO files(path,hash,role,origin,corpus,format)
+             VALUES(?1,?2,'production','repository','code','typescript')",
             rusqlite::params![path, format!("file-{path}")],
         )?;
         let file_id = connection.last_insert_rowid();
@@ -385,8 +394,8 @@ fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()
         ("b.ts", "other", "export const y = 2;"),
     ] {
         connection.execute(
-            "INSERT INTO files(path, hash, role, origin)
-             VALUES(?1, ?2, 'production', 'repository')",
+            "INSERT INTO files(path,hash,role,origin,corpus,format)
+             VALUES(?1,?2,'production','repository','code','typescript')",
             rusqlite::params![path, format!("file-{path}")],
         )?;
         let file_id = connection.last_insert_rowid();
@@ -462,7 +471,8 @@ fn product_embedding_selection_uses_fresh_repository_policy_with_neutral_fallbac
         ("src/runtime.test.ts", "runtime-test", "test"),
     ] {
         connection.execute(
-            "INSERT INTO files(path,hash,role,origin) VALUES(?1,?2,?3,'repository')",
+            "INSERT INTO files(path,hash,role,origin,corpus,format)
+             VALUES(?1,?2,?3,'repository','code','typescript')",
             rusqlite::params![path, format!("file-{hash}"), deterministic_role],
         )?;
         let file_id = connection.last_insert_rowid();
@@ -518,7 +528,8 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin) VALUES('a.ts', 'f', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('a.ts','f','production','repository','code','typescript')",
         [],
     )?;
     let file_id = connection.last_insert_rowid();
@@ -594,12 +605,157 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
 }
 
 #[test]
+fn documentation_hash_collision_never_materializes_in_code_vectors() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute_batch(
+        "INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(1,'src/main.ts','code-file','production','repository','code','typescript');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(1,1,'function','run','','run',0,5,1,1,'collision','alpha');
+         INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(2,'README.md','doc-file','documentation','repository','docs','markdown');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(2,2,'markdown_section',NULL,'','',0,5,1,1,'collision','alpha');
+         INSERT INTO doc_chunk_meta(
+           chunk_id,title,breadcrumb,nearest_heading,ordinal,
+           embedding_identity,front_matter_state
+         ) VALUES(2,'README','Guide','Guide',0,'doc-identity','absent');",
+    )?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    connection.execute(
+        "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES('collision',?1,?2)",
+        rusqlite::params![profile.id, vec_to_blob(&[1.0, 0.0])],
+    )?;
+
+    materialize_cached_embeddings(&connection)?;
+    let materialized = connection
+        .prepare(
+            "SELECT entry.chunk_id
+             FROM embedding_index_entries entry
+             WHERE entry.profile_id=?1 ORDER BY entry.chunk_id",
+        )?
+        .query_map([profile.id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(materialized, [1]);
+    assert_eq!(
+        connection.query_row(
+            "SELECT count(*) FROM doc_embedding_index_entries",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    let missing = missing_embedding_documents(
+        &connection,
+        &spec.fingerprint,
+        Some(profile.id),
+        &["repository".into()],
+        false,
+    )?;
+    assert!(missing.is_empty());
+    Ok(())
+}
+
+#[test]
+fn documentation_file_deletion_purges_only_its_vector_occurrence() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    connection.execute_batch(
+        "INSERT INTO embedding_profiles(
+           id,provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES(1,'test','tiny','profile',2,'{}');
+         INSERT INTO embeddings(chunk_hash,profile_id,vec)
+           VALUES('identity-a',1,x'0000000000000000');
+         INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(1,'a.md','file-a','documentation','repository','docs','markdown');
+         INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(2,'b.md','file-b','documentation','repository','docs','markdown');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(1,1,'markdown_section',NULL,'','',0,1,1,1,'source-a','a');
+         INSERT INTO chunks(
+           id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(2,2,'markdown_section',NULL,'','',0,1,1,1,'source-b','b');
+         INSERT INTO doc_chunk_meta(
+           chunk_id,title,breadcrumb,nearest_heading,ordinal,
+           embedding_identity,front_matter_state
+         ) VALUES(1,'A','','A',0,'identity-a','absent');
+         INSERT INTO doc_chunk_meta(
+           chunk_id,title,breadcrumb,nearest_heading,ordinal,
+           embedding_identity,front_matter_state
+         ) VALUES(2,'B','','B',0,'identity-b','absent');
+         INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+           VALUES(1,'A','','','a','a.md');
+         INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+           VALUES(2,'B','','','b','b.md');
+         INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+           VALUES(1,1,1);
+         INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+           VALUES(2,2,1);
+         INSERT INTO doc_vector_generations(
+           snapshot,profile_id,dimensions,chunk_format_version
+         ) VALUES('snapshot',1,2,'documentation-v1');
+         CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
+           embedding FLOAT[2] distance_metric=cosine,
+           profile_id INTEGER PARTITION KEY
+         );
+         INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+           VALUES(1,x'0000000000000000',1);
+         INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+           VALUES(2,x'0000000000000000',1);",
+    )?;
+
+    crate::store::delete_file(&connection, 1)?;
+
+    let state: (i64, i64, i64, i64, i64, i64) = connection.query_row(
+        "SELECT
+           (SELECT count(*) FROM files),
+           (SELECT count(*) FROM doc_chunk_meta),
+           (SELECT count(*) FROM docs_fts),
+           (SELECT count(*) FROM doc_embedding_index_entries),
+           (SELECT count(*) FROM vec_doc_embeddings_2),
+           (SELECT count(*) FROM doc_vector_generations)",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    assert_eq!(state, (1, 1, 1, 1, 1, 0));
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM embeddings", [], |row| row
+            .get::<_, i64>(0))?,
+        1,
+        "shared embedding cache must survive documentation file deletion"
+    );
+    Ok(())
+}
+
+#[test]
 fn incremental_vector_sync_materializes_a_reused_chunk_rowid() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin)
-         VALUES('old.ts', 'old-file', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('old.ts','old-file','production','repository','code','typescript')",
         [],
     )?;
     let old_file_id = connection.last_insert_rowid();
@@ -646,8 +802,8 @@ fn incremental_vector_sync_materializes_a_reused_chunk_rowid() -> anyhow::Result
     assert_eq!((durable_rows, vector_rows), (0, 0));
 
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin)
-         VALUES('new.ts', 'new-file', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('new.ts','new-file','production','repository','code','typescript')",
         [],
     )?;
     let new_file_id = connection.last_insert_rowid();
@@ -685,8 +841,8 @@ fn incremental_vector_sync_leaves_full_audit_to_explicit_repair() -> anyhow::Res
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin)
-         VALUES('a.ts', 'file-a', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('a.ts','file-a','production','repository','code','typescript')",
         [],
     )?;
     let file_id = connection.last_insert_rowid();
@@ -799,8 +955,8 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin)
-         VALUES('a.ts', 'f', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('a.ts','f','production','repository','code','typescript')",
         [],
     )?;
     let file_id = connection.last_insert_rowid();
@@ -857,8 +1013,8 @@ fn failed_marker_invalidation_does_not_publish_an_empty_vector_table() -> anyhow
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
     connection.execute(
-        "INSERT INTO files(path, hash, role, origin)
-         VALUES('a.ts', 'f', 'production', 'repository')",
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('a.ts','f','production','repository','code','typescript')",
         [],
     )?;
     let file_id = connection.last_insert_rowid();

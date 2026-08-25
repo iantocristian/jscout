@@ -438,8 +438,8 @@ fn overview_unpinned(
         "SELECT file.path, file.origin, file.role,
                 COALESCE(chunk.count, 0), COALESCE(symbol.count, 0),
                 COALESCE(site.count, 0)
-         FROM files file
-         LEFT JOIN (SELECT file_id, count(*) AS count FROM chunks GROUP BY file_id) chunk
+         FROM code_files file
+         LEFT JOIN (SELECT file_id, count(*) AS count FROM code_chunks GROUP BY file_id) chunk
            ON chunk.file_id=file.id
          LEFT JOIN (SELECT file_id, count(*) AS count FROM symbols GROUP BY file_id) symbol
            ON symbol.file_id=file.id
@@ -503,7 +503,7 @@ fn overview_unpinned(
                 count(DISTINCT entity.id), count(DISTINCT occurrence.id)
          FROM entities entity
          JOIN entity_occurrences occurrence ON occurrence.entity_id=entity.id
-         JOIN files file ON file.id=occurrence.file_id
+         JOIN code_files file ON file.id=occurrence.file_id
          WHERE (?1 AND file.origin='repository')
             OR (?2 AND file.origin='workspace')
             OR (?3 AND file.origin='dependency')
@@ -527,8 +527,8 @@ fn overview_unpinned(
     let mut stmt = conn.prepare(
         "SELECT edge.kind, count(*)
          FROM resolved_edges edge
-         LEFT JOIN files file ON file.id=edge.source_file_id
-         WHERE file.origin IS NULL
+         LEFT JOIN code_files file ON file.id=edge.source_file_id
+         WHERE edge.source_file_id IS NULL
             OR (?1 AND file.origin='repository')
             OR (?2 AND file.origin='workspace')
             OR (?3 AND file.origin='dependency')
@@ -710,7 +710,7 @@ fn reconnaissance_overlay(
     let origins_json = serde_json::to_string(file_origins)?;
     let mut statement = conn.prepare(
         "SELECT COALESCE(policy.effective_role, file.role), count(*)
-         FROM files file
+         FROM code_files file
          LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
          WHERE file.origin IN (SELECT value FROM json_each(?1))
            AND (?2 IS NULL OR policy.subject_key=?2)

@@ -1,4 +1,4 @@
-# G24 Markdown retrieval and temporal history — design detail
+# G24 Markdown and MDX retrieval and temporal history — design detail
 
 - Date: 2026-08-24; revised 2026-08-25 — storage moved into the main index
   per [g24-adr-one-store-separate-ranking-2026-08-25.md](g24-adr-one-store-separate-ranking-2026-08-25.md).
@@ -12,10 +12,10 @@
 
 ## Decision summary
 
-Jscout treats repository Markdown as a separate retrieval product inside the
+Jscout treats repository Markdown and MDX as a separate retrieval product inside the
 main index. It is not a source extension of the structural chunker and not
 semantic memory. The surface is `jscout docs`: it owns its inventory,
-Markdown-aware chunks, its own BM25 corpus and vector candidates, and its
+Markdown-compatible chunks, its own BM25 corpus and vector candidates, and its
 search results — all in the main database, published with the shared
 structural snapshot. The observation ledger is deferred to the supersession
 product.
@@ -36,10 +36,14 @@ time.
 
 - code search answers from structurally indexed JS/TS chunks;
 - semantic memory answers from evidence-backed semantic artifacts;
-- documentation search answers from current repository Markdown;
+- documentation search answers from current repository Markdown and MDX;
 - callers opt in through `jscout docs ...` and a separate MCP
   `documentation_search` tool; documentation hits never masquerade as
   structural hits, seed graph expansion, or satisfy semantic support anchors.
+  Documentation extraction emits no `graph_nodes` at all, including no
+  `file:` node: hits are self-contained through snapshot, path, byte/line
+  span, indexed file hash, and stored content, and have no structural or
+  semantic-memory anchor in version one.
 
 Normal documentation search indexes only the current checkout. Retired block
 content and retired cached vectors never enter BM25 or vector candidate
@@ -52,26 +56,36 @@ lifecycle behind its gate: one global schema version and
 structural-snapshot-gated opens. The resolution is not a second database —
 the storage-planes contract already rejects physical splitting — but one
 lifecycle with a separate ranking corpus. Docs are ordinary rows of the
-disposable structural snapshot, shaped to be inert to the code plane:
+disposable structural snapshot, separated from the code plane by an explicit
+corpus boundary:
 
-- docs files are `files` rows: same walker, same snapshot hash, same
-  publication, same entity plane;
+- docs files are `files` rows with `corpus='docs'` and `format='markdown'` for
+  `.md` or `format='mdx'` for `.mdx`:
+  same walker, same snapshot hash, same publication, same entity plane;
 - docs sections are `chunks` rows with `kind='markdown_section'` or
-  `'markdown_document'`, no `name`, no symbols — the exact tiers cannot
-  match them and no existing consumer needs a kind predicate;
+  `'markdown_document'`, no `name`, no symbols — `chunks.kind` is the
+  intra-file structural role, not file classification, and the exact tiers
+  cannot match them;
+- broad code-plane consumers of the shared canonical rows read disposable
+  `code_files` and `code_chunks` views. `code_files` filters
+  `files.corpus='code'`, and `code_chunks` joins through it, providing one
+  central corpus boundary instead of scattered negative documentation
+  predicates or sidecar-presence tests;
 - ranking is a separate corpus: docs rows mirror into `docs_fts` and never
   into `chunks_fts`, so code BM25 statistics never contain a docs term; docs
   vectors materialize into `vec_doc_embeddings_{dimensions}` and never the
   code vector tables, because sqlite-vec applies KNN's k before any join
   filter can run;
 - the durable content-addressed `embeddings` cache is shared;
-- the one real consumer filter is the TypeScript checker file inventory,
-  which reads `files` unfiltered and must exclude non-code kinds.
+- checker inventory, structural support, reconnaissance, scouting, and code
+  embeddings use that same code-corpus boundary. `doc_chunk_meta` is
+  documentation-retrieval metadata only and never determines membership.
 
-Code search reads the same tables, statistics, and pipeline as today; its
-results stay byte-identical. Docs search availability follows the shared
-snapshot lifecycle. Observation history, when built, is local and never a
-replacement for repository version control.
+Code search keeps the same statistics and pipeline as today; its ranked
+content stays byte-identical modulo the shared snapshot identifier. Docs
+search availability follows the shared snapshot lifecycle. Observation
+history, when built, is local and never a replacement for repository version
+control.
 
 ## Configuration
 
@@ -79,10 +93,9 @@ Documentation settings live in the existing repository configuration:
 
 ```toml
 [docs]
-include = ["**/*.md"]
+enabled = true
+include = ["**/*.md", "**/*.mdx"]
 exclude = []
-freshness = true
-max_rank_movement = 2
 
 [docs.search]
 vector = true
@@ -91,18 +104,34 @@ limit = 10
 response_bytes = 24000
 ```
 
-There is no `[docs.embedding]` or `[docs.reranker]` section: vectors use the
-repository `[embedding]` provider, model, and service, and reranking uses the
-repository `[reranker]` profile. Compatibility of a committed `[docs]` section
-with pre-docs jscout binaries is explicitly not a requirement. The feature
-activates only through a `docs` command, never through the mere presence of
-Markdown.
+`enabled=false` admits no documentation files or per-file documentation status
+decisions on the next shared index, while code indexing continues normally.
+`docs search` and `docs embed` fail closed while it is disabled, including
+before the next shared index pass; MCP omits the `documentation_search` tool
+and rejects a direct call.
 
-## Markdown corpus specification
+Phase 3 may add `freshness` and `max_rank_movement`; they are not phase-1/2
+configuration. There is no `[docs.embedding]` or `[docs.reranker]` section:
+vectors use the repository `[embedding]` provider, model, and service, and
+reranking uses the repository `[reranker]` profile. Compatibility of a
+committed `[docs]` section with pre-docs jscout binaries is explicitly not a
+requirement. The feature is admitted by the normal shared index pass, which
+never calls an embedding provider. Only explicit `jscout docs embed`
+materializes missing documentation vectors; the normal code-embedding path
+does not. `[docs.search].vector` controls vector participation in docs search,
+not vector generation, and setting it false does not delete cached vectors.
+
+## Markdown and MDX corpus specification
 
 ### Membership
 
-The first applicable rule below is the one visible in `docs status`:
+File decisions are emitted only for paths ending in exact lowercase `.md` or
+`.mdx`, plus non-document paths that an `include` glob explicitly selects.
+Ordinary unmatched code and other non-document files are outside the docs
+decision universe and create no `doc_inventory` row. Pruned-directory and
+traversal decisions remain visible because their descendants cannot be
+classified individually. Within that universe, the first applicable rule
+below is the one visible in `docs status`:
 
 | Order | Subject | Decision |
 | ----- | ------- | -------- |
@@ -111,7 +140,7 @@ The first applicable rule below is the one visible in `docs status`:
 | 3 | entry | symlink → `symlink-not-followed`; a directory symlink is pruned |
 | 4 | directory or file | hidden path not admitted by the exception below → `hidden-not-allowlisted`; a directory is pruned |
 | 5 | file | non-UTF-8 repository-relative path → `non-utf8-path` |
-| 6 | file | path does not end in exact lowercase `.md` → `unsupported-extension` |
+| 6 | file | path does not end in exact lowercase `.md` or `.mdx` → `unsupported-extension` |
 | 7 | file | `exclude` match → `excluded` |
 | 8 | file | no `include` match → `not-included` |
 | 9 | file | classified permanent open/read failure → `read-error` |
@@ -137,7 +166,7 @@ file in v1. Config globs are compiled with the implementation's pinned
 `case_insensitive(false)`, and `backslash_escape(true)`, against the complete
 slash-normalized UTF-8 path relative to the indexed root. `*`, `?`, and
 character classes do not cross `/`, while `**` may cross path segments and may
-match zero segments, so `**/*.md` includes root-level files. Brace alternation,
+match zero segments, so `**/*.md` and `**/*.mdx` include root-level files. Brace alternation,
 leading `!`, and a trailing `/` are rejected. Patterns match files only, never
 directory ancestors, so a subtree exclusion is written `drafts/**`, not
 `drafts/`. Invalid patterns fail configuration validation. Changing parser or
@@ -153,13 +182,24 @@ directory symlinks. Symlink entries are reported but not admitted, so they
 cannot escape the root, duplicate content, or form traversal cycles. Non-UTF-8
 repository-relative paths are likewise not admitted. Files larger than 4 MiB
 (4,194,304 bytes, an evaluation hypothesis) are excluded from admission.
-`docs status` reports the deciding rule per encountered file (`indexed`,
+`docs status` reports the deciding rule per file in the decision universe (`indexed`,
 `ignored`, `unsupported-extension`, `excluded`, `not-included`,
 `hidden-not-allowlisted`, `oversized`, `non-utf8`, `non-utf8-path`,
 `symlink-not-followed`, `read-error`) and per pruned directory (`hard-skip`, `ignored`,
 `hidden-not-allowlisted`, `symlink-not-followed`), without enumerating
-descendants beneath pruned directories. Version one admits `.md` only; MDX
-requires a separate parsing and safety decision.
+descendants beneath pruned directories. Version one admits exact-lowercase
+`.md` and `.mdx`. Uppercase variants are unsupported when an include selects
+them and otherwise remain outside the decision universe.
+
+MDX uses the same pinned CommonMark parser and GFM-table option as Markdown.
+Raw JSX, props, expressions, inner text, and non-leading ESM imports/exports
+remain inert authored source: they are never evaluated, seed no code FTS, emit
+no symbols, and create no graph rows. A narrow leading-block classifier uses
+the pinned JavaScript parser only to recognize a contiguous preamble made
+entirely of import/export declarations; those blocks emit no retrieval chunk
+or embedding identity. The CommonMark event stream otherwise determines
+whether MDX source is rendered as text or visible HTML; no claim of full MDX
+syntax understanding is made in version one.
 
 ### Field composition
 
@@ -213,6 +253,15 @@ compatibility constants.
   string while plain `true` is a boolean. Duplicate mapping keys make front
   matter malformed. The implementation pins the YAML parser version, and a
   parser/schema change requires a chunk-format version bump.
+- A full YAML parser is deliberate. Correctly distinguishing a valid scalar or
+  sequence from a top-level mapping, applying Core scalar types, rejecting
+  duplicate keys, and rejecting malformed syntax is part of the fallback
+  contract; a hand-written `key: value` subset would silently classify valid
+  YAML differently. The 4 MiB document-admission cap bounds parser input, and
+  adversarial deeply nested and alias-heavy fixtures must either parse within
+  the contract or deterministically fall back to
+  `front_matter=malformed_as_body`; they must not panic, hang, or partially
+  admit metadata.
 - Valid front matter is never emitted as a body chunk.
 - Malformed or unterminated front matter is ordinary Markdown body text,
   reported by `docs status` as `front_matter=malformed_as_body`, not a
@@ -220,7 +269,7 @@ compatibility constants.
 
 ### Blocks and chunks
 
-Markdown uses the implementation's pinned CommonMark parser with only the GFM
+Markdown and MDX use the implementation's pinned CommonMark parser with only the GFM
 table extension enabled; footnotes, task-list markers, strikethrough, smart
 punctuation, and other extensions are disabled. A parser or option change
 requires a chunk-format version bump. Markdown parses into source-backed blocks
@@ -231,7 +280,20 @@ indented, and inline-code ranges, rendering removes each byte range beginning
 with exact ASCII `<!--` through the first subsequent exact ASCII `-->`,
 inclusive. An opener without a closer is retained as ordinary text. This
 deterministic non-nesting scan also removes comments contained inside an opaque
-raw-HTML block; comment-looking text in every code range remains literal.
+raw-HTML block. For `.mdx` only, the same scan also removes exact ASCII `{/*`
+through the first subsequent exact ASCII `*/}`, inclusive. Comment-looking
+text in every protected code range remains literal, and `.md` treats JSX
+comment syntax as ordinary authored text. Protected code ranges also terminate
+a comment scan, so an outside opener cannot consume comment-looking code.
+
+Before MDX body-block publication, a preamble gate examines contiguous leading
+paragraph blocks after BOM/front-matter handling and comment removal. A block
+is omitted only when it parses without diagnostics as a non-empty JavaScript
+module containing exclusively import/export declarations. Empty rendered
+comment blocks do not close the gate. A heading, thematic separator,
+non-paragraph block, or first non-ESM paragraph closes it permanently; later
+imports/exports remain raw searchable text. An ESM-only document therefore
+emits the normal lexical-only document stub and no embedding identity.
 Headings establish structure and metadata but are not independent history
 occurrences; thematic separators carry no retrieval text or history occurrence
 and force a chunk boundary. The ledger tracks retrieval-bearing body blocks.
@@ -245,7 +307,7 @@ Retrieval rendering is byte-deterministic:
 
 1. Each source-backed body block starts as its exact original source slice,
    with CRLF and lone CR normalized to LF. Only ranges emitted by the Markdown
-   comment scanner above removes ranges outside fenced, indented, or inline
+   or MDX comment scanner above are removed outside fenced, indented, or inline
    code. Leading and trailing LF bytes are removed and every other byte is
    retained.
 2. A merged chunk joins rendered blocks with exactly two LF bytes (`\n\n`),
@@ -315,21 +377,30 @@ chunks.
 
 ## Storage model
 
-Docs storage lives in the main database's disposable plane (names may change
-during implementation):
+Docs storage lives in the main database's disposable plane:
 
-- `files` (shared): one row per admitted document — repository-relative path
-  and a full-file BLAKE3 hash over the exact original bytes, including any
-  BOM. The shared structural snapshot already hashes every `files` row, so
-  docs corpus identity is covered by the existing snapshot with no separate
-  fingerprint or sequence.
-- `chunks` (shared, unchanged schema): one row per retrieval chunk in the
-  inert shape — free-text `kind` (`markdown_section`, `markdown_document`),
-  `name` NULL, empty symbols, exact source span and slice, content hash.
-- `doc_chunk_meta` (new, chunk-id keyed): title, heading breadcrumb, nearest
-  heading, same-heading ordinal, embedding identity
+- `files` (shared): one row per admitted file. `corpus` is required ranking
+  membership (`code` or `docs`); `format` is required parser/format identity.
+  An admitted G24 document has `corpus='docs'`, `format='markdown'` for `.md`
+  or `format='mdx'` for `.mdx`, a
+  repository-relative path, and a full-file BLAKE3 hash over the exact
+  original bytes, including any BOM. The shared structural snapshot already
+  hashes every `files` row, so docs corpus identity is covered by the existing
+  snapshot with no separate fingerprint or sequence.
+- `chunks` (shared): one row per retrieval chunk. Free-text `kind`
+  (`markdown_section`, `markdown_document`) records the intra-file structural
+  role; it does not repeat the file corpus or format. Documentation chunks
+  have `name` NULL, empty symbols, exact source span and slice, and content
+  hash.
+- `code_files` and `code_chunks` (new disposable views): the explicit
+  code-corpus boundary for consumers that enumerate shared canonical rows;
+  `code_files` filters `files.corpus='code'`, and `code_chunks` joins through
+  `code_files`.
+- `doc_chunk_meta` (new, chunk-id keyed): title, description, lossless tags,
+  heading breadcrumb, nearest heading, same-heading ordinal, embedding identity
   (`hash(format_version, nearest_heading, rendered_body)`), and, in the
-  freshness phase, the basis and value columns.
+  freshness phase, the basis and value columns. This sidecar contains
+  format-specific metadata and is not a corpus-membership signal.
 - `docs_fts` (new FTS5): the docs ranking corpus — title, description/tags,
   breadcrumb, rendered body, path; rowid is the chunk id. Weighted at query
   time; its statistics never mix with `chunks_fts`.
@@ -355,8 +426,8 @@ during implementation):
   and `doc_block_observations` — append-only events referencing
   `snapshot_log` sequence numbers, growing only when a change is observed.
   Matching needs only the previous state; accumulated history is matching's
-  output, never its input. History recording is a per-kind registry
-  property, on for Markdown only. Matching, lifecycle, and failure semantics
+  output, never its input. History recording is a per-format registry
+  property, on for Markdown and MDX only. Matching, lifecycle, and failure semantics
   remain as specified under History and continuity; references to "snapshot
   sequence" in those sections mean `snapshot_log` sequence numbers. Retired
   body retention (`doc_block_contents`) remains the separate opt-in. Any corpus-level failure —
@@ -551,7 +622,7 @@ for comparison while still reporting bases.
 ## CLI and MCP surface
 
 ```text
-jscout docs index <root>     local, deterministic; no provider request
+jscout index <root>          shared local indexing; no provider request
 jscout docs embed <root>     embeds missing current representations
 jscout docs search <root> <query>
 jscout docs status <root>
@@ -567,12 +638,15 @@ default          BM25, plus vector fusion when the profile has a usable index
                  retrieval remains hybrid — there is no vector-only mode
 --no-vector      BM25 only; reranker unaffected
 --rerank / --no-rerank   override the configured reranker
---no-freshness   skip freshness reordering
 ```
 
-The MCP `documentation_search` tool returns documentation-specific hits:
-path, heading breadcrumb, line range, content, documentation snapshot
-sequence, indexed file hash, freshness basis and value, base rank and movement.
+`--no-freshness` is added only with phase 3.
+
+In phases 1/2 the MCP `documentation_search` tool returns
+documentation-specific hits: path, title and heading metadata, line range,
+content, shared snapshot digest, and indexed file hash. Phase 3 adds freshness
+basis/value, base rank, and movement; a later ledger may add its shared
+`snapshot_log` sequence.
 Byte and line spans are relative to that indexed file hash. To return raw
 checkout source, jscout reads the file once into an immutable buffer, hashes
 that buffer, and slices only that same buffer when the hash matches. On a
@@ -602,7 +676,7 @@ Further failure-state machinery is deferred until the base feature is in use.
 - Hit content is served from stored current rendered bodies and block text.
   Exact source spans are snapshot-relative and paired with the indexed full-
   file hash. Checkout source is read once into an immutable buffer; that same
-  buffer is hashed and, only on a match, sliced. No full raw Markdown copy is
+  buffer is hashed and, only on a match, sliced. No full raw Markdown or MDX copy is
   stored.
 - After a successful replacement snapshot, retired block bodies are removed
   from logical storage. The ledger keeps hashes and transition metadata, and
@@ -623,7 +697,8 @@ Deterministic tests:
   ignore beats both, the hidden allowlist admits `.github`, `.claude`, and
   `.agents`, `README.md` and `drafts/**` pin the config-glob dialect while
   `drafts/` and brace alternation are rejected, symlinks are not followed,
-  a broad include still rejects non-`.md` files, non-UTF-8 paths have a lossless
+  a broad include still rejects non-`.md`/`.mdx` files, default indexing admits
+  both formats, disabled docs emit no file decisions, non-UTF-8 paths have a lossless
   status representation, and every pairwise overlap in the ordered decision
   table reports the first deciding rule;
 - front-matter recognition requires the specified top-level mapping and value
@@ -645,7 +720,9 @@ Deterministic tests:
   reordering do not;
 - golden rendering fixtures pin CRLF normalization, `**API**` heading text,
   the two-LF merge separator, exact non-code HTML-comment scanning (including
-  comments inside raw HTML), inline-code comment preservation, and exact
+  comments inside raw HTML), exact MDX JSX-comment scanning, leading ESM-only
+  preamble suppression, raw JSX/prop/expression/inner-text retention,
+  inline-code comment preservation, and exact
   fence/table prefixes on every oversized
   fragment including the first;
 - every oversized block type splits deterministically, final rendered
@@ -670,7 +747,9 @@ Deterministic tests:
   path-history rewrite, and clone deepening; two identical files with distinct
   path histories use distinct cache entries; configured ignore-revs and
   replacement refs do not alter attribution;
-- code search is byte-identical after docs admission: `chunks_fts` contains
+- code-search ranked content, statistics, and order are byte-identical after
+  Markdown and MDX admission modulo the shared snapshot identifier:
+  `chunks_fts` contains
   no docs rows, its term statistics are unchanged, and the exact tiers match
   no docs chunk; the checker file inventory contains no non-code files; a
   retryable docs scan failure leaves the prior snapshot searchable;
@@ -689,9 +768,15 @@ Deterministic tests:
 - embedding failure after every possible batch, and after index materialization
   but before readiness publication, leaves cached vectors reusable but makes
   the current snapshot BM25-only;
-- code and semantic snapshots, counts, and fingerprints are byte-identical
-  after any docs operation, and the documentation database is byte-identical
-  after any code or semantic operation.
+- code-search rankings, counts, and fingerprints remain identical after docs
+  admission modulo the shared snapshot identifier; code or semantic operations
+  never create a second documentation database or a partial docs projection;
+- the MCP boundary repeats the differential across every deterministic
+  structural code-read tool for a code-only index, an incremental Markdown/MDX
+  admission, and a fresh Markdown/MDX index, normalizing only the shared
+  snapshot field. When docs are disabled, `tools/list` omits
+  `documentation_search`, server instructions do not name it, and a direct
+  call is rejected before retrieval.
 
 Retrieval evaluation, before freshness defaults are accepted: a fixed corpus
 with conflicting versioned instructions of known order, old evergreen
@@ -708,5 +793,5 @@ against movement bounds of 1–3.
 - FTS column weights, target/merge/hard chunk-size bounds, the 4 MiB
   file-admission bound, and
   the `max_rank_movement` default are evaluation hypotheses.
-- Historical search, contradiction detection, MDX, remote documentation
+- Historical search, contradiction detection, remote documentation
   sources, and author-declared supersession remain out of scope.
