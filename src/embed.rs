@@ -30,15 +30,15 @@ pub struct Provider {
 }
 
 #[derive(Clone, Debug)]
-struct ProfileSpec {
-    provider: String,
-    model: String,
-    fingerprint: String,
-    config_json: String,
-    dimensions: Option<usize>,
+pub(crate) struct ProfileSpec {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) fingerprint: String,
+    pub(crate) config_json: String,
+    pub(crate) dimensions: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedProfile {
     pub id: i64,
     pub dimensions: usize,
@@ -133,9 +133,9 @@ pub(crate) fn code_vector_failure_action(error: &anyhow::Error) -> &'static str 
     vector_failure_action(error, "run jscout embed <root> --repair")
 }
 
-struct EmbeddingResponse {
-    vectors: Vec<Vec<f32>>,
-    profile_fingerprint: Option<String>,
+pub(crate) struct EmbeddingResponse {
+    pub(crate) vectors: Vec<Vec<f32>>,
+    pub(crate) profile_fingerprint: Option<String>,
 }
 
 fn default_query_prefix(model: &str) -> &'static str {
@@ -248,6 +248,10 @@ impl Provider {
     }
 
     fn profile(&self) -> Result<ProfileSpec> {
+        self.profile_for(DOCUMENT_TEXT_FORMAT)
+    }
+
+    pub(crate) fn profile_for(&self, document_text_format: &str) -> Result<ProfileSpec> {
         let (configuration, dimensions) = match self.protocol {
             Protocol::Local => {
                 let base = self
@@ -282,7 +286,7 @@ impl Provider {
                 (
                     json!({
                         "protocol": "jscout-local-v1",
-                        "document_text": DOCUMENT_TEXT_FORMAT,
+                        "document_text": document_text_format,
                         "embedding": embedding,
                     }),
                     Some(dimensions),
@@ -291,7 +295,7 @@ impl Provider {
             Protocol::Voyage => (
                 json!({
                     "protocol": "voyage-v1",
-                    "document_text": DOCUMENT_TEXT_FORMAT,
+                    "document_text": document_text_format,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                     "revision": self.revision,
@@ -301,7 +305,7 @@ impl Provider {
             Protocol::OpenAi => (
                 json!({
                     "protocol": "openai-embeddings-v1",
-                    "document_text": DOCUMENT_TEXT_FORMAT,
+                    "document_text": document_text_format,
                     "url": self.url,
                     "query_prefix": self.query_prefix,
                     "revision": self.revision,
@@ -367,15 +371,36 @@ impl Provider {
     }
 
     fn embed_documents(&self, texts: &[String]) -> Result<EmbeddingResponse> {
-        self.embed_texts(texts, false)
+        self.embed_documents_for(texts, DOCUMENT_TEXT_FORMAT)
+    }
+
+    pub(crate) fn embed_documents_for(
+        &self,
+        texts: &[String],
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
+        self.embed_texts(texts, false, document_text_format)
     }
 
     fn embed_query(&self, text: &str) -> Result<EmbeddingResponse> {
-        let text = format!("{}{}", self.query_prefix, text);
-        self.embed_texts(&[text], true)
+        self.embed_query_for(text, DOCUMENT_TEXT_FORMAT)
     }
 
-    fn embed_texts(&self, texts: &[String], query: bool) -> Result<EmbeddingResponse> {
+    pub(crate) fn embed_query_for(
+        &self,
+        text: &str,
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
+        let text = format!("{}{}", self.query_prefix, text);
+        self.embed_texts(&[text], true, document_text_format)
+    }
+
+    fn embed_texts(
+        &self,
+        texts: &[String],
+        query: bool,
+        document_text_format: &str,
+    ) -> Result<EmbeddingResponse> {
         let body = match self.protocol {
             Protocol::Local => json!({
                 "model": self.model,
@@ -409,7 +434,7 @@ impl Provider {
             }
             let configuration = json!({
                 "protocol": "jscout-local-v1",
-                "document_text": DOCUMENT_TEXT_FORMAT,
+                "document_text": document_text_format,
                 "embedding": {
                     "model": response["model"],
                     "dimensions": response["dimensions"],
@@ -620,7 +645,7 @@ fn missing_embedding_documents(
     let flags = origin_flags(file_origins);
     let mut statement = conn.prepare(
         "SELECT c.hash, MIN(c.content), COUNT(DISTINCT c.content)
-         FROM chunks c JOIN files f ON c.file_id=f.id
+         FROM code_chunks c JOIN code_files f ON c.file_id=f.id
          LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
          WHERE NOT EXISTS (
            SELECT 1 FROM embeddings e
@@ -677,7 +702,7 @@ fn selected_embedding_document_count(
     conn.query_row(
         "SELECT COUNT(*) FROM (
            SELECT c.hash
-           FROM chunks c JOIN files f ON c.file_id=f.id
+           FROM code_chunks c JOIN code_files f ON c.file_id=f.id
            LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
            WHERE ((?1 AND f.origin='repository')
              OR (?2 AND f.origin='workspace')
@@ -702,8 +727,8 @@ fn selected_embedding_occurrence_count(
     let flags = origin_flags(file_origins);
     conn.query_row(
         "SELECT COUNT(*)
-         FROM chunks c
-         JOIN files f ON c.file_id=f.id
+         FROM code_chunks c
+         JOIN code_files f ON c.file_id=f.id
          LEFT JOIN repository_file_policy policy ON policy.file_id=f.id
          JOIN embedding_index_entries entry
            ON entry.chunk_id=c.id AND entry.profile_id=?1
@@ -1107,6 +1132,22 @@ fn vector_table(dimensions: usize) -> Result<String> {
     Ok(format!("vec_embeddings_{dimensions}"))
 }
 
+fn doc_vector_table(dimensions: usize) -> Result<String> {
+    if dimensions == 0 || dimensions > 8_192 {
+        bail!("unsupported embedding dimensions: {dimensions}");
+    }
+    Ok(format!("vec_doc_embeddings_{dimensions}"))
+}
+
+fn named_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
     let table = vector_table(dimensions)?;
     conn.execute_batch("SAVEPOINT jscout_vector_table_ensure")?;
@@ -1147,12 +1188,7 @@ fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
 
 fn vector_table_exists(conn: &Connection, dimensions: usize) -> Result<bool> {
     let table = vector_table(dimensions)?;
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-        [&table],
-        |row| row.get::<_, bool>(0),
-    )
-    .map_err(Into::into)
+    named_table_exists(conn, &table)
 }
 
 fn semantic_vector_table(dimensions: usize) -> Result<String> {
@@ -1364,8 +1400,8 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
                 let mut statement = conn.prepare(&format!(
                     "SELECT i.id, f.origin, e.vec
                      FROM embedding_index_entries i
-                     JOIN chunks c ON c.id=i.chunk_id
-                     JOIN files f ON f.id=c.file_id
+                     JOIN code_chunks c ON c.id=i.chunk_id
+                     JOIN code_files f ON f.id=c.file_id
                      JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=i.profile_id
                      LEFT JOIN {table} v ON v.rowid=i.id
                      WHERE i.profile_id=?1 AND v.rowid IS NULL"
@@ -1412,8 +1448,8 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
     let missing_chunks = {
         let mut statement = conn.prepare(
             "SELECT c.id, f.origin, e.vec
-             FROM chunks c
-             JOIN files f ON f.id=c.file_id
+             FROM code_chunks c
+             JOIN code_files f ON f.id=c.file_id
              JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
              LEFT JOIN embedding_index_entries i
                ON i.chunk_id=c.id AND i.profile_id=e.profile_id
@@ -1506,7 +1542,7 @@ fn vector_profile_has_unmaterialized_occurrences(
     conn.query_row(
         "SELECT EXISTS(
            SELECT 1
-           FROM chunks c
+           FROM code_chunks c
            JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
            LEFT JOIN embedding_index_entries i
              ON i.chunk_id=c.id AND i.profile_id=e.profile_id
@@ -1766,6 +1802,7 @@ fn exact_vector_search(
             "SELECT i.chunk_id, v.distance
              FROM {table} v
              JOIN embedding_index_entries i ON i.id=v.rowid
+             JOIN code_chunks c ON c.id=i.chunk_id
              WHERE v.embedding MATCH ?1
                AND v.k=?2
                AND v.profile_id=?3
@@ -1804,6 +1841,34 @@ pub fn delete_vector_rows_for_file(conn: &Connection, file_id: i64) -> Result<()
         let table = ensure_vector_table(conn, dimensions)?;
         conn.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [row_id])?;
     }
+
+    let doc_rows = {
+        let mut statement = conn.prepare(
+            "SELECT i.id, i.profile_id, p.dimensions
+             FROM doc_embedding_index_entries i
+             JOIN chunks c ON c.id=i.chunk_id
+             JOIN embedding_profiles p ON p.id=i.profile_id
+             WHERE c.file_id=?1",
+        )?;
+        let rows = statement.query_map([file_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (row_id, profile_id, dimensions) in doc_rows {
+        let table = doc_vector_table(dimensions)?;
+        if named_table_exists(conn, &table)? {
+            conn.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [row_id])?;
+        }
+        conn.execute(
+            "DELETE FROM doc_vector_generations WHERE profile_id=?1",
+            [profile_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1817,6 +1882,21 @@ pub fn clear_vector_rows(conn: &Connection) -> Result<()> {
         let table = ensure_vector_table(conn, dimension)?;
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
+    let doc_tables = {
+        let mut statement = conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table'
+               AND name GLOB 'vec_doc_embeddings_[0-9]*'
+               AND substr(name, length('vec_doc_embeddings_') + 1)
+                   NOT GLOB '*[^0-9]*'
+             ORDER BY name",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for table in doc_tables {
+        conn.execute(&format!("DELETE FROM {table}"), [])?;
+    }
     Ok(())
 }
 
@@ -1828,7 +1908,10 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
-fn validate_response_profile(profile: &ProfileSpec, response: &EmbeddingResponse) -> Result<()> {
+pub(crate) fn validate_response_profile(
+    profile: &ProfileSpec,
+    response: &EmbeddingResponse,
+) -> Result<()> {
     if let Some(fingerprint) = &response.profile_fingerprint
         && fingerprint != &profile.fingerprint
     {

@@ -398,7 +398,7 @@ pub fn reconcile_file_policy(root: &Path, conn: &Connection) -> Result<usize> {
         conn.execute("DELETE FROM repository_file_policy", [])?;
         conn.execute("DELETE FROM repository_current_classifications", [])?;
         let file_roles = {
-            let mut statement = conn.prepare("SELECT id, role FROM files ORDER BY id")?;
+            let mut statement = conn.prepare("SELECT id, role FROM code_files ORDER BY id")?;
             let rows = statement.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -710,7 +710,7 @@ pub fn current_scope_memberships(conn: &Connection) -> Result<BTreeMap<i64, Stri
     // instead of materializing every file once per current subject.
     let mut files = conn.prepare(
         "SELECT file.id, file.path, file.origin, package.origin, package.locator
-         FROM files file
+         FROM code_files file
          LEFT JOIN package_instances package ON package.id=file.package_instance_id
          ORDER BY file.id",
     )?;
@@ -758,9 +758,9 @@ fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result
     match selector {
         SubjectSelector::RepositoryArea { scope, direct_only } => {
             let mut statement = conn.prepare(
-                "SELECT id, path, hash FROM files
-                 WHERE origin='repository' AND package_instance_id IS NULL
-                 ORDER BY path",
+                "SELECT file.id, file.path, file.hash FROM code_files file
+                 WHERE file.origin='repository' AND file.package_instance_id IS NULL
+                 ORDER BY file.path",
             )?;
             let rows = statement.query_map([], member_row)?;
             for row in rows {
@@ -777,7 +777,7 @@ fn members_for_selector(conn: &Connection, selector: &SubjectSelector) -> Result
         } => {
             let mut statement = conn.prepare(
                 "SELECT file.id, file.path, file.hash
-                 FROM files file
+                 FROM code_files file
                  JOIN package_instances package ON package.id=file.package_instance_id
                  WHERE package.origin='workspace' AND package.locator=?1
                  ORDER BY file.path",

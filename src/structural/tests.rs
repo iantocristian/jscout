@@ -53,6 +53,33 @@ fn projects_resolved_calls_and_returns_snapshot() -> Result<()> {
 }
 
 #[test]
+fn snapshot_hashes_file_corpus_and_parser_format() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(repo.path(), "main.ts", "export const value = 1;\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let baseline = compute_snapshot(&conn)?;
+    assert_eq!(baseline, super::current_snapshot(&conn)?);
+
+    conn.execute(
+        "UPDATE files SET format='javascript' WHERE path='main.ts'",
+        [],
+    )?;
+    let changed_format = compute_snapshot(&conn)?;
+    assert_ne!(changed_format, baseline);
+
+    conn.execute(
+        "UPDATE files SET format='typescript', corpus='docs' WHERE path='main.ts'",
+        [],
+    )?;
+    let changed_corpus = compute_snapshot(&conn)?;
+    assert_ne!(changed_corpus, baseline);
+    assert_ne!(changed_corpus, changed_format);
+    Ok(())
+}
+
+#[test]
 fn neighborhood_orders_parallel_edges_deterministically() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(

@@ -702,7 +702,7 @@ pub(crate) fn validate_annotate_input(
         }
         let anchor_file: Option<String> = conn
             .query_row(
-                "SELECT f.path FROM graph_nodes g LEFT JOIN files f ON g.file_id=f.id
+                "SELECT f.path FROM graph_nodes g LEFT JOIN code_files f ON g.file_id=f.id
                  WHERE g.node_key=?1",
                 [&anchor],
                 |row| row.get(0),

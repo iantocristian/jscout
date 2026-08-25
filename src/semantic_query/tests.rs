@@ -77,6 +77,34 @@ fn replace_concept_chunks(conn: &rusqlite::Connection, spans: &[(i64, i64)]) -> 
 }
 
 #[test]
+fn documentation_file_is_not_a_semantic_evidence_scope() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    std::fs::write(
+        repo.path().join("main.ts"),
+        "export function run() { return 1; }\n",
+    )?;
+    std::fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nDocumentation is retrieved separately.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let error = query(
+        repo.path(),
+        &conn,
+        None,
+        &QueryOptions {
+            file: Some("README.md".into()),
+            ..Default::default()
+        },
+    )
+    .expect_err("documentation must not be accepted as a semantic evidence scope");
+    assert!(error.to_string().contains("not indexed in the code corpus"));
+    Ok(())
+}
+
+#[test]
 fn semantic_query_filters_relates_and_drills_to_exact_source() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::write(

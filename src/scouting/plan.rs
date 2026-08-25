@@ -490,13 +490,14 @@ fn targeted_card_subjects(
         let file = file.strip_prefix("./").unwrap_or(file);
         let exists = conn
             .query_row(
-                "SELECT origin FROM files WHERE path=?1 AND origin IN ('repository','workspace')",
+                "SELECT origin FROM code_files
+                 WHERE path=?1 AND origin IN ('repository','workspace')",
                 [file],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
         if exists.is_none() {
-            bail!("target card file `{file}` is not an indexed repository/workspace file");
+            bail!("target card file `{file}` is not an indexed code file in repository/workspace");
         }
         target_files.insert(
             file.to_string(),
