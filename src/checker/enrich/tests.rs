@@ -3231,6 +3231,20 @@ fn reset_carried_projects_are_removed_from_effective_carry_telemetry() {
 }
 
 #[test]
+fn project_carry_requires_an_explicit_current_and_completed_fingerprint() {
+    let project = "tsconfig.json";
+    let absent = BTreeMap::<String, String>::new();
+    let matching = BTreeMap::from([(project.to_string(), "same".to_string())]);
+    let changed = BTreeMap::from([(project.to_string(), "changed".to_string())]);
+
+    assert!(!project_fingerprint_matches(&absent, &absent, project));
+    assert!(!project_fingerprint_matches(&matching, &absent, project));
+    assert!(!project_fingerprint_matches(&absent, &matching, project));
+    assert!(!project_fingerprint_matches(&matching, &changed, project));
+    assert!(project_fingerprint_matches(&matching, &matching, project));
+}
+
+#[test]
 fn confidence_policy_change_prevents_carry_of_a_legacy_possible_set() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let source = "export class A { insert(): void {} }\n\

@@ -4,9 +4,22 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-pub fn current_binary_fingerprint() -> Result<String> {
-    let path = std::env::current_exe().context("locate current jscout executable")?;
-    binary_fingerprint(&path)
+pub fn current_binary_fingerprint() -> String {
+    let result = std::env::current_exe()
+        .context("locate current jscout executable")
+        .and_then(|path| binary_fingerprint(&path));
+    let (fingerprint, error) = fingerprint_or_unavailable(result);
+    if let Some(error) = error {
+        eprintln!("jscout binary fingerprint status=unavailable error={error:#}");
+    }
+    fingerprint
+}
+
+fn fingerprint_or_unavailable(result: Result<String>) -> (String, Option<anyhow::Error>) {
+    match result {
+        Ok(fingerprint) => (fingerprint, None),
+        Err(error) => ("unavailable".to_string(), Some(error)),
+    }
 }
 
 fn binary_fingerprint(path: &Path) -> Result<String> {
@@ -44,5 +57,16 @@ mod tests {
         assert_eq!(fingerprint, binary_fingerprint(&first)?);
         assert_ne!(fingerprint, binary_fingerprint(&second)?);
         Ok(())
+    }
+
+    #[test]
+    fn unavailable_binary_identity_is_a_stable_nonfatal_marker() {
+        let (fingerprint, error) =
+            fingerprint_or_unavailable(Err(anyhow::anyhow!("executable was replaced")));
+        assert_eq!(fingerprint, "unavailable");
+        assert_eq!(
+            error.expect("diagnostic").to_string(),
+            "executable was replaced"
+        );
     }
 }

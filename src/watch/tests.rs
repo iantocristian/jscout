@@ -11,7 +11,7 @@ use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
     RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
     clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
-    is_refresh_boundary, run_refresh, validate_options, watch_startup_log,
+    is_refresh_boundary, run_refresh, validate_options, watch_enrich_options, watch_startup_log,
 };
 
 fn rejection(path: &str, stage: &'static str, error: &str) -> crate::indexer::IndexRejection {
@@ -647,7 +647,7 @@ fn event_filter_applies_the_configured_documentation_policy() -> Result<()> {
 }
 
 #[test]
-fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result<()> {
+fn irrelevant_regular_files_are_ignored_but_inventory_shapes_refresh_incrementally() -> Result<()> {
     let root = tempfile::tempdir()?;
     fs::write(root.path().join("README.md"), "documentation\n")?;
     fs::write(root.path().join(".DS_Store"), "metadata\n")?;
@@ -676,11 +676,19 @@ fn irrelevant_regular_files_are_ignored_but_uncertain_shapes_rebuild() -> Result
     );
     assert_eq!(
         classifier.classify(&[root.path().join("renamed-directory")]),
-        Some(DirtySignal::full("unknown-directory-event"))
+        Some(DirtySignal::inventory("inventory:directory-event"))
     );
     assert_eq!(
         classifier.classify(&[root.path().join("deleted-unknown-file")]),
-        Some(DirtySignal::full("unknown-event"))
+        Some(DirtySignal::inventory("inventory:unknown-event"))
+    );
+
+    fs::create_dir_all(root.path().join("docs/nested"))?;
+    fs::write(root.path().join("docs/nested/guide.md"), "guide\n")?;
+    fs::remove_dir_all(root.path().join("docs"))?;
+    assert_eq!(
+        classifier.classify(&[root.path().join("docs")]),
+        Some(DirtySignal::inventory("inventory:unknown-event"))
     );
     Ok(())
 }
@@ -824,6 +832,47 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
 }
 
 #[test]
+fn checker_watch_options_factory_owns_selection_and_generation_overrides() {
+    let database = Path::new("/repo/.jscout.db");
+    let normal = watch_enrich_options(
+        database,
+        Some(Path::new("checker/main.mjs")),
+        "node",
+        seconds(300),
+        false,
+        vec!["src/a.ts".into()],
+    );
+    let flush = watch_enrich_options(
+        database,
+        Some(Path::new("checker/main.mjs")),
+        "node",
+        seconds(300),
+        true,
+        vec!["src/b.ts".into()],
+    );
+
+    assert!(normal.files.is_empty());
+    assert!(normal.packages.is_empty());
+    assert!(normal.members.is_empty());
+    assert!(normal.roles.is_empty());
+    assert_eq!(normal.max_occurrences, None);
+    assert!(!normal.include_all);
+    assert!(!normal.dry_run);
+    assert!(normal.carry_forward);
+    assert!(!normal.force_full);
+    assert_eq!(normal.dirty_files, ["src/a.ts"]);
+
+    assert!(!flush.carry_forward);
+    assert!(flush.force_full);
+    assert_eq!(flush.dirty_files, ["src/b.ts"]);
+    assert_eq!(
+        crate::checker::watch_policy_fingerprint(&normal),
+        crate::checker::watch_policy_fingerprint(&flush),
+        "per-generation carry-free work must not change the startup policy identity"
+    );
+}
+
+#[test]
 fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("a.ts"), "export const a = 1;\n")?;
@@ -851,6 +900,58 @@ fn refresh_phase_replaces_the_complete_file_set() -> Result<()> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     assert_eq!(paths, vec!["b.ts"]);
+    Ok(())
+}
+
+#[test]
+fn incremental_inventory_refresh_removes_a_deleted_documentation_subtree() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir_all(directory.path().join("removed/nested"))?;
+    fs::write(
+        directory.path().join("removed/nested/guide.md"),
+        "# Guide\n\nCurrent documentation.\n",
+    )?;
+    fs::write(
+        directory.path().join("removed/main.ts"),
+        "export const removed = true;\n",
+    )?;
+    fs::write(
+        directory.path().join("stable.ts"),
+        "export const stable = true;\n",
+    )?;
+    let database = directory.path().join("watch.db");
+    run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Full,
+    )?;
+
+    fs::remove_dir_all(directory.path().join("removed"))?;
+    let refreshed = run_refresh(
+        directory.path(),
+        &database,
+        &indexer::IndexOptions::default(),
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(refreshed.outcome.unchanged, 1);
+    assert_eq!(refreshed.outcome.removed, 2);
+    assert!(!refreshed.outcome.extraction_reset);
+
+    let conn = crate::store::open_path_read_only(&database)?;
+    let remaining = conn
+        .prepare("SELECT path, corpus FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(remaining, vec![("stable.ts".into(), "code".into())]);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM docs_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
     Ok(())
 }
 

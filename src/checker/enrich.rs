@@ -2390,9 +2390,10 @@ fn carry_forward_projects(
             external_inputs.entry(project).or_default().push(input);
         }
         for project in projects.keys() {
-            if selected_sources.contains_key(project)
-                || complete_projects.get(project) != project_fingerprints.get(project)
-            {
+            if selected_sources.contains_key(project) {
+                continue;
+            }
+            if !project_fingerprint_matches(&complete_projects, project_fingerprints, project) {
                 continue;
             }
             let inputs = external_inputs.remove(project).unwrap_or_default();
@@ -2757,6 +2758,17 @@ fn carry_forward_projects(
             Err(error)
         }
     }
+}
+
+fn project_fingerprint_matches(
+    completed: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+    project: &str,
+) -> bool {
+    let Some(expected) = current.get(project) else {
+        return false;
+    };
+    completed.get(project) == Some(expected)
 }
 
 fn project_complete_and_fresh(

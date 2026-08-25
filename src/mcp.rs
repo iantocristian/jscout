@@ -157,7 +157,7 @@ pub fn serve(
         result_transport,
     } = options;
     let root = root.canonicalize()?;
-    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint()?;
+    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint();
     let conn = store::open_path_read_only(database_path)?;
     let provider =
         embed::Provider::from_settings(&runtime.effective.embedding, &runtime.effective.inference)?;

@@ -1498,14 +1498,16 @@ optimizations, not a second correctness model.
 A source batch is promoted to full refresh when it contains more than 256
 distinct paths. Git HEAD or submodule controls, source-inventory ignore files,
 package/workspace manifests, lockfiles, tsconfig/jsconfig and declaration
-inputs, selected dependency roots, external checker inputs, directories,
-backend errors, and unclassifiable missing paths also require full refresh.
-Full scope is sticky within a generation, so a mixed event cannot be downgraded
-by later source notifications. A changed file with a non-retryable read or
-deterministic extraction failure is reported and excluded rather than leaving
-its previous structural row live. The operation still publishes the indexable
-corpus successfully. A recognized transient read failure instead rolls back
-the transaction and fails the refresh for retry.
+inputs, selected dependency roots, external checker inputs, pathless events,
+and backend errors also require full refresh. Non-boundary directory and
+uncertain missing-path events select complete-inventory incremental refresh;
+the full inventory, not the event path, remains authoritative. Full scope is
+sticky within a generation, so a mixed event cannot be downgraded by later
+source notifications. A changed file with a non-retryable read or deterministic
+extraction failure is reported and excluded rather than leaving its previous
+structural row live. The operation still publishes the indexable corpus
+successfully. A recognized transient read failure instead rolls back the
+transaction and fails the refresh for retry.
 
 G12 does not promise uninterrupted queries during refresh. Publish-then-swap,
 database generations, or a second structural database would add lifecycle
@@ -1529,10 +1531,12 @@ authoritative and must be supplied to watch exactly as they are to index.
 
 Watcher startup telemetry records the jscout version, executable-byte
 fingerprint, non-secret loaded runtime-config fingerprint, config-loaded and
-restart-required semantics, checker-policy fingerprint, effective-watch-policy
-fingerprint after CLI overrides, and effective phase flags. Repository
-snapshots and dirty paths remain per-generation state rather than part of those
-runtime identities.
+restart-required semantics, checker-policy fingerprint derived from the actual
+watcher enrichment selection, effective-watch-policy fingerprint after CLI
+overrides, and effective phase flags. Repository snapshots and dirty paths
+remain per-generation state rather than part of those runtime identities.
+Executable fingerprint acquisition is best-effort: failure is logged and
+rendered as `unavailable`, never promoted into a watcher or MCP startup error.
 
 Code embedding remains ahead of checker enrichment because its document and
 selection inputs are chunk content plus current repository policy; checker
@@ -1662,8 +1666,10 @@ Triggers include:
 Existing regular files that fail every relevance rule are ignored rather than
 escalated: documentation excluded by the configured corpus policy, editor
 metadata, and other unindexed files therefore do not rebuild the repository.
-Pathless/rescan events, directories, and otherwise uncertain missing paths
-remain conservative full-refresh triggers.
+Pathless/rescan events remain conservative full-refresh triggers. A directory
+or uncertain missing path that is not already a recognized boundary schedules
+complete-inventory incremental refresh, which discovers all descendant changes
+without resetting unrelated canonical rows.
 
 After each refresh or enrichment, the coordinator reconciles its narrow
 external watches with the newly resolved package instances and checker input
@@ -1807,9 +1813,10 @@ substitution rather than a completed measurement of that checkout.
   TypeScript runtime, and ambient declaration changes converge;
 - edit -> enrich -> revert cannot reactivate a checker batch created before
   intervening external checker-input changes;
-- bounded source/doc generations and periodic reconciliation parse only changed
-  files and report unchanged-file reuse, while startup, branch/config/package,
-  large-batch, and uncertain generations use full refresh;
+- bounded source/doc generations, non-boundary directory or missing-path
+  generations, and periodic reconciliation parse only changed files and report
+  unchanged-file reuse, while startup, branch/config/package, large-batch, and
+  pathless/backend-uncertain generations use full refresh;
 - no refresh mode can project a checker batch from a different snapshot;
 - plain watch never serves checker edges from an older generation;
 - `watch --enrich` publishes checker facts only for the current exact snapshot,

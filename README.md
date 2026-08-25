@@ -599,9 +599,10 @@ repairs missed create/delete/ignore transitions without rebuilding unchanged
 rows. Startup, more than 256 changed source paths, Git/submodule controls,
 source-inventory ignore files,
 package/workspace manifests, lockfiles, tsconfig/jsconfig or declaration
-inputs, selected dependency/checker inputs, directories, backend errors, and
-uncertain missing paths use full refresh. Full scope is sticky within a
-coalesced generation.
+inputs, selected dependency/checker inputs, pathless events, and backend errors
+use full refresh. Non-boundary directory and uncertain missing-path events use
+the same complete-inventory incremental path, because their paths are not the
+correctness inventory. Full scope is sticky within a coalesced generation.
 
 Both refresh modes rerun dependency ownership, module resolution, snapshot
 calculation, vector occurrence rematerialization, and structural projection as
@@ -1172,10 +1173,13 @@ checker phase. Manual `jscout index` always remains a full disposable-snapshot
 rebuild.
 The startup line records the jscout version, executable-byte fingerprint,
 loaded non-secret runtime-config fingerprint, whether a config file was loaded,
-restart-required config semantics, checker-policy fingerprint, and a separate
-non-secret fingerprint of the effective watch invocation after CLI overrides
-alongside the effective watch flags. These identities make logs from different
-binaries or policies comparable without exposing credentials.
+restart-required config semantics, checker-policy fingerprint derived from the
+actual watcher enrichment selection, and a separate non-secret fingerprint of
+the effective watch invocation after CLI overrides alongside the effective
+watch flags. These identities make logs from different binaries or policies
+comparable without exposing credentials. If the running executable cannot be
+read, jscout warns and records `binary_fingerprint=unavailable`; diagnostic
+identity never prevents watch or MCP startup.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

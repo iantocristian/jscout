@@ -113,6 +113,19 @@ impl DirtySignal {
         }
     }
 
+    /// Schedule a complete-inventory incremental refresh when an event cannot
+    /// name one source file. The inventory pass still discovers every added,
+    /// removed, or moved code/document file; a destructive canonical reset is
+    /// unnecessary unless a known boundary explicitly requests one.
+    fn inventory(reason: impl Into<String>) -> Self {
+        Self {
+            scope: RefreshScope::Incremental,
+            reasons: [reason.into()].into(),
+            source_paths: BTreeSet::new(),
+            force_full_enrichment: false,
+        }
+    }
+
     fn checker_drift_flush() -> Self {
         Self {
             scope: RefreshScope::Incremental,
@@ -583,7 +596,10 @@ impl EventClassifier {
                 continue;
             }
             if path.is_dir() {
-                merge_signal(&mut signal, DirtySignal::full("unknown-directory-event"));
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::inventory("inventory:directory-event"),
+                );
                 continue;
             }
             if walk::is_indexable(&path) {
@@ -600,7 +616,10 @@ impl EventClassifier {
             // backend may be reporting a delete, rename, or rescan without
             // enough type information to classify it safely.
             if !path.is_file() {
-                merge_signal(&mut signal, DirtySignal::full("unknown-event"));
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::inventory("inventory:unknown-event"),
+                );
             }
         }
         signal
@@ -757,8 +776,15 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     validate_options(options)?;
     let root = root.canonicalize()?;
     let database = absolute_database_path(&root, options.database);
-    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint()?;
-    let checker_policy_fingerprint = checker::watch_policy_fingerprint();
+    let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint();
+    let checker_policy_fingerprint = checker::watch_policy_fingerprint(&watch_enrich_options(
+        &database,
+        options.checker_sidecar,
+        options.checker_node,
+        options.enrich_timeout,
+        false,
+        Vec::new(),
+    ));
     let watch_policy_fingerprint = effective_watch_policy_fingerprint(options);
     let provider = if options.embed_on_change {
         Some(Arc::new(
@@ -1397,25 +1423,15 @@ fn run_enrichment_interruptible(
         .cloned()
         .collect();
     let worker = thread::spawn(move || {
-        checker::enrich(
-            &root,
-            &checker::EnrichOptions {
-                database: Some(&database),
-                sidecar: sidecar.as_deref(),
-                node: &node,
-                timeout,
-                files: Vec::new(),
-                packages: Vec::new(),
-                members: Vec::new(),
-                roles: Vec::new(),
-                max_occurrences: None,
-                include_all: false,
-                dry_run: false,
-                carry_forward: !force_full,
-                force_full,
-                dirty_files,
-            },
-        )
+        let enrich_options = watch_enrich_options(
+            &database,
+            sidecar.as_deref(),
+            &node,
+            timeout,
+            force_full,
+            dirty_files,
+        );
+        checker::enrich(&root, &enrich_options)
     });
     while !worker.is_finished() {
         monitor.poll();
@@ -1427,6 +1443,32 @@ fn run_enrichment_interruptible(
     worker
         .join()
         .map_err(|_| anyhow::anyhow!("checker enrichment worker panicked"))?
+}
+
+fn watch_enrich_options<'a>(
+    database: &'a Path,
+    sidecar: Option<&'a Path>,
+    node: &'a str,
+    timeout: Duration,
+    force_full: bool,
+    dirty_files: Vec<String>,
+) -> checker::EnrichOptions<'a> {
+    checker::EnrichOptions {
+        database: Some(database),
+        sidecar,
+        node,
+        timeout,
+        files: Vec::new(),
+        packages: Vec::new(),
+        members: Vec::new(),
+        roles: Vec::new(),
+        max_occurrences: None,
+        include_all: false,
+        dry_run: false,
+        carry_forward: !force_full,
+        force_full,
+        dirty_files,
+    }
 }
 
 struct PhaseMonitor<'a> {
