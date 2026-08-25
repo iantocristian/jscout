@@ -9,9 +9,9 @@ use serde_json::json;
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
-    expansion_role_metrics, log_request, render_bounded_items, render_tool_result,
-    search_options_from_args, semantic_artifact_metrics, server_instructions, sum_durations,
-    tool_defs,
+    exhaustive_telemetry_metrics, expansion_role_metrics, log_request, render_bounded_items,
+    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
+    sum_durations, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -750,6 +750,10 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "exhaustive=true",
             "next_cursor",
             "truncated=false",
+            "broad_or_query",
+            "abandon that query",
+            "never page merely because next_cursor exists",
+            "partial abandoned pages",
             "total_chunks",
             "page-local returned",
             "match_lines",
@@ -764,6 +768,10 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "corpus, file_roles, origins, and snapshot",
             "convention",
             "safe",
+            "localize first",
+            "vector=false and rerank=false",
+            "selection predicate",
+            "selected subject's metadata",
             "sequential",
             "snapshot change",
         ] {
@@ -793,6 +801,9 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
         "Inquiry loop",
         "semantic_memory",
         "repository_overview once",
+        "exact returned anchor or file",
+        "simple occurrence and convention questions do not need memory",
+        "broad semantic_memory only for genuinely anchor-free architecture or workflow questions",
         "include_memory=false",
         "expand=false",
         "one separate expand=true",
@@ -2140,6 +2151,38 @@ fn telemetry_counts_semantic_artifact_freshness() {
     );
     assert_eq!(overlay.returned, 2);
     assert_eq!(overlay.fresh, 2);
+}
+
+#[test]
+fn telemetry_records_exhaustive_counts_and_warnings_without_misclassifying_ranked_results() {
+    let warning = json!({
+        "code": "broad_or_query",
+        "terms": ["history", "cache"],
+        "total_chunks": 1496,
+        "message": "refine"
+    });
+    let metrics = exhaustive_telemetry_metrics(Some(&json!({
+        "total_chunks": 1496,
+        "returned": 200,
+        "truncated": true,
+        "warnings": [warning.clone()]
+    })));
+    assert_eq!(metrics.total_chunks, Some(1496));
+    assert_eq!(metrics.returned, Some(200));
+    assert_eq!(metrics.truncated, Some(true));
+    assert_eq!(metrics.warnings, Some(vec![warning]));
+
+    let no_warning = exhaustive_telemetry_metrics(Some(&json!({
+        "total_chunks": 4,
+        "returned": 4,
+        "truncated": false
+    })));
+    assert_eq!(no_warning.warnings, Some(Vec::new()));
+
+    assert_eq!(
+        exhaustive_telemetry_metrics(Some(&json!({ "hits": [] }))),
+        Default::default()
+    );
 }
 
 #[test]

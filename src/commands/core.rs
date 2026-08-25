@@ -145,6 +145,15 @@ pub(super) fn cmd_search(
             exhaustive.effective.page_size,
         );
         println!("scope: {}", serde_json::to_string(&exhaustive.scope)?);
+        for warning in &exhaustive.warnings {
+            println!(
+                "warning {}: {} terms={} total_chunks={}",
+                warning.code,
+                warning.message,
+                warning.terms.join(","),
+                warning.total_chunks
+            );
+        }
         if let Some(cursor) = &exhaustive.next_cursor {
             println!("next cursor: {cursor}");
         }

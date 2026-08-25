@@ -82,6 +82,9 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
             "next_cursor".into(),
             json!(exhaustive.next_cursor.as_deref()),
         );
+        if !exhaustive.warnings.is_empty() {
+            response.insert("warnings".into(), json!(exhaustive.warnings));
+        }
     }
     if search_retrieval_is_actionable(&result.retrieval) {
         response.insert("retrieval".into(), json!(result.retrieval));
