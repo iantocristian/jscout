@@ -1,4 +1,44 @@
-# Agent evaluation
+# Evaluation
+
+## G24 documentation retrieval
+
+The G24 harness freezes a generated Git history, six repository-state
+variants, and exact path-plus-heading qrels before documentation freshness is
+implemented. The corpus is declared in
+[`fixtures/docs-retrieval/manifest.json`](fixtures/docs-retrieval/manifest.json),
+and the treatment and default-selection rules are pre-registered in
+[`prereg/g24-documentation-freshness-2026-08-25.md`](prereg/g24-documentation-freshness-2026-08-25.md).
+
+Build the release binary and run the provider-free lexical/fallback check:
+
+```bash
+cargo build --release
+node scripts/eval-docs-retrieval.mjs \
+  --binary target/release/jscout \
+  --profiles lexical,fallback \
+  --output /tmp/g24-docs-retrieval-lexical.json
+```
+
+For the complete Phase 2 baseline, start the pinned local inference service in
+another terminal with `npm run inference`, then run:
+
+```bash
+node scripts/eval-docs-retrieval.mjs \
+  --binary target/release/jscout \
+  --run-kind phase2-baseline \
+  --profiles lexical,fallback,hybrid,hybrid-rerank \
+  --provider-config eval/protocols/g24-docs-retrieval-provider.toml \
+  --output /tmp/g24-docs-retrieval-phase2.json
+```
+
+The runner invalidates an arm instead of scoring it as a miss when a required
+provider stage is degraded or inactive, a response is truncated, source
+resolution is stale, snapshots differ, or an identical repetition changes
+rank order. The recorded baseline is available as a
+[human report](results/g24-docs-retrieval-phase2-2026-08-25.md) and
+[machine result](results/g24-docs-retrieval-phase2-2026-08-25.json).
+
+## Agent behavior
 
 This harness compares agent behavior with the same prompts, model, limits, and
 repository snapshot under controlled retrieval profiles:

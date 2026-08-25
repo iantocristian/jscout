@@ -3213,10 +3213,11 @@ links-iteration investigation following the skill reaches the
 missed gold chunks, false completeness claims, calls, bytes, and telemetry's
 exact-anchor definition success rate.
 
-## Proposed G24 — repository documentation retrieval
+## G24 — repository documentation retrieval (phase 3 pending)
 
-Repository Markdown and MDX are authored source material that agents currently cannot
-retrieve through jscout. It is the wrong shape for the code structural and
+Repository Markdown and MDX are authored source material. G24 makes them
+retrievable through jscout without treating them as code structural evidence.
+They are the wrong shape for the code structural and
 ranking corpus — a JavaScript parser cannot manufacture documentation chunks,
 and prose must not become structural evidence — while still sharing the same
 publication snapshot. It is also the wrong shape for semantic memory, whose
@@ -3331,7 +3332,8 @@ The revised decisions:
    evaluation arm.
 5. Freshness: order-based and bounded, not a score multiplier. After
    relevance fusion and optional reranking, each candidate's final rank differs
-   from its base rank by at most `max_rank_movement` (default 2), and swaps
+   from its base rank by at most `max_rank_movement` (candidate value 2;
+   evaluation hypothesis), and swaps
    occur only between candidates with comparable provenance: git orders
    against git by latest author time with working-tree lines newest, observed
    orders post-baseline `added` and `body_changed` events by snapshot sequence,
@@ -3354,19 +3356,20 @@ The revised decisions:
    retired hashes, transition metadata, and content-addressed vectors may
    remain. Version one adds no retention controls.
 
-Delivery: phase 1 admits Markdown and MDX at the named-sections tier through the
-shared index pass — the `files.corpus` and `files.format` classifications,
-`docs_fts`, `doc_chunk_meta`, the MCP
-documentation-search surface and `docs search --lexical-only`, with the
-central corpus views and the FTS/vector write-point routings in the same change,
-rebuild timing instrumented, and nothing temporal (hits may display git
-timestamps as inert metadata); phase 2 adds docs vectors from the shared
-`[embedding]` profile into the docs vector tables; phase 3 adds git-basis
-freshness and the bounded reorder only after the retrieval evaluation corpus
-exists and reports; phase 4 adds documentation-aware watch classification.
-The observation ledger is unscheduled and ships only with the supersession
-product. No implementation milestone is assigned and no current goal is
-displaced.
+Delivery status: phases 1, 2, and 4 are implemented. Phase 1 admits Markdown
+and MDX at the named-sections tier through the shared index pass, with the
+`files.corpus` and `files.format` classifications, `docs_fts`,
+`doc_chunk_meta`, the MCP documentation-search surface, and lexical docs
+search. Phase 2 adds docs vectors from the shared `[embedding]` profile. Phase
+4 adds documentation-aware watch classification through the shared
+incremental watcher. The fixed
+[retrieval corpus](eval/fixtures/docs-retrieval/manifest.json),
+[pre-registration](eval/prereg/g24-documentation-freshness-2026-08-25.md), and
+Phase 2 [human](eval/results/g24-docs-retrieval-phase2-2026-08-25.md) and
+[machine](eval/results/g24-docs-retrieval-phase2-2026-08-25.json) reports
+satisfy Phase 3's entry prerequisite. Phase 3 — Git-basis provenance and the
+bounded freshness reorder — remains unimplemented. The observation ledger is
+unscheduled and belongs only to the supersession product.
 
 Phase 1/2 acceptance: code-search ranking, content, and statistics are
 byte-identical after docs admission modulo the necessarily changed shared

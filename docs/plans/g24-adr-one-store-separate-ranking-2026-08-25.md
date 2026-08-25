@@ -1,7 +1,7 @@
 # Documentation in the main index: one store, separate ranking
 
 - Date: 2026-08-25
-- Status: accepted decision record; revises the storage half of Proposed G24 and introduces Proposed G25. Subordinate to PLAN.md — the G24/G25 entries win on any disagreement.
+- Status: accepted decision record; revises the storage half of G24 and introduces Proposed G25. Subordinate to PLAN.md — the G24/G25 entries win on any disagreement.
 - One line: docs live in the main index and lifecycle, but rank in their own corpus with their own surface — code search is untouched by construction, not by discipline.
 
 ## The question
