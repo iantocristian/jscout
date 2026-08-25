@@ -202,6 +202,13 @@ impl GitRepository {
 
     fn try_prepare_document(&self, path: &str, bytes: &[u8]) -> Result<Option<BlameRequest>> {
         validate_repository_relative_path(path)?;
+        if !path_exists_in_index(&self.root, path)
+            .with_context(|| format!("check current index membership for {path}"))?
+        {
+            // `git rm --cached` leaves a physical file that is untracked even
+            // though the recorded HEAD still contains a blob at the path.
+            return Ok(None);
+        }
         if !path_exists_at_head(&self.root, &self.head, path)
             .with_context(|| format!("check path membership at recorded HEAD for {path}"))?
         {
@@ -462,6 +469,36 @@ fn path_exists_at_head(root: &Path, head: &str, path: &str) -> Result<bool> {
     Ok(fields[1] == b"blob")
 }
 
+fn path_exists_in_index(root: &Path, path: &str) -> Result<bool> {
+    let args = vec![
+        OsString::from("--no-replace-objects"),
+        OsString::from("ls-files"),
+        OsString::from("--stage"),
+        OsString::from("-z"),
+        OsString::from("--"),
+        OsString::from(path),
+    ];
+    let output = run_git(root, &args, None)?;
+    let expected = path.as_bytes();
+    for record in output.split(|byte| *byte == b'\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let metadata_end = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| anyhow!("Git returned an invalid ls-files record"))?;
+        let fields = record[..metadata_end]
+            .split(|byte| *byte == b' ')
+            .collect::<Vec<_>>();
+        ensure!(fields.len() == 3, "Git returned invalid ls-files metadata");
+        if &record[metadata_end + 1..] == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn read_shallow_state(root: &Path) -> Result<ShallowState> {
     let args = [
         OsString::from("--no-replace-objects"),
@@ -470,7 +507,7 @@ fn read_shallow_state(root: &Path) -> Result<ShallowState> {
         OsString::from("shallow"),
     ];
     let output = run_git(root, &args, None)?;
-    let raw_path = one_output_line(&output, "resolved shallow path")?;
+    let raw_path = one_output_path(&output, "resolved shallow path")?;
     let path = output_path(raw_path)?;
     let path = if path.is_absolute() {
         path
@@ -688,6 +725,13 @@ fn one_output_line<'a>(output: &'a [u8], label: &str) -> Result<&'a [u8]> {
         !output.contains(&b'\n') && !output.contains(&b'\r'),
         "Git returned multiple lines for {label}"
     );
+    Ok(output)
+}
+
+fn one_output_path<'a>(output: &'a [u8], label: &str) -> Result<&'a [u8]> {
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    let output = output.strip_suffix(b"\r").unwrap_or(output);
+    ensure!(!output.is_empty(), "Git returned an empty {label}");
     Ok(output)
 }
 
@@ -912,6 +956,18 @@ mod tests {
     }
 
     #[test]
+    fn resolved_git_path_preserves_embedded_line_bytes() -> Result<()> {
+        assert_eq!(
+            one_output_path(
+                b"/tmp/repository\nwith\rcontrols/.git/shallow\n",
+                "resolved shallow path"
+            )?,
+            b"/tmp/repository\nwith\rcontrols/.git/shallow"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn only_literal_shallow_oids_lose_git_age() -> Result<()> {
         let shallow_oid = "1111111111111111111111111111111111111111";
         let root_oid = "2222222222222222222222222222222222222222";
@@ -1101,6 +1157,28 @@ mod tests {
         ));
         assert!(matches!(
             git.prepare_document("staged.md", b"staged\n"),
+            DocumentPreparation::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn path_removed_from_the_index_is_untracked_despite_the_head_blob() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        let bytes = b"tracked documentation\n";
+        repository.write("README.md", bytes)?;
+        repository.commit(
+            "documentation",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+        repository.git(&["rm", "--cached", "--quiet", "README.md"])?;
+
+        let git = captured_git(&repository)?;
+        assert!(matches!(
+            git.prepare_document("README.md", bytes),
             DocumentPreparation::Unknown
         ));
         Ok(())
@@ -1349,6 +1427,59 @@ mod tests {
                 assert!(diagnostic.detail.contains("not inside a Git worktree"));
             }
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_under_a_control_character_path_keeps_git_provenance() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        let bytes = b"tracked documentation\n";
+        repository.write("README.md", bytes)?;
+        repository.commit(
+            "documentation",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+
+        let worktrees = tempfile::tempdir()?;
+        let common = worktrees.path().join("common\nwith\rcontrols");
+        let linked = worktrees.path().join("linked");
+        let clone = Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(repository.path())
+            .arg(&common)
+            .output()?;
+        if !clone.status.success() {
+            bail!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&clone.stderr)
+            );
+        }
+        let add = Command::new("git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .arg("HEAD")
+            .current_dir(&common)
+            .output()?;
+        if !add.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&add.stderr)
+            );
+        }
+
+        let git = match RepositoryCapture::capture(&linked) {
+            RepositoryCapture::Git(git) => git,
+            RepositoryCapture::Unknown(diagnostic) => {
+                bail!("expected Git provenance: {}", diagnostic.detail)
+            }
+        };
+        let request = tracked_request(&git, "README.md", bytes)?;
+        let mapping = attributed(&git, &request, bytes)?;
+        assert!(matches!(mapping.lines[0], LineProvenance::Git { .. }));
         Ok(())
     }
 

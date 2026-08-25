@@ -3367,6 +3367,9 @@ The revised decisions:
    file count as shallow boundaries and contribute no timestamp; provenance
    uses captured indexed bytes with
    `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
+   attribution requires both a blob at that recorded HEAD path and an exact
+   current-index entry, so staged additions and `git rm --cached` files remain
+   unknown;
    blame mappings cache by an opaque hash of Git's worktree-relative prefix for
    the indexed root, indexed-root-relative path, exact file-byte hash, path-tip
    commit, and shallow boundary fingerprint; nested roots sharing one database

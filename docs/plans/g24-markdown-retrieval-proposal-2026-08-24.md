@@ -549,8 +549,11 @@ retrieval chunks. Rules:
 - modified lines in an already tracked file are labelled `working_tree`
   whether staged or unstaged and order newer than committed lines, without
   inventing a commit;
-- newly added staged files and untracked files have no Git authorship time and
-  carry observed or unknown provenance;
+- Git attribution requires both a blob at the recorded `HEAD` path and an
+  exact current-index entry for that path; a directory entry or indexed
+  descendant is not a file match. Newly added staged files, files removed with
+  `git rm --cached`, and other untracked files therefore have no Git authorship
+  time and carry observed or unknown provenance;
 - filesystem modification time is never a fallback;
 - Git absence or a per-file blame failure emits a diagnostic and degrades
   that file to observed/unknown provenance without failing the scan.
