@@ -11,6 +11,7 @@ mod commands;
 mod compact;
 mod config;
 mod dependency;
+mod docs;
 mod embed;
 mod entity;
 mod file_role;

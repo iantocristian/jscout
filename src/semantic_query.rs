@@ -819,14 +819,16 @@ fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<Su
         let origins_json = serde_json::to_string(&options.file_origins)?;
         let indexed = conn
             .query_row(
-                "SELECT 1 FROM files
+                "SELECT 1 FROM code_files
                  WHERE path=?1 AND origin IN (SELECT value FROM json_each(?2))",
                 rusqlite::params![file, origins_json],
                 |_| Ok(()),
             )
             .optional()?;
         if indexed.is_none() {
-            bail!("semantic evidence file `{file}` is not indexed in the requested origins");
+            bail!(
+                "semantic evidence file `{file}` is not indexed in the code corpus for the requested origins"
+            );
         }
     }
     let reconnaissance_subject = options.reconnaissance_subject.clone();
@@ -834,7 +836,7 @@ fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<Su
         let origins_json = serde_json::to_string(&options.file_origins)?;
         let allowed = conn
             .prepare(
-                "SELECT path FROM files
+                "SELECT path FROM code_files
                  WHERE origin IN (SELECT value FROM json_each(?1))",
             )?
             .query_map([origins_json], |row| row.get::<_, String>(0))?

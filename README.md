@@ -88,6 +88,10 @@ jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only witho
                                #   add --expand for a bounded structural context pack
                                #   --no-vector, --no-rerank, or --lexical-only control stages
                                #   --json is compact; --debug-json retains diagnostics
+jscout docs search <root> Q    # Markdown/MDX BM25 plus ready shared-profile vectors
+                               #   --lexical-only needs no embedding provider
+jscout docs embed <root>       # embed missing Markdown/MDX representations
+jscout docs status <root>      # corpus decisions and vector readiness
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
 jscout neighborhood <root> A   # bounded structural traversal around an anchor
                                #   compact JSON by default; --debug-json for diagnostics
@@ -152,6 +156,64 @@ jscout chunks <root>           # dump AST-aware chunks as JSONL
 jscout agent-guide             # print agent integration guidance
 jscout agent-guide --install R # install a project-local jscout skill
 ```
+
+### Markdown and MDX documentation retrieval
+
+Repository Markdown and MDX are admitted by the normal `jscout index` pass
+into the shared snapshot and database. They rank in an isolated BM25/vector
+corpus, so documentation never changes code-search term statistics or vector
+candidates. MDX deliberately uses the same inert Markdown block parser: raw
+JSX, props, expressions, and inner text remain searchable documentation and
+never enter code graphs. Two narrow exclusions keep retrieval units useful: a
+contiguous leading import/export-only preamble emits no chunk, and exact JSX
+comments (`{/* ... */}`) are removed outside Markdown code ranges just as HTML
+comments are.
+The disposable `files` inventory records ranking membership in `corpus`
+(`code` or `docs`) separately from parser identity in `format`; Markdown uses
+`corpus='docs'` and `format='markdown'`, while MDX uses `corpus='docs'` and
+`format='mdx'`. Chunk `kind` describes structure inside that file.
+Documentation metadata is stored separately and is not used to infer corpus
+membership.
+
+Documentation admission is enabled by default and can be disabled
+independently of vector search:
+
+```toml
+[docs]
+enabled = false
+
+[docs.search]
+vector = true
+```
+
+With `enabled = false`, the shared index admits no documentation rows,
+`docs status` reports the feature as disabled, and the CLI/MCP documentation
+retrieval surfaces are unavailable. The `docs.search.vector` setting controls
+only vector participation during documentation search; it does not enable
+corpus admission or generate vectors.
+
+```bash
+jscout index /path/to/repo
+jscout docs search /path/to/repo "current deployment procedure" --lexical-only
+
+# Optional: reuse the existing [embedding] provider and model.
+jscout docs embed /path/to/repo
+jscout docs search /path/to/repo "current deployment procedure"
+```
+
+Vector search joins BM25 only when the current shared snapshot has a complete
+documentation vector generation for the configured embedding profile. Ordinary
+search falls back to BM25 when vectors are absent; `--vector` requires vector
+participation and fails instead. Index rebuilds rematerialize complete cached
+documentation generations without provider calls; only new documentation
+identities require `jscout docs embed`. Ordinary `jscout embed` and watched
+code embedding never request documentation vectors. Hits retain title,
+description, tags, heading context, exact source spans, and the indexed file
+hash. The MCP `documentation_search` tool exposes the same isolated ranking
+corpus.
+Membership defaults to exact lowercase `**/*.md` and `**/*.mdx` and is
+configured with `[docs]`. Temporal ranking is deferred; this release ranks by
+relevance only.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:
@@ -862,7 +924,8 @@ database path, so `database.path = ".jscout/jscout.db"` needs no preparatory
 `mkdir`. Read-only search and MCP startup remain non-mutating: they require an
 already published database and never create a missing path.
 
-The file configures the database; retrieval defaults and budgets; embedding,
+The file configures the shared database; documentation membership; retrieval
+defaults and budgets; embedding,
 reranker, and local-inference models; LLM/provider metadata and scouting
 concurrency; Node/gateway and
 checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
@@ -1353,8 +1416,8 @@ inputs; keep it with restricted raw eval artifacts, not in the repository.
 
 ## Storage
 
-Everything lives in one SQLite file, `.jscout.db`, in the repo root (add it to
-`.gitignore`): chunks + FTS5 (BM25), symbols, import/export tables, classified
+Everything lives in one SQLite file, `.jscout.db`: code and Markdown chunks,
+separate code/docs FTS5 corpora, symbols, import/export tables, classified
 references, event/member-call sites, provenance-keyed embedding caches,
 dimension-specific sqlite-vec indexes, and a disposable
 `graph_nodes`/`resolved_edges` traversal projection. The projection is rebuilt
@@ -1366,6 +1429,10 @@ file rows and are refreshed even when source hashes are unchanged. Files also
 carry `repository`, `workspace`, or `dependency` origin plus optional package
 instance/path identity. Package instances record canonical root, name, version,
 locator, manifest hash, and completeness status.
+
+Repository Markdown uses the shared `files`/`chunks` snapshot and durable
+content-addressed embedding cache. `docs_fts` and dimension-specific docs vector
+tables keep its ranking statistics and candidates isolated from code search.
 
 Agent-authored and generated `workflow`, `card`, `summary`, `concept`, and
 `annotation` records live in separate `semantic_artifacts`/

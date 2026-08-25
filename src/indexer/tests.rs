@@ -6,11 +6,609 @@ use anyhow::Result;
 
 use super::{
     IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_fs,
-    index_repo_with_options, index_repo_with_options_and_fs, index_repo_without_extraction_reset,
+    index_repo_with_options, index_repo_with_options_and_fs,
+    index_repo_with_post_replacement_failure, index_repo_without_extraction_reset,
     refresh_repo_with_options,
 };
 use crate::test_fs::{FaultFileSystem, FileOperation};
-use crate::{embed, origin, query, search, semantic, store, structural};
+use crate::{docs, embed, origin, query, search, semantic, store, structural};
+
+type MarkdownChunkRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    String,
+);
+
+#[test]
+fn shared_index_routes_markdown_without_polluting_code_search_or_graphs() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "import './README.md';\nexport const codeOnlyMarker = 1;\n",
+    )?;
+    let markdown = b"\xEF\xBB\xBF---\r\ntitle: Unified Guide\r\ndescription: shared database\r\ntags: [alpha, beta]\r\n---\r\n# Start\r\n\r\nUse docsMarker now.\r\n";
+    fs::write(repo.path().join("README.md"), markdown)?;
+    let conn = store::open(repo.path())?;
+
+    let outcome = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((outcome.indexed, outcome.rejected), (2, 0));
+    let identities = conn
+        .prepare("SELECT path, role, corpus, format FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(identities.contains(&(
+        "README.md".to_owned(),
+        "documentation".to_owned(),
+        "docs".to_owned(),
+        "markdown".to_owned(),
+    )));
+    assert!(identities.contains(&(
+        "main.ts".to_owned(),
+        "production".to_owned(),
+        "code".to_owned(),
+        "typescript".to_owned(),
+    )));
+
+    let (
+        chunk_id,
+        kind,
+        name,
+        symbols,
+        start,
+        end,
+        content,
+        title,
+        breadcrumb,
+        nearest_heading,
+        ordinal,
+        embedding_identity,
+        front_matter_state,
+    ): MarkdownChunkRow = conn.query_row(
+        "SELECT chunk.id, chunk.kind, chunk.name, chunk.symbols,
+                chunk.start, chunk.end, chunk.content,
+                metadata.title, metadata.breadcrumb, metadata.nearest_heading,
+                metadata.ordinal, metadata.embedding_identity,
+                metadata.front_matter_state
+         FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+         WHERE file.path='README.md'",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        },
+    )?;
+    assert_eq!(kind, "markdown_section");
+    assert_eq!(name, None);
+    assert_eq!(symbols, "");
+    let start = usize::try_from(start)?;
+    let end = usize::try_from(end)?;
+    assert_eq!(content.as_bytes(), &markdown[start..end]);
+    assert_eq!(title, "Unified Guide");
+    assert_eq!(breadcrumb, "Start");
+    assert_eq!(nearest_heading.as_deref(), Some("Start"));
+    assert_eq!(ordinal, 0);
+    assert!(embedding_identity.is_some());
+    assert_eq!(front_matter_state, "valid");
+
+    let fts: (String, String, String, String, String) = conn.query_row(
+        "SELECT title, metadata, breadcrumb, body, path
+         FROM docs_fts WHERE rowid=?1",
+        [chunk_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        fts,
+        (
+            "Unified Guide".to_owned(),
+            "shared database alpha beta".to_owned(),
+            "Start".to_owned(),
+            "Use docsMarker now.".to_owned(),
+            "README.md".to_owned(),
+        )
+    );
+    let docs_match: i64 = conn.query_row(
+        "SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'docsMarker'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(docs_match, 1);
+    let code_pollution: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks_fts
+         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
+         WHERE EXISTS (
+           SELECT 1 FROM doc_chunk_meta doc WHERE doc.chunk_id=chunk.id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(code_pollution, 0);
+    for table in ["symbols", "imports", "exports", "refs", "events"] {
+        let query = format!(
+            "SELECT count(*) FROM {table} item
+             JOIN files file ON file.id=item.file_id
+             WHERE file.path='README.md'"
+        );
+        let rows: i64 = conn.query_row(&query, [], |row| row.get(0))?;
+        assert_eq!(rows, 0, "documentation leaked into {table}");
+    }
+    let documentation_file_id: i64 =
+        conn.query_row("SELECT id FROM files WHERE path='README.md'", [], |row| {
+            row.get(0)
+        })?;
+    let code_file_id: i64 =
+        conn.query_row("SELECT id FROM files WHERE path='main.ts'", [], |row| {
+            row.get(0)
+        })?;
+    let module_graph = query::ModuleGraph::load(&conn)?;
+    assert!(module_graph.paths.contains_key(&code_file_id));
+    assert!(
+        !module_graph.paths.contains_key(&documentation_file_id),
+        "documentation must not enter the code module-graph inventory"
+    );
+    let module_edges: i64 = conn.query_row(
+        "SELECT count(*) FROM module_edges
+         WHERE from_file=?1 OR to_file=?1",
+        [documentation_file_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        module_edges, 0,
+        "Markdown must not be a module-resolution importer or target"
+    );
+    let structural_nodes: i64 = conn.query_row(
+        "SELECT count(*) FROM graph_nodes WHERE file_id=?1",
+        [documentation_file_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        structural_nodes, 0,
+        "Markdown must not enter the structural graph"
+    );
+    let structural_edges: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM resolved_edges edge
+         JOIN graph_nodes node
+           ON node.node_key=edge.src_key OR node.node_key=edge.dst_key
+         WHERE node.file_id=?1",
+        [documentation_file_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        structural_edges, 0,
+        "Markdown must not contribute structural edges"
+    );
+    let indexed_decision: i64 = conn.query_row(
+        "SELECT count(*) FROM doc_inventory
+         WHERE path='README.md' AND subject='file' AND rule='indexed'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(indexed_decision, 1);
+    Ok(())
+}
+
+#[test]
+fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const codeOnlyNeedle = 1;\n",
+    )?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        concat!(
+            "import PreambleOnlyNeedle from './preamble-only'\n",
+            "export const preambleMetadataNeedle = { title: 'Guide' }\n\n",
+            "# Component guide {/* headingCommentNeedle */}\n\n",
+            "<Widget mode=\"safe\">ActualInnerNeedle</Widget>\n\n",
+            "<Badge label=\"Deprecated\" since={version} />\n\n",
+            "Visible before {/* jsxCommentNeedle */} visible after.\n\n",
+            "`{/* protectedCommentNeedle */}`\n\n",
+            "export const mdxOnlyNeedle = 'documentation text';\n",
+        ),
+    )?;
+    let conn = store::open(repo.path())?;
+
+    let outcome = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((outcome.indexed, outcome.rejected), (2, 0));
+    let identity: (String, String, String) = conn.query_row(
+        "SELECT corpus, format, role FROM files WHERE path='guide.mdx'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        identity,
+        ("docs".into(), "mdx".into(), "documentation".into())
+    );
+    let inert_chunk: (String, Option<String>, String) = conn.query_row(
+        "SELECT chunk.kind, chunk.name, chunk.symbols
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.mdx' AND chunk.content LIKE '%mdxOnlyNeedle%'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        inert_chunk,
+        ("markdown_section".into(), None, String::new())
+    );
+
+    let raw_comment_rows: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.mdx' AND chunk.content LIKE '%jsxCommentNeedle%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(raw_comment_rows, 1, "raw source slice lost the JSX comment");
+    let retrieval_chunks: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.mdx'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retrieval_chunks, 1, "ESM preamble became a retrieval unit");
+    for (query, expected) in [
+        ("PreambleOnlyNeedle", 0_i64),
+        ("preambleMetadataNeedle", 0),
+        ("headingCommentNeedle", 0),
+        ("jsxCommentNeedle", 0),
+        ("ActualInnerNeedle", 1),
+        ("Badge", 1),
+        ("label", 1),
+        ("Deprecated", 1),
+        ("version", 1),
+        ("protectedCommentNeedle", 1),
+        ("\"Badge label Deprecated\"", 1),
+    ] {
+        let rows: i64 = conn.query_row(
+            "SELECT count(*) FROM docs_fts WHERE docs_fts MATCH ?1",
+            [query],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, expected, "docs FTS query {query}");
+    }
+
+    let snapshot = structural::current_snapshot(&conn)?;
+    let docs_hits = docs::store::lexical_search(&conn, &snapshot, "mdxOnlyNeedle", 10)?;
+    assert_eq!(docs_hits.len(), 1);
+    assert_eq!(docs_hits[0].path, "guide.mdx");
+    assert!(
+        search::search(
+            &conn,
+            None,
+            "mdxOnlyNeedle",
+            &search::SearchOptions::default(),
+        )?
+        .hits
+        .is_empty(),
+        "MDX prose entered ordinary code search"
+    );
+    let code_fts_rows: i64 = conn.query_row(
+        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'mdxOnlyNeedle'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(code_fts_rows, 0);
+    let graph_rows: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM graph_nodes node JOIN files file ON file.id=node.file_id
+         WHERE file.path='guide.mdx'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(graph_rows, 0);
+    for table in ["symbols", "imports", "exports", "refs", "events"] {
+        let query = format!(
+            "SELECT count(*) FROM {table} item
+             JOIN files file ON file.id=item.file_id
+             WHERE file.path='guide.mdx'"
+        );
+        let rows: i64 = conn.query_row(&query, [], |row| row.get(0))?;
+        assert_eq!(rows, 0, "MDX leaked into {table}");
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_embedding_never_requests_mdx_documents() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        "# Guide\n\nProviderCallSentinel appears only in MDX.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let provider = embed::Provider::from_settings(
+        &crate::config::EmbeddingSettings {
+            provider: Some("openai".into()),
+            model: Some("unreachable-test-model".into()),
+            revision: None,
+            url: Some("http://127.0.0.1:1/v1/embeddings".into()),
+            api_key_env: None,
+            query_prefix: None,
+            batch: 8,
+            origins: origin::defaults(),
+        },
+        &crate::config::InferenceSettings {
+            url: "http://127.0.0.1:1/".into(),
+            host: "127.0.0.1".into(),
+            port: 1,
+            project: None,
+            uv: "uv".into(),
+            allow_remote: false,
+            batch_size: 8,
+            max_length: 4_096,
+            model_cache_root: None,
+        },
+    )?
+    .expect("configured provider");
+
+    // The endpoint is deliberately unreachable. Any accidental MDX
+    // selection would turn this into a provider-call failure.
+    let report = embed::embed_missing_for_selection_report(
+        &conn,
+        &provider,
+        8,
+        &origin::defaults(),
+        false,
+        false,
+    )?;
+
+    assert_eq!(
+        (report.missing, report.embedded, report.occurrences_synced),
+        (0, 0, 0)
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_documentation_policy_removes_the_prior_docs_corpus() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const retained = 1;\n")?;
+    fs::write(repo.path().join("guide.md"), "# Markdown\n\nRemove me.\n")?;
+    fs::write(repo.path().join("guide.mdx"), "# MDX\n\nRemove me too.\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let initial_docs: i64 = conn.query_row(
+        "SELECT count(*) FROM files WHERE corpus='docs'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(initial_docs, 2);
+
+    let disabled = index_repo_with_options(
+        repo.path(),
+        &conn,
+        &IndexOptions {
+            docs_include: Vec::new(),
+            docs_exclude: Vec::new(),
+            ..Default::default()
+        },
+    )?;
+
+    assert_eq!(
+        (disabled.indexed, disabled.unchanged, disabled.removed),
+        (0, 1, 2)
+    );
+    let docs_state: (i64, i64, i64, i64) = conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM files WHERE corpus='docs'),
+           (SELECT count(*) FROM doc_chunk_meta),
+           (SELECT count(*) FROM docs_fts),
+           (SELECT count(*) FROM doc_inventory)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(docs_state, (0, 0, 0, 0));
+    let retained_code: i64 = conn.query_row(
+        "SELECT count(*) FROM files WHERE path='main.ts' AND corpus='code'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retained_code, 1);
+    Ok(())
+}
+
+#[test]
+fn incremental_index_repairs_explicit_corpus_and_format_mismatches() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const value = 1;\n")?;
+    fs::write(repo.path().join("README.md"), "# Guide\n\nCurrent docs.\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    conn.execute(
+        "UPDATE files SET corpus='docs', format='javascript' WHERE path='main.ts'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE files SET format='plain_text' WHERE path='README.md'",
+        [],
+    )?;
+
+    let repaired = index_repo(repo.path(), &conn)?;
+    assert_eq!((repaired.indexed, repaired.unchanged), (2, 0));
+    let identities = conn
+        .prepare("SELECT path, corpus, format FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        identities,
+        [
+            ("README.md".into(), "docs".into(), "markdown".into()),
+            ("main.ts".into(), "code".into(), "typescript".into()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_index_repairs_same_hash_mdx_format_mismatches() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        "# Guide\n\nStable MDX body.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let original_hash: String =
+        conn.query_row("SELECT hash FROM files WHERE path='guide.mdx'", [], |row| {
+            row.get(0)
+        })?;
+    conn.execute(
+        "UPDATE files SET format='markdown' WHERE path='guide.mdx'",
+        [],
+    )?;
+
+    let repaired = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((repaired.indexed, repaired.unchanged), (1, 0));
+    let repaired_identity: (String, String, String) = conn.query_row(
+        "SELECT hash, corpus, format FROM files WHERE path='guide.mdx'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        repaired_identity,
+        (original_hash, "docs".into(), "mdx".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn markdown_sidecar_persists_same_heading_ordinals_not_global_chunk_order() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("ordinals.md"),
+        "# Repeated\n\nFirst.\n\n---\n\nSecond.\n\n# Repeated\n\nThird.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    let ordinals = conn
+        .prepare(
+            "SELECT metadata.ordinal
+             FROM doc_chunk_meta metadata
+             JOIN chunks chunk ON chunk.id=metadata.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             WHERE file.path='ordinals.md'
+             ORDER BY chunk.start, chunk.end, chunk.id",
+        )?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(ordinals, [0, 1, 0]);
+    Ok(())
+}
+
+#[test]
+fn markdown_membership_and_replacement_share_the_normal_index_lifecycle() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let admitted = repo.path().join("guide.md");
+    fs::write(&admitted, "# Guide\n\nFirst body.\n")?;
+    fs::write(repo.path().join("draft.md"), "# Draft\n\nDo not index.\n")?;
+    let conn = store::open(repo.path())?;
+    let options = IndexOptions {
+        docs_exclude: vec!["draft.md".to_owned()],
+        ..IndexOptions::default()
+    };
+
+    let first = index_repo_with_options(repo.path(), &conn, &options)?;
+    assert_eq!((first.indexed, first.unchanged, first.removed), (1, 0, 0));
+    let excluded: i64 = conn.query_row(
+        "SELECT count(*) FROM doc_inventory
+         WHERE path='draft.md' AND rule='excluded'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(excluded, 1);
+    let absent: i64 = conn.query_row(
+        "SELECT count(*) FROM files WHERE path='draft.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(absent, 0);
+
+    let second = index_repo_with_options(repo.path(), &conn, &options)?;
+    assert_eq!((second.indexed, second.unchanged), (0, 1));
+    fs::write(&admitted, "# Guide\n\nReplacement body.\n")?;
+    let replaced = index_repo_with_options(repo.path(), &conn, &options)?;
+    assert_eq!(
+        (replaced.indexed, replaced.unchanged, replaced.removed),
+        (1, 0, 0)
+    );
+    let replacement: String = conn.query_row(
+        "SELECT docs_fts.body FROM docs_fts
+         JOIN chunks chunk ON chunk.id=docs_fts.rowid
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(replacement, "Replacement body.");
+
+    fs::remove_file(admitted)?;
+    let removed = index_repo_with_options(repo.path(), &conn, &options)?;
+    assert_eq!(
+        (removed.indexed, removed.unchanged, removed.removed),
+        (0, 0, 1)
+    );
+    let doc_rows: i64 =
+        conn.query_row("SELECT count(*) FROM doc_chunk_meta", [], |row| row.get(0))?;
+    let docs_fts_rows: i64 =
+        conn.query_row("SELECT count(*) FROM docs_fts", [], |row| row.get(0))?;
+    assert_eq!((doc_rows, docs_fts_rows), (0, 0));
+    Ok(())
+}
 
 #[test]
 fn reports_the_file_and_stage_for_rejected_reads() -> Result<()> {
@@ -87,6 +685,125 @@ fn retryable_source_read_preserves_the_published_snapshot() -> Result<()> {
         blake3::hash(before.as_bytes()).to_hex().to_string()
     );
     assert_eq!(structural::current_snapshot(&conn)?, old_snapshot);
+    Ok(())
+}
+
+#[test]
+fn failure_after_canonical_replacement_restores_the_last_good_publication() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = repo.path().join("main.ts");
+    let guide = repo.path().join("guide.md");
+    let code_before = "export const beforeCode = 1;\n";
+    let docs_before = "# Guide\n\nBefore documentation.\n";
+    fs::write(&source, code_before)?;
+    fs::write(&guide, docs_before)?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    let old_snapshot = structural::current_snapshot(&conn)?;
+    let old_rows = conn
+        .prepare("SELECT path, hash FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let old_doc_body: String = conn.query_row("SELECT body FROM docs_fts", [], |row| row.get(0))?;
+
+    fs::write(&source, "export const afterCode = 2;\n")?;
+    fs::write(&guide, "# Guide\n\nAfter documentation.\n")?;
+    let error = index_repo_with_post_replacement_failure(repo.path(), &conn)
+        .err()
+        .expect("the post-replacement failure seam must abort publication");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected failure after canonical replacement")
+    );
+    assert!(
+        conn.is_autocommit(),
+        "failed refresh left a transaction open"
+    );
+    assert_eq!(structural::current_snapshot(&conn)?, old_snapshot);
+    let retained_rows = conn
+        .prepare("SELECT path, hash FROM files ORDER BY path")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(retained_rows, old_rows);
+    let retained_code: String = conn.query_row(
+        "SELECT chunk.content
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='main.ts' AND chunk.kind='module'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(retained_code.contains("beforeCode"));
+    assert!(!retained_code.contains("afterCode"));
+    let retained_doc_body: String =
+        conn.query_row("SELECT body FROM docs_fts", [], |row| row.get(0))?;
+    assert_eq!(retained_doc_body, old_doc_body);
+    assert_eq!(retained_doc_body, "Before documentation.");
+    Ok(())
+}
+
+#[test]
+fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const unchangedCode = 1;\n",
+    )?;
+    fs::write(repo.path().join("guide.md"), "# Guide\n\nCurrent body.\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    let code_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='main.ts' AND chunk.kind='module'",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "UPDATE doc_chunk_meta SET nearest_heading='stale-format-marker'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE meta SET value='documentation-v0'
+         WHERE key='documentation_chunk_format_version'",
+        [],
+    )?;
+    let old_format_snapshot = structural::compute_snapshot(&conn)?;
+    conn.execute(
+        "UPDATE meta SET value=?1 WHERE key='snapshot'",
+        [&old_format_snapshot],
+    )?;
+
+    let outcome = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((outcome.indexed, outcome.unchanged), (1, 1));
+    let retained_code_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='main.ts' AND chunk.kind='module'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retained_code_chunk_id, code_chunk_id);
+    let nearest_heading: String =
+        conn.query_row("SELECT nearest_heading FROM doc_chunk_meta", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(nearest_heading, "Guide");
+    let persisted_format: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='documentation_chunk_format_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(persisted_format, crate::docs::CHUNK_FORMAT_VERSION);
+    assert_ne!(structural::current_snapshot(&conn)?, old_format_snapshot);
     Ok(())
 }
 
@@ -210,6 +927,12 @@ fn indexes_js_files_containing_jsx() -> Result<()> {
     let outcome = index_repo(repo.path(), &conn)?;
 
     assert_eq!((outcome.indexed, outcome.rejected), (1, 0));
+    let identity: (String, String) = conn.query_row(
+        "SELECT corpus, format FROM files WHERE path='page.js'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(identity, ("code".into(), "javascript".into()));
     let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
     assert!(chunks > 0);
     Ok(())
@@ -227,13 +950,31 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
     assert_eq!(first.indexed, 1);
     let second = index_repo(repo.path(), &conn)?;
     assert_eq!((second.indexed, second.unchanged), (0, 1));
+    let current_contract_snapshot = structural::current_snapshot(&conn)?;
 
     conn.execute(
         "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
         [],
     )?;
+    let legacy_contract_snapshot = structural::compute_snapshot(&conn)?;
+    assert_ne!(legacy_contract_snapshot, current_contract_snapshot);
+    conn.execute(
+        "UPDATE meta SET value=?1 WHERE key='snapshot'",
+        [&legacy_contract_snapshot],
+    )?;
     let third = index_repo(repo.path(), &conn)?;
     assert_eq!((third.indexed, third.unchanged), (1, 0));
+    assert_ne!(
+        structural::current_snapshot(&conn)?,
+        legacy_contract_snapshot,
+        "an extraction-contract refresh must rotate the published snapshot"
+    );
+    let extraction_version: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='extraction_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(extraction_version, crate::entity::EXTRACTION_VERSION);
     let environment_occurrences: i64 = conn.query_row(
         "SELECT count(*) FROM entity_occurrences occurrence
          JOIN entities entity ON entity.id=occurrence.entity_id

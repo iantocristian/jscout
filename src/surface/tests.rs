@@ -87,8 +87,24 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
         repo.path().join("docs/runtime.test.ts"),
         "test('render', () => renderDocument());\n",
     )?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Documentation\n\nThis stays in the canonical repository inventory.\n",
+    )?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
+    let documentation_file_nodes: i64 = conn.query_row(
+        "SELECT count(*)
+         FROM graph_nodes node
+         JOIN files file ON file.id=node.file_id
+         WHERE node.node_kind='file' AND file.path='README.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        documentation_file_nodes, 0,
+        "the code structural projection must exclude Markdown files"
+    );
     let selector = recon::SubjectSelector::RepositoryArea {
         scope: "docs".into(),
         direct_only: false,
@@ -141,6 +157,8 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
     recon::reconcile_file_policy(repo.path(), &conn)?;
 
     let response = overview_response(&conn, &OverviewOptions::default())?;
+    assert_eq!(response.overview.totals["files"], 2);
+    assert_eq!(response.overview.files_by_origin["repository"], 2);
     let overlay = response
         .reconnaissance
         .expect("current reconnaissance overlay");
@@ -150,6 +168,7 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
     assert_eq!(overlay.roles["runtime"], 1);
     assert_eq!(overlay.effective_file_roles["runtime"], 1);
     assert_eq!(overlay.effective_file_roles["test"], 1);
+    assert!(!overlay.effective_file_roles.contains_key("documentation"));
     assert_eq!(overlay.classifications[0].conflict_files, 1);
     assert_eq!(overlay.classifications[0].citation_count, 1);
     assert_eq!(

@@ -2,23 +2,47 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
+use crate::docs::corpus::{CapturedDocument, CorpusOptions, Decision, DocFile};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
 use crate::{file_role, io_policy, parse, store, walk};
 
-#[derive(Debug, Clone, Default)]
+const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
+const CODE_CORPUS: &str = "code";
+const DOCS_CORPUS: &str = "docs";
+const JAVASCRIPT_FORMAT: &str = "javascript";
+const TYPESCRIPT_FORMAT: &str = "typescript";
+const MARKDOWN_FORMAT: &str = "markdown";
+const MDX_FORMAT: &str = "mdx";
+
+#[derive(Debug, Clone)]
 pub struct IndexOptions {
     pub dependencies: Vec<String>,
     pub dependency_limits: DependencyLimits,
+    pub docs_include: Vec<String>,
+    pub docs_exclude: Vec<String>,
     pub timing: bool,
     pub debug: bool,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            dependencies: Vec::new(),
+            dependency_limits: DependencyLimits::default(),
+            docs_include: crate::docs::default_include_globs(),
+            docs_exclude: Vec::new(),
+            timing: false,
+            debug: false,
+        }
+    }
 }
 
 pub struct IndexOutcome {
@@ -104,9 +128,21 @@ struct PreparedDependencyFile {
     role: &'static str,
 }
 
+struct StoredDependencyFile {
+    id: i64,
+    hash: String,
+    role: String,
+    corpus: String,
+    format: String,
+    package_instance_id: i64,
+    package_path: String,
+}
+
 struct FileIdentity<'a> {
     path: &'a str,
     hash: &'a str,
+    corpus: &'a str,
+    format: &'a str,
     role: &'a str,
     origin: &'a str,
     package_instance_id: Option<i64>,
@@ -277,12 +313,42 @@ enum CheckerRetention {
 /// `IndexOptions`; this private context carries the replaceable runtime seam.
 struct IndexOperation<'a, F: FileSystem> {
     fs: &'a F,
+    #[cfg(test)]
+    fail_after_canonical_replacement: bool,
 }
 
 impl<'a, F: FileSystem> IndexOperation<'a, F> {
     const fn new(fs: &'a F) -> Self {
-        Self { fs }
+        Self {
+            fs,
+            #[cfg(test)]
+            fail_after_canonical_replacement: false,
+        }
     }
+
+    #[cfg(test)]
+    const fn failing_after_canonical_replacement(fs: &'a F) -> Self {
+        Self {
+            fs,
+            fail_after_canonical_replacement: true,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn index_repo_with_post_replacement_failure(
+    root: &Path,
+    conn: &Connection,
+) -> Result<IndexOutcome> {
+    index_repo_impl(
+        root,
+        conn,
+        &IndexOptions::default(),
+        true,
+        IndexMode::Incremental,
+        CheckerRetention::Drop,
+        IndexOperation::failing_after_canonical_replacement(&OsFileSystem),
+    )
 }
 
 /// The pre-reset code path: always replace files one at a time, even when
@@ -315,7 +381,22 @@ fn index_repo_impl<F: FileSystem>(
     operation: IndexOperation<'_, F>,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
-    let inventory = walk::source_inventory(&root)?;
+    let inventory_started = std::time::Instant::now();
+    let inventory = walk::repository_inventory(
+        &root,
+        &CorpusOptions {
+            include: options.docs_include.clone(),
+            exclude: options.docs_exclude.clone(),
+            ..CorpusOptions::default()
+        },
+    )?;
+    if options.timing {
+        // Markdown parsing is part of the shared repository inventory pass.
+        eprintln!(
+            "timing repository-inventory={:?}",
+            inventory_started.elapsed()
+        );
+    }
     let workspace_discovery =
         crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
@@ -351,15 +432,20 @@ fn index_repo_impl<F: FileSystem>(
         );
     }
 
-    // Source extraction and every selected-dependency read happen before the
-    // publication boundary. A retryable corpus failure therefore rolls this
-    // transaction back and leaves the previously published snapshot intact.
-    conn.execute_batch("BEGIN")?;
+    // The complete canonical replacement, dependency synchronization, cached
+    // vector materialization, module resolution, structural projection, and
+    // marker publication form one SQLite commit. WAL readers continue to see
+    // the last-good committed snapshot while this writer is active, and any
+    // failure below rolls the replacement back as a unit.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
     let preparation = (|| -> Result<(_, _, _)> {
         ensure_extraction_version(conn)?;
-        let stored: HashMap<String, (i64, String, String)> = {
-            let mut stmt =
-                conn.prepare("SELECT path, id, hash, role FROM files WHERE origin!='dependency'")?;
+        let documentation_format_changed = ensure_documentation_chunk_format(conn)?;
+        let stored: HashMap<String, (i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT path, id, hash, role, corpus, format
+                 FROM files WHERE origin!='dependency'",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -367,6 +453,8 @@ fn index_repo_impl<F: FileSystem>(
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ),
                 ))
             })?;
@@ -387,7 +475,7 @@ fn index_repo_impl<F: FileSystem>(
         // truncate the disposable plane once and insert like a fresh index.
         let cleared = existing
             .values()
-            .filter(|(_, hash, _)| hash.is_empty())
+            .filter(|(_, hash, _, corpus, _)| corpus == CODE_CORPUS && hash.is_empty())
             .count();
         let extraction_reset = mode == IndexMode::FullRefresh
             || (allow_extraction_reset && !existing.is_empty() && cleared * 2 >= existing.len());
@@ -401,6 +489,7 @@ fn index_repo_impl<F: FileSystem>(
             outcome.extraction_reset = true;
         }
 
+        replace_documentation_inventory(conn, &inventory.documentation_decisions)?;
         let mut seen = std::collections::HashSet::new();
         let mut published = std::collections::HashSet::new();
         for file in &inventory.files {
@@ -416,7 +505,7 @@ fn index_repo_impl<F: FileSystem>(
                 }
                 Err(error) => {
                     seen.insert(rel.clone());
-                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                    if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
                         store::delete_file(conn, *old_id)?;
                     }
                     outcome.record_rejection(rel, "read", error);
@@ -425,8 +514,11 @@ fn index_repo_impl<F: FileSystem>(
             };
             let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
             let role = file_role::classify(Path::new(&rel), &source);
-            if let Some((id, old_hash, old_role)) = existing.get(&rel)
+            let format = code_format(file)?;
+            if let Some((id, old_hash, old_role, old_corpus, old_format)) = existing.get(&rel)
                 && *old_hash == hash
+                && old_corpus == CODE_CORPUS
+                && old_format == format
             {
                 if old_role != role {
                     conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
@@ -440,12 +532,14 @@ fn index_repo_impl<F: FileSystem>(
             }
             match extract_file(file, &rel, &source) {
                 Ok(data) => {
-                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                    if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
                         store::delete_file(conn, *old_id)?;
                     }
                     let identity = FileIdentity {
                         path: &rel,
                         hash: &hash,
+                        corpus: CODE_CORPUS,
+                        format,
                         role,
                         origin: "repository",
                         package_instance_id: None,
@@ -458,14 +552,61 @@ fn index_repo_impl<F: FileSystem>(
                     published.insert(rel);
                 }
                 Err(error) => {
-                    if let Some((old_id, _, _)) = existing.get(&rel) {
+                    if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
                         store::delete_file(conn, *old_id)?;
                     }
                     outcome.record_rejection(rel, "extract", error);
                 }
             }
         }
-        for (path, (id, _, _)) in &existing {
+        let documentation_projection_started = std::time::Instant::now();
+        for document in &inventory.documents {
+            let rel = document.file.path.clone();
+            seen.insert(rel.clone());
+            let hash = document.file.content_hash.as_str();
+            let format = documentation_format(Path::new(&rel))?;
+            let role = "documentation";
+            if !documentation_format_changed
+                && let Some((id, old_hash, old_role, old_corpus, old_format)) = existing.get(&rel)
+                && old_hash == hash
+                && old_corpus == DOCS_CORPUS
+                && old_format == format
+            {
+                if old_role != role {
+                    conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
+                }
+                outcome.unchanged += 1;
+                published.insert(rel);
+                continue;
+            }
+            if options.debug {
+                eprintln!("extracting {}", document.file.path);
+            }
+            if let Some((old_id, _, _, _, _)) = existing.get(&document.file.path) {
+                store::delete_file(conn, *old_id)?;
+            }
+            let identity = FileIdentity {
+                path: &document.file.path,
+                hash,
+                corpus: DOCS_CORPUS,
+                format,
+                role,
+                origin: "repository",
+                package_instance_id: None,
+                package_path: None,
+            };
+            let chunks = insert_documentation_file(conn, &identity, document)?;
+            outcome.indexed += 1;
+            outcome.chunks += chunks;
+            published.insert(rel);
+        }
+        if options.timing {
+            eprintln!(
+                "timing documentation-projection={:?}",
+                documentation_projection_started.elapsed()
+            );
+        }
+        for (path, (id, _, _, _, _)) in &existing {
             if !seen.contains(path) {
                 store::delete_file(conn, *id)?;
             }
@@ -483,9 +624,9 @@ fn index_repo_impl<F: FileSystem>(
         };
 
         // Dependency discovery sees the just-extracted, uncommitted importer
-        // rows. Reading and parsing the selected corpus here closes the gap
-        // where one transient dependency file previously invalidated the old
-        // publication before failing.
+        // rows. Reading and parsing the selected corpus inside the outer
+        // transaction ensures a transient dependency failure restores the
+        // previous canonical rows and publication markers together.
         let discovered =
             dependency::discover(&root, conn, &options.dependencies, &workspace, operation.fs)?;
         let plans =
@@ -505,76 +646,91 @@ fn index_repo_impl<F: FileSystem>(
             return Err(error);
         }
     };
-    if let Err(error) = conn.execute_batch("COMMIT") {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(error.into());
-    }
+    let publication = (|| -> Result<()> {
+        let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
+        index_dependency_files(conn, &prepared, &instances, &mut outcome)?;
 
-    let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
-    index_dependency_files(conn, &prepared, &instances, &mut outcome)?;
-    if outcome.indexed > 0 {
-        crate::embed::materialize_cached_embeddings(conn)?;
-    }
-
-    resolve_module_edges(&root, conn, &workspace)?;
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES('root', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [root.to_string_lossy()],
-    )?;
-    let resolution = crate::structural::compute_resolution_hash(conn)?;
-    let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
-    // Manual indexing always resets the optional checker plane. Watch keeps
-    // one old active batch hidden for the immediately following per-project
-    // carry step; projection still rejects a mismatched source snapshot.
-    let checker_batches_changed = match checker_retention {
-        CheckerRetention::Drop => store::clear_checker_batches(conn)?,
-        CheckerRetention::PreserveActiveForWatch => {
-            store::preserve_active_checker_batch_for_watch(conn)?
+        #[cfg(test)]
+        if operation.fail_after_canonical_replacement {
+            anyhow::bail!("injected failure after canonical replacement");
         }
-    };
-    let current = ProjectionIdentity {
-        snapshot: Some(snapshot.clone()),
-        projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
-        resolution_hash: Some(resolution.clone()),
-    };
-    let projection_started = std::time::Instant::now();
-    if previous == current && !checker_batches_changed {
-        // The projection is a pure function of the canonical tables: the
-        // snapshot covers every extracted row (file content identity) and the
-        // resolution hash covers module edges, whose inputs (tsconfigs,
-        // manifests, node_modules layout) live outside indexed content.
-        // Checker publication rebuilds the projection immediately and its
-        // batch is accepted only for this exact snapshot. Identical inputs
-        // under the same projection version can therefore republish the
-        // existing rows.
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = current.publish(conn);
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(error);
+
+        if outcome.indexed > 0 {
+            crate::embed::materialize_cached_embeddings(conn)?;
+        }
+
+        resolve_module_edges(&root, conn, &workspace)?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('root', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [root.to_string_lossy()],
+        )?;
+        let resolution = crate::structural::compute_resolution_hash(conn)?;
+        let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
+        // Manual indexing always resets the optional checker plane. Watch keeps
+        // one old active batch hidden for the immediately following per-project
+        // carry step; projection still rejects a mismatched source snapshot.
+        let checker_batches_changed = match checker_retention {
+            CheckerRetention::Drop => store::clear_checker_batches(conn)?,
+            CheckerRetention::PreserveActiveForWatch => {
+                store::preserve_active_checker_batch_for_watch(conn)?
+            }
+        };
+        let current = ProjectionIdentity {
+            snapshot: Some(snapshot.clone()),
+            projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
+            resolution_hash: Some(resolution.clone()),
+        };
+        let snapshot_changed = previous.snapshot.as_deref() != current.snapshot.as_deref();
+        let projection_started = std::time::Instant::now();
+        if previous == current && !checker_batches_changed {
+            // The projection is a pure function of the canonical tables: the
+            // snapshot covers every extracted row (file content identity) and the
+            // resolution hash covers module edges, whose inputs (tsconfigs,
+            // manifests, node_modules layout) live outside indexed content.
+            // Checker publication rebuilds the projection immediately and its
+            // batch is accepted only for this exact snapshot. Identical inputs
+            // under the same projection version can therefore republish the
+            // existing rows.
+            current.publish(conn)?;
+            outcome.projection_rebuilt = false;
+            if options.timing {
+                eprintln!("timing structural-projection=skipped (unchanged)");
+            }
+        } else {
+            crate::structural::rebuild_projection_with_timing(conn, &snapshot, options.timing)?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [&resolution],
+            )?;
+            if options.timing {
+                eprintln!(
+                    "timing structural-projection={:?}",
+                    projection_started.elapsed()
+                );
             }
         }
-        outcome.projection_rebuilt = false;
-        if options.timing {
-            eprintln!("timing structural-projection=skipped (unchanged)");
+        // Documentation readiness is exact-snapshot state. Rebuild it from the
+        // durable shared cache after the new marker exists, but before the outer
+        // publication commit. An incomplete cache remains a normal NotReady
+        // state and never turns indexing into a provider operation.
+        if snapshot_changed {
+            crate::docs::retrieval::rematerialize_cached_generations(conn, &snapshot)?;
         }
-        crate::recon::reconcile_file_policy_after_index(&root, conn);
-        return Ok(outcome);
-    }
-    crate::structural::rebuild_projection_with_timing(conn, &snapshot, options.timing)?;
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [&resolution],
-    )?;
-    if options.timing {
-        eprintln!(
-            "timing structural-projection={:?}",
-            projection_started.elapsed()
-        );
+        Ok(())
+    })();
+    match publication {
+        Ok(()) => {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
     }
     crate::recon::reconcile_file_policy_after_index(&root, conn);
     Ok(outcome)
@@ -645,7 +801,7 @@ fn ensure_extraction_version(conn: &Connection) -> Result<()> {
     // The caller owns the refresh transaction. Keeping this invalidation
     // inside it ensures a later source/dependency acquisition failure restores
     // the previously published extractor version and snapshot together.
-    conn.execute("UPDATE files SET hash=''", [])?;
+    conn.execute("UPDATE files SET hash='' WHERE corpus='code'", [])?;
     conn.execute("DELETE FROM resolved_edges", [])?;
     conn.execute("DELETE FROM graph_nodes", [])?;
     conn.execute(
@@ -658,6 +814,28 @@ fn ensure_extraction_version(conn: &Connection) -> Result<()> {
         [crate::entity::EXTRACTION_VERSION],
     )?;
     Ok(())
+}
+
+/// Persist the Markdown-family chunk/admission contract independently from
+/// the code extractor contract. A contract change reprocesses unchanged
+/// documentation without needlessly invalidating unchanged code rows.
+fn ensure_documentation_chunk_format(conn: &Connection) -> Result<bool> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [DOC_CHUNK_FORMAT_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(crate::docs::CHUNK_FORMAT_VERSION) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![DOC_CHUNK_FORMAT_META_KEY, crate::docs::CHUNK_FORMAT_VERSION],
+    )?;
+    Ok(true)
 }
 
 fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
@@ -673,6 +851,30 @@ fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
     })
 }
 
+fn code_format(path: &Path) -> Result<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("js" | "jsx" | "mjs" | "cjs") => Ok(JAVASCRIPT_FORMAT),
+        Some("ts" | "tsx" | "mts" | "cts") => Ok(TYPESCRIPT_FORMAT),
+        extension => Err(anyhow::anyhow!(
+            "indexed code file `{}` has unsupported format extension `{}`",
+            path.display(),
+            extension.unwrap_or("<none>")
+        )),
+    }
+}
+
+fn documentation_format(path: &Path) -> Result<&'static str> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("md") => Ok(MARKDOWN_FORMAT),
+        Some("mdx") => Ok(MDX_FORMAT),
+        extension => Err(anyhow::anyhow!(
+            "indexed documentation file `{}` has unsupported format extension `{}`",
+            path.display(),
+            extension.unwrap_or("<none>")
+        )),
+    }
+}
+
 fn fts_content(content: &str) -> Cow<'_, str> {
     if content.contains('\0') {
         // FTS5 indexes text after an embedded NUL, but highlight() can omit
@@ -684,18 +886,206 @@ fn fts_content(content: &str) -> Cow<'_, str> {
     }
 }
 
+fn replace_documentation_inventory(conn: &Connection, decisions: &[Decision]) -> Result<()> {
+    conn.execute("DELETE FROM doc_inventory", [])?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO doc_inventory(
+           path, subject, rule, detail, path_base64, path_encoding
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for decision in decisions {
+        insert.execute(params![
+            decision.path,
+            decision.subject,
+            decision.rule,
+            decision.detail,
+            decision.path_base64,
+            decision.path_encoding,
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_documentation_file(
+    conn: &Connection,
+    identity: &FileIdentity<'_>,
+    captured: &CapturedDocument,
+) -> Result<usize> {
+    let file = &captured.file;
+    ensure!(
+        identity.path == file.path,
+        "documentation file identity path does not match captured document"
+    );
+    ensure!(
+        identity.corpus == DOCS_CORPUS && matches!(identity.format, MARKDOWN_FORMAT | MDX_FORMAT),
+        "documentation file identity has an invalid corpus or format"
+    );
+    ensure!(
+        captured.bytes.len() as u64 == file.byte_len,
+        "captured documentation byte length does not match parser metadata for {}",
+        file.path
+    );
+    ensure!(
+        blake3::hash(&captured.bytes).to_hex().as_str() == file.content_hash,
+        "captured documentation hash does not match parser metadata for {}",
+        file.path
+    );
+
+    conn.execute(
+        "INSERT INTO files(
+           path, hash, corpus, format, role, origin,
+           package_instance_id, package_path
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            identity.path,
+            identity.hash,
+            identity.corpus,
+            identity.format,
+            identity.role,
+            identity.origin,
+            identity.package_instance_id,
+            identity.package_path,
+        ],
+    )?;
+    let file_id = conn.last_insert_rowid();
+    let metadata = documentation_metadata(file);
+    let tags_json = serde_json::to_string(&file.tags)
+        .with_context(|| format!("serialize Markdown tags for {}", file.path))?;
+    let title_fts = fts_content(&file.title);
+    let metadata_fts = fts_content(&metadata);
+    let path_fts = fts_content(identity.path);
+
+    let mut insert_chunk = conn.prepare_cached(
+        "INSERT INTO chunks(
+           file_id, kind, name, scope_chain, symbols, start, end,
+           start_line, end_line, hash, content
+         ) VALUES(?1, ?2, NULL, '', '', ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    let mut insert_meta = conn.prepare_cached(
+        "INSERT INTO doc_chunk_meta(
+           chunk_id, title, description, tags_json, breadcrumb,
+           nearest_heading, ordinal, embedding_identity, front_matter_state
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    let mut insert_fts = conn.prepare_cached(
+        "INSERT INTO docs_fts(rowid, title, metadata, breadcrumb, body, path)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+
+    for (position, chunk) in file.chunks.iter().enumerate() {
+        ensure!(
+            chunk.ordinal == position as u64,
+            "Markdown chunk ordinals are not contiguous for {}",
+            file.path
+        );
+        let start = usize::try_from(chunk.source_start)
+            .with_context(|| format!("invalid Markdown source start for {}", file.path))?;
+        let end = usize::try_from(chunk.source_end)
+            .with_context(|| format!("invalid Markdown source end for {}", file.path))?;
+        ensure!(
+            start <= end && end <= captured.bytes.len(),
+            "Markdown chunk {}:{} has an invalid source span",
+            file.path,
+            chunk.ordinal
+        );
+        let source = std::str::from_utf8(&captured.bytes[start..end]).with_context(|| {
+            format!(
+                "Markdown chunk {}:{} source slice is not UTF-8",
+                file.path, chunk.ordinal
+            )
+        })?;
+        let start = u32::try_from(start).context("Markdown source start exceeds chunk schema")?;
+        let end = u32::try_from(end).context("Markdown source end exceeds chunk schema")?;
+        let start_line =
+            u32::try_from(chunk.line_start).context("Markdown start line exceeds chunk schema")?;
+        let end_line =
+            u32::try_from(chunk.line_end).context("Markdown end line exceeds chunk schema")?;
+        let same_heading_ordinal = i64::try_from(chunk.same_heading_ordinal)
+            .context("Markdown same-heading ordinal exceeds SQLite integer range")?;
+        let kind = if chunk.is_stub {
+            "markdown_document"
+        } else {
+            "markdown_section"
+        };
+        ensure!(
+            chunk.is_stub == chunk.embedding_identity.is_none(),
+            "Markdown stub/embedding identity mismatch for {}:{}",
+            file.path,
+            chunk.ordinal
+        );
+        if !chunk.is_stub {
+            let expected = crate::docs::corpus::embedding_identity(
+                chunk.nearest_heading.as_deref(),
+                &chunk.rendered_body,
+            );
+            ensure!(
+                chunk.embedding_identity.as_deref() == Some(expected.as_str()),
+                "Markdown embedding identity mismatch for {}:{}",
+                file.path,
+                chunk.ordinal
+            );
+        }
+        let chunk_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        insert_chunk.execute(params![
+            file_id, kind, start, end, start_line, end_line, chunk_hash, source,
+        ])?;
+        let chunk_id = conn.last_insert_rowid();
+        insert_meta.execute(params![
+            chunk_id,
+            file.title,
+            file.description,
+            tags_json,
+            chunk.breadcrumb,
+            chunk.nearest_heading,
+            same_heading_ordinal,
+            chunk.embedding_identity,
+            file.front_matter_state,
+        ])?;
+        let breadcrumb_fts = fts_content(&chunk.breadcrumb);
+        insert_fts.execute(params![
+            chunk_id,
+            title_fts.as_ref(),
+            metadata_fts.as_ref(),
+            breadcrumb_fts.as_ref(),
+            chunk.rendered_body,
+            path_fts.as_ref(),
+        ])?;
+    }
+    Ok(file.chunks.len())
+}
+
+fn documentation_metadata(file: &DocFile) -> String {
+    let mut parts = Vec::new();
+    if let Some(description) = file
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        parts.push(description);
+    }
+    parts.extend(file.tags.iter().map(String::as_str));
+    parts.join(" ")
+}
+
 fn insert_file(
     conn: &Connection,
     identity: &FileIdentity<'_>,
     data: &FileData,
 ) -> Result<(usize, usize)> {
+    ensure!(
+        identity.corpus == CODE_CORPUS,
+        "code file identity has an invalid corpus"
+    );
     conn.execute(
         "INSERT INTO files(
-           path, hash, role, origin, package_instance_id, package_path
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+           path, hash, corpus, format, role, origin,
+           package_instance_id, package_path
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             identity.path,
             identity.hash,
+            identity.corpus,
+            identity.format,
             identity.role,
             identity.origin,
             identity.package_instance_id,
@@ -1074,57 +1464,64 @@ fn index_dependency_files(
     instances: &std::collections::BTreeMap<PathBuf, i64>,
     outcome: &mut IndexOutcome,
 ) -> Result<()> {
-    let existing: HashMap<String, (i64, String, String, i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT path, id, hash, role, package_instance_id, package_path
-             FROM files WHERE origin='dependency'",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                ),
-            ))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    let mut seen = std::collections::HashSet::new();
-    conn.execute_batch("BEGIN")?;
-    let result = (|| {
+    conn.execute_batch("SAVEPOINT jscout_dependency_files")?;
+    let result = (|| -> Result<()> {
+        let existing: HashMap<String, StoredDependencyFile> = {
+            let mut stmt = conn.prepare(
+                "SELECT path, id, hash, role, corpus, format,
+                        package_instance_id, package_path
+                 FROM files WHERE origin='dependency'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    StoredDependencyFile {
+                        id: row.get(1)?,
+                        hash: row.get(2)?,
+                        role: row.get(3)?,
+                        corpus: row.get(4)?,
+                        format: row.get(5)?,
+                        package_instance_id: row.get(6)?,
+                        package_path: row.get(7)?,
+                    },
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut seen = std::collections::HashSet::new();
         for file in prepared {
             let package_id = *instances.get(&file.package_root).ok_or_else(|| {
                 anyhow::anyhow!("dependency package instance was not synchronized")
             })?;
             seen.insert(file.display.clone());
-            if let Some((id, old_hash, old_role, old_package, old_package_path)) =
-                existing.get(&file.display)
-                && *old_hash == file.hash
-                && *old_package == package_id
-                && *old_package_path == file.package_path
+            let format = code_format(&file.source_path)?;
+            if let Some(old) = existing.get(&file.display)
+                && old.hash == file.hash
+                && old.corpus == CODE_CORPUS
+                && old.format == format
+                && old.package_instance_id == package_id
+                && old.package_path == file.package_path
             {
-                if old_role != file.role {
+                if old.role != file.role {
                     conn.execute(
                         "UPDATE files SET role=?1 WHERE id=?2",
-                        params![file.role, id],
+                        params![file.role, old.id],
                     )?;
                 }
                 outcome.unchanged += 1;
                 outcome.dependency_files += 1;
                 continue;
             }
-            if let Some((old_id, _, _, _, _)) = existing.get(&file.display) {
-                store::delete_file(conn, *old_id)?;
+            if let Some(old) = existing.get(&file.display) {
+                store::delete_file(conn, old.id)?;
             }
             match extract_file(&file.source_path, &file.display, &file.source) {
                 Ok(data) => {
                     let identity = FileIdentity {
                         path: &file.display,
                         hash: &file.hash,
+                        corpus: CODE_CORPUS,
+                        format,
                         role: file.role,
                         origin: "dependency",
                         package_instance_id: Some(package_id),
@@ -1139,20 +1536,22 @@ fn index_dependency_files(
                 Err(error) => outcome.record_rejection(file.display.clone(), "extract", error),
             }
         }
-        for (path, (id, _, _, _, _)) in &existing {
+        for (path, old) in &existing {
             if !seen.contains(path) {
-                store::delete_file(conn, *id)?;
+                store::delete_file(conn, old.id)?;
             }
         }
         Ok(())
     })();
     match result {
         Ok(()) => {
-            conn.execute_batch("COMMIT")?;
+            conn.execute_batch("RELEASE jscout_dependency_files")?;
             Ok(())
         }
         Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_dependency_files; RELEASE jscout_dependency_files",
+            );
             Err(error)
         }
     }
@@ -1188,29 +1587,30 @@ pub fn resolve_module_edges(
     // workspace aliases inside it can redirect a dependency's own imports to
     // an unrelated first-party package with the same name.
     let dependency_resolver = Resolver::new(resolver_options(Vec::new(), None));
-    let (file_ids, importer_paths) = {
-        let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, f.origin, f.package_path, f.package_instance_id,
-                    p.canonical_root
-             FROM files f
-             LEFT JOIN package_instances p ON p.id=f.package_instance_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
-        let mut by_path = HashMap::new();
-        let mut by_id = HashMap::new();
-        for row in rows {
-            let (id, path, origin, package_path, package_instance, package_root) = row?;
-            let physical =
-                if origin == "dependency" {
+    conn.execute_batch("SAVEPOINT jscout_module_edges")?;
+    let result = (|| -> Result<()> {
+        let (file_ids, importer_paths) = {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, f.path, f.origin, f.package_path, f.package_instance_id,
+                        p.canonical_root
+                 FROM code_files f
+                 LEFT JOIN package_instances p ON p.id=f.package_instance_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            let mut by_path = HashMap::new();
+            let mut by_id = HashMap::new();
+            for row in rows {
+                let (id, path, origin, package_path, package_instance, package_root) = row?;
+                let physical = if origin == "dependency" {
                     PathBuf::from(package_root.ok_or_else(|| {
                         anyhow::anyhow!("dependency file {path} has no package root")
                     })?)
@@ -1220,132 +1620,141 @@ pub fn resolve_module_edges(
                 } else {
                     root.join(path)
                 };
-            let physical = physical.canonicalize().unwrap_or(physical);
-            by_path.insert(physical.clone(), (id, package_instance));
-            by_id.insert(id, (physical, origin == "dependency"));
-        }
-        (by_path, by_id)
-    };
+                let physical = physical.canonicalize().unwrap_or(physical);
+                by_path.insert(physical.clone(), (id, package_instance));
+                by_id.insert(id, (physical, origin == "dependency"));
+            }
+            (by_path, by_id)
+        };
 
-    let mut package_roots: Vec<(PathBuf, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT canonical_root, id FROM package_instances WHERE origin='dependency'",
+        let mut package_roots: Vec<(PathBuf, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT canonical_root, id FROM package_instances WHERE origin='dependency'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    PathBuf::from(row.get::<_, String>(0)?),
+                    row.get::<_, i64>(1)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        package_roots.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+
+        let pairs: Vec<(i64, String, bool)> = {
+            let mut stmt = conn.prepare(
+                "SELECT f.id, requests.request, max(requests.is_runtime) = 0
+                 FROM code_files f
+                 JOIN (
+                   SELECT file_id, request, 1 AS is_runtime FROM imports
+                   UNION ALL
+                   SELECT file_id, from_request, 1 FROM exports WHERE from_request IS NOT NULL
+                   UNION ALL
+                   SELECT file_id, target_request, 1 FROM refs WHERE target_request IS NOT NULL
+                   UNION ALL
+                   SELECT file_id, request, 0 FROM contract_imports
+                   UNION ALL
+                   SELECT file_id, from_request, 0 FROM contract_exports
+                     WHERE from_request IS NOT NULL
+                 ) requests ON requests.file_id = f.id
+                 GROUP BY f.id, requests.request",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+
+        conn.execute("DELETE FROM module_edges", [])?;
+        let mut ins = conn.prepare_cached(
+            "INSERT INTO module_edges(
+               from_file, request, to_file, package, resolution, package_instance_id, type_only
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                PathBuf::from(row.get::<_, String>(0)?),
-                row.get::<_, i64>(1)?,
-            ))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-    package_roots.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-
-    let pairs: Vec<(i64, String, bool)> = {
-        let mut stmt = conn.prepare(
-            "SELECT f.id, requests.request, max(requests.is_runtime) = 0
-             FROM files f
-             JOIN (
-               SELECT file_id, request, 1 AS is_runtime FROM imports
-               UNION ALL
-               SELECT file_id, from_request, 1 FROM exports WHERE from_request IS NOT NULL
-               UNION ALL
-               SELECT file_id, target_request, 1 FROM refs WHERE target_request IS NOT NULL
-               UNION ALL
-               SELECT file_id, request, 0 FROM contract_imports
-               UNION ALL
-               SELECT file_id, from_request, 0 FROM contract_exports
-                 WHERE from_request IS NOT NULL
-             ) requests ON requests.file_id = f.id
-             GROUP BY f.id, requests.request",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)? != 0,
-            ))
-        })?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-
-    conn.execute_batch("BEGIN")?;
-    conn.execute("DELETE FROM module_edges", [])?;
-    let mut ins = conn.prepare_cached(
-        "INSERT INTO module_edges(
-           from_file, request, to_file, package, resolution, package_instance_id, type_only
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-    )?;
-    type Resolved = (
-        Option<i64>,
-        Option<String>,
-        Option<&'static str>,
-        Option<i64>,
-    );
-    let mut cache: HashMap<(PathBuf, String), Resolved> = HashMap::new();
-    for (file_id, request, type_only) in pairs {
-        let (importer, dependency_importer) = importer_paths
-            .get(&file_id)
-            .ok_or_else(|| anyhow::anyhow!("indexed importer {file_id} has no physical path"))?
-            .clone();
-        let key = (importer.clone(), request.clone());
-        let (to_file, package, resolution, package_instance) = cache
-            .entry(key)
-            .or_insert_with(|| {
-                match if dependency_importer {
-                    dependency_resolver.resolve_file(&importer, &request)
-                } else {
-                    resolver
-                        .resolve_file(&importer, &request)
-                        .or_else(|_| no_tsconfig.resolve_file(&importer, &request))
-                } {
-                    Ok(resolution) => {
-                        let path = resolution.path().to_path_buf();
-                        let path = path.canonicalize().unwrap_or(path);
-                        match file_ids.get(&path) {
-                            Some((id, package_instance)) => (
-                                Some(*id),
-                                None,
-                                Some(workspace.classify(&request)),
-                                *package_instance,
-                            ),
-                            None if external_package_name(&request).is_none() => {
-                                // Resolved to a real but un-indexable file
-                                // (styles, assets, JSON): keep the edge as
-                                // evidence without inventing a package.
-                                (None, None, Some("unresolved"), None)
-                            }
-                            None => {
-                                let package = external_package_name(&request)
-                                    .expect("guarded external package request");
-                                let package_instance = package_roots
-                                    .iter()
-                                    .find(|(root, _)| path.starts_with(root))
-                                    .map(|(_, id)| *id);
-                                (None, Some(package), None, package_instance)
+        type Resolved = (
+            Option<i64>,
+            Option<String>,
+            Option<&'static str>,
+            Option<i64>,
+        );
+        let mut cache: HashMap<(PathBuf, String), Resolved> = HashMap::new();
+        for (file_id, request, type_only) in pairs {
+            let (importer, dependency_importer) = importer_paths
+                .get(&file_id)
+                .ok_or_else(|| anyhow::anyhow!("indexed importer {file_id} has no physical path"))?
+                .clone();
+            let key = (importer.clone(), request.clone());
+            let (to_file, package, resolution, package_instance) = cache
+                .entry(key)
+                .or_insert_with(|| {
+                    match if dependency_importer {
+                        dependency_resolver.resolve_file(&importer, &request)
+                    } else {
+                        resolver
+                            .resolve_file(&importer, &request)
+                            .or_else(|_| no_tsconfig.resolve_file(&importer, &request))
+                    } {
+                        Ok(resolution) => {
+                            let path = resolution.path().to_path_buf();
+                            let path = path.canonicalize().unwrap_or(path);
+                            match file_ids.get(&path) {
+                                Some((id, package_instance)) => (
+                                    Some(*id),
+                                    None,
+                                    Some(workspace.classify(&request)),
+                                    *package_instance,
+                                ),
+                                None if external_package_name(&request).is_none() => {
+                                    // Resolved to a real but un-indexable file
+                                    // (styles, assets, JSON): keep the edge as
+                                    // evidence without inventing a package.
+                                    (None, None, Some("unresolved"), None)
+                                }
+                                None => {
+                                    let package = external_package_name(&request)
+                                        .expect("guarded external package request");
+                                    let package_instance = package_roots
+                                        .iter()
+                                        .find(|(root, _)| path.starts_with(root))
+                                        .map(|(_, id)| *id);
+                                    (None, Some(package), None, package_instance)
+                                }
                             }
                         }
+                        Err(_) if external_package_name(&request).is_none() => {
+                            (None, None, Some("unresolved"), None)
+                        }
+                        Err(_) => (None, external_package_name(&request), None, None),
                     }
-                    Err(_) if external_package_name(&request).is_none() => {
-                        (None, None, Some("unresolved"), None)
-                    }
-                    Err(_) => (None, external_package_name(&request), None, None),
-                }
-            })
-            .clone();
-        ins.execute(params![
-            file_id,
-            request,
-            to_file,
-            package,
-            resolution,
-            package_instance,
-            type_only,
-        ])?;
+                })
+                .clone();
+            ins.execute(params![
+                file_id,
+                request,
+                to_file,
+                package,
+                resolution,
+                package_instance,
+                type_only,
+            ])?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE jscout_module_edges")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO jscout_module_edges; RELEASE jscout_module_edges");
+            Err(error)
+        }
     }
-    drop(ins);
-    conn.execute_batch("COMMIT")?;
-    Ok(())
 }
 
 /// Return the package boundary for a syntactically valid bare package
