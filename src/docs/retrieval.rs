@@ -500,6 +500,29 @@ fn search_inner(
     options: &SearchOptions,
 ) -> Result<SearchResponse> {
     let snapshot = store::current_snapshot(conn)?;
+    if options.freshness {
+        let (provenance_enabled, provenance_format): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT
+                   (SELECT value FROM meta WHERE key=?1),
+                   (SELECT value FROM meta
+                    WHERE key='documentation_provenance_format_version')",
+                [super::PROVENANCE_ENABLED_META_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        if provenance_enabled.as_deref() != Some("true") {
+            bail!(
+                "documentation freshness is enabled, but provenance is not indexed; run `jscout index`"
+            );
+        }
+        let provenance_format = provenance_format.as_deref().unwrap_or("missing");
+        if provenance_format != super::PROVENANCE_FORMAT_VERSION {
+            bail!(
+                "documentation freshness provenance uses format {provenance_format}, but this jscout requires {}; run `jscout index`",
+                super::PROVENANCE_FORMAT_VERSION,
+            );
+        }
+    }
     let reranker_pool = options
         .reranker
         .as_ref()

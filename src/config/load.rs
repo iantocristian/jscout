@@ -8,11 +8,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::{
-    DatabaseSettings, DiagnosticsSettings, DocsSearchSettings, DocsSettings, EffectiveConfig,
-    EmbeddingSettings, ExpansionSettings, FILE_NAME, IndexSettings, InferenceSettings, LlmSettings,
-    McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig,
-    SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource,
-    WatchSettings,
+    DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings, DocsSearchSettings, DocsSettings,
+    EffectiveConfig, EmbeddingSettings, ExpansionSettings, FILE_NAME, IndexSettings,
+    InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider,
+    RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE,
+    TelemetrySettings, ValueSource, WatchSettings,
 };
 use crate::{docs, file_role, origin, search, store};
 
@@ -362,6 +362,55 @@ impl Resolver {
         self.sources.insert(key.to_string(), ValueSource::Builtin);
         Ok(default)
     }
+}
+
+/// Load and validate only the configuration fields a running watcher may
+/// apply without restart. TOML/schema parsing remains global, but semantic
+/// validation of database, model, sidecar, and watch-process settings is
+/// deliberately outside this reload boundary.
+pub fn load_docs_indexing_settings(
+    root: &Path,
+    explicit_path: Option<&Path>,
+) -> Result<DocsIndexingSettings> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("repository root does not exist: {}", root.display()))?;
+    let config_path = match explicit_path {
+        Some(path) => absolute_from_cwd(path)?,
+        None => root.join(FILE_NAME),
+    };
+    let raw = if config_path.is_file() {
+        let text = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("read configuration {}", config_path.display()))?;
+        let parsed: FileConfig = toml::from_str(&text)
+            .with_context(|| format!("parse configuration {}", config_path.display()))?;
+        if parsed.version != SCHEMA_VERSION {
+            bail!(
+                "unsupported jscout configuration version {} in {}; expected {}",
+                parsed.version,
+                config_path.display(),
+                SCHEMA_VERSION
+            );
+        }
+        parsed
+    } else if explicit_path.is_some() {
+        bail!(
+            "explicit configuration does not exist: {}",
+            config_path.display()
+        );
+    } else {
+        FileConfig::default()
+    };
+
+    let settings = DocsIndexingSettings {
+        enabled: raw.docs.enabled.unwrap_or(true),
+        include: raw.docs.include.unwrap_or_else(docs::default_include_globs),
+        exclude: raw.docs.exclude.unwrap_or_default(),
+        freshness: raw.docs.search.freshness.unwrap_or(false),
+    };
+    docs::corpus::validate_patterns(&settings.include, &settings.exclude)
+        .context("validate documentation include/exclude patterns")?;
+    Ok(settings)
 }
 
 impl RuntimeConfig {

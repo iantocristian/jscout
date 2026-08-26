@@ -119,22 +119,18 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
 
 /// Reject source-derived rows produced by an incompatible binary contract.
 /// Indexing is the only repair path; read and embedding surfaces must not
-/// reinterpret old rows under the current extractor, Markdown format, or
-/// documentation-provenance contract.
+/// reinterpret old rows under the current extractor or Markdown format.
+/// Documentation provenance is optional and is validated only by retrieval
+/// calls that opt in to freshness ranking.
 pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
-    let (extraction_version, documentation_chunk_format, documentation_provenance_format): (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = conn.query_row(
+    let (extraction_version, documentation_chunk_format): (Option<String>, Option<String>) = conn
+        .query_row(
         "SELECT
                (SELECT value FROM meta WHERE key='extraction_version'),
                (SELECT value FROM meta
-                WHERE key='documentation_chunk_format_version'),
-               (SELECT value FROM meta
-                WHERE key='documentation_provenance_format_version')",
+                WHERE key='documentation_chunk_format_version')",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let extraction_version = extraction_version.as_deref().unwrap_or("missing");
     if extraction_version != crate::entity::EXTRACTION_VERSION {
@@ -148,15 +144,6 @@ pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
         bail!(
             "published index uses documentation chunk format {documentation_chunk_format}, but this jscout requires {}; run `jscout index`",
             crate::docs::CHUNK_FORMAT_VERSION,
-        );
-    }
-    let documentation_provenance_format = documentation_provenance_format
-        .as_deref()
-        .unwrap_or("missing");
-    if documentation_provenance_format != crate::docs::PROVENANCE_FORMAT_VERSION {
-        bail!(
-            "published index uses documentation provenance format {documentation_provenance_format}, but this jscout requires {}; run `jscout index`",
-            crate::docs::PROVENANCE_FORMAT_VERSION,
         );
     }
     Ok(())
@@ -310,7 +297,8 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              WHERE key IN (
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version', 'documentation_chunk_format_version',
-               'documentation_provenance_format_version'
+               'documentation_provenance_format_version',
+               'documentation_provenance_enabled'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
              UPDATE meta SET value='33' WHERE key='schema_version';",
@@ -1620,16 +1608,20 @@ mod tests {
              );
              INSERT INTO meta(key,value)
                VALUES('documentation_provenance_format_version','test-v1');
+             INSERT INTO meta(key,value)
+               VALUES('documentation_provenance_enabled','true');
              UPDATE meta SET value='32' WHERE key='schema_version';",
         )?;
         drop(conn);
 
         let upgraded = open_path(&database)?;
-        let state: (String, i64, i64, i64, i64) = upgraded.query_row(
+        let state: (String, i64, i64, i64, i64, i64) = upgraded.query_row(
             "SELECT
                (SELECT value FROM meta WHERE key='schema_version'),
                (SELECT count(*) FROM meta
                 WHERE key='documentation_provenance_format_version'),
+               (SELECT count(*) FROM meta
+                WHERE key='documentation_provenance_enabled'),
                (SELECT count(*) FROM doc_chunk_meta),
                (SELECT count(*) FROM doc_file_provenance),
                (SELECT count(*) FROM doc_blame_cache)",
@@ -1641,10 +1633,11 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
-        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0, 0, 0));
+        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0, 0, 0, 0));
         Ok(())
     }
 
@@ -1825,12 +1818,33 @@ mod tests {
             [],
         )?;
         drop(writer);
-        let error = open_path_read_only(&database)
-            .expect_err("read-only consumers must reject stale documentation provenance");
-        assert!(
-            error
-                .to_string()
-                .contains("documentation provenance format documentation-provenance-v0")
+        let reader = open_path_read_only(&database)?;
+        assert_eq!(
+            reader.query_row(
+                "SELECT value FROM meta WHERE key='documentation_provenance_format_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "documentation-provenance-v0",
+            "non-freshness readers must not rewrite optional provenance metadata"
+        );
+        drop(reader);
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "DELETE FROM meta WHERE key='documentation_provenance_format_version'",
+            [],
+        )?;
+        drop(writer);
+        let reader = open_path_read_only(&database)?;
+        assert_eq!(
+            reader.query_row(
+                "SELECT count(*) FROM meta
+                 WHERE key='documentation_provenance_format_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "non-freshness readers must accept a missing optional provenance contract"
         );
         Ok(())
     }

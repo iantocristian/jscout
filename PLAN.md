@@ -3038,8 +3038,13 @@ G21 adds one versioned `<repository>/.jscout.toml` for non-secret stable
 configuration. Every command resolves the canonical repository root first;
 MCP loads that exact file once at startup and remains one process serving one
 root/database. The default database remains `<root>/.jscout.db`, an explicit
-`--database` remains authoritative, and no parent-directory search,
-multi-repository MCP routing, or hot reload is introduced.
+`--database` remains authoritative, and no parent-directory search or
+multi-repository MCP routing is introduced. MCP policy remains immutable
+until restart. Watch has one narrow live-reload exception: the documentation
+indexing policy formed by `[docs].enabled`, `[docs].include`, `[docs].exclude`,
+and `[docs.search].freshness`. A change to that effective policy promotes the
+next watch generation to a full refresh. Every other watch setting remains
+bound to the startup configuration and requires restart.
 
 Resolution is explicit invocation/MCP argument, then repository config, then a
 legacy environment fallback, then built-in behavior. API keys and tokens stay
@@ -3360,36 +3365,64 @@ The revised decisions:
    freshness for every block; this accepted version-one false-recency trade-off
    is bounded by `max_rank_movement` and measured by the renamed-file
    evaluation arm.
-5. Freshness: order-based and bounded, not a score multiplier. After
-   relevance fusion and optional reranking, each candidate's final rank differs
-   from its base rank by at most `max_rank_movement` (the configurable built-in
-   remains 2 but is dormant because evaluation rejected every enabled
-   default), and swaps
-   occur only between candidates with comparable provenance: git orders
-   against git by latest author time with working-tree lines newest, observed
-   orders post-baseline `added` and `body_changed` events by snapshot sequence,
-   git and observed never reorder against each other, and unknown provenance
-   never moves and is never advantaged. The model reranker never receives
-   temporal metadata. Only commits listed by the repository's resolved shallow
-   file count as shallow boundaries and contribute no timestamp; provenance
-   uses captured indexed bytes with
+5. Freshness: one opt-in controls both index-time Git attribution and the
+   order-based, bounded query stage; it is not a score multiplier. With
+   `[docs.search].freshness = false`, indexing publishes
+   `documentation_provenance_enabled = false`, deterministic per-file
+   `disabled` provenance, and per-chunk `unknown` bases with no timestamps. It
+   performs no Phase 3 repository capture, blame-cache lookup or mutation, Git
+   attribution, or provenance publication revalidation. With freshness
+   enabled, the index resolves and publishes Git/working-tree provenance and
+   sets the marker true in the same transaction. A documentation search whose
+   effective freshness option is enabled requires that true marker and the
+   current provenance format; a missing, false, or incompatible marker fails
+   closed with an instruction to run `jscout index`. Freshness-disabled search,
+   `docs status`, `docs embed`, and non-documentation read surfaces do not
+   require that optional projection.
+
+   A running watcher alone hot-reloads the complete documentation indexing
+   policy: `[docs].enabled`, `[docs].include`, `[docs].exclude`, and
+   `[docs.search].freshness`. Any effective change forces a full generation
+   before the new corpus/provenance state is considered indexed; all other
+   configuration remains restart-bound. The ordinary structural branch-switch
+   controls for the nearest file-form `.git` indirection, worktree `HEAD`, and
+   `.gitmodules` remain watched in either mode. Worktree-index, reference/log,
+   shallow, reftable, and Git conversion controls are added only while
+   provenance is enabled.
+
+   After relevance fusion and optional reranking, each candidate's final rank
+   differs from its base rank by at most `max_rank_movement` (the configurable
+   built-in remains 2 but is dormant because evaluation rejected every enabled
+   default), and swaps occur only between candidates with comparable
+   provenance: git orders against git by latest author time with working-tree
+   lines newest, observed orders post-baseline `added` and `body_changed`
+   events by snapshot sequence, git and observed never reorder against each
+   other, and unknown provenance never moves and is never advantaged. The model
+   reranker never receives temporal metadata. Only commits listed by the
+   repository's resolved shallow file count as shallow boundaries and
+   contribute no timestamp; provenance uses captured indexed bytes with
    `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
    attribution requires both a blob at that recorded HEAD path and an exact
    current-index entry, so staged additions and `git rm --cached` files remain
-   unknown;
-   blame mappings cache by an opaque hash of Git's worktree-relative prefix for
-   the indexed root, indexed-root-relative path, exact file-byte hash, path-tip
-   commit, shallow boundary fingerprint, and Git conversion fingerprint
-   produced from the same captured bytes and path by
+   unknown. Blame mappings cache by an opaque hash of Git's worktree-relative
+   prefix for the indexed root, indexed-root-relative path, exact file-byte
+   hash, path-tip commit, shallow boundary fingerprint, and Git conversion
+   fingerprint produced from the same captured bytes and path by
    `git --no-replace-objects hash-object --stdin --path <path>`; nested roots
    sharing one database cannot alias one another, a changed effective Git
    conversion outcome cannot reuse a stale mapping, and filesystem mtime is
-   never a fallback. Provenance
-   attribution is separately bounded to 65,536 logical lines and 64 MiB of
-   blame standard output per document. Crossing either provenance-only bound
-   leaves the document indexed and searchable but reports visible
-   `unknown`/`blame_failed` provenance.
-   `--no-freshness` preserves the relevance order for comparison.
+   never a fallback. Provenance attribution is separately bounded to 65,536
+   logical lines and 64 MiB of blame standard output per document. Crossing
+   either provenance-only bound leaves the document indexed and searchable but
+   reports visible `unknown`/`blame_failed` provenance. `--no-freshness`
+   disables the query stage and preserves relevance order for comparison
+   without changing the indexed projection.
+
+   Provenance still participates in the shared structural snapshot when the
+   option is enabled. A history-only attribution change can therefore rotate
+   `meta.snapshot` and invalidate other snapshot-bound products. Separating
+   provenance identity from the structural snapshot is a follow-up after this
+   pull request, not part of the opt-in correction.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
    file hash. Checkout source is read once into an immutable buffer, and only
@@ -3434,14 +3467,23 @@ search; disabling `[docs].enabled` yields no docs rows or docs-status file
 decisions while leaving every code surface unchanged; indexing and code
 embedding never generate documentation vectors; and crash recovery exposes exactly one complete old or replacement
 shared snapshot, never a partial mixture. Phase 3 acceptance: disabled
-freshness preserves Phase 2 ranked identities; enabled movement never exceeds
+freshness preserves Phase 2 ranked identities, publishes a false readiness
+marker plus disabled/unknown projection, and performs no Phase 3 Git,
+blame-cache, or provenance-revalidation work; enabled movement never exceeds
 its configured bound, moves unknown provenance, or crosses incomparable
-provenance clocks;
-captured-byte blame, including its Git conversion fingerprint, is revalidated
-before publication; blame line/output bounds fail only provenance rather than
-document admission; worktree-index and reftable-manifest changes trigger a
-full watch refresh, as do repository-controlled Git attribute and configuration
-changes that can alter conversion; and the evaluation
+provenance clocks; an effectively enabled query fails closed until the
+current-format provenance projection is indexed, while freshness-disabled docs
+queries and unrelated read surfaces remain available; captured-byte blame,
+including its Git conversion fingerprint, is revalidated before publication;
+blame line/output bounds fail only provenance rather than document admission; a
+running watcher hot-reloads only the documentation indexing policy
+(`[docs].enabled/include/exclude` and `[docs.search].freshness`) and forces a
+full generation when it changes; the nearest file-form `.git` indirection and
+baseline `HEAD` and `.gitmodules` controls remain active, while worktree-index
+and reftable-manifest changes trigger a full watch refresh only when provenance
+is enabled, as do
+repository-controlled Git attribute and configuration changes that can alter
+conversion; and the evaluation
 records the disabled default after rejecting every candidate bound. Deferred
 ledger acceptance: inserting one uniquely distinguishable paragraph produces
 one `added` block observation and no succession rows for untouched blocks;

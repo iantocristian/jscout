@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use notify::{RecursiveMode, Watcher};
 use rusqlite::Connection;
 
-use crate::{checker, docs, embed, indexer, store, structural, walk};
+use crate::{checker, config, docs, embed, indexer, store, structural, walk};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
@@ -34,6 +34,9 @@ pub struct WatchOptions<'a> {
     pub dependencies: &'a [String],
     pub docs_include: &'a [String],
     pub docs_exclude: &'a [String],
+    /// Effective indexing-time provenance policy. This is already gated by
+    /// documentation corpus admission (`docs.enabled`).
+    pub docs_freshness: bool,
     pub enrich_on_change: bool,
     pub enrich_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
@@ -46,6 +49,65 @@ pub struct WatchOptions<'a> {
     /// CLI overrides are rendered separately in the effective watch flags.
     pub config_fingerprint: &'a str,
     pub config_loaded: bool,
+    /// Exact startup-resolved configuration path. The default repository path
+    /// remains optional; an explicit path must continue to exist on reload.
+    pub config_path: Option<&'a Path>,
+    pub config_explicit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsIndexingPolicy {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    freshness: bool,
+}
+
+impl DocsIndexingPolicy {
+    fn from_options(options: &WatchOptions<'_>) -> Self {
+        Self {
+            include: options.docs_include.to_vec(),
+            exclude: options.docs_exclude.to_vec(),
+            freshness: options.docs_freshness,
+        }
+    }
+
+    fn load(root: &Path, options: &WatchOptions<'_>) -> Result<Self> {
+        let explicit_path = if options.config_explicit {
+            Some(
+                options
+                    .config_path
+                    .context("explicit watch configuration path is missing")?,
+            )
+        } else {
+            None
+        };
+        let settings = config::load_docs_indexing_settings(root, explicit_path)?;
+        Ok(Self {
+            include: settings.effective_include().to_vec(),
+            exclude: settings.effective_exclude().to_vec(),
+            freshness: settings.effective_freshness(),
+        })
+    }
+
+    fn corpus_options(&self) -> docs::corpus::CorpusOptions {
+        docs::corpus::CorpusOptions {
+            include: self.include.clone(),
+            exclude: self.exclude.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn index_options(&self, options: &WatchOptions<'_>) -> indexer::IndexOptions {
+        indexer::IndexOptions {
+            dependencies: options.dependencies.to_vec(),
+            docs_include: self.include.clone(),
+            docs_exclude: self.exclude.clone(),
+            docs_freshness: self.freshness,
+            timing: options.timing,
+            debug: options.debug,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -497,17 +559,30 @@ struct EventClassifier {
     root: PathBuf,
     excluded: BTreeSet<PathBuf>,
     git_controls: BTreeSet<PathBuf>,
+    docs_freshness: bool,
+    config_exact: BTreeSet<PathBuf>,
     external_exact: BTreeSet<PathBuf>,
     external_prefixes: BTreeSet<PathBuf>,
     source_policy: RefCell<walk::SourcePathPolicy>,
     documentation_policy: RefCell<docs::corpus::DocumentationPathPolicy>,
+    documentation_options: docs::corpus::CorpusOptions,
 }
 
 impl EventClassifier {
+    #[cfg(test)]
     fn new(
         root: &Path,
         database: &Path,
         documentation: &docs::corpus::CorpusOptions,
+    ) -> Result<Self> {
+        Self::new_with_docs_freshness(root, database, documentation, true)
+    }
+
+    fn new_with_docs_freshness(
+        root: &Path,
+        database: &Path,
+        documentation: &docs::corpus::CorpusOptions,
+        docs_freshness: bool,
     ) -> Result<Self> {
         let mut excluded = BTreeSet::new();
         excluded.insert(database.to_path_buf());
@@ -517,7 +592,9 @@ impl EventClassifier {
         Ok(Self {
             root: root.to_path_buf(),
             excluded,
-            git_controls: git_control_paths(root),
+            git_controls: active_git_control_paths(root, docs_freshness),
+            docs_freshness,
+            config_exact: BTreeSet::new(),
             external_exact: BTreeSet::new(),
             external_prefixes: BTreeSet::new(),
             source_policy: RefCell::new(walk::SourcePathPolicy::new(root)),
@@ -525,6 +602,7 @@ impl EventClassifier {
                 root,
                 documentation,
             )?),
+            documentation_options: documentation.clone(),
         })
     }
 
@@ -533,7 +611,31 @@ impl EventClassifier {
         self.documentation_policy.get_mut().reload_ignore()
     }
 
-    fn set_external(&mut self, exact: BTreeSet<PathBuf>, prefixes: BTreeSet<PathBuf>) {
+    fn reload_indexing_policy(
+        &mut self,
+        documentation: &docs::corpus::CorpusOptions,
+        docs_freshness: bool,
+    ) -> Result<()> {
+        if self.documentation_options == *documentation {
+            self.reload_path_policies()?;
+        } else {
+            *self.source_policy.get_mut() = walk::SourcePathPolicy::new(&self.root);
+            *self.documentation_policy.get_mut() =
+                docs::corpus::DocumentationPathPolicy::new(&self.root, documentation)?;
+            self.documentation_options = documentation.clone();
+        }
+        self.git_controls = active_git_control_paths(&self.root, docs_freshness);
+        self.docs_freshness = docs_freshness;
+        Ok(())
+    }
+
+    fn set_external(
+        &mut self,
+        config_exact: BTreeSet<PathBuf>,
+        exact: BTreeSet<PathBuf>,
+        prefixes: BTreeSet<PathBuf>,
+    ) {
+        self.config_exact = config_exact;
         self.external_exact = exact;
         self.external_prefixes = prefixes;
     }
@@ -546,6 +648,13 @@ impl EventClassifier {
         for path in paths {
             let path = self.absolute(path);
             if self.excluded.contains(&path) {
+                continue;
+            }
+            if self.config_exact.contains(&path) {
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::inventory(format!("config:{}", display_path(&self.root, &path))),
+                );
                 continue;
             }
             if self.git_controls.contains(&path) {
@@ -574,7 +683,7 @@ impl EventClassifier {
             if walk::is_in_skipped_directory(&self.root, &path) {
                 continue;
             }
-            if is_refresh_boundary(&path) {
+            if is_active_refresh_boundary(&path, self.docs_freshness) {
                 merge_signal(
                     &mut signal,
                     DirtySignal::full(format!("boundary:{}", display_path(&self.root, &path))),
@@ -678,9 +787,10 @@ enum TargetKind {
     Prefix,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TargetSource {
     Git,
+    Config,
     Dependency,
     Checker,
 }
@@ -803,6 +913,29 @@ impl RejectionReportLatch {
     }
 }
 
+fn prepare_refresh(
+    root: &Path,
+    options: &WatchOptions<'_>,
+    current: &DocsIndexingPolicy,
+    classifier: &mut EventClassifier,
+    requested_scope: RefreshScope,
+) -> Result<(DocsIndexingPolicy, RefreshScope)> {
+    // Reload before opening the phase database. Invalid or temporarily partial
+    // configuration therefore enters the ordinary refresh retry loop without
+    // publishing a snapshot under stale indexing policy.
+    let next = DocsIndexingPolicy::load(root, options)?;
+    let changed = next != *current;
+    classifier.reload_indexing_policy(&next.corpus_options(), next.freshness)?;
+    Ok((
+        next,
+        if changed {
+            RefreshScope::Full
+        } else {
+            requested_scope
+        },
+    ))
+}
+
 pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     validate_options(options)?;
     let root = root.canonicalize()?;
@@ -843,16 +976,18 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         options.enrich_on_change,
     );
     let mut rejection_report_latch = RejectionReportLatch::default();
-    let documentation = docs::corpus::CorpusOptions {
-        include: options.docs_include.to_vec(),
-        exclude: options.docs_exclude.to_vec(),
-        ..Default::default()
-    };
-    let mut classifier = EventClassifier::new(&root, &database, &documentation)?;
+    let mut docs_policy = DocsIndexingPolicy::from_options(options);
+    let documentation = docs_policy.corpus_options();
+    let mut classifier = EventClassifier::new_with_docs_freshness(
+        &root,
+        &database,
+        &documentation,
+        docs_policy.freshness,
+    )?;
     let mut registry = WatchRegistry::default();
-    let mut targets =
-        collect_watch_targets(&root, &database).unwrap_or_else(|_| git_watch_targets(&root));
-    targets.extend(selector_watch_targets(&root, options.dependencies));
+    let mut targets = collect_watch_targets(&root, &database, docs_policy.freshness)
+        .unwrap_or_else(|_| active_git_watch_targets(&root, docs_policy.freshness));
+    extend_configured_watch_targets(&mut targets, &root, options);
     normalize_targets(&mut targets);
     update_classifier_targets(&mut classifier, &targets);
     registry.reconcile(&mut watcher, &root, &targets);
@@ -904,11 +1039,34 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
 
         if let Some(work) = coordinator.next_work(started.elapsed()) {
             let phase_started = Instant::now();
+            if work.phase == Phase::Refresh {
+                // A lexical config symlink may have been repointed by the
+                // event that scheduled this generation. Subscribe its current
+                // resolved target before loading policy or indexing, while
+                // retaining the prior target until successful reconciliation.
+                extend_config_watch_targets(&mut targets, options);
+                normalize_targets(&mut targets);
+                update_classifier_targets(&mut classifier, &targets);
+                registry.reconcile(&mut watcher, &root, &targets);
+            }
+            let mut refresh_preflight = (work.phase == Phase::Refresh).then(|| {
+                prepare_refresh(
+                    &root,
+                    options,
+                    &docs_policy,
+                    &mut classifier,
+                    work.refresh_scope,
+                )
+            });
+            let displayed_refresh_scope = refresh_preflight
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(work.refresh_scope, |(_, scope)| *scope);
             eprintln!(
                 "watch generation={} phase={} refresh_scope={} status=started reasons={}",
                 work.generation,
                 work.phase,
-                work.refresh_scope,
+                displayed_refresh_scope,
                 coordinator
                     .dirty_reasons
                     .iter()
@@ -918,16 +1076,45 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             );
             match work.phase {
                 Phase::Refresh => {
-                    let index_options = indexer::IndexOptions {
-                        dependencies: options.dependencies.to_vec(),
-                        docs_include: options.docs_include.to_vec(),
-                        docs_exclude: options.docs_exclude.to_vec(),
-                        timing: options.timing,
-                        debug: options.debug,
-                        ..Default::default()
+                    let (refresh_scope, candidate_policy, refresh_result) = match refresh_preflight
+                        .take()
+                        .expect("refresh preflight exists for the refresh phase")
+                    {
+                        Ok((next_policy, refresh_scope)) => {
+                            if !docs_policy.freshness && next_policy.freshness {
+                                // Subscribe the provenance controls before the
+                                // first enabled refresh starts. In particular,
+                                // linked-worktree/common-dir controls can live
+                                // outside the recursive repository root. A Git
+                                // change during this refresh must queue a
+                                // successor generation instead of landing in
+                                // the registration gap after publication.
+                                targets.extend(active_git_watch_targets(&root, true));
+                                normalize_targets(&mut targets);
+                                update_classifier_targets(&mut classifier, &targets);
+                                registry.reconcile(&mut watcher, &root, &targets);
+                            }
+                            if next_policy != docs_policy {
+                                eprintln!(
+                                    "watch config_reload=docs-indexing status=loaded freshness={} include={} exclude={}",
+                                    next_policy.freshness,
+                                    next_policy.include.len(),
+                                    next_policy.exclude.len(),
+                                );
+                            }
+                            let index_options = next_policy.index_options(options);
+                            (
+                                refresh_scope,
+                                Some(next_policy),
+                                run_refresh(&root, &database, &index_options, refresh_scope),
+                            )
+                        }
+                        Err(error) => (work.refresh_scope, None, Err(error)),
                     };
-                    match run_refresh(&root, &database, &index_options, work.refresh_scope) {
+                    match refresh_result {
                         Ok(result) => {
+                            docs_policy = candidate_policy
+                                .expect("successful refresh has a loaded documentation policy");
                             match rejection_report_latch.observe(&result.outcome.rejections) {
                                 RejectionReportDecision::Silent => {}
                                 RejectionReportDecision::Details => {
@@ -942,7 +1129,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             eprintln!(
                                 "watch generation={} phase=refresh refresh_scope={} status=succeeded snapshot={} indexed={} unchanged={} removed={} rejected={} extracted_chunks={} extracted_refs={} projection={} elapsed_ms={}",
                                 work.generation,
-                                work.refresh_scope,
+                                refresh_scope,
                                 result.snapshot,
                                 result.outcome.indexed,
                                 result.outcome.unchanged,
@@ -959,10 +1146,13 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                             );
                             let previous_targets = targets.clone();
                             targets =
-                                collect_watch_targets(&root, &database).unwrap_or_else(|error| {
-                                    eprintln!("watch coverage status=read-failed error={error:#}");
-                                    git_watch_targets(&root)
-                                });
+                                collect_watch_targets(&root, &database, docs_policy.freshness)
+                                    .unwrap_or_else(|error| {
+                                        eprintln!(
+                                            "watch coverage status=read-failed error={error:#}"
+                                        );
+                                        active_git_watch_targets(&root, docs_policy.freshness)
+                                    });
                             if options.enrich_on_change {
                                 targets.extend(
                                     previous_targets
@@ -971,11 +1161,10 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 );
                                 normalize_targets(&mut targets);
                             }
-                            targets.extend(selector_watch_targets(&root, options.dependencies));
+                            extend_configured_watch_targets(&mut targets, &root, options);
                             normalize_targets(&mut targets);
                             update_classifier_targets(&mut classifier, &targets);
                             registry.reconcile(&mut watcher, &root, &targets);
-                            classifier.reload_path_policies()?;
                             drain_events(
                                 &receiver,
                                 &classifier,
@@ -1105,11 +1294,14 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 phase_started.elapsed().as_millis()
                             );
                             targets =
-                                collect_watch_targets(&root, &database).unwrap_or_else(|error| {
-                                    eprintln!("watch coverage status=read-failed error={error:#}");
-                                    targets.clone()
-                                });
-                            targets.extend(selector_watch_targets(&root, options.dependencies));
+                                collect_watch_targets(&root, &database, docs_policy.freshness)
+                                    .unwrap_or_else(|error| {
+                                        eprintln!(
+                                            "watch coverage status=read-failed error={error:#}"
+                                        );
+                                        targets.clone()
+                                    });
+                            extend_configured_watch_targets(&mut targets, &root, options);
                             normalize_targets(&mut targets);
                             update_classifier_targets(&mut classifier, &targets);
                             registry.reconcile(&mut watcher, &root, &targets);
@@ -1264,7 +1456,7 @@ fn watch_startup_log(
     watch_policy_fingerprint: &str,
 ) -> String {
     format!(
-        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=restart-required checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={}",
+        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=docs-indexing-only checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={} docs_freshness={}",
         root.display(),
         database.display(),
         env!("CARGO_PKG_VERSION"),
@@ -1278,6 +1470,7 @@ fn watch_startup_log(
         options.embed_on_change,
         options.embed_product_only,
         options.enrich_on_change,
+        options.docs_freshness,
     )
 }
 
@@ -1316,6 +1509,11 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
     list(&mut hasher, "dependencies", options.dependencies);
     list(&mut hasher, "docs_include", options.docs_include);
     list(&mut hasher, "docs_exclude", options.docs_exclude);
+    field(
+        &mut hasher,
+        "docs_freshness",
+        &options.docs_freshness.to_string(),
+    );
     field(&mut hasher, "enrich", &options.enrich_on_change.to_string());
     field(
         &mut hasher,
@@ -1346,6 +1544,9 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
 }
 
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
+    if options.config_explicit && options.config_path.is_none() {
+        bail!("explicit watch configuration path is missing");
+    }
     if options.embed_product_only && !options.embed_on_change {
         bail!("--product requires --embed");
     }
@@ -1629,8 +1830,19 @@ fn absolute_database_path(root: &Path, selected: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Apply runtime policy to the complete boundary vocabulary. Git attribute
+/// conversion affects documentation provenance only, so an opted-out watcher
+/// ignores `.gitattributes` while retaining every structural boundary.
+fn is_active_refresh_boundary(path: &Path, docs_freshness: bool) -> bool {
+    is_refresh_boundary(path)
+        && (docs_freshness
+            || !path
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes"))
+}
+
 /// Paths whose changes can alter source discovery, package ownership, module
-/// resolution, dependency selection, or checker project ownership.
+/// resolution, dependency selection, checker ownership, or Git conversion.
 fn is_refresh_boundary(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -1803,8 +2015,39 @@ fn git_ancestor_attribute_paths(root: &Path) -> BTreeSet<PathBuf> {
     paths
 }
 
-fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
+/// Git controls retained from the structural watcher contract. These remain
+/// active when documentation provenance is disabled; source/package behavior
+/// must not lose its existing checkout and submodule coverage.
+fn source_git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::from([root.join(".gitmodules")]);
+    // A linked worktree or absorbed submodule discovers its private Git
+    // directory through the nearest file-form `.git`. If that indirection is
+    // repaired or repointed, every resolved HEAD/control target can move, so
+    // retain the gitfile itself as a structural control in either freshness
+    // mode.
+    if let Some(gitfile) = root
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .find(|candidate| candidate.is_file() || candidate.is_dir())
+        .filter(|candidate| candidate.is_file())
+    {
+        paths.insert(gitfile);
+    }
+    // Submodule declarations apply from the repository worktree root even
+    // when only a nested package is indexed. That file lies outside the
+    // recursive nested-root subscription and therefore needs an exact target.
+    if let Some(worktree_root) = git_path(root, &["rev-parse", "--show-toplevel"]) {
+        paths.insert(worktree_root.join(".gitmodules"));
+    }
+    if let Some((git_dir, _)) = git_directories(root) {
+        paths.insert(git_dir.join("HEAD"));
+    }
+    paths
+}
+
+/// Complete Git control plane used when documentation provenance is enabled.
+fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = source_git_control_paths(root);
     // Git itself discovers a worktree by walking upward. Watch must use the
     // same ownership boundary when the indexed root is a repository subtree;
     // otherwise a commit can change blame state without touching bytes below
@@ -1877,11 +2120,49 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     paths
 }
 
+fn active_git_control_paths(root: &Path, docs_freshness: bool) -> BTreeSet<PathBuf> {
+    if docs_freshness {
+        git_control_paths(root)
+    } else {
+        source_git_control_paths(root)
+    }
+}
+
+#[cfg(test)]
 fn git_watch_targets(root: &Path) -> Vec<WatchTarget> {
-    git_control_paths(root)
+    active_git_watch_targets(root, true)
+}
+
+fn active_git_watch_targets(root: &Path, docs_freshness: bool) -> Vec<WatchTarget> {
+    active_git_control_paths(root, docs_freshness)
         .into_iter()
         .map(|path| exact_watch_target(path, TargetSource::Git))
         .collect()
+}
+
+fn extend_configured_watch_targets(
+    targets: &mut Vec<WatchTarget>,
+    root: &Path,
+    options: &WatchOptions<'_>,
+) {
+    extend_config_watch_targets(targets, options);
+    targets.extend(selector_watch_targets(root, options.dependencies));
+}
+
+fn extend_config_watch_targets(targets: &mut Vec<WatchTarget>, options: &WatchOptions<'_>) {
+    if let Some(path) = options.config_path {
+        for path in config_watch_paths(path) {
+            targets.push(exact_watch_target(path, TargetSource::Config));
+        }
+    }
+}
+
+fn config_watch_paths(path: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::from([path.to_path_buf()]);
+    if let Ok(resolved) = path.canonicalize() {
+        paths.insert(resolved);
+    }
+    paths
 }
 
 fn selector_watch_targets(root: &Path, dependencies: &[String]) -> Vec<WatchTarget> {
@@ -1896,9 +2177,13 @@ fn selector_watch_targets(root: &Path, dependencies: &[String]) -> Vec<WatchTarg
         .collect()
 }
 
-fn collect_watch_targets(root: &Path, database: &Path) -> Result<Vec<WatchTarget>> {
+fn collect_watch_targets(
+    root: &Path,
+    database: &Path,
+    docs_freshness: bool,
+) -> Result<Vec<WatchTarget>> {
     let conn = store::open_path_read_only(database)?;
-    let mut targets = git_watch_targets(root);
+    let mut targets = active_git_watch_targets(root, docs_freshness);
     let mut packages = conn.prepare(
         "SELECT canonical_root, locator FROM package_instances WHERE origin='dependency'",
     )?;
@@ -1949,9 +2234,13 @@ fn normalize_targets(targets: &mut Vec<WatchTarget>) {
         left.path
             .cmp(&right.path)
             .then_with(|| left.watch_path.cmp(&right.watch_path))
+            .then_with(|| left.source.cmp(&right.source))
     });
     targets.dedup_by(|left, right| {
-        left.path == right.path && left.watch_path == right.watch_path && left.mode == right.mode
+        left.path == right.path
+            && left.watch_path == right.watch_path
+            && left.mode == right.mode
+            && left.source == right.source
     });
 }
 
@@ -1969,9 +2258,14 @@ fn exact_watch_target(path: PathBuf, source: TargetSource) -> WatchTarget {
 }
 
 fn update_classifier_targets(classifier: &mut EventClassifier, targets: &[WatchTarget]) {
+    let mut config_exact = BTreeSet::new();
     let mut exact = BTreeSet::new();
     let mut prefixes = BTreeSet::new();
     for target in targets {
+        if target.source == TargetSource::Config {
+            config_exact.insert(target.path.clone());
+            continue;
+        }
         match target.kind {
             TargetKind::Exact => {
                 exact.insert(target.path.clone());
@@ -1981,7 +2275,7 @@ fn update_classifier_targets(classifier: &mut EventClassifier, targets: &[WatchT
             }
         }
     }
-    classifier.set_external(exact, prefixes);
+    classifier.set_external(config_exact, exact, prefixes);
 }
 
 fn display_path(root: &Path, path: &Path) -> String {

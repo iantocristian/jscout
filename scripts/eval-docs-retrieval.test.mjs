@@ -11,6 +11,7 @@ import {
   configWithFreshness,
   docsSearchArguments,
   hasConflictTreatmentOpportunity,
+  indexConfigForRun,
   materializeRepositories,
   parseArguments,
   phase2ValidityForReport,
@@ -333,6 +334,28 @@ model = "fixed"
   assert.equal(projected.match(/freshness\s*=/g).length, 1);
   assert.equal(projected.match(/max_rank_movement\s*=/g).length, 1);
   assert.match(projected, /\[embedding\]\nmodel = "fixed"/);
+});
+
+test("Phase 3 indexes once with provenance while disabled queries remain opt-out", () => {
+  const configs = new Map([
+    ["baseline\0disabled", "/configs/disabled.toml"],
+    ["baseline\0bound-1", "/configs/enabled.toml"],
+  ]);
+  assert.equal(
+    indexConfigForRun("phase3-candidate", "/configs/baseline.toml", configs),
+    "/configs/enabled.toml",
+  );
+  assert.equal(
+    indexConfigForRun("phase2-baseline", "/configs/baseline.toml", configs),
+    "/configs/baseline.toml",
+  );
+  assert.ok(docsSearchArguments(
+    "lexical",
+    "/repo",
+    "query",
+    "/index.db",
+    { id: "disabled", enabled: false, bound: 1 },
+  ).includes("--no-freshness"));
 });
 
 const freshnessHit = ({

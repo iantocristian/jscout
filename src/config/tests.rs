@@ -109,6 +109,7 @@ include = ["handbook/**/*.md", "handbook/**/*.mdx"]
 exclude = ["handbook/archive/**"]
 [docs.search]
 vector = true
+freshness = true
 "#,
     )?;
 
@@ -116,6 +117,8 @@ vector = true
 
     assert!(!config.effective.docs.enabled);
     assert!(config.effective.docs.search.vector);
+    assert!(config.effective.docs.search.freshness);
+    assert!(!config.effective.docs.indexing_freshness());
     assert!(config.effective.docs.indexing_include().is_empty());
     assert!(config.effective.docs.indexing_exclude().is_empty());
     assert_eq!(

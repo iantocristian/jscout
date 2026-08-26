@@ -339,7 +339,14 @@ fn documentation_search_applies_configured_freshness_at_the_mcp_boundary() -> Re
     anyhow::ensure!(new_commit.status.success(), "second Git commit failed");
 
     let conn = store::open(repo.path())?;
-    indexer::refresh_repo_with_options(repo.path(), &conn, &indexer::IndexOptions::default())?;
+    indexer::refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &indexer::IndexOptions {
+            docs_freshness: true,
+            ..indexer::IndexOptions::default()
+        },
+    )?;
     let defaults = config::DocsSettings {
         enabled: true,
         include: vec!["**/*.md".into()],

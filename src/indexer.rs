@@ -33,6 +33,7 @@ pub struct IndexOptions {
     pub dependency_limits: DependencyLimits,
     pub docs_include: Vec<String>,
     pub docs_exclude: Vec<String>,
+    pub docs_freshness: bool,
     pub timing: bool,
     pub debug: bool,
 }
@@ -44,6 +45,7 @@ impl Default for IndexOptions {
             dependency_limits: DependencyLimits::default(),
             docs_include: crate::docs::default_include_globs(),
             docs_exclude: Vec::new(),
+            docs_freshness: false,
             timing: false,
             debug: false,
         }
@@ -457,9 +459,12 @@ fn index_repo_attempt<F: FileSystem>(
     operation: IndexOperation<'_, F>,
 ) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
-    // Git state is recorded before the immutable documentation capture. Every
-    // blame and the final drift check belong to this one attempted snapshot.
-    let provenance_repository = RepositoryCapture::capture(&root);
+    // Git state is recorded before the immutable documentation capture only
+    // when freshness is opted in. Every blame and final drift check then
+    // belongs to this one attempted snapshot.
+    let provenance_repository = options
+        .docs_freshness
+        .then(|| RepositoryCapture::capture(&root));
     let inventory_started = std::time::Instant::now();
     let inventory = corpus::repository_inventory(
         &root,
@@ -476,11 +481,12 @@ fn index_repo_attempt<F: FileSystem>(
             inventory_started.elapsed()
         );
     }
-    let documentation_provenance = provenance_store::resolve_document_provenance(
-        conn,
-        &provenance_repository,
-        &inventory.documents,
-    )?;
+    let documentation_provenance = match provenance_repository.as_ref() {
+        Some(repository) => {
+            provenance_store::resolve_document_provenance(conn, repository, &inventory.documents)?
+        }
+        None => provenance_store::disabled_document_provenance(&inventory.documents),
+    };
     let workspace_discovery =
         crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
@@ -713,8 +719,25 @@ fn index_repo_attempt<F: FileSystem>(
             outcome.chunks += chunks;
             published.insert(rel);
         }
-        provenance_store::upsert_blame_cache(conn, &documentation_provenance.cache_updates)?;
-        provenance_store::prune_blame_cache(conn, &documentation_provenance.retained_cache_keys)?;
+        if options.docs_freshness {
+            provenance_store::upsert_blame_cache(conn, &documentation_provenance.cache_updates)?;
+            provenance_store::prune_blame_cache(
+                conn,
+                &documentation_provenance.retained_cache_keys,
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![
+                crate::docs::PROVENANCE_ENABLED_META_KEY,
+                if options.docs_freshness {
+                    "true"
+                } else {
+                    "false"
+                }
+            ],
+        )?;
         if options.timing {
             eprintln!(
                 "timing documentation-projection={:?}",
@@ -782,13 +805,15 @@ fn index_repo_attempt<F: FileSystem>(
         )?;
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
-        validate_documentation_provenance_publication(
-            &provenance_repository,
-            &inventory.documents,
-            // Keep this early drift check cheap. Conversion identities are
-            // recomputed once, at the final pre-COMMIT validation below.
-            &[],
-        )?;
+        if let Some(repository) = provenance_repository.as_ref() {
+            validate_documentation_provenance_publication(
+                repository,
+                &inventory.documents,
+                // Keep this early drift check cheap. Conversion identities are
+                // recomputed once, at the final pre-COMMIT validation below.
+                &[],
+            )?;
+        }
         // Manual indexing always resets the optional checker plane. Watch keeps
         // the old active batch and newest superseded staging batch hidden for
         // the following per-project carry step; projection still rejects a
@@ -848,11 +873,13 @@ fn index_repo_attempt<F: FileSystem>(
             // This is intentionally the last fallible operation before the
             // SQLite commit. A checkout or clone-deepening change during
             // projection must not publish provenance from the earlier state.
-            if let Err(error) = validate_documentation_provenance_publication(
-                &provenance_repository,
-                &inventory.documents,
-                &documentation_provenance.publication_checks,
-            ) {
+            if let Some(repository) = provenance_repository.as_ref()
+                && let Err(error) = validate_documentation_provenance_publication(
+                    repository,
+                    &inventory.documents,
+                    &documentation_provenance.publication_checks,
+                )
+            {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error);
             }

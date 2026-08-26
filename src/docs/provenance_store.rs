@@ -13,6 +13,7 @@ const PROJECTION_DOMAIN: &[u8] = b"jscout-doc-provenance-projection-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentProvenanceStatus {
+    Disabled,
     Resolved,
     GitUnavailable,
     UntrackedOrNew,
@@ -23,12 +24,29 @@ pub(crate) enum DocumentProvenanceStatus {
 impl DocumentProvenanceStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Disabled => "disabled",
             Self::Resolved => "resolved",
             Self::GitUnavailable => "git_unavailable",
             Self::UntrackedOrNew => "untracked_or_new",
             Self::PrepareFailed => "prepare_failed",
             Self::BlameFailed => "blame_failed",
         }
+    }
+}
+
+/// Produce deterministic provenance rows without consulting Git or the blame
+/// cache. This keeps the canonical documentation schema complete while the
+/// opt-in freshness projection is disabled.
+pub(crate) fn disabled_document_provenance(documents: &[CapturedDocument]) -> ProvenanceResolution {
+    ProvenanceResolution {
+        documents: documents
+            .iter()
+            .map(|document| unknown_document(document, DocumentProvenanceStatus::Disabled, None))
+            .collect(),
+        diagnostics: Vec::new(),
+        cache_updates: Vec::new(),
+        publication_checks: Vec::new(),
+        retained_cache_keys: BTreeMap::new(),
     }
 }
 

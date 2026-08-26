@@ -28,6 +28,12 @@ search degrades to lexical retrieval rather than disabling. Freshness is a
 bounded reordering applied after relevance, only between candidates whose
 provenance is comparable, and never through the model reranker.
 
+The freshness switch is also the index-time provenance switch. Its default-off
+state performs no Phase 3 Git attribution, blame-cache work, or provenance
+publication revalidation and publishes a disabled/unknown projection. An
+enabled query uses provenance only after an enabled, current-format projection
+has been published by indexing.
+
 History is a block-observation ledger, not reconstructed source history.
 Matching is conservative and one-to-one: exact content first, unique
 neighbor-anchored block alignment second, and no succession claim from ordinal
@@ -114,9 +120,21 @@ decisions on the next shared index, while code indexing continues normally.
 before the next shared index pass; MCP omits the `documentation_search` tool
 and rejects a direct call.
 
-`freshness` controls the bounded temporal reorder and defaults to `false`;
-`max_rank_movement` accepts 1–3 and defaults to 2, but is dormant while
-freshness is disabled. There is no `[docs.embedding]` or `[docs.reranker]` section:
+`freshness` defaults to `false` and controls both index-time Git provenance and
+the bounded temporal reorder. A disabled index pass performs no Phase 3
+repository capture, Git attribution, blame-cache lookup or mutation, or
+provenance revalidation. It atomically publishes
+`documentation_provenance_enabled = false`, per-file status `disabled`, and
+per-chunk basis `unknown` with no timestamps. An enabled index pass computes
+provenance and publishes the marker true in the same transaction.
+
+A search whose effective freshness option is enabled requires that true marker
+and the current provenance format. Missing, false, or incompatible readiness
+fails closed with an instruction to run `jscout index`; it does not block
+freshness-disabled documentation search, `docs status`, `docs embed`, or any
+code or semantic read surface. `max_rank_movement` accepts 1–3 and defaults to
+2, but is dormant while freshness is disabled. There is no `[docs.embedding]`
+or `[docs.reranker]` section:
 vectors use the repository `[embedding]` provider, model, and service, and
 reranking uses the repository `[reranker]` profile. Compatibility of a
 committed `[docs]` section with pre-docs jscout binaries is explicitly not a
@@ -125,6 +143,14 @@ never calls an embedding provider. Only explicit `jscout docs embed`
 materializes missing documentation vectors; the normal code-embedding path
 does not. `[docs.search].vector` controls vector participation in docs search,
 not vector generation, and setting it false does not delete cached vectors.
+
+MCP continues to load all policy once at startup. Watch has one deliberate
+exception: it hot-reloads the documentation indexing policy formed by
+`[docs].enabled`, `[docs].include`, `[docs].exclude`, and
+`[docs.search].freshness`. Any effective change promotes the next watch
+generation to a full refresh; a freshness transition also updates the
+provenance-specific watch targets. Every other config change remains
+restart-bound.
 
 ## Markdown and MDX corpus specification
 
@@ -406,6 +432,13 @@ Docs storage lives in the main database's disposable plane:
   (`hash(format_version, nearest_heading, rendered_body)`), and, in the
   freshness phase, the basis and value columns. This sidecar contains
   format-specific metadata and is not a corpus-membership signal.
+- `doc_file_provenance` (new, file-id keyed): the current per-document
+  projection identity, status, and diagnostic. When freshness is disabled its
+  deterministic status is `disabled`; corresponding chunk bases are `unknown`.
+  `meta.documentation_provenance_enabled` is the independently checked
+  readiness marker, published atomically with these rows. Missing means not
+  ready. The provenance format marker is required only by an effectively
+  freshness-enabled query.
 - `docs_fts` (new FTS5): the docs ranking corpus — title, description/tags,
   breadcrumb, rendered body, path; rowid is the chunk id. Weighted at query
   time; its statistics never mix with `chunks_fts`.
@@ -446,6 +479,13 @@ index pass, same transaction boundaries, same last-good semantics. A failure
 before commit leaves the previous snapshot active for docs and code alike;
 crash recovery exposes exactly one complete previous or replacement
 snapshot, never a partial mixture.
+
+For this implementation, enabled provenance remains input to the shared
+structural snapshot. A history-only attribution change can therefore rotate
+`meta.snapshot` and invalidate checker, semantic, or other snapshot-bound
+publications even when source bytes are unchanged. A separate provenance
+identity/generation is deferred to a post-merge follow-up; this opt-in change
+does not attempt that lifecycle split.
 
 Before chunking, inventory candidates are sorted by their slash-normalized
 repository-relative UTF-8 path in ascending raw byte order, so filesystem
@@ -515,11 +555,13 @@ succession.
 
 ## Git provenance
 
-In a Git worktree, documentation indexing records the checked-out `HEAD` and
-runs one line-porcelain blame per changed tracked Markdown file against the
-same immutable bytes already hashed and parsed, mapping
-blamed lines onto already-produced blocks and then aggregating them into
-retrieval chunks. Rules:
+This section applies only when `[docs.search].freshness = true` for the index
+pass. In a Git worktree, enabled documentation indexing records the checked-out
+`HEAD` and runs one line-porcelain blame per changed tracked Markdown file
+against the same immutable bytes already hashed and parsed, mapping blamed
+lines onto already-produced blocks and then aggregating them into retrieval
+chunks. With freshness disabled, none of the Git commands, cache operations, or
+pre-publication revalidation in this section runs. Rules:
 
 - both author and committer times are stored; "newest" for freshness means
   the latest author time among contributing body lines, because author time
@@ -581,9 +623,10 @@ change aborts that attempt and retries from a new immutable corpus capture; no
 mixed provenance snapshot is published. Staging content at an already tracked
 path does not change the membership fingerprint.
 
-The worktree index, reference manifests, and repository-controlled conversion
-inputs are full-refresh watch controls because their changes can alter current
-attribution. Watch uses the actual worktree index returned by
+While provenance is enabled, the worktree index, reference manifests, and
+repository-controlled conversion inputs are full-refresh watch controls because
+their changes can alter current attribution. Watch uses the actual worktree
+index returned by
 `git rev-parse --git-path index`, including for linked worktrees, rather than
 assuming a common `.git/index`. When the repository uses reftable storage, it
 also watches the exact `reftable/tables.list` manifests under both the resolved
@@ -596,6 +639,14 @@ the resolved `HEAD`, current-ref/log, shallow, and packed-ref controls. Global
 or system Git configuration and external filter executables are not exact watch
 targets; periodic reconciliation remains the eventual-detection boundary for
 conversion inputs outside repository control.
+
+These are provenance-specific controls. The structural controls for the
+nearest file-form `.git` indirection, worktree `HEAD`, and `.gitmodules` remain
+active when provenance is disabled so worktree-pointer repairs, branch
+switches, and submodule-boundary changes still converge. On an off-to-on config
+transition, watch subscribes the provenance controls before running the forced
+full refresh; on an on-to-off transition, it removes them and publishes the
+disabled projection through that full refresh.
 
 Git history is metadata for current chunks only; previous file revisions are
 never ingested.
@@ -660,7 +711,8 @@ the freshness-bearing observation snapshot sequence and timestamp for
 `observed`; and absent for `unknown`.
 Compact agent output retains path, heading, lines, basis, and a
 human-readable changed/observed value. `--no-freshness` disables reordering
-for comparison while still reporting bases.
+for comparison while still reporting whatever bases were published by the
+indexed projection. It does not enable, disable, or rebuild that projection.
 
 ## CLI and MCP surface
 
@@ -683,7 +735,10 @@ default          BM25, plus vector fusion when the profile has a usable index
 --rerank / --no-rerank   override the configured reranker
 ```
 
-`--no-freshness` is added only with phase 3.
+`--no-freshness` is added only with phase 3. An effectively enabled search
+against a database whose `documentation_provenance_enabled` marker is missing
+or false, or whose provenance format is incompatible, fails before ranking and
+tells the operator to run `jscout index`.
 
 In phases 1/2 the MCP `documentation_search` tool returns
 documentation-specific hits: path, title and heading metadata, line range,
@@ -710,6 +765,14 @@ follow the same complete-response accounting as code search.
 - Provider failure during `docs embed`: completed cached batches are kept;
   no readiness row is published, and search reports degraded vector status and
   uses BM25. A previous vector projection is cache, never queryable as current.
+- Freshness enabled without an enabled, current-format index projection: the
+  documentation query fails closed with `run jscout index`; unrelated query,
+  status, and embedding surfaces remain available.
+- Watch documentation-indexing config change: the effective `docs.enabled`,
+  `docs.include`, `docs.exclude`, and `docs.search.freshness` policy is reloaded;
+  any change schedules a full generation. Invalid reloaded config publishes
+  nothing and remains retryable. Other config edits still require a process
+  restart.
 - History matching ambiguity: new occurrence, never a guessed successor.
 
 Further failure-state machinery is deferred until the base feature is in use.
@@ -779,6 +842,15 @@ Deterministic tests:
 - BM25 works with no provider; `--vector` errors without one; hybrid RRF uses
   `k = 60`, produces the expected `1 / (60 + rank)` contributions, and is
   deterministic across insertion order and exact-score ties;
+- freshness-disabled indexing publishes a false provenance marker,
+  `disabled` file statuses, and `unknown` timestamp-free chunk bases without
+  invoking Phase 3 Git commands, blame-cache operations, or provenance
+  revalidation; an enabled index publishes the true marker and provenance rows
+  atomically;
+- an effectively enabled query accepts only a true marker with the current
+  provenance format and otherwise requests `jscout index`; disabled docs
+  search, `docs status`, `docs embed`, and unrelated read surfaces remain
+  available with a missing or false marker;
 - freshness movement from each candidate's recorded base rank never exceeds
   `max_rank_movement`; git and observed candidates never reorder against each
   other; unknown provenance never moves; a rank just outside `limit` can enter
@@ -794,10 +866,15 @@ Deterministic tests:
 - a document above 65,536 logical lines or blame output above 64 MiB remains
   indexed and searchable with visible `unknown`/`blame_failed` provenance, and
   the implementation never buffers an over-limit porcelain response;
-- a worktree-index membership-only change, each reftable `tables.list`
-  location, applicable ancestor `.gitattributes`, repository `info/attributes`,
-  and repository/worktree configuration changes trigger a full watch
-  generation, including in linked worktrees;
+- watch reloads only the effective documentation indexing policy
+  (`docs.enabled/include/exclude` and `docs.search.freshness`), and any change
+  forces a full generation; every other setting remains restart-bound;
+- while provenance is enabled, a worktree-index membership-only change, each
+  reftable `tables.list` location, applicable ancestor `.gitattributes`,
+  repository `info/attributes`, and repository/worktree configuration changes
+  trigger a full watch generation, including in linked worktrees; while it is
+  disabled those Phase 3 targets are absent but the structural file-form
+  `.git`, `HEAD`, and `.gitmodules` controls remain active;
 - code-search ranked content, statistics, and order are byte-identical after
   Markdown and MDX admission modulo the shared snapshot identifier:
   `chunks_fts` contains

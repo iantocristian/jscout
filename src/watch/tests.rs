@@ -13,11 +13,14 @@ use anyhow::Result;
 use crate::indexer;
 
 use super::{
-    Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
-    RefreshScope, RejectionReportDecision, RejectionReportLatch, TargetKind, TargetSource,
-    WatchOptions, clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
-    git_control_paths, git_path, git_watch_targets, is_refresh_boundary, parse_git_ascii_scalar,
-    run_refresh, strip_git_record_terminator, validate_options, watch_enrich_options,
+    Coordinator, DirtySignal, DocsIndexingPolicy, EventClassifier, FinishState,
+    MAX_INCREMENTAL_SOURCE_PATHS, Phase, RefreshScope, RejectionReportDecision,
+    RejectionReportLatch, TargetKind, TargetSource, WatchOptions, active_git_control_paths,
+    active_git_watch_targets, clear_reconciliation_deadline_if_dirty, config_watch_paths,
+    effective_watch_policy_fingerprint, extend_config_watch_targets,
+    extend_configured_watch_targets, git_control_paths, git_path, git_watch_targets,
+    is_refresh_boundary, normalize_targets, parse_git_ascii_scalar, prepare_refresh, run_refresh,
+    strip_git_record_terminator, update_classifier_targets, validate_options, watch_enrich_options,
     watch_startup_log,
 };
 
@@ -573,6 +576,85 @@ fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
 }
 
 #[test]
+fn disabled_docs_freshness_gates_only_provenance_git_controls() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    fs::create_dir_all(repository.path().join(".git/logs"))?;
+    fs::write(repository.path().join(".git/HEAD"), "detached\n")?;
+    fs::write(repository.path().join(".gitattributes"), "*.md text\n")?;
+    fs::write(repository.path().join(".gitignore"), "dist/\n")?;
+    fs::write(repository.path().join(".gitmodules"), "")?;
+    let root = repository.path().canonicalize()?;
+
+    let disabled = active_git_control_paths(&root, false);
+    let enabled = active_git_control_paths(&root, true);
+
+    assert!(disabled.contains(&root.join(".gitmodules")));
+    assert!(disabled.contains(&root.join(".git/HEAD")));
+    assert!(!disabled.contains(&root.join(".git/index")));
+    assert!(!disabled.contains(&root.join(".git/logs/HEAD")));
+    assert!(enabled.is_superset(&disabled));
+    assert!(enabled.contains(&root.join(".git/index")));
+    assert!(enabled.contains(&root.join(".git/logs/HEAD")));
+
+    let disabled_classifier = EventClassifier::new_with_docs_freshness(
+        &root,
+        &root.join("disabled.db"),
+        &Default::default(),
+        false,
+    )?;
+    assert!(
+        disabled_classifier
+            .classify(&[root.join(".gitattributes")])
+            .is_none()
+    );
+    for boundary in [".gitignore", ".gitmodules"] {
+        assert!(
+            disabled_classifier
+                .classify(&[root.join(boundary)])
+                .is_some_and(|signal| signal.scope == RefreshScope::Full),
+            "disabled provenance must retain structural boundary {boundary}"
+        );
+    }
+    let enabled_classifier = EventClassifier::new_with_docs_freshness(
+        &root,
+        &root.join("enabled.db"),
+        &Default::default(),
+        true,
+    )?;
+    assert!(
+        enabled_classifier
+            .classify(&[root.join(".gitattributes")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+
+    let nested = root.join("packages/app");
+    fs::create_dir_all(&nested)?;
+    let disabled_nested = EventClassifier::new_with_docs_freshness(
+        &nested,
+        &nested.join("disabled.db"),
+        &Default::default(),
+        false,
+    )?;
+    assert!(
+        disabled_nested
+            .classify(&[root.join(".gitattributes")])
+            .is_none()
+    );
+    let enabled_nested = EventClassifier::new_with_docs_freshness(
+        &nested,
+        &nested.join("enabled.db"),
+        &Default::default(),
+        true,
+    )?;
+    assert!(
+        enabled_nested
+            .classify(&[root.join(".gitattributes")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    Ok(())
+}
+
+#[test]
 fn git_controls_cover_the_repository_index() -> Result<()> {
     let repository = tempfile::tempdir()?;
     git(repository.path(), &["init"])?;
@@ -605,6 +687,7 @@ fn nested_root_watches_ancestor_attributes_and_repository_conversion_config() ->
     let root_attributes = worktree_root.join(".gitattributes");
     let package_attributes = worktree_root.join("packages/.gitattributes");
     let nested_attributes = nested.join(".gitattributes");
+    let root_gitmodules = worktree_root.join(".gitmodules");
     let config = git_path(&nested, &["rev-parse", "--git-path", "config"])
         .expect("Git must resolve repository config");
     let worktree_config = git_path(&nested, &["rev-parse", "--git-path", "config.worktree"])
@@ -617,6 +700,7 @@ fn nested_root_watches_ancestor_attributes_and_repository_conversion_config() ->
         &nested_attributes,
         &config,
         &worktree_config,
+        &root_gitmodules,
     ] {
         assert!(
             controls.contains(path),
@@ -624,6 +708,27 @@ fn nested_root_watches_ancestor_attributes_and_repository_conversion_config() ->
             path.display()
         );
     }
+
+    let structural_controls = active_git_control_paths(&nested, false);
+    assert!(structural_controls.contains(&root_gitmodules));
+    let structural_classifier = EventClassifier::new_with_docs_freshness(
+        &nested,
+        &nested.join("structural-watch.db"),
+        &Default::default(),
+        false,
+    )?;
+    assert!(
+        structural_classifier
+            .classify(std::slice::from_ref(&root_gitmodules))
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    let structural_target = active_git_watch_targets(&nested, false)
+        .into_iter()
+        .find(|target| target.path == root_gitmodules)
+        .expect("worktree-root .gitmodules needs an external exact target");
+    assert_eq!(structural_target.kind, TargetKind::Exact);
+    assert_eq!(structural_target.source, TargetSource::Git);
+    assert_eq!(structural_target.watch_path, worktree_root);
     let classifier = EventClassifier::new(&nested, &nested.join("watch.db"), &Default::default())?;
     for path in [
         &root_attributes,
@@ -678,8 +783,12 @@ fn git_controls_cover_the_linked_worktree_index() -> Result<()> {
     let linked = linked.canonicalize()?;
     let index = git_path(&linked, &["rev-parse", "--git-path", "index"])
         .expect("Git must resolve the linked worktree index path");
+    let gitfile = linked.join(".git");
+    let nested = linked.join("packages/app");
+    fs::create_dir_all(&nested)?;
 
     assert!(index.is_file());
+    assert!(gitfile.is_file());
     assert!(!index.starts_with(&linked));
     assert!(git_control_paths(&linked).contains(&index));
     let classifier = EventClassifier::new(&linked, &linked.join("watch.db"), &Default::default())?;
@@ -687,6 +796,44 @@ fn git_controls_cover_the_linked_worktree_index() -> Result<()> {
         classifier
             .classify(&[index])
             .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    for (indexed_root, label) in [(&linked, "worktree root"), (&nested, "nested root")] {
+        for freshness in [false, true] {
+            assert!(
+                active_git_control_paths(indexed_root, freshness).contains(&gitfile),
+                "{label} must retain its gitfile when freshness={freshness}"
+            );
+            let target = active_git_watch_targets(indexed_root, freshness)
+                .into_iter()
+                .find(|target| target.path == gitfile)
+                .expect("linked-worktree gitfile needs an exact watch target");
+            assert_eq!(target.kind, TargetKind::Exact);
+            assert_eq!(target.source, TargetSource::Git);
+            assert_eq!(target.watch_path, linked);
+
+            let classifier = EventClassifier::new_with_docs_freshness(
+                indexed_root,
+                &indexed_root.join("gitfile-watch.db"),
+                &Default::default(),
+                freshness,
+            )?;
+            assert!(
+                classifier
+                    .classify(std::slice::from_ref(&gitfile))
+                    .is_some_and(|signal| signal.scope == RefreshScope::Full),
+                "{label} gitfile must force a full refresh when freshness={freshness}"
+            );
+        }
+    }
+
+    let nested_repository = linked.join("nested-repository");
+    fs::create_dir(&nested_repository)?;
+    git(&nested_repository, &["init"])?;
+    let nested_repository_controls = active_git_control_paths(&nested_repository, false);
+    assert!(nested_repository_controls.contains(&nested_repository.join(".git/HEAD")));
+    assert!(
+        !nested_repository_controls.contains(&gitfile),
+        "a nearer .git directory must stop discovery of the outer worktree gitfile"
     );
     Ok(())
 }
@@ -702,7 +849,8 @@ fn git_controls_resolve_a_non_utf8_linked_worktree_pointer() -> Result<()> {
         if matches!(
             error.kind(),
             std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
-        ) {
+        ) || error.raw_os_error() == Some(libc::EILSEQ)
+        {
             // Some Unix filesystems (notably the default macOS filesystem)
             // reject non-UTF8 names before Git can exercise this path.
             return Ok(());
@@ -818,7 +966,11 @@ fn selected_external_prefix_overrides_node_modules_noise() {
     let dependency = root.join("node_modules/pkg");
     let mut classifier =
         EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
-    classifier.set_external(Default::default(), [dependency.clone()].into());
+    classifier.set_external(
+        Default::default(),
+        Default::default(),
+        [dependency.clone()].into(),
+    );
     assert!(
         classifier
             .classify(&[dependency.join("index.js")])
@@ -1121,6 +1273,334 @@ fn irrelevant_regular_files_are_ignored_but_inventory_shapes_refresh_incremental
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn symlinked_config_watches_lexical_and_external_resolved_paths() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    let external = tempfile::tempdir()?;
+    let target = external.path().join("repository-config.toml");
+    fs::write(&target, "version = 1\n")?;
+    let target = target.canonicalize()?;
+
+    let default_link = repository.path().join(crate::config::FILE_NAME);
+    std::os::unix::fs::symlink(&target, &default_link)?;
+    let default_paths = config_watch_paths(&default_link);
+    assert!(default_paths.contains(&default_link));
+    assert!(default_paths.contains(&target));
+
+    let explicit_link = external.path().join("explicit-config.toml");
+    std::os::unix::fs::symlink(&target, &explicit_link)?;
+    let explicit_paths = config_watch_paths(&explicit_link);
+    assert!(explicit_paths.contains(&explicit_link));
+    assert!(explicit_paths.contains(&target));
+
+    let root = repository.path().canonicalize()?;
+    let docs_include = crate::docs::default_include_globs();
+    let options = WatchOptions {
+        database: None,
+        embed_on_change: false,
+        provider: None,
+        embed_product_only: false,
+        dependencies: &[],
+        docs_include: &docs_include,
+        docs_exclude: &[],
+        docs_freshness: false,
+        enrich_on_change: false,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "symlink-config",
+        config_loaded: true,
+        config_path: Some(&default_link),
+        config_explicit: false,
+    };
+    let mut classifier = EventClassifier::new_with_docs_freshness(
+        &root,
+        &root.join("watch.db"),
+        &Default::default(),
+        false,
+    )?;
+    let mut targets = Vec::new();
+    extend_configured_watch_targets(&mut targets, &root, &options);
+    normalize_targets(&mut targets);
+    update_classifier_targets(&mut classifier, &targets);
+
+    for config_event in [&default_link, &target] {
+        assert!(
+            classifier
+                .classify(std::slice::from_ref(config_event))
+                .is_some_and(|signal| signal.scope == RefreshScope::Incremental),
+            "config event was not recognized at {}",
+            config_event.display()
+        );
+    }
+    assert!(targets.iter().any(|watch_target| {
+        watch_target.source == TargetSource::Config
+            && watch_target.path == target
+            && !watch_target.watch_path.starts_with(&root)
+    }));
+
+    let repointed_target = external.path().join("repointed-config.toml");
+    fs::write(&repointed_target, "version = 1\n")?;
+    let repointed_target = repointed_target.canonicalize()?;
+    fs::remove_file(&default_link)?;
+    std::os::unix::fs::symlink(&repointed_target, &default_link)?;
+    extend_config_watch_targets(&mut targets, &options);
+    normalize_targets(&mut targets);
+    update_classifier_targets(&mut classifier, &targets);
+
+    assert!(
+        targets
+            .iter()
+            .any(|watch_target| watch_target.path == repointed_target)
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|watch_target| watch_target.path == target),
+        "the prior target remains covered until successful refresh reconciliation"
+    );
+    assert!(
+        classifier
+            .classify(std::slice::from_ref(&repointed_target))
+            .is_some_and(|signal| signal.scope == RefreshScope::Incremental)
+    );
+    Ok(())
+}
+
+#[test]
+fn config_reload_toggles_docs_provenance_and_forces_a_full_refresh() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    fs::create_dir_all(repository.path().join(".git/logs"))?;
+    fs::write(repository.path().join(".git/HEAD"), "detached\n")?;
+    fs::write(repository.path().join(".gitattributes"), "*.md text\n")?;
+    let root = repository.path().canonicalize()?;
+    let config_path = root.join(crate::config::FILE_NAME);
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs.search]\nfreshness = false\n",
+    )?;
+    let docs_include = crate::docs::default_include_globs();
+    let options = WatchOptions {
+        database: None,
+        embed_on_change: false,
+        provider: None,
+        embed_product_only: false,
+        dependencies: &[],
+        docs_include: &docs_include,
+        docs_exclude: &[],
+        docs_freshness: false,
+        enrich_on_change: false,
+        enrich_timeout: seconds(300),
+        checker_sidecar: None,
+        checker_node: "node",
+        timing: false,
+        debug: false,
+        debounce: seconds(2),
+        reconcile_interval: seconds(600),
+        config_fingerprint: "startup-config",
+        config_loaded: true,
+        config_path: Some(&config_path),
+        config_explicit: false,
+    };
+    let mut policy = DocsIndexingPolicy::from_options(&options);
+    let mut classifier = EventClassifier::new_with_docs_freshness(
+        &root,
+        &root.join("watch.db"),
+        &policy.corpus_options(),
+        policy.freshness,
+    )?;
+    let mut targets = Vec::new();
+    extend_configured_watch_targets(&mut targets, &root, &options);
+    update_classifier_targets(&mut classifier, &targets);
+    assert!(
+        classifier
+            .classify(std::slice::from_ref(&config_path))
+            .is_some_and(|signal| signal.scope == RefreshScope::Incremental)
+    );
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs.search]\nfreshness = false\n\n[watch]\ndebounce_ms = 3000\n",
+    )?;
+    let (unrelated_edit, scope) = prepare_refresh(
+        &root,
+        &options,
+        &policy,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Incremental);
+    assert_eq!(unrelated_edit, policy);
+
+    // Restart-only settings are outside the hot-reload semantic boundary.
+    // Their invalid values must not poison documentation refresh retries.
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs.search]\nfreshness = false\nmax_rank_movement = 0\nlimit = 0\n\n[watch]\ndebounce_ms = 0\n",
+    )?;
+    let (invalid_restart_only, scope) = prepare_refresh(
+        &root,
+        &options,
+        &policy,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Incremental);
+    assert_eq!(invalid_restart_only, policy);
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs.search]\nfreshness = true\n",
+    )?;
+    let (enabled, scope) = prepare_refresh(
+        &root,
+        &options,
+        &policy,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Full);
+    assert!(enabled.freshness);
+    assert!(enabled.index_options(&options).docs_freshness);
+    assert!(
+        classifier
+            .classify(&[root.join(".git/logs/HEAD")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    assert!(
+        classifier
+            .classify(&[root.join(".gitattributes")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+
+    // A failed publication does not advance the in-memory published policy;
+    // retrying the same incremental work must retain the Full promotion.
+    let (retry_enabled, retry_scope) = prepare_refresh(
+        &root,
+        &options,
+        &policy,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(retry_scope, RefreshScope::Full);
+    assert_eq!(retry_enabled, enabled);
+
+    policy = retry_enabled;
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs.search]\nfreshness = false\n",
+    )?;
+    let (disabled, scope) = prepare_refresh(
+        &root,
+        &options,
+        &policy,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Full);
+    assert!(!disabled.freshness);
+    assert!(
+        classifier
+            .classify(&[root.join(".git/logs/HEAD")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join(".gitattributes")])
+            .is_none()
+    );
+    assert!(
+        classifier
+            .classify(&[root.join(".git/HEAD")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs]\ninclude = [\"handbook/**/*.md\"]\nexclude = [\"handbook/private/**\"]\n\n[docs.search]\nfreshness = false\n",
+    )?;
+    let (reselected, scope) = prepare_refresh(
+        &root,
+        &options,
+        &disabled,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Full);
+    assert_eq!(reselected.include, ["handbook/**/*.md"]);
+    assert_eq!(reselected.exclude, ["handbook/private/**"]);
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs]\nenabled = false\n\n[docs.search]\nfreshness = true\n",
+    )?;
+    let (docs_disabled, scope) = prepare_refresh(
+        &root,
+        &options,
+        &reselected,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Full);
+    assert!(docs_disabled.include.is_empty());
+    assert!(docs_disabled.exclude.is_empty());
+    assert!(!docs_disabled.freshness);
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs]\nenabled = false\n\n[docs.search]\nfreshness = false\n",
+    )?;
+    let (disabled_noop, scope) = prepare_refresh(
+        &root,
+        &options,
+        &docs_disabled,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )?;
+    assert_eq!(scope, RefreshScope::Incremental);
+    assert_eq!(disabled_noop, docs_disabled);
+
+    fs::write(
+        &config_path,
+        "version = 1\n\n[docs]\ninclude = [\"!private/**\"]\n",
+    )?;
+    let policy_error = prepare_refresh(
+        &root,
+        &options,
+        &docs_disabled,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )
+    .expect_err("invalid hot-reloaded documentation policy must retry");
+    assert!(
+        policy_error
+            .to_string()
+            .contains("validate documentation include/exclude patterns")
+    );
+
+    fs::write(&config_path, "version =")?;
+    let error = prepare_refresh(
+        &root,
+        &options,
+        &docs_disabled,
+        &mut classifier,
+        RefreshScope::Incremental,
+    )
+    .expect_err("invalid configuration must fail refresh preflight");
+    assert!(error.to_string().contains("parse configuration"));
+    assert!(
+        classifier
+            .classify(&[root.join(".git/logs/HEAD")])
+            .is_none()
+    );
+    Ok(())
+}
+
 #[test]
 fn reconciliation_interval_must_exceed_debounce() {
     let options = WatchOptions {
@@ -1131,6 +1611,7 @@ fn reconciliation_interval_must_exceed_debounce() {
         dependencies: &[],
         docs_include: &[],
         docs_exclude: &[],
+        docs_freshness: false,
         enrich_on_change: false,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -1141,6 +1622,8 @@ fn reconciliation_interval_must_exceed_debounce() {
         reconcile_interval: seconds(2),
         config_fingerprint: "config-test",
         config_loaded: true,
+        config_path: None,
+        config_explicit: false,
     };
     let error = validate_options(&options).expect_err("invalid interval");
     assert!(error.to_string().contains("must exceed"));
@@ -1156,6 +1639,7 @@ fn product_embedding_requires_embedding_phase() {
         dependencies: &[],
         docs_include: &[],
         docs_exclude: &[],
+        docs_freshness: false,
         enrich_on_change: false,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -1166,6 +1650,8 @@ fn product_embedding_requires_embedding_phase() {
         reconcile_interval: seconds(600),
         config_fingerprint: "config-test",
         config_loaded: false,
+        config_path: None,
+        config_explicit: false,
     };
     let error = validate_options(&options).expect_err("product needs embedding");
     assert_eq!(error.to_string(), "--product requires --embed");
@@ -1181,6 +1667,7 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         dependencies: &[],
         docs_include: &[],
         docs_exclude: &[],
+        docs_freshness: false,
         enrich_on_change: true,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -1191,6 +1678,8 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         reconcile_interval: seconds(600),
         config_fingerprint: "runtime-config",
         config_loaded: true,
+        config_path: None,
+        config_explicit: false,
     };
     let line = watch_startup_log(
         Path::new("/repo"),
@@ -1205,7 +1694,7 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         "binary_fingerprint=binary-id",
         "config_fingerprint=runtime-config",
         "config_loaded=true",
-        "config_reload=restart-required",
+        "config_reload=docs-indexing-only",
         "checker_policy_fingerprint=checker-policy-id",
         "watch_policy_fingerprint=watch-policy-id",
         "debounce_ms=2000",
@@ -1213,6 +1702,7 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         "embed=true",
         "product=true",
         "enrich=true",
+        "docs_freshness=false",
     ] {
         assert!(line.contains(expected), "missing {expected:?} from {line}");
     }
@@ -1229,6 +1719,7 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
         dependencies: &dependencies,
         docs_include: &[],
         docs_exclude: &[],
+        docs_freshness: false,
         enrich_on_change: true,
         enrich_timeout: seconds(300),
         checker_sidecar: None,
@@ -1239,6 +1730,8 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
         reconcile_interval: seconds(600),
         config_fingerprint: "same-baseline",
         config_loaded: true,
+        config_path: None,
+        config_explicit: false,
     };
     let baseline = effective_watch_policy_fingerprint(&options);
     assert_eq!(baseline.len(), 64);
@@ -1253,8 +1746,12 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
     assert_ne!(dependencies_changed, timeout_changed);
 
     options.checker_sidecar = Some(Path::new("checker/custom.mjs"));
+    let sidecar_changed = effective_watch_policy_fingerprint(&options);
+    assert_ne!(timeout_changed, sidecar_changed);
+
+    options.docs_freshness = true;
     assert_ne!(
-        timeout_changed,
+        sidecar_changed,
         effective_watch_policy_fingerprint(&options)
     );
 }

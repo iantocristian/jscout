@@ -57,6 +57,207 @@ fn git_test_commit(root: &std::path::Path, message: &str, date: &str) -> Result<
     Ok(())
 }
 
+fn index_repo_with_docs_freshness(
+    root: &std::path::Path,
+    conn: &rusqlite::Connection,
+) -> Result<super::IndexOutcome> {
+    index_repo_with_options(
+        root,
+        conn,
+        &IndexOptions {
+            docs_freshness: true,
+            ..IndexOptions::default()
+        },
+    )
+}
+
+#[test]
+fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -> Result<()> {
+    if Command::new("git").arg("--version").output().is_err() {
+        return Ok(());
+    }
+    assert!(!IndexOptions::default().docs_freshness);
+
+    let repo = tempfile::tempdir()?;
+    git_test_command(repo.path(), &["init", "--quiet"])?;
+    git_test_command(
+        repo.path(),
+        &["config", "user.email", "jscout@example.invalid"],
+    )?;
+    git_test_command(repo.path(), &["config", "user.name", "jscout test"])?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nCurrent provenance guidance.\n",
+    )?;
+    git_test_commit(repo.path(), "initial", "2024-01-01T00:00:00+00:00")?;
+
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let read_marker = || -> Result<String> {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [docs::PROVENANCE_ENABLED_META_KEY],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    };
+    let read_provenance = || -> Result<(String, String, Option<i64>, Option<i64>)> {
+        conn.query_row(
+            "SELECT provenance.status, metadata.freshness_basis,
+                    metadata.freshness_author_time,
+                    metadata.freshness_committer_time
+             FROM files file
+             JOIN chunks chunk ON chunk.file_id=file.id
+             JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+             JOIN doc_file_provenance provenance ON provenance.file_id=file.id
+             WHERE file.path='README.md'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(Into::into)
+    };
+    assert_eq!(read_marker()?, "false");
+    assert_eq!(
+        read_provenance()?,
+        ("disabled".into(), "unknown".into(), None, None)
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM doc_blame_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        0
+    );
+
+    let lexical_options = docs::retrieval::SearchOptions {
+        response_bytes: usize::MAX,
+        output: docs::retrieval::SearchOutput::Pretty,
+        vector: false,
+        rerank: false,
+        ..docs::retrieval::SearchOptions::default()
+    };
+    assert_eq!(
+        docs::retrieval::search(
+            &conn,
+            repo.path(),
+            None,
+            "current provenance guidance",
+            &lexical_options,
+        )?
+        .hits
+        .len(),
+        1
+    );
+    let freshness_options = docs::retrieval::SearchOptions {
+        freshness: true,
+        ..lexical_options.clone()
+    };
+    let error = docs::retrieval::search(
+        &conn,
+        repo.path(),
+        None,
+        "current provenance guidance",
+        &freshness_options,
+    )
+    .expect_err("a false provenance marker must fail closed");
+    assert!(error.to_string().contains("provenance is not indexed"));
+
+    conn.execute(
+        "DELETE FROM meta WHERE key=?1",
+        [docs::PROVENANCE_ENABLED_META_KEY],
+    )?;
+    let error = docs::retrieval::search(
+        &conn,
+        repo.path(),
+        None,
+        "current provenance guidance",
+        &freshness_options,
+    )
+    .expect_err("a missing provenance marker must fail closed");
+    assert!(error.to_string().contains("run `jscout index`"));
+
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
+    assert_eq!(read_marker()?, "true");
+    assert_eq!(
+        read_provenance()?,
+        (
+            "resolved".into(),
+            "git".into(),
+            Some(1_704_067_200),
+            Some(1_704_067_200),
+        )
+    );
+    assert_eq!(
+        docs::retrieval::search(
+            &conn,
+            repo.path(),
+            None,
+            "current provenance guidance",
+            &freshness_options,
+        )?
+        .diagnostics
+        .freshness_status,
+        docs::retrieval::FreshnessStatus::Active
+    );
+    conn.execute(
+        "UPDATE meta SET value='documentation-provenance-stale'
+         WHERE key='documentation_provenance_format_version'",
+        [],
+    )?;
+    let error = docs::retrieval::search(
+        &conn,
+        repo.path(),
+        None,
+        "current provenance guidance",
+        &freshness_options,
+    )
+    .expect_err("a stale enabled provenance format must fail closed");
+    assert!(error.to_string().contains("provenance uses format"));
+    conn.execute(
+        "DELETE FROM meta WHERE key='documentation_provenance_format_version'",
+        [],
+    )?;
+    let error = docs::retrieval::search(
+        &conn,
+        repo.path(),
+        None,
+        "current provenance guidance",
+        &freshness_options,
+    )
+    .expect_err("a missing enabled provenance format must fail closed");
+    assert!(error.to_string().contains("uses format missing"));
+    assert_eq!(
+        docs::retrieval::search(
+            &conn,
+            repo.path(),
+            None,
+            "current provenance guidance",
+            &lexical_options,
+        )?
+        .hits
+        .len(),
+        1,
+        "freshness-disabled search must not require the provenance contract"
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM doc_blame_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+
+    index_repo(repo.path(), &conn)?;
+    assert_eq!(read_marker()?, "false");
+    assert_eq!(
+        read_provenance()?,
+        ("disabled".into(), "unknown".into(), None, None)
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM doc_blame_cache", [], |row| row
+            .get::<_, i64>(0))?,
+        1,
+        "disabling freshness must preserve reusable blame-cache entries"
+    );
+    Ok(())
+}
+
 #[test]
 fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() -> Result<()> {
     if Command::new("git").arg("--version").output().is_err() {
@@ -77,7 +278,7 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
     git_test_commit(repo.path(), "initial", "2001-01-01T00:00:00+00:00")?;
 
     let conn = store::open(repo.path())?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     let read_provenance = || -> Result<(String, Option<i64>, String, i64)> {
         conn.query_row(
             "SELECT metadata.freshness_basis, metadata.freshness_author_time,
@@ -104,7 +305,7 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
 
     fs::write(repo.path().join("main.ts"), "export const value = 2;\n")?;
     git_test_commit(repo.path(), "unrelated code", "2010-01-01T00:00:00+00:00")?;
-    let unrelated = index_repo(repo.path(), &conn)?;
+    let unrelated = index_repo_with_docs_freshness(repo.path(), &conn)?;
     assert!(unrelated.unchanged >= 1);
     assert_eq!(read_provenance()?.3, initial.3);
 
@@ -112,7 +313,7 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
         repo.path().join("README.md"),
         "# Guide\n\nCurrent guidance.\n\n<!-- private note two -->\n",
     )?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     let dirty_comment = read_provenance()?;
     assert_eq!(
         (dirty_comment.0.as_str(), dirty_comment.1),
@@ -121,7 +322,7 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
     let dirty_comment_snapshot = structural::current_snapshot(&conn)?;
 
     git_test_commit(repo.path(), "comment only", "2020-01-01T00:00:00+00:00")?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     assert_eq!(read_provenance()?.1, initial.1);
     assert_eq!(
         structural::current_snapshot(&conn)?,
@@ -133,13 +334,13 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
         repo.path().join("README.md"),
         "# Guide\n\nNew guidance.\n\n<!-- private note two -->\n",
     )?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     let dirty_body = read_provenance()?;
     assert_eq!(dirty_body.0, "working_tree");
     assert_eq!(dirty_body.1, None);
 
     git_test_commit(repo.path(), "current guidance", "2024-01-01T00:00:00+00:00")?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     let committed_body = read_provenance()?;
     assert_eq!(committed_body.0, "git");
     assert_eq!(committed_body.1, Some(1_704_067_200));
@@ -166,7 +367,7 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
     git_test_commit(repo.path(), "initial", "2001-01-01T00:00:00+00:00")?;
 
     let conn = store::open(repo.path())?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
     let snapshot = structural::current_snapshot(&conn)?;
     let initial = {
         let mut statement = conn.prepare(
@@ -233,7 +434,7 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
         String::from_utf8_lossy(&amend.stderr)
     );
 
-    let refreshed = index_repo(repo.path(), &conn)?;
+    let refreshed = index_repo_with_docs_freshness(repo.path(), &conn)?;
     assert_eq!((refreshed.indexed, refreshed.unchanged), (1, 0));
     assert_eq!(structural::current_snapshot(&conn)?, snapshot);
     let current = {
@@ -963,9 +1164,15 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
     fs::write(&source, code_before)?;
     fs::write(&guide, docs_before)?;
     let conn = store::open(repo.path())?;
-    index_repo(repo.path(), &conn)?;
+    index_repo_with_docs_freshness(repo.path(), &conn)?;
 
     let old_snapshot = structural::current_snapshot(&conn)?;
+    let old_provenance_marker: String = conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [docs::PROVENANCE_ENABLED_META_KEY],
+        |row| row.get(0),
+    )?;
+    assert_eq!(old_provenance_marker, "true");
     let old_rows = conn
         .prepare("SELECT path, hash FROM files ORDER BY path")?
         .query_map([], |row| {
@@ -990,6 +1197,15 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
         "failed refresh left a transaction open"
     );
     assert_eq!(structural::current_snapshot(&conn)?, old_snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [docs::PROVENANCE_ENABLED_META_KEY],
+            |row| row.get::<_, String>(0),
+        )?,
+        old_provenance_marker,
+        "failed refresh published a mismatched provenance readiness marker"
+    );
     let retained_rows = conn
         .prepare("SELECT path, hash FROM files ORDER BY path")?
         .query_map([], |row| {

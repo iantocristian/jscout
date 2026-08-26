@@ -1142,6 +1142,14 @@ export function configWithFreshness(source, treatment) {
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
 
+export function indexConfigForRun(runKind, baselineConfig, treatmentConfigs) {
+  if (runKind !== "phase3-candidate") return baselineConfig;
+  const enabledTreatment = FRESHNESS_TREATMENTS.find((treatment) => treatment.enabled);
+  const config = treatmentConfigs.get(`baseline\0${enabledTreatment.id}`);
+  if (!config) throw new Error("phase3-candidate has no provenance-enabled index configuration");
+  return config;
+}
+
 function writeExclusive(path, value, force) {
   mkdirSync(dirname(path), { recursive: true });
   if (existsSync(path) && !force) throw new Error(`output already exists: ${path}`);
@@ -1261,12 +1269,13 @@ async function main() {
       : null;
     const environments = [];
     const runs = [];
+    const indexConfig = indexConfigForRun(options.runKind, baselineConfig, treatmentConfigs);
     for (const repository of repositories.values()) {
       const database = join(workspace, "databases", `${repository.id}.db`);
       mkdirSync(dirname(database), { recursive: true });
       const indexed = run(
         options.binary,
-        ["--config", baselineConfig, "index", repository.path, "--database", database],
+        ["--config", indexConfig, "index", repository.path, "--database", database],
         { env: baseEnv },
       );
       const statusBeforeEmbed = runJscoutJson(
