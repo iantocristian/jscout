@@ -777,6 +777,9 @@ documentation-specific hits: path, title and heading metadata, line range,
 content, shared snapshot digest, and indexed file hash. Phase 3 adds freshness
 basis/value, base rank, and movement; a later ledger may add its shared
 `snapshot_log` sequence.
+Equality of the shared `snapshot` identifies the same indexed source-content
+state; it does not promise identical optional provenance attribution,
+freshness fields, or freshness-adjusted documentation order.
 Byte and line spans are relative to that indexed file hash. To return raw
 checkout source, jscout reads the file once into an immutable buffer, hashes
 that buffer, and slices only that same buffer when the hash matches. On a

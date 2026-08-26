@@ -241,6 +241,8 @@ rotating `meta.snapshot`, so code-bound checker, semantic, and cursor state does
 not become stale solely because Git authorship metadata changed. Documentation
 source edits still rotate `meta.snapshot`, and public responses continue to
 report that shared snapshot; a full code/docs identity split is separate work.
+Snapshot equality covers indexed source content, not optional provenance fields
+or freshness-adjusted ranking.
 The first reindex after installing the digest-split version may rotate an older
 structural digest once because the structural hash contract itself changed.
 

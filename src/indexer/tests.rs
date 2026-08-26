@@ -10,7 +10,7 @@ use super::{
     incremental_refresh_repo_with_options, index_repo, index_repo_with_fs, index_repo_with_options,
     index_repo_with_options_and_fs, index_repo_with_post_replacement_failure,
     index_repo_with_rust_extraction_failure, refresh_repo_with_options,
-    watch_full_refresh_repo_rebinding_checker,
+    watch_full_refresh_repo_rebinding_checker, watch_full_refresh_repo_with_options,
 };
 use crate::test_fs::{FaultFileSystem, FileOperation};
 use crate::{docs, embed, origin, query, search, semantic, store, structural};
@@ -4064,6 +4064,53 @@ fn stale_checker_inputs_are_unpublished_even_when_rust_snapshot_is_unchanged() -
             |row| row.get::<_, i64>(0),
         )?,
         0
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -> Result<()> {
+    let (repo, _external, conn, batch, target, old_file_id, old_call_id) =
+        checker_rebind_fixture()?;
+    let snapshot = structural::current_snapshot(&conn)?;
+
+    let outcome =
+        watch_full_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(outcome.extraction_reset);
+    assert!(outcome.projection_rebuilt);
+    assert!(!outcome.checker_rebound);
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        batch,
+        "an identical watcher refresh must retain the active checker publication"
+    );
+
+    let current_ids: (i64, i64) = conn.query_row(
+        "SELECT file.id,call.rowid FROM files file
+         JOIN member_calls call ON call.file_id=file.id
+         WHERE file.path='service.ts' AND call.prop='load'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        current_ids,
+        (old_file_id, old_call_id),
+        "identical extraction must deterministically reproduce checker source rowids"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1 AND source_ref_id=?2",
+            rusqlite::params![target, current_ids.1],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "the retained checker fact must re-project against the rebuilt canonical row"
     );
     Ok(())
 }
