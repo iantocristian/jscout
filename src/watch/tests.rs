@@ -1,6 +1,11 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,9 +14,11 @@ use crate::indexer;
 
 use super::{
     Coordinator, DirtySignal, EventClassifier, FinishState, MAX_INCREMENTAL_SOURCE_PATHS, Phase,
-    RefreshScope, RejectionReportDecision, RejectionReportLatch, WatchOptions,
-    clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint, git_control_paths,
-    is_refresh_boundary, run_refresh, validate_options, watch_enrich_options, watch_startup_log,
+    RefreshScope, RejectionReportDecision, RejectionReportLatch, TargetKind, TargetSource,
+    WatchOptions, clear_reconciliation_deadline_if_dirty, effective_watch_policy_fingerprint,
+    git_control_paths, git_path, git_watch_targets, is_refresh_boundary, parse_git_ascii_scalar,
+    run_refresh, strip_git_record_terminator, validate_options, watch_enrich_options,
+    watch_startup_log,
 };
 
 fn rejection(path: &str, stage: &'static str, error: &str) -> crate::indexer::IndexRejection {
@@ -28,6 +35,45 @@ fn seconds(value: u64) -> Duration {
 
 fn source_signal(path: &str) -> DirtySignal {
     DirtySignal::source(format!("source:{path}"), path)
+}
+
+fn git(root: &Path, arguments: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+#[test]
+fn git_record_parsing_removes_only_the_output_terminator() {
+    assert_eq!(
+        strip_git_record_terminator(b"index-with-newline\n\n".to_vec()),
+        Some(b"index-with-newline\n".to_vec())
+    );
+    assert_eq!(
+        strip_git_record_terminator(b"index-with-tab\t\n".to_vec()),
+        Some(b"index-with-tab\t".to_vec())
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        strip_git_record_terminator(b"index-with-carriage-return\r\n".to_vec()),
+        Some(b"index-with-carriage-return\r".to_vec())
+    );
+    assert_eq!(strip_git_record_terminator(b"\n".to_vec()), None);
+    assert_eq!(
+        parse_git_ascii_scalar(b"reftable\n".to_vec()).as_deref(),
+        Some("reftable")
+    );
+    assert_eq!(parse_git_ascii_scalar(b"\n".to_vec()), None);
+    assert_eq!(parse_git_ascii_scalar(b"reftable\nfiles\n".to_vec()), None);
 }
 
 #[test]
@@ -480,6 +526,10 @@ fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
     let controls = git_control_paths(root);
     for relative in [
         ".git/HEAD",
+        ".git/config",
+        ".git/config.worktree",
+        ".git/index",
+        ".git/info/attributes",
         ".git/logs/HEAD",
         ".git/refs/heads/main",
         ".git/logs/refs/heads/main",
@@ -493,7 +543,15 @@ fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
     }
 
     let classifier = EventClassifier::new(root, &root.join("watch.db"), &Default::default())?;
-    for relative in [".git/refs/heads/main", ".git/logs/HEAD", ".git/shallow"] {
+    for relative in [
+        ".git/index",
+        ".git/config",
+        ".git/config.worktree",
+        ".git/info/attributes",
+        ".git/refs/heads/main",
+        ".git/logs/HEAD",
+        ".git/shallow",
+    ] {
         let signal = classifier
             .classify(&[root.join(relative)])
             .expect("Git provenance metadata must schedule a refresh");
@@ -511,6 +569,246 @@ fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
         .classify(&[root.join(".git/refs/heads/main")])
         .expect("parent Git metadata must schedule a nested-root refresh");
     assert_eq!(signal.scope, RefreshScope::Full);
+    Ok(())
+}
+
+#[test]
+fn git_controls_cover_the_repository_index() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    git(repository.path(), &["init"])?;
+    fs::write(repository.path().join("README.md"), "tracked\n")?;
+    git(repository.path(), &["add", "README.md"])?;
+    let root = repository.path().canonicalize()?;
+    let index = git_path(&root, &["rev-parse", "--git-path", "index"])
+        .expect("Git must resolve its index path");
+
+    assert!(git_control_paths(&root).contains(&index));
+    let classifier = EventClassifier::new(&root, &root.join("watch.db"), &Default::default())?;
+    let signal = classifier
+        .classify(std::slice::from_ref(&index))
+        .expect("index membership change must schedule a refresh");
+    assert_eq!(signal.scope, RefreshScope::Full);
+    assert!(signal.reasons.contains(&format!(
+        "git:{}",
+        index.strip_prefix(&root).unwrap_or(&index).display()
+    )));
+    Ok(())
+}
+
+#[test]
+fn nested_root_watches_ancestor_attributes_and_repository_conversion_config() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    git(repository.path(), &["init"])?;
+    let worktree_root = repository.path().canonicalize()?;
+    let nested = worktree_root.join("packages/app");
+    fs::create_dir_all(&nested)?;
+    let root_attributes = worktree_root.join(".gitattributes");
+    let package_attributes = worktree_root.join("packages/.gitattributes");
+    let nested_attributes = nested.join(".gitattributes");
+    let config = git_path(&nested, &["rev-parse", "--git-path", "config"])
+        .expect("Git must resolve repository config");
+    let worktree_config = git_path(&nested, &["rev-parse", "--git-path", "config.worktree"])
+        .expect("Git must resolve worktree config");
+    let controls = git_control_paths(&nested);
+
+    for path in [
+        &root_attributes,
+        &package_attributes,
+        &nested_attributes,
+        &config,
+        &worktree_config,
+    ] {
+        assert!(
+            controls.contains(path),
+            "missing control {}",
+            path.display()
+        );
+    }
+    let classifier = EventClassifier::new(&nested, &nested.join("watch.db"), &Default::default())?;
+    for path in [
+        &root_attributes,
+        &package_attributes,
+        &config,
+        &worktree_config,
+    ] {
+        assert!(
+            classifier
+                .classify(std::slice::from_ref(path))
+                .is_some_and(|signal| signal.scope == RefreshScope::Full),
+            "control must trigger a full refresh: {}",
+            path.display()
+        );
+    }
+    let targets = git_watch_targets(&nested);
+    let target = targets
+        .iter()
+        .find(|target| target.path == root_attributes)
+        .expect("worktree-root attributes need an external exact target");
+    assert_eq!(target.kind, TargetKind::Exact);
+    assert_eq!(target.source, TargetSource::Git);
+    assert_eq!(target.watch_path, worktree_root);
+    Ok(())
+}
+
+#[test]
+fn git_controls_cover_the_linked_worktree_index() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let repository = fixture.path().join("repository");
+    fs::create_dir(&repository)?;
+    git(&repository, &["init"])?;
+    git(&repository, &["config", "user.name", "jscout tests"])?;
+    git(
+        &repository,
+        &["config", "user.email", "jscout-tests@example.invalid"],
+    )?;
+    fs::write(repository.join("README.md"), "tracked\n")?;
+    git(&repository, &["add", "README.md"])?;
+    git(&repository, &["commit", "-m", "initial"])?;
+
+    let linked = fixture.path().join("linked");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("temporary path is UTF-8"),
+        ],
+    )?;
+    let linked = linked.canonicalize()?;
+    let index = git_path(&linked, &["rev-parse", "--git-path", "index"])
+        .expect("Git must resolve the linked worktree index path");
+
+    assert!(index.is_file());
+    assert!(!index.starts_with(&linked));
+    assert!(git_control_paths(&linked).contains(&index));
+    let classifier = EventClassifier::new(&linked, &linked.join("watch.db"), &Default::default())?;
+    assert!(
+        classifier
+            .classify(&[index])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn git_controls_resolve_a_non_utf8_linked_worktree_pointer() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let repository = fixture
+        .path()
+        .join(OsString::from_vec(b"repository-\xff".to_vec()));
+    if let Err(error) = fs::create_dir(&repository) {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+        ) {
+            // Some Unix filesystems (notably the default macOS filesystem)
+            // reject non-UTF8 names before Git can exercise this path.
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    git(&repository, &["init"])?;
+    git(&repository, &["config", "user.name", "jscout tests"])?;
+    git(
+        &repository,
+        &["config", "user.email", "jscout-tests@example.invalid"],
+    )?;
+    git(&repository, &["commit", "--allow-empty", "-m", "initial"])?;
+
+    let linked = fixture
+        .path()
+        .join(OsString::from_vec(b"linked-\xfe".to_vec()));
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked)
+        .output()?;
+    if !add.status.success()
+        && String::from_utf8_lossy(&add.stderr).contains("Operation not permitted")
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(add.status.success(), "git worktree add failed");
+    let linked = linked.canonicalize()?;
+    assert!(fs::read_to_string(linked.join(".git")).is_err());
+
+    let git_dir = git_path(&linked, &["rev-parse", "--absolute-git-dir"])
+        .expect("Git must return the raw worktree Git directory");
+    let common_dir = git_path(&linked, &["rev-parse", "--git-common-dir"])
+        .expect("Git must return the raw common Git directory");
+    let index = git_path(&linked, &["rev-parse", "--git-path", "index"])
+        .expect("Git must return the raw index path");
+    let controls = git_control_paths(&linked);
+
+    assert!(controls.contains(&git_dir.join("HEAD")));
+    assert!(controls.contains(&common_dir.join("packed-refs")));
+    assert!(controls.contains(&index));
+    let classifier = EventClassifier::new(&linked, &linked.join("watch.db"), &Default::default())?;
+    assert!(
+        classifier
+            .classify(&[index])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    Ok(())
+}
+
+#[test]
+fn git_controls_cover_both_linked_worktree_reftable_manifests() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let repository = fixture.path().join("repository");
+    fs::create_dir(&repository)?;
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["init", "--ref-format=reftable"])
+        .output()?;
+    if !init.status.success() {
+        // Reftable is optional in older Git builds.
+        return Ok(());
+    }
+    git(&repository, &["config", "user.name", "jscout tests"])?;
+    git(
+        &repository,
+        &["config", "user.email", "jscout-tests@example.invalid"],
+    )?;
+    git(&repository, &["commit", "--allow-empty", "-m", "initial"])?;
+
+    let linked = fixture.path().join("linked");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("temporary path is UTF-8"),
+        ],
+    )?;
+    let linked = linked.canonicalize()?;
+    let git_dir = git_path(&linked, &["rev-parse", "--absolute-git-dir"])
+        .expect("Git must resolve the worktree Git directory");
+    let common_dir = git_path(
+        &linked,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .expect("Git must resolve the common Git directory");
+    let worktree_manifest = git_dir.join("reftable/tables.list");
+    let common_manifest = common_dir.join("reftable/tables.list");
+    let controls = git_control_paths(&linked);
+
+    assert_ne!(worktree_manifest, common_manifest);
+    assert!(controls.contains(&worktree_manifest));
+    assert!(controls.contains(&common_manifest));
+    let classifier = EventClassifier::new(&linked, &linked.join("watch.db"), &Default::default())?;
+    for manifest in [worktree_manifest, common_manifest] {
+        assert!(
+            classifier
+                .classify(&[manifest])
+                .is_some_and(|signal| signal.scope == RefreshScope::Full)
+        );
+    }
     Ok(())
 }
 
@@ -557,12 +855,18 @@ fn lockfiles_and_configs_are_full_refresh_boundaries() {
     assert!(is_refresh_boundary(Path::new("tsconfig.server.json")));
     assert!(is_refresh_boundary(Path::new("types/ambient.d.ts")));
     assert!(is_refresh_boundary(Path::new(".gitignore")));
+    assert!(is_refresh_boundary(Path::new(".gitattributes")));
     assert!(is_refresh_boundary(Path::new(".ignore")));
 
     let root = PathBuf::from("/repo");
     let classifier =
         EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
-    for boundary in [".gitignore", ".ignore", "pnpm-workspace.yaml"] {
+    for boundary in [
+        ".gitignore",
+        ".gitattributes",
+        ".ignore",
+        "pnpm-workspace.yaml",
+    ] {
         assert!(
             classifier
                 .classify(&[root.join(boundary)])
@@ -795,8 +1099,8 @@ fn irrelevant_regular_files_are_ignored_but_inventory_shapes_refresh_incremental
     );
     assert!(
         classifier
-            .classify(&[root.path().join(".git/index")])
-            .is_none()
+            .classify(&[root.path().join(".git/index").canonicalize()?])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
     );
     assert_eq!(
         classifier.classify(&[root.path().join("renamed-directory")]),

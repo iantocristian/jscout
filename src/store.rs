@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "32";
+pub const SCHEMA_VERSION: &str = "33";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -313,7 +313,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'documentation_provenance_format_version'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='32' WHERE key='schema_version';",
+             UPDATE meta SET value='33' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -331,7 +331,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '32')
+INSERT INTO meta(key, value) VALUES('schema_version', '33')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -414,11 +414,12 @@ CREATE TABLE IF NOT EXISTS doc_file_provenance(
 -- Rebuildable blame mappings. One current entry per indexed-root-scoped path
 -- prevents this cache from becoming a document-history store, while the
 -- complete key avoids reuse across roots, worktree edits, rewritten path
--- history, or clone deepening.
+-- history, Git conversion-state changes, or clone deepening.
 CREATE TABLE IF NOT EXISTS doc_blame_cache(
   path_scope TEXT NOT NULL,
   path TEXT NOT NULL,
   bytes_hash TEXT NOT NULL,
+  converted_blob_oid TEXT NOT NULL,
   path_tip TEXT NOT NULL,
   shallow_fingerprint TEXT NOT NULL,
   attribution_json TEXT NOT NULL,
@@ -1593,9 +1594,9 @@ mod tests {
     }
 
     #[test]
-    fn v31_rebuild_discards_phase3_source_state_and_contract_marker() -> Result<()> {
+    fn v32_rebuild_discards_phase3_source_state_and_contract_marker() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let database = directory.path().join("v31.db");
+        let database = directory.path().join("v32.db");
         let conn = open_path(&database)?;
         conn.execute_batch(
             "INSERT INTO files(id,path,hash,corpus,format,role,origin)
@@ -1612,12 +1613,14 @@ mod tests {
                file_id,projection_hash,status,detail
              ) VALUES(1,'projection','resolved',NULL);
              INSERT INTO doc_blame_cache(
-               path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
-               attribution_json,format_version
-             ) VALUES('scope','README.md','file','tip','shallow','[]','test-v1');
+               path_scope,path,bytes_hash,converted_blob_oid,path_tip,
+               shallow_fingerprint,attribution_json,format_version
+             ) VALUES(
+               'scope','README.md','file','converted','tip','shallow','[]','test-v1'
+             );
              INSERT INTO meta(key,value)
                VALUES('documentation_provenance_format_version','test-v1');
-             UPDATE meta SET value='31' WHERE key='schema_version';",
+             UPDATE meta SET value='32' WHERE key='schema_version';",
         )?;
         drop(conn);
 
@@ -2235,6 +2238,7 @@ mod tests {
                 "path_scope",
                 "path",
                 "bytes_hash",
+                "converted_blob_oid",
                 "path_tip",
                 "shallow_fingerprint",
                 "attribution_json",
@@ -2269,10 +2273,11 @@ mod tests {
                file_id,projection_hash,status,detail
              ) VALUES(1,'projection','resolved',NULL);
              INSERT INTO doc_blame_cache(
-               path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
-               attribution_json,format_version
+               path_scope,path,bytes_hash,converted_blob_oid,path_tip,
+               shallow_fingerprint,attribution_json,format_version
              ) VALUES(
-               'scope','README.md','file','tip','shallow','[]','documentation-provenance-v1'
+               'scope','README.md','file','converted','tip','shallow','[]',
+               'test-contract'
              );
              INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
                VALUES(1,'README','','','','README.md');

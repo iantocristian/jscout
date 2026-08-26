@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -9,10 +9,14 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-const CACHE_KEY_DOMAIN: &[u8] = b"jscout-doc-blame-cache-v1\0";
+const CACHE_KEY_DOMAIN: &[u8] = b"jscout-doc-blame-cache-v2\0";
 const INDEX_MEMBERSHIP_DOMAIN: &[u8] = b"jscout-doc-git-index-membership-v1\0";
 const PATH_SCOPE_DOMAIN: &[u8] = b"jscout-doc-git-path-scope-v1\0";
 const SHALLOW_SET_DOMAIN: &[u8] = b"jscout-doc-shallow-set-v1\0";
+pub(crate) const MAX_BLAME_LOGICAL_LINES: usize = 65_536;
+const MAX_BLAME_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;
+const MAX_HASH_OBJECT_STDOUT_BYTES: usize = 128;
 
 /// Git state recorded before a documentation corpus is captured and parsed.
 /// Every per-file blame uses this same `HEAD` and shallow set.
@@ -48,6 +52,10 @@ pub(crate) struct BlameCacheKey {
     pub path_scope: String,
     pub path: String,
     pub bytes_hash: String,
+    /// Object ID after Git applies the path's current clean-conversion rules
+    /// to the exact captured bytes. Raw bytes alone cannot distinguish an
+    /// attributes or conversion-config change that alters blame semantics.
+    pub converted_blob_oid: String,
     pub path_tip: String,
     pub shallow_fingerprint: String,
 }
@@ -60,6 +68,7 @@ impl BlameCacheKey {
         hash_field(&mut hasher, self.path_scope.as_bytes());
         hash_field(&mut hasher, self.path.as_bytes());
         hash_field(&mut hasher, self.bytes_hash.as_bytes());
+        hash_field(&mut hasher, self.converted_blob_oid.as_bytes());
         hash_field(&mut hasher, self.path_tip.as_bytes());
         hash_field(&mut hasher, self.shallow_fingerprint.as_bytes());
         hasher.finalize().to_hex().to_string()
@@ -136,6 +145,14 @@ pub(crate) struct ChunkGitProvenance {
 pub(crate) enum PublicationValidation {
     Stable,
     Drift(RepositoryDrift),
+    ConversionDrift(ConvertedBlobDrift),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConvertedBlobDrift {
+    pub path: String,
+    pub recorded_oid: String,
+    pub current_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +257,8 @@ impl GitRepository {
                 path_scope: self.path_scope.clone(),
                 path: path.to_owned(),
                 bytes_hash: blake3::hash(bytes).to_hex().to_string(),
+                converted_blob_oid: read_converted_blob_oid(&self.root, path, bytes)
+                    .with_context(|| format!("fingerprint Git conversion state for {path}"))?,
                 path_tip,
                 shallow_fingerprint: self.shallow.fingerprint.clone(),
             },
@@ -281,10 +300,9 @@ impl GitRepository {
             "captured bytes do not match the prepared blame cache key"
         );
 
+        let expected_lines = validate_blame_input(bytes)?;
         let args = blame_arguments(&self.head, &request.cache_key.path);
-        let output = run_git(&self.root, &args, Some(bytes))?;
-        let lines =
-            parse_line_porcelain(&output, git_logical_line_count(bytes), &self.shallow.oids)?;
+        let lines = run_git_blame(&self.root, &args, bytes, expected_lines, &self.shallow.oids)?;
         Ok(BlameMapping {
             cache_key: request.cache_key.clone(),
             lines,
@@ -293,26 +311,48 @@ impl GitRepository {
 
     /// Re-read all state inputs immediately before publication. Callers must
     /// abort and retry the whole immutable capture when this reports drift.
-    pub(crate) fn validate_before_publication(&self) -> Result<PublicationValidation> {
+    pub(crate) fn validate_before_publication<'a, I>(
+        &self,
+        conversion_checks: I,
+    ) -> Result<PublicationValidation>
+    where
+        I: IntoIterator<Item = (&'a BlameCacheKey, &'a [u8])>,
+    {
         let current_head = read_head(&self.root).context("re-read checked-out HEAD")?;
         let current_index =
             read_index_state(&self.root).context("re-read current index membership")?;
         let current_shallow =
             read_shallow_state(&self.root).context("re-read resolved shallow file")?;
-        if current_head == self.head
-            && current_index.fingerprint == self.index.fingerprint
-            && current_shallow.fingerprint == self.shallow.fingerprint
+        if current_head != self.head
+            || current_index.fingerprint != self.index.fingerprint
+            || current_shallow.fingerprint != self.shallow.fingerprint
         {
-            return Ok(PublicationValidation::Stable);
+            return Ok(PublicationValidation::Drift(RepositoryDrift {
+                recorded_head: self.head.clone(),
+                current_head,
+                recorded_index_fingerprint: self.index.fingerprint.clone(),
+                current_index_fingerprint: current_index.fingerprint,
+                recorded_shallow_fingerprint: self.shallow.fingerprint.clone(),
+                current_shallow_fingerprint: current_shallow.fingerprint,
+            }));
         }
-        Ok(PublicationValidation::Drift(RepositoryDrift {
-            recorded_head: self.head.clone(),
-            current_head,
-            recorded_index_fingerprint: self.index.fingerprint.clone(),
-            current_index_fingerprint: current_index.fingerprint,
-            recorded_shallow_fingerprint: self.shallow.fingerprint.clone(),
-            current_shallow_fingerprint: current_shallow.fingerprint,
-        }))
+        for (key, bytes) in conversion_checks {
+            ensure!(
+                key.bytes_hash == blake3::hash(bytes).to_hex().as_str(),
+                "captured bytes do not match the conversion revalidation key for {}",
+                key.path
+            );
+            let current_oid = read_converted_blob_oid(&self.root, &key.path, bytes)
+                .with_context(|| format!("revalidate Git conversion state for {}", key.path))?;
+            if current_oid != key.converted_blob_oid {
+                return Ok(PublicationValidation::ConversionDrift(ConvertedBlobDrift {
+                    path: key.path.clone(),
+                    recorded_oid: key.converted_blob_oid.clone(),
+                    current_oid,
+                }));
+            }
+        }
+        Ok(PublicationValidation::Stable)
     }
 }
 
@@ -569,7 +609,22 @@ fn blame_arguments(head: &str, path: &str) -> Vec<OsString> {
     ]
 }
 
+fn read_converted_blob_oid(root: &Path, path: &str, bytes: &[u8]) -> Result<String> {
+    let args = vec![
+        OsString::from("--no-replace-objects"),
+        OsString::from("hash-object"),
+        OsString::from("--stdin"),
+        OsString::from("--path"),
+        OsString::from(path),
+    ];
+    let output = run_git(root, &args, Some(bytes))?;
+    parse_single_oid(&output, "converted blob")
+}
+
 fn run_git(root: &Path, args: &[OsString], stdin_bytes: Option<&[u8]>) -> Result<Vec<u8>> {
+    if let Some(bytes) = stdin_bytes {
+        return run_git_with_bounded_input(root, args, bytes, MAX_HASH_OBJECT_STDOUT_BYTES);
+    }
     let mut command = Command::new("git");
     command
         .args(args)
@@ -579,35 +634,15 @@ fn run_git(root: &Path, args: &[OsString], stdin_bytes: Option<&[u8]>) -> Result
         .env("GIT_LITERAL_PATHSPECS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    let mut child = command.spawn().with_context(|| {
+        .stdin(Stdio::null());
+    let child = command.spawn().with_context(|| {
         format!(
             "run Git command `{}`",
             display_git_command(args.iter().map(OsString::as_os_str))
         )
     })?;
 
-    let output = if let Some(bytes) = stdin_bytes {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("Git child did not expose piped stdin"))?;
-        std::thread::scope(|scope| -> Result<_> {
-            let writer = scope.spawn(move || stdin.write_all(bytes));
-            let output = child.wait_with_output().context("wait for Git command")?;
-            writer
-                .join()
-                .map_err(|_| anyhow!("Git stdin writer panicked"))?
-                .context("write captured documentation bytes to Git blame")?;
-            Ok(output)
-        })?
-    } else {
-        child.wait_with_output().context("wait for Git command")?
-    };
+    let output = child.wait_with_output().context("wait for Git command")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -621,6 +656,219 @@ fn run_git(root: &Path, args: &[OsString], stdin_bytes: Option<&[u8]>) -> Result
     Ok(output.stdout)
 }
 
+fn run_git_with_bounded_input(
+    root: &Path,
+    args: &[OsString],
+    stdin_bytes: &[u8],
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "run Git command `{}`",
+            display_git_command(args.iter().map(OsString::as_os_str))
+        )
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stderr"))?;
+
+    std::thread::scope(|scope| -> Result<Vec<u8>> {
+        let writer = scope.spawn(move || stdin.write_all(stdin_bytes));
+        let stderr_reader = scope.spawn(move || read_capped_stderr(stderr));
+        let stdout = read_strictly_capped(stdout, max_stdout_bytes);
+        if stdout.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait().context("wait for bounded Git command")?;
+        let writer_result = writer
+            .join()
+            .map_err(|_| anyhow!("Git stdin writer panicked"))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("Git stderr reader panicked"))?
+            .context("read bounded Git command stderr")?;
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+        let truncation = if stderr.truncated {
+            " [stderr truncated]"
+        } else {
+            ""
+        };
+        let stdout = stdout.with_context(|| {
+            format!(
+                "read bounded output from Git command `{}` (status {}): {}{}",
+                display_git_command(args.iter().map(OsString::as_os_str)),
+                status,
+                stderr_text.trim(),
+                truncation,
+            )
+        })?;
+        // A failing filter commonly closes stdin early. Preserve Git's actual
+        // stderr instead of replacing it with a secondary BrokenPipe.
+        if !status.success() {
+            bail!(
+                "Git command `{}` exited with {}: {}{}",
+                display_git_command(args.iter().map(OsString::as_os_str)),
+                status,
+                stderr_text.trim(),
+                truncation,
+            );
+        }
+        writer_result.context("write command input to Git")?;
+        Ok(stdout)
+    })
+}
+
+fn read_strictly_capped(mut reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).context("read Git stdout")?;
+        if read == 0 {
+            break;
+        }
+        ensure!(
+            retained.len().saturating_add(read) <= limit,
+            "Git stdout exceeds the {limit}-byte limit"
+        );
+        retained.extend_from_slice(&buffer[..read]);
+    }
+    Ok(retained)
+}
+
+struct CappedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_capped_stderr(mut reader: impl Read) -> std::io::Result<CappedStderr> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let available = MAX_GIT_STDERR_BYTES.saturating_sub(retained.len());
+        let keep = available.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(CappedStderr {
+        bytes: retained,
+        truncated,
+    })
+}
+
+fn run_git_blame(
+    root: &Path,
+    args: &[OsString],
+    stdin_bytes: &[u8],
+    expected_lines: usize,
+    shallow_oids: &BTreeSet<String>,
+) -> Result<Vec<LineProvenance>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "run Git command `{}`",
+            display_git_command(args.iter().map(OsString::as_os_str))
+        )
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Git child did not expose piped stderr"))?;
+
+    std::thread::scope(|scope| -> Result<Vec<LineProvenance>> {
+        let writer = scope.spawn(move || stdin.write_all(stdin_bytes));
+        // Always drain stderr to EOF so a verbose Git/filter failure cannot
+        // block the child, but retain only a diagnostic-sized prefix.
+        let stderr_reader = scope.spawn(move || read_capped_stderr(stderr));
+
+        let parsed = parse_line_porcelain_reader(
+            BufReader::new(stdout),
+            expected_lines,
+            shallow_oids,
+            MAX_BLAME_STDOUT_BYTES,
+        );
+        if parsed.is_err() {
+            // Closing stdout is normally enough to stop Git, but an explicit
+            // kill also handles producers that ignore a broken pipe. `wait`
+            // below always reaps the process.
+            let _ = child.kill();
+        }
+        let status = child.wait().context("wait for Git blame command")?;
+        let writer_result = writer
+            .join()
+            .map_err(|_| anyhow!("Git stdin writer panicked"))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("Git stderr reader panicked"))?
+            .context("read Git blame stderr")?;
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+        let truncation = if stderr.truncated {
+            " [stderr truncated]"
+        } else {
+            ""
+        };
+
+        let lines = parsed.with_context(|| {
+            format!(
+                "parse bounded output from Git command `{}` (status {}): {}{}",
+                display_git_command(args.iter().map(OsString::as_os_str)),
+                status,
+                stderr_text.trim(),
+                truncation,
+            )
+        })?;
+        // Preserve Git's stderr when an early command failure also causes the
+        // stdin writer to observe BrokenPipe.
+        if !status.success() {
+            bail!(
+                "Git command `{}` exited with {}: {}{}",
+                display_git_command(args.iter().map(OsString::as_os_str)),
+                status,
+                stderr_text.trim(),
+                truncation,
+            );
+        }
+        writer_result.context("write captured documentation bytes to Git blame")?;
+        Ok(lines)
+    })
+}
+
 fn display_git_command<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> String {
     let mut display = String::from("git");
     for arg in args {
@@ -630,46 +878,65 @@ fn display_git_command<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> String 
     display
 }
 
+#[cfg(test)]
 fn parse_line_porcelain(
     output: &[u8],
     expected_lines: usize,
     shallow_oids: &BTreeSet<String>,
 ) -> Result<Vec<LineProvenance>> {
+    parse_line_porcelain_reader(
+        std::io::Cursor::new(output),
+        expected_lines,
+        shallow_oids,
+        MAX_BLAME_STDOUT_BYTES,
+    )
+}
+
+fn parse_line_porcelain_reader(
+    mut reader: impl BufRead,
+    expected_lines: usize,
+    shallow_oids: &BTreeSet<String>,
+    max_output_bytes: usize,
+) -> Result<Vec<LineProvenance>> {
+    let mut consumed = 0_usize;
+    let mut record = Vec::new();
     if expected_lines == 0 {
         ensure!(
-            output.is_empty(),
+            !read_capped_line(&mut reader, &mut record, &mut consumed, max_output_bytes)?,
             "Git blame returned output for an empty document"
         );
         return Ok(Vec::new());
     }
 
-    let records = output.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let mut cursor = 0_usize;
     let mut mapped = vec![None; expected_lines];
-    while cursor < records.len() {
-        if records[cursor].is_empty() && cursor + 1 == records.len() {
-            break;
-        }
-        let header = ascii(records[cursor], "blame header")?;
-        cursor += 1;
-        let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+    while read_capped_line(&mut reader, &mut record, &mut consumed, max_output_bytes)? {
+        let header = ascii(&record, "blame header")?;
+        let mut fields = header.split_ascii_whitespace();
+        let oid = fields
+            .next()
+            .ok_or_else(|| anyhow!("malformed line-porcelain header `{header}`"))?;
+        let original_line = fields
+            .next()
+            .ok_or_else(|| anyhow!("malformed line-porcelain header `{header}`"))?;
+        let final_line = fields
+            .next()
+            .ok_or_else(|| anyhow!("malformed line-porcelain header `{header}`"))?;
+        let group_size = fields.next();
         ensure!(
-            matches!(fields.len(), 3 | 4),
+            fields.next().is_none(),
             "malformed line-porcelain header `{header}`"
         );
-        let oid = parse_oid(fields[0], "blamed commit")?;
-        let _original_line = parse_positive_line(fields[1], "original line")?;
-        let final_line = parse_positive_line(fields[2], "final line")?;
-        if let Some(group_size) = fields.get(3) {
+        let oid = parse_oid(oid, "blamed commit")?;
+        let _original_line = parse_positive_line(original_line, "original line")?;
+        let final_line = parse_positive_line(final_line, "final line")?;
+        if let Some(group_size) = group_size {
             let _ = parse_positive_line(group_size, "group size")?;
         }
 
         let mut author_time = None;
         let mut committer_time = None;
         let mut found_content = false;
-        while cursor < records.len() {
-            let record = records[cursor];
-            cursor += 1;
+        while read_capped_line(&mut reader, &mut record, &mut consumed, max_output_bytes)? {
             if record.first() == Some(&b'\t') {
                 found_content = true;
                 break;
@@ -710,6 +977,39 @@ fn parse_line_porcelain(
             line.ok_or_else(|| anyhow!("Git blame omitted captured final line {}", index + 1))
         })
         .collect()
+}
+
+fn read_capped_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    consumed: &mut usize,
+    max_output_bytes: usize,
+) -> Result<bool> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf().context("read Git blame stdout")?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let (take, terminated) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (available.len(), false),
+        };
+        let next_consumed = consumed
+            .checked_add(take)
+            .ok_or_else(|| anyhow!("Git blame stdout byte count overflowed"))?;
+        ensure!(
+            next_consumed <= max_output_bytes,
+            "Git blame output exceeds the {max_output_bytes}-byte provenance limit"
+        );
+        let content_end = take - usize::from(terminated);
+        line.extend_from_slice(&available[..content_end]);
+        reader.consume(take);
+        *consumed = next_consumed;
+        if terminated {
+            return Ok(true);
+        }
+    }
 }
 
 fn parse_shallow_set(bytes: &[u8]) -> Result<BTreeSet<String>> {
@@ -788,6 +1088,15 @@ fn parse_timestamp(value: &[u8], label: &str) -> Result<i64> {
 fn ascii<'a>(value: &'a [u8], label: &str) -> Result<&'a str> {
     ensure!(value.is_ascii(), "Git returned non-ASCII {label}");
     std::str::from_utf8(value).context("ASCII Git output is not UTF-8")
+}
+
+pub(crate) fn validate_blame_input(bytes: &[u8]) -> Result<usize> {
+    let logical_lines = git_logical_line_count(bytes);
+    ensure!(
+        logical_lines <= MAX_BLAME_LOGICAL_LINES,
+        "captured document has {logical_lines} Git logical lines; provenance is limited to {MAX_BLAME_LOGICAL_LINES}"
+    );
+    Ok(logical_lines)
 }
 
 fn git_logical_line_count(bytes: &[u8]) -> usize {
@@ -983,6 +1292,56 @@ mod tests {
     }
 
     #[test]
+    fn streaming_parser_enforces_its_stdout_byte_limit() {
+        let oid = "1111111111111111111111111111111111111111";
+        let output = format!(
+            "{oid} 1 1 1\nauthor A\nauthor-time 100\ncommitter C\ncommitter-time 200\nfilename guide.md\n\tbody\n"
+        );
+        assert_eq!(
+            parse_line_porcelain_reader(
+                std::io::Cursor::new(output.as_bytes()),
+                1,
+                &BTreeSet::new(),
+                output.len(),
+            )
+            .expect("the exact output cap must be accepted")
+            .len(),
+            1
+        );
+        let error = parse_line_porcelain_reader(
+            std::io::Cursor::new(output.as_bytes()),
+            1,
+            &BTreeSet::new(),
+            output.len() - 1,
+        )
+        .expect_err("one byte beyond the configured cap must fail");
+        assert!(error.to_string().contains("provenance limit"));
+    }
+
+    #[test]
+    fn blame_logical_line_limit_is_exact() {
+        let accepted = vec![b'\n'; MAX_BLAME_LOGICAL_LINES];
+        assert_eq!(
+            validate_blame_input(&accepted).expect("exact limit must be accepted"),
+            MAX_BLAME_LOGICAL_LINES
+        );
+
+        let rejected = vec![b'\n'; MAX_BLAME_LOGICAL_LINES + 1];
+        let error = validate_blame_input(&rejected).expect_err("line bomb must be rejected");
+        assert!(error.to_string().contains("65537 Git logical lines"));
+        assert!(error.to_string().contains("limited to 65536"));
+    }
+
+    #[test]
+    fn stderr_capture_drains_but_retains_only_its_bound() -> Result<()> {
+        let stderr = vec![b'x'; MAX_GIT_STDERR_BYTES + 17];
+        let captured = read_capped_stderr(std::io::Cursor::new(stderr))?;
+        assert_eq!(captured.bytes.len(), MAX_GIT_STDERR_BYTES);
+        assert!(captured.truncated);
+        Ok(())
+    }
+
+    #[test]
     fn resolved_git_path_preserves_embedded_line_bytes() -> Result<()> {
         assert_eq!(
             one_output_path(
@@ -1094,6 +1453,35 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn real_streaming_blame_maps_a_multi_record_document() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        let mut bytes = Vec::new();
+        for line in 0..2_048 {
+            writeln!(&mut bytes, "stable line {line}")?;
+        }
+        repository.write("guide.md", &bytes)?;
+        repository.commit(
+            "multi-line documentation",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+
+        let git = captured_git(&repository)?;
+        let request = tracked_request(&git, "guide.md", &bytes)?;
+        let mapping = attributed(&git, &request, &bytes)?;
+        assert_eq!(mapping.lines.len(), 2_048);
+        assert!(
+            mapping
+                .lines
+                .iter()
+                .all(|line| matches!(line, LineProvenance::Git { .. }))
+        );
         Ok(())
     }
 
@@ -1340,6 +1728,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_and_publication_validation_track_git_conversion_state() -> Result<()> {
+        let Some(repository) = TestRepository::new()? else {
+            return Ok(());
+        };
+        repository.git(&["config", "core.autocrlf", "true"])?;
+        let bytes = b"first\r\nsecond\r\n";
+        repository.write("guide.md", bytes)?;
+        repository.commit(
+            "documentation",
+            "2001-01-01T00:00:00 +0000",
+            "2001-01-01T00:00:00 +0000",
+        )?;
+        assert_eq!(fs::read(repository.path().join("guide.md"))?, bytes);
+
+        let before_attributes = captured_git(&repository)?;
+        let before = tracked_request(&before_attributes, "guide.md", bytes)?;
+        repository.write(".gitattributes", b"guide.md -text\n")?;
+
+        assert!(matches!(
+            before_attributes
+                .validate_before_publication([(&before.cache_key, bytes.as_slice())])?,
+            PublicationValidation::ConversionDrift(_)
+        ));
+
+        repository.git(&["add", ".gitattributes"])?;
+        repository.git(&["commit", "--quiet", "-m", "disable conversion"])?;
+        let after_attributes = captured_git(&repository)?;
+        let after = tracked_request(&after_attributes, "guide.md", bytes)?;
+        assert_eq!(before.cache_key.bytes_hash, after.cache_key.bytes_hash);
+        assert_eq!(before.cache_key.path_tip, after.cache_key.path_tip);
+        assert_eq!(
+            before.cache_key.shallow_fingerprint,
+            after.cache_key.shallow_fingerprint
+        );
+        assert_ne!(
+            before.cache_key.converted_blob_oid,
+            after.cache_key.converted_blob_oid
+        );
+        assert_ne!(
+            before.cache_key.fingerprint(),
+            after.cache_key.fingerprint()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn shallow_file_controls_mapping_and_cache_key() -> Result<()> {
         let Some(repository) = TestRepository::new()? else {
             return Ok(());
@@ -1394,14 +1828,14 @@ mod tests {
             "2002-01-01T00:00:00 +0000",
         )?;
         assert!(matches!(
-            before_head_change.validate_before_publication()?,
+            before_head_change.validate_before_publication(std::iter::empty())?,
             PublicationValidation::Drift(_)
         ));
 
         let before_index_change = captured_git(&repository)?;
         repository.git(&["rm", "--cached", "--quiet", "guide.md"])?;
         assert!(matches!(
-            before_index_change.validate_before_publication()?,
+            before_index_change.validate_before_publication(std::iter::empty())?,
             PublicationValidation::Drift(_)
         ));
         repository.git(&["add", "guide.md"])?;
@@ -1409,7 +1843,7 @@ mod tests {
         let before_shallow_change = captured_git(&repository)?;
         fs::write(repository.shallow_path(), format!("{root_oid}\n"))?;
         assert!(matches!(
-            before_shallow_change.validate_before_publication()?,
+            before_shallow_change.validate_before_publication(std::iter::empty())?,
             PublicationValidation::Drift(_)
         ));
         Ok(())
@@ -1523,6 +1957,7 @@ mod tests {
             path_scope: "scope".to_owned(),
             path: "guide.md".to_owned(),
             bytes_hash: "bytes".to_owned(),
+            converted_blob_oid: "converted".to_owned(),
             path_tip: "tip".to_owned(),
             shallow_fingerprint: "shallow".to_owned(),
         }

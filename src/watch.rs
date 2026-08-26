@@ -1,8 +1,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -1641,6 +1646,7 @@ fn is_refresh_boundary(path: &Path) -> bool {
             | "bun.lockb"
             | "tsconfig.json"
             | "jsconfig.json"
+            | ".gitattributes"
             | ".gitignore"
             | ".ignore"
             | ".gitmodules"
@@ -1651,12 +1657,76 @@ fn is_refresh_boundary(path: &Path) -> bool {
         || name.ends_with(".d.cts")
 }
 
-fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::from([root.join(".gitmodules")]);
-    // Git itself discovers a worktree by walking upward. Watch must use the
-    // same ownership boundary when the indexed root is a repository subtree;
-    // otherwise a commit can change blame state without touching bytes below
-    // the watched root.
+fn git_output(root: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
+fn strip_git_record_terminator(mut output: Vec<u8>) -> Option<Vec<u8>> {
+    if output.last() == Some(&b'\n') {
+        output.pop();
+        #[cfg(windows)]
+        if output.last() == Some(&b'\r') {
+            output.pop();
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn parse_git_ascii_scalar(output: Vec<u8>) -> Option<String> {
+    let output = strip_git_record_terminator(output)?;
+    if !output.is_ascii() || output.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        return None;
+    }
+    String::from_utf8(output).ok()
+}
+
+fn git_ascii_scalar(root: &Path, arguments: &[&str]) -> Option<String> {
+    parse_git_ascii_scalar(git_output(root, arguments)?)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(output: Vec<u8>) -> PathBuf {
+    PathBuf::from(OsString::from_vec(output))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(output: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(output).ok().map(PathBuf::from)
+}
+
+fn git_path(root: &Path, arguments: &[&str]) -> Option<PathBuf> {
+    let output = strip_git_record_terminator(git_output(root, arguments)?)?;
+    #[cfg(unix)]
+    let path = path_from_git_bytes(output);
+    #[cfg(not(unix))]
+    let path = path_from_git_bytes(output)?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    Some(match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or(path),
+        _ => path,
+    })
+}
+
+fn filesystem_git_directories(root: &Path) -> Option<(PathBuf, PathBuf)> {
     let dot_git = root
         .ancestors()
         .map(|ancestor| ancestor.join(".git"))
@@ -1682,25 +1752,67 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
                     }
                 })
         })
-    });
-    if let Some(git_dir) = git_dir {
-        let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
-        let common_dir = fs::read_to_string(git_dir.join("commondir"))
-            .ok()
-            .map(|contents| contents.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    git_dir.join(path)
-                }
-            })
-            .map_or_else(
-                || git_dir.clone(),
-                |path| path.canonicalize().unwrap_or(path),
-            );
+    })?;
+    let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+    let common_dir = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|contents| contents.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            }
+        })
+        .map_or_else(
+            || git_dir.clone(),
+            |path| path.canonicalize().unwrap_or(path),
+        );
+    Some((git_dir, common_dir))
+}
+
+fn git_directories(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    match (
+        git_path(root, &["rev-parse", "--absolute-git-dir"]),
+        git_path(root, &["rev-parse", "--git-common-dir"]),
+    ) {
+        (Some(git_dir), Some(common_dir)) => Some((git_dir, common_dir)),
+        _ => filesystem_git_directories(root),
+    }
+}
+
+fn git_ancestor_attribute_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let Some(worktree_root) = git_path(root, &["rev-parse", "--show-toplevel"]) else {
+        return BTreeSet::new();
+    };
+    let indexed_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !indexed_root.starts_with(&worktree_root) {
+        return BTreeSet::new();
+    }
+    let mut paths = BTreeSet::new();
+    let mut directory = Some(indexed_root.as_path());
+    while let Some(current) = directory {
+        paths.insert(current.join(".gitattributes"));
+        if current == worktree_root {
+            break;
+        }
+        directory = current.parent();
+    }
+    paths
+}
+
+fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::from([root.join(".gitmodules")]);
+    // Git itself discovers a worktree by walking upward. Watch must use the
+    // same ownership boundary when the indexed root is a repository subtree;
+    // otherwise a commit can change blame state without touching bytes below
+    // the watched root. Prefer Git's raw path resolution so non-UTF8 linked
+    // worktree pointers remain usable; the filesystem parser is retained for
+    // synthetic fixtures and older Git behavior.
+    if let Some((git_dir, common_dir)) = git_directories(root) {
+        paths.extend(git_ancestor_attribute_paths(root));
         let head = git_dir.join("HEAD");
         paths.extend([
             head.clone(),
@@ -1709,6 +1821,38 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
             common_dir.join("packed-refs"),
             common_dir.join("shallow"),
         ]);
+        // `--git-path` resolves the worktree-specific index and deliberately
+        // honors GIT_INDEX_FILE, just like the provenance commands whose
+        // result depends on index membership. Git may return a relative path,
+        // which is relative to the indexed root selected by `-C`.
+        paths.insert(
+            git_path(root, &["rev-parse", "--git-path", "index"])
+                .unwrap_or_else(|| git_dir.join("index")),
+        );
+        paths.insert(
+            git_path(root, &["rev-parse", "--git-path", "info/attributes"])
+                .unwrap_or_else(|| common_dir.join("info/attributes")),
+        );
+        paths.insert(
+            git_path(root, &["rev-parse", "--git-path", "config"])
+                .unwrap_or_else(|| common_dir.join("config")),
+        );
+        paths.insert(
+            git_path(root, &["rev-parse", "--git-path", "config.worktree"])
+                .unwrap_or_else(|| git_dir.join("config.worktree")),
+        );
+        // Reftable updates manifests atomically. Linked worktrees can update
+        // either their private stack or the shared stack, so both manifests
+        // are controls. Match the reported format exactly: older Git versions
+        // may reject this query, in which case the file/packed-refs controls
+        // above remain the conservative fallback for repositories they can
+        // understand.
+        if git_ascii_scalar(root, &["rev-parse", "--show-ref-format"]).as_deref()
+            == Some("reftable")
+        {
+            paths.insert(git_dir.join("reftable/tables.list"));
+            paths.insert(common_dir.join("reftable/tables.list"));
+        }
         if let Some(reference) = fs::read_to_string(&head)
             .ok()
             .and_then(|contents| {

@@ -540,12 +540,25 @@ retrieval chunks. Rules:
 - the blame mapping cache key includes an opaque hash of Git's emitted
   worktree-relative prefix for the indexed root, the indexed-root-relative
   path, a hash of the exact file bytes being blamed, the newest commit touching
-  that path as resolved from the recorded head, and the shallow-set
-  fingerprint. Nested indexed roots that publish into the same database cannot
-  alias one another's `README.md` mapping. Worktree edits, path-history rewriting,
-  clone deepening, and same-content files with different histories therefore
+  that path as resolved from the recorded head, the shallow-set fingerprint,
+  and Git's conversion fingerprint for those bytes at that path. The conversion
+  fingerprint is the object ID produced by
+  `git --no-replace-objects hash-object --stdin --path <path>` over the exact
+  captured bytes, run from the indexed root, so a changed effective Git
+  conversion outcome cannot reuse a stale blame mapping. Nested indexed
+  roots that publish into the same database cannot alias one another's
+  `README.md` mapping. Worktree edits, path-history rewriting, clone deepening,
+  conversion changes, and same-content files with different histories therefore
   resolve correctly; unrelated commits and staging an unchanged worktree file
   do not invalidate it;
+- Git attribution has separate hard per-document limits of 65,536 logical
+  lines and 64 MiB (67,108,864 bytes) of blame standard output. The line limit
+  is checked from the captured bytes before cache lookup or per-document Git
+  execution, and the output limit is enforced while reading the child process, before
+  retaining or parsing an unbounded porcelain response. Either limit is
+  provenance-only: the captured document remains admitted, chunked, and
+  searchable, while its chunks expose basis `unknown`, provenance status
+  `blame_failed`, and a visible diagnostic;
 - modified lines in an already tracked file are labelled `working_tree`
   whether staged or unstaged and order newer than committed lines, without
   inventing a commit;
@@ -559,12 +572,30 @@ retrieval chunks. Rules:
   that file to observed/unknown provenance without failing the scan.
 
 Immediately before publication, the attempt re-reads `HEAD`, exact index path
-membership, and the resolved shallow file and compares them with the recorded
-head, index-membership fingerprint, and shallow-set fingerprint. Drift from a
-concurrent checkout, staging membership change, or clone deepening aborts that
-attempt and retries from a new immutable corpus capture; no mixed provenance
-snapshot is published. Staging content at an already tracked path does not
-change the membership fingerprint.
+membership, and the resolved shallow file and recomputes each prepared tracked
+document's Git conversion fingerprint from its captured bytes. It compares
+those values with the recorded head, index-membership fingerprint, shallow-set
+fingerprint, and per-document conversion fingerprint. Drift from a concurrent
+checkout, staging membership change, clone deepening, or conversion-state
+change aborts that attempt and retries from a new immutable corpus capture; no
+mixed provenance snapshot is published. Staging content at an already tracked
+path does not change the membership fingerprint.
+
+The worktree index, reference manifests, and repository-controlled conversion
+inputs are full-refresh watch controls because their changes can alter current
+attribution. Watch uses the actual worktree index returned by
+`git rev-parse --git-path index`, including for linked worktrees, rather than
+assuming a common `.git/index`. When the repository uses reftable storage, it
+also watches the exact `reftable/tables.list` manifests under both the resolved
+worktree Git directory and common Git directory; the two locations cover
+worktree-local and shared reference updates. Conversion controls include every
+applicable `.gitattributes` from the worktree root through the indexed root,
+including exact ancestor paths when indexing a nested root, plus repository
+`info/attributes`, `config`, and `config.worktree`. These controls supplement
+the resolved `HEAD`, current-ref/log, shallow, and packed-ref controls. Global
+or system Git configuration and external filter executables are not exact watch
+targets; periodic reconciliation remains the eventual-detection boundary for
+conversion inputs outside repository control.
 
 Git history is metadata for current chunks only; previous file revisions are
 never ingested.
@@ -756,9 +787,17 @@ Deterministic tests:
   full-clone root commit retains author time even when porcelain marks it
   `boundary`; rebase preserves author time and freshness ordering; the blame
   cache survives unrelated commits and invalidates on worktree edits,
-  path-history rewrite, and clone deepening; two identical files with distinct
-  path histories use distinct cache entries; configured ignore-revs and
-  replacement refs do not alter attribution;
+  path-history rewrite, clone deepening, and effective Git conversion changes;
+  final drift validation catches a conversion change after cache lookup; two
+  identical files with distinct path histories use distinct cache entries;
+  configured ignore-revs and replacement refs do not alter attribution;
+- a document above 65,536 logical lines or blame output above 64 MiB remains
+  indexed and searchable with visible `unknown`/`blame_failed` provenance, and
+  the implementation never buffers an over-limit porcelain response;
+- a worktree-index membership-only change, each reftable `tables.list`
+  location, applicable ancestor `.gitattributes`, repository `info/attributes`,
+  and repository/worktree configuration changes trigger a full watch
+  generation, including in linked worktrees;
 - code-search ranked content, statistics, and order are byte-identical after
   Markdown and MDX admission modulo the shared snapshot identifier:
   `chunks_fts` contains

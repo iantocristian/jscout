@@ -196,7 +196,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v32; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v33; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -1654,9 +1654,16 @@ Triggers include:
 - `package.json`, `pnpm-workspace.yaml`, source-inventory ignore files,
   supported lockfiles, tsconfig/jsconfig files, declaration files, and other
   resolver configuration;
-- resolved Git worktree `HEAD` control paths, including branch switches and
-  worktree-specific Git directories; source notifications cover checkout
-  changes without treating routine `.git/index` writes as rebuild triggers;
+- resolved Git provenance controls, including worktree-specific `HEAD` and
+  current-ref paths, the exact worktree index returned by
+  `git rev-parse --git-path index`, and shallow/packed-ref state; repositories
+  using reftable additionally watch `reftable/tables.list` under both the
+  resolved worktree Git directory and common Git directory. Git conversion
+  controls also include applicable `.gitattributes` files from the worktree
+  root through a nested indexed root, repository `info/attributes`, and
+  repository/worktree `config` files. Any of these changes selects a full
+  refresh; conversion inputs outside repository control remain covered by
+  periodic reconciliation;
 - `.gitmodules`, submodule control paths, and submodule worktree changes;
 - selected dependency locator entries and canonical package roots, including
   pnpm/Yarn symlink replacement and package installation changes;
@@ -3372,8 +3379,16 @@ The revised decisions:
    unknown;
    blame mappings cache by an opaque hash of Git's worktree-relative prefix for
    the indexed root, indexed-root-relative path, exact file-byte hash, path-tip
-   commit, and shallow boundary fingerprint; nested roots sharing one database
-   cannot alias one another, and filesystem mtime is never a fallback.
+   commit, shallow boundary fingerprint, and Git conversion fingerprint
+   produced from the same captured bytes and path by
+   `git --no-replace-objects hash-object --stdin --path <path>`; nested roots
+   sharing one database cannot alias one another, a changed effective Git
+   conversion outcome cannot reuse a stale mapping, and filesystem mtime is
+   never a fallback. Provenance
+   attribution is separately bounded to 65,536 logical lines and 64 MiB of
+   blame standard output per document. Crossing either provenance-only bound
+   leaves the document indexed and searchable but reports visible
+   `unknown`/`blame_failed` provenance.
    `--no-freshness` preserves the relevance order for comparison.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
@@ -3422,7 +3437,11 @@ shared snapshot, never a partial mixture. Phase 3 acceptance: disabled
 freshness preserves Phase 2 ranked identities; enabled movement never exceeds
 its configured bound, moves unknown provenance, or crosses incomparable
 provenance clocks;
-captured-byte blame is revalidated before publication; and the evaluation
+captured-byte blame, including its Git conversion fingerprint, is revalidated
+before publication; blame line/output bounds fail only provenance rather than
+document admission; worktree-index and reftable-manifest changes trigger a
+full watch refresh, as do repository-controlled Git attribute and configuration
+changes that can alter conversion; and the evaluation
 records the disabled default after rejecting every candidate bound. Deferred
 ledger acceptance: inserting one uniquely distinguishable paragraph produces
 one `added` block observation and no succession rows for untouched blocks;

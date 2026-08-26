@@ -133,9 +133,11 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
     )?;
     conn.execute(
         "INSERT INTO doc_blame_cache(
-           path_scope,path,bytes_hash,path_tip,shallow_fingerprint,
-           attribution_json,format_version
-         ) VALUES('scope-a','README.md','bytes-a','tip-a','shallow-a','[]','cache-v1')",
+           path_scope,path,bytes_hash,converted_blob_oid,path_tip,
+           shallow_fingerprint,attribution_json,format_version
+         ) VALUES(
+           'scope-a','README.md','bytes-a','converted-a','tip-a','shallow-a','[]','cache-v1'
+         )",
         [],
     )?;
     assert_eq!(
@@ -146,7 +148,7 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
 
     conn.execute(
         "UPDATE doc_blame_cache
-         SET bytes_hash='bytes-b', path_tip='tip-b',
+         SET bytes_hash='bytes-b', converted_blob_oid='converted-b', path_tip='tip-b',
              shallow_fingerprint='shallow-b',
              attribution_json='[{\"basis\":\"working_tree\"}]'",
         [],

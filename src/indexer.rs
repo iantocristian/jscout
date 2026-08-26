@@ -9,7 +9,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
 use crate::docs::corpus::{self, CapturedDocument, CorpusOptions, Decision, DocFile};
-use crate::docs::provenance::{GitChunkBasis, PublicationValidation, RepositoryCapture};
+use crate::docs::provenance::{
+    BlameCacheKey, GitChunkBasis, PublicationValidation, RepositoryCapture,
+};
 use crate::docs::provenance_store::{self, ResolvedDocumentProvenance};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
@@ -780,7 +782,13 @@ fn index_repo_attempt<F: FileSystem>(
         )?;
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
-        validate_documentation_provenance_publication(&provenance_repository)?;
+        validate_documentation_provenance_publication(
+            &provenance_repository,
+            &inventory.documents,
+            // Keep this early drift check cheap. Conversion identities are
+            // recomputed once, at the final pre-COMMIT validation below.
+            &[],
+        )?;
         // Manual indexing always resets the optional checker plane. Watch keeps
         // the old active batch and newest superseded staging batch hidden for
         // the following per-project carry step; projection still rejects a
@@ -840,9 +848,11 @@ fn index_repo_attempt<F: FileSystem>(
             // This is intentionally the last fallible operation before the
             // SQLite commit. A checkout or clone-deepening change during
             // projection must not publish provenance from the earlier state.
-            if let Err(error) =
-                validate_documentation_provenance_publication(&provenance_repository)
-            {
+            if let Err(error) = validate_documentation_provenance_publication(
+                &provenance_repository,
+                &inventory.documents,
+                &documentation_provenance.publication_checks,
+            ) {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error);
             }
@@ -860,11 +870,38 @@ fn index_repo_attempt<F: FileSystem>(
     Ok(outcome)
 }
 
-fn validate_documentation_provenance_publication(repository: &RepositoryCapture) -> Result<()> {
+fn validate_documentation_provenance_publication(
+    repository: &RepositoryCapture,
+    documents: &[CapturedDocument],
+    conversion_keys: &[BlameCacheKey],
+) -> Result<()> {
     let RepositoryCapture::Git(repository) = repository else {
         return Ok(());
     };
-    match repository.validate_before_publication() {
+    let conversion_checks = if conversion_keys.is_empty() {
+        Vec::new()
+    } else {
+        let documents_by_path = documents
+            .iter()
+            .map(|document| (document.file.path.as_str(), document.bytes.as_slice()))
+            .collect::<HashMap<_, _>>();
+        conversion_keys
+            .iter()
+            .map(|key| {
+                documents_by_path
+                    .get(key.path.as_str())
+                    .copied()
+                    .map(|bytes| (key, bytes))
+                    .with_context(|| {
+                        format!(
+                            "missing captured documentation bytes for conversion check {}",
+                            key.path
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    match repository.validate_before_publication(conversion_checks) {
         Ok(PublicationValidation::Stable) => Ok(()),
         Ok(PublicationValidation::Drift(drift)) => {
             Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
@@ -875,6 +912,12 @@ fn validate_documentation_provenance_publication(repository: &RepositoryCapture)
                 drift.current_index_fingerprint,
                 drift.recorded_shallow_fingerprint,
                 drift.current_shallow_fingerprint,
+            ))))
+        }
+        Ok(PublicationValidation::ConversionDrift(drift)) => {
+            Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
+                "Git documentation conversion drifted before publication for {}: {} -> {}",
+                drift.path, drift.recorded_oid, drift.current_oid,
             ))))
         }
         Err(error) => Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(

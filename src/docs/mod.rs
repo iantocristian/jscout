@@ -14,7 +14,7 @@ pub const DEFAULT_INCLUDE_GLOBS: &[&str] = &["**/*.md", "**/*.mdx"];
 pub const CHUNK_FORMAT_VERSION: &str = "documentation-v1";
 
 /// Git-attribution and per-chunk provenance projection contract.
-pub const PROVENANCE_FORMAT_VERSION: &str = "documentation-provenance-v1";
+pub const PROVENANCE_FORMAT_VERSION: &str = "documentation-provenance-v2";
 
 pub fn default_include_globs() -> Vec<String> {
     DEFAULT_INCLUDE_GLOBS
