@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "32";
+pub const SCHEMA_VERSION: &str = "33";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -320,7 +320,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'format_contract_version:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='32' WHERE key='schema_version';",
+             UPDATE meta SET value='33' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -338,7 +338,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '32')
+INSERT INTO meta(key, value) VALUES('schema_version', '33')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -2007,6 +2007,90 @@ mod tests {
                     [],
                 )
                 .is_err(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v32_rebuild_preserves_embedding_cache_and_replaces_code_vector_partition_schema()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v32.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "INSERT INTO embedding_profiles(
+               id,provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES(1,'test','tiny','profile',2,'{}');
+             INSERT INTO embeddings(chunk_hash,profile_id,vec)
+               VALUES('cached',1,x'0000000000000000');
+             INSERT INTO semantic_embeddings(document_hash,profile_id,vec)
+               VALUES('semantic-cached',1,x'0000000000000000');
+             INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(1,'src/old.ts','file','code','typescript','production','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,start,end,start_line,end_line,hash,content
+             ) VALUES(1,1,'module',0,1,1,1,'cached','x');
+             INSERT INTO embedding_index_entries(id,chunk_id,profile_id) VALUES(1,1,1);
+             CREATE VIRTUAL TABLE vec_embeddings_2 USING vec0(
+               embedding FLOAT[2] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               origin TEXT PARTITION KEY
+             );
+             INSERT INTO vec_embeddings_2(rowid,embedding,profile_id,origin)
+               VALUES(1,x'0000000000000000',1,'repository');
+             INSERT INTO meta(key,value) VALUES('embedding_index_synced_v1:1','1');
+             UPDATE meta SET value='32' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let rebuilt = open_path(&database)?;
+        rebuilt.execute_batch(
+            "INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(2,'src/current.ts','file-current','code','typescript','production','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,start,end,start_line,end_line,hash,content
+             ) VALUES(2,2,'module',0,1,1,1,'cached','x');",
+        )?;
+        crate::embed::materialize_cached_embeddings(&rebuilt)?;
+        let durable: (i64, i64, i64) = rebuilt.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_profiles),
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM semantic_embeddings)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(durable, (1, 1, 1));
+        assert_eq!(
+            relation_columns(&rebuilt, "vec_embeddings_2")?,
+            ["rowid", "embedding", "profile_id", "origin", "format",],
+        );
+        let disposable: (i64, i64) = rebuilt.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_index_entries),
+               (SELECT count(*) FROM vec_embeddings_2)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(disposable, (1, 1));
+        assert_eq!(
+            rebuilt.query_row(
+                "SELECT vector.format
+                 FROM vec_embeddings_2 vector
+                 JOIN embedding_index_entries entry ON entry.id=vector.rowid",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "typescript",
+            "the preserved cache must rematerialize under the current file format without a provider",
+        );
+        assert_eq!(
+            rebuilt.query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            SCHEMA_VERSION,
         );
         Ok(())
     }

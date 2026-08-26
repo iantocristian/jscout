@@ -3484,7 +3484,13 @@ format. The decisions:
    `target` whose parent contains `Cargo.toml` is a Cargo-output root in phase 1.
    Rust is also excluded from repository reconnaissance membership and its
    disposable file-policy projection; lexical code-corpus admission does not
-   imply semantic-policy admission.
+   imply semantic-policy admission. Code search accepts an optional plural
+   `formats` allowlist of registry ids; omission means every registered code
+   format. The same normalized scope applies before limits to ranked lexical,
+   exact, vector, reranker, and exhaustive candidate generation, is echoed in
+   exhaustive `scope`, and binds its cursor. The original explicit allowlist is
+   copied unchanged across compatible follow-ups and is never reconstructed
+   from echoed scope.
 3. The pinned parser is `ra_ap_syntax`: lossless byte ranges, error tolerance,
    and no C toolchain. Phase-1 chunks form a non-overlapping, gap-free partition
    of the source, carry `kind='rust_text'`, no name/symbol/scope, and an empty
@@ -3508,6 +3514,24 @@ format. The decisions:
    Inline `#[cfg(test)]` modules indexing with their containing file's role is a
    recorded role-granularity limitation.
 
+Canonical `files` and `chunks` remain shared, and phase 1 keeps one code FTS
+ranking corpus. A format filter is a scoping tool, not statistics isolation:
+FTS5 document frequency and average document length still include every code
+format, so filtered JS/TS ranks need not be byte-identical to a Rust-free
+database. The first treatment's post-hoc projection found only a small residual
+effect, but that inspected pilot is not confirmatory evidence. Separate
+per-format FTS statistics are revisited only if a prospectively judged
+mixed-language evaluation shows persistent domination—irrelevant
+cross-language hits pushing relevant same-language gold below K on
+single-language-intent queries—rather than relevant competition.
+
+Phase 1 adds `format` as a sqlite-vec partition key, searches each requested
+origin/format partition, and merges same-profile cosine scores. Rust vectors
+remain disabled until named phase-2 chunks exist and a Rust embedding
+evaluation passes. Later Rust enablement reuses the existing embedding model
+and cache; different models would require rank fusion instead. Only then does
+Rust change from `CodeLexical` to `CodeLexicalAndVector`.
+
 Phase 0 acceptance: a differential fixture indexes the same JS/TS/Markdown/MDX
 repository before and after the registry refactor and compares every public
 code/docs surface and pre-existing canonical column byte-for-byte. The only
@@ -3521,14 +3545,16 @@ Rust rows never enter exact tiers, checker inventory, checker dirty affinity,
 JS-specific fact tables, or module edges; spans slice exactly on multibyte,
 raw-string, and CRLF content; malformed Rust remains searchable and reports its
 parse-error count; and a Rust-only change preserves all JS/TS canonical rows
-and checker carry inputs. A committed query manifest supplies gold JS/TS hits:
-all remain recall@10, no first-gold rank worsens by more than five positions,
-and exact-tier candidates/order remain byte-identical. Self-index timing,
-database size, chunk counts, parse diagnostics, and query results land in
-`eval/results/`. Retrieval evaluation overfetches 100 ranked chunks, preserves
-that raw order, deduplicates by first file occurrence, and then computes file
-Recall@10/MRR. Exact-identifier and genuine multi-token BM25 strata are gated
-and reported separately through the committed provider-free runner. Phase 2
+and checker carry inputs. A prospectively committed provider-free protocol has
+two fresh arms. Filtered parity compares a Rust-free baseline with the mixed
+index searched using `formats=['javascript','typescript']`; JS/TS Recall@10
+does not decrease, MRR drops by no more than 0.02, and baseline top-five gold
+stays top-ten. Mixed relevance searches with formats omitted and uses blinded,
+cross-language relevance judgments plus nDCG@10; language representation is
+observational unless a product quota is explicitly adopted. Both arms retain
+100 raw ranked chunks, deduplicate files by first occurrence, and truncate to
+10. Self-index timing, database size, chunk counts, parse diagnostics, and
+query results land in `eval/results/`. Phase 2
 and 3 remain blocked until their own preregistered
 collision and edge-correctness protocols are committed. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)

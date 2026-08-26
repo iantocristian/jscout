@@ -129,6 +129,27 @@ ineligible for both in phase 1, so the JavaScript-oriented occurrence scanner
 never examines Rust chunks. The absence of Rust names is not relied on as the
 filter.
 
+### Format-scoped retrieval
+
+Code search accepts an optional plural `formats` allowlist containing registry
+ids (`javascript`, `typescript`, `rust`); omission spans every registered code
+format. The normalized selection intersects each producer's capability and is
+applied before limits to BM25, exact definitions, exact occurrences, vectors,
+reranker candidates, and exhaustive traversal. Exhaustive responses echo it in
+`scope.formats`, cursor fingerprints bind it, and completeness claims state
+`corpus`, `file_roles`, `origins`, `formats`, and `snapshot`. A continuation or
+compatible follow-up copies an explicitly supplied formats allowlist unchanged;
+it never synthesizes request filters from echoed scope.
+
+The phase keeps one `chunks_fts` table for the code corpus. Candidate filtering
+therefore does not isolate FTS5 document-frequency or average-document-length
+statistics: a filtered JS/TS ranking need not be byte-identical to a Rust-free
+database. The first inspected treatment showed a small residual statistics
+effect after JS/TS projection, which remains pilot evidence only. Split
+per-format statistics only if a prospectively judged mixed-language evaluation
+shows persistent irrelevant cross-language domination on single-language-
+intent queries; relevant results from another language are not domination.
+
 ### Repository, dependency, and `target` policy
 
 `target` is not a global skipped directory. A directory named `target` whose
@@ -175,17 +196,16 @@ The committed suite must prove:
 8. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
    their input contains no Rust.
 
-Before evaluation results are run, commit a manifest containing at least 24
-Rust retrieval questions and 24 frozen JavaScript/TypeScript controls, their
-gold files, query stratum, retrieval depth, file cutoff, and baseline output.
-The provider-free runner retains 100 raw ranked chunk hits, deduplicates files
-by first occurrence, and then truncates to the first 10 files. Exact-identifier
-and genuine multi-token BM25 strata are reported separately. Phase 1 passes when Rust file
-Recall@10 is at least 90%, JavaScript/TypeScript Recall@10 does not decrease,
-mean reciprocal rank drops by no more than 0.02, and no previously top-five
-gold file falls outside the top ten. Record wall time, peak RSS, indexed bytes,
-chunk count, database bytes, and parse diagnostics for both arms. Performance
-numbers are reported separately from the retrieval gate.
+Before evaluation results are run, prospectively commit a fresh protocol with
+two arms. Filtered parity compares the Rust-free baseline against the mixed
+index with `formats=['javascript','typescript']` on fresh JS/TS controls; file
+Recall@10 may not decrease, MRR may drop by at most 0.02, and baseline top-five
+gold remains top-ten. Mixed relevance searches the default combined corpus
+with formats omitted, uses blinded pooled cross-language relevance judgments,
+and gates nDCG@10 without a language quota. Both arms retain 100 raw ranked
+chunks, deduplicate files by first occurrence, and truncate to 10 files. Record
+wall time, peak RSS, indexed bytes, chunk count, database bytes, and parse
+diagnostics. Performance remains separate from retrieval acceptance.
 
 The first treatment formally failed that frozen gate because relevant new Rust
 files displaced a legacy JS/TS gold file in the shared ranking. Projecting the
@@ -193,6 +213,18 @@ same inspected result to JS/TS paths stayed within the old thresholds, but that
 post-hoc projection is diagnostic only. This phase remains unaccepted pending
 a prospectively frozen replacement control and fresh holdout queries; the
 preserved failure report is the governing evidence until then.
+
+### Later vector enablement
+
+Rust stays lexical-only until phase 2 publishes named semantic chunks; embedding
+the phase-1 lossless partitions would spend provider calls on identities that
+the scheduled rechunk invalidates. Phase 1 adds `format` as a sqlite-vec
+partition key alongside profile and origin because KNN applies `k` before a
+relational format filter. Search queries each requested origin/format partition
+and merges same-profile cosine scores. Later Rust vectors reuse the configured
+code embedding model and content-addressed cache; different models require rank
+fusion. Only after named chunks and a Rust retrieval evaluation pass does the
+registry flip Rust to `CodeLexicalAndVector`.
 
 ## Phase 2 — named Rust chunks and exact tiers
 
@@ -214,7 +246,9 @@ at least eight Rust and eight JavaScript/TypeScript definitions for each of
 `new`, `from`, and `default`. When both formats are eligible, each must appear
 within the first four definition candidates and neither may consume the whole
 definition allowance. A Rust-absent fixture must retain byte-identical existing
-exact results. The phase-1 retrieval thresholds remain gates.
+exact results. The same fixture proves that `formats=['javascript','typescript']`
+and `formats=['rust']` independently constrain exact candidates before their
+limits. The phase-1 retrieval thresholds remain gates.
 
 ## Phase 3 — Rust module edges and Cargo lifecycle
 

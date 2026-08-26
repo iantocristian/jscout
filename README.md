@@ -1,6 +1,7 @@
 # jscout
 
-A fast JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on [oxc](https://oxc.rs).
+A fast JavaScript/TypeScript structural and Rust lexical codebase indexer for
+RAG and agent retrieval, written in Rust with [oxc](https://oxc.rs) for JS/TS.
 
 The runtime value graph remains primary: functions, classes, components, calls,
 renders, and executable module edges work the same way for JavaScript and
@@ -1085,6 +1086,14 @@ projected from the chunk's overlapping declarations. Roles are deterministic:
 Use repeatable `--file-role` flags to restrict primary hits. Chunks remain
 retrieval units; they do not become graph identity.
 
+Code search spans JavaScript, TypeScript, and Rust by default. Use repeatable
+`--format javascript`, `--format typescript`, or `--format rust` flags to scope
+primary retrieval before candidate limits; the MCP `semantic_search` surface
+uses the equivalent plural `formats` array. The formats share one lexical FTS
+corpus, so the filter isolates candidates but not BM25 corpus statistics. Rust
+is lexical-only until its named-chunk phase; a Rust-only search does not invoke
+the code embedding provider.
+
 Structural expansion is off by default and does not alter search scores. Add
 `--expand` to attach a separately labelled context pack:
 
@@ -1319,7 +1328,8 @@ the new space or deleted automatically.
 
 Vector retrieval uses the statically linked `sqlite-vec` extension. jscout
 creates one cosine `vec0` virtual table per embedding dimension, partitioned by
-profile and source origin, and keeps occurrence rows in the same SQLite file.
+profile, source origin, and code format, and keeps occurrence rows in the same
+SQLite file.
 This removes the Rust full-table cosine loop. The stable `vec0` implementation
 is native exact KNN, not an HNSW/approximate index.
 

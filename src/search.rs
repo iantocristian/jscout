@@ -103,6 +103,8 @@ pub struct SearchOptions {
     pub file_roles: Vec<String>,
     /// Backing-file origin allowlist. Defaults to first-party origins.
     pub file_origins: Vec<String>,
+    /// Code-format allowlist. Empty means every registered code format.
+    pub formats: Vec<String>,
     pub include_memory: bool,
     pub memory_limit: usize,
     /// Maximum likely/certain structural hops used to connect a semantic
@@ -137,6 +139,7 @@ impl Default for SearchOptions {
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             file_roles: Vec::new(),
             file_origins: origin::defaults(),
+            formats: Vec::new(),
             include_memory: false,
             memory_limit: 4,
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
@@ -166,6 +169,24 @@ pub enum SearchScopeFileRoles {
     Selected(Vec<String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScopeFormats {
+    All,
+    Selected(Vec<String>),
+}
+
+impl serde::Serialize for SearchScopeFormats {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::All => serializer.serialize_str("all"),
+            Self::Selected(formats) => serde::Serialize::serialize(formats, serializer),
+        }
+    }
+}
+
 impl serde::Serialize for SearchScopeFileRoles {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -183,6 +204,7 @@ pub struct SearchScope {
     pub corpus: &'static str,
     pub file_roles: SearchScopeFileRoles,
     pub origins: Vec<String>,
+    pub formats: SearchScopeFormats,
     pub snapshot: String,
 }
 
@@ -585,6 +607,7 @@ fn exact_intent_candidates(
     per_identifier_limit: usize,
     file_roles: &[String],
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<ExactIntentCandidates> {
     let identifiers = exact_intent_tokens(query);
     // A pure identifier lookup is an explicit request for every exact usage.
@@ -605,6 +628,7 @@ fn exact_intent_candidates(
             per_identifier_limit,
             file_roles,
             file_origins,
+            file_formats,
         )?;
         let definition_set = definition_ids.iter().copied().collect::<HashSet<_>>();
         // Fetch through the normal bounded per-identifier window before
@@ -617,6 +641,7 @@ fn exact_intent_candidates(
             per_identifier_limit,
             file_roles,
             file_origins,
+            file_formats,
         )?
         .into_iter()
         .filter(|chunk_id| !definition_set.contains(chunk_id))
@@ -638,11 +663,12 @@ fn exact_definition_chunks(
     limit: usize,
     file_roles: &[String],
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
+        format_allowlist_json(file_formats, crate::formats::Capability::ExactDefinition)?;
     let row_limit = limit.max(1) as i64;
     let mut rows = Vec::<(i64, i64, i64, i64, String, i64)>::new();
 
@@ -688,7 +714,7 @@ fn exact_definition_chunks(
 
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
+        format_allowlist_json(file_formats, crate::formats::Capability::ExactDefinition)?;
     let mut containing_chunks = conn.prepare_cached(
         "SELECT chunk.id,
                 CASE WHEN chunk.name=?1 COLLATE BINARY THEN 0 ELSE 1 END AS name_priority,
@@ -761,11 +787,12 @@ fn exact_occurrence_chunks(
     limit: usize,
     file_roles: &[String],
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::ExactOccurrence);
+        format_allowlist_json(file_formats, crate::formats::Capability::ExactOccurrence)?;
     let mut statement = conn.prepare_cached(
         "SELECT candidate.chunk_id
          FROM (
@@ -831,7 +858,7 @@ fn exact_occurrence_chunks(
     // against the stored source chunk before admitting an exact occurrence.
     if result.len() < limit {
         let eligible_formats =
-            crate::formats::eligible_ids_json(crate::formats::Capability::ExactOccurrence);
+            format_allowlist_json(file_formats, crate::formats::Capability::ExactOccurrence)?;
         let mut textual = conn.prepare_cached(
             "SELECT chunk.id, chunk.content
              FROM chunks_fts
@@ -1059,13 +1086,14 @@ fn bm25_ranking(
     limit: usize,
     file_roles: &[String],
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<Vec<(i64, f64)>> {
     let fq = fts_query(q);
     if fq.is_empty() {
         return Ok(vec![]);
     }
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
+        format_allowlist_json(file_formats, crate::formats::Capability::CodeLexical)?;
     let mut stmt = conn.prepare(
         "SELECT chunks_fts.rowid, bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0) AS r
          FROM chunks_fts
@@ -1103,8 +1131,9 @@ fn vector_ranking(
     q: &str,
     limit: usize,
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<embed::VectorSearchResult> {
-    embed::vector_search(conn, provider, q, limit, file_origins)
+    embed::vector_search(conn, provider, q, limit, file_origins, file_formats)
 }
 
 fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
@@ -1115,7 +1144,7 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
-const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v2";
+const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v3";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExhaustiveCursorPosition {
@@ -1231,7 +1260,56 @@ fn normalized_allowlist(values: &[String], allowed: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn exhaustive_scope(options: &SearchOptions, snapshot: &str) -> (Vec<String>, SearchScope) {
+fn code_format_ids() -> Vec<&'static str> {
+    crate::formats::ALL
+        .iter()
+        .filter(|format| format.corpus == crate::formats::Corpus::Code)
+        .map(|format| format.id)
+        .collect()
+}
+
+pub(crate) fn validate_code_formats(values: &[String]) -> Result<()> {
+    let allowed = code_format_ids();
+    for format in values {
+        if !allowed.contains(&format.as_str()) {
+            anyhow::bail!(
+                "code format must be one of: {}; got `{format}`",
+                allowed.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_scope_supports_code_vectors(values: &[String]) -> bool {
+    !format_allowlist(values, crate::formats::Capability::CodeVector).is_empty()
+}
+
+fn normalized_code_formats(values: &[String]) -> Vec<String> {
+    normalized_allowlist(values, &code_format_ids())
+}
+
+fn format_allowlist(requested: &[String], capability: crate::formats::Capability) -> Vec<String> {
+    crate::formats::eligible_ids(capability)
+        .into_iter()
+        .filter(|format| requested.is_empty() || requested.iter().any(|value| value == format))
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_allowlist_json(
+    requested: &[String],
+    capability: crate::formats::Capability,
+) -> Result<String> {
+    Ok(serde_json::to_string(&format_allowlist(
+        requested, capability,
+    ))?)
+}
+
+fn exhaustive_scope(
+    options: &SearchOptions,
+    snapshot: &str,
+) -> (Vec<String>, Vec<String>, SearchScope) {
     let selected_roles = normalized_allowlist(&options.file_roles, file_role::ALL);
     let all_roles = selected_roles.len() == file_role::ALL.len();
     let query_roles = if options.file_roles.is_empty() || all_roles {
@@ -1245,20 +1323,39 @@ fn exhaustive_scope(options: &SearchOptions, snapshot: &str) -> (Vec<String>, Se
         SearchScopeFileRoles::Selected(selected_roles)
     };
     let origins = normalized_allowlist(&options.file_origins, origin::ALL);
+    let selected_formats = normalized_code_formats(&options.formats);
+    let all_formats = selected_formats.len() == code_format_ids().len();
+    let query_formats = if options.formats.is_empty() || all_formats {
+        Vec::new()
+    } else {
+        selected_formats.clone()
+    };
+    let formats = if query_formats.is_empty() {
+        SearchScopeFormats::All
+    } else {
+        SearchScopeFormats::Selected(selected_formats)
+    };
     (
         query_roles,
+        query_formats,
         SearchScope {
             corpus: "indexed_chunks",
             file_roles,
             origins,
+            formats,
             snapshot: snapshot.to_string(),
         },
     )
 }
 
-fn exhaustive_request_fingerprint(q: &str, file_roles: &[String], origins: &[String]) -> String {
+fn exhaustive_request_fingerprint(
+    q: &str,
+    file_roles: &[String],
+    origins: &[String],
+    formats: &[String],
+) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-exhaustive-request-v1\0");
+    hasher.update(b"jscout-exhaustive-request-v2\0");
     hasher.update(q.as_bytes());
     hasher.update(b"\0roles\0");
     if file_roles.is_empty() {
@@ -1273,6 +1370,15 @@ fn exhaustive_request_fingerprint(q: &str, file_roles: &[String], origins: &[Str
     for origin in origins {
         hasher.update(origin.as_bytes());
         hasher.update(b"\0");
+    }
+    hasher.update(b"formats\0");
+    if formats.is_empty() {
+        hasher.update(b"all\0");
+    } else {
+        for format in formats {
+            hasher.update(format.as_bytes());
+            hasher.update(b"\0");
+        }
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -1382,11 +1488,12 @@ fn exhaustive_cursor_position(
     position: &ExhaustiveCursorPosition,
     file_roles: &[String],
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<i64> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
+        format_allowlist_json(file_formats, crate::formats::Capability::CodeLexical)?;
     let (chunk_id, matches): (Option<i64>, i64) = conn.query_row(
         "SELECT MIN(chunk.id), COUNT(*)
              FROM chunks_fts
@@ -1426,16 +1533,23 @@ fn exhaustive_hits(
     snapshot: &str,
     cursor: Option<&str>,
 ) -> Result<(Vec<Hit>, ExhaustivePageState)> {
-    let (file_roles, scope) = exhaustive_scope(options, snapshot);
-    let request_fingerprint = exhaustive_request_fingerprint(q, &file_roles, &scope.origins);
+    let (file_roles, file_formats, scope) = exhaustive_scope(options, snapshot);
+    let request_fingerprint =
+        exhaustive_request_fingerprint(q, &file_roles, &scope.origins, &file_formats);
     let query = exhaustive_fts_query(q);
     let cursor_position = if let Some(cursor) = cursor {
         let position = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
         if query.is_empty() {
             anyhow::bail!("exhaustive search cursor does not identify a matching chunk in scope");
         }
-        let chunk_id =
-            exhaustive_cursor_position(conn, &query, &position, &file_roles, &scope.origins)?;
+        let chunk_id = exhaustive_cursor_position(
+            conn,
+            &query,
+            &position,
+            &file_roles,
+            &scope.origins,
+            &file_formats,
+        )?;
         Some((position.path, position.start, chunk_id))
     } else {
         None
@@ -1456,7 +1570,7 @@ fn exhaustive_hits(
     let flags = origin_flags(&scope.origins);
     let roles_json = serde_json::to_string(&file_roles)?;
     let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
+        format_allowlist_json(&file_formats, crate::formats::Capability::CodeLexical)?;
     let total: i64 = conn.query_row(
         "SELECT count(*)
          FROM chunks_fts
@@ -1711,6 +1825,7 @@ pub fn search(
     file_role::validate_all(&options.expansion.file_roles)?;
     origin::validate_all(&options.file_origins)?;
     origin::validate_all(&options.expansion.file_origins)?;
+    validate_code_formats(&options.formats)?;
     if options.memory_graph_depth > MAX_MEMORY_GRAPH_DEPTH {
         anyhow::bail!("memory graph depth must be at most {MAX_MEMORY_GRAPH_DEPTH}");
     }
@@ -2163,6 +2278,7 @@ fn ranked_hits(
         options.limit,
         &options.file_roles,
         &options.file_origins,
+        &options.formats,
     )?;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(
@@ -2171,16 +2287,24 @@ fn ranked_hits(
         pool,
         &options.file_roles,
         &options.file_origins,
+        &options.formats,
     )?];
     let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
         eprintln!("timing: bm25 {:?}", t0.elapsed());
     }
-    if let Some(p) = provider {
+    if let Some(p) = provider.filter(|_| format_scope_supports_code_vectors(&options.formats)) {
         let t = std::time::Instant::now();
         retrieval = record_vector_ranking(
             &mut rankings,
-            vector_ranking(conn, p, q, vector_pool, &options.file_origins),
+            vector_ranking(
+                conn,
+                p,
+                q,
+                vector_pool,
+                &options.file_origins,
+                &options.formats,
+            ),
         );
         if timing {
             eprintln!("timing: embed-query+sqlite-vec {:?}", t.elapsed());
@@ -2239,6 +2363,7 @@ fn ranked_hits(
             candidate.match_reason,
             candidate.matched_identifiers,
             &options.file_origins,
+            &options.formats,
         )? {
             if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
                 continue;
@@ -2428,6 +2553,7 @@ fn load_hit(
     match_reason: MatchReason,
     matched_identifiers: Vec<String>,
     file_origins: &[String],
+    file_formats: &[String],
 ) -> Result<Option<Hit>> {
     let row = conn
         .query_row(
@@ -2469,6 +2595,9 @@ fn load_hit(
     else {
         return Ok(None);
     };
+    if !file_formats.is_empty() && !file_formats.iter().any(|candidate| candidate == &format) {
+        return Ok(None);
+    }
     let structurally_eligible =
         crate::formats::by_id(&format).is_some_and(|format| format.structural_eligible());
     let anchors = if structurally_eligible {

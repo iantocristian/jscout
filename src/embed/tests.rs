@@ -605,6 +605,160 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
 }
 
 #[test]
+fn code_vectors_partition_knn_by_format_and_skip_ineligible_only_queries() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    let config_json = "{}".to_string();
+    let spec = ProfileSpec {
+        provider: "test".into(),
+        model: "tiny".into(),
+        fingerprint: profile_fingerprint("test", "tiny", &config_json),
+        config_json,
+        dimensions: Some(2),
+    };
+    let profile = ensure_profile(&connection, &spec, 2)?;
+    let mut chunks = std::collections::BTreeMap::new();
+    for (id, path, format, hash, vector) in [
+        (
+            1,
+            "src/nearest.js",
+            "javascript",
+            "javascript-nearest",
+            [1.0_f32, 0.0],
+        ),
+        (
+            2,
+            "src/other.js",
+            "javascript",
+            "javascript-other",
+            [0.9_f32, 0.1],
+        ),
+        (
+            3,
+            "src/only.ts",
+            "typescript",
+            "typescript-only",
+            [0.0_f32, 1.0],
+        ),
+    ] {
+        connection.execute(
+            "INSERT INTO files(id,path,hash,role,origin,corpus,format)
+             VALUES(?1,?2,?3,'production','repository','code',?4)",
+            rusqlite::params![id, path, format!("file-{hash}"), format],
+        )?;
+        connection.execute(
+            "INSERT INTO chunks(
+               file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(?1,'module','needle','','needle',0,6,1,1,?2,'needle')",
+            rusqlite::params![id, hash],
+        )?;
+        chunks
+            .entry(format)
+            .or_insert_with(|| connection.last_insert_rowid());
+        connection.execute(
+            "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+            rusqlite::params![hash, profile.id, vec_to_blob(&vector)],
+        )?;
+    }
+    materialize_cached_embeddings(&connection)?;
+
+    let table = vector_table(profile.dimensions)?;
+    let partitions = connection
+        .prepare(&format!(
+            "SELECT format,COUNT(*) FROM {table} GROUP BY format ORDER BY format"
+        ))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        partitions,
+        [("javascript".to_string(), 2), ("typescript".to_string(), 1)]
+    );
+
+    let typescript_row: (i64, Vec<u8>) = connection.query_row(
+        "SELECT entry.id,embedding.vec
+         FROM embedding_index_entries entry
+         JOIN chunks chunk ON chunk.id=entry.chunk_id
+         JOIN files file ON file.id=chunk.file_id
+         JOIN embeddings embedding
+           ON embedding.chunk_hash=chunk.hash AND embedding.profile_id=entry.profile_id
+         WHERE file.format='typescript'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    connection.execute(
+        &format!("DELETE FROM {table} WHERE rowid=?1"),
+        [typescript_row.0],
+    )?;
+    connection.execute(
+        &format!(
+            "INSERT INTO {table}(rowid,embedding,profile_id,origin,format)
+             VALUES(?1,?2,?3,'repository',NULL)"
+        ),
+        rusqlite::params![typescript_row.0, typescript_row.1, profile.id],
+    )?;
+    sync_vector_index(&connection, Some(profile.id))?;
+    assert_eq!(
+        connection.query_row(
+            &format!("SELECT format FROM {table} WHERE rowid=?1"),
+            [typescript_row.0],
+            |row| row.get::<_, String>(0),
+        )?,
+        "typescript",
+        "a full repair must restore a stale vector partition from file metadata"
+    );
+
+    let origins = ["repository".to_string()];
+    let javascript = ["javascript".to_string()];
+    let typescript = ["typescript".to_string()];
+    let rust = ["rust".to_string()];
+    assert_eq!(
+        exact_vector_search(&connection, &profile, &[1.0, 0.0], 1, &origins, &javascript,)?
+            .first()
+            .map(|result| result.0),
+        Some(chunks["javascript"])
+    );
+    assert_eq!(
+        exact_vector_search(&connection, &profile, &[1.0, 0.0], 1, &origins, &typescript,)?
+            .first()
+            .map(|result| result.0),
+        Some(chunks["typescript"]),
+        "format must constrain sqlite-vec before k is applied"
+    );
+    assert!(
+        exact_vector_search(&connection, &profile, &[1.0, 0.0], 10, &origins, &rust)?.is_empty()
+    );
+    assert_eq!(
+        exact_vector_search(&connection, &profile, &[1.0, 0.0], 10, &origins, &[])?.len(),
+        3,
+        "an omitted format allowlist keeps every vector-capable code format"
+    );
+
+    let unconfigured_provider = Provider {
+        name: "openai-compatible".into(),
+        model: "not-materialized".into(),
+        url: "https://example.test/v1/embeddings".into(),
+        key: None,
+        protocol: Protocol::OpenAi,
+        query_prefix: String::new(),
+        revision: None,
+    };
+    let skipped = vector_search(
+        &connection,
+        &unconfigured_provider,
+        "needle",
+        10,
+        &origins,
+        &rust,
+    )?;
+    assert!(skipped.ranking.is_empty());
+    assert_eq!(skipped.timings.embedding_query, std::time::Duration::ZERO);
+    assert_eq!(skipped.timings.vector_index, std::time::Duration::ZERO);
+    Ok(())
+}
+
+#[test]
 fn documentation_hash_collision_never_materializes_in_code_vectors() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let connection = crate::store::open(directory.path())?;
@@ -768,8 +922,8 @@ fn rust_chunks_are_not_code_embedding_candidates_or_vector_entries() -> anyhow::
     let stale_row_id = connection.last_insert_rowid();
     connection.execute(
         &format!(
-            "INSERT INTO {table}(rowid,embedding,profile_id,origin)
-             VALUES(?1,?2,?3,'repository')"
+            "INSERT INTO {table}(rowid,embedding,profile_id,origin,format)
+             VALUES(?1,?2,?3,'repository','rust')"
         ),
         rusqlite::params![stale_row_id, vec_to_blob(&[1.0, 0.0]), profile.id],
     )?;
@@ -779,6 +933,7 @@ fn rust_chunks_are_not_code_embedding_candidates_or_vector_entries() -> anyhow::
         &[1.0, 0.0],
         2,
         &["repository".into()],
+        &[],
     )?;
     assert_eq!(
         surfaced
@@ -1120,8 +1275,15 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
 
     let table = vector_table(profile.dimensions)?;
     connection.execute(&format!("DROP TABLE {table}"), [])?;
-    let failure = vector_search(&connection, &provider, "alpha", 1, &["repository".into()])
-        .expect_err("search must fail closed when the vector table is missing");
+    let failure = vector_search(
+        &connection,
+        &provider,
+        "alpha",
+        1,
+        &["repository".into()],
+        &[],
+    )
+    .expect_err("search must fail closed when the vector table is missing");
     assert!(
         failure
             .to_string()
@@ -1136,7 +1298,14 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
 
     connection.pragma_update(None, "query_only", true)?;
     let ready = ready_search_profile(&connection, &spec)?;
-    let results = exact_vector_search(&connection, &ready, &[1.0, 0.0], 1, &["repository".into()])?;
+    let results = exact_vector_search(
+        &connection,
+        &ready,
+        &[1.0, 0.0],
+        1,
+        &["repository".into()],
+        &[],
+    )?;
     assert_eq!(results.first().map(|result| result.0), Some(chunk_id));
     Ok(())
 }

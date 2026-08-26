@@ -153,6 +153,19 @@ pub(super) fn effective_search_response_byte_limit(
     requested.unwrap_or(if debug_json { usize::MAX } else { configured })
 }
 
+pub(super) fn resolve_search_provider(
+    vector: bool,
+    formats: &[String],
+    embedding: &config::EmbeddingSettings,
+    inference: &config::InferenceSettings,
+) -> Result<Option<embed::Provider>> {
+    search::validate_code_formats(formats)?;
+    if !vector || !search::format_scope_supports_code_vectors(formats) {
+        return Ok(None);
+    }
+    embed::Provider::from_settings(embedding, inference)
+}
+
 #[cfg(test)]
 pub(super) fn render_cli_neighborhood(
     neighborhood: &structural::Neighborhood,
@@ -231,6 +244,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             exhaustive,
             cursor,
             file_roles,
+            formats,
             file_origins,
             memory,
             no_memory,
@@ -270,14 +284,12 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             let file_origins = or_configured(file_origins, &configured.origins);
             let expand_file_roles =
                 or_configured(expand_file_roles, &configured.expansion.file_roles);
-            let provider = if vector {
-                embed::Provider::from_settings(
-                    &runtime.effective.embedding,
-                    &runtime.effective.inference,
-                )?
-            } else {
-                None
-            };
+            let provider = resolve_search_provider(
+                vector,
+                &formats,
+                &runtime.effective.embedding,
+                &runtime.effective.inference,
+            )?;
             cmd_search(
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
@@ -294,6 +306,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     limit: search::resolve_search_limit(exhaustive, limit, configured.limit),
                     expand,
                     file_roles,
+                    formats,
                     file_origins: file_origins.clone(),
                     include_memory,
                     memory_limit: memory_limit.unwrap_or(configured.memory_limit),

@@ -1165,15 +1165,29 @@ fn named_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
+fn code_vector_table_has_format_partition(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info(?1) WHERE name='format'
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
     let table = vector_table(dimensions)?;
     conn.execute_batch("SAVEPOINT jscout_vector_table_ensure")?;
     let result = (|| -> Result<()> {
         let existed = vector_table_exists(conn, dimensions)?;
-        if !existed {
+        let current = existed && code_vector_table_has_format_partition(conn, &table)?;
+        if !current {
             // A sqlite-vec table is shared by every profile with these dimensions.
-            // Invalidate every completion marker before publishing its replacement
-            // so readers can never observe an empty table as synchronized.
+            // Invalidate every completion marker before replacing a missing or
+            // pre-format-partition table, so readers can never observe an empty
+            // table as synchronized. The durable content-addressed embeddings
+            // remain untouched and rematerialize without provider calls.
             conn.execute(
                 "DELETE FROM meta
                  WHERE key IN (
@@ -1181,12 +1195,16 @@ fn ensure_vector_table(conn: &Connection, dimensions: usize) -> Result<String> {
                  )",
                 params![VECTOR_SYNC_KEY_PREFIX, dimensions as i64],
             )?;
+            if existed {
+                conn.execute(&format!("DROP TABLE {table}"), [])?;
+            }
         }
         conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
                embedding FLOAT[{dimensions}] distance_metric=cosine,
                profile_id INTEGER PARTITION KEY,
-               origin TEXT PARTITION KEY
+               origin TEXT PARTITION KEY,
+               format TEXT PARTITION KEY
              );"
         ))?;
         Ok(())
@@ -1388,6 +1406,29 @@ fn prune_ineligible_vector_occurrences(
     Ok(())
 }
 
+fn prune_mispartitioned_vector_rows(conn: &Connection, profile_id: i64, table: &str) -> Result<()> {
+    let stale_rows = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT entry.id
+             FROM embedding_index_entries entry
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             JOIN {table} vector ON vector.rowid=entry.id
+             WHERE entry.profile_id=?1
+               AND (vector.profile_id IS NOT entry.profile_id
+                 OR vector.origin IS NOT file.origin
+                 OR vector.format IS NOT file.format)
+             ORDER BY entry.id"
+        ))?;
+        let rows = statement.query_map([profile_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for row_id in stale_rows {
+        conn.execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [row_id])?;
+    }
+    Ok(())
+}
+
 /// Use the cheap occurrence anti-join for normal embedding passes. A missing
 /// completion marker or virtual table falls back to the full audit, while
 /// `repair` deliberately verifies orphaned and missing sqlite-vec rows as well.
@@ -1448,6 +1489,7 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
     let sync_result = (|| -> Result<()> {
         for (profile_id, table) in profiles {
             prune_ineligible_vector_occurrences(conn, profile_id, &table)?;
+            prune_mispartitioned_vector_rows(conn, profile_id, &table)?;
             conn.execute(
                 &format!(
                     "DELETE FROM {table}
@@ -1465,7 +1507,7 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
                 let eligible_formats =
                     crate::formats::eligible_ids_json(crate::formats::Capability::CodeVector);
                 let mut statement = conn.prepare(&format!(
-                    "SELECT i.id, f.origin, e.vec
+                    "SELECT i.id, f.origin, f.format, e.vec
                      FROM embedding_index_entries i
                      JOIN code_chunks c ON c.id=i.chunk_id
                      JOIN code_files f ON f.id=c.file_id
@@ -1478,18 +1520,19 @@ pub fn sync_vector_index(conn: &Connection, only_profile: Option<i64>) -> Result
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
                     ))
                 })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
             };
-            for (row_id, origin, vector) in missing_vectors {
+            for (row_id, origin, format, vector) in missing_vectors {
                 conn.execute(
                     &format!(
-                        "INSERT INTO {table}(rowid, embedding, profile_id, origin)
-                         VALUES(?1, ?2, ?3, ?4)"
+                        "INSERT INTO {table}(rowid, embedding, profile_id, origin, format)
+                         VALUES(?1, ?2, ?3, ?4, ?5)"
                     ),
-                    params![row_id, vector, profile_id, origin],
+                    params![row_id, vector, profile_id, origin, format],
                 )?;
             }
 
@@ -1517,7 +1560,7 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
         let eligible_formats =
             crate::formats::eligible_ids_json(crate::formats::Capability::CodeVector);
         let mut statement = conn.prepare(
-            "SELECT c.id, f.origin, e.vec
+            "SELECT c.id, f.origin, f.format, e.vec
              FROM code_chunks c
              JOIN code_files f ON f.id=c.file_id
              JOIN embeddings e ON e.chunk_hash=c.hash AND e.profile_id=?1
@@ -1530,12 +1573,13 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (chunk_id, origin, vector) in missing_chunks {
+    for (chunk_id, origin, format, vector) in missing_chunks {
         conn.execute(
             "INSERT INTO embedding_index_entries(chunk_id, profile_id) VALUES(?1, ?2)",
             params![chunk_id, profile_id],
@@ -1543,10 +1587,10 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
         let row_id = conn.last_insert_rowid();
         conn.execute(
             &format!(
-                "INSERT INTO {table}(rowid, embedding, profile_id, origin)
-                 VALUES(?1, ?2, ?3, ?4)"
+                "INSERT INTO {table}(rowid, embedding, profile_id, origin, format)
+                 VALUES(?1, ?2, ?3, ?4, ?5)"
             ),
-            params![row_id, vector, profile_id, origin],
+            params![row_id, vector, profile_id, origin, format],
         )?;
     }
     Ok(())
@@ -1677,6 +1721,12 @@ fn ready_search_profile(conn: &Connection, spec: &ProfileSpec) -> Result<Resolve
     }
     if !vector_table_exists(conn, profile.dimensions)? {
         bail!("vector index table is missing; run `jscout embed <root> --repair` to repair it")
+    }
+    let table = vector_table(profile.dimensions)?;
+    if !code_vector_table_has_format_partition(conn, &table)? {
+        bail!(
+            "vector index table uses an obsolete partition schema; run `jscout embed <root> --repair` to repair it"
+        )
     }
     Ok(profile)
 }
@@ -1851,7 +1901,14 @@ pub fn vector_search(
     query: &str,
     limit: usize,
     file_origins: &[String],
+    requested_formats: &[String],
 ) -> Result<VectorSearchResult> {
+    if selected_code_vector_formats(requested_formats).is_empty() {
+        return Ok(VectorSearchResult {
+            ranking: Vec::new(),
+            timings: VectorSearchTimings::default(),
+        });
+    }
     let index_started = std::time::Instant::now();
     let spec = provider
         .profile()
@@ -1875,8 +1932,15 @@ pub fn vector_search(
         ));
     }
     let index_started = std::time::Instant::now();
-    let ranking = exact_vector_search(conn, &profile, vector, limit, file_origins)
-        .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
+    let ranking = exact_vector_search(
+        conn,
+        &profile,
+        vector,
+        limit,
+        file_origins,
+        requested_formats,
+    )
+    .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     vector_index += index_started.elapsed();
     Ok(VectorSearchResult {
         ranking,
@@ -1887,45 +1951,63 @@ pub fn vector_search(
     })
 }
 
+fn selected_code_vector_formats(requested_formats: &[String]) -> Vec<&'static str> {
+    let eligible = crate::formats::eligible_ids(crate::formats::Capability::CodeVector);
+    if requested_formats.is_empty() {
+        return eligible;
+    }
+    eligible
+        .into_iter()
+        .filter(|eligible| {
+            requested_formats
+                .iter()
+                .any(|requested| requested == eligible)
+        })
+        .collect()
+}
+
 fn exact_vector_search(
     conn: &Connection,
     profile: &ResolvedProfile,
     vector: &[f32],
     limit: usize,
     file_origins: &[String],
+    requested_formats: &[String],
 ) -> Result<Vec<(i64, f64)>> {
     let table = vector_table(profile.dimensions)?;
-    let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::CodeVector);
+    let selected_formats = selected_code_vector_formats(requested_formats);
+    if selected_formats.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut scores = Vec::new();
     for origin in file_origins {
-        let mut statement = conn.prepare(&format!(
-            "SELECT i.chunk_id, v.distance
-             FROM {table} v
-             JOIN embedding_index_entries i ON i.id=v.rowid
-             JOIN code_chunks c ON c.id=i.chunk_id
-             JOIN code_files f ON f.id=c.file_id
-             WHERE v.embedding MATCH ?1
-               AND v.k=?2
-               AND v.profile_id=?3
-               AND v.origin=?4
-               AND f.format IN (SELECT value FROM json_each(?5))
-             ORDER BY v.distance"
-        ))?;
-        let rows = statement.query_map(
-            params![
-                vec_to_blob(vector),
-                limit.max(1) as i64,
-                profile.id,
-                origin,
-                eligible_formats,
-            ],
-            |row| {
-                let distance = row.get::<_, f64>(1)?;
-                Ok((row.get::<_, i64>(0)?, 1.0 - distance))
-            },
-        )?;
-        scores.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        for format in &selected_formats {
+            let mut statement = conn.prepare(&format!(
+                "SELECT i.chunk_id, v.distance
+                 FROM {table} v
+                 JOIN embedding_index_entries i ON i.id=v.rowid
+                 WHERE v.embedding MATCH ?1
+                   AND v.k=?2
+                   AND v.profile_id=?3
+                   AND v.origin=?4
+                   AND v.format=?5
+                 ORDER BY v.distance"
+            ))?;
+            let rows = statement.query_map(
+                params![
+                    vec_to_blob(vector),
+                    limit.max(1) as i64,
+                    profile.id,
+                    origin,
+                    format,
+                ],
+                |row| {
+                    let distance = row.get::<_, f64>(1)?;
+                    Ok((row.get::<_, i64>(0)?, 1.0 - distance))
+                },
+            )?;
+            scores.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
     }
     scores.sort_by(|left, right| right.1.total_cmp(&left.1));
     scores.truncate(limit);

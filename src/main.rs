@@ -77,7 +77,7 @@ use cli::{ConfigCommand, ScoutCommand};
 #[cfg(test)]
 use commands::{
     effective_search_response_byte_limit, or_configured, render_cli_neighborhood,
-    render_semantic_memory_text, resolve_flag,
+    render_semantic_memory_text, resolve_flag, resolve_search_provider,
 };
 
 #[cfg(test)]

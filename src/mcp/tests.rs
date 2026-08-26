@@ -547,6 +547,64 @@ fn rust_semantic_search_expand_stays_lexical_at_mcp_boundary() -> Result<()> {
 }
 
 #[test]
+fn semantic_search_formats_scope_is_enforced_and_echoed_at_mcp_boundary() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("web.ts"),
+        "export const crossFormatMcpMarker = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub const crossFormatMcpMarker: bool = true;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rendered = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Baseline,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "crossFormatMcpMarker",
+            "formats": ["rust"],
+            "exhaustive": true,
+            "limit": 10,
+            "response_bytes": 100_000
+        }),
+    )?;
+    let response: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(response["scope"]["formats"], json!(["rust"]));
+    let hits = response["hits"].as_array().expect("compact hits");
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|hit| {
+        hit["at"]
+            .as_str()
+            .is_some_and(|location| location.starts_with("native.rs:"))
+    }));
+
+    let error = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Baseline,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "crossFormatMcpMarker",
+            "formats": ["markdown"],
+            "vector": false,
+            "rerank": false
+        }),
+    )
+    .expect_err("documentation formats must not enter code search");
+    assert!(error.to_string().contains("code format must be one of"));
+    Ok(())
+}
+
+#[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
     let defaults = config::SearchSettings {
         vector: false,
@@ -763,9 +821,10 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "sym: anchor plus its snapshot",
             "strip only the leading file:",
             "Human-authored symbol mode",
-            "original search's explicit origins allowlist",
-            "never synthesize it from echoed scope.origins",
-            "corpus, file_roles, origins, and snapshot",
+            "spans all registered code formats by default",
+            "original search's explicit origins and formats allowlists",
+            "never synthesize it from echoed scope.origins or scope.formats",
+            "corpus, file_roles, origins, formats, and snapshot",
             "convention",
             "safe",
             "localize first",
@@ -847,6 +906,17 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             origins["description"]
                 .as_str()
                 .is_some_and(|description| description.contains("not the whole repository"))
+        );
+        let formats = &search["inputSchema"]["properties"]["formats"];
+        assert!(formats.get("default").is_none());
+        assert_eq!(
+            formats["items"]["enum"],
+            json!(["javascript", "typescript", "rust"])
+        );
+        assert!(
+            formats["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("all registered code formats"))
         );
     }
 }
