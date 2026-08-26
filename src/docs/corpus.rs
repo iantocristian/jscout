@@ -204,6 +204,17 @@ pub struct DocHeading {
     pub line_end: u64,
 }
 
+/// One inclusive, 1-based Git/LF-logical source-line range whose retained text
+/// contributes to a documentation block or chunk. Exact source spans and the
+/// display line fields retain the parser's broader line-ending semantics;
+/// these ranges match `git blame` numbering and deliberately omit blank lines
+/// and text removed from retrieval, such as Markdown and MDX comments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocLineRange {
+    pub start: u64,
+    pub end: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocBlock {
     pub ordinal: u64,
@@ -212,6 +223,8 @@ pub struct DocBlock {
     pub source_end: u64,
     pub line_start: u64,
     pub line_end: u64,
+    /// Retained body lines inside this exact block span.
+    pub contributing_lines: Vec<DocLineRange>,
     pub content_hash: String,
     /// Exact source text for this block, including original line endings.
     pub body: String,
@@ -230,6 +243,10 @@ pub struct DocChunk {
     pub source_end: u64,
     pub line_start: u64,
     pub line_end: u64,
+    /// Retained body lines used by this retrieval chunk. An oversized table
+    /// or fence fragment also names the earlier line that supplies its repeated
+    /// synthetic context, even when that line is outside the fragment span.
+    pub contributing_lines: Vec<DocLineRange>,
     pub breadcrumb: String,
     pub nearest_heading: Option<String>,
     pub rendered_body: String,
@@ -997,6 +1014,7 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
     let removals = comment_removals(bytes, body_base..bytes.len(), &protected, is_mdx);
     let items = document_items(body, body_base, options, bytes, &removals);
     let lines = LineIndex::new(bytes);
+    let git_lines = GitLineIndex::new(bytes);
 
     let mut heading_levels = vec![None::<String>; 6];
     let mut headings = Vec::new();
@@ -1044,6 +1062,8 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
             }
             DocumentItem::Body { kind, range } => {
                 let rendered_body = render_source_range(bytes, range.clone(), &removals);
+                let contributing_lines =
+                    contributing_line_ranges(bytes, range.clone(), &removals, &git_lines);
                 if rendered_body.is_empty() {
                     continue;
                 }
@@ -1071,6 +1091,7 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
                         source_end: range.end as u64,
                         line_start,
                         line_end,
+                        contributing_lines,
                         content_hash: blake3::hash(&bytes[range.clone()]).to_hex().to_string(),
                         body: raw,
                         rendered_body,
@@ -1093,7 +1114,7 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
             .to_owned()
     });
     let public_blocks = blocks.iter().map(|block| block.public.clone()).collect();
-    let mut chunks = build_chunks(bytes, &blocks, &removals, &lines);
+    let mut chunks = build_chunks(bytes, &blocks, &removals, &lines, &git_lines);
     if chunks.is_empty() {
         let breadcrumb = headings
             .iter()
@@ -1108,6 +1129,7 @@ fn parse_document(path: &str, bytes: &[u8]) -> Result<DocFile> {
             source_end: bytes.len() as u64,
             line_start,
             line_end,
+            contributing_lines: Vec::new(),
             breadcrumb,
             nearest_heading: None,
             rendered_body: String::new(),
@@ -1393,10 +1415,93 @@ fn render_source_range(bytes: &[u8], range: Range<usize>, removals: &[Range<usiz
         .expect("a source slice with ASCII removal remains UTF-8")
 }
 
+fn contributing_line_ranges(
+    bytes: &[u8],
+    range: Range<usize>,
+    removals: &[Range<usize>],
+    lines: &GitLineIndex,
+) -> Vec<DocLineRange> {
+    let mut contributing = Vec::new();
+    for (index, &line_start) in lines.starts.iter().enumerate() {
+        if line_start >= range.end {
+            break;
+        }
+        let full_end = lines.starts.get(index + 1).copied().unwrap_or(bytes.len());
+        if full_end <= range.start {
+            continue;
+        }
+        let mut content_end = full_end;
+        if content_end > line_start && bytes[content_end - 1] == b'\n' {
+            content_end -= 1;
+            if content_end > line_start && bytes[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+        } else if content_end > line_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        let retained = line_start.max(range.start)..content_end.min(range.end);
+        if retained.start < retained.end && has_retained_non_whitespace(bytes, retained, removals) {
+            let line = index as u64 + 1;
+            append_line_range(
+                &mut contributing,
+                DocLineRange {
+                    start: line,
+                    end: line,
+                },
+            );
+        }
+    }
+    contributing
+}
+
+fn has_retained_non_whitespace(
+    bytes: &[u8],
+    range: Range<usize>,
+    removals: &[Range<usize>],
+) -> bool {
+    let mut cursor = range.start;
+    for removal in removals {
+        if removal.end <= cursor {
+            continue;
+        }
+        if removal.start >= range.end {
+            break;
+        }
+        let keep_end = removal.start.max(cursor).min(range.end);
+        if bytes[cursor..keep_end]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+        {
+            return true;
+        }
+        cursor = removal.end.max(cursor).min(range.end);
+    }
+    bytes[cursor..range.end]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+}
+
+fn append_line_ranges(target: &mut Vec<DocLineRange>, ranges: Vec<DocLineRange>) {
+    for range in ranges {
+        append_line_range(target, range);
+    }
+}
+
+fn append_line_range(target: &mut Vec<DocLineRange>, range: DocLineRange) {
+    if let Some(previous) = target.last_mut()
+        && range.start <= previous.end.saturating_add(1)
+    {
+        previous.end = previous.end.max(range.end);
+    } else {
+        target.push(range);
+    }
+}
+
 #[derive(Debug)]
 struct ChunkDraft {
     source_start: usize,
     source_end: usize,
+    contributing_lines: Vec<DocLineRange>,
     heading_instance: u64,
     breadcrumb: String,
     nearest_heading: Option<String>,
@@ -1409,6 +1514,7 @@ fn build_chunks(
     blocks: &[ParsedBlock],
     removals: &[Range<usize>],
     lines: &LineIndex,
+    git_lines: &GitLineIndex,
 ) -> Vec<DocChunk> {
     let mut drafts = Vec::<ChunkDraft>::new();
     let mut current = None::<(u64, ChunkDraft)>;
@@ -1420,13 +1526,14 @@ fn build_chunks(
         let provider = provider_text(nearest.as_deref(), &block.public.rendered_body);
         if provider.len() > HARD_MAX_BYTES {
             flush_draft(&mut current, &mut drafts);
-            drafts.extend(split_block(bytes, block, removals, nearest));
+            drafts.extend(split_block(bytes, block, removals, nearest, git_lines));
             continue;
         }
 
         let candidate = ChunkDraft {
             source_start: block.public.source_start as usize,
             source_end: block.public.source_end as usize,
+            contributing_lines: block.public.contributing_lines.clone(),
             heading_instance: block.heading_instance,
             breadcrumb: block.public.breadcrumb.clone(),
             nearest_heading: nearest,
@@ -1443,6 +1550,7 @@ fn build_chunks(
                 draft.rendered_body.push_str("\n\n");
                 draft.rendered_body.push_str(&candidate.rendered_body);
                 draft.source_end = candidate.source_end;
+                append_line_ranges(&mut draft.contributing_lines, candidate.contributing_lines);
                 draft.block_ordinals.extend(candidate.block_ordinals);
             }
             Some(_) => {
@@ -1479,6 +1587,7 @@ fn build_chunks(
                 source_end: draft.source_end as u64,
                 line_start,
                 line_end,
+                contributing_lines: draft.contributing_lines,
                 breadcrumb: draft.breadcrumb,
                 nearest_heading: draft.nearest_heading,
                 rendered_body: draft.rendered_body,
@@ -1502,9 +1611,24 @@ fn split_block(
     block: &ParsedBlock,
     removals: &[Range<usize>],
     nearest_heading: Option<String>,
+    git_lines: &GitLineIndex,
 ) -> Vec<ChunkDraft> {
     let block_range = block.public.source_start as usize..block.public.source_end as usize;
     let synthetic = block.kind.synthetic_context().unwrap_or_default();
+    let synthetic_context_line = (!synthetic.is_empty()).then(|| {
+        let line = git_lines.line(block_range.start);
+        DocLineRange {
+            start: line,
+            end: line,
+        }
+    });
+    let fragment_context = FragmentContext {
+        bytes,
+        removals,
+        synthetic: &synthetic,
+        synthetic_context_line,
+        git_lines,
+    };
     let heading_overhead = nearest_heading
         .as_ref()
         .map_or(0, |heading| heading.len() + 2);
@@ -1524,14 +1648,7 @@ fn split_block(
             &synthetic,
             body_budget,
         ) {
-            drafts.push(fragment_draft(
-                bytes,
-                start..block_range.end,
-                block,
-                removals,
-                &synthetic,
-                nearest_heading,
-            ));
+            drafts.push(fragment_context.draft(start..block_range.end, block, nearest_heading));
             break;
         }
         let end = last_fitting_boundary(
@@ -1565,38 +1682,49 @@ fn split_block(
             )
         });
         assert!(end > start, "hard-bound splitting must make progress");
-        drafts.push(fragment_draft(
-            bytes,
-            start..end,
-            block,
-            removals,
-            &synthetic,
-            nearest_heading.clone(),
-        ));
+        drafts.push(fragment_context.draft(start..end, block, nearest_heading.clone()));
         start = end;
     }
     drafts
 }
 
-fn fragment_draft(
-    bytes: &[u8],
-    range: Range<usize>,
-    block: &ParsedBlock,
-    removals: &[Range<usize>],
-    synthetic: &str,
-    nearest_heading: Option<String>,
-) -> ChunkDraft {
-    let mut rendered = String::with_capacity(synthetic.len() + range.len());
-    rendered.push_str(synthetic);
-    rendered.push_str(&render_source_range(bytes, range.clone(), removals));
-    ChunkDraft {
-        source_start: range.start,
-        source_end: range.end,
-        heading_instance: block.heading_instance,
-        breadcrumb: block.public.breadcrumb.clone(),
-        nearest_heading,
-        rendered_body: rendered,
-        block_ordinals: vec![block.public.ordinal],
+struct FragmentContext<'a> {
+    bytes: &'a [u8],
+    removals: &'a [Range<usize>],
+    synthetic: &'a str,
+    synthetic_context_line: Option<DocLineRange>,
+    git_lines: &'a GitLineIndex,
+}
+
+impl FragmentContext<'_> {
+    fn draft(
+        &self,
+        range: Range<usize>,
+        block: &ParsedBlock,
+        nearest_heading: Option<String>,
+    ) -> ChunkDraft {
+        let mut rendered = String::with_capacity(self.synthetic.len() + range.len());
+        rendered.push_str(self.synthetic);
+        rendered.push_str(&render_source_range(
+            self.bytes,
+            range.clone(),
+            self.removals,
+        ));
+        let mut contributing_lines = self.synthetic_context_line.into_iter().collect::<Vec<_>>();
+        append_line_ranges(
+            &mut contributing_lines,
+            contributing_line_ranges(self.bytes, range.clone(), self.removals, self.git_lines),
+        );
+        ChunkDraft {
+            source_start: range.start,
+            source_end: range.end,
+            contributing_lines,
+            heading_instance: block.heading_instance,
+            breadcrumb: block.public.breadcrumb.clone(),
+            nearest_heading,
+            rendered_body: rendered,
+            block_ordinals: vec![block.public.ordinal],
+        }
     }
 }
 
@@ -1786,6 +1914,30 @@ impl LineIndex {
         let start = self.line(range.start);
         let last_byte = range.end.saturating_sub(1).max(range.start);
         (start, self.line(last_byte))
+    }
+
+    fn line(&self, offset: usize) -> u64 {
+        self.starts.partition_point(|start| *start <= offset) as u64
+    }
+}
+
+/// Line index matching Git's LF-only logical-line model. Markdown display
+/// spans continue to use `LineIndex`, which also recognizes bare CR; freshness
+/// attribution must instead address the exact line numbers emitted by blame.
+#[derive(Debug)]
+struct GitLineIndex {
+    starts: Vec<usize>,
+}
+
+impl GitLineIndex {
+    fn new(bytes: &[u8]) -> Self {
+        let mut starts = vec![0];
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                starts.push(index + 1);
+            }
+        }
+        Self { starts }
     }
 
     fn line(&self, offset: usize) -> u64 {
@@ -2376,6 +2528,105 @@ mod tests {
         assert_eq!(esm_only.chunks.len(), 1);
         assert!(esm_only.chunks[0].is_stub);
         assert!(esm_only.chunks[0].embedding_identity.is_none());
+        assert!(esm_only.chunks[0].contributing_lines.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn contributing_lines_exclude_removed_comments_and_mdx_preamble() -> Result<()> {
+        let source = concat!(
+            "import Widget from './widget'\n",
+            "export const metadata = { privateNeedle: true }\n",
+            "\n",
+            "# Guide\n",
+            "\n",
+            "Before {/* inlineHidden */} after.\n",
+            "\n",
+            "Start {/*\n",
+            "jsxCommentOnly\n",
+            "*/} finish.\n",
+            "\n",
+            "{/*\n",
+            "wholeJsxCommentOnly\n",
+            "*/}\n",
+            "\n",
+            "After <!-- inlineHtmlHidden --> text.\n",
+            "\n",
+            "<!--\n",
+            "wholeHtmlCommentOnly\n",
+            "-->\n",
+            "\n",
+            "Last.\n",
+        );
+        let file = parse_document("guide.mdx", source.as_bytes())?;
+
+        assert_eq!(
+            file.blocks
+                .iter()
+                .map(|block| block.contributing_lines.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![DocLineRange { start: 6, end: 6 }],
+                vec![
+                    DocLineRange { start: 8, end: 8 },
+                    DocLineRange { start: 10, end: 10 },
+                ],
+                vec![DocLineRange { start: 16, end: 16 }],
+                vec![DocLineRange { start: 22, end: 22 }],
+            ]
+        );
+        assert_eq!(file.chunks.len(), 1);
+        assert_eq!(
+            file.chunks[0].contributing_lines,
+            [
+                DocLineRange { start: 6, end: 6 },
+                DocLineRange { start: 8, end: 8 },
+                DocLineRange { start: 10, end: 10 },
+                DocLineRange { start: 16, end: 16 },
+                DocLineRange { start: 22, end: 22 },
+            ]
+        );
+        assert!(file.chunks[0].source_start < file.chunks[0].source_end);
+        assert!(file.blocks[0].body.contains("inlineHidden"));
+        assert!(file.blocks[1].body.contains("jsxCommentOnly"));
+        assert!(
+            file.blocks
+                .iter()
+                .all(|block| !block.body.contains("privateNeedle"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contributing_lines_follow_git_lf_numbering_for_bare_cr() -> Result<()> {
+        let file = parse_document(
+            "bare-cr.mdx",
+            b"Before.\r{/* commentOnlyNeedle */}\rAfter.\r",
+        )?;
+        assert_eq!(file.chunks.len(), 1);
+        assert_eq!(
+            file.chunks[0].contributing_lines,
+            [DocLineRange { start: 1, end: 1 }]
+        );
+        assert!(file.chunks[0].line_end > 1);
+        assert!(!file.chunks[0].rendered_body.contains("commentOnlyNeedle"));
+
+        let comments_only = parse_document("comments-only.mdx", b"{/* hidden */}\r")?;
+        assert!(comments_only.chunks[0].is_stub);
+        assert!(comments_only.chunks[0].contributing_lines.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_whitespace_without_contributing_lines_keeps_phase2_chunk_shape() -> Result<()> {
+        let file = parse_document("whitespace.md", b"<!-- hidden -->   \n")?;
+        assert_eq!(file.blocks.len(), 1);
+        assert_eq!(file.blocks[0].rendered_body, "   ");
+        assert!(file.blocks[0].contributing_lines.is_empty());
+        assert_eq!(file.chunks.len(), 1);
+        assert!(!file.chunks[0].is_stub);
+        assert_eq!(file.chunks[0].rendered_body, "   ");
+        assert!(file.chunks[0].contributing_lines.is_empty());
         Ok(())
     }
 
@@ -2432,6 +2683,10 @@ mod tests {
         assert!(file.chunks.len() > 1);
         for chunk in &file.chunks {
             assert!(chunk.rendered_body.starts_with("[table Name | Value]\n"));
+            assert_eq!(
+                chunk.contributing_lines.first().map(|range| range.start),
+                Some(1)
+            );
             assert!(!chunk.rendered_body.contains("tableCommentNeedle"));
             assert!(
                 !chunk

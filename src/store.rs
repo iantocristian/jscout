@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "31";
+pub const SCHEMA_VERSION: &str = "33";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -120,6 +120,8 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
 /// Reject source-derived rows produced by an incompatible binary contract.
 /// Indexing is the only repair path; read and embedding surfaces must not
 /// reinterpret old rows under the current extractor or Markdown format.
+/// Documentation provenance is optional and is validated only by retrieval
+/// calls that opt in to freshness ranking.
 pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
     let (extraction_version, documentation_chunk_format): (Option<String>, Option<String>) = conn
         .query_row(
@@ -283,7 +285,9 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS exports;
              DROP TABLE IF EXISTS docs_fts;
              DROP TABLE IF EXISTS chunks_fts;
+             DROP TABLE IF EXISTS doc_file_provenance;
              DROP TABLE IF EXISTS doc_chunk_meta;
+             DROP TABLE IF EXISTS doc_blame_cache;
              DROP TABLE IF EXISTS doc_inventory;
              DROP TABLE IF EXISTS chunks;
              DROP TABLE IF EXISTS symbols;
@@ -292,10 +296,12 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DELETE FROM meta
              WHERE key IN (
                'root', 'snapshot', 'projection_version', 'resolution_hash',
-               'extraction_version', 'documentation_chunk_format_version'
+               'extraction_version', 'documentation_chunk_format_version',
+               'documentation_provenance_format_version',
+               'documentation_provenance_enabled'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='31' WHERE key='schema_version';",
+             UPDATE meta SET value='33' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -313,7 +319,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '31')
+INSERT INTO meta(key, value) VALUES('schema_version', '33')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -374,10 +380,40 @@ CREATE TABLE IF NOT EXISTS doc_chunk_meta(
   nearest_heading TEXT,
   ordinal INTEGER NOT NULL,
   embedding_identity TEXT,
-  front_matter_state TEXT NOT NULL
+  front_matter_state TEXT NOT NULL,
+  freshness_basis TEXT NOT NULL DEFAULT 'unknown'
+    CHECK(freshness_basis IN ('git', 'working_tree', 'observed', 'unknown')),
+  freshness_author_time INTEGER,
+  freshness_committer_time INTEGER,
+  freshness_detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_doc_chunk_embedding_identity
   ON doc_chunk_meta(embedding_identity);
+
+-- Current-snapshot provenance identity and diagnostic for each admitted
+-- documentation file. This sidecar is disposable with the file rows.
+CREATE TABLE IF NOT EXISTS doc_file_provenance(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  projection_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  detail TEXT
+);
+
+-- Rebuildable blame mappings. One current entry per indexed-root-scoped path
+-- prevents this cache from becoming a document-history store, while the
+-- complete key avoids reuse across roots, worktree edits, rewritten path
+-- history, Git conversion-state changes, or clone deepening.
+CREATE TABLE IF NOT EXISTS doc_blame_cache(
+  path_scope TEXT NOT NULL,
+  path TEXT NOT NULL,
+  bytes_hash TEXT NOT NULL,
+  converted_blob_oid TEXT NOT NULL,
+  path_tip TEXT NOT NULL,
+  shallow_fingerprint TEXT NOT NULL,
+  attribution_json TEXT NOT NULL,
+  format_version TEXT NOT NULL,
+  PRIMARY KEY(path_scope,path)
+);
 
 CREATE TRIGGER IF NOT EXISTS doc_chunk_meta_requires_docs_insert
 BEFORE INSERT ON doc_chunk_meta
@@ -1237,6 +1273,7 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM contract_imports;
          DELETE FROM contract_exports;
          DELETE FROM module_edges;
+         DELETE FROM doc_file_provenance;
          DELETE FROM doc_chunk_meta;
          DELETE FROM doc_inventory;
          DELETE FROM chunks;
@@ -1545,6 +1582,66 @@ mod tests {
     }
 
     #[test]
+    fn v32_rebuild_discards_phase3_source_state_and_contract_marker() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v32.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(1,'README.md','file','docs','markdown','documentation','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,name,scope_chain,symbols,start,end,
+               start_line,end_line,hash,content
+             ) VALUES(1,1,'markdown_section',NULL,'','',0,4,1,1,'chunk','body');
+             INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,ordinal,front_matter_state,
+               freshness_basis,freshness_author_time
+             ) VALUES(1,'README','',0,'absent','git',10);
+             INSERT INTO doc_file_provenance(
+               file_id,projection_hash,status,detail
+             ) VALUES(1,'projection','resolved',NULL);
+             INSERT INTO doc_blame_cache(
+               path_scope,path,bytes_hash,converted_blob_oid,path_tip,
+               shallow_fingerprint,attribution_json,format_version
+             ) VALUES(
+               'scope','README.md','file','converted','tip','shallow','[]','test-v1'
+             );
+             INSERT INTO meta(key,value)
+               VALUES('documentation_provenance_format_version','test-v1');
+             INSERT INTO meta(key,value)
+               VALUES('documentation_provenance_enabled','true');
+             UPDATE meta SET value='32' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let upgraded = open_path(&database)?;
+        let state: (String, i64, i64, i64, i64, i64) = upgraded.query_row(
+            "SELECT
+               (SELECT value FROM meta WHERE key='schema_version'),
+               (SELECT count(*) FROM meta
+                WHERE key='documentation_provenance_format_version'),
+               (SELECT count(*) FROM meta
+                WHERE key='documentation_provenance_enabled'),
+               (SELECT count(*) FROM doc_chunk_meta),
+               (SELECT count(*) FROM doc_file_provenance),
+               (SELECT count(*) FROM doc_blame_cache)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0, 0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
     fn early_v20_reconnaissance_table_gains_auditable_cited_evidence() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("early-v20.db");
@@ -1632,6 +1729,11 @@ mod tests {
              VALUES('documentation_chunk_format_version', ?1)",
             [crate::docs::CHUNK_FORMAT_VERSION],
         )?;
+        writer.execute(
+            "INSERT INTO meta(key, value)
+             VALUES('documentation_provenance_format_version', ?1)",
+            [crate::docs::PROVENANCE_FORMAT_VERSION],
+        )?;
         drop(writer);
 
         let reader = open_path_read_only(&database)?;
@@ -1702,6 +1804,47 @@ mod tests {
             error
                 .to_string()
                 .contains("documentation chunk format documentation-v0")
+        );
+
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "UPDATE meta SET value=?1
+             WHERE key='documentation_chunk_format_version'",
+            [crate::docs::CHUNK_FORMAT_VERSION],
+        )?;
+        writer.execute(
+            "UPDATE meta SET value='documentation-provenance-v0'
+             WHERE key='documentation_provenance_format_version'",
+            [],
+        )?;
+        drop(writer);
+        let reader = open_path_read_only(&database)?;
+        assert_eq!(
+            reader.query_row(
+                "SELECT value FROM meta WHERE key='documentation_provenance_format_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "documentation-provenance-v0",
+            "non-freshness readers must not rewrite optional provenance metadata"
+        );
+        drop(reader);
+        let writer = Connection::open(&database)?;
+        writer.execute(
+            "DELETE FROM meta WHERE key='documentation_provenance_format_version'",
+            [],
+        )?;
+        drop(writer);
+        let reader = open_path_read_only(&database)?;
+        assert_eq!(
+            reader.query_row(
+                "SELECT count(*) FROM meta
+                 WHERE key='documentation_provenance_format_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "non-freshness readers must accept a missing optional provenance contract"
         );
         Ok(())
     }
@@ -2093,6 +2236,27 @@ mod tests {
                 "ordinal",
                 "embedding_identity",
                 "front_matter_state",
+                "freshness_basis",
+                "freshness_author_time",
+                "freshness_committer_time",
+                "freshness_detail",
+            ]
+        );
+        assert_eq!(
+            relation_columns(&conn, "doc_file_provenance")?,
+            ["file_id", "projection_hash", "status", "detail"]
+        );
+        assert_eq!(
+            relation_columns(&conn, "doc_blame_cache")?,
+            [
+                "path_scope",
+                "path",
+                "bytes_hash",
+                "converted_blob_oid",
+                "path_tip",
+                "shallow_fingerprint",
+                "attribution_json",
+                "format_version",
             ]
         );
         let fts_columns = conn
@@ -2119,6 +2283,16 @@ mod tests {
                chunk_id,title,breadcrumb,nearest_heading,ordinal,
                embedding_identity,front_matter_state
              ) VALUES(1,'README','',NULL,0,'doc-identity','absent');
+             INSERT INTO doc_file_provenance(
+               file_id,projection_hash,status,detail
+             ) VALUES(1,'projection','resolved',NULL);
+             INSERT INTO doc_blame_cache(
+               path_scope,path,bytes_hash,converted_blob_oid,path_tip,
+               shallow_fingerprint,attribution_json,format_version
+             ) VALUES(
+               'scope','README.md','file','converted','tip','shallow','[]',
+               'test-contract'
+             );
              INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
                VALUES(1,'README','','','','README.md');
              INSERT INTO doc_inventory(path,subject,rule)
@@ -2138,14 +2312,16 @@ mod tests {
         )?;
 
         reset_extraction_state(&conn)?;
-        let state: (i64, i64, i64, i64, i64, i64) = conn.query_row(
+        let state: (i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
             "SELECT
                (SELECT count(*) FROM files),
                (SELECT count(*) FROM docs_fts),
                (SELECT count(*) FROM doc_chunk_meta),
+               (SELECT count(*) FROM doc_file_provenance),
                (SELECT count(*) FROM doc_inventory),
                (SELECT count(*) FROM vec_doc_embeddings_2),
-               (SELECT count(*) FROM embeddings)",
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM doc_blame_cache)",
             [],
             |row| {
                 Ok((
@@ -2155,10 +2331,12 @@ mod tests {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )?;
-        assert_eq!(state, (0, 0, 0, 0, 0, 1));
+        assert_eq!(state, (0, 0, 0, 0, 0, 0, 1, 1));
         Ok(())
     }
 

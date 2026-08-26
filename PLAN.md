@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-25.
+> Status: authoritative plan as of 2026-08-26.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -22,9 +22,10 @@
 > exhaustive lexical search is implemented. G23 investigation/inquiry guidance
 > is implemented, with its production replay still pending. Neither triggers
 > G16 or widens the semantic product surface, and no retrieval default changes
-> without a same-binary, same-snapshot comparison. G24 repository documentation
-> retrieval phases 1, 2, and 4 are implemented; git-basis freshness remains
-> gated on a retrieval evaluation corpus. G25 multi-format admission is
+> without a same-binary, same-snapshot comparison. All four G24 repository
+> documentation retrieval phases are implemented. Git-basis freshness is
+> available as an opt-in, while its pre-registered evaluation rejected every
+> tested movement bound as the default. G25 multi-format admission is
 > scheduled as G26 phase 0. G26 Rust code indexing is the current implementation
 > goal and the first additional code-corpus format, motivated by self-indexing this
 > repository.
@@ -195,7 +196,7 @@ credentials, cache identity, vector storage, fusion, fallback, and ranking.
 | Area | Current implementation |
 |---|---|
 | Parsing and chunking | OXC syntax and semantic analysis; AST-aware JS/JSX/TS/TSX/MJS/CJS/MTS/CTS chunks with scopes, declarations, imports, JSDoc, source spans, and BLAKE3 hashes |
-| Storage | One versioned SQLite database; schema v29; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
+| Storage | One versioned SQLite database; schema v33; three explicit logical lifecycles; FTS5, provenance-keyed embedding caches, dimension-specific sqlite-vec `vec0` indexes, canonical extraction tables, graph projection, durable reconnaissance policy, semantic artifacts, run ledger, and freshness metadata |
 | Runtime graph | Files, symbols, imports/exports/re-exports, module resolution, local/imported references, calls, construction, JSX renders, inheritance, event/property hubs, and ranked bounded traversal |
 | Runtime boundaries | Registry handlers/dispatch, lifecycle operations/listeners, jobs/queues/crons, DI tokens/providers, and logical workflow handoffs |
 | Contract plane | Interfaces, aliases, enums, decorators, DTO/schema evidence, exported parameter/return contracts, referenced contract names, and type-only barrel resolution; documentary edges remain separate from runtime edges |
@@ -609,7 +610,7 @@ and only then compare real agent work with and without it.
 
 ## Implemented post-v1 checker enrichment sidecar (G10)
 
-As implemented, schema v29 stores exact call/receiver/property byte spans and
+As implemented, schema v32 stores exact call/receiver/property byte spans and
 canonical checker batches. `jscout enrich` drives a pinned Node/TypeScript
 sidecar explicitly; `jscout checker doctor` reports project/configuration
 readiness. The protocol host isolates compiler work in a terminable worker,
@@ -831,7 +832,7 @@ belong to the watcher coordinator; the fixed-snapshot path remains stateless.
 ### Required G10 scale correction
 
 **Implementation status (2026-08-14, amended 2026-08-22).** The correction
-below is implemented in checker protocol v4 and schema v29: complete
+below is implemented in checker protocol v4 and schema v32: complete
 configured-project coverage, package-policy admission of runtime orphan scopes
 by default, exhaustive inferred-project coverage under `--all`, manual planning,
 configuration-only ownership discovery, package/file spread ordering, bounded
@@ -1653,9 +1654,16 @@ Triggers include:
 - `package.json`, `pnpm-workspace.yaml`, source-inventory ignore files,
   supported lockfiles, tsconfig/jsconfig files, declaration files, and other
   resolver configuration;
-- resolved Git worktree `HEAD` control paths, including branch switches and
-  worktree-specific Git directories; source notifications cover checkout
-  changes without treating routine `.git/index` writes as rebuild triggers;
+- resolved Git provenance controls, including worktree-specific `HEAD` and
+  current-ref paths, the exact worktree index returned by
+  `git rev-parse --git-path index`, and shallow/packed-ref state; repositories
+  using reftable additionally watch `reftable/tables.list` under both the
+  resolved worktree Git directory and common Git directory. Git conversion
+  controls also include applicable `.gitattributes` files from the worktree
+  root through a nested indexed root, repository `info/attributes`, and
+  repository/worktree `config` files. Any of these changes selects a full
+  refresh; conversion inputs outside repository control remain covered by
+  periodic reconciliation;
 - `.gitmodules`, submodule control paths, and submodule worktree changes;
 - selected dependency locator entries and canonical package roots, including
   pnpm/Yarn symlink replacement and package installation changes;
@@ -3030,8 +3038,13 @@ G21 adds one versioned `<repository>/.jscout.toml` for non-secret stable
 configuration. Every command resolves the canonical repository root first;
 MCP loads that exact file once at startup and remains one process serving one
 root/database. The default database remains `<root>/.jscout.db`, an explicit
-`--database` remains authoritative, and no parent-directory search,
-multi-repository MCP routing, or hot reload is introduced.
+`--database` remains authoritative, and no parent-directory search or
+multi-repository MCP routing is introduced. MCP policy remains immutable
+until restart. Watch has one narrow live-reload exception: the documentation
+indexing policy formed by `[docs].enabled`, `[docs].include`, `[docs].exclude`,
+and `[docs.search].freshness`. A change to that effective policy promotes the
+next watch generation to a full refresh. Every other watch setting remains
+bound to the startup configuration and requires restart.
 
 Resolution is explicit invocation/MCP argument, then repository config, then a
 legacy environment fallback, then built-in behavior. API keys and tokens stay
@@ -3235,7 +3248,7 @@ a completeness claim; telemetry retains its exhaustive counts and warning.
 Install refuses an existing guide, while update replaces that exact guide and
 leaves unrelated agent-specific copies untouched.
 
-## G24 — repository documentation retrieval (phase 3 pending)
+## G24 — repository documentation retrieval (implemented; freshness opt-in)
 
 Repository Markdown and MDX are authored source material. G24 makes them
 retrievable through jscout without treating them as code structural evidence.
@@ -3352,23 +3365,64 @@ The revised decisions:
    freshness for every block; this accepted version-one false-recency trade-off
    is bounded by `max_rank_movement` and measured by the renamed-file
    evaluation arm.
-5. Freshness: order-based and bounded, not a score multiplier. After
-   relevance fusion and optional reranking, each candidate's final rank differs
-   from its base rank by at most `max_rank_movement` (candidate value 2;
-   evaluation hypothesis), and swaps
-   occur only between candidates with comparable provenance: git orders
-   against git by latest author time with working-tree lines newest, observed
-   orders post-baseline `added` and `body_changed` events by snapshot sequence,
-   git and observed never reorder against each other, and unknown provenance
-   never moves and is never advantaged. The model reranker never receives
-   temporal metadata. Only commits listed by the repository's resolved shallow
-   file count as shallow boundaries and contribute no timestamp; provenance
-   uses captured indexed bytes with
+5. Freshness: one opt-in controls both index-time Git attribution and the
+   order-based, bounded query stage; it is not a score multiplier. With
+   `[docs.search].freshness = false`, indexing publishes
+   `documentation_provenance_enabled = false`, deterministic per-file
+   `disabled` provenance, and per-chunk `unknown` bases with no timestamps. It
+   performs no Phase 3 repository capture, blame-cache lookup or mutation, Git
+   attribution, or provenance publication revalidation. With freshness
+   enabled, the index resolves and publishes Git/working-tree provenance and
+   sets the marker true in the same transaction. A documentation search whose
+   effective freshness option is enabled requires that true marker and the
+   current provenance format; a missing, false, or incompatible marker fails
+   closed with an instruction to run `jscout index`. Freshness-disabled search,
+   `docs status`, `docs embed`, and non-documentation read surfaces do not
+   require that optional projection.
+
+   A running watcher alone hot-reloads the complete documentation indexing
+   policy: `[docs].enabled`, `[docs].include`, `[docs].exclude`, and
+   `[docs.search].freshness`. Any effective change forces a full generation
+   before the new corpus/provenance state is considered indexed; all other
+   configuration remains restart-bound. The ordinary structural branch-switch
+   controls for the nearest file-form `.git` indirection, worktree `HEAD`, and
+   `.gitmodules` remain watched in either mode. Worktree-index, reference/log,
+   shallow, reftable, and Git conversion controls are added only while
+   provenance is enabled.
+
+   After relevance fusion and optional reranking, each candidate's final rank
+   differs from its base rank by at most `max_rank_movement` (the configurable
+   built-in remains 2 but is dormant because evaluation rejected every enabled
+   default), and swaps occur only between candidates with comparable
+   provenance: git orders against git by latest author time with working-tree
+   lines newest, observed orders post-baseline `added` and `body_changed`
+   events by snapshot sequence, git and observed never reorder against each
+   other, and unknown provenance never moves and is never advantaged. The model
+   reranker never receives temporal metadata. Only commits listed by the
+   repository's resolved shallow file count as shallow boundaries and
+   contribute no timestamp; provenance uses captured indexed bytes with
    `git --no-replace-objects blame --line-porcelain --no-ignore-revs-file --contents - <recorded-head> -- <path>`;
-   blame mappings cache by repository-relative
-   path, exact file-byte hash, path-tip commit, and shallow boundary
-   fingerprint; filesystem mtime is never a fallback.
-   `--no-freshness` preserves the relevance order for comparison.
+   attribution requires both a blob at that recorded HEAD path and an exact
+   current-index entry, so staged additions and `git rm --cached` files remain
+   unknown. Blame mappings cache by an opaque hash of Git's worktree-relative
+   prefix for the indexed root, indexed-root-relative path, exact file-byte
+   hash, path-tip commit, shallow boundary fingerprint, and Git conversion
+   fingerprint produced from the same captured bytes and path by
+   `git --no-replace-objects hash-object --stdin --path <path>`; nested roots
+   sharing one database cannot alias one another, a changed effective Git
+   conversion outcome cannot reuse a stale mapping, and filesystem mtime is
+   never a fallback. Provenance attribution is separately bounded to 65,536
+   logical lines and 64 MiB of blame standard output per document. Crossing
+   either provenance-only bound leaves the document indexed and searchable but
+   reports visible `unknown`/`blame_failed` provenance. `--no-freshness`
+   disables the query stage and preserves relevance order for comparison
+   without changing the indexed projection.
+
+   Provenance still participates in the shared structural snapshot when the
+   option is enabled. A history-only attribution change can therefore rotate
+   `meta.snapshot` and invalidate other snapshot-bound products. Separating
+   provenance identity from the structural snapshot is a follow-up after this
+   pull request, not part of the opt-in correction.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
    file hash. Checkout source is read once into an immutable buffer, and only
@@ -3378,21 +3432,27 @@ The revised decisions:
    retired hashes, transition metadata, and content-addressed vectors may
    remain. Version one adds no retention controls.
 
-Delivery status: phases 1, 2, and 4 are implemented. Phase 1 admits Markdown
+Delivery status: all four numbered phases are implemented. Phase 1 admits Markdown
 and MDX at the named-sections tier through the shared index pass, with the
 `files.corpus` and `files.format` classifications, `docs_fts`,
 `doc_chunk_meta`, the MCP documentation-search surface, and lexical docs
 search. Phase 2 adds docs vectors from the shared `[embedding]` profile. Phase
-4 adds documentation-aware watch classification through the shared
-incremental watcher. The fixed
+3 adds Git/working-tree provenance, persisted blame caching, bounded temporal
+reordering after relevance and reranking, result diagnostics, and
+`--no-freshness`. Phase 4 adds documentation-aware watch classification
+through the shared incremental watcher. The fixed
 [retrieval corpus](eval/fixtures/docs-retrieval/manifest.json),
 [pre-registration](eval/prereg/g24-documentation-freshness-2026-08-25.md),
 [conflict-arm addendum](eval/prereg/g24-documentation-freshness-addendum-2026-08-25.md), and
 Phase 2 [human](eval/results/g24-docs-retrieval-phase2-2026-08-25.md) and
 [machine](eval/results/g24-docs-retrieval-phase2-2026-08-25.json) reports
-satisfy Phase 3's entry prerequisite. Phase 3 — Git-basis provenance and the
-bounded freshness reorder — remains unimplemented. The observation ledger is
-unscheduled and belongs only to the supersession product.
+satisfy Phase 3's entry prerequisite. The Phase 3
+[human](eval/results/g24-docs-retrieval-phase3-2026-08-26.md) and
+[machine](eval/results/g24-docs-retrieval-phase3-2026-08-26.json) reports
+record that all hard validity gates passed but bounds 1–3 failed the evergreen
+and recall guardrails. Freshness therefore defaults to disabled and remains
+explicitly opt-in. The observation ledger is unscheduled and belongs only to
+the supersession product.
 
 Phase 1/2 acceptance: code-search ranking, content, and statistics are
 byte-identical after docs admission modulo the necessarily changed shared
@@ -3406,12 +3466,29 @@ a repository with no `[embedding]` provider retains full lexical documentation
 search; disabling `[docs].enabled` yields no docs rows or docs-status file
 decisions while leaving every code surface unchanged; indexing and code
 embedding never generate documentation vectors; and crash recovery exposes exactly one complete old or replacement
-shared snapshot, never a partial mixture. Deferred ledger/freshness acceptance:
-inserting one uniquely distinguishable paragraph produces one `added` block
-observation and no succession rows for untouched blocks; globally unique copied
-content and Git-detected renames receive no cross-path predecessor; and
-freshness movement never exceeds its configured bound or crosses provenance
-bases. The detailed implementation
+shared snapshot, never a partial mixture. Phase 3 acceptance: disabled
+freshness preserves Phase 2 ranked identities, publishes a false readiness
+marker plus disabled/unknown projection, and performs no Phase 3 Git,
+blame-cache, or provenance-revalidation work; enabled movement never exceeds
+its configured bound, moves unknown provenance, or crosses incomparable
+provenance clocks; an effectively enabled query fails closed until the
+current-format provenance projection is indexed, while freshness-disabled docs
+queries and unrelated read surfaces remain available; captured-byte blame,
+including its Git conversion fingerprint, is revalidated before publication;
+blame line/output bounds fail only provenance rather than document admission; a
+running watcher hot-reloads only the documentation indexing policy
+(`[docs].enabled/include/exclude` and `[docs.search].freshness`) and forces a
+full generation when it changes; the nearest file-form `.git` indirection and
+baseline `HEAD` and `.gitmodules` controls remain active, while worktree-index
+and reftable-manifest changes trigger a full watch refresh only when provenance
+is enabled, as do
+repository-controlled Git attribute and configuration changes that can alter
+conversion; and the evaluation
+records the disabled default after rejecting every candidate bound. Deferred
+ledger acceptance: inserting one uniquely distinguishable paragraph produces
+one `added` block observation and no succession rows for untouched blocks;
+globally unique copied content and Git-detected renames receive no cross-path
+predecessor. The detailed implementation
 contract
 [docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md](docs/plans/g24-markdown-retrieval-proposal-2026-08-24.md)
 and the decision record

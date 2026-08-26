@@ -36,9 +36,11 @@ impl RuntimeConfig {
                 self.effective.docs.exclude,
             ),
             format!(
-                "docs-search: vector={} rerank={} limit={} response_bytes={}",
+                "docs-search: vector={} rerank={} freshness={} max_rank_movement={} limit={} response_bytes={}",
                 self.effective.docs.search.vector,
                 self.effective.docs.search.rerank,
+                self.effective.docs.search.freshness,
+                self.effective.docs.search.max_rank_movement,
                 self.effective.docs.search.limit,
                 self.effective.docs.search.response_bytes,
             ),

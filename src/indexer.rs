@@ -9,12 +9,17 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::chunk::{Chunk, Chunker, LineIndex};
 use crate::dependency::{self, DependencyLimits};
 use crate::docs::corpus::{self, CapturedDocument, CorpusOptions, Decision, DocFile};
+use crate::docs::provenance::{
+    BlameCacheKey, GitChunkBasis, PublicationValidation, RepositoryCapture,
+};
+use crate::docs::provenance_store::{self, ResolvedDocumentProvenance};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
 use crate::{file_role, io_policy, parse, store};
 
 const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
+const DOC_PROVENANCE_FORMAT_META_KEY: &str = "documentation_provenance_format_version";
 const CODE_CORPUS: &str = "code";
 const DOCS_CORPUS: &str = "docs";
 const JAVASCRIPT_FORMAT: &str = "javascript";
@@ -28,6 +33,7 @@ pub struct IndexOptions {
     pub dependency_limits: DependencyLimits,
     pub docs_include: Vec<String>,
     pub docs_exclude: Vec<String>,
+    pub docs_freshness: bool,
     pub timing: bool,
     pub debug: bool,
 }
@@ -39,6 +45,7 @@ impl Default for IndexOptions {
             dependency_limits: DependencyLimits::default(),
             docs_include: crate::docs::default_include_globs(),
             docs_exclude: Vec::new(),
+            docs_freshness: false,
             timing: false,
             debug: false,
         }
@@ -57,6 +64,7 @@ pub struct IndexOutcome {
     /// are visible corpus exclusions, not phase failures.
     pub rejected: usize,
     pub rejections: Vec<IndexRejection>,
+    pub diagnostics: Vec<IndexDiagnostic>,
     pub chunks: usize,
     pub refs: usize,
     pub dependency_packages: usize,
@@ -81,6 +89,13 @@ pub struct IndexRejection {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDiagnostic {
+    pub path: Option<String>,
+    pub stage: &'static str,
+    pub detail: String,
+}
+
 fn retryable_read_failure(path: &str, error: std::io::Error) -> anyhow::Error {
     anyhow::Error::new(error).context(format!("retryable read failure for `{path}`"))
 }
@@ -102,13 +117,20 @@ impl IndexOutcome {
 }
 
 pub fn report_rejections(outcome: &IndexOutcome) {
-    if outcome.rejections.is_empty() {
-        return;
+    if !outcome.rejections.is_empty() {
+        eprintln!("index inputs rejected ({}):", outcome.rejections.len());
+        for rejection in &outcome.rejections {
+            let error = rejection.error.replace('\n', "\n      ");
+            eprintln!("  [{}] {}: {error}", rejection.stage, rejection.path);
+        }
     }
-    eprintln!("index inputs rejected ({}):", outcome.rejections.len());
-    for rejection in &outcome.rejections {
-        let error = rejection.error.replace('\n', "\n      ");
-        eprintln!("  [{}] {}: {error}", rejection.stage, rejection.path);
+    for diagnostic in &outcome.diagnostics {
+        let detail = diagnostic.detail.replace('\n', "\n      ");
+        eprintln!(
+            "index diagnostic [{}] {}: {detail}",
+            diagnostic.stage,
+            diagnostic.path.as_deref().unwrap_or("<repository>"),
+        );
     }
 }
 
@@ -380,7 +402,69 @@ fn index_repo_impl<F: FileSystem>(
     checker_retention: CheckerRetention,
     operation: IndexOperation<'_, F>,
 ) -> Result<IndexOutcome> {
+    const MAX_PROVENANCE_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_PROVENANCE_ATTEMPTS {
+        let attempt_operation = IndexOperation {
+            fs: operation.fs,
+            #[cfg(test)]
+            fail_after_canonical_replacement: operation.fail_after_canonical_replacement,
+        };
+        match index_repo_attempt(
+            root,
+            conn,
+            options,
+            allow_extraction_reset,
+            mode,
+            checker_retention,
+            attempt_operation,
+        ) {
+            Err(error)
+                if error
+                    .downcast_ref::<DocumentationProvenanceDrift>()
+                    .is_some()
+                    && attempt < MAX_PROVENANCE_ATTEMPTS =>
+            {
+                if options.debug {
+                    eprintln!(
+                        "documentation provenance changed during indexing; retrying immutable capture ({}/{})",
+                        attempt + 1,
+                        MAX_PROVENANCE_ATTEMPTS
+                    );
+                }
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded documentation provenance retry loop always returns")
+}
+
+#[derive(Debug)]
+struct DocumentationProvenanceDrift(String);
+
+impl std::fmt::Display for DocumentationProvenanceDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DocumentationProvenanceDrift {}
+
+fn index_repo_attempt<F: FileSystem>(
+    root: &Path,
+    conn: &Connection,
+    options: &IndexOptions,
+    allow_extraction_reset: bool,
+    mode: IndexMode,
+    checker_retention: CheckerRetention,
+    operation: IndexOperation<'_, F>,
+) -> Result<IndexOutcome> {
     let root = root.canonicalize()?;
+    // Git state is recorded before the immutable documentation capture only
+    // when freshness is opted in. Every blame and final drift check then
+    // belongs to this one attempted snapshot.
+    let provenance_repository = options
+        .docs_freshness
+        .then(|| RepositoryCapture::capture(&root));
     let inventory_started = std::time::Instant::now();
     let inventory = corpus::repository_inventory(
         &root,
@@ -397,6 +481,12 @@ fn index_repo_impl<F: FileSystem>(
             inventory_started.elapsed()
         );
     }
+    let documentation_provenance = match provenance_repository.as_ref() {
+        Some(repository) => {
+            provenance_store::resolve_document_provenance(conn, repository, &inventory.documents)?
+        }
+        None => provenance_store::disabled_document_provenance(&inventory.documents),
+    };
     let workspace_discovery =
         crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
@@ -406,6 +496,7 @@ fn index_repo_impl<F: FileSystem>(
         removed: 0,
         rejected: 0,
         rejections: Vec::new(),
+        diagnostics: Vec::new(),
         chunks: 0,
         refs: 0,
         dependency_packages: 0,
@@ -424,6 +515,16 @@ fn index_repo_impl<F: FileSystem>(
             rejection.error,
         );
     }
+    outcome.diagnostics.extend(
+        documentation_provenance
+            .diagnostics
+            .iter()
+            .map(|diagnostic| IndexDiagnostic {
+                path: diagnostic.path.clone(),
+                stage: "documentation-provenance",
+                detail: format!("{}: {}", diagnostic.operation, diagnostic.detail),
+            }),
+    );
     for rejection in workspace_discovery.rejections {
         outcome.record_rejection(
             display_repository_path(&root, &rejection.path),
@@ -437,10 +538,16 @@ fn index_repo_impl<F: FileSystem>(
     // marker publication form one SQLite commit. WAL readers continue to see
     // the last-good committed snapshot while this writer is active, and any
     // failure below rolls the replacement back as a unit.
+    let documentation_provenance_by_path = documentation_provenance
+        .documents
+        .iter()
+        .map(|provenance| (provenance.path.as_str(), provenance))
+        .collect::<HashMap<_, _>>();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let preparation = (|| -> Result<(_, _, _)> {
         ensure_extraction_version(conn)?;
         let documentation_format_changed = ensure_documentation_chunk_format(conn)?;
+        let documentation_provenance_format_changed = ensure_documentation_provenance_format(conn)?;
         let stored: HashMap<String, (i64, String, String, String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT path, id, hash, role, corpus, format
@@ -562,6 +669,10 @@ fn index_repo_impl<F: FileSystem>(
         let documentation_projection_started = std::time::Instant::now();
         for document in &inventory.documents {
             let rel = document.file.path.clone();
+            let provenance = documentation_provenance_by_path
+                .get(rel.as_str())
+                .copied()
+                .with_context(|| format!("missing resolved documentation provenance for {rel}"))?;
             seen.insert(rel.clone());
             let hash = document.file.content_hash.as_str();
             let format = documentation_format(Path::new(&rel))?;
@@ -575,7 +686,15 @@ fn index_repo_impl<F: FileSystem>(
                 if old_role != role {
                     conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
                 }
-                outcome.unchanged += 1;
+                if !documentation_provenance_format_changed
+                    && stored_documentation_provenance_hash(conn, *id)?.as_deref()
+                        == Some(provenance.projection_hash.as_str())
+                {
+                    outcome.unchanged += 1;
+                } else {
+                    update_documentation_provenance(conn, *id, provenance)?;
+                    outcome.indexed += 1;
+                }
                 published.insert(rel);
                 continue;
             }
@@ -595,11 +714,30 @@ fn index_repo_impl<F: FileSystem>(
                 package_instance_id: None,
                 package_path: None,
             };
-            let chunks = insert_documentation_file(conn, &identity, document)?;
+            let chunks = insert_documentation_file(conn, &identity, document, provenance)?;
             outcome.indexed += 1;
             outcome.chunks += chunks;
             published.insert(rel);
         }
+        if options.docs_freshness {
+            provenance_store::upsert_blame_cache(conn, &documentation_provenance.cache_updates)?;
+            provenance_store::prune_blame_cache(
+                conn,
+                &documentation_provenance.retained_cache_keys,
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![
+                crate::docs::PROVENANCE_ENABLED_META_KEY,
+                if options.docs_freshness {
+                    "true"
+                } else {
+                    "false"
+                }
+            ],
+        )?;
         if options.timing {
             eprintln!(
                 "timing documentation-projection={:?}",
@@ -667,6 +805,15 @@ fn index_repo_impl<F: FileSystem>(
         )?;
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
+        if let Some(repository) = provenance_repository.as_ref() {
+            validate_documentation_provenance_publication(
+                repository,
+                &inventory.documents,
+                // Keep this early drift check cheap. Conversion identities are
+                // recomputed once, at the final pre-COMMIT validation below.
+                &[],
+            )?;
+        }
         // Manual indexing always resets the optional checker plane. Watch keeps
         // the old active batch and newest superseded staging batch hidden for
         // the following per-project carry step; projection still rejects a
@@ -723,6 +870,19 @@ fn index_repo_impl<F: FileSystem>(
     })();
     match publication {
         Ok(()) => {
+            // This is intentionally the last fallible operation before the
+            // SQLite commit. A checkout or clone-deepening change during
+            // projection must not publish provenance from the earlier state.
+            if let Some(repository) = provenance_repository.as_ref()
+                && let Err(error) = validate_documentation_provenance_publication(
+                    repository,
+                    &inventory.documents,
+                    &documentation_provenance.publication_checks,
+                )
+            {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
             if let Err(error) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error.into());
@@ -735,6 +895,62 @@ fn index_repo_impl<F: FileSystem>(
     }
     crate::recon::reconcile_file_policy_after_index(&root, conn);
     Ok(outcome)
+}
+
+fn validate_documentation_provenance_publication(
+    repository: &RepositoryCapture,
+    documents: &[CapturedDocument],
+    conversion_keys: &[BlameCacheKey],
+) -> Result<()> {
+    let RepositoryCapture::Git(repository) = repository else {
+        return Ok(());
+    };
+    let conversion_checks = if conversion_keys.is_empty() {
+        Vec::new()
+    } else {
+        let documents_by_path = documents
+            .iter()
+            .map(|document| (document.file.path.as_str(), document.bytes.as_slice()))
+            .collect::<HashMap<_, _>>();
+        conversion_keys
+            .iter()
+            .map(|key| {
+                documents_by_path
+                    .get(key.path.as_str())
+                    .copied()
+                    .map(|bytes| (key, bytes))
+                    .with_context(|| {
+                        format!(
+                            "missing captured documentation bytes for conversion check {}",
+                            key.path
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    match repository.validate_before_publication(conversion_checks) {
+        Ok(PublicationValidation::Stable) => Ok(()),
+        Ok(PublicationValidation::Drift(drift)) => {
+            Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
+                "Git documentation provenance drifted before publication: HEAD {} -> {}, index membership {} -> {}, shallow {} -> {}",
+                drift.recorded_head,
+                drift.current_head,
+                drift.recorded_index_fingerprint,
+                drift.current_index_fingerprint,
+                drift.recorded_shallow_fingerprint,
+                drift.current_shallow_fingerprint,
+            ))))
+        }
+        Ok(PublicationValidation::ConversionDrift(drift)) => {
+            Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
+                "Git documentation conversion drifted before publication for {}: {} -> {}",
+                drift.path, drift.recorded_oid, drift.current_oid,
+            ))))
+        }
+        Err(error) => Err(anyhow::Error::new(DocumentationProvenanceDrift(format!(
+            "could not revalidate Git documentation provenance before publication: {error:#}"
+        )))),
+    }
 }
 
 fn display_repository_path(root: &Path, path: &Path) -> String {
@@ -839,6 +1055,38 @@ fn ensure_documentation_chunk_format(conn: &Connection) -> Result<bool> {
     Ok(true)
 }
 
+fn ensure_documentation_provenance_format(conn: &Connection) -> Result<bool> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [DOC_PROVENANCE_FORMAT_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(crate::docs::PROVENANCE_FORMAT_VERSION) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![
+            DOC_PROVENANCE_FORMAT_META_KEY,
+            crate::docs::PROVENANCE_FORMAT_VERSION
+        ],
+    )?;
+    Ok(true)
+}
+
+fn stored_documentation_provenance_hash(conn: &Connection, file_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT projection_hash FROM doc_file_provenance WHERE file_id=?1",
+        [file_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("read stored documentation provenance projection hash")
+}
+
 fn extract_file(abs: &Path, rel: &str, source: &str) -> Result<FileData> {
     parse::with_parsed(source, abs, |ret, semantic| {
         let chunker = Chunker::new(Path::new(rel), source, ret);
@@ -911,11 +1159,17 @@ fn insert_documentation_file(
     conn: &Connection,
     identity: &FileIdentity<'_>,
     captured: &CapturedDocument,
+    provenance: &ResolvedDocumentProvenance,
 ) -> Result<usize> {
     let file = &captured.file;
     ensure!(
         identity.path == file.path,
         "documentation file identity path does not match captured document"
+    );
+    ensure!(
+        provenance.path == file.path && provenance.chunks.len() == file.chunks.len(),
+        "documentation provenance does not match captured document {}",
+        file.path
     );
     ensure!(
         identity.corpus == DOCS_CORPUS && matches!(identity.format, MARKDOWN_FORMAT | MDX_FORMAT),
@@ -949,6 +1203,7 @@ fn insert_documentation_file(
         ],
     )?;
     let file_id = conn.last_insert_rowid();
+    provenance_store::upsert_file_provenance(conn, file_id, provenance)?;
     let metadata = documentation_metadata(file);
     let tags_json = serde_json::to_string(&file.tags)
         .with_context(|| format!("serialize Markdown tags for {}", file.path))?;
@@ -965,8 +1220,10 @@ fn insert_documentation_file(
     let mut insert_meta = conn.prepare_cached(
         "INSERT INTO doc_chunk_meta(
            chunk_id, title, description, tags_json, breadcrumb,
-           nearest_heading, ordinal, embedding_identity, front_matter_state
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+           nearest_heading, ordinal, embedding_identity, front_matter_state,
+           freshness_basis, freshness_author_time, freshness_committer_time,
+           freshness_detail
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
     let mut insert_fts = conn.prepare_cached(
         "INSERT INTO docs_fts(rowid, title, metadata, breadcrumb, body, path)
@@ -974,9 +1231,15 @@ fn insert_documentation_file(
     )?;
 
     for (position, chunk) in file.chunks.iter().enumerate() {
+        let chunk_provenance = &provenance.chunks[position];
         ensure!(
             chunk.ordinal == position as u64,
             "Markdown chunk ordinals are not contiguous for {}",
+            file.path
+        );
+        ensure!(
+            chunk_provenance.chunk_ordinal == chunk.ordinal,
+            "documentation provenance ordinals are not aligned for {}",
             file.path
         );
         let start = usize::try_from(chunk.source_start)
@@ -1041,6 +1304,10 @@ fn insert_documentation_file(
             same_heading_ordinal,
             chunk.embedding_identity,
             file.front_matter_state,
+            git_chunk_basis_name(chunk_provenance.basis),
+            chunk_provenance.author_time,
+            chunk_provenance.committer_time,
+            provenance.detail,
         ])?;
         let breadcrumb_fts = fts_content(&chunk.breadcrumb);
         insert_fts.execute(params![
@@ -1055,6 +1322,53 @@ fn insert_documentation_file(
     Ok(file.chunks.len())
 }
 
+fn update_documentation_provenance(
+    conn: &Connection,
+    file_id: i64,
+    provenance: &ResolvedDocumentProvenance,
+) -> Result<()> {
+    let chunk_rows = {
+        let mut statement = conn.prepare(
+            "SELECT chunk.id
+             FROM chunks chunk
+             JOIN doc_chunk_meta metadata ON metadata.chunk_id=chunk.id
+             WHERE chunk.file_id=?1
+             ORDER BY chunk.start, chunk.end, chunk.id",
+        )?;
+        let rows = statement.query_map([file_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    ensure!(
+        chunk_rows.len() == provenance.chunks.len(),
+        "stored documentation chunks do not match refreshed provenance for {}",
+        provenance.path
+    );
+
+    let mut update = conn.prepare_cached(
+        "UPDATE doc_chunk_meta
+         SET freshness_basis=?1, freshness_author_time=?2,
+             freshness_committer_time=?3, freshness_detail=?4
+         WHERE chunk_id=?5",
+    )?;
+    for (position, (chunk_id, chunk_provenance)) in
+        chunk_rows.into_iter().zip(&provenance.chunks).enumerate()
+    {
+        ensure!(
+            position as u64 == chunk_provenance.chunk_ordinal,
+            "stored documentation ordinal does not match refreshed provenance for {}",
+            provenance.path
+        );
+        update.execute(params![
+            git_chunk_basis_name(chunk_provenance.basis),
+            chunk_provenance.author_time,
+            chunk_provenance.committer_time,
+            provenance.detail,
+            chunk_id,
+        ])?;
+    }
+    provenance_store::upsert_file_provenance(conn, file_id, provenance)
+}
+
 fn documentation_metadata(file: &DocFile) -> String {
     let mut parts = Vec::new();
     if let Some(description) = file
@@ -1066,6 +1380,14 @@ fn documentation_metadata(file: &DocFile) -> String {
     }
     parts.extend(file.tags.iter().map(String::as_str));
     parts.join(" ")
+}
+
+const fn git_chunk_basis_name(basis: GitChunkBasis) -> &'static str {
+    match basis {
+        GitChunkBasis::Git => "git",
+        GitChunkBasis::WorkingTree => "working_tree",
+        GitChunkBasis::Unknown => "unknown",
+    }
 }
 
 fn insert_file(
