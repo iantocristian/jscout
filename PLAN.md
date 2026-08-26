@@ -3499,11 +3499,13 @@ format. The decisions:
    Parse errors do not reject the file and are counted in index/watch refresh
    diagnostics. The Rust extractor contract is versioned per format; changing
    it does not invalidate unchanged JavaScript or TypeScript rows.
-4. Phase 2 replaces the text projection with a non-overlapping partition of
+4. Phase 2a replaces the text projection with a non-overlapping partition of
    named item chunks plus residual unnamed chunks—never duplicate full-text and
-   named rows. It adds exact definitions only after a committed mixed-corpus
-   collision protocol passes. Rust-aware exact occurrences are a separate
-   capability and do not turn on merely because names exist.
+   named rows. Exact definitions, exact occurrences, and Rust vectors remain
+   disabled throughout 2a. Phase 2b may add exact definitions only after a
+   committed mixed-corpus collision protocol passes. Rust-aware exact
+   occurrences are a separate capability and do not turn on merely because
+   names exist.
 5. Phase 3 adds Rust module edges. Before code begins, its contract must fix the
    exact `cargo metadata` invocation, no-network/no-mutation policy, tool and
    input identity, failure behavior, supported path forms, and unresolved-edge
@@ -3527,7 +3529,7 @@ single-language-intent queries—rather than relevant competition.
 
 Phase 1 adds `format` as a sqlite-vec partition key, searches each requested
 origin/format partition, and merges same-profile cosine scores. Rust vectors
-remain disabled until named phase-2 chunks exist and a Rust embedding
+remain disabled until named phase-2a chunks exist and a Rust embedding
 evaluation passes. Later Rust enablement reuses the existing embedding model
 and cache; different models would require rank fusion instead. Only then does
 Rust change from `CodeLexical` to `CodeLexicalAndVector`.
@@ -3568,11 +3570,16 @@ the score report to fresh paths outside every evaluated checkout. Those
 artifacts record indexing duration, database bytes, index stdout/stderr
 diagnostics, and raw query results. After scoring, a hash-linked result record
 and any selected immutable artifact copies are preserved under
-`eval/results/`. Phase 2 and 3 remain blocked until their own preregistered
-collision and edge-correctness protocols are committed. The detail document
+`eval/results/`. V4 completed as the decision-grade formal failure recorded in
+[eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
+The format-scoped JS/TS regression contract passed, but mixed treatment mean
+nDCG@10 was `0.597555`, below the frozen `0.70` absolute gate. Phase 2a named,
+item-local Rust chunks is therefore the current milestone. Exact definitions,
+exact occurrences, Rust vectors, and module edges remain disabled pending their
+own prospective acceptance protocols. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
 is subordinate and non-normative, this entry winning on any disagreement.
-Phases 0 and 1 are the current implementation milestone.
+Phases 0 and 1 remain the built substrate for that work.
 
 The first phase-1 treatment formally failed the preregistered mixed-corpus
 control gate: relevant Rust implementations displaced one legacy JS/TS gold
@@ -3581,29 +3588,31 @@ the numerical thresholds, but it is diagnostic evidence, not a passing result.
 The v3 replacement's filtered regression arm passed: JS/TS Recall@10 remained
 `1.0000`, mean MRR improved from `0.8833` to `0.8854`, and every baseline
 top-five gold file stayed top-ten. Its mixed arm still failed the frozen
-`0.70` nDCG gate at `0.5084`, so the result remains a
-formal failure under `eval/results/`. That mixed score was not decision-grade,
+`0.70` nDCG gate at `0.5084`, so the result remains a formal failure under
+`eval/results/`. That mixed score was not decision-grade,
 however: the evaluator called source-authored positive qrels a pool, judged
 only 68 of 240 returned top-ten slots, supplied no explicit zeroes, and treated
 every unjudged file as zero gain. The same output also contained real misses,
 so neither dismissing the failure nor changing its judgments after inspection
 is allowed.
 
-Phase 1 therefore remains unaccepted while one unchanged-treatment v4 run
-repairs the evaluation rather than the ranking. Its filtered arm reuses the
-previously inspected v3 JS/TS cohort only as a regression guard; its mixed arm
-uses a fresh source-only holdout. It pools the union of baseline and treatment
-top-ten files plus authored positives, removes arm/rank/score provenance,
-blindly assigns an explicit grade to every pooled query-file pair, freezes
-those qrels, then scores both arms against that same pool. Treatment mean
-nDCG@10 must be at least `0.70`, may trail baseline by no more than `0.02`, and
-both arms must have complete judgment coverage at ten. If that complete pool
-still fails, advance the planned named, item-local Rust chunks as phase 2a
-while exact definitions and occurrences remain disabled. Identifier subtoken
-aliases, if tested, attach only to those item-local chunks; appending aliases
-to phase-1 4.8KB lossless chunks would amplify unrelated identifiers.
-Per-format FTS tables and language quotas remain
-unsupported by the evidence.
+V4 then completed the blind pool and assigned explicit qrels to every pooled
+candidate, making its formal failure decision-grade. Filtered Recall@10 stayed
+`1.000000`, mean MRR improved from `0.883333` to `0.885417`, and no baseline
+top-five positive left the top ten, so format-scoped JS/TS retrieval remains
+validated. Mixed treatment nDCG@10 improved from the Rust-free baseline's
+`0.310561` to `0.597555`, and authored-positive Recall@10 improved from
+`0.319697` to `0.550000`; relevant Rust therefore improved the combined
+ranking, leaving no evidence for per-language statistics, quotas, or weights.
+The treatment nevertheless failed the frozen absolute `0.70` nDCG gate.
+
+G26 consequently advances to Phase 2a named, item-local Rust chunks while
+exact definitions, exact occurrences, Rust vectors, and module edges remain
+disabled. Identifier aliases must not be appended to the broad phase-1 chunks;
+any alias experiment belongs to the item-local projection and requires its own
+prospective test. The complete v4 result and immutable artifact hashes are
+recorded in
+[eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
 
 ## Evaluation decisions already made
 

@@ -1,0 +1,3071 @@
+{
+  "schema_version": "g26-format-scope-v4-score-report-1",
+  "protocol_version": 4,
+  "manifest_sha256": "b7f330d5aeae5b96b0eb25ef77a12a8f5ce0cf93c8d2b00381d430d428c0c9a6",
+  "query_manifest_sha256": "c44ac807b7b67183248b76101a806255532781d63e1865a1d1fa98febdbbd858",
+  "runner_sha256": "502c72b2227cb258095d5ebf3a2d9c9ea0d187e1f2a02ff9b3285da693f1d9e5",
+  "baseline_report_sha256": "557bb4b4287bf922226db22a5fd4547a1a6b6813a7f99e7f64da5ee659532434",
+  "treatment_report_sha256": "ac2948a437c22131daeac16f2b5b3e556462a709befd193a0fce7ba3959e0845",
+  "pool_file_sha256": "e6b8d1a1719d4f427a62a609795af6a21214ec0c63cadf46d0c1ffc5742567f8",
+  "pool_sha256": "6e850924f0c33114ab3a85582b867b29eb8048e90bee58941e42393368e65d03",
+  "qrels_file_sha256": "1d3bb1183984531bab59cccf6ce9341b1adab5145e051ffcccec4f741a50b991",
+  "metrics": {
+    "filtered_parity": {
+      "label": "filtered_js_ts_parity",
+      "queries": [
+        {
+          "id": "v3-js-filter-exact-01",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "checker/src/protocol.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/protocol.mjs",
+            "checker/test/sidecar.test.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/protocol.mjs",
+            "checker/test/sidecar.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-02",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "checker/src/protocol.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/protocol.mjs",
+            "checker/src/main.mjs",
+            "checker/test/sidecar.test.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/protocol.mjs",
+            "checker/src/main.mjs",
+            "checker/test/sidecar.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-03",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-04",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-05",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-06",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/protocol.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/protocol.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/protocol.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/protocol.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/protocol.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-07",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-08",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/completion.mjs",
+            "gateway/test/gateway.test.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/completion.mjs",
+            "gateway/test/gateway.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-09",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/completion.mjs",
+            "gateway/test/gateway.test.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/completion.mjs",
+            "gateway/test/gateway.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-10",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/registry.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/src/server.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/src/server.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-11",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "gateway/src/registry.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/test-fixtures/credential-writer.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/test-fixtures/credential-writer.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-exact-12",
+          "query_form": "exact_identifier",
+          "authored_positive_files": [
+            "examples/graph-memory/demo.mjs"
+          ],
+          "baseline_ranked_files": [
+            "examples/graph-memory/demo.mjs"
+          ],
+          "ranked_files": [
+            "examples/graph-memory/demo.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "examples/graph-memory/demo.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "examples/graph-memory/demo.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-01",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/protocol.mjs",
+            "checker/src/main.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/main.mjs",
+            "checker/src/worker.mjs",
+            "scripts/eval-pr-omission-adjudicate.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-run-memory-replay.test.mjs",
+            "scripts/eval-pr-omission-adjudicate.test.mjs",
+            "checker/src/protocol.mjs",
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-pr-snapshot.mjs",
+            "bench/perf/ai-pipe-fixture.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/main.mjs",
+            "checker/src/worker.mjs",
+            "gateway/test/gateway.test.mjs",
+            "checker/src/protocol.mjs",
+            "scripts/eval-pr-omission-adjudicate.test.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/eval-pr-omission-adjudicate.mjs",
+            "scripts/eval-pr-snapshot.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-run-memory-replay.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 7
+            },
+            {
+              "file": "checker/src/main.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/protocol.mjs",
+              "rank": 4
+            },
+            {
+              "file": "checker/src/main.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-02",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "checker/src/protocol.mjs",
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-pr-replay.test.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "bench/perf/lib.mjs",
+            "gateway/src/completion.mjs",
+            "gateway/src/protocol.mjs",
+            "scripts/eval-run-codex.mjs"
+          ],
+          "ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-pr-replay.test.mjs",
+            "bench/perf/lib.mjs",
+            "checker/src/protocol.mjs",
+            "scripts/eval-run-replay.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-run-memory.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 0.5,
+          "reciprocal_rank": 0.5,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-03",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "gateway/src/protocol.mjs",
+            "scripts/eval-run-replay.mjs",
+            "checker/src/protocol.mjs",
+            "bench/perf/ai-pipe-fixture.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "scripts/npm-package.mjs"
+          ],
+          "ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "scripts/eval-run-replay.mjs",
+            "scripts/npm-package.mjs",
+            "gateway/src/protocol.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "checker/src/protocol.mjs",
+            "bench/perf/ai-pipe-fixture.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 0.5,
+          "reciprocal_rank": 0.5,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-04",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/worker.mjs",
+            "checker/src/inferred-options.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/worker.mjs",
+            "checker/src/inferred-options.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/eval-anchor-certify.mjs",
+            "npm/cli/bin/jscout.mjs",
+            "scripts/eval-next-teardown-preload.cjs",
+            "scripts/eval-memory-transfer-probe.mjs",
+            "scripts/eval-run-replay.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "scripts/eval-run-replay.test.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/worker.mjs",
+            "checker/test/sidecar.test.mjs",
+            "checker/src/inferred-options.mjs",
+            "scripts/eval-next-teardown-preload.cjs",
+            "npm/cli/bin/jscout.mjs",
+            "scripts/eval-anchor-certify.mjs",
+            "scripts/eval-run-replay.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "checker/src/protocol.mjs",
+            "bench/perf/ai-pipe.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            },
+            {
+              "file": "checker/src/inferred-options.mjs",
+              "rank": 2
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            },
+            {
+              "file": "checker/src/inferred-options.mjs",
+              "rank": 3
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-05",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/src/worker.mjs",
+            "scripts/eval-anchor-certify.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "scripts/eval-run-memory-replay.test.mjs",
+            "scripts/eval-run-memory.test.mjs",
+            "scripts/eval-run-replay.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "checker/src/protocol.mjs",
+            "checker/test/sidecar.test.mjs",
+            "gateway/src/completion.mjs"
+          ],
+          "ranked_files": [
+            "checker/src/worker.mjs",
+            "scripts/eval-run-replay.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/npm-package.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "scripts/eval-run-memory.test.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "scripts/eval-run-memory-replay.test.mjs",
+            "scripts/eval-run-memory.mjs",
+            "scripts/eval-anchor-certify.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-06",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "checker/src/worker.mjs"
+          ],
+          "baseline_ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "scripts/eval-run-memory.mjs",
+            "scripts/eval-run-codex.mjs",
+            "scripts/eval-workflow-candidate-gate.mjs",
+            "scripts/eval-memory-correctness-adjudicate.mjs",
+            "scripts/eval-docs-retrieval.mjs",
+            "scripts/eval-run-replay.mjs",
+            "examples/graph-memory/demo.mjs"
+          ],
+          "ranked_files": [
+            "checker/test/sidecar.test.mjs",
+            "checker/src/worker.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "scripts/eval-docs-retrieval.mjs",
+            "scripts/eval-workflow-candidate-gate.mjs",
+            "scripts/eval-pr-omission-adjudicate.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "scripts/eval-memory-correctness-adjudicate.mjs",
+            "scripts/eval-run-memory.mjs",
+            "scripts/eval-run-codex.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 0.5,
+          "reciprocal_rank": 0.5,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "checker/src/worker.mjs",
+              "rank": 2
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-07",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/test/gateway.test.mjs",
+            "gateway/src/completion.mjs",
+            "gateway/src/registry.mjs",
+            "scripts/eval-run-replay.mjs",
+            "scripts/eval-anchor-certify.test.mjs",
+            "bench/perf/mock-gateway.mjs",
+            "scripts/eval-workflow-candidate-gate.test.mjs",
+            "checker/src/main.mjs",
+            "gateway/test-fixtures/credential-writer.mjs",
+            "gateway/src/server.mjs"
+          ],
+          "ranked_files": [
+            "gateway/test/gateway.test.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-run-replay.mjs",
+            "scripts/eval-anchor-certify.test.mjs",
+            "gateway/src/registry.mjs",
+            "scripts/eval-workflow-candidate-gate.test.mjs",
+            "checker/src/main.mjs",
+            "gateway/src/server.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/eval-run-memory.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 0.5,
+          "reciprocal_rank": 0.5,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 2
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 2
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-08",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/completion.mjs",
+            "scripts/eval-mcp-structured-content-probe.mjs",
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-mcp-structured-content-probe.test.mjs",
+            "scripts/eval-run-codex.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "gateway/src/main.mjs",
+            "scripts/eval-pr-omission-adjudicate.mjs",
+            "scripts/eval-expansion-role-backfill.mjs",
+            "checker/src/worker.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/completion.mjs",
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-mcp-structured-content-probe.mjs",
+            "scripts/eval-mcp-structured-content-probe.test.mjs",
+            "scripts/eval-run-replay.test.mjs",
+            "scripts/eval-run-codex.mjs",
+            "gateway/src/main.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/eval-pr-omission-adjudicate.mjs",
+            "scripts/eval-expansion-role-backfill.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-09",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "gateway/src/protocol.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/test/gateway.test.mjs",
+            "gateway/src/registry.mjs",
+            "scripts/eval-memory-report.test.mjs",
+            "scripts/eval-anchor-certify.test.mjs",
+            "gateway/src/protocol.mjs",
+            "scripts/eval-pr-snapshot.mjs",
+            "scripts/eval-pr-grade.mjs",
+            "bench/perf/ai-pipe-fixture.mjs",
+            "scripts/eval-docs-retrieval.mjs",
+            "checker/src/worker.mjs"
+          ],
+          "ranked_files": [
+            "gateway/test/gateway.test.mjs",
+            "scripts/eval-anchor-certify.test.mjs",
+            "gateway/src/registry.mjs",
+            "gateway/src/protocol.mjs",
+            "scripts/eval-memory-report.test.mjs",
+            "scripts/eval-run-replay.mjs",
+            "bench/perf/ai-pipe-fixture.mjs",
+            "scripts/eval-anchor-certify.mjs",
+            "scripts/eval-pooled-report.test.mjs",
+            "scripts/eval-pr-snapshot.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 0.2,
+          "reciprocal_rank": 0.25,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/protocol.mjs",
+              "rank": 5
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/protocol.mjs",
+              "rank": 4
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-10",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "gateway/src/registry.mjs",
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/registry.mjs",
+            "scripts/eval-docs-retrieval.test.mjs",
+            "checker/test/sidecar.test.mjs",
+            "gateway/test/gateway.test.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-docs-retrieval.mjs",
+            "scripts/eval-contamination-probe.mjs",
+            "scripts/eval-run-memory.mjs",
+            "scripts/eval-run-memory-replay.mjs",
+            "bench/perf/ai-pipe.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/test/gateway.test.mjs",
+            "checker/test/sidecar.test.mjs",
+            "scripts/eval-docs-retrieval.test.mjs",
+            "gateway/src/completion.mjs",
+            "scripts/eval-docs-retrieval.mjs",
+            "scripts/eval-memory-correctness-adjudicate.mjs",
+            "scripts/eval-memory-staleness-adjudicate.mjs",
+            "scripts/eval-memory-transfer-probe.mjs",
+            "scripts/eval-contamination-probe.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            },
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 5
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            },
+            {
+              "file": "gateway/src/completion.mjs",
+              "rank": 5
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-11",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "gateway/src/registry.mjs"
+          ],
+          "baseline_ranked_files": [
+            "gateway/src/registry.mjs",
+            "scripts/eval-run-replay.mjs",
+            "checker/src/worker.mjs",
+            "gateway/test/gateway.test.mjs",
+            "bench/perf/ai-pipe-fixture.mjs",
+            "scripts/eval-run-memory.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "examples/graph-memory/demo.mjs",
+            "scripts/eval-memory-staleness-adjudicate.test.mjs",
+            "scripts/eval-run-replay.test.mjs"
+          ],
+          "ranked_files": [
+            "gateway/src/registry.mjs",
+            "gateway/test/gateway.test.mjs",
+            "bench/perf/ai-pipe-fixture.mjs",
+            "checker/src/worker.mjs",
+            "scripts/eval-run-replay.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "scripts/eval-run-codex.mjs",
+            "scripts/eval-run-memory.test.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "gateway/src/completion.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "gateway/src/registry.mjs",
+              "rank": 1
+            }
+          ]
+        },
+        {
+          "id": "v3-js-filter-prose-12",
+          "query_form": "lowercase_multi_token_prose",
+          "authored_positive_files": [
+            "npm/cli/bin/jscout.mjs"
+          ],
+          "baseline_ranked_files": [
+            "npm/cli/bin/jscout.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "scripts/eval-contamination-probe.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "checker/test/sidecar.test.mjs",
+            "gateway/src/main.mjs",
+            "scripts/eval-run-codex.mjs",
+            "scripts/eval-memory-transfer-probe.mjs",
+            "checker/src/worker.mjs",
+            "npm/cli/test/launcher.test.mjs"
+          ],
+          "ranked_files": [
+            "npm/cli/bin/jscout.mjs",
+            "npm/cli/test/launcher.test.mjs",
+            "scripts/npm-bootstrap-publish.mjs",
+            "checker/test/sidecar.test.mjs",
+            "bench/perf/ai-pipe.mjs",
+            "gateway/src/main.mjs",
+            "examples/graph-memory/demo.mjs",
+            "checker/src/worker.mjs",
+            "scripts/npm-package.mjs",
+            "bench/perf/perf.test.mjs"
+          ],
+          "baseline_known_positive_recall_at_10": 1,
+          "known_positive_recall_at_10": 1,
+          "baseline_reciprocal_rank": 1,
+          "reciprocal_rank": 1,
+          "baseline_known_positive_ranks": [
+            {
+              "file": "npm/cli/bin/jscout.mjs",
+              "rank": 1
+            }
+          ],
+          "known_positive_ranks": [
+            {
+              "file": "npm/cli/bin/jscout.mjs",
+              "rank": 1
+            }
+          ]
+        }
+      ],
+      "baseline_mean_known_positive_recall_at_10": 1,
+      "mean_known_positive_recall_at_10": 1,
+      "baseline_mean_reciprocal_rank": 0.8833333333333333,
+      "mean_reciprocal_rank": 0.8854166666666666
+    },
+    "mixed_relevance": {
+      "baseline": {
+        "label": "mixed_unfiltered_baseline",
+        "queries": [
+          {
+            "id": "g26v4-01",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/protocol.mjs",
+              "src/llm/protocol.rs",
+              "gateway/src/server.mjs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "gateway/src/main.mjs",
+              "scripts/eval-run-memory.mjs",
+              "bench/perf/perf.test.mjs",
+              "bench/perf/mock-gateway.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-memory-transfer-probe.mjs",
+              "scripts/eval-run-replay.mjs"
+            ],
+            "ndcg_at_10": 0.17365660576630126,
+            "known_positive_recall_at_10": 0,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-02",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "gateway/src/protocol.mjs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe-fixture.mjs",
+              "checker/src/main.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "gateway/src/main.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "bench/perf/mock-inference.mjs",
+              "bench/perf/perf.test.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "gateway/src/completion.mjs"
+            ],
+            "ndcg_at_10": 0.08204467939504198,
+            "known_positive_recall_at_10": 0,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-03",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe-fixture.mjs",
+              "gateway/src/completion.mjs",
+              "checker/src/main.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-run-replay.mjs",
+              "gateway/test/gateway.test.mjs",
+              "scripts/eval-anchor-certify.test.mjs",
+              "scripts/eval-mcp-structured-content-probe.test.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "gateway/src/main.mjs"
+            ],
+            "ndcg_at_10": 0.14597006696585427,
+            "known_positive_recall_at_10": 0,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-04",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "src/scouting/mod.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-mcp-structured-content-probe.mjs",
+              "scripts/eval-run-replay.mjs",
+              "gateway/src/completion.mjs",
+              "gateway/test/gateway.test.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "scripts/eval-anchor-certify.mjs"
+            ],
+            "ndcg_at_10": 0.0980946020721222,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 7
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-05",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "src/scouting/mod.rs",
+              "src/llm/process.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-replay.test.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "scripts/eval-mcp-structured-content-probe.test.mjs",
+              "checker/src/worker.mjs",
+              "bench/perf/ai-pipe.mjs",
+              "gateway/src/completion.mjs",
+              "gateway/test/gateway.test.mjs"
+            ],
+            "ndcg_at_10": 0.14758488371126272,
+            "known_positive_recall_at_10": 0.25,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 9
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-06",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "gateway/src/protocol.mjs",
+              "src/llm/mod.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "gateway/src/completion.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "gateway/test/gateway.test.mjs",
+              "gateway/src/protocol.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-run-codex.mjs",
+              "checker/src/worker.mjs",
+              "scripts/eval-docs-retrieval.mjs"
+            ],
+            "ndcg_at_10": 0.7032516488340044,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 1
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": 4
+              },
+              {
+                "file": "src/llm/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-07",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/server.mjs",
+              "gateway/src/registry.mjs",
+              "src/llm/mod.rs",
+              "src/llm/config.rs"
+            ],
+            "ranked_files": [
+              "gateway/test/gateway.test.mjs",
+              "gateway/src/completion.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "gateway/src/server.mjs",
+              "bench/perf/ai-pipe.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "gateway/src/registry.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "bench/perf/mock-gateway.mjs",
+              "scripts/eval-pr-omission-report.test.mjs"
+            ],
+            "ndcg_at_10": 0.40021069243387114,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": 4
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 7
+              },
+              {
+                "file": "src/llm/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/config.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-08",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/commands/mod.rs",
+              "src/scouting/mod.rs",
+              "gateway/src/registry.mjs",
+              "gateway/src/completion.mjs"
+            ],
+            "ranked_files": [
+              "scripts/eval-run-replay.mjs",
+              "gateway/src/registry.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "bench/perf/mock-gateway.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-pr-snapshot.mjs",
+              "scripts/eval-run-memory.mjs",
+              "gateway/src/completion.mjs"
+            ],
+            "ndcg_at_10": 0.31593046003089464,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/commands/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 2
+              },
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 10
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-09",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/scouting/mod.rs",
+              "gateway/src/registry.mjs",
+              "src/llm/protocol.rs",
+              "gateway/src/completion.mjs"
+            ],
+            "ranked_files": [
+              "scripts/eval-anchor-certify.mjs",
+              "gateway/src/registry.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-memory-transfer-probe.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-run-replay.mjs",
+              "gateway/src/completion.mjs",
+              "scripts/eval-memory-transfer-probe.test.mjs",
+              "scripts/eval-docs-retrieval.mjs",
+              "bench/perf/ai-pipe.mjs"
+            ],
+            "ndcg_at_10": 0.29317437244437616,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 2
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 7
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-10",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/config/load.rs",
+              "src/llm/process.rs",
+              "gateway/src/registry.mjs",
+              "gateway/src/server.mjs"
+            ],
+            "ranked_files": [
+              "gateway/test/gateway.test.mjs",
+              "gateway/src/registry.mjs",
+              "scripts/eval-docs-retrieval.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "gateway/src/server.mjs",
+              "scripts/eval-run-memory.test.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs"
+            ],
+            "ndcg_at_10": 0.4010661152402865,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 2
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": 7
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-11",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "npm/cli/bin/jscout.mjs",
+              "src/config/load.rs",
+              "src/checker/mod.rs",
+              "src/llm/config.rs",
+              "npm/cli/test/launcher.test.mjs"
+            ],
+            "ranked_files": [
+              "scripts/eval-anchor-certify.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-run-codex.mjs",
+              "npm/cli/test/launcher.test.mjs",
+              "scripts/eval-run-replay.mjs",
+              "checker/src/worker.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "gateway/src/registry.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs"
+            ],
+            "ndcg_at_10": 0.021771856207190205,
+            "known_positive_recall_at_10": 0.2,
+            "known_positive_ranks": [
+              {
+                "file": "npm/cli/bin/jscout.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/config.rs",
+                "rank": null
+              },
+              {
+                "file": "npm/cli/test/launcher.test.mjs",
+                "rank": 4
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-12",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "src/config/load.rs"
+            ],
+            "ranked_files": [
+              "scripts/eval-anchor-certify.mjs",
+              "gateway/src/completion.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "gateway/src/main.mjs",
+              "scripts/eval-run-codex.mjs",
+              "gateway/test/gateway.test.mjs",
+              "checker/src/worker.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "gateway/src/server.mjs"
+            ],
+            "ndcg_at_10": 0.21150084451312973,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": 10
+              },
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-13",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/process.rs",
+              "checker/src/main.mjs",
+              "checker/src/protocol.mjs",
+              "src/checker/enrich.rs"
+            ],
+            "ranked_files": [
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-memory.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-run-replay.mjs",
+              "checker/src/main.mjs",
+              "bench/perf/perf.test.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-docs-retrieval.mjs"
+            ],
+            "ndcg_at_10": 0.16192400818622715,
+            "known_positive_recall_at_10": 0.25,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/process.rs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/main.mjs",
+                "rank": 6
+              },
+              {
+                "file": "checker/src/protocol.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-14",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/process.rs",
+              "checker/src/main.mjs",
+              "checker/src/worker.mjs"
+            ],
+            "ranked_files": [
+              "checker/src/main.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "checker/src/worker.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-next-teardown-preload.cjs",
+              "gateway/src/main.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "gateway/test/gateway.test.mjs"
+            ],
+            "ndcg_at_10": 0.5774468343378925,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/process.rs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/main.mjs",
+                "rank": 1
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 3
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-15",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/enrich.rs",
+              "checker/src/worker.mjs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe-fixture.mjs",
+              "checker/src/worker.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-pr-snapshot.mjs",
+              "scripts/eval-mcp-structured-content-probe.mjs",
+              "scripts/eval-pooled-report.mjs"
+            ],
+            "ndcg_at_10": 0.3553710411996341,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 2
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-16",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/src/worker.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-memory.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "examples/graph-memory/demo.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs"
+            ],
+            "ndcg_at_10": 0.5877184585334834,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 1
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-17",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/package_gate.rs",
+              "checker/src/inferred-options.mjs"
+            ],
+            "ranked_files": [
+              "checker/src/inferred-options.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "checker/test/sidecar.test.mjs",
+              "checker/src/worker.mjs",
+              "scripts/eval-run-replay.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "npm/cli/bin/jscout.mjs",
+              "checker/src/main.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-memory.mjs"
+            ],
+            "ndcg_at_10": 0.6346619961305615,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 4
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/package_gate.rs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/inferred-options.mjs",
+                "rank": 1
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-18",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/src/worker.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-run-memory.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-run-codex.mjs",
+              "checker/src/inferred-options.mjs"
+            ],
+            "ndcg_at_10": 0.4493226731459069,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 1
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-19",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-memory-transfer-probe.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-contamination-probe.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-memory-transfer-probe.test.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-run-replay.test.mjs"
+            ],
+            "ndcg_at_10": 0,
+            "known_positive_recall_at_10": 0,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-20",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/test/sidecar.test.mjs",
+              "checker/src/worker.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/npm-package.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-run-codex.mjs"
+            ],
+            "ndcg_at_10": 0.34425418311724115,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 2
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-21",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/enrich.rs",
+              "checker/src/worker.mjs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "checker/src/worker.mjs",
+              "gateway/src/main.mjs",
+              "scripts/eval-pooled-report.mjs",
+              "examples/graph-memory/demo.mjs",
+              "examples/graph-memory/demo.test.mjs",
+              "scripts/eval-run-memory.mjs",
+              "checker/test/sidecar.test.mjs",
+              "bench/perf/ai-pipe-fixture.mjs"
+            ],
+            "ndcg_at_10": 0.2697632328054449,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 3
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          },
+          {
+            "id": "g26v4-22",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/src/worker.mjs",
+              "checker/test/sidecar.test.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "scripts/eval-run-memory.mjs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-memory-correctness-adjudicate.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-docs-retrieval.mjs"
+            ],
+            "ndcg_at_10": 0.4576233556445128,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 1
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 10
+            }
+          }
+        ],
+        "mean_ndcg_at_10": 0.3105610277597835,
+        "mean_known_positive_recall_at_10": 0.3196969696969696,
+        "mean_judged_at_10": 1,
+        "all_queries_fully_judged_at_10": true,
+        "observed_format_counts": {
+          "javascript": 220
+        },
+        "representation_note": "Descriptive only; protocol v4 applies no language quota or weight."
+      },
+      "treatment": {
+        "label": "mixed_unfiltered_treatment",
+        "queries": [
+          {
+            "id": "g26v4-01",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/protocol.mjs",
+              "src/llm/protocol.rs",
+              "gateway/src/server.mjs"
+            ],
+            "ranked_files": [
+              "bench/perf/ai-pipe.mjs",
+              "src/llm/process.rs",
+              "src/llm/mod.rs",
+              "gateway/src/main.mjs",
+              "bench/perf/perf.test.mjs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "bench/perf/mock-gateway.mjs",
+              "src/scouting/card.rs",
+              "src/workspace.rs",
+              "src/scouting/refresh.rs"
+            ],
+            "ndcg_at_10": 0.4245605434040873,
+            "known_positive_recall_at_10": 0.25,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": 2
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 5,
+              "rust": 5
+            }
+          },
+          {
+            "id": "g26v4-02",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "gateway/src/protocol.mjs"
+            ],
+            "ranked_files": [
+              "checker/src/main.mjs",
+              "src/llm/process.rs",
+              "src/checker/process.rs",
+              "src/llm/mod.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "src/scouting/mod.rs",
+              "src/query.rs",
+              "src/checker/enrich.rs",
+              "src/cli.rs",
+              "src/indexer.rs"
+            ],
+            "ndcg_at_10": 0.3404262620432406,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": 2
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 2,
+              "rust": 8
+            }
+          },
+          {
+            "id": "g26v4-03",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/llm/process.rs",
+              "src/llm/mod.rs",
+              "src/scouting/mod.rs",
+              "gateway/src/completion.mjs",
+              "src/scouting/tests.rs",
+              "src/checker/enrich.rs",
+              "src/embed.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "gateway/test/gateway.test.mjs",
+              "checker/src/main.mjs"
+            ],
+            "ndcg_at_10": 0.7115841211642129,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": 1
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 6,
+              "javascript": 4
+            }
+          },
+          {
+            "id": "g26v4-04",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "src/scouting/mod.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/scouting/card.rs",
+              "src/scouting/workflow.rs",
+              "src/scouting/mod.rs",
+              "src/scouting/summary.rs",
+              "src/scouting/concept.rs",
+              "src/scouting/repository.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "src/semantic.rs",
+              "src/cli.rs",
+              "gateway/test/gateway.test.mjs"
+            ],
+            "ndcg_at_10": 0.8790743574350879,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 8,
+              "javascript": 2
+            }
+          },
+          {
+            "id": "g26v4-05",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "src/scouting/mod.rs",
+              "src/llm/process.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/scouting/mod.rs",
+              "src/parse.rs",
+              "src/llm/process.rs",
+              "scripts/eval-run-replay.test.mjs",
+              "src/mcp.rs",
+              "src/llm/mod.rs",
+              "gateway/test/gateway.test.mjs",
+              "scripts/eval-run-replay.mjs",
+              "scripts/eval-mcp-structured-content-probe.test.mjs",
+              "src/scouting/tests.rs"
+            ],
+            "ndcg_at_10": 0.5546404308394538,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": 1
+              },
+              {
+                "file": "src/llm/process.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 6,
+              "javascript": 4
+            }
+          },
+          {
+            "id": "g26v4-06",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/completion.mjs",
+              "gateway/src/protocol.mjs",
+              "src/llm/mod.rs",
+              "src/llm/protocol.rs"
+            ],
+            "ranked_files": [
+              "gateway/src/completion.mjs",
+              "gateway/test/gateway.test.mjs",
+              "src/llm/mod.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "src/indexer.rs",
+              "scripts/eval-anchor-certify.mjs",
+              "src/cli.rs",
+              "gateway/src/protocol.mjs",
+              "src/workspace.rs",
+              "src/scouting/mod.rs"
+            ],
+            "ndcg_at_10": 0.7777261508289629,
+            "known_positive_recall_at_10": 0.75,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": 1
+              },
+              {
+                "file": "gateway/src/protocol.mjs",
+                "rank": 8
+              },
+              {
+                "file": "src/llm/mod.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 5,
+              "rust": 5
+            }
+          },
+          {
+            "id": "g26v4-07",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "gateway/src/server.mjs",
+              "gateway/src/registry.mjs",
+              "src/llm/mod.rs",
+              "src/llm/config.rs"
+            ],
+            "ranked_files": [
+              "src/llm/mod.rs",
+              "gateway/src/completion.mjs",
+              "gateway/test/gateway.test.mjs",
+              "src/scouting/card.rs",
+              "src/scouting/mod.rs",
+              "src/scouting/tests.rs",
+              "scripts/eval-pr-omission-adjudicate.mjs",
+              "src/commands/scout.rs",
+              "src/config/load.rs",
+              "src/llm/config.rs"
+            ],
+            "ndcg_at_10": 0.5694007442225942,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/mod.rs",
+                "rank": 1
+              },
+              {
+                "file": "src/llm/config.rs",
+                "rank": 10
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 7,
+              "javascript": 3
+            }
+          },
+          {
+            "id": "g26v4-08",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/commands/mod.rs",
+              "src/scouting/mod.rs",
+              "gateway/src/registry.mjs",
+              "gateway/src/completion.mjs"
+            ],
+            "ranked_files": [
+              "src/cli.rs",
+              "src/scouting/mod.rs",
+              "scripts/eval-run-replay.mjs",
+              "src/scouting/repository.rs",
+              "src/llm/config.rs",
+              "src/semantic.rs",
+              "src/scouting/refresh.rs",
+              "scripts/eval-pr-snapshot.mjs",
+              "gateway/src/registry.mjs",
+              "scripts/eval-pr-omission-adjudicate.mjs"
+            ],
+            "ndcg_at_10": 0.512781083512135,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/commands/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": 2
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 9
+              },
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 6,
+              "javascript": 4
+            }
+          },
+          {
+            "id": "g26v4-09",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/scouting/mod.rs",
+              "gateway/src/registry.mjs",
+              "src/llm/protocol.rs",
+              "gateway/src/completion.mjs"
+            ],
+            "ranked_files": [
+              "src/llm/mod.rs",
+              "src/cli.rs",
+              "src/scouting/repository.rs",
+              "src/scouting/card.rs",
+              "src/embed.rs",
+              "src/scouting/tests.rs",
+              "src/scouting/refresh.rs",
+              "scripts/eval-anchor-certify.mjs",
+              "gateway/src/registry.mjs",
+              "src/semantic.rs"
+            ],
+            "ndcg_at_10": 0.41262543244642624,
+            "known_positive_recall_at_10": 0.25,
+            "known_positive_ranks": [
+              {
+                "file": "src/scouting/mod.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 9
+              },
+              {
+                "file": "src/llm/protocol.rs",
+                "rank": null
+              },
+              {
+                "file": "gateway/src/completion.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 8,
+              "javascript": 2
+            }
+          },
+          {
+            "id": "g26v4-10",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/config/load.rs",
+              "src/llm/process.rs",
+              "gateway/src/registry.mjs",
+              "gateway/src/server.mjs"
+            ],
+            "ranked_files": [
+              "gateway/test/gateway.test.mjs",
+              "src/embed.rs",
+              "src/llm/mod.rs",
+              "gateway/src/registry.mjs",
+              "src/cli.rs",
+              "src/scouting/mod.rs",
+              "src/mcp.rs",
+              "src/embed/tests.rs",
+              "src/llm/config.rs",
+              "src/llm/process.rs"
+            ],
+            "ndcg_at_10": 0.37237430769570956,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              },
+              {
+                "file": "src/llm/process.rs",
+                "rank": 10
+              },
+              {
+                "file": "gateway/src/registry.mjs",
+                "rank": 4
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 2,
+              "rust": 8
+            }
+          },
+          {
+            "id": "g26v4-11",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "npm/cli/bin/jscout.mjs",
+              "src/config/load.rs",
+              "src/checker/mod.rs",
+              "src/llm/config.rs",
+              "npm/cli/test/launcher.test.mjs"
+            ],
+            "ranked_files": [
+              "npm/cli/test/launcher.test.mjs",
+              "src/cli.rs",
+              "src/llm/config.rs",
+              "src/llm/process.rs",
+              "src/scouting/mod.rs",
+              "src/scouting/plan.rs",
+              "src/mcp.rs",
+              "scripts/eval-anchor-certify.mjs",
+              "src/fs_ops.rs",
+              "src/checker/mod.rs"
+            ],
+            "ndcg_at_10": 0.42698886315331896,
+            "known_positive_recall_at_10": 0.6,
+            "known_positive_ranks": [
+              {
+                "file": "npm/cli/bin/jscout.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/mod.rs",
+                "rank": 10
+              },
+              {
+                "file": "src/llm/config.rs",
+                "rank": 3
+              },
+              {
+                "file": "npm/cli/test/launcher.test.mjs",
+                "rank": 1
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 2,
+              "rust": 8
+            }
+          },
+          {
+            "id": "g26v4-12",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/llm/process.rs",
+              "gateway/src/server.mjs",
+              "src/config/load.rs"
+            ],
+            "ranked_files": [
+              "src/llm/process.rs",
+              "src/scouting/mod.rs",
+              "src/llm/config.rs",
+              "scripts/eval-anchor-certify.mjs",
+              "src/cli.rs",
+              "src/llm/mod.rs",
+              "gateway/src/completion.mjs",
+              "src/checker/enrich.rs",
+              "gateway/src/main.mjs",
+              "src/scouting/tests.rs"
+            ],
+            "ndcg_at_10": 0.7624443938827101,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "src/llm/process.rs",
+                "rank": 1
+              },
+              {
+                "file": "gateway/src/server.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/config/load.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 7,
+              "javascript": 3
+            }
+          },
+          {
+            "id": "g26v4-13",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/process.rs",
+              "checker/src/main.mjs",
+              "checker/src/protocol.mjs",
+              "src/checker/enrich.rs"
+            ],
+            "ranked_files": [
+              "src/checker/enrich.rs",
+              "src/mcp.rs",
+              "src/checker/process.rs",
+              "src/cli.rs",
+              "scripts/eval-run-codex.mjs",
+              "src/checker/package_gate.rs",
+              "src/mcp/tests.rs",
+              "src/semantic.rs",
+              "src/search.rs",
+              "src/scouting/card.rs"
+            ],
+            "ndcg_at_10": 0.4429624543379728,
+            "known_positive_recall_at_10": 0.5,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/process.rs",
+                "rank": 3
+              },
+              {
+                "file": "checker/src/main.mjs",
+                "rank": null
+              },
+              {
+                "file": "checker/src/protocol.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 1
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 9,
+              "javascript": 1
+            }
+          },
+          {
+            "id": "g26v4-14",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/process.rs",
+              "checker/src/main.mjs",
+              "checker/src/worker.mjs"
+            ],
+            "ranked_files": [
+              "checker/src/main.mjs",
+              "src/checker/process.rs",
+              "src/llm/process.rs",
+              "checker/test/sidecar.test.mjs",
+              "checker/src/worker.mjs",
+              "src/scouting/ledger.rs",
+              "src/workspace.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "scripts/eval-next-teardown-preload.cjs",
+              "src/checker/enrich.rs"
+            ],
+            "ndcg_at_10": 0.9539242910483141,
+            "known_positive_recall_at_10": 1,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/process.rs",
+                "rank": 2
+              },
+              {
+                "file": "checker/src/main.mjs",
+                "rank": 1
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 5
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 5,
+              "rust": 5
+            }
+          },
+          {
+            "id": "g26v4-15",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/enrich.rs",
+              "checker/src/worker.mjs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/mcp.rs",
+              "src/heur.rs",
+              "src/search.rs",
+              "bench/perf/ai-pipe-fixture.mjs",
+              "src/cli.rs",
+              "src/checker/enrich.rs",
+              "src/query.rs",
+              "src/chunk.rs",
+              "checker/src/worker.mjs",
+              "src/workspace.rs"
+            ],
+            "ndcg_at_10": 0.5194348637974975,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 6
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 9
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 8,
+              "javascript": 2
+            }
+          },
+          {
+            "id": "g26v4-16",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/dependency.rs",
+              "src/cli.rs",
+              "checker/test/sidecar.test.mjs",
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "scripts/eval-anchor-certify.mjs",
+              "src/checker/package_gate.rs",
+              "src/semantic.rs",
+              "src/recon.rs",
+              "src/mcp.rs"
+            ],
+            "ndcg_at_10": 0.5177606908719522,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 4
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 5
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 7,
+              "javascript": 3
+            }
+          },
+          {
+            "id": "g26v4-17",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/package_gate.rs",
+              "checker/src/inferred-options.mjs"
+            ],
+            "ranked_files": [
+              "src/workspace.rs",
+              "src/checker/enrich.rs",
+              "src/scouting/plan.rs",
+              "src/mcp.rs",
+              "src/indexer.rs",
+              "src/checker/package_gate.rs",
+              "checker/src/inferred-options.mjs",
+              "src/cli.rs",
+              "src/scouting/mod.rs",
+              "src/scouting/summary.rs"
+            ],
+            "ndcg_at_10": 0.45041760878045706,
+            "known_positive_recall_at_10": 0.75,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 2
+              },
+              {
+                "file": "src/checker/package_gate.rs",
+                "rank": 6
+              },
+              {
+                "file": "checker/src/inferred-options.mjs",
+                "rank": 7
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 9,
+              "javascript": 1
+            }
+          },
+          {
+            "id": "g26v4-18",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/checker/enrich/tests.rs",
+              "src/checker/enrich.rs",
+              "checker/src/worker.mjs",
+              "src/store.rs",
+              "src/scouting/ledger.rs",
+              "src/structural/tests.rs",
+              "src/checker/package_gate.rs",
+              "src/scouting/mod.rs",
+              "src/scouting/card.rs",
+              "src/structural.rs"
+            ],
+            "ndcg_at_10": 0.6987545740622301,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 3
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 2
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 9,
+              "javascript": 1
+            }
+          },
+          {
+            "id": "g26v4-19",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/mcp.rs",
+              "src/cli.rs",
+              "src/checker/enrich.rs",
+              "src/indexer.rs",
+              "src/scouting/repository.rs",
+              "src/docs/retrieval.rs",
+              "src/agent.rs",
+              "scripts/eval-run-codex.mjs",
+              "scripts/eval-run-memory.mjs",
+              "src/indexer/tests.rs"
+            ],
+            "ndcg_at_10": 0.3820343668730539,
+            "known_positive_recall_at_10": 0.3333333333333333,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": null
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 8,
+              "javascript": 2
+            }
+          },
+          {
+            "id": "g26v4-20",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "src/checker/protocol.rs",
+              "checker/test/sidecar.test.mjs",
+              "src/checker/enrich.rs",
+              "src/workspace.rs",
+              "src/scouting/card.rs",
+              "src/cli.rs",
+              "checker/src/worker.mjs",
+              "src/scouting/mod.rs",
+              "src/mcp.rs",
+              "src/watch.rs"
+            ],
+            "ndcg_at_10": 0.8783803998667791,
+            "known_positive_recall_at_10": 1,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 7
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": 1
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "rust": 8,
+              "javascript": 2
+            }
+          },
+          {
+            "id": "g26v4-21",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "src/checker/enrich.rs",
+              "checker/src/worker.mjs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/src/worker.mjs",
+              "src/scouting/card.rs",
+              "src/docs/retrieval.rs",
+              "src/mcp.rs",
+              "scripts/eval-memory-staleness-adjudicate.mjs",
+              "scripts/eval-anchor-certify.mjs",
+              "src/checker/enrich.rs",
+              "src/cli.rs",
+              "src/indexer/tests.rs",
+              "src/checker/enrich/tests.rs"
+            ],
+            "ndcg_at_10": 0.7053009481496239,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 7
+              },
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 1
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 3,
+              "rust": 7
+            }
+          },
+          {
+            "id": "g26v4-22",
+            "query_form": "natural_language",
+            "authored_positive_files": [
+              "checker/src/worker.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/protocol.rs"
+            ],
+            "ranked_files": [
+              "checker/src/worker.mjs",
+              "checker/test/sidecar.test.mjs",
+              "src/checker/enrich.rs",
+              "src/checker/enrich/tests.rs",
+              "src/cli.rs",
+              "src/structural.rs",
+              "src/checker/mod.rs",
+              "src/mcp.rs",
+              "src/checker/package_gate.rs",
+              "src/checker/process.rs"
+            ],
+            "ndcg_at_10": 0.8526234571256927,
+            "known_positive_recall_at_10": 0.6666666666666666,
+            "known_positive_ranks": [
+              {
+                "file": "checker/src/worker.mjs",
+                "rank": 1
+              },
+              {
+                "file": "src/checker/enrich.rs",
+                "rank": 3
+              },
+              {
+                "file": "src/checker/protocol.rs",
+                "rank": null
+              }
+            ],
+            "judged_at_10": 1,
+            "judged_files_at_10": 10,
+            "returned_files_at_10": 10,
+            "representation": {
+              "javascript": 2,
+              "rust": 8
+            }
+          }
+        ],
+        "mean_ndcg_at_10": 0.5975554702518872,
+        "mean_known_positive_recall_at_10": 0.5499999999999999,
+        "mean_judged_at_10": 1,
+        "all_queries_fully_judged_at_10": true,
+        "observed_format_counts": {
+          "javascript": 60,
+          "rust": 160
+        },
+        "representation_note": "Descriptive only; protocol v4 applies no language quota or weight."
+      }
+    }
+  },
+  "gates": {
+    "decision": "fail",
+    "outcomes": [
+      {
+        "gate": "filtered_known_positive_recall_at_10_nondecrease",
+        "baseline": 1,
+        "actual": 1,
+        "pass": true
+      },
+      {
+        "gate": "filtered_mean_mrr_maximum_drop",
+        "threshold": 0.02,
+        "actual_drop": -0.002083333333333326,
+        "pass": true
+      },
+      {
+        "gate": "filtered_baseline_top_five_positive_stays_within_bound",
+        "threshold": 10,
+        "failures": [],
+        "pass": true
+      },
+      {
+        "gate": "mixed_treatment_mean_ndcg_at_10",
+        "threshold": 0.7,
+        "actual": 0.5975554702518872,
+        "pass": false
+      },
+      {
+        "gate": "mixed_mean_ndcg_maximum_drop",
+        "baseline": 0.3105610277597835,
+        "actual": 0.5975554702518872,
+        "threshold": 0.02,
+        "actual_drop": -0.28699444249210365,
+        "pass": true
+      },
+      {
+        "gate": "mixed_judged_at_10_complete",
+        "threshold": 1,
+        "actual": {
+          "baseline": 1,
+          "treatment": 1
+        },
+        "pass": true
+      }
+    ]
+  }
+}

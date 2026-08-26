@@ -196,8 +196,8 @@ The committed suite must prove:
 8. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
    their input contains no Rust.
 
-Before evaluation results are run, prospectively commit the v4 protocol with
-clean baseline and treatment arms. Filtered parity compares the Rust-free
+The prospectively committed v4 protocol used clean baseline and treatment
+arms. Filtered parity compares the Rust-free
 baseline against the mixed index with
 `formats=['javascript','typescript']` using the previously inspected v3 JS/TS
 cohort. That reused cohort is a regression guard, not fresh confirmatory
@@ -232,42 +232,55 @@ gold file left the top ten. The mixed arm formally failed at `0.5084` against
 the frozen `0.70` nDCG gate. Its qrels were not actually a retrieval pool—only
 68 of 240 returned top-ten slots had judgments, every judgment was positive,
 and unjudged direct tests were scored zero—so the score cannot choose a storage
-or fusion design.
-Real authored positives were also missed, so the failure remains preserved and
-cannot be regraded after inspection.
+or fusion design. Real authored positives were also missed, so the failure
+remains preserved and cannot be regraded after inspection.
 
-Before changing retrieval, run one unchanged-treatment v4 replacement. Reuse
-the previously inspected v3 JS/TS filtered cohort only as a regression guard,
-and use a fresh source-only mixed holdout. Union both systems' top-ten files and
-the authored positives, remove arm/rank/score information, grade every pair
-`0`–`3`, freeze the qrels, and only then score both arms against that same
-pool. Treatment mean nDCG@10 must reach `0.70`, may drop by at most `0.02` from
-baseline, and both arms require full judgment coverage at ten. A repeated
-failure advances named Rust item chunks as phase 2a with exact tiers still
-disabled. Do not append lexical aliases to phase-1 lossless chunks; any alias
-experiment belongs on the item-local projection. Separate FTS statistics and
-language quotas remain unearned.
+V4 completed that blind pool and explicitly judged every pooled candidate, so
+its formal failure is decision-grade. Filtered Recall@10 stayed `1.000000`,
+mean MRR improved from `0.883333` to `0.885417`, and no baseline top-five
+positive left the top ten. Format-scoped JS/TS retrieval therefore remains
+validated. Mixed treatment nDCG@10 improved from the Rust-free baseline's
+`0.310561` to `0.597555`, a `+0.286994` change, and authored-positive Recall@10
+improved from `0.319697` to `0.550000`. Both arms had complete judgment
+coverage at ten. Relevant Rust improved the combined ranking, so this result
+does not support per-language FTS statistics, language quotas, or weights.
+
+Treatment nDCG@10 nevertheless missed the frozen absolute `0.70` gate. G26
+therefore advances to Phase 2a named, item-local Rust chunks. Exact definitions,
+exact occurrences, Rust vectors, and module edges remain disabled. Do not add
+identifier aliases to the broad phase-1 chunks; any alias experiment belongs
+to the item-local projection and requires its own prospective test. The full
+decision and immutable artifact hashes are recorded in
+[eval/results/g26-format-scope-v4-failed-2026-08-26.md](../../eval/results/g26-format-scope-v4-failed-2026-08-26.md).
 
 ### Later vector enablement
 
-Rust stays lexical-only until phase 2 publishes named semantic chunks; embedding
-the phase-1 lossless partitions would spend provider calls on identities that
-the scheduled rechunk invalidates. Phase 1 adds `format` as a sqlite-vec
-partition key alongside profile and origin because KNN applies `k` before a
-relational format filter. Search queries each requested origin/format partition
-and merges same-profile cosine scores. Later Rust vectors reuse the configured
-code embedding model and content-addressed cache; different models require rank
-fusion. Only after named chunks and a Rust retrieval evaluation pass does the
-registry flip Rust to `CodeLexicalAndVector`.
+Rust stays lexical-only until phase 2a publishes named semantic chunks;
+embedding the phase-1 lossless partitions would spend provider calls on
+identities that the scheduled rechunk invalidates. Phase 1 adds `format` as a
+sqlite-vec partition key alongside profile and origin because KNN applies `k`
+before a relational format filter. Search queries each requested origin/format
+partition and merges same-profile cosine scores. Later Rust vectors reuse the
+configured code embedding model and content-addressed cache; different models
+require rank fusion. Only after named chunks and a Rust retrieval evaluation
+pass does the registry flip Rust to `CodeLexicalAndVector`.
 
-## Phase 2 — named Rust chunks and exact tiers
+## Phase 2a — named Rust chunks
 
-Phase 2 replaces the text projection with a non-overlapping partition of named
+Phase 2a replaces the text projection with a non-overlapping partition of named
 item chunks and residual unnamed chunks. It adds names for functions, structs,
 enums, traits, modules, constants, statics, `macro_rules!`, and associated
 items. An associated-item chunk includes bounded enclosing `impl` or `trait`
 header context; doc comments attach to their item; scope is the lexical
 module/type path; macro bodies remain unexpanded.
+
+Exact definitions, exact occurrences, and Rust vectors remain disabled in
+Phase 2a. Because the v4 holdout and ranking are now inspected, item-local
+retrieval acceptance requires its own prospectively committed evaluation; v4
+cannot be reused as confirmatory evidence. Identifier aliases are not part of
+the initial projection and must never be appended to the broad phase-1 chunks.
+
+## Phase 2b — Rust exact tiers
 
 Rust exact definitions and a Rust-specific exact-occurrence scanner are
 separate registry capabilities. Neither turns on merely because named chunks
