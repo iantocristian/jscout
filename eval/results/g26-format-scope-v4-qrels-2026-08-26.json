@@ -1,0 +1,2164 @@
+{
+  "schema_version": "g26-format-scope-v4-qrels-1",
+  "protocol_version": 4,
+  "manifest_sha256": "b7f330d5aeae5b96b0eb25ef77a12a8f5ce0cf93c8d2b00381d430d428c0c9a6",
+  "query_manifest_sha256": "c44ac807b7b67183248b76101a806255532781d63e1865a1d1fa98febdbbd858",
+  "pool_sha256": "6e850924f0c33114ab3a85582b867b29eb8048e90bee58941e42393368e65d03",
+  "adjudication_attestation": {
+    "adjudicators": [
+      "v4-judge-a",
+      "v4-judge-b"
+    ],
+    "candidate_input": "blinded_pool_only",
+    "corpus_revision": "5b7d3f62406a782ef957f260104955691f661155",
+    "rubric_sha256": "04f6915a54a4ac556ff51d2a2a5673ea4135d9323b07a8f506f7860c6ca6a8f1",
+    "independent_of_retrieval_generation": true,
+    "arm_identity_seen": false,
+    "rank_seen": false,
+    "score_seen": false,
+    "source_holdout_seen": false,
+    "manifest_seen": false,
+    "arm_reports_seen": false,
+    "raw_search_output_seen": false,
+    "eval_results_seen": false,
+    "prior_qrels_seen": false,
+    "git_history_seen": false
+  },
+  "queries": [
+    {
+      "id": "g26v4-01",
+      "judgments": [
+        {
+          "path": "bench/perf/perf.test.mjs",
+          "grade": 1,
+          "reason": "Exercises a mock gateway hello/ready JSONL exchange, but not the native fail-closed correlation logic."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Defines and validates symbol-card submissions; it contains no gateway session framing or request correlation."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 2,
+          "reason": "Runs the stdin line reader, parses each protocol frame, dispatches it, and writes versioned JSONL replies."
+        },
+        {
+          "path": "scripts/eval-memory-transfer-probe.mjs",
+          "grade": 0,
+          "reason": "Probes transferred search memory through evaluation clients, not the native model-gateway session."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Provides benchmark corpus fixtures and invariants, with no gateway transport implementation."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 2,
+          "reason": "Gates requests on hello and emits ready with protocol version while preserving request IDs in responses."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs Codex evaluation prompts and captures outputs; it does not implement the model gateway protocol."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Is the Rust wire contract for protocol-v1 envelopes, hello/ready messages, IDs, and all inbound/outbound variants."
+        },
+        {
+          "path": "src/scouting/refresh.rs",
+          "grade": 0,
+          "reason": "Selects stale semantic artifacts and reconstructs replay configuration, without gateway framing or session checks."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Discovers workspace packages and resolver aliases; it has no model-gateway session behavior."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Authoritatively parses and emits versioned JSONL envelopes, validates IDs/kinds/protocol, and bounds line frames."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Orchestrates replay evaluation over MCP processes and does not implement the native gateway session."
+        },
+        {
+          "path": "bench/perf/mock-gateway.mjs",
+          "grade": 1,
+          "reason": "Implements a deterministic protocol-v1 hello/ready fixture that corroborates the session contract."
+        },
+        {
+          "path": "bench/perf/ai-pipe.mjs",
+          "grade": 1,
+          "reason": "Invokes native scouting against the mock gateway as a smoke caller, without owning handshake or ID validation."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates memory-staleness evaluation records and contains no gateway protocol implementation."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Defines the gateway abstraction and protocol-error surface, while framing and ID enforcement live in protocol/process code."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation cases over MCP, not the native JSONL model-gateway client."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Spawns the Node sidecar, performs hello/ready version negotiation, correlates every reply ID, and poisons on skew or mismatch."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-02",
+      "judgments": [
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 2,
+          "reason": "Provides the validated versioned envelope used to transport cancel and cancellation-result messages."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 0,
+          "reason": "Manages the separate TypeScript checker sidecar and does not cancel model completions on interrupt."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 1,
+          "reason": "Records a returned GatewayError::Canceled as a terminal run state, but does not coordinate interrupt dispatch."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Contains benchmark corpus fixtures, not cancellation or interrupt coordination."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Checks evaluation contamination behavior and has no in-flight gateway cancellation path."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 0,
+          "reason": "Orchestrates TypeScript checker enrichment, not model-request interrupt cancellation."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Tracks the active request, aborts only a matching target, acknowledges cancel state, and clears activity after completion."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 2,
+          "reason": "Propagates AbortSignal to provider execution and makes retry backoff abortable, producing a stable canceled outcome."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 1,
+          "reason": "Dispatches parsed cancel frames to the server, but does not own active-request or ordering state."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 0,
+          "reason": "Declares command-line arguments and contains no Ctrl-C admission or cancel transport logic."
+        },
+        {
+          "path": "bench/perf/mock-inference.mjs",
+          "grade": 0,
+          "reason": "Serves deterministic embedding HTTP responses, unrelated to model-gateway cancellation."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Defines the canceled gateway error and completion seam, while interrupt ordering is implemented by the process client."
+        },
+        {
+          "path": "bench/perf/perf.test.mjs",
+          "grade": 0,
+          "reason": "Its gateway smoke test covers hello/complete/shutdown, not interrupt cancellation ordering."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Processes staleness evaluation data and has no model-request interrupt path."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Uses a shared interrupt admission gate, serialized writer, active-ID guard, and queued cancel so cancel cannot overtake dispatch or leak to the next request."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluation children and does not implement native model-gateway cancellation."
+        },
+        {
+          "path": "src/indexer.rs",
+          "grade": 0,
+          "reason": "Builds structural index state; it contains no model request or interrupt cancellation mechanism."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 0,
+          "reason": "Dispatches the distinct checker protocol, not the model completion gateway addressed by the query."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores pull-request omission evaluation output and has no gateway cancellation behavior."
+        },
+        {
+          "path": "src/query.rs",
+          "grade": 0,
+          "reason": "Resolves module exports for structural queries and does not dispatch or cancel model requests."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-03",
+      "judgments": [
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 0,
+          "reason": "Implements checker-sidecar request handling; its deadlines are not model completion deadlines."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Creates the request timer, aborts the provider controller at timeout_ms, and emits the retryable timeout error."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Defines per-completion timeout inputs and distinct remote-versus-local timeout error outcomes for the native seam."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Controls evaluation-process timeouts, not gateway provider deadlines or native grace windows."
+        },
+        {
+          "path": "src/embed.rs",
+          "grade": 0,
+          "reason": "Implements embedding-provider deadlines on a separate HTTP plane, not model completion timing."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Lets the gateway enforce the deadline and waits timeout plus a five-second grace so the remote timeout result arrives first."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 1,
+          "reason": "Hosts the dispatcher carrying timeout-bearing completion frames, while deadline enforcement is in the server."
+        },
+        {
+          "path": "scripts/eval-mcp-structured-content-probe.test.mjs",
+          "grade": 0,
+          "reason": "Tests MCP structured-content probing and does not exercise model provider deadlines."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates omission results and contains no model completion deadline implementation."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 2,
+          "reason": "Passes the server AbortSignal through provider execution and retry delay so an enforced deadline can stop all work."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 2,
+          "reason": "Places policy timeout_ms in each completion request and supplies the same timeout to the native gateway call."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates that timeout_ms aborts a hanging provider and returns a retryable timeout error."
+        },
+        {
+          "path": "src/scouting/tests.rs",
+          "grade": 1,
+          "reason": "Tests native handling of remote timeout versus a fatal local frame timeout, but not the deadline implementation itself."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 2,
+          "reason": "Defines timeout_ms on complete requests and the remote error contract transported back to Rust."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Contains benchmark source fixtures rather than model deadline code."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 0,
+          "reason": "Handles checker enrichment time budgets, not gateway provider completion deadlines."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and does not enforce model completion timeouts."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.test.mjs",
+          "grade": 0,
+          "reason": "Tests anchor certification behavior, unrelated to provider deadlines and native grace."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-04",
+      "judgments": [
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory retrieval evaluation and does not define model submit-tool contracts."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates memory correctness records rather than validating gateway tool submissions."
+        },
+        {
+          "path": "scripts/eval-mcp-structured-content-probe.mjs",
+          "grade": 0,
+          "reason": "Probes MCP structuredContent transport, which is distinct from forced model submit-tool output."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 3,
+          "reason": "Builds the single SubmitTool request, checks the returned tool name, deserializes arguments, and invokes authoritative Rust validation before publication."
+        },
+        {
+          "path": "src/scouting/workflow.rs",
+          "grade": 3,
+          "reason": "Defines the workflow submit-tool JSON Schema and authoritative candidate-closed Rust validator."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Orchestrates replay evaluation and does not define or validate scouting model schemas."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 3,
+          "reason": "Defines the symbol-card submit schema and authoritatively validates every evidence-backed returned claim."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs Codex evaluation jobs rather than the native scouting submit-tool path."
+        },
+        {
+          "path": "src/scouting/summary.rs",
+          "grade": 3,
+          "reason": "Defines the scope-summary submit schema and authoritative child-citation validation contract."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 2,
+          "reason": "Defines the wire-level SubmitTool request and ToolCall result structures used by both sides."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Validates evaluation anchor records, not model tool calls or scouting schemas."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Supplies benchmark fixture source and expected anchors, not a submit-tool implementation."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Forces the sole declared tool where supported and rejects zero, multiple, wrong-name, non-JSON, or non-object tool payloads."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores omission evaluation output and does not validate model tool payloads."
+        },
+        {
+          "path": "src/semantic.rs",
+          "grade": 1,
+          "reason": "Performs adjacent artifact/support validation after the tool payload has passed its scouting contract."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Tests forced tool choice and rejection of text-only, multiple-tool, and unexpected-tool responses."
+        },
+        {
+          "path": "src/scouting/repository.rs",
+          "grade": 3,
+          "reason": "Defines the repository-classification submit schema and checks tool identity, deserialization, citations, and values before persistence."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 0,
+          "reason": "Declares scouting command options but contains no model tool schema or returned-payload validation."
+        },
+        {
+          "path": "src/scouting/concept.rs",
+          "grade": 3,
+          "reason": "Defines the concept submit schema and authoritative closed-source Rust validation of returned claims and decisions."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-05",
+      "judgments": [
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 3,
+          "reason": "Persists aggregate outcome usage and attempt count in each native scout run's terminal usage JSON."
+        },
+        {
+          "path": "scripts/eval-run-replay.test.mjs",
+          "grade": 0,
+          "reason": "Tests replay-evaluation orchestration and does not exercise gateway retry accounting."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay cases over MCP without implementing provider retry or native run usage storage."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Implements the MCP server surface, not model-provider retry or scout-run accounting."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 2,
+          "reason": "Transports aggregate usage and attempts from the result frame into CompletionOutcome without adding hidden retries."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Tests bounded retry recovery, exhaustion, attempts, and accumulation of repeated prompt/output usage."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Defines CompletionOutcome with usage and attempts as the native contract consumed by run persistence."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 0,
+          "reason": "Performs TypeScript checker work and has no model-provider retry accounting."
+        },
+        {
+          "path": "scripts/eval-mcp-structured-content-probe.test.mjs",
+          "grade": 0,
+          "reason": "Tests MCP transport shape, not provider retry attempts or token aggregation."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation cases and does not own gateway retries or scout-run usage records."
+        },
+        {
+          "path": "src/scouting/tests.rs",
+          "grade": 1,
+          "reason": "Scripted scouting outcomes carry usage and attempt fields through native run finalization, but do not implement aggregation."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Owns the bounded exponential backoff, disables adapter retries, sums every attempt's usage, and reports the visible attempt count."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Checks evaluation contamination rather than retry or token-accounting behavior."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs Codex evaluation subprocesses and does not implement the model gateway retry ledger."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Is the wire contract for normalized Usage and result attempts delivered to native persistence."
+        },
+        {
+          "path": "bench/perf/ai-pipe.mjs",
+          "grade": 1,
+          "reason": "Smoke-runs a completed fake-gateway scout publication carrying usage/attempt fields, without testing retry aggregation."
+        },
+        {
+          "path": "src/parse.rs",
+          "grade": 0,
+          "reason": "Parses JavaScript and TypeScript syntax and has no model retry or usage-record logic."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-06",
+      "judgments": [
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and does not classify or redact provider failures."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Maps raw provider text to stable billing, capacity, auth, context-limit, connection, or provider errors without echoing raw text."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 1,
+          "reason": "Consumes stable gateway codes to terminalize native runs, but does not classify or redact raw provider failures."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation subprocesses and has no provider-error normalization boundary."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Surfaces only the typed RemoteError code/message through GatewayError and derives stable ledger codes."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Implements workspace package resolution, unrelated to provider error handling."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 0,
+          "reason": "Declares CLI arguments and does not transform or redact provider failures."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation and does not implement provider failure reduction."
+        },
+        {
+          "path": "scripts/eval-docs-retrieval.mjs",
+          "grade": 0,
+          "reason": "Evaluates documentation retrieval, not model-provider error classification."
+        },
+        {
+          "path": "src/indexer.rs",
+          "grade": 0,
+          "reason": "Indexes repository files and has no model provider error boundary."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Builds sanitized error payloads and redacts bearer tokens, keys, URL credentials, queries, and fragments before JSONL output."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates terminal billing classification, transient categories, and removal of prompt and credential material."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 0,
+          "reason": "Implements TypeScript checker operations, not provider failure normalization."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 2,
+          "reason": "Defines the stable RemoteError code/message/retryable/capacity contract Rust accepts from the gateway."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Orchestrates replay evaluation and does not classify raw provider failures."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Provides benchmark fixture code rather than provider error-handling logic."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-07",
+      "judgments": [
+        {
+          "path": "bench/perf/mock-gateway.mjs",
+          "grade": 1,
+          "reason": "Returns a deterministic capabilities fixture including provider, auth, billing, tools, and context fields."
+        },
+        {
+          "path": "src/scouting/tests.rs",
+          "grade": 1,
+          "reason": "Provides a capability-result test double with the reported fields, but does not implement the inspection command."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Defines benchmark source fixtures and no model capability inspection."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates memory staleness and does not inspect provider models."
+        },
+        {
+          "path": "scripts/eval-pr-omission-report.test.mjs",
+          "grade": 0,
+          "reason": "Tests omission-report formatting rather than model capabilities."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Defines card submission validation and contains no provider/model capability reporting."
+        },
+        {
+          "path": "bench/perf/ai-pipe.mjs",
+          "grade": 0,
+          "reason": "Benchmarks scouting and only consumes a mock gateway; it does not expose capability inspection."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores evaluation output and contains no provider-qualified model inspection."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 1,
+          "reason": "Queries and caches model capabilities for scouting budgets and billing, but does not present the inspection report."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 3,
+          "reason": "Implements llm doctor: resolves the requested model, queries capabilities, and reports provider, API, tools, context, reasoning, service tier, billing, and auth."
+        },
+        {
+          "path": "src/commands/scout.rs",
+          "grade": 1,
+          "reason": "Launches gateways for scouting paths that consume capabilities, but it is not the model inspection implementation."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 1,
+          "reason": "Resolves auth and billing for actual calls and emits started identity, adjacent to but not authoritative for capability inspection."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Handles capabilities requests, resolves provider-qualified models, checks auth, and assembles the complete capability response."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 1,
+          "reason": "Supplies configured model/provider and auth settings consumed by doctor, without producing capability results."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Authoritatively parses provider:model, resolves the registry model, derives billing route, and describes tool/context/reasoning/service-tier support."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Tests known-model capability reporting and malformed provider-qualified model rejection."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 2,
+          "reason": "Defines and resolves the provider-qualified ModelSpec used by doctor and rejects malformed model specifications."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-08",
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Applies normalized request reasoning through reasoningOptions to the actual provider call."
+        },
+        {
+          "path": "src/scouting/repository.rs",
+          "grade": 2,
+          "reason": "Carries repository scout reasoning into CompleteRequest and includes it in immutable run identity."
+        },
+        {
+          "path": "src/scouting/refresh.rs",
+          "grade": 2,
+          "reason": "Reloads the producing run's recorded reasoning so refreshed artifacts replay the same setting."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates memory evaluation output and has no reasoning-option propagation."
+        },
+        {
+          "path": "src/semantic.rs",
+          "grade": 0,
+          "reason": "Validates and retrieves semantic artifacts, not model reasoning settings."
+        },
+        {
+          "path": "bench/perf/mock-gateway.mjs",
+          "grade": 0,
+          "reason": "Advertises reasoning support in a fixture but does not map or reject reasoning levels."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Probes evaluation contamination rather than provider request options."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and does not transport reasoning configuration."
+        },
+        {
+          "path": "src/commands/mod.rs",
+          "grade": 3,
+          "reason": "Resolves CLI reasoning over repository configuration and constructs each scout option with the resolved value."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 2,
+          "reason": "Defines CLI-over-repository reasoning resolution and provider-qualified model selection for request construction."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 2,
+          "reason": "Places resolved reasoning in every standard scout CompleteRequest and run fingerprint/spec."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Maps supported normalized levels to provider-specific options and explicitly rejects invalid or unsupported levels."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluation and does not implement model reasoning option mapping."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation cases, not scouting reasoning transport."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 2,
+          "reason": "Defines the reasoning option on repository and other scouting commands as the user-facing transport entry."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores omission evaluation output and has no provider reasoning settings."
+        },
+        {
+          "path": "scripts/eval-pr-snapshot.mjs",
+          "grade": 0,
+          "reason": "Captures pull-request snapshots, unrelated to model reasoning propagation."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-09",
+      "judgments": [
+        {
+          "path": "src/scouting/repository.rs",
+          "grade": 3,
+          "reason": "Carries repository service_tier into ProviderOptions and persists it in run configuration and identity."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines the service_tier ProviderOptions field in the authoritative Rust-to-gateway request contract."
+        },
+        {
+          "path": "bench/perf/ai-pipe.mjs",
+          "grade": 0,
+          "reason": "Its scouting smoke run sets reasoning only and does not exercise service-tier propagation."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and contains no service-tier configuration."
+        },
+        {
+          "path": "src/embed.rs",
+          "grade": 0,
+          "reason": "Implements the separate embedding provider plane and has no model service-tier option."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Passes the requested service tier into actual provider options after registry validation."
+        },
+        {
+          "path": "scripts/eval-memory-transfer-probe.test.mjs",
+          "grade": 0,
+          "reason": "Tests memory-transfer probing, not model provider service tiers."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 2,
+          "reason": "Defines service-tier flags for every initial scouting family as the command-line entry to the flow."
+        },
+        {
+          "path": "scripts/eval-memory-transfer-probe.mjs",
+          "grade": 0,
+          "reason": "Probes memory behavior and does not configure model service tiers."
+        },
+        {
+          "path": "scripts/eval-docs-retrieval.mjs",
+          "grade": 0,
+          "reason": "Evaluates documentation retrieval and has no model service-tier transport."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Defines card output validation; service-tier request construction is in the scouting orchestrator."
+        },
+        {
+          "path": "src/scouting/tests.rs",
+          "grade": 0,
+          "reason": "Uses only service_tier None in test options and does not corroborate tier propagation."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Provides benchmark fixture source with no service-tier behavior."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Provides the completion seam used by tier-bearing requests, while the tier contract and application live elsewhere."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Allows serviceTier only for the supported OpenAI response APIs and explicitly rejects it for other APIs."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 3,
+          "reason": "Carries scout configuration into ProviderOptions for all standard scouting requests and records it for replay."
+        },
+        {
+          "path": "src/scouting/refresh.rs",
+          "grade": 2,
+          "reason": "Deserializes recorded service-tier configuration so refresh preserves the original tier request."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Orchestrates replay evaluation and has no model service-tier option flow."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates omission results, unrelated to provider service tiers."
+        },
+        {
+          "path": "src/semantic.rs",
+          "grade": 0,
+          "reason": "Implements semantic artifact storage and retrieval, not provider call options."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-10",
+      "judgments": [
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Forwards evaluation environment to an MCP child but does not implement the Rust-to-Node provider-definition boundary."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 1,
+          "reason": "Parses provider-qualified model specifications used with custom registries, but does not serialize provider definitions or secrets."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Consumes the Rust-supplied base-URL and provider-definition environment, parses definitions, and initializes the Node registry."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates memory correctness and contains no model provider configuration boundary."
+        },
+        {
+          "path": "src/embed.rs",
+          "grade": 0,
+          "reason": "Handles separate embedding endpoints and keys, not custom model providers crossing to the Node gateway."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 1,
+          "reason": "Records the resolved non-secret base URL in run configuration, adjacent to but not responsible for boundary serialization."
+        },
+        {
+          "path": "scripts/eval-run-memory.test.mjs",
+          "grade": 0,
+          "reason": "Tests memory evaluation orchestration, not custom model provider configuration."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Implements the MCP server and does not serialize custom model provider definitions to Node."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Exposes resolved provider/base-URL identity in StartedInfo, but does not build the cross-process configuration."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores omission evaluations and has no custom provider configuration path."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Tests custom provider env-key auth, base-URL override, collision rejection, and unsafe endpoint rejection."
+        },
+        {
+          "path": "scripts/eval-docs-retrieval.mjs",
+          "grade": 0,
+          "reason": "Evaluates docs retrieval and does not configure the model gateway."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation cases, unrelated to custom model providers."
+        },
+        {
+          "path": "src/embed/tests.rs",
+          "grade": 0,
+          "reason": "Tests embedding-provider configuration on a distinct transport plane."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Contains benchmark fixture code rather than provider configuration."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 3,
+          "reason": "Parses and validates OpenAI-compatible provider definitions, base URLs, model limits, and secret environment-variable names without embedding secret values."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Builds custom OpenAI-compatible providers from non-secret definitions and resolves credentials at call time from the named environment variable."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Serializes only provider definitions/base URLs into gateway environment entries and handles key values separately, never placing them in provider JSON."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 0,
+          "reason": "Provides general config/model command options but no custom-provider or base-URL boundary implementation."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-11",
+      "judgments": [
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and does not participate in npm sidecar discovery."
+        },
+        {
+          "path": "src/checker/mod.rs",
+          "grade": 3,
+          "reason": "Authoritatively resolves checker sidecars with explicit CLI/config precedence before installed companion discovery."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluation and contains no packaged sidecar discovery logic."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 2,
+          "reason": "Launches the gateway path selected by runtime configuration, preserving the resolved discovery/override result."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 3,
+          "reason": "Implements config then legacy override then internal bundled discovery precedence and labels bundled transport as built-in."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 3,
+          "reason": "Authoritatively resolves explicit/configured gateway paths before installed companion locations."
+        },
+        {
+          "path": "src/scouting/plan.rs",
+          "grade": 0,
+          "reason": "Plans deterministic scouting subjects without starting or discovering sidecars."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates omission evaluation output and has no npm launcher behavior."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Implements the MCP request surface but not packaged checker/gateway discovery."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 0,
+          "reason": "Executes checker operations after launch and does not select the packaged checker entrypoint."
+        },
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "grade": 3,
+          "reason": "Directly supplies packaged gateway/checker paths as internal built-ins only when operator override and existing bundled values are absent, then preserves the environment for Rust."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Defines explicit gateway/checker sidecar flags that form the operator-override surface preserved by discovery."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 0,
+          "reason": "Builds provider/model registries after gateway launch and does not discover sidecar executables."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Probes evaluation contamination and does not launch npm-packaged sidecars."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Provides benchmark fixture source with no launcher discovery logic."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 0,
+          "reason": "Runs scouting over an already-launched gateway and does not resolve packaged sidecars."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluation children and does not implement npm built-in sidecar precedence."
+        },
+        {
+          "path": "src/fs_ops.rs",
+          "grade": 0,
+          "reason": "Abstracts filesystem operations and contains no checker or gateway discovery policy."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs Codex evaluation subprocesses, unrelated to npm sidecar discovery."
+        },
+        {
+          "path": "npm/cli/test/launcher.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates packaged sidecar injection and verifies that legacy operator overrides suppress bundled defaults."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-12",
+      "judgments": [
+        {
+          "path": "src/cli.rs",
+          "grade": 0,
+          "reason": "Defines CLI commands and gateway path options but no model-call concurrency or single-active-completion logic."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Directly launches exactly max_concurrency independent gateway child processes and dispatches each batch across them in scoped threads."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 0,
+          "reason": "Implements TypeScript checker enrichment, not generative gateway concurrency."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation Codex subprocesses and does not implement the product gateway."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Defines the batched LlmGateway seam and serial fallback that the process pool overrides for concurrent transport."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 2,
+          "reason": "Defines and validates RequestPolicy.max_concurrency, including the default of one."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 2,
+          "reason": "Runs the gateway protocol loop and dispatches messages without awaiting, allowing control traffic during an active completion."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 1,
+          "reason": "Tests that a second overlapping completion receives busy while the first finishes."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Authoritatively maintains one active completion and returns busy for any overlapping complete request."
+        },
+        {
+          "path": "src/scouting/tests.rs",
+          "grade": 1,
+          "reason": "Exercises max_concurrency waves and complete_batch behavior through a fake gateway."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation-memory responses and does not participate in gateway execution."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 1,
+          "reason": "Implements one structured completion and retry policy but does not own process pooling or the single-active guard."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 2,
+          "reason": "Loads llm.max_concurrency from configuration with a default of one."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies evaluation prompt anchors and has no gateway concurrency role."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 3,
+          "reason": "Directly bounds scouting waves by configured max_concurrency and dispatches them through complete_batch."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 0,
+          "reason": "Runs TypeScript checker work, not model completions."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates replay omissions and has no product gateway role."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 0,
+          "reason": "Tests the TypeScript checker sidecar, not the model gateway."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-13",
+      "judgments": [
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Analyzes evaluation-answer anchor wording and does not build or page ownership inventories."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Exposes checker planning and enrichment commands but delegates ownership transport and validation."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Builds evaluation contamination probes, unrelated to checker inventory transport."
+        },
+        {
+          "path": "src/search.rs",
+          "grade": 0,
+          "reason": "Implements indexed search and its cursor, not ownership upload or paging."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes MCP search and scout tools; it does not implement checker ownership pages."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Directly sends deterministically ordered payload-bounded upload chunks and validates page cursors, totals, ordering, and exact coverage."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates multi-megabyte inventory upload, paged results, invalid sequencing, and session reset behavior."
+        },
+        {
+          "path": "scripts/eval-docs-retrieval.mjs",
+          "grade": 0,
+          "reason": "Evaluates documentation retrieval and contains no checker ownership protocol."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations rather than product inventory planning."
+        },
+        {
+          "path": "bench/perf/perf.test.mjs",
+          "grade": 0,
+          "reason": "Benchmarks CLI performance and does not implement ownership upload or paging."
+        },
+        {
+          "path": "src/mcp/tests.rs",
+          "grade": 0,
+          "reason": "Tests MCP result paging, a distinct cursor path from checker ownership planning."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Generates a benchmark fixture repository and has no ownership protocol logic."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 2,
+          "reason": "Defines the complete first-party inventory and rejects missing, duplicate, or outside ownership entries."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Authoritatively enforces upload sequencing, declared totals, duplicate rejection, finish-time planning, and exact next-cursor use."
+        },
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Authoritatively constructs payload-bounded result pages with first-page totals and deterministic section cursors."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs external evaluation prompts and does not handle checker ownership state."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Orchestrates the complete inventory pass and rejects incomplete or changed ownership before downstream planning."
+        },
+        {
+          "path": "src/semantic.rs",
+          "grade": 0,
+          "reason": "Implements semantic indexing and retrieval, not checker ownership transport."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Renders scouting cards and does not upload or page ownership inventories."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation queries and has no product checker inventory role."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-14",
+      "judgments": [
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Registers checker cancellation, observes pending interruption, and prevents canceled staged work from activating."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies evaluation anchors and contains no checker cancellation path."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates replay omissions and does not run the TypeScript checker."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Directly terminates the active Worker, resets session state, acknowledges cancellation, and discards the canceled plan's trailing frame."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Resolves workspace paths and ignore rules, not blocking checker work or cancellation."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Directly routes Ctrl-C to cancel, accepts the cancel acknowledgement while awaiting the target response, and preserves client reuse unless protocol invariants fail."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 1,
+          "reason": "Hosts the blocking TypeScript planning operation inside the terminable Worker boundary."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Tests mid-plan cancellation, session reset, and a successful subsequent request on the same sidecar."
+        },
+        {
+          "path": "gateway/test/gateway.test.mjs",
+          "grade": 0,
+          "reason": "Tests cancellation for the model gateway, not blocking TypeScript planning."
+        },
+        {
+          "path": "src/scouting/ledger.rs",
+          "grade": 0,
+          "reason": "Persists scouting progress and has no checker cancellation transport."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 0,
+          "reason": "Dispatches model-gateway messages, not TypeScript checker Worker cancellation."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Builds benchmark fixtures and contains no cancellation implementation."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluations and does not cancel checker planning."
+        },
+        {
+          "path": "scripts/eval-next-teardown-preload.cjs",
+          "grade": 0,
+          "reason": "Tracks Next.js child processes for evaluation teardown, not checker Worker cancellation."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 0,
+          "reason": "Implements model-gateway process control, not the TypeScript checker planning protocol."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-15",
+      "judgments": [
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines the wire contract carrying call, receiver, and property byte spans plus indexed hashes."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation omissions and contains no source-offset conversion."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not resolve TypeScript call spans."
+        },
+        {
+          "path": "src/search.rs",
+          "grade": 0,
+          "reason": "Searches stored symbols and text; it does not convert Rust byte offsets for the checker."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Handles workspace discovery and path filtering, not offset identity."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation prompts and has no checker offset logic."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Creates benchmark source fixtures but does not translate or match offsets."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation queries and does not participate in span resolution."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies prompt anchors and has no byte-to-UTF-16 conversion."
+        },
+        {
+          "path": "scripts/eval-pr-snapshot.mjs",
+          "grade": 0,
+          "reason": "Snapshots pull-request evaluation inputs and does not inspect TypeScript AST spans."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Loads stored indexed spans and hashes and constructs the exact MemberQuery sent to the checker."
+        },
+        {
+          "path": "scripts/eval-pooled-report.mjs",
+          "grade": 0,
+          "reason": "Aggregates evaluation reports and contains no source-coordinate implementation."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 1,
+          "reason": "Surfaces indexed structural results carrying byte spans but does not translate or verify them."
+        },
+        {
+          "path": "src/chunk.rs",
+          "grade": 0,
+          "reason": "Chunks source for indexing and does not identify member-call coordinate triples."
+        },
+        {
+          "path": "src/heur.rs",
+          "grade": 2,
+          "reason": "Extracts exact UTF-8 byte spans for the call, receiver, and property into indexed member-call records."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Invokes checker enrichment and reports outcomes but delegates offset handling."
+        },
+        {
+          "path": "scripts/eval-mcp-structured-content-probe.mjs",
+          "grade": 0,
+          "reason": "Probes MCP response structure and does not implement checker span matching."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly converts bounded UTF-8 byte offsets to UTF-16, verifies round trips, and requires the exact six-coordinate AST span match."
+        },
+        {
+          "path": "src/query.rs",
+          "grade": 0,
+          "reason": "Parses user query syntax and has no TypeScript member-call offset conversion."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-16",
+      "judgments": [
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation Codex sessions and does not discover TypeScript projects."
+        },
+        {
+          "path": "src/recon.rs",
+          "grade": 1,
+          "reason": "Provides repository-boundary policy used by checker planning but does not discover or classify tsconfig projects."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Generates benchmark repositories and contains no product project-selection policy."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Exercises tooling-only project exclusion and tooling fallback behavior through the sidecar."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly walks and parses tsconfig files, records config problems, classifies tooling purpose, and selects general owners with tooling fallback."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Exposes checker planning commands and summaries but delegates project discovery and selection."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation omissions and has no tsconfig discovery path."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores evaluation answers and does not select configured projects."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluations rather than product project discovery."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies prompt anchors and contains no TypeScript config classification."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not inspect tsconfig ownership."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes retrieval tools and does not discover configured TypeScript projects."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Consumes selected, excluded, and fallback ownership and applies repository reconciliation policy before enrichment."
+        },
+        {
+          "path": "src/dependency.rs",
+          "grade": 0,
+          "reason": "Extracts dependency edges from indexed code and does not classify tsconfig projects."
+        },
+        {
+          "path": "src/semantic.rs",
+          "grade": 0,
+          "reason": "Implements semantic indexing and has no configured-project discovery role."
+        },
+        {
+          "path": "examples/graph-memory/demo.mjs",
+          "grade": 0,
+          "reason": "Demonstrates graph memory over MCP and contains no checker project selection."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 2,
+          "reason": "Validates complete selected, excluded, and fallback ownership against the first-party inventory."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines config-problem, project-purpose, excluded-ownership, and fallback-ownership contracts."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-17",
+      "judgments": [
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly validates complete inferred roots, root caps, summaries, and full project membership before accepting inferred projects."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Builds performance fixtures and does not construct inferred checker scopes."
+        },
+        {
+          "path": "src/indexer.rs",
+          "grade": 0,
+          "reason": "Indexes files and symbols but does not group unowned files into inferred TypeScript projects."
+        },
+        {
+          "path": "src/scouting/plan.rs",
+          "grade": 0,
+          "reason": "Plans scouting prompts and has no checker-scope inference."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 0,
+          "reason": "Orchestrates model scouting, not TypeScript project inference."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Invokes checker planning and reports inferred-project counts but delegates construction and validation."
+        },
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "grade": 0,
+          "reason": "Bootstraps the packaged CLI binary and contains no scope-inference policy."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly groups unowned files by nearest package and module family, applies deterministic IDs, recursively caps roots, and reconstructs exact membership."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies evaluation anchors and does not infer checker projects."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 2,
+          "reason": "Admits full inventory ownership using nearest-package boundaries before inferred grouping."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Runs replay evaluation sessions and has no product inference logic."
+        },
+        {
+          "path": "checker/src/inferred-options.mjs",
+          "grade": 3,
+          "reason": "Defines the authoritative compiler-option families used for node-esm, node-cjs, and bundler-jsx inferred projects."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Finds workspace files and ignore boundaries but does not partition them into inferred project families."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes retrieval tools and does not build TypeScript checker scopes."
+        },
+        {
+          "path": "src/scouting/summary.rs",
+          "grade": 0,
+          "reason": "Summarizes scouting output, unrelated to checker project membership."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 2,
+          "reason": "Orchestrates complete inventory upload and invokes the Worker plan that returns inferred-project pages."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs external evaluation prompts and does not infer checker scopes."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and contains no TypeScript scope inference."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Tests deterministic inferred grouping, package boundaries, module families, and root-cap behavior."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-18",
+      "judgments": [
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation memory answers and does not validate checker snapshots."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates stale-input rejection and project validation through sidecar scenarios."
+        },
+        {
+          "path": "src/checker/enrich/tests.rs",
+          "grade": 1,
+          "reason": "Tests stale source, package-gate, and activation-race rejection in the enrichment pipeline."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 2,
+          "reason": "Fingerprints package manifests and absent package-boundary probes, then revalidates them before commit."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation prompts and does not implement checker snapshot reuse."
+        },
+        {
+          "path": "src/structural.rs",
+          "grade": 1,
+          "reason": "Reads active checker state and reports staleness, but does not establish or revalidate project fingerprints."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 0,
+          "reason": "Orchestrates model scouting and has no checker snapshot transaction."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Renders scouting cards and does not validate checker inputs."
+        },
+        {
+          "path": "src/structural/tests.rs",
+          "grade": 1,
+          "reason": "Tests downstream behavior when active checker generations are partial or stale."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly gates reuse, deactivates stale state, validates projects after batches, rechecks package inputs before activation, and repeats hashes in the commit transaction."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Generates benchmark repositories and contains no snapshot validation logic."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines project fingerprints, input hashes, source hashes, and validation request and response contracts."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation queries and does not participate in checker activation."
+        },
+        {
+          "path": "src/scouting/ledger.rs",
+          "grade": 0,
+          "reason": "Persists scouting progress, not checker project snapshots."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly fingerprints compiler/runtime, configs, manifests, absent probes, options, membership, and sources, then rereads them during project validation."
+        },
+        {
+          "path": "checker/src/inferred-options.mjs",
+          "grade": 1,
+          "reason": "Defines inferred compiler options that are incorporated into project fingerprints."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation prompt anchors and has no checker fingerprint role."
+        },
+        {
+          "path": "src/store.rs",
+          "grade": 2,
+          "reason": "Persists checker batches, project runs, generations, and project-input hashes used by snapshot validation and activation."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores memory-answer staleness in evaluations, not product checker inputs."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not implement checker revalidation."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-19",
+      "judgments": [
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation-memory staleness and does not check indexed source identity."
+        },
+        {
+          "path": "scripts/eval-contamination-probe.mjs",
+          "grade": 0,
+          "reason": "Probes evaluation contamination and contains no checker identity validation."
+        },
+        {
+          "path": "scripts/eval-memory-transfer-probe.mjs",
+          "grade": 0,
+          "reason": "Probes answer-memory transfer and does not participate in TypeScript enrichment."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Invokes enrichment and reports failures but delegates request and response identity checks."
+        },
+        {
+          "path": "src/scouting/repository.rs",
+          "grade": 0,
+          "reason": "Builds repository context for scouting, not checker source identities."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly hashes current source bytes and rejects a query whose indexed_hash differs before semantic resolution."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation queries and does not validate checker responses."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines indexed hashes, source hashes, project IDs, fingerprints, and per-answer identity fields on the wire."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes retrieval tools and does not send or validate checker batches."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates replay omissions and has no product source-hash role."
+        },
+        {
+          "path": "scripts/eval-run-replay.test.mjs",
+          "grade": 0,
+          "reason": "Tests evaluation replay mechanics rather than checker identity handling."
+        },
+        {
+          "path": "src/docs/retrieval.rs",
+          "grade": 0,
+          "reason": "Retrieves documentation evidence and does not process checker identities."
+        },
+        {
+          "path": "scripts/eval-memory-transfer-probe.test.mjs",
+          "grade": 0,
+          "reason": "Tests evaluation transfer probes, unrelated to checker request identity."
+        },
+        {
+          "path": "src/agent.rs",
+          "grade": 0,
+          "reason": "Defines agent-facing context generation and does not validate TypeScript checker answers."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies evaluation anchors and contains no source-hash verification."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not construct checker member queries."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs external evaluation prompts and has no enrichment identity checks."
+        },
+        {
+          "path": "src/indexer/tests.rs",
+          "grade": 1,
+          "reason": "Tests indexed content hashes and guarded checker rebind behavior."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly validates batch project identity, TypeScript identity, fingerprints, counts, indexed and source hashes, and per-answer project identity before accepting results."
+        },
+        {
+          "path": "src/indexer.rs",
+          "grade": 2,
+          "reason": "Computes and persists indexed content hashes and conditionally rebinds checker facts only when identity invariants hold."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-20",
+      "judgments": [
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation requests and does not classify declaration provenance."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines the authoritative declaration-context and declaration-provenance contract, including file, hash, and byte span."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Invokes checker enrichment and reports its summaries but delegates provenance classification and symbol mapping."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Generates benchmark code and contains no declaration-provenance implementation."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Renders scouting context and does not classify TypeScript declarations."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "grade": 0,
+          "reason": "Orchestrates scouting and has no declaration-to-symbol mapping."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not map declaration spans."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Tests repository, type-package, lib, vendored, and outside declaration contexts through the sidecar."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and contains no declaration provenance logic."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly ignores non-repository contexts and maps repository declarations only to a unique tight containing same-name symbol with matching source hash."
+        },
+        {
+          "path": "src/watch.rs",
+          "grade": 0,
+          "reason": "Watches filesystem changes and does not resolve declaration provenance."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation prompts and has no TypeScript declaration mapping."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly classifies declarations as repository, @types, TypeScript lib, vendored, or outside and returns hashed byte-span provenance."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes retrieval tools and does not classify or map checker declarations."
+        },
+        {
+          "path": "scripts/npm-package.mjs",
+          "grade": 0,
+          "reason": "Packages npm artifacts and contains no declaration-context policy."
+        },
+        {
+          "path": "src/workspace.rs",
+          "grade": 0,
+          "reason": "Handles workspace paths and ignore rules but does not map declaration spans to symbols."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores evaluation staleness rather than product provenance."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation omissions and has no checker mapping role."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-21",
+      "judgments": [
+        {
+          "path": "examples/graph-memory/demo.test.mjs",
+          "grade": 0,
+          "reason": "Tests the graph-memory example and does not exercise checker batch budgets."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Implements MCP retrieval transport, not TypeScript checker batch sizing."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly enforces query-count and serialized-response byte limits, returns oversized_batch, and reports process memory."
+        },
+        {
+          "path": "src/docs/retrieval.rs",
+          "grade": 0,
+          "reason": "Retrieves documentation candidates and has no checker resource-budget logic."
+        },
+        {
+          "path": "src/indexer/tests.rs",
+          "grade": 0,
+          "reason": "Tests indexing behavior rather than checker batch limits."
+        },
+        {
+          "path": "scripts/eval-memory-staleness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores evaluation-memory staleness and does not meter checker resources."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Builds benchmark fixtures and does not implement runtime batch budgets."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Tests oversized-batch rejection and checker resource telemetry."
+        },
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not size checker requests."
+        },
+        {
+          "path": "scripts/eval-pooled-report.mjs",
+          "grade": 0,
+          "reason": "Aggregates evaluation metrics and has no product checker budget role."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines the resource-usage and oversized-batch error fields exchanged across the checker boundary."
+        },
+        {
+          "path": "examples/graph-memory/demo.mjs",
+          "grade": 0,
+          "reason": "Demonstrates MCP graph memory and does not invoke the checker batch protocol."
+        },
+        {
+          "path": "src/scouting/card.rs",
+          "grade": 0,
+          "reason": "Renders scouting cards and does not enforce checker byte or query limits."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Certifies evaluation anchors and contains no resource telemetry."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly caps batches by count and encoded bytes, halves before send, halves and retries oversized batches, and accumulates peak RSS and heap metrics."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Reports checker enrichment outcomes but delegates budget enforcement and retry."
+        },
+        {
+          "path": "src/checker/enrich/tests.rs",
+          "grade": 1,
+          "reason": "Tests local byte-budget splitting, oversized retry, and peak resource aggregation."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 0,
+          "reason": "Runs the model gateway protocol and does not enforce TypeScript checker budgets."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-22",
+      "judgments": [
+        {
+          "path": "scripts/eval-run-memory.mjs",
+          "grade": 0,
+          "reason": "Runs memory evaluations and does not isolate checker failures."
+        },
+        {
+          "path": "src/mcp.rs",
+          "grade": 0,
+          "reason": "Exposes retrieval tools and does not classify TypeScript checker failures."
+        },
+        {
+          "path": "scripts/eval-run-replay.mjs",
+          "grade": 0,
+          "reason": "Replays evaluation requests and contains no product checker fault boundary."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Transports batch results and distinguishes structured checker failures from protocol violations that poison the client."
+        },
+        {
+          "path": "bench/perf/ai-pipe-fixture.mjs",
+          "grade": 0,
+          "reason": "Creates benchmark repositories and does not implement failure isolation."
+        },
+        {
+          "path": "src/checker/mod.rs",
+          "grade": 1,
+          "reason": "Defines checker project and generation status types consumed by partial-failure reporting."
+        },
+        {
+          "path": "src/structural.rs",
+          "grade": 2,
+          "reason": "Consumes partial generations and failed-project metadata while retaining usable structural facts."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Directly permits file-local failures only for inferred projects, stages whole-file failure transactionally, preserves healthy siblings, and classifies partial versus project-wide failure."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Directly catches only eligible per-file resolution failures for inferred projects while leaving configured-project and invariant failures project-wide."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 0,
+          "reason": "Validates package inventory ownership but does not isolate semantic-query failures."
+        },
+        {
+          "path": "scripts/eval-pr-omission-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Adjudicates evaluation omissions and has no checker failure policy."
+        },
+        {
+          "path": "src/checker/enrich/tests.rs",
+          "grade": 1,
+          "reason": "Tests inferred file-local failure, configured-project failure, partial publication, and healthy-sibling preservation."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines per-item failed answers and project-level error contracts used by the isolation policy."
+        },
+        {
+          "path": "scripts/eval-memory-correctness-adjudicate.mjs",
+          "grade": 0,
+          "reason": "Scores evaluation answers and does not handle product checker faults."
+        },
+        {
+          "path": "scripts/eval-docs-retrieval.mjs",
+          "grade": 0,
+          "reason": "Evaluates documentation retrieval and has no checker project status logic."
+        },
+        {
+          "path": "checker/test/sidecar.test.mjs",
+          "grade": 1,
+          "reason": "Corroborates inferred per-file failure responses and configured-project fail-closed behavior."
+        },
+        {
+          "path": "scripts/eval-run-codex.mjs",
+          "grade": 0,
+          "reason": "Runs evaluation prompts and does not participate in checker fault isolation."
+        },
+        {
+          "path": "src/cli.rs",
+          "grade": 1,
+          "reason": "Reports completed, partial, and failed checker outcomes but delegates fault classification."
+        },
+        {
+          "path": "scripts/eval-anchor-certify.mjs",
+          "grade": 0,
+          "reason": "Classifies evaluation anchors and contains no checker failure handling."
+        }
+      ]
+    }
+  ]
+}
