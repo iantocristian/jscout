@@ -1,0 +1,677 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  ARM_REPORT_SCHEMA,
+  FROZEN_ADJUDICATION,
+  POOL_SCHEMA,
+  QRELS_SCHEMA,
+  assertFreshExternalPath,
+  buildSearchArgs,
+  canonicalizeProspectivePath,
+  createPoolArtifact,
+  deduplicateFiles,
+  evaluateScoreGates,
+  normalizedDiscountedCumulativeGain,
+  judgmentRubricSha256,
+  poolPayloadSha256,
+  queriesForArm,
+  queryManifestSha256,
+  scoreBaselineMixed,
+  scoreFilteredParity,
+  scoreTreatmentMixed,
+  validateArmReport,
+  validateFrozenManifest,
+  validateManifest,
+  validatePoolArtifact,
+  validateQrels,
+  validateRunnerSha,
+  validateSourceHoldout,
+} from "./eval-g26-format-scope-v4";
+
+const BASELINE_REVISION = "1".repeat(40);
+const TREATMENT_REVISION = "2".repeat(40);
+const CORPUS_REVISION = TREATMENT_REVISION;
+const MANIFEST_SHA256 = "a".repeat(64);
+const BASELINE_REPORT_SHA256 = "b".repeat(64);
+const TREATMENT_REPORT_SHA256 = "c".repeat(64);
+const RUNNER_SHA256 = "d".repeat(64);
+
+function query(id, text, form, positives) {
+  return {
+    id,
+    query: text,
+    query_form: form,
+    authored_positive_files: positives,
+    rationale: `Source-only rationale for ${id}.`,
+  };
+}
+
+function fixtureManifest() {
+  return {
+    protocol_version: 4,
+    baseline_revision: BASELINE_REVISION,
+    treatment_revision: TREATMENT_REVISION,
+    corpus_revision: CORPUS_REVISION,
+    expected_runner_sha256: RUNNER_SHA256,
+    retrieval_k: 100,
+    file_k: 10,
+    pool_file_k: 10,
+    pool_seed: "frozen-v4-pool-seed",
+    filtered_formats: ["javascript", "typescript"],
+    adjudication: structuredClone(FROZEN_ADJUDICATION),
+    gates: {
+      filtered_recall_at_10_must_not_decrease: true,
+      filtered_mean_mrr_maximum_drop: 0.02,
+      filtered_baseline_top_five_gold_may_not_fall_below_rank: 10,
+      mixed_treatment_mean_ndcg_at_10_minimum: 0.70,
+      mixed_mean_ndcg_maximum_drop: 0.02,
+      mixed_judged_at_10_required: 1,
+    },
+    filtered_parity_queries: [
+      query("filtered-exact", "GatewayRegistry", "exact_identifier", ["src/gateway.ts"]),
+      query("filtered-prose", "resolve checker configuration", "natural_language", [
+        "src/checker.mjs",
+      ]),
+    ],
+    mixed_relevance_queries: [
+      query("mixed-gateway", "register a source language gateway", "natural_language", [
+        "src/gateway.ts",
+        "src/gateway.rs",
+      ]),
+      query("mixed-checker", "validate checker protocol responses", "natural_language", [
+        "src/checker.mjs",
+        "src/checker.rs",
+      ]),
+    ],
+  };
+}
+
+function rawRun(queryEntry, cohort, files, snapshot = "snapshot-one") {
+  return {
+    id: queryEntry.id,
+    cohort,
+    query: queryEntry.query,
+    query_form: queryEntry.query_form,
+    raw_hits: files.map((file, index) => ({
+      file,
+      chunk_id: index + 1,
+      score: 100 - index,
+      rank: index + 1,
+    })),
+    retrieval: { vector: "disabled", reranker: "disabled" },
+    snapshot,
+  };
+}
+
+function searchProfiles(manifest, arm) {
+  const common = {
+    origins: ["repository", "workspace"],
+    retrieval_k: manifest.retrieval_k,
+    lexical_only: true,
+    memory: false,
+    expansion: false,
+  };
+  return {
+    filtered_parity: {
+      ...common,
+      formats: arm === "baseline"
+        ? "omitted_for_baseline_binary_compatibility"
+        : ["javascript", "typescript"],
+    },
+    mixed_relevance: {
+      ...common,
+      formats: "omitted_all_code_formats",
+    },
+  };
+}
+
+function armReport(manifest, arm) {
+  const filteredFiles = arm === "baseline"
+    ? [["src/gateway.ts", "src/shared.ts"], ["src/checker.mjs", "src/shared.ts"]]
+    : [["src/gateway.ts", "src/shared.ts"], ["src/checker.mjs", "src/shared.ts"]];
+  const mixedFiles = arm === "baseline"
+    ? [
+      ["src/gateway.ts", "src/shared.ts", "src/legacy.js", "src/base-a.ts"],
+      ["src/checker.mjs", "src/shared.ts", "src/base-b.ts"],
+    ]
+    : [
+      ["src/gateway.rs", "src/gateway.ts", "src/shared.rs", "src/treatment-a.rs"],
+      ["src/checker.rs", "src/checker.mjs", "src/shared.rs", "src/treatment-b.rs"],
+    ];
+  const queryRuns = [
+    ...manifest.filtered_parity_queries.map((entry, index) =>
+      rawRun(entry, "filtered_parity", filteredFiles[index])),
+    ...manifest.mixed_relevance_queries.map((entry, index) =>
+      rawRun(entry, "mixed_relevance", mixedFiles[index])),
+  ];
+  return {
+    schema_version: ARM_REPORT_SCHEMA,
+    protocol_version: 4,
+    arm,
+    manifest_sha256: MANIFEST_SHA256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    runner: { sha256: RUNNER_SHA256 },
+    binary_source: {
+      revision: arm === "baseline" ? manifest.baseline_revision : manifest.treatment_revision,
+      sha256: "e".repeat(64),
+    },
+    corpus: {
+      repository: process.cwd(),
+      revision: manifest.corpus_revision,
+      shared_between_arms: true,
+    },
+    provider_free: true,
+    arm_snapshot: "snapshot-one",
+    search_profiles: searchProfiles(manifest, arm),
+    query_runs: queryRuns,
+  };
+}
+
+function fixtureArtifacts() {
+  const manifest = validateManifest(fixtureManifest());
+  const baseline = armReport(manifest, "baseline");
+  const treatment = armReport(manifest, "treatment");
+  validateArmReport(manifest, baseline, MANIFEST_SHA256, "baseline", RUNNER_SHA256);
+  validateArmReport(manifest, treatment, MANIFEST_SHA256, "treatment", RUNNER_SHA256);
+  const pool = createPoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    baseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  );
+  return { manifest, baseline, treatment, pool };
+}
+
+function completeQrels(manifest, pool) {
+  const manifestQueries = new Map(
+    manifest.mixed_relevance_queries.map((entry) => [entry.id, entry]),
+  );
+  return {
+    schema_version: QRELS_SCHEMA,
+    protocol_version: 4,
+    manifest_sha256: MANIFEST_SHA256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    pool_sha256: pool.pool_sha256,
+    adjudication_attestation: {
+      adjudicators: ["independent-reviewer-one"],
+      candidate_input: "blinded_pool_only",
+      corpus_revision: manifest.corpus_revision,
+      rubric_sha256: judgmentRubricSha256(manifest),
+      independent_of_retrieval_generation: true,
+      arm_identity_seen: false,
+      rank_seen: false,
+      score_seen: false,
+      source_holdout_seen: false,
+      manifest_seen: false,
+      arm_reports_seen: false,
+      raw_search_output_seen: false,
+      eval_results_seen: false,
+      prior_qrels_seen: false,
+      git_history_seen: false,
+    },
+    queries: pool.queries.map((poolQuery) => {
+      const authored = new Set(manifestQueries.get(poolQuery.id).authored_positive_files);
+      return {
+        id: poolQuery.id,
+        judgments: poolQuery.candidates.map((candidate) => ({
+          path: candidate,
+          grade: authored.has(candidate) ? 3 : candidate.includes("shared") ? 1 : 0,
+          reason: authored.has(candidate) ? "Authored known-positive." : "Pooled candidate.",
+        })),
+      };
+    }),
+  };
+}
+
+test("v4 manifest shape fixes metric and pool depth", () => {
+  const manifest = fixtureManifest();
+  assert.equal(validateManifest(manifest), manifest);
+  assert.equal(manifest.filtered_parity_queries.length, 2);
+  assert.equal(manifest.mixed_relevance_queries.length, 2);
+
+  const wrongDepth = structuredClone(manifest);
+  wrongDepth.pool_file_k = 20;
+  assert.throws(() => validateManifest(wrongDepth), /pool_file_k=10/);
+
+  const duplicate = structuredClone(manifest);
+  duplicate.mixed_relevance_queries[0].id = duplicate.filtered_parity_queries[0].id;
+  assert.throws(() => validateManifest(duplicate), /duplicate query id/);
+
+  const unsupportedPositive = structuredClone(manifest);
+  unsupportedPositive.mixed_relevance_queries[0].authored_positive_files = ["README.md"];
+  assert.throws(() => validateManifest(unsupportedPositive), /unsupported format/);
+
+  const mismatchedCorpus = structuredClone(manifest);
+  mismatchedCorpus.corpus_revision = "3".repeat(40);
+  assert.throws(() => validateManifest(mismatchedCorpus), /must match/);
+});
+
+test("the executable protocol binds the frozen revisions, queries, and source holdout", () => {
+  const manifest = JSON.parse(
+    fs.readFileSync("eval/prereg/g26-format-scope-v4-2026-08-26.json", "utf8"),
+  );
+  assert.equal(validateFrozenManifest(manifest), manifest);
+  const currentRunnerSha256 = createHash("sha256")
+    .update(fs.readFileSync("scripts/eval-g26-format-scope-v4"))
+    .digest("hex");
+  assert.equal(manifest.expected_runner_sha256, currentRunnerSha256);
+  assert.equal(validateRunnerSha(manifest, currentRunnerSha256), currentRunnerSha256);
+  assert.equal(
+    validateSourceHoldout(
+      manifest,
+      "eval/prereg/g26-format-scope-v4-2026-08-26.json",
+    ).queries.length,
+    22,
+  );
+
+  const changedRevision = structuredClone(manifest);
+  changedRevision.treatment_revision = "f".repeat(40);
+  changedRevision.corpus_revision = changedRevision.treatment_revision;
+  assert.throws(() => validateFrozenManifest(changedRevision), /frozen protocol/);
+
+  const changedQuery = structuredClone(manifest);
+  changedQuery.mixed_relevance_queries[0].query += " changed";
+  assert.throws(() => validateFrozenManifest(changedQuery), /frozen payload/);
+
+  const changedRetrievalDepth = structuredClone(manifest);
+  changedRetrievalDepth.retrieval_k = 101;
+  assert.throws(() => validateFrozenManifest(changedRetrievalDepth), /retrieval depth/);
+
+  const changedPoolSeed = structuredClone(manifest);
+  changedPoolSeed.pool_seed = "a-different-seed";
+  assert.throws(() => validateFrozenManifest(changedPoolSeed), /pool seed/);
+
+  assert.throws(
+    () => validateRunnerSha(manifest, "f".repeat(64)),
+    /current runner bytes/,
+  );
+});
+
+test("both arms schedule filtered and mixed queries while only treatment filtered adds formats", () => {
+  const manifest = validateManifest(fixtureManifest());
+  for (const arm of ["baseline", "treatment"]) {
+    assert.deepEqual(
+      queriesForArm(manifest, arm).map(({ cohort, query: entry }) => [cohort, entry.id]),
+      [
+        ["filtered_parity", "filtered-exact"],
+        ["filtered_parity", "filtered-prose"],
+        ["mixed_relevance", "mixed-gateway"],
+        ["mixed_relevance", "mixed-checker"],
+      ],
+    );
+  }
+  const queryEntry = manifest.filtered_parity_queries[0];
+  const baselineFiltered = buildSearchArgs(
+    manifest, "baseline", "filtered_parity", queryEntry, "/repo", "/db",
+  );
+  const treatmentFiltered = buildSearchArgs(
+    manifest, "treatment", "filtered_parity", queryEntry, "/repo", "/db",
+  );
+  const treatmentMixed = buildSearchArgs(
+    manifest, "treatment", "mixed_relevance", queryEntry, "/repo", "/db",
+  );
+  assert.equal(baselineFiltered.includes("--format"), false);
+  assert.deepEqual(treatmentFiltered.slice(-4), [
+    "--format", "javascript", "--format", "typescript",
+  ]);
+  assert.equal(treatmentMixed.includes("--format"), false);
+});
+
+test("arm reports bind revisions, runner bytes, query order, snapshots, and raw formats", () => {
+  const { manifest, baseline } = fixtureArtifacts();
+  assert.equal(
+    validateArmReport(manifest, baseline, MANIFEST_SHA256, "baseline", RUNNER_SHA256),
+    baseline,
+  );
+
+  const wrongRevision = structuredClone(baseline);
+  wrongRevision.binary_source.revision = TREATMENT_REVISION;
+  assert.throws(
+    () => validateArmReport(manifest, wrongRevision, MANIFEST_SHA256, "baseline"),
+    /revision provenance/,
+  );
+
+  const wrongSnapshot = structuredClone(baseline);
+  wrongSnapshot.query_runs.at(-1).snapshot = "different-snapshot";
+  assert.throws(
+    () => validateArmReport(manifest, wrongSnapshot, MANIFEST_SHA256, "baseline"),
+    /same snapshot/,
+  );
+
+  const RustLeak = structuredClone(baseline);
+  RustLeak.query_runs[0].raw_hits.push({ file: "src/leak.rs" });
+  assert.throws(
+    () => validateArmReport(manifest, RustLeak, MANIFEST_SHA256, "baseline"),
+    /not JavaScript\/TypeScript/,
+  );
+
+  const mixedRustLeak = structuredClone(baseline);
+  mixedRustLeak.query_runs.find((run) => run.cohort === "mixed_relevance")
+    .raw_hits.push({ file: "src/leak.rs" });
+  assert.throws(
+    () => validateArmReport(manifest, mixedRustLeak, MANIFEST_SHA256, "baseline"),
+    /impossible in the frozen baseline/,
+  );
+});
+
+test("pool takes ten deduplicated files per arm, includes positives, and exposes no provenance", () => {
+  const { manifest, baseline, treatment } = fixtureArtifacts();
+  const baselineRun = baseline.query_runs.find((run) => run.id === "mixed-gateway");
+  const treatmentRun = treatment.query_runs.find((run) => run.id === "mixed-gateway");
+  baselineRun.raw_hits = [
+    { file: "src/dup.ts", score: 99, rank: 1 },
+    { file: "src/dup.ts", score: 98, rank: 2 },
+    ...Array.from({ length: 10 }, (_, index) => ({
+      file: `src/base-${index}.ts`, score: 90 - index, rank: index + 3,
+    })),
+    { file: "src/base-excluded.ts", score: 1, rank: 13 },
+  ];
+  treatmentRun.raw_hits = Array.from({ length: 11 }, (_, index) => ({
+    file: `src/treatment-${index}.rs`, score: 90 - index, rank: index + 1,
+  }));
+  const pool = createPoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    baseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  );
+  const candidates = pool.queries.find((entry) => entry.id === "mixed-gateway").candidates;
+  assert.equal(candidates.includes("src/dup.ts"), true);
+  assert.equal(candidates.includes("src/base-8.ts"), true);
+  assert.equal(candidates.includes("src/base-9.ts"), false);
+  assert.equal(candidates.includes("src/base-excluded.ts"), false);
+  assert.equal(candidates.includes("src/treatment-9.rs"), true);
+  assert.equal(candidates.includes("src/treatment-10.rs"), false);
+  assert.equal(candidates.includes("src/gateway.ts"), true);
+  assert.equal(candidates.includes("src/gateway.rs"), true);
+  assert.equal(candidates.every((candidate) => typeof candidate === "string"), true);
+  assert.deepEqual(pool.policy.candidate_provenance_fields, []);
+  assert.deepEqual(pool.adjudication.rubric, manifest.adjudication.rubric);
+  assert.deepEqual(pool.adjudication.allowed_inputs, manifest.adjudication.allowed_inputs);
+  assert.deepEqual(pool.adjudication.prohibited_inputs, manifest.adjudication.prohibited_inputs);
+  assert.deepEqual(
+    pool.adjudication.required_attestation,
+    {
+      ...manifest.adjudication.required_attestation,
+      corpus_revision: manifest.corpus_revision,
+      rubric_sha256: judgmentRubricSha256(manifest),
+    },
+  );
+  assert.equal(
+    pool.adjudication.required_attestation.corpus_revision,
+    manifest.corpus_revision,
+  );
+  assert.equal(pool.adjudication.rubric_sha256, judgmentRubricSha256(manifest));
+
+  const rescoredBaseline = structuredClone(baseline);
+  for (const run of rescoredBaseline.query_runs) {
+    for (const hit of run.raw_hits) {
+      hit.score = -123;
+      hit.rank = 999;
+    }
+  }
+  const samePool = createPoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    rescoredBaseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  );
+  assert.deepEqual(samePool, pool);
+  assert.equal(pool.pool_sha256, poolPayloadSha256(pool));
+});
+
+test("pool validation recomputes membership, ordering, source hashes, and payload hash", () => {
+  const { manifest, baseline, treatment, pool } = fixtureArtifacts();
+  assert.equal(pool.schema_version, POOL_SCHEMA);
+  assert.equal(validatePoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    pool,
+    baseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  ), pool);
+
+  const tampered = structuredClone(pool);
+  tampered.queries[0].candidates[0] = "src/tampered.rs";
+  assert.throws(() => validatePoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    tampered,
+    baseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  ), /pool SHA/);
+
+  const tamperedRevision = structuredClone(pool);
+  tamperedRevision.adjudication.required_attestation.corpus_revision = "f".repeat(40);
+  tamperedRevision.pool_sha256 = poolPayloadSha256(tamperedRevision);
+  assert.throws(() => validatePoolArtifact(
+    manifest,
+    MANIFEST_SHA256,
+    tamperedRevision,
+    baseline,
+    BASELINE_REPORT_SHA256,
+    treatment,
+    TREATMENT_REPORT_SHA256,
+  ), /pool does not match/);
+});
+
+test("qrels require one explicit integer 0-3 judgment for every pooled candidate", () => {
+  const { manifest, pool } = fixtureArtifacts();
+  const qrels = completeQrels(manifest, pool);
+  assert.equal(validateQrels(manifest, MANIFEST_SHA256, pool, qrels), qrels);
+  assert.equal(qrels.queries.some((entry) => entry.judgments.some(({ grade }) => grade === 0)), true);
+
+  const missing = structuredClone(qrels);
+  missing.queries[0].judgments.pop();
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, missing),
+    /explicitly grade every pool candidate/,
+  );
+
+  const duplicate = structuredClone(qrels);
+  duplicate.queries[0].judgments.push(structuredClone(duplicate.queries[0].judgments[0]));
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, duplicate),
+    /duplicate qrel/,
+  );
+
+  const outOfRange = structuredClone(qrels);
+  outOfRange.queries[0].judgments[0].grade = 4;
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, outOfRange),
+    /integers from 0 through 3/,
+  );
+
+  const missingReason = structuredClone(qrels);
+  delete missingReason.queries[0].judgments[0].reason;
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, missingReason),
+    /reason must be a non-empty trimmed string/,
+  );
+
+  const wrongPool = structuredClone(qrels);
+  wrongPool.pool_sha256 = "0".repeat(64);
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, wrongPool),
+    /hashes do not match/,
+  );
+
+  const sawRanks = structuredClone(qrels);
+  sawRanks.adjudication_attestation.rank_seen = true;
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, sawRanks),
+    /rank_seen must be false/,
+  );
+
+  const missingAdjudicator = structuredClone(qrels);
+  missingAdjudicator.adjudication_attestation.adjudicators = [];
+  assert.throws(
+    () => validateQrels(manifest, MANIFEST_SHA256, pool, missingAdjudicator),
+    /adjudicators must be a non-empty array/,
+  );
+
+  const permitsIndependentZeroForAuthored = structuredClone(qrels);
+  const firstAuthored = manifest.mixed_relevance_queries[0].authored_positive_files[0];
+  permitsIndependentZeroForAuthored.queries[0].judgments.find(
+    ({ path }) => path === firstAuthored,
+  ).grade = 0;
+  assert.equal(
+    validateQrels(manifest, MANIFEST_SHA256, pool, permitsIndependentZeroForAuthored),
+    permitsIndependentZeroForAuthored,
+  );
+});
+
+test("nDCG uses the whole judged pool and both-arm metrics report coverage and formats", () => {
+  assert.equal(
+    normalizedDiscountedCumulativeGain(
+      ["direct.rs", "support.ts", "noise.js"],
+      new Map([["direct.rs", 3], ["support.ts", 2], ["noise.js", 0]]),
+      10,
+    ),
+    1,
+  );
+  const displaced = normalizedDiscountedCumulativeGain(
+    ["support.ts"],
+    new Map([["unreturned.rs", 3], ["support.ts", 2]]),
+    10,
+  );
+  assert.ok(displaced > 0 && displaced < 0.5);
+
+  const { manifest, baseline, treatment, pool } = fixtureArtifacts();
+  const qrels = validateQrels(
+    manifest,
+    MANIFEST_SHA256,
+    pool,
+    completeQrels(manifest, pool),
+  );
+  const baselineMixed = scoreBaselineMixed(manifest, baseline, pool, qrels);
+  const treatmentMixed = scoreTreatmentMixed(manifest, treatment, pool, qrels);
+  assert.equal(baselineMixed.all_queries_fully_judged_at_10, true);
+  assert.equal(treatmentMixed.all_queries_fully_judged_at_10, true);
+  assert.equal(treatmentMixed.mean_judged_at_10, 1);
+  assert.equal(treatmentMixed.mean_known_positive_recall_at_10, 1);
+  assert.ok(treatmentMixed.observed_format_counts.rust > 0);
+  assert.ok(treatmentMixed.observed_format_counts.javascript > 0);
+  assert.ok(Number.isFinite(baselineMixed.mean_ndcg_at_10));
+  assert.ok(Number.isFinite(treatmentMixed.mean_ndcg_at_10));
+});
+
+test("filtered, mixed relevance, and judgment gates fail independently", () => {
+  const { manifest, baseline, treatment, pool } = fixtureArtifacts();
+  const qrels = validateQrels(
+    manifest,
+    MANIFEST_SHA256,
+    pool,
+    completeQrels(manifest, pool),
+  );
+  const filtered = scoreFilteredParity(manifest, baseline, treatment);
+  const baselineMixed = scoreBaselineMixed(manifest, baseline, pool, qrels);
+  const treatmentMixed = scoreTreatmentMixed(manifest, treatment, pool, qrels);
+  const passingManifest = structuredClone(manifest);
+  passingManifest.gates.mixed_treatment_mean_ndcg_at_10_minimum = 0;
+  passingManifest.gates.mixed_mean_ndcg_maximum_drop = 1;
+  assert.equal(
+    evaluateScoreGates(passingManifest, filtered, baselineMixed, treatmentMixed).decision,
+    "pass",
+  );
+
+  const lowRecall = structuredClone(filtered);
+  lowRecall.mean_known_positive_recall_at_10 = 0;
+  assert.equal(
+    evaluateScoreGates(passingManifest, lowRecall, baselineMixed, treatmentMixed).decision,
+    "fail",
+  );
+
+  const lowNdcg = structuredClone(treatmentMixed);
+  lowNdcg.mean_ndcg_at_10 = 0;
+  passingManifest.gates.mixed_treatment_mean_ndcg_at_10_minimum = 0.70;
+  assert.equal(
+    evaluateScoreGates(passingManifest, filtered, baselineMixed, lowNdcg).decision,
+    "fail",
+  );
+
+  const highBaseline = structuredClone(baselineMixed);
+  const passingAbsoluteTreatment = structuredClone(treatmentMixed);
+  highBaseline.mean_ndcg_at_10 = 0.90;
+  passingAbsoluteTreatment.mean_ndcg_at_10 = 0.80;
+  passingManifest.gates.mixed_treatment_mean_ndcg_at_10_minimum = 0.70;
+  passingManifest.gates.mixed_mean_ndcg_maximum_drop = 0.02;
+  assert.equal(
+    evaluateScoreGates(
+      passingManifest,
+      filtered,
+      highBaseline,
+      passingAbsoluteTreatment,
+    ).decision,
+    "fail",
+  );
+
+  const withinToleranceBaseline = structuredClone(baselineMixed);
+  const withinToleranceTreatment = structuredClone(treatmentMixed);
+  withinToleranceBaseline.mean_ndcg_at_10 = 0.81;
+  withinToleranceTreatment.mean_ndcg_at_10 = 0.80;
+  assert.equal(
+    evaluateScoreGates(
+      passingManifest,
+      filtered,
+      withinToleranceBaseline,
+      withinToleranceTreatment,
+    ).decision,
+    "pass",
+  );
+
+  const incomplete = structuredClone(treatmentMixed);
+  incomplete.mean_judged_at_10 = 0.9;
+  incomplete.all_queries_fully_judged_at_10 = false;
+  assert.equal(
+    evaluateScoreGates(passingManifest, filtered, baselineMixed, incomplete).decision,
+    "fail",
+  );
+});
+
+test("file deduplication applies before the ten-file boundary", () => {
+  const hits = [
+    { file: "src/one.rs" },
+    { file: "src/one.rs" },
+    ...Array.from({ length: 10 }, (_, index) => ({ file: `src/${index}.ts` })),
+  ];
+  assert.deepEqual(deduplicateFiles(hits, 10), [
+    "src/one.rs",
+    ...Array.from({ length: 9 }, (_, index) => `src/${index}.ts`),
+  ]);
+});
+
+test("fresh external paths resolve symlinked existing parents before containment checks", (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-g26-v4-paths-"));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const repository = path.join(temporary, "repository");
+  const alias = path.join(temporary, "repository-alias");
+  fs.mkdirSync(repository);
+  fs.symlinkSync(repository, alias, process.platform === "win32" ? "junction" : "dir");
+  const disguisedInsidePath = path.join(alias, "new", "report.json");
+  assert.equal(
+    canonicalizeProspectivePath(disguisedInsidePath),
+    path.join(fs.realpathSync(repository), "new", "report.json"),
+  );
+  assert.throws(
+    () => assertFreshExternalPath(disguisedInsidePath, [repository]),
+    /outside evaluated checkouts/,
+  );
+  const external = path.join(temporary, "external", "report.json");
+  assert.equal(assertFreshExternalPath(external, [repository]), path.resolve(external));
+});

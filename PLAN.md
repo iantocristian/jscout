@@ -3545,22 +3545,30 @@ Rust rows never enter exact tiers, checker inventory, checker dirty affinity,
 JS-specific fact tables, or module edges; spans slice exactly on multibyte,
 raw-string, and CRLF content; malformed Rust remains searchable and reports its
 parse-error count; and a Rust-only change preserves all JS/TS canonical rows
-and checker carry inputs. A prospectively committed provider-free protocol has
-two fresh arms. Filtered parity compares a Rust-free baseline with the mixed
+and checker carry inputs. The prospectively committed v4 provider-free
+protocol has clean baseline and treatment arms. Filtered parity reuses the
+previously inspected v3 JS/TS regression cohort; it is a regression guard, not
+fresh confirmatory evidence. It compares a Rust-free baseline with the mixed
 index searched using `formats=['javascript','typescript']`; JS/TS Recall@10
 does not decrease, MRR drops by no more than 0.02, and baseline top-five gold
-stays top-ten. Mixed relevance searches with formats omitted and uses blinded,
-cross-language relevance judgments; its frozen gate is pooled-judgment mean
-nDCG@10 >= 0.70 with gain `2^grade-1`. Unjudged returned files
-score zero only for metric computation and are not declared irrelevant.
-Language representation is reported but not gated. Both arms retain
-100 raw ranked chunks, deduplicate files by first occurrence, and truncate to
-10. Every filtered-parity raw hit must be JavaScript or TypeScript. Each arm's
-query responses share one nonempty snapshot; the two arms need not share a
-snapshot because their indexed memberships differ. Self-index timing, database
-size, chunk counts, parse diagnostics, and
-query results land in `eval/results/`. Phase 2
-and 3 remain blocked until their own preregistered
+stays top-ten. Mixed relevance instead uses a fresh source-only holdout and
+searches with formats omitted. For each query, one blinded pool unions the
+baseline and treatment top-ten files plus authored positive recall sentinels,
+and every pooled query-file pair receives an explicit `0`–`3` qrel. Baseline
+and treatment nDCG@10 use that same complete pool and gain `2^grade-1`;
+treatment mean nDCG@10 must be at least `0.70` and may trail baseline by no more
+than `0.02`. Missing qrels invalidate v4 scoring rather than receiving zero
+gain. Language representation and known-positive Recall@10 are reported but
+not gated. Both arms retain 100 raw ranked chunks, deduplicate files by first
+occurrence, and truncate to 10. Every filtered-parity raw hit must be
+JavaScript or TypeScript. Each arm's query responses share one nonempty
+snapshot; the two arms need not share a snapshot because their indexed
+memberships differ. V4 first writes arm reports, the blinded pool, qrels, and
+the score report to fresh paths outside every evaluated checkout. Those
+artifacts record indexing duration, database bytes, index stdout/stderr
+diagnostics, and raw query results. After scoring, a hash-linked result record
+and any selected immutable artifact copies are preserved under
+`eval/results/`. Phase 2 and 3 remain blocked until their own preregistered
 collision and edge-correctness protocols are committed. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
 is subordinate and non-normative, this entry winning on any disagreement.
@@ -3570,9 +3578,32 @@ The first phase-1 treatment formally failed the preregistered mixed-corpus
 control gate: relevant Rust implementations displaced one legacy JS/TS gold
 file from the combined top ten. A post-hoc JS/TS-only projection stayed within
 the numerical thresholds, but it is diagnostic evidence, not a passing result.
-Phase 1 therefore remains unaccepted until a replacement control is frozen
-prospectively and evaluated on fresh holdout queries; the failed report remains
-under `eval/results/`.
+The v3 replacement's filtered regression arm passed: JS/TS Recall@10 remained
+`1.0000`, mean MRR improved from `0.8833` to `0.8854`, and every baseline
+top-five gold file stayed top-ten. Its mixed arm still failed the frozen
+`0.70` nDCG gate at `0.5084`, so the result remains a
+formal failure under `eval/results/`. That mixed score was not decision-grade,
+however: the evaluator called source-authored positive qrels a pool, judged
+only 68 of 240 returned top-ten slots, supplied no explicit zeroes, and treated
+every unjudged file as zero gain. The same output also contained real misses,
+so neither dismissing the failure nor changing its judgments after inspection
+is allowed.
+
+Phase 1 therefore remains unaccepted while one unchanged-treatment v4 run
+repairs the evaluation rather than the ranking. Its filtered arm reuses the
+previously inspected v3 JS/TS cohort only as a regression guard; its mixed arm
+uses a fresh source-only holdout. It pools the union of baseline and treatment
+top-ten files plus authored positives, removes arm/rank/score provenance,
+blindly assigns an explicit grade to every pooled query-file pair, freezes
+those qrels, then scores both arms against that same pool. Treatment mean
+nDCG@10 must be at least `0.70`, may trail baseline by no more than `0.02`, and
+both arms must have complete judgment coverage at ten. If that complete pool
+still fails, advance the planned named, item-local Rust chunks as phase 2a
+while exact definitions and occurrences remain disabled. Identifier subtoken
+aliases, if tested, attach only to those item-local chunks; appending aliases
+to phase-1 4.8KB lossless chunks would amplify unrelated identifiers.
+Per-format FTS tables and language quotas remain
+unsupported by the evidence.
 
 ## Evaluation decisions already made
 

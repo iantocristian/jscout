@@ -1,0 +1,1356 @@
+#!/usr/bin/env node
+
+// Protocol v4 separates retrieval from relevance adjudication:
+//
+//   1. run baseline and treatment arms into independent raw reports;
+//   2. pool their mixed-corpus candidates into a blinded, hashed artifact;
+//   3. score only after complete 0-3 qrels bind themselves to that pool.
+//
+// The runner is intentionally extensionless so it cannot enter only one arm's
+// JavaScript corpus and perturb the ranking it measures.
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+export const ARM_REPORT_SCHEMA = "g26-format-scope-v4-arm-report-1";
+export const POOL_SCHEMA = "g26-format-scope-v4-pool-1";
+export const QRELS_SCHEMA = "g26-format-scope-v4-qrels-1";
+export const SCORE_REPORT_SCHEMA = "g26-format-scope-v4-score-report-1";
+const FILTERED_FORMATS = ["javascript", "typescript"];
+const KNOWN_FORMATS = new Set([...FILTERED_FORMATS, "rust"]);
+const FROZEN_BASELINE_REVISION = "444540e3a29b68bfd5adc42bc4df99b5c5a92386";
+const FROZEN_TREATMENT_REVISION = "5b7d3f62406a782ef957f260104955691f661155";
+const FROZEN_SOURCE_HOLDOUT_SHA256 =
+  "01ff607297f024075c8eaf850e0eb8b90bb3696350539be3ff5a666c1abcb3ec";
+const FROZEN_QUERY_PAYLOAD_SHA256 =
+  "c44ac807b7b67183248b76101a806255532781d63e1865a1d1fa98febdbbd858";
+const FROZEN_RETRIEVAL_K = 100;
+const FROZEN_POOL_SEED = "g26-format-scope-v4-2026-08-26";
+export const FROZEN_ADJUDICATION = {
+  unit: "query_file_pair",
+  rubric: {
+    "0": "No meaningful evidence for the behavior requested by the query.",
+    "1": "Supporting or corroborating context, test, caller, or adjacent implementation; not a primary implementation or contract.",
+    "2": "A substantial participant in the requested behavior's transport, orchestration, validation, or persistence.",
+    "3": "The direct authoritative implementation or contract for the requested behavior.",
+  },
+  allowed_inputs: [
+    "blinded_pool_artifact",
+    "pinned_corpus_product_source",
+    "this_rubric",
+  ],
+  prohibited_inputs: [
+    "manifest",
+    "source_holdout",
+    "arm_reports",
+    "raw_search_output",
+    "eval_results",
+    "prior_qrels",
+    "ranks",
+    "scores",
+    "arm_identity",
+    "git_history",
+  ],
+  required_attestation: {
+    adjudicators: "one_or_more_unique_nonempty_strings",
+    candidate_input: "blinded_pool_only",
+    corpus_revision: "must_equal_manifest_corpus_revision",
+    rubric_sha256: "must_equal_manifest_rubric_sha256",
+    independent_of_retrieval_generation: true,
+    arm_identity_seen: false,
+    rank_seen: false,
+    score_seen: false,
+    source_holdout_seen: false,
+    manifest_seen: false,
+    arm_reports_seen: false,
+    raw_search_output_seen: false,
+    eval_results_seen: false,
+    prior_qrels_seen: false,
+    git_history_seen: false,
+  },
+};
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requireString(value, label) {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
+    throw new Error(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireRevision(value, label) {
+  requireString(value, label);
+  if (!/^[0-9a-f]{40}$/.test(value)) {
+    throw new Error(`${label} must be a full lowercase Git revision`);
+  }
+  return value;
+}
+
+function requireSha256(value, label) {
+  requireString(value, label);
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  }
+  return value;
+}
+
+function requirePositiveInteger(value, label) {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+function requireUnitInterval(value, label) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${label} must be a finite number from 0 through 1`);
+  }
+  return value;
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sha256Bytes(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function sha256File(file) {
+  return sha256Bytes(fs.readFileSync(file));
+}
+
+function assertUniqueStrings(values, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${label} must be a non-empty array`);
+  }
+  const seen = new Set();
+  for (const [index, value] of values.entries()) {
+    requireString(value, `${label}[${index}]`);
+    if (seen.has(value)) throw new Error(`${label} contains duplicate ${value}`);
+    seen.add(value);
+  }
+  return values;
+}
+
+export function validateRelativePath(value, label) {
+  requireString(value, label);
+  if (value.includes("\\") || path.posix.isAbsolute(value) ||
+      path.posix.normalize(value) !== value || value === "." ||
+      value.startsWith("../") || value.includes("/../")) {
+    throw new Error(`${label} must be a normalized repository-relative POSIX path`);
+  }
+  return value;
+}
+
+export function formatForPath(file) {
+  const extension = path.posix.extname(file).toLowerCase();
+  if ([".js", ".jsx", ".mjs", ".cjs"].includes(extension)) return "javascript";
+  if ([".ts", ".tsx", ".mts", ".cts"].includes(extension)) return "typescript";
+  if (extension === ".rs") return "rust";
+  return "other";
+}
+
+function validateQuery(query, cohort, ids, texts) {
+  if (!isObject(query)) throw new Error(`${cohort}: query entries must be objects`);
+  requireString(query.id, `${cohort}.id`);
+  if (ids.has(query.id)) throw new Error(`duplicate query id: ${query.id}`);
+  ids.add(query.id);
+  requireString(query.query, `${query.id}.query`);
+  if (texts.has(query.query)) throw new Error(`duplicate query text: ${query.query}`);
+  texts.add(query.query);
+  requireString(query.query_form, `${query.id}.query_form`);
+  const positives = assertUniqueStrings(
+    query.authored_positive_files,
+    `${query.id}.authored_positive_files`,
+  );
+  for (const [index, file] of positives.entries()) {
+    validateRelativePath(file, `${query.id}.authored_positive_files[${index}]`);
+    const format = formatForPath(file);
+    if (!KNOWN_FORMATS.has(format)) {
+      throw new Error(`${query.id}: authored positive has an unsupported format: ${file}`);
+    }
+    if (cohort === "filtered_parity" && !FILTERED_FORMATS.includes(format)) {
+      throw new Error(`${query.id}: filtered authored positives must be JavaScript/TypeScript`);
+    }
+  }
+  if (query.rationale !== undefined) requireString(query.rationale, `${query.id}.rationale`);
+}
+
+export function queryManifestSha256(manifest) {
+  return sha256Bytes(JSON.stringify({
+    filtered_parity_queries: manifest.filtered_parity_queries,
+    mixed_relevance_queries: manifest.mixed_relevance_queries,
+  }));
+}
+
+export function judgmentRubricSha256(manifest) {
+  return sha256Bytes(JSON.stringify({
+    unit: manifest.adjudication?.unit,
+    rubric: manifest.adjudication?.rubric,
+  }));
+}
+
+export function validateManifest(manifest) {
+  if (!isObject(manifest) || manifest.protocol_version !== 4) {
+    throw new Error("manifest protocol_version must be 4");
+  }
+  requireRevision(manifest.baseline_revision, "baseline_revision");
+  requireRevision(manifest.treatment_revision, "treatment_revision");
+  requireRevision(manifest.corpus_revision, "corpus_revision");
+  if (manifest.baseline_revision === manifest.treatment_revision) {
+    throw new Error("baseline_revision and treatment_revision must differ");
+  }
+  if (manifest.treatment_revision !== manifest.corpus_revision) {
+    throw new Error("treatment_revision and corpus_revision must match");
+  }
+  requireSha256(manifest.expected_runner_sha256, "expected_runner_sha256");
+  requirePositiveInteger(manifest.retrieval_k, "retrieval_k");
+  if (manifest.file_k !== 10) throw new Error("v4 requires file_k=10");
+  if (manifest.pool_file_k !== 10) throw new Error("v4 requires pool_file_k=10");
+  if (manifest.retrieval_k < manifest.pool_file_k) {
+    throw new Error("retrieval_k must be at least pool_file_k");
+  }
+  requireString(manifest.pool_seed, "pool_seed");
+  if (!sameJson(manifest.filtered_formats, FILTERED_FORMATS)) {
+    throw new Error("filtered_formats must be exactly javascript,typescript");
+  }
+  if (!sameJson(manifest.adjudication, FROZEN_ADJUDICATION)) {
+    throw new Error("adjudication must contain the complete frozen rubric and access policy");
+  }
+  if (!isObject(manifest.gates)) throw new Error("gates must be an object");
+  if (manifest.gates.filtered_recall_at_10_must_not_decrease !== true) {
+    throw new Error("filtered recall nondecrease gate must be enabled");
+  }
+  requireUnitInterval(
+    manifest.gates.filtered_mean_mrr_maximum_drop,
+    "gates.filtered_mean_mrr_maximum_drop",
+  );
+  requirePositiveInteger(
+    manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank,
+    "gates.filtered_baseline_top_five_gold_may_not_fall_below_rank",
+  );
+  requireUnitInterval(
+    manifest.gates.mixed_treatment_mean_ndcg_at_10_minimum,
+    "gates.mixed_treatment_mean_ndcg_at_10_minimum",
+  );
+  requireUnitInterval(
+    manifest.gates.mixed_mean_ndcg_maximum_drop,
+    "gates.mixed_mean_ndcg_maximum_drop",
+  );
+  if (manifest.gates.mixed_judged_at_10_required !== 1) {
+    throw new Error("mixed_judged_at_10_required must be 1");
+  }
+  if (!Array.isArray(manifest.filtered_parity_queries) ||
+      manifest.filtered_parity_queries.length === 0) {
+    throw new Error("filtered_parity_queries must be non-empty");
+  }
+  if (!Array.isArray(manifest.mixed_relevance_queries) ||
+      manifest.mixed_relevance_queries.length === 0) {
+    throw new Error("mixed_relevance_queries must be non-empty");
+  }
+  const ids = new Set();
+  const texts = new Set();
+  for (const query of manifest.filtered_parity_queries) {
+    validateQuery(query, "filtered_parity", ids, texts);
+  }
+  for (const query of manifest.mixed_relevance_queries) {
+    validateQuery(query, "mixed_relevance", ids, texts);
+  }
+  return manifest;
+}
+
+export function validateFrozenManifest(manifest) {
+  validateManifest(manifest);
+  if (manifest.baseline_revision !== FROZEN_BASELINE_REVISION ||
+      manifest.treatment_revision !== FROZEN_TREATMENT_REVISION ||
+      manifest.corpus_revision !== FROZEN_TREATMENT_REVISION) {
+    throw new Error("v4 revisions do not match the frozen protocol");
+  }
+  if (manifest.filtered_parity_queries.length !== 24 ||
+      manifest.mixed_relevance_queries.length !== 22) {
+    throw new Error("v4 requires exactly 24 filtered and 22 mixed queries");
+  }
+  if (manifest.retrieval_k !== FROZEN_RETRIEVAL_K ||
+      manifest.pool_seed !== FROZEN_POOL_SEED) {
+    throw new Error("v4 retrieval depth or pool seed does not match the frozen protocol");
+  }
+  if (queryManifestSha256(manifest) !== FROZEN_QUERY_PAYLOAD_SHA256) {
+    throw new Error("v4 queries do not match the frozen payload");
+  }
+  if (manifest.source_holdout?.source_sha256 !== FROZEN_SOURCE_HOLDOUT_SHA256 ||
+      manifest.source_holdout?.copied_query_payload_sha256 !==
+        FROZEN_QUERY_PAYLOAD_SHA256 ||
+      manifest.source_holdout?.fresh_authorship !== true ||
+      manifest.source_holdout?.ranked_outputs_inspected !== false ||
+      manifest.source_holdout?.jscout_search_run !== false) {
+    throw new Error("v4 source-holdout provenance does not match the frozen protocol");
+  }
+  if (manifest.gates.filtered_mean_mrr_maximum_drop !== 0.02 ||
+      manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank !== 10 ||
+      manifest.gates.mixed_treatment_mean_ndcg_at_10_minimum !== 0.70 ||
+      manifest.gates.mixed_mean_ndcg_maximum_drop !== 0.02 ||
+      manifest.gates.mixed_judged_at_10_required !== 1) {
+    throw new Error("v4 gate constants do not match the frozen protocol");
+  }
+  return manifest;
+}
+
+export function validateRunnerSha(manifest, runnerSha256) {
+  requireSha256(runnerSha256, "runnerSha256");
+  if (manifest.expected_runner_sha256 !== runnerSha256) {
+    throw new Error("current runner bytes do not match expected_runner_sha256");
+  }
+  return runnerSha256;
+}
+
+export function validateSourceHoldout(manifest, manifestPath) {
+  const manifestDirectory = path.dirname(path.resolve(manifestPath));
+  const repository = path.resolve(manifestDirectory, "..", "..");
+  const committedPath = validateRelativePath(
+    manifest.source_holdout?.committed_path,
+    "source_holdout.committed_path",
+  );
+  const sourcePath = path.resolve(repository, ...committedPath.split("/"));
+  if (!sourcePath.startsWith(`${repository}${path.sep}`) ||
+      sha256File(sourcePath) !== FROZEN_SOURCE_HOLDOUT_SHA256) {
+    throw new Error("committed source holdout is missing or does not match its frozen SHA");
+  }
+  const source = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+  if (!Array.isArray(source.queries) || source.queries.length !== 22) {
+    throw new Error("committed source holdout must contain exactly 22 queries");
+  }
+  const projected = source.queries.map((query) => ({
+    id: query.id,
+    query: query.query,
+    authored_positive_files: query.positive_file_judgments.map((entry) => entry.path),
+  }));
+  const frozen = manifest.mixed_relevance_queries.map((query) => ({
+    id: query.id,
+    query: query.query,
+    authored_positive_files: query.authored_positive_files,
+  }));
+  if (!sameJson(projected, frozen)) {
+    throw new Error("manifest mixed queries do not project exactly from the source holdout");
+  }
+  return source;
+}
+
+export function validateCorpusPaths(manifest, repository) {
+  const root = fs.realpathSync(repository);
+  const checked = new Set();
+  for (const query of [
+    ...manifest.filtered_parity_queries,
+    ...manifest.mixed_relevance_queries,
+  ]) {
+    for (const file of query.authored_positive_files) {
+      if (checked.has(file)) continue;
+      checked.add(file);
+      const candidate = path.resolve(root, ...file.split("/"));
+      const relative = path.relative(root, candidate);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw new Error(`${query.id}: authored positive escapes the corpus: ${file}`);
+      }
+      let stat;
+      try {
+        stat = fs.statSync(candidate);
+      } catch {
+        throw new Error(`${query.id}: authored positive does not exist: ${file}`);
+      }
+      if (!stat.isFile()) {
+        throw new Error(`${query.id}: authored positive is not a file: ${file}`);
+      }
+    }
+  }
+}
+
+export function deduplicateFiles(hits, fileK) {
+  requirePositiveInteger(fileK, "fileK");
+  if (!Array.isArray(hits)) throw new Error("hits must be an array");
+  const seen = new Set();
+  const files = [];
+  for (const [index, hit] of hits.entries()) {
+    if (!isObject(hit) || typeof hit.file !== "string" || hit.file.length === 0) {
+      throw new Error(`hits[${index}] must have a file`);
+    }
+    validateRelativePath(hit.file, `hits[${index}].file`);
+    if (seen.has(hit.file)) continue;
+    seen.add(hit.file);
+    files.push(hit.file);
+    if (files.length === fileK) break;
+  }
+  return files;
+}
+
+function mean(values) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error("cannot average an empty set");
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function scoreKnownPositives(positiveFiles, rankedFiles) {
+  const positiveRanks = positiveFiles.map((file) => {
+    const index = rankedFiles.indexOf(file);
+    return { file, rank: index === -1 ? null : index + 1 };
+  });
+  const present = positiveRanks.flatMap(({ rank }) => rank === null ? [] : [rank]);
+  const first = present.length === 0 ? null : Math.min(...present);
+  return {
+    known_positive_ranks: positiveRanks,
+    known_positive_recall_at_10: present.length / positiveFiles.length,
+    first_known_positive_rank: first,
+    reciprocal_rank: first === null ? 0 : 1 / first,
+  };
+}
+
+export function validateRawHitFormats(hits, cohort, queryId) {
+  if (!Array.isArray(hits)) throw new Error(`${queryId}: raw hits must be an array`);
+  for (const [index, hit] of hits.entries()) {
+    if (!isObject(hit) || typeof hit.file !== "string" || hit.file.length === 0) {
+      throw new Error(`${queryId}: raw_hits[${index}] must have a file`);
+    }
+    validateRelativePath(hit.file, `${queryId}.raw_hits[${index}].file`);
+    const format = formatForPath(hit.file);
+    if (cohort === "filtered_parity") {
+      if (!FILTERED_FORMATS.includes(format)) {
+        throw new Error(`${queryId}: filtered raw hit is not JavaScript/TypeScript: ${hit.file}`);
+      }
+    } else if (cohort === "mixed_relevance") {
+      if (!KNOWN_FORMATS.has(format)) {
+        throw new Error(`${queryId}: mixed raw hit has an unsupported format: ${hit.file}`);
+      }
+    } else {
+      throw new Error(`${queryId}: unknown cohort ${cohort}`);
+    }
+  }
+}
+
+export function validateArmSnapshot(queryRuns, label = "arm") {
+  if (!Array.isArray(queryRuns) || queryRuns.length === 0) {
+    throw new Error(`${label}: query runs must be non-empty`);
+  }
+  const snapshot = requireString(queryRuns[0].snapshot, `${label}.snapshot`);
+  for (const run of queryRuns) {
+    if (run.snapshot !== snapshot) {
+      throw new Error(`${label}: every query response must use the same snapshot`);
+    }
+  }
+  return snapshot;
+}
+
+export function queriesForArm(manifest, arm) {
+  if (!new Set(["baseline", "treatment"]).has(arm)) {
+    throw new Error("arm must be baseline or treatment");
+  }
+  return [
+    ...manifest.filtered_parity_queries.map((query) => ({
+      cohort: "filtered_parity",
+      query,
+    })),
+    ...manifest.mixed_relevance_queries.map((query) => ({
+      cohort: "mixed_relevance",
+      query,
+    })),
+  ];
+}
+
+export function buildSearchArgs(manifest, arm, cohort, query, repository, database) {
+  const args = [
+    "search",
+    repository,
+    query.query,
+    "--database",
+    database,
+    "--limit",
+    String(manifest.retrieval_k),
+    "--origin",
+    "repository,workspace",
+    "--lexical-only",
+    "--no-memory",
+    "--no-expand",
+    "--debug-json",
+  ];
+  if (arm === "treatment" && cohort === "filtered_parity") {
+    for (const format of manifest.filtered_formats) args.push("--format", format);
+  }
+  return args;
+}
+
+function searchProfiles(manifest, arm) {
+  const common = {
+    origins: ["repository", "workspace"],
+    retrieval_k: manifest.retrieval_k,
+    lexical_only: true,
+    memory: false,
+    expansion: false,
+  };
+  return {
+    filtered_parity: {
+      ...common,
+      formats: arm === "baseline"
+        ? "omitted_for_baseline_binary_compatibility"
+        : [...manifest.filtered_formats],
+    },
+    mixed_relevance: {
+      ...common,
+      formats: "omitted_all_code_formats",
+    },
+  };
+}
+
+function expectedQueryEntries(manifest) {
+  return queriesForArm(manifest, "baseline");
+}
+
+export function validateArmReport(
+  manifest,
+  report,
+  manifestSha256,
+  expectedArm,
+  expectedRunnerSha256 = null,
+) {
+  if (!isObject(report) || report.schema_version !== ARM_REPORT_SCHEMA ||
+      report.protocol_version !== 4 || report.arm !== expectedArm) {
+    throw new Error(`${expectedArm} report has the wrong schema, protocol, or arm`);
+  }
+  if (report.manifest_sha256 !== manifestSha256 ||
+      report.query_manifest_sha256 !== queryManifestSha256(manifest)) {
+    throw new Error(`${expectedArm} report does not match this manifest`);
+  }
+  const expectedRevision = expectedArm === "baseline"
+    ? manifest.baseline_revision
+    : manifest.treatment_revision;
+  if (report.binary_source?.revision !== expectedRevision ||
+      report.corpus?.revision !== manifest.corpus_revision ||
+      report.corpus?.shared_between_arms !== true) {
+    throw new Error(`${expectedArm} report revision provenance is invalid`);
+  }
+  requireSha256(report.binary_source?.sha256, `${expectedArm}.binary_source.sha256`);
+  requireSha256(report.runner?.sha256, `${expectedArm}.runner.sha256`);
+  if (expectedRunnerSha256 !== null && report.runner.sha256 !== expectedRunnerSha256) {
+    throw new Error(`${expectedArm} report runner SHA does not match current runner bytes`);
+  }
+  if (report.provider_free !== true ||
+      !sameJson(report.search_profiles, searchProfiles(manifest, expectedArm))) {
+    throw new Error(`${expectedArm} report search provenance is invalid`);
+  }
+  const expected = expectedQueryEntries(manifest);
+  if (!Array.isArray(report.query_runs) || report.query_runs.length !== expected.length) {
+    throw new Error(`${expectedArm} report has the wrong number of query runs`);
+  }
+  for (const [index, entry] of expected.entries()) {
+    const run = report.query_runs[index];
+    if (!isObject(run) || run.id !== entry.query.id || run.cohort !== entry.cohort ||
+        run.query !== entry.query.query || run.query_form !== entry.query.query_form ||
+        !Array.isArray(run.raw_hits) || run.raw_hits.length > manifest.retrieval_k ||
+        run.retrieval?.vector !== "disabled" ||
+        run.retrieval?.reranker !== "disabled") {
+      throw new Error(`${entry.query.id}: ${expectedArm} raw run provenance mismatch`);
+    }
+    validateRawHitFormats(run.raw_hits, entry.cohort, entry.query.id);
+    if (expectedArm === "baseline" && entry.cohort === "mixed_relevance" &&
+        run.raw_hits.some((hit) => formatForPath(hit.file) === "rust")) {
+      throw new Error(`${entry.query.id}: Rust hit is impossible in the frozen baseline`);
+    }
+  }
+  const snapshot = validateArmSnapshot(report.query_runs, `${expectedArm} report`);
+  if (report.arm_snapshot !== snapshot) {
+    throw new Error(`${expectedArm} report arm_snapshot does not match query responses`);
+  }
+  return report;
+}
+
+function reportRunsByCohort(report, cohort) {
+  return new Map(
+    report.query_runs.filter((run) => run.cohort === cohort).map((run) => [run.id, run]),
+  );
+}
+
+function deterministicShuffle(values, seed, queryId) {
+  return [...values].sort((left, right) => {
+    const leftKey = sha256Bytes(`${seed}\0${queryId}\0${left}`);
+    const rightKey = sha256Bytes(`${seed}\0${queryId}\0${right}`);
+    return leftKey.localeCompare(rightKey) || left.localeCompare(right);
+  });
+}
+
+export function poolPayloadSha256(pool) {
+  if (!isObject(pool)) throw new Error("pool must be an object");
+  const { pool_sha256: _ignored, ...payload } = pool;
+  return sha256Bytes(JSON.stringify(payload));
+}
+
+export function createPoolArtifact(
+  manifest,
+  manifestSha256,
+  baselineReport,
+  baselineReportSha256,
+  treatmentReport,
+  treatmentReportSha256,
+) {
+  requireSha256(manifestSha256, "manifestSha256");
+  requireSha256(baselineReportSha256, "baselineReportSha256");
+  requireSha256(treatmentReportSha256, "treatmentReportSha256");
+  const baseline = reportRunsByCohort(baselineReport, "mixed_relevance");
+  const treatment = reportRunsByCohort(treatmentReport, "mixed_relevance");
+  const queries = manifest.mixed_relevance_queries.map((query) => {
+    const baselineRun = baseline.get(query.id);
+    const treatmentRun = treatment.get(query.id);
+    if (!baselineRun || !treatmentRun) {
+      throw new Error(`${query.id}: mixed run missing from one arm`);
+    }
+    const candidates = new Set(query.authored_positive_files);
+    for (const file of deduplicateFiles(baselineRun.raw_hits, manifest.pool_file_k)) {
+      candidates.add(file);
+    }
+    for (const file of deduplicateFiles(treatmentRun.raw_hits, manifest.pool_file_k)) {
+      candidates.add(file);
+    }
+    return {
+      id: query.id,
+      query: query.query,
+      candidates: deterministicShuffle(candidates, manifest.pool_seed, query.id),
+    };
+  });
+  const pool = {
+    schema_version: POOL_SCHEMA,
+    protocol_version: 4,
+    manifest_sha256: manifestSha256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    source_report_sha256s: [baselineReportSha256, treatmentReportSha256].sort(),
+    policy: {
+      authored_positives_included: true,
+      deduplicated_files_per_arm: manifest.pool_file_k,
+      candidate_provenance_fields: [],
+      shuffle: "sha256-key-sort-v1",
+      seed: manifest.pool_seed,
+    },
+    adjudication: {
+      unit: manifest.adjudication.unit,
+      rubric: { ...manifest.adjudication.rubric },
+      rubric_sha256: judgmentRubricSha256(manifest),
+      allowed_inputs: [...manifest.adjudication.allowed_inputs],
+      prohibited_inputs: [...manifest.adjudication.prohibited_inputs],
+      required_attestation: {
+        ...manifest.adjudication.required_attestation,
+        corpus_revision: manifest.corpus_revision,
+        rubric_sha256: judgmentRubricSha256(manifest),
+      },
+      instruction: "Grade every candidate for its query using only the allowed inputs, then attest to that boundary in the qrels artifact.",
+    },
+    queries,
+  };
+  pool.pool_sha256 = poolPayloadSha256(pool);
+  return pool;
+}
+
+export function validatePoolArtifact(
+  manifest,
+  manifestSha256,
+  pool,
+  baselineReport,
+  baselineReportSha256,
+  treatmentReport,
+  treatmentReportSha256,
+) {
+  if (!isObject(pool) || pool.schema_version !== POOL_SCHEMA || pool.protocol_version !== 4) {
+    throw new Error("pool has the wrong schema or protocol");
+  }
+  requireSha256(pool.pool_sha256, "pool.pool_sha256");
+  if (pool.pool_sha256 !== poolPayloadSha256(pool)) {
+    throw new Error("pool SHA does not match its payload");
+  }
+  const expected = createPoolArtifact(
+    manifest,
+    manifestSha256,
+    baselineReport,
+    baselineReportSha256,
+    treatmentReport,
+    treatmentReportSha256,
+  );
+  if (!sameJson(pool, expected)) {
+    throw new Error("pool does not match the manifest and source reports");
+  }
+  for (const query of pool.queries) {
+    assertUniqueStrings(query.candidates, `${query.id}.candidates`);
+    for (const [index, file] of query.candidates.entries()) {
+      validateRelativePath(file, `${query.id}.candidates[${index}]`);
+      if (!KNOWN_FORMATS.has(formatForPath(file))) {
+        throw new Error(`${query.id}: pool candidate has unsupported format: ${file}`);
+      }
+    }
+  }
+  return pool;
+}
+
+export function validateQrels(manifest, manifestSha256, pool, qrels) {
+  if (!isObject(qrels) || qrels.schema_version !== QRELS_SCHEMA ||
+      qrels.protocol_version !== 4) {
+    throw new Error("qrels have the wrong schema or protocol");
+  }
+  if (qrels.manifest_sha256 !== manifestSha256 ||
+      qrels.query_manifest_sha256 !== queryManifestSha256(manifest) ||
+      qrels.pool_sha256 !== pool.pool_sha256) {
+    throw new Error("qrels hashes do not match the manifest and pool");
+  }
+  const attestation = qrels.adjudication_attestation;
+  if (!isObject(attestation)) {
+    throw new Error("qrels must contain an adjudication_attestation");
+  }
+  assertUniqueStrings(attestation.adjudicators, "adjudication_attestation.adjudicators");
+  const { adjudicators: _adjudicatorRequirement, ...expectedAttestation } =
+    pool.adjudication.required_attestation;
+  for (const [field, expected] of Object.entries(expectedAttestation)) {
+    if (attestation[field] !== expected) {
+      throw new Error(`adjudication attestation field ${field} must be ${JSON.stringify(expected)}`);
+    }
+  }
+  if (!Array.isArray(qrels.queries) || qrels.queries.length !== pool.queries.length) {
+    throw new Error("qrels must contain one entry for every pooled query");
+  }
+  for (const [index, poolQuery] of pool.queries.entries()) {
+    const entry = qrels.queries[index];
+    if (!isObject(entry) || entry.id !== poolQuery.id || !Array.isArray(entry.judgments)) {
+      throw new Error(`${poolQuery.id}: qrels query order or shape mismatch`);
+    }
+    const grades = new Map();
+    for (const [judgmentIndex, judgment] of entry.judgments.entries()) {
+      if (!isObject(judgment)) {
+        throw new Error(`${poolQuery.id}.judgments[${judgmentIndex}] must be an object`);
+      }
+      validateRelativePath(
+        judgment.path,
+        `${poolQuery.id}.judgments[${judgmentIndex}].path`,
+      );
+      if (grades.has(judgment.path)) {
+        throw new Error(`${poolQuery.id}: duplicate qrel for ${judgment.path}`);
+      }
+      if (!Number.isInteger(judgment.grade) || judgment.grade < 0 || judgment.grade > 3) {
+        throw new Error(`${poolQuery.id}: qrel grades must be integers from 0 through 3`);
+      }
+      requireString(judgment.reason, `${poolQuery.id}.${judgment.path}.reason`);
+      grades.set(judgment.path, judgment.grade);
+    }
+    const candidateSet = new Set(poolQuery.candidates);
+    if (grades.size !== candidateSet.size ||
+        [...grades.keys()].some((file) => !candidateSet.has(file))) {
+      throw new Error(`${poolQuery.id}: qrels must explicitly grade every pool candidate exactly once`);
+    }
+  }
+  return qrels;
+}
+
+export function normalizedDiscountedCumulativeGain(rankedFiles, gradeMap, k = 10) {
+  requirePositiveInteger(k, "k");
+  if (!(gradeMap instanceof Map)) throw new Error("gradeMap must be a Map");
+  const gain = (grade) => (2 ** grade) - 1;
+  const dcg = rankedFiles.slice(0, k).reduce((score, file, index) =>
+    score + gain(gradeMap.get(file) ?? 0) / Math.log2(index + 2), 0);
+  const ideal = [...gradeMap.values()]
+    .sort((left, right) => right - left)
+    .slice(0, k)
+    .reduce((score, grade, index) => score + gain(grade) / Math.log2(index + 2), 0);
+  if (ideal === 0) throw new Error("nDCG requires at least one positive qrel");
+  return dcg / ideal;
+}
+
+export function scoreBaselineFiltered(manifest, baselineReport) {
+  const runs = reportRunsByCohort(baselineReport, "filtered_parity");
+  const queries = manifest.filtered_parity_queries.map((query) => {
+    const run = runs.get(query.id);
+    if (!run) throw new Error(`missing baseline filtered run: ${query.id}`);
+    const ranked = deduplicateFiles(run.raw_hits, manifest.file_k);
+    return {
+      id: query.id,
+      query_form: query.query_form,
+      authored_positive_files: query.authored_positive_files,
+      ranked_files: ranked,
+      ...scoreKnownPositives(query.authored_positive_files, ranked),
+    };
+  });
+  return {
+    queries,
+    mean_known_positive_recall_at_10: mean(
+      queries.map((query) => query.known_positive_recall_at_10),
+    ),
+    mean_reciprocal_rank: mean(queries.map((query) => query.reciprocal_rank)),
+  };
+}
+
+export function scoreFilteredParity(manifest, baselineReport, treatmentReport) {
+  const baseline = scoreBaselineFiltered(manifest, baselineReport);
+  const baselineById = new Map(baseline.queries.map((query) => [query.id, query]));
+  const treatmentRuns = reportRunsByCohort(treatmentReport, "filtered_parity");
+  const queries = manifest.filtered_parity_queries.map((query) => {
+    const old = baselineById.get(query.id);
+    const run = treatmentRuns.get(query.id);
+    if (!old || !run) throw new Error(`missing filtered parity result: ${query.id}`);
+    const ranked = deduplicateFiles(run.raw_hits, manifest.file_k);
+    const current = scoreKnownPositives(query.authored_positive_files, ranked);
+    return {
+      id: query.id,
+      query_form: query.query_form,
+      authored_positive_files: query.authored_positive_files,
+      baseline_ranked_files: old.ranked_files,
+      ranked_files: ranked,
+      baseline_known_positive_recall_at_10: old.known_positive_recall_at_10,
+      known_positive_recall_at_10: current.known_positive_recall_at_10,
+      baseline_reciprocal_rank: old.reciprocal_rank,
+      reciprocal_rank: current.reciprocal_rank,
+      baseline_known_positive_ranks: old.known_positive_ranks,
+      known_positive_ranks: current.known_positive_ranks,
+    };
+  });
+  return {
+    label: "filtered_js_ts_parity",
+    queries,
+    baseline_mean_known_positive_recall_at_10: mean(
+      queries.map((query) => query.baseline_known_positive_recall_at_10),
+    ),
+    mean_known_positive_recall_at_10: mean(
+      queries.map((query) => query.known_positive_recall_at_10),
+    ),
+    baseline_mean_reciprocal_rank: mean(
+      queries.map((query) => query.baseline_reciprocal_rank),
+    ),
+    mean_reciprocal_rank: mean(queries.map((query) => query.reciprocal_rank)),
+  };
+}
+
+function representationForFiles(files) {
+  return files.reduce((counts, file) => {
+    const format = formatForPath(file);
+    counts[format] = (counts[format] ?? 0) + 1;
+    return counts;
+  }, {});
+}
+
+function scoreMixedArm(manifest, report, pool, qrels, arm) {
+  const runs = reportRunsByCohort(report, "mixed_relevance");
+  const poolById = new Map(pool.queries.map((query) => [query.id, query]));
+  const qrelsById = new Map(qrels.queries.map((query) => [query.id, query]));
+  const queries = manifest.mixed_relevance_queries.map((query) => {
+    const run = runs.get(query.id);
+    const poolQuery = poolById.get(query.id);
+    const qrelQuery = qrelsById.get(query.id);
+    if (!run || !poolQuery || !qrelQuery) {
+      throw new Error(`${query.id}: missing mixed treatment, pool, or qrels entry`);
+    }
+    const grades = new Map(qrelQuery.judgments.map((entry) => [entry.path, entry.grade]));
+    const ranked = deduplicateFiles(run.raw_hits, manifest.file_k);
+    const judgedCount = ranked.filter((file) => grades.has(file)).length;
+    const judgedAt10 = ranked.length === 0 ? 0 : judgedCount / ranked.length;
+    const known = scoreKnownPositives(query.authored_positive_files, ranked);
+    return {
+      id: query.id,
+      query_form: query.query_form,
+      authored_positive_files: query.authored_positive_files,
+      ranked_files: ranked,
+      ndcg_at_10: normalizedDiscountedCumulativeGain(
+        ranked,
+        grades,
+        manifest.file_k,
+      ),
+      known_positive_recall_at_10: known.known_positive_recall_at_10,
+      known_positive_ranks: known.known_positive_ranks,
+      judged_at_10: judgedAt10,
+      judged_files_at_10: judgedCount,
+      returned_files_at_10: ranked.length,
+      representation: representationForFiles(ranked),
+    };
+  });
+  const representation = queries.reduce((totals, query) => {
+    for (const [format, count] of Object.entries(query.representation)) {
+      totals[format] = (totals[format] ?? 0) + count;
+    }
+    return totals;
+  }, {});
+  return {
+    label: `mixed_unfiltered_${arm}`,
+    queries,
+    mean_ndcg_at_10: mean(queries.map((query) => query.ndcg_at_10)),
+    mean_known_positive_recall_at_10: mean(
+      queries.map((query) => query.known_positive_recall_at_10),
+    ),
+    mean_judged_at_10: mean(queries.map((query) => query.judged_at_10)),
+    all_queries_fully_judged_at_10: queries.every((query) => query.judged_at_10 === 1),
+    observed_format_counts: representation,
+    representation_note: "Descriptive only; protocol v4 applies no language quota or weight.",
+  };
+}
+
+export function scoreBaselineMixed(manifest, baselineReport, pool, qrels) {
+  return scoreMixedArm(manifest, baselineReport, pool, qrels, "baseline");
+}
+
+export function scoreTreatmentMixed(manifest, treatmentReport, pool, qrels) {
+  return scoreMixedArm(manifest, treatmentReport, pool, qrels, "treatment");
+}
+
+export function evaluateScoreGates(manifest, filtered, baselineMixed, treatmentMixed) {
+  const displaced = filtered.queries.flatMap((query) => {
+    const current = new Map(query.known_positive_ranks.map(({ file, rank }) => [file, rank]));
+    return query.baseline_known_positive_ranks
+      .filter(({ rank }) => rank !== null && rank <= 5)
+      .flatMap(({ file, rank }) => {
+        const treatmentRank = current.get(file);
+        return treatmentRank === null ||
+          treatmentRank > manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank
+          ? [{ id: query.id, file, baseline_rank: rank, treatment_rank: treatmentRank ?? null }]
+          : [];
+      });
+  });
+  const mrrDrop = filtered.baseline_mean_reciprocal_rank - filtered.mean_reciprocal_rank;
+  const mixedNdcgDrop = baselineMixed.mean_ndcg_at_10 - treatmentMixed.mean_ndcg_at_10;
+  const outcomes = [{
+    gate: "filtered_known_positive_recall_at_10_nondecrease",
+    baseline: filtered.baseline_mean_known_positive_recall_at_10,
+    actual: filtered.mean_known_positive_recall_at_10,
+    pass: filtered.mean_known_positive_recall_at_10 >=
+      filtered.baseline_mean_known_positive_recall_at_10,
+  }, {
+    gate: "filtered_mean_mrr_maximum_drop",
+    threshold: manifest.gates.filtered_mean_mrr_maximum_drop,
+    actual_drop: mrrDrop,
+    pass: mrrDrop <= manifest.gates.filtered_mean_mrr_maximum_drop,
+  }, {
+    gate: "filtered_baseline_top_five_positive_stays_within_bound",
+    threshold: manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank,
+    failures: displaced,
+    pass: displaced.length === 0,
+  }, {
+    gate: "mixed_treatment_mean_ndcg_at_10",
+    threshold: manifest.gates.mixed_treatment_mean_ndcg_at_10_minimum,
+    actual: treatmentMixed.mean_ndcg_at_10,
+    pass: treatmentMixed.mean_ndcg_at_10 >=
+      manifest.gates.mixed_treatment_mean_ndcg_at_10_minimum,
+  }, {
+    gate: "mixed_mean_ndcg_maximum_drop",
+    baseline: baselineMixed.mean_ndcg_at_10,
+    actual: treatmentMixed.mean_ndcg_at_10,
+    threshold: manifest.gates.mixed_mean_ndcg_maximum_drop,
+    actual_drop: mixedNdcgDrop,
+    pass: mixedNdcgDrop <= manifest.gates.mixed_mean_ndcg_maximum_drop,
+  }, {
+    gate: "mixed_judged_at_10_complete",
+    threshold: manifest.gates.mixed_judged_at_10_required,
+    actual: {
+      baseline: baselineMixed.mean_judged_at_10,
+      treatment: treatmentMixed.mean_judged_at_10,
+    },
+    pass: baselineMixed.all_queries_fully_judged_at_10 &&
+      treatmentMixed.all_queries_fully_judged_at_10 &&
+      baselineMixed.mean_judged_at_10 === manifest.gates.mixed_judged_at_10_required &&
+      treatmentMixed.mean_judged_at_10 === manifest.gates.mixed_judged_at_10_required,
+  }];
+  return {
+    decision: outcomes.every((outcome) => outcome.pass) ? "pass" : "fail",
+    outcomes,
+  };
+}
+
+function parseArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!flag?.startsWith("--") || value === undefined) {
+      throw new Error("arguments must be --name value pairs");
+    }
+    const name = flag.slice(2);
+    if (Object.hasOwn(options, name)) throw new Error(`duplicate argument --${name}`);
+    options[name] = value;
+  }
+  for (const required of ["mode", "manifest", "output"]) {
+    if (!options[required]) throw new Error(`--${required} is required`);
+  }
+  if (!new Set(["run", "pool", "score"]).has(options.mode)) {
+    throw new Error("--mode must be run, pool, or score");
+  }
+  if (options.mode === "run") {
+    for (const required of ["arm", "binary-repository", "corpus-repository", "database"]) {
+      if (!options[required]) throw new Error(`--${required} is required in run mode`);
+    }
+    if (!new Set(["baseline", "treatment"]).has(options.arm)) {
+      throw new Error("--arm must be baseline or treatment");
+    }
+  } else {
+    for (const required of ["baseline-report", "treatment-report"]) {
+      if (!options[required]) throw new Error(`--${required} is required in ${options.mode} mode`);
+    }
+    if (options.mode === "score") {
+      for (const required of ["pool", "qrels"]) {
+        if (!options[required]) throw new Error(`--${required} is required in score mode`);
+      }
+    }
+  }
+  return options;
+}
+
+function git(repository, args) {
+  return execFileSync("git", ["-C", repository, ...args], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  }).trim();
+}
+
+function assertCleanCheckout(repository, expectedRevision, label) {
+  const root = fs.realpathSync(repository);
+  const topLevel = fs.realpathSync(git(root, ["rev-parse", "--show-toplevel"]));
+  if (root !== topLevel) throw new Error(`${label} must name the checkout root`);
+  const revision = git(root, ["rev-parse", "HEAD"]);
+  if (revision !== expectedRevision) {
+    throw new Error(`${label} revision ${revision} does not match ${expectedRevision}`);
+  }
+  const dirty = git(root, ["status", "--porcelain", "--untracked-files=all"]);
+  if (dirty) throw new Error(`${label} must be clean before evaluation:\n${dirty}`);
+  return root;
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function canonicalizeProspectivePath(candidate) {
+  const absolute = path.resolve(candidate);
+  const suffix = [];
+  let existing = absolute;
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw new Error(`cannot resolve an existing ancestor for ${absolute}`);
+    }
+    suffix.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(fs.realpathSync(existing), ...suffix);
+}
+
+export function assertFreshExternalPath(candidate, repositories = []) {
+  const absolute = path.resolve(candidate);
+  const canonical = canonicalizeProspectivePath(absolute);
+  const canonicalRepositories = repositories.map((repository) => fs.realpathSync(repository));
+  if (canonicalRepositories.some((repository) => isInside(repository, canonical))) {
+    throw new Error(`evaluation artifact must be outside evaluated checkouts: ${absolute}`);
+  }
+  if (fs.existsSync(absolute)) throw new Error(`path already exists: ${absolute}`);
+  return absolute;
+}
+
+function run(binary, args, options = {}) {
+  const result = spawnSync(binary, args, {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+    env: options.env ?? process.env,
+    cwd: options.cwd,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `${path.basename(binary)} ${args[0]} failed (${result.status}): ${result.stderr.trim()}`,
+    );
+  }
+  return result;
+}
+
+function cleanProviderEnvironment() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("JSCOUT_EMBED_") || key.startsWith("JSCOUT_RERANK_")) delete env[key];
+  }
+  for (const key of ["OPENAI_API_KEY", "VOYAGE_API_KEY", "COHERE_API_KEY"]) delete env[key];
+  return env;
+}
+
+function validateSearchResponse(response, queryId, cohort, retrievalK) {
+  if (response.retrieval?.vector !== "disabled" ||
+      response.retrieval?.reranker !== "disabled") {
+    throw new Error(`${queryId}: search was not provider-free lexical`);
+  }
+  if (!Array.isArray(response.hits) || response.hits.length > retrievalK) {
+    throw new Error(`${queryId}: debug JSON did not expose a bounded raw hit list`);
+  }
+  requireString(response.snapshot, `${queryId}.snapshot`);
+  validateRawHitFormats(response.hits, cohort, queryId);
+}
+
+function loadManifest(file, runnerSha256) {
+  const absolute = path.resolve(file);
+  const bytes = fs.readFileSync(absolute);
+  const manifest = validateFrozenManifest(JSON.parse(bytes.toString("utf8")));
+  validateRunnerSha(manifest, runnerSha256);
+  validateSourceHoldout(manifest, absolute);
+  return {
+    path: absolute,
+    bytes,
+    sha256: sha256Bytes(bytes),
+    manifest,
+  };
+}
+
+function loadJsonWithSha(file, label) {
+  const absolute = path.resolve(file);
+  const stat = fs.statSync(absolute);
+  if (!stat.isFile()) throw new Error(`${label} must name a regular file`);
+  const bytes = fs.readFileSync(absolute);
+  return {
+    path: absolute,
+    sha256: sha256Bytes(bytes),
+    value: JSON.parse(bytes.toString("utf8")),
+  };
+}
+
+function writeNewJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+}
+
+function runArm(options, loaded, runnerPath, runnerSha256) {
+  const { manifest, sha256: manifestSha256 } = loaded;
+  const expectedRevision = options.arm === "baseline"
+    ? manifest.baseline_revision
+    : manifest.treatment_revision;
+  const binaryRepository = assertCleanCheckout(
+    options["binary-repository"],
+    expectedRevision,
+    "binary repository",
+  );
+  const corpusRepository = assertCleanCheckout(
+    options["corpus-repository"],
+    manifest.corpus_revision,
+    "corpus repository",
+  );
+  if (fs.existsSync(path.join(corpusRepository, ".jscout.toml"))) {
+    throw new Error("corpus-local .jscout.toml is not allowed by this provider-free protocol");
+  }
+  validateCorpusPaths(manifest, corpusRepository);
+  const database = assertFreshExternalPath(
+    options.database,
+    [binaryRepository, corpusRepository],
+  );
+  const output = assertFreshExternalPath(
+    options.output,
+    [binaryRepository, corpusRepository],
+  );
+  if (canonicalizeProspectivePath(database) === canonicalizeProspectivePath(output)) {
+    throw new Error("database and output paths must be distinct");
+  }
+  const env = cleanProviderEnvironment();
+  run("cargo", ["build", "--release", "--locked"], { env, cwd: binaryRepository });
+  const binary = path.join(
+    binaryRepository,
+    "target",
+    "release",
+    process.platform === "win32" ? "jscout.exe" : "jscout",
+  );
+  if (!fs.statSync(binary).isFile()) throw new Error(`release build did not produce ${binary}`);
+  fs.accessSync(binary, fs.constants.X_OK);
+  const version = run(binary, ["--version"], { env }).stdout.trim();
+  fs.mkdirSync(path.dirname(database), { recursive: true });
+  const started = process.hrtime.bigint();
+  const indexed = run(binary, [
+    "index",
+    corpusRepository,
+    "--database",
+    database,
+  ], { env });
+  const indexDurationMs = Number(process.hrtime.bigint() - started) / 1e6;
+  const queryRuns = [];
+  for (const { cohort, query } of queriesForArm(manifest, options.arm)) {
+    const result = run(binary, buildSearchArgs(
+      manifest,
+      options.arm,
+      cohort,
+      query,
+      corpusRepository,
+      database,
+    ), { env });
+    const response = JSON.parse(result.stdout);
+    validateSearchResponse(response, query.id, cohort, manifest.retrieval_k);
+    queryRuns.push({
+      id: query.id,
+      cohort,
+      query: query.query,
+      query_form: query.query_form,
+      raw_hits: response.hits,
+      retrieval: response.retrieval,
+      snapshot: response.snapshot,
+    });
+  }
+  const armSnapshot = validateArmSnapshot(queryRuns, `${options.arm} arm`);
+  assertCleanCheckout(binaryRepository, expectedRevision, "binary repository");
+  assertCleanCheckout(corpusRepository, manifest.corpus_revision, "corpus repository");
+  const report = {
+    schema_version: ARM_REPORT_SCHEMA,
+    protocol_version: 4,
+    arm: options.arm,
+    manifest: path.relative(process.cwd(), loaded.path),
+    manifest_sha256: manifestSha256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    runner: { path: runnerPath, sha256: runnerSha256 },
+    binary_source: {
+      repository: binaryRepository,
+      revision: expectedRevision,
+      binary,
+      sha256: sha256File(binary),
+      version,
+      build: "cargo build --release --locked",
+    },
+    corpus: {
+      repository: corpusRepository,
+      revision: manifest.corpus_revision,
+      shared_between_arms: true,
+    },
+    database,
+    database_bytes: fs.statSync(database).size,
+    index_duration_ms: indexDurationMs,
+    index_stdout: indexed.stdout.trim(),
+    index_stderr: indexed.stderr.trim(),
+    provider_free: true,
+    arm_snapshot: armSnapshot,
+    search_profiles: searchProfiles(manifest, options.arm),
+    query_runs: queryRuns,
+  };
+  writeNewJson(output, report);
+  process.stdout.write(`${JSON.stringify({
+    output,
+    arm: options.arm,
+    manifest_sha256: manifestSha256,
+    runner_sha256: runnerSha256,
+    binary_sha256: report.binary_source.sha256,
+    arm_snapshot: armSnapshot,
+  }, null, 2)}\n`);
+}
+
+function loadAndValidateArmReports(options, loaded, runnerSha256) {
+  const baseline = loadJsonWithSha(options["baseline-report"], "baseline report");
+  const treatment = loadJsonWithSha(options["treatment-report"], "treatment report");
+  validateArmReport(
+    loaded.manifest,
+    baseline.value,
+    loaded.sha256,
+    "baseline",
+    runnerSha256,
+  );
+  validateArmReport(
+    loaded.manifest,
+    treatment.value,
+    loaded.sha256,
+    "treatment",
+    runnerSha256,
+  );
+  if (fs.realpathSync(baseline.value.corpus.repository) !==
+      fs.realpathSync(treatment.value.corpus.repository)) {
+    throw new Error("baseline and treatment reports must index the same corpus checkout");
+  }
+  return { baseline, treatment };
+}
+
+function runPool(options, loaded, runnerSha256) {
+  const { baseline, treatment } = loadAndValidateArmReports(options, loaded, runnerSha256);
+  const output = assertFreshExternalPath(options.output, [
+    baseline.value.binary_source.repository,
+    treatment.value.binary_source.repository,
+    baseline.value.corpus.repository,
+    treatment.value.corpus.repository,
+  ]);
+  const pool = createPoolArtifact(
+    loaded.manifest,
+    loaded.sha256,
+    baseline.value,
+    baseline.sha256,
+    treatment.value,
+    treatment.sha256,
+  );
+  writeNewJson(output, pool);
+  process.stdout.write(`${JSON.stringify({
+    output,
+    pool_sha256: pool.pool_sha256,
+    query_count: pool.queries.length,
+    candidate_count: pool.queries.reduce((sum, query) => sum + query.candidates.length, 0),
+  }, null, 2)}\n`);
+}
+
+function runScore(options, loaded, runnerSha256) {
+  const { baseline, treatment } = loadAndValidateArmReports(options, loaded, runnerSha256);
+  const output = assertFreshExternalPath(options.output, [
+    baseline.value.binary_source.repository,
+    treatment.value.binary_source.repository,
+    baseline.value.corpus.repository,
+    treatment.value.corpus.repository,
+  ]);
+  const poolFile = loadJsonWithSha(options.pool, "pool");
+  const pool = validatePoolArtifact(
+    loaded.manifest,
+    loaded.sha256,
+    poolFile.value,
+    baseline.value,
+    baseline.sha256,
+    treatment.value,
+    treatment.sha256,
+  );
+  const qrelsFile = loadJsonWithSha(options.qrels, "qrels");
+  const qrels = validateQrels(loaded.manifest, loaded.sha256, pool, qrelsFile.value);
+  const filtered = scoreFilteredParity(loaded.manifest, baseline.value, treatment.value);
+  const baselineMixed = scoreBaselineMixed(loaded.manifest, baseline.value, pool, qrels);
+  const treatmentMixed = scoreTreatmentMixed(loaded.manifest, treatment.value, pool, qrels);
+  const gates = evaluateScoreGates(
+    loaded.manifest,
+    filtered,
+    baselineMixed,
+    treatmentMixed,
+  );
+  const report = {
+    schema_version: SCORE_REPORT_SCHEMA,
+    protocol_version: 4,
+    manifest_sha256: loaded.sha256,
+    query_manifest_sha256: queryManifestSha256(loaded.manifest),
+    runner_sha256: runnerSha256,
+    baseline_report_sha256: baseline.sha256,
+    treatment_report_sha256: treatment.sha256,
+    pool_file_sha256: poolFile.sha256,
+    pool_sha256: pool.pool_sha256,
+    qrels_file_sha256: qrelsFile.sha256,
+    metrics: {
+      filtered_parity: filtered,
+      mixed_relevance: { baseline: baselineMixed, treatment: treatmentMixed },
+    },
+    gates,
+  };
+  writeNewJson(output, report);
+  process.stdout.write(`${JSON.stringify({
+    output,
+    decision: gates.decision,
+    pool_sha256: pool.pool_sha256,
+    qrels_file_sha256: qrelsFile.sha256,
+    filtered_mean_recall_at_10: filtered.mean_known_positive_recall_at_10,
+    mixed_baseline_mean_ndcg_at_10: baselineMixed.mean_ndcg_at_10,
+    mixed_treatment_mean_ndcg_at_10: treatmentMixed.mean_ndcg_at_10,
+    mixed_treatment_mean_known_positive_recall_at_10:
+      treatmentMixed.mean_known_positive_recall_at_10,
+    mixed_treatment_mean_judged_at_10: treatmentMixed.mean_judged_at_10,
+  }, null, 2)}\n`);
+  if (gates.decision === "fail") process.exitCode = 1;
+}
+
+function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const runnerPath = fs.realpathSync(fileURLToPath(import.meta.url));
+  const runnerSha256 = sha256File(runnerPath);
+  const loaded = loadManifest(options.manifest, runnerSha256);
+  if (options.mode === "run") runArm(options, loaded, runnerPath, runnerSha256);
+  else if (options.mode === "pool") runPool(options, loaded, runnerSha256);
+  else runScore(options, loaded, runnerSha256);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main();
+}

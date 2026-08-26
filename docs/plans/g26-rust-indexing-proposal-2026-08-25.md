@@ -196,29 +196,57 @@ The committed suite must prove:
 8. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
    their input contains no Rust.
 
-Before evaluation results are run, prospectively commit a fresh protocol with
-two arms. Filtered parity compares the Rust-free baseline against the mixed
-index with `formats=['javascript','typescript']` on fresh JS/TS controls; file
-Recall@10 may not decrease, MRR may drop by at most 0.02, and baseline top-five
-gold remains top-ten. Mixed relevance searches the default combined corpus
-with formats omitted and uses blinded pooled cross-language relevance
-judgments. Its frozen gate is pooled-judgment mean nDCG@10 >= 0.70
-with gain `2^grade-1`; unjudged returned files score zero only for metric
-computation and are not declared irrelevant. Language representation is
-reported but not gated. Both arms retain 100 raw ranked
-chunks, deduplicate files by first occurrence, and truncate to 10 files. Every
-filtered-parity raw hit must be JavaScript or TypeScript. Each arm's query
-responses share one nonempty snapshot; the arms need not share a snapshot
-because their indexed memberships differ. Record wall time, peak RSS, indexed
-bytes, chunk count, database bytes, and parse
-diagnostics. Performance remains separate from retrieval acceptance.
+Before evaluation results are run, prospectively commit the v4 protocol with
+clean baseline and treatment arms. Filtered parity compares the Rust-free
+baseline against the mixed index with
+`formats=['javascript','typescript']` using the previously inspected v3 JS/TS
+cohort. That reused cohort is a regression guard, not fresh confirmatory
+evidence: file Recall@10 may not decrease, MRR may drop by at most 0.02, and
+baseline top-five gold remains top-ten. Mixed relevance uses a fresh
+source-only holdout, searches the default combined corpus with formats omitted,
+and uses blinded pooled cross-language judgments. Each query's pool unions the
+baseline and treatment top-ten files plus authored positive recall sentinels;
+every pooled query-file pair must receive an explicit `0`–`3` qrel. Baseline
+and treatment nDCG@10 use the same complete pool with gain `2^grade-1`.
+Treatment mean nDCG@10 must be at least `0.70` and may trail baseline by no
+more than `0.02`. Missing qrels invalidate v4 scoring rather than receiving
+zero gain. Language representation and known-positive Recall@10 are reported
+but not gated. Both arms retain 100 raw ranked chunks, deduplicate files by
+first occurrence, and truncate to 10 files. Every filtered-parity raw hit must
+be JavaScript or TypeScript. Each arm's query responses share one nonempty
+snapshot; the arms need not share a snapshot because their indexed memberships
+differ. V4 arm reports record indexing duration, database bytes, index
+stdout/stderr diagnostics, and raw query results. Performance remains separate
+from retrieval acceptance.
 
 The first treatment formally failed that frozen gate because relevant new Rust
 files displaced a legacy JS/TS gold file in the shared ranking. Projecting the
 same inspected result to JS/TS paths stayed within the old thresholds, but that
-post-hoc projection is diagnostic only. This phase remains unaccepted pending
-a prospectively frozen replacement control and fresh holdout queries; the
-preserved failure report is the governing evidence until then.
+post-hoc projection is diagnostic only. At that point, phase 1 remained
+unaccepted pending a prospectively frozen replacement control and fresh
+holdout queries; the preserved failure report was the governing evidence.
+
+The v3 replacement's filtered regression arm passed: Recall@10 stayed
+`1.0000`, mean MRR moved from `0.8833` to `0.8854`, and no baseline top-five
+gold file left the top ten. The mixed arm formally failed at `0.5084` against
+the frozen `0.70` nDCG gate. Its qrels were not actually a retrieval pool—only
+68 of 240 returned top-ten slots had judgments, every judgment was positive,
+and unjudged direct tests were scored zero—so the score cannot choose a storage
+or fusion design.
+Real authored positives were also missed, so the failure remains preserved and
+cannot be regraded after inspection.
+
+Before changing retrieval, run one unchanged-treatment v4 replacement. Reuse
+the previously inspected v3 JS/TS filtered cohort only as a regression guard,
+and use a fresh source-only mixed holdout. Union both systems' top-ten files and
+the authored positives, remove arm/rank/score information, grade every pair
+`0`–`3`, freeze the qrels, and only then score both arms against that same
+pool. Treatment mean nDCG@10 must reach `0.70`, may drop by at most `0.02` from
+baseline, and both arms require full judgment coverage at ten. A repeated
+failure advances named Rust item chunks as phase 2a with exact tiers still
+disabled. Do not append lexical aliases to phase-1 lossless chunks; any alias
+experiment belongs on the item-local projection. Separate FTS statistics and
+language quotas remain unearned.
 
 ### Later vector enablement
 
