@@ -3550,10 +3550,15 @@ two fresh arms. Filtered parity compares a Rust-free baseline with the mixed
 index searched using `formats=['javascript','typescript']`; JS/TS Recall@10
 does not decrease, MRR drops by no more than 0.02, and baseline top-five gold
 stays top-ten. Mixed relevance searches with formats omitted and uses blinded,
-cross-language relevance judgments plus nDCG@10; language representation is
-observational unless a product quota is explicitly adopted. Both arms retain
+cross-language relevance judgments; its frozen gate is pooled-judgment mean
+nDCG@10 >= 0.70 with gain `2^grade-1`. Unjudged returned files
+score zero only for metric computation and are not declared irrelevant.
+Language representation is reported but not gated. Both arms retain
 100 raw ranked chunks, deduplicate files by first occurrence, and truncate to
-10. Self-index timing, database size, chunk counts, parse diagnostics, and
+10. Every filtered-parity raw hit must be JavaScript or TypeScript. Each arm's
+query responses share one nonempty snapshot; the two arms need not share a
+snapshot because their indexed memberships differ. Self-index timing, database
+size, chunk counts, parse diagnostics, and
 query results land in `eval/results/`. Phase 2
 and 3 remain blocked until their own preregistered
 collision and edge-correctness protocols are committed. The detail document

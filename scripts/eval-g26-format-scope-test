@@ -1,0 +1,452 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  buildSearchArgs,
+  deduplicateFiles,
+  evaluateTreatmentGates,
+  normalizedDiscountedCumulativeGain,
+  queriesForArm,
+  queryManifestSha256,
+  scoreBaselineFiltered,
+  scoreFilteredParity,
+  scoreMixedRelevance,
+  validateArmSnapshot,
+  validateBaselineReport,
+  validateCorpusPaths,
+  validateManifest,
+} from "./eval-g26-format-scope";
+
+const BASELINE_REVISION = "444540e3a29b68bfd5adc42bc4df99b5c5a92386";
+const TREATMENT_REVISION = "10e1cd54e052fd5cc4ab81b7483c4d14f6f8621f";
+const RUNNER_SHA256 = "f".repeat(64);
+
+function frozenManifest() {
+  return JSON.parse(fs.readFileSync(
+    path.resolve("eval/prereg/g26-format-scope-2026-08-26.json"),
+    "utf8",
+  ));
+}
+
+function filteredQuery(index, form = index < 12 ? "exact_identifier" : "lowercase_multi_token_prose") {
+  const suffix = String(index + 1);
+  return {
+    id: `filtered-${suffix}`,
+    query: form === "exact_identifier" ? `ExactIdentifier${suffix}` : `filtered prose query number ${suffix}`,
+    query_form: form,
+    search_scope: { formats: ["javascript", "typescript"] },
+    gold_files: [`src/filtered-${suffix}.ts`],
+    judgments: [{
+      path: `src/filtered-${suffix}.ts`,
+      grade: 3,
+      reason: `Direct filtered implementation ${suffix}.`,
+    }],
+    rationale: `Filtered source-authored rationale ${suffix}.`,
+  };
+}
+
+function mixedQuery(index) {
+  const suffix = String(index + 1);
+  return {
+    id: `mixed-${suffix}`,
+    query: `mixed relevance query number ${suffix}`,
+    query_form: "lowercase_multi_token_prose",
+    search_scope: {
+      mode: "unfiltered",
+      expected_formats: ["javascript", "rust"],
+    },
+    gold_files: [`src/mixed-${suffix}.mjs`, `src/mixed-${suffix}.rs`],
+    judgments: [{
+      path: `src/mixed-${suffix}.mjs`,
+      grade: 3,
+      reason: `Direct JavaScript participant ${suffix}.`,
+    }, {
+      path: `src/mixed-${suffix}.rs`,
+      grade: 3,
+      reason: `Direct Rust participant ${suffix}.`,
+    }],
+    rationale: `Mixed source-authored rationale ${suffix}.`,
+  };
+}
+
+function fixtureManifest() {
+  const manifest = {
+    protocol_version: 3,
+    baseline_revision: BASELINE_REVISION,
+    treatment_revision: TREATMENT_REVISION,
+    corpus_revision: TREATMENT_REVISION,
+    retrieval_k: 100,
+    file_k: 10,
+    metric_policy: {
+      filtered_parity: "test",
+      mixed_relevance: "pooled judgment; unjudged files are not declared irrelevant",
+      language_representation: "observe only and never enforce a language quota",
+    },
+    gates: {
+      filtered_recall_at_10_must_not_decrease: true,
+      filtered_mean_mrr_maximum_drop: 0.02,
+      filtered_baseline_top_five_gold_may_not_fall_below_rank: 10,
+      mixed_pooled_judgment_mean_ndcg_at_10_minimum: 0.70,
+    },
+    source_holdout: {
+      source_sha256: "e4b66dddc243fd870c7d7387c0eab2127cfd11f9de01d8ccb8b5de852f3cb5a4",
+      copied_query_payload_sha256: "pending",
+      authoring_constraints: {
+        prospective: true,
+        ranked_outputs_inspected: false,
+        jscout_search_run: false,
+        existing_g26_manifests_inspected: false,
+        existing_eval_results_inspected: false,
+        source_only_authoring: true,
+      },
+    },
+    filtered_parity_queries: Array.from({ length: 24 }, (_, index) => filteredQuery(index)),
+    mixed_relevance_queries: Array.from({ length: 24 }, (_, index) => mixedQuery(index)),
+  };
+  manifest.source_holdout.copied_query_payload_sha256 = queryManifestSha256(manifest);
+  return manifest;
+}
+
+function rawRun(query, files, cohort) {
+  return {
+    id: query.id,
+    cohort,
+    query: query.query,
+    query_form: query.query_form,
+    raw_hits: files.map((file, index) => ({ file, chunk_id: index + 1 })),
+    snapshot: "snapshot-one",
+  };
+}
+
+function perfectFilteredRuns(manifest) {
+  return manifest.filtered_parity_queries.map((query) =>
+    rawRun(query, [query.gold_files[0]], "filtered_parity"));
+}
+
+function perfectMixedRuns(manifest) {
+  return manifest.mixed_relevance_queries.map((query) =>
+    rawRun(query, query.gold_files, "mixed_relevance"));
+}
+
+function baselineReport(manifest, manifestSha256 = "d".repeat(64)) {
+  const queryRuns = perfectFilteredRuns(manifest);
+  for (const run of queryRuns) {
+    run.retrieval = { vector: "disabled", reranker: "disabled" };
+  }
+  return {
+    schema_version: "g26-format-scope-report-1",
+    protocol_version: 3,
+    arm: "baseline",
+    manifest_sha256: manifestSha256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    runner: {
+      path: path.resolve("scripts/eval-g26-format-scope"),
+      sha256: RUNNER_SHA256,
+    },
+    binary_source: {
+      revision: manifest.baseline_revision,
+      sha256: "e".repeat(64),
+    },
+    corpus: { repository: process.cwd(), revision: manifest.corpus_revision },
+    arm_snapshot: "snapshot-one",
+    provider_free: true,
+    search_profiles: {
+      filtered_parity: {
+        formats: "omitted_for_baseline_binary_compatibility",
+        origins: ["repository", "workspace"],
+        retrieval_k: 100,
+        lexical_only: true,
+        memory: false,
+        expansion: false,
+      },
+      mixed_relevance: null,
+    },
+    query_runs: queryRuns,
+    metrics: {
+      filtered_parity: scoreBaselineFiltered(manifest, queryRuns),
+      mixed_relevance: null,
+    },
+  };
+}
+
+test("the frozen manifest validates and preserves all judged corpus paths", () => {
+  const manifest = validateManifest(frozenManifest());
+  assert.equal(manifest.filtered_parity_queries.length, 24);
+  assert.equal(manifest.mixed_relevance_queries.length, 24);
+  validateCorpusPaths(manifest, process.cwd());
+});
+
+test("manifest validation pins counts, forms, and grade-2/3 gold consistency", () => {
+  const manifest = frozenManifest();
+  validateManifest(manifest);
+
+  const badCount = structuredClone(manifest);
+  badCount.mixed_relevance_queries.pop();
+  assert.throws(() => validateManifest(badCount), /exactly 24/);
+
+  const badForm = structuredClone(manifest);
+  badForm.filtered_parity_queries[0].query_form = "lowercase_multi_token_prose";
+  assert.throws(() => validateManifest(badForm), /prose queries/);
+
+  const badGold = structuredClone(manifest);
+  badGold.mixed_relevance_queries[0].gold_files.pop();
+  assert.throws(() => validateManifest(badGold), /grade-2\/3/);
+});
+
+test("manifest validation freezes the copied source-authored query payload digest", () => {
+  const changed = frozenManifest();
+  changed.filtered_parity_queries[0].rationale += " changed";
+  assert.throws(() => validateManifest(changed), /frozen source-authored payload/);
+
+  changed.source_holdout.copied_query_payload_sha256 = queryManifestSha256(changed);
+  assert.throws(() => validateManifest(changed), /source holdout provenance/);
+});
+
+test("file ranking deduplicates by the first raw chunk position before file k", () => {
+  assert.deepEqual(deduplicateFiles([
+    { file: "a.rs", chunk_id: 1 },
+    { file: "a.rs", chunk_id: 2 },
+    { file: "b.ts", chunk_id: 3 },
+    { file: "c.mjs", chunk_id: 4 },
+  ], 2), ["a.rs", "b.ts"]);
+});
+
+test("filtered parity rejects every Rust raw hit in baseline and treatment", () => {
+  const manifest = fixtureManifest();
+  const baselineRuns = perfectFilteredRuns(manifest);
+  baselineRuns[0].raw_hits.push({ file: "src/leaked.rs", chunk_id: 2 });
+  assert.throws(
+    () => scoreBaselineFiltered(manifest, baselineRuns),
+    /not JavaScript\/TypeScript.*leaked\.rs/,
+  );
+
+  const report = baselineReport(manifest);
+  const treatmentRuns = perfectFilteredRuns(manifest);
+  treatmentRuns[0].raw_hits.push({ file: "src/leaked.rs", chunk_id: 2 });
+  assert.throws(
+    () => scoreFilteredParity(
+      manifest,
+      report.metrics.filtered_parity,
+      treatmentRuns,
+    ),
+    /not JavaScript\/TypeScript.*leaked\.rs/,
+  );
+});
+
+test("mixed retrieval accepts registered code formats and rejects other raw hits", () => {
+  const manifest = fixtureManifest();
+  const mixedRuns = perfectMixedRuns(manifest);
+  mixedRuns[0].raw_hits.push({ file: "src/support.ts", chunk_id: 3 });
+  scoreMixedRelevance(manifest, mixedRuns);
+
+  mixedRuns[0].raw_hits.push({ file: "README.md", chunk_id: 4 });
+  assert.throws(
+    () => scoreMixedRelevance(manifest, mixedRuns),
+    /unregistered code format.*README\.md/,
+  );
+});
+
+test("an arm requires one nonempty snapshot across every query response", () => {
+  const runs = perfectFilteredRuns(fixtureManifest());
+  assert.equal(validateArmSnapshot(runs, "test arm"), "snapshot-one");
+
+  const changed = structuredClone(runs);
+  changed[1].snapshot = "snapshot-two";
+  assert.throws(
+    () => validateArmSnapshot(changed, "test arm"),
+    /same snapshot/,
+  );
+
+  const empty = structuredClone(runs);
+  empty[0].snapshot = "";
+  assert.throws(
+    () => validateArmSnapshot(empty, "test arm"),
+    /non-empty trimmed string/,
+  );
+});
+
+test("graded nDCG uses exponential gain and zero only operationally for unjudged files", () => {
+  const judgments = [
+    { path: "best.rs", grade: 3 },
+    { path: "second.mjs", grade: 2 },
+    { path: "context.ts", grade: 1 },
+  ];
+  assert.equal(
+    normalizedDiscountedCumulativeGain(
+      ["best.rs", "second.mjs", "context.ts"],
+      judgments,
+      10,
+    ),
+    1,
+  );
+  const withUnjudged = normalizedDiscountedCumulativeGain(
+    ["unknown.rs", "best.rs", "second.mjs"],
+    judgments,
+    10,
+  );
+  assert.ok(withUnjudged > 0 && withUnjudged < 1);
+});
+
+test("baseline and treatment construct the frozen query scopes", () => {
+  const manifest = fixtureManifest();
+  assert.equal(queriesForArm(manifest, "baseline").length, 24);
+  assert.equal(queriesForArm(manifest, "treatment").length, 48);
+
+  const filtered = manifest.filtered_parity_queries[0];
+  const mixed = manifest.mixed_relevance_queries[0];
+  const baselineArgs = buildSearchArgs(
+    manifest,
+    "baseline",
+    "filtered_parity",
+    filtered,
+    "/corpus",
+    "/tmp/index.db",
+  );
+  const treatmentFilteredArgs = buildSearchArgs(
+    manifest,
+    "treatment",
+    "filtered_parity",
+    filtered,
+    "/corpus",
+    "/tmp/index.db",
+  );
+  const treatmentMixedArgs = buildSearchArgs(
+    manifest,
+    "treatment",
+    "mixed_relevance",
+    mixed,
+    "/corpus",
+    "/tmp/index.db",
+  );
+  assert.equal(baselineArgs.includes("--format"), false);
+  assert.deepEqual(
+    treatmentFilteredArgs.slice(-4),
+    ["--format", "javascript", "--format", "typescript"],
+  );
+  assert.equal(treatmentMixedArgs.includes("--format"), false);
+  for (const args of [baselineArgs, treatmentFilteredArgs, treatmentMixedArgs]) {
+    assert.ok(args.includes("--lexical-only"));
+    assert.ok(args.includes("--no-memory"));
+    assert.ok(args.includes("--no-expand"));
+    assert.ok(args.includes("--debug-json"));
+    assert.equal(args[args.indexOf("--limit") + 1], "100");
+    assert.equal(args[args.indexOf("--origin") + 1], "repository,workspace");
+  }
+});
+
+test("baseline report validation binds manifest, revisions, raw runs, and metrics", () => {
+  const manifest = fixtureManifest();
+  const manifestSha256 = "d".repeat(64);
+  const report = baselineReport(manifest, manifestSha256);
+  const metrics = validateBaselineReport(
+    manifest,
+    report,
+    manifestSha256,
+    fs.realpathSync(process.cwd()),
+    RUNNER_SHA256,
+  );
+  assert.equal(metrics.mean_recall_at_10, 1);
+
+  assert.throws(
+    () => validateBaselineReport(
+      manifest,
+      report,
+      manifestSha256,
+      fs.realpathSync("/tmp"),
+      RUNNER_SHA256,
+    ),
+    /same corpus checkout/,
+  );
+
+  const wrongManifest = structuredClone(report);
+  wrongManifest.manifest_sha256 = "f".repeat(64);
+  assert.throws(
+    () => validateBaselineReport(manifest, wrongManifest, manifestSha256),
+    /frozen manifest/,
+  );
+
+  const wrongRunner = structuredClone(report);
+  wrongRunner.runner.sha256 = "a".repeat(64);
+  assert.throws(
+    () => validateBaselineReport(
+      manifest,
+      wrongRunner,
+      manifestSha256,
+      null,
+      RUNNER_SHA256,
+    ),
+    /current runner bytes/,
+  );
+
+  const changedSnapshot = structuredClone(report);
+  changedSnapshot.query_runs[1].snapshot = "snapshot-two";
+  assert.throws(
+    () => validateBaselineReport(manifest, changedSnapshot, manifestSha256),
+    /same snapshot/,
+  );
+
+  const wrongArmSnapshot = structuredClone(report);
+  wrongArmSnapshot.arm_snapshot = "snapshot-two";
+  assert.throws(
+    () => validateBaselineReport(manifest, wrongArmSnapshot, manifestSha256),
+    /arm_snapshot/,
+  );
+
+  const tamperedMetrics = structuredClone(report);
+  tamperedMetrics.metrics.filtered_parity.mean_recall_at_10 = 0;
+  assert.throws(
+    () => validateBaselineReport(manifest, tamperedMetrics, manifestSha256),
+    /metrics do not match/,
+  );
+});
+
+test("all four treatment gates pass for parity and perfect mixed rankings", () => {
+  const manifest = fixtureManifest();
+  const report = baselineReport(manifest);
+  const filtered = scoreFilteredParity(
+    manifest,
+    report.metrics.filtered_parity,
+    perfectFilteredRuns(manifest),
+  );
+  const mixed = scoreMixedRelevance(manifest, perfectMixedRuns(manifest));
+  const gates = evaluateTreatmentGates(manifest, filtered, mixed);
+  assert.equal(gates.decision, "pass");
+  assert.equal(gates.outcomes.length, 4);
+  assert.equal(mixed.mean_pooled_judgment_ndcg_at_10, 1);
+  assert.deepEqual(mixed.observed_format_counts, { javascript: 24, rust: 24 });
+});
+
+test("MRR, top-five preservation, and mixed nDCG failures are independently visible", () => {
+  const manifest = fixtureManifest();
+  const report = baselineReport(manifest);
+  const degradedFilteredRuns = perfectFilteredRuns(manifest);
+  degradedFilteredRuns[0] = rawRun(
+    manifest.filtered_parity_queries[0],
+    Array.from({ length: 10 }, (_, index) => `noise-${index}.ts`),
+    "filtered_parity",
+  );
+  const filtered = scoreFilteredParity(
+    manifest,
+    report.metrics.filtered_parity,
+    degradedFilteredRuns,
+  );
+  const degradedMixedRuns = manifest.mixed_relevance_queries.map((query) =>
+    rawRun(
+      query,
+      Array.from({ length: 10 }, (_, index) => `unjudged-${query.id}-${index}.rs`),
+      "mixed_relevance",
+    ));
+  const mixed = scoreMixedRelevance(manifest, degradedMixedRuns);
+  const gates = evaluateTreatmentGates(manifest, filtered, mixed);
+  assert.equal(gates.decision, "fail");
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "filtered_recall_at_10_nondecrease" && !outcome.pass));
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "filtered_mean_mrr_maximum_drop" && !outcome.pass));
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "filtered_baseline_top_five_gold_stays_top_ten" && !outcome.pass));
+  assert.ok(gates.outcomes.some((outcome) =>
+    outcome.gate === "mixed_pooled_judgment_mean_ndcg_at_10" && !outcome.pass));
+});
