@@ -28,7 +28,14 @@ const RESPONSE_BYTES = 1_048_576;
 const CUTOFFS = [1, 3, 5, 10];
 const PROFILE_NAMES = new Set(["lexical", "fallback", "hybrid", "hybrid-rerank"]);
 const PHASE2_PROFILES = ["lexical", "fallback", "hybrid", "hybrid-rerank"];
+const PHASE3_PROFILES = ["lexical", "hybrid", "hybrid-rerank"];
 const PROVIDER_FREE_PROFILES = ["lexical", "fallback"];
+const FRESHNESS_TREATMENTS = [
+  { id: "disabled", enabled: false, bound: 1 },
+  { id: "bound-1", enabled: true, bound: 1 },
+  { id: "bound-2", enabled: true, bound: 2 },
+  { id: "bound-3", enabled: true, bound: 3 },
+];
 const EMBEDDING_MODEL = "BAAI/bge-m3";
 const EMBEDDING_REVISION = "5617a9f61b028005a4858fdac845db406aefb181";
 const RERANKER_MODEL = "BAAI/bge-reranker-v2-m3";
@@ -42,10 +49,12 @@ Usage:
 Options:
   --binary PATH             jscout binary (default: target/release/jscout)
   --manifest PATH           fixed corpus manifest
-  --run-kind NAME           provider-free-check (default) or phase2-baseline
+  --run-kind NAME           provider-free-check (default), phase2-baseline,
+                            or phase3-candidate
   --profiles LIST           comma-separated lexical,fallback,hybrid,hybrid-rerank
                             (default: lexical,fallback; hybrid arms require --provider-config)
   --provider-config PATH    explicit config used only for docs embed/vector/rerank arms
+  --phase2-report PATH      frozen Phase 2 JSON report (required for phase3-candidate)
   --pass-env LIST           comma-separated secret variable names copied to provider calls
   --workdir PATH            empty/nonexistent isolated workspace to use
   --keep-workdir            retain the generated repositories and databases
@@ -81,6 +90,7 @@ export function parseArguments(argv) {
       "--run-kind": "runKind",
       "--profiles": "profiles",
       "--provider-config": "providerConfig",
+      "--phase2-report": "phase2Report",
       "--pass-env": "passEnv",
       "--workdir": "workdir",
     }[argument];
@@ -94,6 +104,7 @@ export function parseArguments(argv) {
   options.manifest = resolve(options.manifest);
   options.output = resolve(options.output);
   options.providerConfig = options.providerConfig ? resolve(options.providerConfig) : null;
+  options.phase2Report = options.phase2Report ? resolve(options.phase2Report) : null;
   options.workdir = options.workdir ? resolve(options.workdir) : null;
   options.profiles = Array.isArray(options.profiles)
     ? options.profiles
@@ -111,13 +122,23 @@ export function parseArguments(argv) {
   if (options.profiles.some((profile) => profile.startsWith("hybrid")) && !options.providerConfig) {
     throw new Error("hybrid profiles require --provider-config");
   }
-  if (!new Set(["provider-free-check", "phase2-baseline"]).has(options.runKind)) {
+  if (!new Set(["provider-free-check", "phase2-baseline", "phase3-candidate"]).has(options.runKind)) {
     throw new Error(`unknown --run-kind: ${options.runKind}`);
   }
-  const requiredProfiles = options.runKind === "phase2-baseline" ? PHASE2_PROFILES : PROVIDER_FREE_PROFILES;
+  const requiredProfiles = options.runKind === "phase2-baseline"
+    ? PHASE2_PROFILES
+    : options.runKind === "phase3-candidate"
+      ? PHASE3_PROFILES
+      : PROVIDER_FREE_PROFILES;
   if (options.profiles.length !== requiredProfiles.length
       || requiredProfiles.some((profile) => !options.profiles.includes(profile))) {
     throw new Error(`${options.runKind} requires exactly: ${requiredProfiles.join(",")}`);
+  }
+  if (options.runKind === "phase3-candidate" && !options.phase2Report) {
+    throw new Error("phase3-candidate requires --phase2-report");
+  }
+  if (options.runKind !== "phase3-candidate" && options.phase2Report) {
+    throw new Error("--phase2-report is only valid with --run-kind phase3-candidate");
   }
   for (const name of options.passEnv) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid environment name: ${name}`);
@@ -206,6 +227,25 @@ function assertString(value, label) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty string`);
 }
 
+function parseExplicitRfc3339(value, label) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!match) throw new Error(`${label} must be RFC3339 with an explicit timezone`);
+  const [, year, month, day, hour, minute, second, , zone, , offsetHour, offsetMinute] = match;
+  const numeric = [year, month, day, hour, minute, second, offsetHour ?? "0", offsetMinute ?? "0"]
+    .map(Number);
+  const [yearValue, monthValue, dayValue, hourValue, minuteValue, secondValue, offsetHourValue, offsetMinuteValue]
+    = numeric;
+  const daysInMonth = new Date(Date.UTC(yearValue, monthValue, 0)).getUTCDate();
+  if (monthValue < 1 || monthValue > 12 || dayValue < 1 || dayValue > daysInMonth
+      || hourValue > 23 || minuteValue > 59 || secondValue > 59
+      || (zone !== "Z" && (offsetHourValue > 23 || offsetMinuteValue > 59))) {
+    throw new Error(`${label} is not a valid RFC3339 timestamp`);
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error(`${label} is not a valid RFC3339 timestamp`);
+  return timestamp;
+}
+
 function validateQrels(values, label) {
   if (!Array.isArray(values) || values.length === 0) throw new Error(`${label} must be a non-empty array`);
   const ids = new Set();
@@ -229,14 +269,7 @@ export function validateManifest(manifest, manifestPath = "manifest") {
   let previousCommitTime = Number.NEGATIVE_INFINITY;
   for (const [index, commit] of manifest.commits.entries()) {
     for (const key of ["id", "date", "message"]) assertString(commit[key], `commits[${index}].${key}`);
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(commit.date)) {
-      throw new Error(`commits[${index}].date must use YYYY-MM-DDTHH:mm:ssZ`);
-    }
-    const commitTime = Date.parse(commit.date);
-    if (!Number.isFinite(commitTime)
-        || new Date(commitTime).toISOString() !== commit.date.replace(/Z$/, ".000Z")) {
-      throw new Error(`commits[${index}].date is not a valid UTC timestamp`);
-    }
+    const commitTime = parseExplicitRfc3339(commit.date, `commits[${index}].date`);
     if (commitTime <= previousCommitTime) {
       throw new Error(`commits[${index}].date must be later than the preceding commit`);
     }
@@ -553,9 +586,305 @@ export function compareProfiles(runs, baselineProfile, candidateProfile) {
   };
 }
 
+function runKey(run) {
+  return `${run.variant}\0${run.query.id}`;
+}
+
+function identities(hits) {
+  return hits.map(hitIdentity);
+}
+
+function identityDeltaAt(baselineHits, candidateHits, cutoff) {
+  const baseline = new Set(identities(baselineHits.slice(0, cutoff)));
+  const candidate = new Set(identities(candidateHits.slice(0, cutoff)));
+  return {
+    entrants: [...candidate].filter((identity) => !baseline.has(identity)).toSorted(),
+    exits: [...baseline].filter((identity) => !candidate.has(identity)).toSorted(),
+  };
+}
+
+function gitObservedCrossings(hits) {
+  const gitFamily = new Set(["git", "working_tree"]);
+  let crossings = 0;
+  for (let left = 0; left < hits.length; left += 1) {
+    for (let right = left + 1; right < hits.length; right += 1) {
+      const first = hits[left];
+      const second = hits[right];
+      if (first.base_rank < second.base_rank) continue;
+      if ((gitFamily.has(first.freshness_basis) && second.freshness_basis === "observed")
+          || (first.freshness_basis === "observed" && gitFamily.has(second.freshness_basis))) {
+        crossings += 1;
+      }
+    }
+  }
+  return crossings;
+}
+
+function movementSummary(runs) {
+  const movements = runs.flatMap((run) => run.hits.map((hit) => hit.movement));
+  const histogram = {};
+  for (const movement of movements) histogram[String(movement)] = (histogram[String(movement)] ?? 0) + 1;
+  return {
+    maximum_absolute_movement: movements.length === 0 ? 0 : Math.max(...movements.map(Math.abs)),
+    movement_histogram: Object.fromEntries(
+      Object.entries(histogram).toSorted(([left], [right]) => Number(left) - Number(right)),
+    ),
+  };
+}
+
+export function compareFreshnessTreatments(runs, profile, treatment) {
+  const baselineRuns = runs.filter((run) => run.profile === profile && run.treatment === "disabled");
+  const candidateRuns = runs.filter((run) => run.profile === profile && run.treatment === treatment);
+  const baseline = new Map(baselineRuns.map((run) => [runKey(run), run]));
+  if (baseline.size !== baselineRuns.length || candidateRuns.length !== baselineRuns.length) {
+    throw new Error(`${profile}/${treatment}: freshness treatment does not pair one-to-one with disabled runs`);
+  }
+  const details = candidateRuns.map((candidate) => {
+    const original = baseline.get(runKey(candidate));
+    if (!original) throw new Error(`missing disabled freshness pair for ${candidate.variant}/${candidate.query.id}`);
+    const originalIdentities = identities(original.hits);
+    const candidateIdentities = identities(candidate.hits);
+    const topK = Object.fromEntries(CUTOFFS.map((cutoff) => [
+      cutoff,
+      identityDeltaAt(original.hits, candidate.hits, cutoff),
+    ]));
+    const candidateBaseMatches = candidate.hits.every((hit) => (
+      hit.base_rank > original.hits.length
+      || hitIdentity(hit) === hitIdentity(original.hits[hit.base_rank - 1])
+    ));
+    return {
+      variant: candidate.variant,
+      query_id: candidate.query.id,
+      exact_order: JSON.stringify(originalIdentities) === JSON.stringify(candidateIdentities),
+      top_k: topK,
+      candidate_base_matches_disabled: candidateBaseMatches,
+      current_recall_delta: Object.fromEntries(
+        CUTOFFS.map((cutoff) => [cutoff, candidate.score.current_recall[cutoff] - original.score.current_recall[cutoff]]),
+      ),
+      current_rank_delta:
+        original.score.current_rank === null || candidate.score.current_rank === null
+          ? null
+          : candidate.score.current_rank - original.score.current_rank,
+      conflict_changed_to_current_first:
+        original.score.current_ahead_of_older === false && candidate.score.current_ahead_of_older === true,
+      conflict_reversed_to_obsolete_first:
+        original.score.current_ahead_of_older === true && candidate.score.current_ahead_of_older === false,
+      comparable_conflict_pair: comparableConflictPair(candidate),
+    };
+  });
+  const movement = movementSummary(candidateRuns);
+  const candidateHits = candidateRuns.flatMap((run) => run.hits);
+  const configuredBound = Number(treatment.replace("bound-", ""));
+  return {
+    profile,
+    baseline_treatment: "disabled",
+    candidate_treatment: treatment,
+    pairs: details.length,
+    changed_orders: details.filter((detail) => !detail.exact_order).length,
+    top_k_entrants: Object.fromEntries(CUTOFFS.map((cutoff) => [
+      cutoff,
+      details.reduce((count, detail) => count + detail.top_k[cutoff].entrants.length, 0),
+    ])),
+    top_k_exits: Object.fromEntries(CUTOFFS.map((cutoff) => [
+      cutoff,
+      details.reduce((count, detail) => count + detail.top_k[cutoff].exits.length, 0),
+    ])),
+    current_answer_recall_delta: Object.fromEntries(
+      CUTOFFS.map((cutoff) => [cutoff, mean(details.map((detail) => detail.current_recall_delta[cutoff]))]),
+    ),
+    ...movement,
+    validity: {
+      movement_within_bound: movement.maximum_absolute_movement <= configuredBound,
+      movement_values_consistent: candidateHits.every(
+        (hit) => hit.movement === hit.base_rank - hit.rank,
+      ),
+      unknown_basis_stationary: candidateHits.every(
+        (hit) => hit.freshness_basis !== "unknown" || hit.movement === 0,
+      ),
+      git_observed_do_not_cross: candidateRuns.every((run) => gitObservedCrossings(run.hits) === 0),
+      candidate_bases_match_disabled: details.every((detail) => detail.candidate_base_matches_disabled),
+    },
+    details,
+  };
+}
+
+export function comparePhase2RankedIdentities(runs, phase2Report) {
+  const phase2 = new Map(phase2Report.runs.map((run) => [`${run.profile}\0${runKey(run)}`, run]));
+  const disabled = runs.filter((run) => run.treatment === "disabled");
+  const details = disabled.map((candidate) => {
+    const key = `${candidate.profile}\0${runKey(candidate)}`;
+    const baseline = phase2.get(key);
+    if (!baseline) throw new Error(`Phase 2 report has no run for ${candidate.profile}/${candidate.variant}/${candidate.query.id}`);
+    const exact = JSON.stringify(identities(candidate.hits)) === JSON.stringify(identities(baseline.hits));
+    return {
+      profile: candidate.profile,
+      variant: candidate.variant,
+      query_id: candidate.query.id,
+      exact_ranked_identities: exact,
+    };
+  });
+  return {
+    pairs: details.length,
+    exact_ranked_identities: details.every((detail) => detail.exact_ranked_identities),
+    by_profile: Object.fromEntries(PHASE3_PROFILES.map((profile) => {
+      const profileDetails = details.filter((detail) => detail.profile === profile);
+      return [profile, {
+        pairs: profileDetails.length,
+        exact_ranked_identities: profileDetails.every((detail) => detail.exact_ranked_identities),
+      }];
+    })),
+    details,
+  };
+}
+
+function comparableConflictPair(run) {
+  if (run.query.category !== "conflict") return false;
+  const current = run.hits.find((hit) => run.query.current.some((qrel) => qrelMatches(hit, qrel)));
+  const older = run.hits.find((hit) => run.query.older_conflicts?.some((qrel) => qrelMatches(hit, qrel)));
+  if (!current || !older) return false;
+  const gitFamily = new Set(["git", "working_tree"]);
+  return (gitFamily.has(current.freshness_basis) && gitFamily.has(older.freshness_basis))
+    || (current.freshness_basis === "observed" && older.freshness_basis === "observed");
+}
+
+function pairedTreatmentRuns(runs, profile, treatment) {
+  const baseline = new Map(
+    runs.filter((run) => run.profile === profile && run.treatment === "disabled")
+      .map((run) => [runKey(run), run]),
+  );
+  return runs.filter((run) => run.profile === profile && run.treatment === treatment).map((candidate) => {
+    const original = baseline.get(runKey(candidate));
+    if (!original) throw new Error(`missing disabled arm for ${profile}/${runKey(candidate)}`);
+    return { original, candidate };
+  });
+}
+
+export function selectPhase3Default(runs, comparisons, phase2Parity) {
+  const candidates = [1, 2, 3].map((bound) => {
+    const treatment = `bound-${bound}`;
+    const profileComparisons = PHASE3_PROFILES.map((profile) => {
+      const comparison = comparisons.find(
+        (value) => value.profile === profile && value.candidate_treatment === treatment,
+      );
+      if (!comparison) throw new Error(`missing freshness comparison for ${profile}/${treatment}`);
+      const pairs = pairedTreatmentRuns(runs, profile, treatment);
+      const baselineSummary = summarizeProfile(pairs.map(({ original }) => original));
+      const candidateSummary = summarizeProfile(pairs.map(({ candidate }) => candidate));
+      const comparableConflicts = pairs.filter(({ candidate }) => comparableConflictPair(candidate));
+      const corrected = comparableConflicts.filter(
+        ({ original, candidate }) => original.score.current_ahead_of_older === false
+          && candidate.score.current_ahead_of_older === true,
+      ).length;
+      const reversed = comparableConflicts.filter(
+        ({ original, candidate }) => original.score.current_ahead_of_older === true
+          && candidate.score.current_ahead_of_older === false,
+      ).length;
+      const evergreenTopFiveRetained = pairs.every(({ original, candidate }) => (
+        original.query.category !== "evergreen"
+        || original.score.current_rank === null
+        || original.score.current_rank > 5
+        || (candidate.score.current_rank !== null && candidate.score.current_rank <= 5)
+      ));
+      const noNewEvergreenInversion = pairs.every(({ original, candidate }) => (
+        original.query.category !== "evergreen"
+        || original.score.recent_irrelevant_inversion === true
+        || candidate.score.recent_irrelevant_inversion !== true
+      ));
+      const obsoleteTopTenRetained = pairs.every(({ original, candidate }) => (
+        original.query.category !== "conflict"
+        || original.score.older_conflict_rank === null
+        || original.score.older_conflict_rank > 10
+        || (candidate.score.older_conflict_rank !== null && candidate.score.older_conflict_rank <= 10)
+      ));
+      const hardGates = {
+        ...comparison.validity,
+        phase2_disabled_identity_parity: phase2Parity.by_profile[profile].exact_ranked_identities,
+        required_stages_active: pairs.every(({ candidate }) => {
+          const expected = expectedDiagnostics(profile);
+          return candidate.diagnostics.vector_status === expected.vector
+            && candidate.diagnostics.reranker_status === expected.reranker
+            && candidate.diagnostics.freshness_status === "active"
+            && candidate.diagnostics.max_rank_movement === bound;
+        }),
+        repeated_orders_stable: pairs.every(({ candidate }) => candidate.repeated_exact_order),
+        current_sources_only: pairs.every(
+          ({ candidate }) => candidate.hits.every((hit) => hit.source_state === "current"),
+        ),
+        all_candidates_reported: pairs.every(
+          ({ candidate }) => candidate.hits.length === candidate.diagnostics.total_candidates,
+        ),
+      };
+      const guardrails = {
+        recall_at_5_not_lower:
+          candidateSummary.current_answer_recall[5] >= baselineSummary.current_answer_recall[5],
+        recall_at_10_not_lower:
+          candidateSummary.current_answer_recall[10] >= baselineSummary.current_answer_recall[10],
+        evergreen_top_five_retained: evergreenTopFiveRetained,
+        no_new_recent_irrelevant_over_evergreen_inversion: noNewEvergreenInversion,
+        obsolete_conflict_top_ten_retained: obsoleteTopTenRetained,
+        no_intended_conflict_reversed: reversed === 0,
+        intended_conflict_corrected: corrected > 0,
+      };
+      return {
+        profile,
+        hard_gates: hardGates,
+        guardrails,
+        corrected_comparable_conflicts: corrected,
+        reversed_comparable_conflicts: reversed,
+        current_first_conflict_pairs: pairs.filter(
+          ({ candidate }) => candidate.query.category === "conflict"
+            && comparableConflictPair(candidate)
+            && candidate.score.current_ahead_of_older === true,
+        ).length,
+        current_answer_recall_at_3: candidateSummary.current_answer_recall[3],
+        changed_order_count: comparison.changed_orders,
+        passes:
+          Object.values(hardGates).every(Boolean) && Object.values(guardrails).every(Boolean),
+      };
+    });
+    const correctedComparableConflicts = profileComparisons.reduce(
+      (sum, profile) => sum + profile.corrected_comparable_conflicts,
+      0,
+    );
+    const currentFirstConflictPairs = profileComparisons.reduce(
+      (sum, profile) => sum + profile.current_first_conflict_pairs,
+      0,
+    );
+    const currentAnswerRecallAt3 = mean(profileComparisons.map((profile) => profile.current_answer_recall_at_3));
+    const changedOrderCount = profileComparisons.reduce((sum, profile) => sum + profile.changed_order_count, 0);
+    const passes = profileComparisons.every((profile) => profile.passes);
+    return {
+      bound,
+      passes,
+      corrected_comparable_conflicts: correctedComparableConflicts,
+      current_first_conflict_pairs: currentFirstConflictPairs,
+      current_answer_recall_at_3: currentAnswerRecallAt3,
+      changed_order_count: changedOrderCount,
+      profiles: profileComparisons,
+    };
+  });
+  const passing = candidates.filter((candidate) => candidate.passes);
+  const bestConflictCount = passing.length === 0
+    ? null
+    : Math.max(...passing.map((candidate) => candidate.current_first_conflict_pairs));
+  const selected = passing
+    .filter((candidate) => candidate.current_first_conflict_pairs === bestConflictCount)
+    .toSorted((left, right) => left.bound - right.bound)[0] ?? null;
+  return {
+    candidates,
+    selected_default: selected === null ? { freshness: false, max_rank_movement: null } : {
+      freshness: true,
+      max_rank_movement: selected.bound,
+    },
+    selection_rule: "best current-first conflict count, then smallest passing bound; report also records Recall@3 and changed-order tie inputs",
+  };
+}
+
 function normalizeHit(hit, query) {
   const normalized = {
     rank: hit.rank,
+    base_rank: hit.base_rank ?? hit.rank,
+    movement: hit.movement ?? 0,
     path: hit.path,
     heading: hit.breadcrumb,
     lines: [hit.start_line, hit.end_line],
@@ -564,6 +893,10 @@ function normalizeHit(hit, query) {
     content_sha256: sha256(hit.content),
     lexical_score: hit.lexical_score,
     vector_score: hit.vector_score,
+    freshness_basis: hit.freshness_basis ?? null,
+    freshness_value: hit.freshness_value ?? null,
+    freshness_secondary_value: hit.freshness_secondary_value ?? null,
+    freshness_detail: hit.freshness_detail ?? null,
     source_state: hit.source_state,
   };
   normalized.answer_ids = rankedAnswerIds([normalized], query)[0];
@@ -669,6 +1002,63 @@ export function validatePhase2ServiceConfiguration(configuration) {
   }
 }
 
+export function validatePhase2Report(report, manifest, fingerprints) {
+  if (!report || report.schema !== "jscout.docs-retrieval-eval.v1" || report.schema_version !== 1) {
+    throw new Error("Phase 2 report has an unsupported schema");
+  }
+  if (report.run_kind !== "phase2-baseline" || report.decision !== "phase2-baseline-recorded") {
+    throw new Error("Phase 2 report is not a recorded phase2-baseline");
+  }
+  if (report.suite !== manifest.suite) throw new Error("Phase 2 report suite differs from the manifest");
+  if (report.inputs?.manifest_sha256 !== fingerprints.manifestSha256
+      || report.inputs?.fixture_sha256 !== fingerprints.fixtureSha256) {
+    throw new Error("Phase 2 report corpus fingerprints differ from the current fixture");
+  }
+  if (report.inputs?.profiles?.length !== PHASE2_PROFILES.length
+      || new Set(report.inputs.profiles).size !== PHASE2_PROFILES.length
+      || !PHASE2_PROFILES.every((profile) => report.inputs.profiles.includes(profile))) {
+    throw new Error("Phase 2 report does not contain every frozen retrieval posture");
+  }
+  for (const gate of [
+    "bm25_fallback_exact_order",
+    "repeated_orders_stable",
+    "phase2_complete",
+    "required_profiles_present",
+    "hybrid_measured",
+    "hybrid_rerank_measured",
+  ]) {
+    if (report.validity?.[gate] !== true) throw new Error(`Phase 2 report failed validity gate: ${gate}`);
+  }
+  if (!Array.isArray(report.runs)) throw new Error("Phase 2 report has no runs");
+  const expectedKeys = new Set(manifest.queries.flatMap((query) => query.variants.flatMap(
+    (variant) => PHASE2_PROFILES.map((profile) => `${profile}\0${variant}\0${query.id}`),
+  )));
+  const keys = new Set();
+  for (const run of report.runs) {
+    const key = `${run.profile}\0${run.variant}\0${run.query?.id}`;
+    if (keys.has(key)) throw new Error(`Phase 2 report repeats run: ${key.replaceAll("\0", "/")}`);
+    if (!expectedKeys.has(key)) throw new Error(`Phase 2 report contains unexpected run: ${key.replaceAll("\0", "/")}`);
+    keys.add(key);
+  }
+  if (keys.size !== expectedKeys.size) {
+    throw new Error("Phase 2 report run count differs from the fixed manifest");
+  }
+  return report;
+}
+
+export function phase2ValidityForReport(phase3, profiles, fallbackComparison, phase2Report) {
+  if (phase3) {
+    return {
+      bm25_fallback_exact_order: phase2Report.validity.bm25_fallback_exact_order,
+      phase2_complete: phase2Report.validity.phase2_complete,
+    };
+  }
+  return {
+    bm25_fallback_exact_order: fallbackComparison?.exact_order_parity ?? false,
+    phase2_complete: PHASE2_PROFILES.every((profile) => profiles.includes(profile)),
+  };
+}
+
 async function queryServiceConfiguration(endpointValue) {
   const endpoint = new URL(endpointValue);
   endpoint.pathname = "/configuration";
@@ -719,7 +1109,7 @@ function searchArguments(profile) {
   return flags;
 }
 
-export function docsSearchArguments(profile, root, query, database) {
+export function docsSearchArguments(profile, root, query, database, treatment = null) {
   return [
     "docs",
     "search",
@@ -732,8 +1122,32 @@ export function docsSearchArguments(profile, root, query, database) {
     "--response-bytes",
     String(RESPONSE_BYTES),
     "--debug-json",
+    ...(treatment?.enabled === false ? ["--no-freshness"] : []),
     ...searchArguments(profile),
   ];
+}
+
+export function configWithFreshness(source, treatment) {
+  const lines = source.split(/\r?\n/);
+  const header = lines.findIndex((line) => /^\s*\[docs\.search\]\s*(?:#.*)?$/.test(line));
+  if (header < 0) throw new Error("evaluation config must contain a [docs.search] table");
+  let end = header + 1;
+  while (end < lines.length && !/^\s*\[/.test(lines[end])) end += 1;
+  const body = lines.slice(header + 1, end).filter(
+    (line) => !/^\s*(?:freshness|max_rank_movement)\s*=/.test(line),
+  );
+  body.push(`freshness = ${treatment.enabled ? "true" : "false"}`);
+  body.push(`max_rank_movement = ${treatment.bound}`);
+  lines.splice(header + 1, end - header - 1, ...body);
+  return `${lines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+export function indexConfigForRun(runKind, baselineConfig, treatmentConfigs) {
+  if (runKind !== "phase3-candidate") return baselineConfig;
+  const enabledTreatment = FRESHNESS_TREATMENTS.find((treatment) => treatment.enabled);
+  const config = treatmentConfigs.get(`baseline\0${enabledTreatment.id}`);
+  if (!config) throw new Error("phase3-candidate has no provenance-enabled index configuration");
+  return config;
 }
 
 function writeExclusive(path, value, force) {
@@ -768,8 +1182,16 @@ async function main() {
   if (options.providerConfig && !existsSync(options.providerConfig)) {
     throw new Error(`provider config does not exist: ${options.providerConfig}`);
   }
+  if (options.phase2Report && !existsSync(options.phase2Report)) {
+    throw new Error(`Phase 2 report does not exist: ${options.phase2Report}`);
+  }
   const manifest = validateManifest(readJson(options.manifest), options.manifest);
   const fixtureRoot = dirname(options.manifest);
+  const manifestSha256 = sha256File(options.manifest);
+  const fixtureSha256 = directoryDigest(fixtureRoot);
+  const phase2Report = options.phase2Report
+    ? validatePhase2Report(readJson(options.phase2Report), manifest, { manifestSha256, fixtureSha256 })
+    : null;
   const workspace = prepareWorkspace(options);
   if (pathIsContained(workspace, options.output)) {
     throw new Error("--output must be outside --workdir because successful runs remove the workspace");
@@ -781,6 +1203,20 @@ async function main() {
     baselineConfig,
     "version = 1\n\n[docs.search]\nvector = true\nrerank = false\nlimit = 10\nresponse_bytes = 1048576\n\n[llm]\nauth_file = \".jscout-eval-unused-auth.json\"\n",
   );
+  const treatmentConfigs = new Map();
+  if (options.runKind === "phase3-candidate") {
+    const sources = {
+      baseline: readFileSync(baselineConfig, "utf8"),
+      provider: readFileSync(options.providerConfig, "utf8"),
+    };
+    for (const treatment of FRESHNESS_TREATMENTS) {
+      for (const [kind, source] of Object.entries(sources)) {
+        const path = join(workspace, `phase3-${kind}-${treatment.id}.toml`);
+        writeFileSync(path, configWithFreshness(source, treatment));
+        treatmentConfigs.set(`${kind}\0${treatment.id}`, path);
+      }
+    }
+  }
   let completed = false;
   try {
     const repositories = materializeRepositories(manifest, options.manifest, workspace, baseEnv);
@@ -797,21 +1233,49 @@ async function main() {
       provider: options.providerConfig
         ? configShow(options.binary, options.providerConfig, repositories.values().next().value.path, providerEnv)
         : null,
+      phase3_treatments: options.runKind === "phase3-candidate"
+        ? Object.fromEntries(FRESHNESS_TREATMENTS.map((treatment) => [treatment.id, {
+          baseline: configShow(
+            options.binary,
+            treatmentConfigs.get(`baseline\0${treatment.id}`),
+            repositories.values().next().value.path,
+            baseEnv,
+          ),
+          provider: configShow(
+            options.binary,
+            treatmentConfigs.get(`provider\0${treatment.id}`),
+            repositories.values().next().value.path,
+            providerEnv,
+          ),
+        }]))
+        : null,
     };
-    if (options.runKind === "phase2-baseline") {
+    if (["phase2-baseline", "phase3-candidate"].includes(options.runKind)) {
       validatePhase2ProviderConfiguration(configurations.provider);
     }
-    const serviceConfigurationBefore = options.runKind === "phase2-baseline"
+    if (options.runKind === "phase3-candidate") {
+      for (const treatment of FRESHNESS_TREATMENTS) {
+        for (const kind of ["baseline", "provider"]) {
+          const docsSearch = configurations.phase3_treatments[treatment.id][kind].docs.search;
+          if (docsSearch.freshness !== treatment.enabled
+              || docsSearch.max_rank_movement !== treatment.bound) {
+            throw new Error(`${treatment.id}/${kind}: effective freshness treatment differs from the matrix`);
+          }
+        }
+      }
+    }
+    const serviceConfigurationBefore = ["phase2-baseline", "phase3-candidate"].includes(options.runKind)
       ? await queryServiceConfiguration(configurations.provider.inference.url)
       : null;
     const environments = [];
     const runs = [];
+    const indexConfig = indexConfigForRun(options.runKind, baselineConfig, treatmentConfigs);
     for (const repository of repositories.values()) {
       const database = join(workspace, "databases", `${repository.id}.db`);
       mkdirSync(dirname(database), { recursive: true });
       const indexed = run(
         options.binary,
-        ["--config", baselineConfig, "index", repository.path, "--database", database],
+        ["--config", indexConfig, "index", repository.path, "--database", database],
         { env: baseEnv },
       );
       const statusBeforeEmbed = runJscoutJson(
@@ -859,64 +1323,88 @@ async function main() {
       });
       for (const query of manifest.queries.filter((value) => value.variants.includes(repository.id))) {
         for (const profile of options.profiles) {
-          const config = profile.startsWith("hybrid") ? options.providerConfig : baselineConfig;
-          const env = profile.startsWith("hybrid") ? providerEnv : baseEnv;
-          const searchArgs = docsSearchArguments(profile, repository.path, query.query, database);
-          const response = runJscoutJson(options.binary, config, searchArgs, env);
-          const repeated = runJscoutJson(options.binary, config, searchArgs, env);
-          const expected = expectedDiagnostics(profile);
-          if (response.value.truncated) throw new Error(`${repository.id}/${query.id}/${profile}: response truncated`);
-          if (repeated.value.truncated) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: repeated response truncated`);
-          }
-          if (response.value.diagnostics.vector_status !== expected.vector) {
-            throw new Error(
-              `${repository.id}/${query.id}/${profile}: vector=${response.value.diagnostics.vector_status}, expected ${expected.vector}`,
+          const treatments = options.runKind === "phase3-candidate"
+            ? FRESHNESS_TREATMENTS
+            : [{ id: null, enabled: false, bound: 0 }];
+          for (const treatment of treatments) {
+            const configKind = profile.startsWith("hybrid") ? "provider" : "baseline";
+            const config = options.runKind === "phase3-candidate"
+              ? treatmentConfigs.get(`${configKind}\0${treatment.id}`)
+              : profile.startsWith("hybrid") ? options.providerConfig : baselineConfig;
+            const env = profile.startsWith("hybrid") ? providerEnv : baseEnv;
+            const searchArgs = docsSearchArguments(
+              profile,
+              repository.path,
+              query.query,
+              database,
+              options.runKind === "phase3-candidate" ? treatment : null,
             );
+            const response = runJscoutJson(options.binary, config, searchArgs, env);
+            const repeated = runJscoutJson(options.binary, config, searchArgs, env);
+            const expected = expectedDiagnostics(profile);
+            const label = [repository.id, query.id, profile, treatment.id].filter(Boolean).join("/");
+            if (response.value.truncated) throw new Error(`${label}: response truncated`);
+            if (repeated.value.truncated) throw new Error(`${label}: repeated response truncated`);
+            if (response.value.diagnostics.vector_status !== expected.vector) {
+              throw new Error(
+                `${label}: vector=${response.value.diagnostics.vector_status}, expected ${expected.vector}`,
+              );
+            }
+            if (response.value.diagnostics.reranker_status !== expected.reranker) {
+              throw new Error(
+                `${label}: reranker=${response.value.diagnostics.reranker_status}, expected ${expected.reranker}`,
+              );
+            }
+            if (repeated.value.diagnostics.vector_status !== expected.vector
+                || repeated.value.diagnostics.reranker_status !== expected.reranker) {
+              throw new Error(`${label}: repeated retrieval stage status changed`);
+            }
+            if (options.runKind === "phase3-candidate") {
+              const expectedFreshness = treatment.enabled ? "active" : "disabled";
+              const expectedBound = treatment.bound;
+              if (response.value.diagnostics.freshness_status !== expectedFreshness
+                  || response.value.diagnostics.max_rank_movement !== expectedBound
+                  || repeated.value.diagnostics.freshness_status !== expectedFreshness
+                  || repeated.value.diagnostics.max_rank_movement !== expectedBound) {
+                throw new Error(`${label}: effective freshness diagnostics differ from the treatment`);
+              }
+            }
+            if (response.value.snapshot !== status.snapshot || repeated.value.snapshot !== status.snapshot) {
+              throw new Error(`${label}: search snapshot differs from indexed status`);
+            }
+            if (profile.startsWith("hybrid")
+                && response.value.diagnostics.vector_profile_id !== embed.value.profile_id) {
+              throw new Error(`${label}: vector profile differs from docs embed`);
+            }
+            if (profile.startsWith("hybrid")
+                && repeated.value.diagnostics.vector_profile_id !== embed.value.profile_id) {
+              throw new Error(`${label}: repeated vector profile differs from docs embed`);
+            }
+            const hits = response.value.hits.map((hit) => normalizeHit(hit, query));
+            const repeatedHits = repeated.value.hits.map((hit) => normalizeHit(hit, query));
+            const stableOrder = JSON.stringify(hits.map(hitIdentity)) === JSON.stringify(repeatedHits.map(hitIdentity));
+            if (!stableOrder) throw new Error(`${label}: repeated rank order changed`);
+            if (hits.some((hit) => hit.source_state !== "current")) {
+              throw new Error(`${label}: source resolution was not current`);
+            }
+            if (repeatedHits.some((hit) => hit.source_state !== "current")) {
+              throw new Error(`${label}: repeated source resolution was not current`);
+            }
+            runs.push({
+              variant: repository.id,
+              profile,
+              treatment: treatment.id,
+              query: { id: query.id, category: query.category },
+              elapsed_ms: response.elapsedMs,
+              snapshot: response.value.snapshot,
+              diagnostics: response.value.diagnostics,
+              stdout_sha256: response.stdoutSha256,
+              repeated_stdout_sha256: repeated.stdoutSha256,
+              repeated_exact_order: stableOrder,
+              hits,
+              score: scoreRun(query, hits),
+            });
           }
-          if (response.value.diagnostics.reranker_status !== expected.reranker) {
-            throw new Error(
-              `${repository.id}/${query.id}/${profile}: reranker=${response.value.diagnostics.reranker_status}, expected ${expected.reranker}`,
-            );
-          }
-          if (repeated.value.diagnostics.vector_status !== expected.vector
-              || repeated.value.diagnostics.reranker_status !== expected.reranker) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: repeated retrieval stage status changed`);
-          }
-          if (response.value.snapshot !== status.snapshot || repeated.value.snapshot !== status.snapshot) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: search snapshot differs from indexed status`);
-          }
-          if (profile.startsWith("hybrid")
-              && response.value.diagnostics.vector_profile_id !== embed.value.profile_id) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: vector profile differs from docs embed`);
-          }
-          if (profile.startsWith("hybrid")
-              && repeated.value.diagnostics.vector_profile_id !== embed.value.profile_id) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: repeated vector profile differs from docs embed`);
-          }
-          const hits = response.value.hits.map((hit) => normalizeHit(hit, query));
-          const repeatedHits = repeated.value.hits.map((hit) => normalizeHit(hit, query));
-          const stableOrder = JSON.stringify(hits.map(hitIdentity)) === JSON.stringify(repeatedHits.map(hitIdentity));
-          if (!stableOrder) throw new Error(`${repository.id}/${query.id}/${profile}: repeated rank order changed`);
-          if (hits.some((hit) => hit.source_state !== "current")) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: source resolution was not current`);
-          }
-          if (repeatedHits.some((hit) => hit.source_state !== "current")) {
-            throw new Error(`${repository.id}/${query.id}/${profile}: repeated source resolution was not current`);
-          }
-          runs.push({
-            variant: repository.id,
-            profile,
-            query: { id: query.id, category: query.category },
-            elapsed_ms: response.elapsedMs,
-            snapshot: response.value.snapshot,
-            diagnostics: response.value.diagnostics,
-            stdout_sha256: response.stdoutSha256,
-            repeated_stdout_sha256: repeated.stdoutSha256,
-            repeated_exact_order: stableOrder,
-            hits,
-            score: scoreRun(query, hits),
-          });
         }
       }
     }
@@ -924,35 +1412,61 @@ async function main() {
       ...run,
       query: manifest.queries.find((query) => query.id === run.query.id),
     }));
-    const summaries = Object.fromEntries(
-      options.profiles.map((profile) => [
+    const phase3 = options.runKind === "phase3-candidate";
+    const summaries = phase3
+      ? Object.fromEntries(options.profiles.map((profile) => [
+        profile,
+        Object.fromEntries(FRESHNESS_TREATMENTS.map((treatment) => [
+          treatment.id,
+          summarizeProfile(scoredRuns.filter(
+            (run) => run.profile === profile && run.treatment === treatment.id,
+          )),
+        ])),
+      ]))
+      : Object.fromEntries(options.profiles.map((profile) => [
         profile,
         summarizeProfile(scoredRuns.filter((run) => run.profile === profile)),
-      ]),
-    );
+      ]));
     const summariesByVariant = Object.fromEntries(
       [...repositories.keys()].map((variant) => [
         variant,
-        Object.fromEntries(options.profiles.map((profile) => [
-          profile,
-          summarizeProfile(scoredRuns.filter((run) => run.variant === variant && run.profile === profile)),
-        ])),
+        phase3
+          ? Object.fromEntries(options.profiles.map((profile) => [
+            profile,
+            Object.fromEntries(FRESHNESS_TREATMENTS.map((treatment) => [
+              treatment.id,
+              summarizeProfile(scoredRuns.filter(
+                (run) => run.variant === variant
+                  && run.profile === profile
+                  && run.treatment === treatment.id,
+              )),
+            ])),
+          ]))
+          : Object.fromEntries(options.profiles.map((profile) => [
+            profile,
+            summarizeProfile(scoredRuns.filter((run) => run.variant === variant && run.profile === profile)),
+          ])),
       ]),
     );
     const conflictTreatmentOpportunity = Object.fromEntries(
       options.profiles.map((profile) => [
         profile,
-        hasConflictTreatmentOpportunity(scoredRuns.filter((run) => run.profile === profile)),
+        hasConflictTreatmentOpportunity(scoredRuns.filter(
+          (run) => run.profile === profile && (!phase3 || run.treatment === "disabled"),
+        )),
       ]),
     );
     if (options.runKind === "phase2-baseline"
         && Object.values(conflictTreatmentOpportunity).some((value) => !value)) {
       throw new Error("phase2-baseline has no obsolete-first conflict within the tested movement bounds");
     }
+    const profileComparisonRuns = phase3
+      ? scoredRuns.filter((run) => run.treatment === "disabled")
+      : scoredRuns;
     const comparisons = [];
     for (const profile of options.profiles.filter((profile) => profile !== "lexical")) {
       comparisons.push(compareProfiles(
-        scoredRuns,
+        profileComparisonRuns,
         "lexical",
         profile,
       ));
@@ -961,12 +1475,39 @@ async function main() {
     if (fallback && !fallback.exact_order_parity) {
       throw new Error("BM25 fallback order differs from --lexical-only");
     }
-    const serviceConfigurationAfter = options.runKind === "phase2-baseline"
+    const freshnessComparisons = phase3
+      ? PHASE3_PROFILES.flatMap((profile) => [1, 2, 3].map(
+        (bound) => compareFreshnessTreatments(scoredRuns, profile, `bound-${bound}`),
+      ))
+      : [];
+    const phase2IdentityParity = phase3
+      ? comparePhase2RankedIdentities(scoredRuns, phase2Report)
+      : null;
+    const defaultSelection = phase3
+      ? selectPhase3Default(scoredRuns, freshnessComparisons, phase2IdentityParity)
+      : null;
+    const serviceConfigurationAfter = ["phase2-baseline", "phase3-candidate"].includes(options.runKind)
       ? await queryServiceConfiguration(configurations.provider.inference.url)
       : null;
     if (JSON.stringify(serviceConfigurationBefore) !== JSON.stringify(serviceConfigurationAfter)) {
-      throw new Error("inference service configuration changed during phase2-baseline");
+      throw new Error(`inference service configuration changed during ${options.runKind}`);
     }
+    const requiredProfiles = options.runKind === "phase2-baseline"
+      ? PHASE2_PROFILES
+      : phase3 ? PHASE3_PROFILES : PROVIDER_FREE_PROFILES;
+    const decision = phase3
+      ? defaultSelection.selected_default.freshness
+        ? `freshness-bound-${defaultSelection.selected_default.max_rank_movement}-selected`
+        : "freshness-disabled-selected"
+      : options.runKind === "phase2-baseline"
+        ? "phase2-baseline-recorded"
+        : "provider-free-check-recorded";
+    const phase2Validity = phase2ValidityForReport(
+      phase3,
+      options.profiles,
+      fallback,
+      phase2Report,
+    );
     const result = {
       schema: "jscout.docs-retrieval-eval.v1",
       schema_version: 1,
@@ -974,8 +1515,8 @@ async function main() {
       suite: manifest.suite,
       generated_at: new Date().toISOString(),
       inputs: {
-        fixture_sha256: directoryDigest(fixtureRoot),
-        manifest_sha256: sha256File(options.manifest),
+        fixture_sha256: fixtureSha256,
+        manifest_sha256: manifestSha256,
         harness_sha256: sha256File(scriptPath),
         binary_sha256: sha256File(options.binary),
         binary_version: version,
@@ -983,11 +1524,26 @@ async function main() {
         source_status: sourceStatus,
         git_version: gitVersion,
         provider_config_sha256: options.providerConfig ? sha256File(options.providerConfig) : null,
+        phase2_report_sha256: options.phase2Report ? sha256File(options.phase2Report) : null,
+        phase2_binary_sha256: phase2Report?.inputs?.binary_sha256 ?? null,
         profiles: options.profiles,
+        freshness_treatments: phase3 ? FRESHNESS_TREATMENTS : null,
         max_k: MAX_K,
         response_bytes: RESPONSE_BYTES,
       },
-      treatments: {
+      treatments: phase3 ? {
+        retrieval: {
+          lexical: ["--lexical-only"],
+          hybrid: ["--vector", "--no-rerank"],
+          "hybrid-rerank": ["--vector", "--rerank"],
+        },
+        freshness: {
+          disabled: { config: { freshness: false, max_rank_movement: 1 }, flags: ["--no-freshness"] },
+          "bound-1": { config: { freshness: true, max_rank_movement: 1 }, flags: [] },
+          "bound-2": { config: { freshness: true, max_rank_movement: 2 }, flags: [] },
+          "bound-3": { config: { freshness: true, max_rank_movement: 3 }, flags: [] },
+        },
+      } : {
         lexical: ["--lexical-only"],
         fallback: ["--no-rerank"],
         hybrid: ["--vector", "--no-rerank"],
@@ -1002,20 +1558,25 @@ async function main() {
       summaries,
       summaries_by_variant: summariesByVariant,
       comparisons,
+      hybrid_lift_from_no_freshness_lexical: phase3 ? comparisons : null,
+      freshness_comparisons: phase3 ? freshnessComparisons : null,
+      phase2_disabled_identity_parity: phase2IdentityParity,
+      default_selection: defaultSelection,
       validity: {
-        bm25_fallback_exact_order: fallback?.exact_order_parity ?? false,
+        bm25_fallback_exact_order: phase2Validity.bm25_fallback_exact_order,
         repeated_orders_stable: runs.every((run) => run.repeated_exact_order),
         source_tree_clean: sourceStatus.length === 0,
-        phase2_complete: PHASE2_PROFILES.every((profile) => options.profiles.includes(profile)),
+        phase2_complete: phase2Validity.phase2_complete,
+        phase3_complete: phase3
+          && PHASE3_PROFILES.every((profile) => options.profiles.includes(profile))
+          && FRESHNESS_TREATMENTS.every((treatment) => runs.some((run) => run.treatment === treatment.id)),
+        phase2_disabled_identity_parity: phase2IdentityParity?.exact_ranked_identities ?? null,
         conflict_treatment_opportunity: conflictTreatmentOpportunity,
-        required_profiles_present: (options.runKind === "phase2-baseline" ? PHASE2_PROFILES : PROVIDER_FREE_PROFILES)
-          .every((profile) => options.profiles.includes(profile)),
+        required_profiles_present: requiredProfiles.every((profile) => options.profiles.includes(profile)),
         hybrid_measured: options.profiles.includes("hybrid"),
         hybrid_rerank_measured: options.profiles.includes("hybrid-rerank"),
       },
-      decision: options.runKind === "phase2-baseline"
-        ? "phase2-baseline-recorded"
-        : "provider-free-check-recorded",
+      decision,
       runs,
     };
     writeExclusive(options.output, result, options.force);

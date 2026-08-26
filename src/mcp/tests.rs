@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -9,11 +10,34 @@ use serde_json::json;
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
-    exhaustive_telemetry_metrics, expansion_role_metrics, log_request, render_bounded_items,
-    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
-    sum_durations, tool_defs,
+    exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
+    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
+    server_instructions, sum_durations, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
+
+#[test]
+fn initialize_exposes_effective_documentation_freshness_defaults() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join(".jscout.toml"),
+        "version = 1\n\n[docs.search]\nfreshness = true\nmax_rank_movement = 3\n",
+    )?;
+    let runtime = config::RuntimeConfig::load(Some(repo.path()), None)?;
+    let result = initialize_result(
+        "2025-06-18",
+        "test-binary",
+        &repo.path().join("index.db"),
+        ToolProfile::Structural,
+        ResultTransportPolicy::Text,
+        &McpClientInfo::default(),
+        &runtime,
+    );
+    let defaults = &result["serverInfo"]["documentationRetrievalDefaults"];
+    assert_eq!(defaults["freshness"], json!(true));
+    assert_eq!(defaults["maxRankMovement"], json!(3));
+    Ok(())
+}
 
 fn capture_code_read_surfaces(
     root: &Path,
@@ -202,6 +226,8 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
         search: config::DocsSearchSettings {
             vector: false,
             rerank: false,
+            freshness: false,
+            max_rank_movement: 2,
             limit: 10,
             response_bytes: 24_000,
         },
@@ -217,7 +243,13 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
     assert_eq!(value["hits"][0]["path"], "README.md");
     assert_eq!(value["hits"][0]["heading"], "Deployment");
     assert_eq!(value["hits"][0]["source_state"], "current");
+    assert_eq!(value["hits"][0]["freshness_basis"], "unknown");
+    assert!(value["hits"][0]["freshness_value"].is_null());
+    assert_eq!(value["hits"][0]["base_rank"], 1);
+    assert_eq!(value["hits"][0]["movement"], 0);
     assert_eq!(value["retrieval"]["vector"], "disabled");
+    assert_eq!(value["retrieval"]["freshness"], "disabled");
+    assert_eq!(value["retrieval"]["max_rank_movement"], 2);
     assert!(
         tool_defs(ToolProfile::Baseline, true)
             .as_array()
@@ -256,6 +288,95 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
     assert_eq!(stale["hits"][0]["source_state"], "source_mismatch");
     assert_eq!(stale["hits"][0]["source_detail"], "hash_mismatch");
     assert_eq!(stale["hits"][0]["content"], "Use the blue release channel.");
+    Ok(())
+}
+
+#[test]
+fn documentation_search_applies_configured_freshness_at_the_mcp_boundary() -> Result<()> {
+    if Command::new("git").arg("--version").output().is_err() {
+        return Ok(());
+    }
+    let repo = tempfile::tempdir()?;
+    let git = |args: &[&str]| -> Result<()> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    git(&["init", "--quiet"])?;
+    git(&["config", "user.name", "Documentation Test"])?;
+    git(&["config", "user.email", "docs@example.invalid"])?;
+    fs::write(
+        repo.path().join("a-obsolete.md"),
+        "# Guidance\n\nShared header recommendation.\n",
+    )?;
+    git(&["add", "a-obsolete.md"])?;
+    let old_commit = Command::new("git")
+        .args(["commit", "--quiet", "-m", "obsolete"])
+        .current_dir(repo.path())
+        .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00+00:00")
+        .output()?;
+    anyhow::ensure!(old_commit.status.success(), "initial Git commit failed");
+    fs::write(
+        repo.path().join("z-current.md"),
+        "# Guidance\n\nShared header recommendation.\n",
+    )?;
+    git(&["add", "z-current.md"])?;
+    let new_commit = Command::new("git")
+        .args(["commit", "--quiet", "-m", "current"])
+        .current_dir(repo.path())
+        .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2024-01-01T00:00:00+00:00")
+        .output()?;
+    anyhow::ensure!(new_commit.status.success(), "second Git commit failed");
+
+    let conn = store::open(repo.path())?;
+    indexer::refresh_repo_with_options(
+        repo.path(),
+        &conn,
+        &indexer::IndexOptions {
+            docs_freshness: true,
+            ..indexer::IndexOptions::default()
+        },
+    )?;
+    let defaults = config::DocsSettings {
+        enabled: true,
+        include: vec!["**/*.md".into()],
+        exclude: Vec::new(),
+        search: config::DocsSearchSettings {
+            vector: false,
+            rerank: false,
+            freshness: true,
+            max_rank_movement: 1,
+            limit: 10,
+            response_bytes: 24_000,
+        },
+    };
+    let rendered = call_documentation_tool(
+        repo.path(),
+        &conn,
+        None,
+        &defaults,
+        &json!({ "query": "shared header recommendation" }),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["retrieval"]["freshness"], "active");
+    assert_eq!(value["retrieval"]["max_rank_movement"], 1);
+    assert_eq!(value["hits"][0]["path"], "z-current.md");
+    assert_eq!(value["hits"][0]["freshness_basis"], "git");
+    assert_eq!(value["hits"][0]["base_rank"], 2);
+    assert_eq!(value["hits"][0]["movement"], 1);
+    assert_eq!(value["hits"][1]["path"], "a-obsolete.md");
+    assert_eq!(value["hits"][1]["base_rank"], 1);
+    assert_eq!(value["hits"][1]["movement"], -1);
     Ok(())
 }
 

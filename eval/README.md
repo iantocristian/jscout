@@ -41,6 +41,25 @@ rank order. The recorded baseline is available as a
 [human report](results/g24-docs-retrieval-phase2-2026-08-25.md) and
 [machine result](results/g24-docs-retrieval-phase2-2026-08-25.json).
 
+For the Phase 3 freshness matrix, keep the same pinned inference service
+running and execute:
+
+```bash
+node scripts/eval-docs-retrieval.mjs \
+  --binary target/release/jscout \
+  --run-kind phase3-candidate \
+  --profiles lexical,hybrid,hybrid-rerank \
+  --provider-config eval/protocols/g24-docs-retrieval-provider.toml \
+  --phase2-report eval/results/g24-docs-retrieval-phase2-2026-08-25.json \
+  --output /tmp/g24-docs-retrieval-phase3.json
+```
+
+The recorded Phase 3 [human
+report](results/g24-docs-retrieval-phase3-2026-08-26.md) and [machine
+result](results/g24-docs-retrieval-phase3-2026-08-26.json) reject every tested
+movement bound as the default. Git freshness remains available as an opt-in;
+the built-in default is `freshness = false`.
+
 ## Agent behavior
 
 This harness compares agent behavior with the same prompts, model, limits, and

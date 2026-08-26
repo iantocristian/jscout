@@ -23,6 +23,8 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert!(config.effective.docs.exclude.is_empty());
     assert!(config.effective.docs.search.vector);
     assert!(config.effective.docs.search.rerank);
+    assert!(!config.effective.docs.search.freshness);
+    assert_eq!(config.effective.docs.search.max_rank_movement, 2);
     assert_eq!(config.effective.docs.search.limit, 10);
     assert_eq!(config.effective.docs.search.response_bytes, 24_000);
     assert!(config.effective.search.vector);
@@ -51,6 +53,8 @@ exclude = ["archive/**"]
 [docs.search]
 vector = false
 rerank = false
+freshness = true
+max_rank_movement = 3
 limit = 7
 response_bytes = 12000
 [search]
@@ -70,6 +74,8 @@ file = "logs/mcp.jsonl"
     assert_eq!(config.effective.docs.exclude, ["archive/**"]);
     assert!(!config.effective.docs.search.vector);
     assert!(!config.effective.docs.search.rerank);
+    assert!(config.effective.docs.search.freshness);
+    assert_eq!(config.effective.docs.search.max_rank_movement, 3);
     assert_eq!(config.effective.docs.search.limit, 7);
     assert_eq!(config.effective.docs.search.response_bytes, 12_000);
     assert_eq!(
@@ -83,7 +89,9 @@ file = "logs/mcp.jsonl"
     assert_eq!(config.sources["docs.search.limit"], ValueSource::Config);
     let shown = config.show_text();
     assert!(shown.contains("docs: enabled=true include="));
-    assert!(shown.contains("docs-search: vector=false rerank=false limit=7 response_bytes=12000"));
+    assert!(shown.contains(
+        "docs-search: vector=false rerank=false freshness=true max_rank_movement=3 limit=7 response_bytes=12000"
+    ));
     let json = config.show_json()?;
     assert!(json.contains("\"docs\""));
     Ok(())
@@ -101,6 +109,7 @@ include = ["handbook/**/*.md", "handbook/**/*.mdx"]
 exclude = ["handbook/archive/**"]
 [docs.search]
 vector = true
+freshness = true
 "#,
     )?;
 
@@ -108,6 +117,8 @@ vector = true
 
     assert!(!config.effective.docs.enabled);
     assert!(config.effective.docs.search.vector);
+    assert!(config.effective.docs.search.freshness);
+    assert!(!config.effective.docs.indexing_freshness());
     assert!(config.effective.docs.indexing_include().is_empty());
     assert!(config.effective.docs.indexing_exclude().is_empty());
     assert_eq!(
@@ -200,6 +211,10 @@ fn documentation_globs_and_positive_bounds_fail_during_load() -> anyhow::Result<
         (
             "version = 1\n[docs.search]\nresponse_bytes = 0\n",
             "docs.search.response_bytes",
+        ),
+        (
+            "version = 1\n[docs.search]\nmax_rank_movement = 4\n",
+            "docs.search.max_rank_movement",
         ),
     ] {
         write_config(root.path(), text)?;

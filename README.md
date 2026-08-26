@@ -91,6 +91,7 @@ jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only witho
                                #   --json is compact; --debug-json retains diagnostics
 jscout docs search <root> Q    # Markdown/MDX BM25 plus ready shared-profile vectors
                                #   --lexical-only needs no embedding provider
+                               #   --no-freshness preserves pure relevance order
 jscout docs embed <root>       # embed missing Markdown/MDX representations
 jscout docs status <root>      # corpus decisions and vector readiness
 jscout who-uses <root> SPEC    # all usage sites of a symbol, grouped by confidence
@@ -186,13 +187,20 @@ enabled = false
 
 [docs.search]
 vector = true
+freshness = false
+max_rank_movement = 2
 ```
 
 With `enabled = false`, the shared index admits no documentation rows,
 `docs status` reports the feature as disabled, and the CLI/MCP documentation
 retrieval surfaces are unavailable. The `docs.search.vector` setting controls
 only vector participation during documentation search; it does not enable
-corpus admission or generate vectors.
+corpus admission or generate vectors. `docs.search.freshness` defaults to
+`false`; it controls both index-time Git attribution and the bounded
+Git-authorship reorder. With the default, indexing performs no documentation
+provenance Git commands, blame-cache work, or publication revalidation and
+publishes disabled/unknown provenance. When enabled,
+`max_rank_movement` selects the reorder's one-to-three position bound.
 
 ```bash
 jscout index /path/to/repo
@@ -202,6 +210,13 @@ jscout docs search /path/to/repo "current deployment procedure" --lexical-only
 jscout docs embed /path/to/repo
 jscout docs search /path/to/repo "current deployment procedure"
 ```
+
+After changing `docs.search.freshness`, run `jscout index`. A running
+`jscout watch` reloads the documentation indexing policy and forces a full
+generation automatically. Until an enabled, current-format provenance
+projection has been published, an effectively freshness-enabled search fails
+closed and asks for `jscout index`; freshness-disabled search, status, embed,
+and code surfaces remain available.
 
 Vector search joins BM25 only when the current shared snapshot has a complete
 documentation vector generation for the configured embedding profile. Ordinary
@@ -214,8 +229,15 @@ description, tags, heading context, exact source spans, and the indexed file
 hash. The MCP `documentation_search` tool exposes the same isolated ranking
 corpus.
 Membership defaults to exact lowercase `**/*.md` and `**/*.mdx` and is
-configured with `[docs]`. Temporal ranking is deferred; this release ranks by
-relevance only.
+configured with `[docs]`. `docs.search.freshness` controls both indexed Git
+provenance and the bounded temporal reorder. `--no-freshness` disables only the
+query reorder and preserves relevance order for comparison; it does not rebuild
+the indexed projection.
+
+Enabled provenance still participates in the shared structural snapshot. A
+history-only attribution change can therefore rotate `meta.snapshot` and
+invalidate other snapshot-bound products. Separating that identity is deferred
+to a follow-up after this pull request.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:
@@ -955,9 +977,11 @@ later re-enabling reranking never causes a re-embed.
 MCP remains one process for one root and one database. `jscout mcp
 /path/to/repo` loads `/path/to/repo/.jscout.toml` once at startup.
 Initialization metadata reports the exact database, config path, binary/config
-fingerprints, and effective retrieval defaults. MCP and `watch` load policy
-once; restart either long-running process after editing the file. There is no
-hot reload or multi-repository routing.
+fingerprints, and effective retrieval defaults. MCP has no hot reload. Watch
+reloads only the documentation indexing policy—`docs.enabled`, `docs.include`,
+`docs.exclude`, and `docs.search.freshness`—and forces a full generation when
+that effective policy changes. Every other watch setting remains bound to
+startup and requires restart. There is no multi-repository routing.
 
 `mcp.result_transport = "auto"` emits native MCP `structuredContent` only for
 verified Codex client versions and retains the fact-equivalent JSON-text
@@ -1195,15 +1219,20 @@ a fully cached pass therefore reports reuse rather than `embedded=0/0`.
 `watch --embed` also repairs and tops up semantic-artifact vectors after the
 checker phase. Manual `jscout index` always remains a full disposable-snapshot
 rebuild.
+The structural nearest file-form `.git` indirection, worktree `HEAD`, and
+`.gitmodules` controls remain watched even when documentation freshness is
+disabled. Worktree-index, reference/log, shallow, reftable, and Git conversion
+controls are provenance-specific and are subscribed only while freshness
+indexing is enabled.
 The startup line records the jscout version, executable-byte fingerprint,
 loaded non-secret runtime-config fingerprint, whether a config file was loaded,
-restart-required config semantics, checker-policy fingerprint derived from the
-actual watcher enrichment selection, and a separate non-secret fingerprint of
-the effective watch invocation after CLI overrides alongside the effective
-watch flags. These identities make logs from different binaries or policies
-comparable without exposing credentials. If the running executable cannot be
-read, jscout warns and records `binary_fingerprint=unavailable`; diagnostic
-identity never prevents watch or MCP startup.
+the documentation-indexing-only reload boundary, checker-policy fingerprint
+derived from the actual watcher enrichment selection, and a separate non-secret
+fingerprint of the effective watch invocation after CLI overrides alongside the
+effective watch flags. These identities make logs from different binaries or
+policies comparable without exposing credentials. If the running executable
+cannot be read, jscout warns and records `binary_fingerprint=unavailable`;
+diagnostic identity never prevents watch or MCP startup.
 Retrieval-only CLI commands and MCP sessions open an existing published index
 read-only: they do not create `.jscout.db` or migrate an old schema. The MCP
 server opens a writer lazily only when its `annotate` tool is selected.

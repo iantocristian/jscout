@@ -293,6 +293,7 @@ pub(super) fn cmd_index(
             dependencies: dependencies.to_vec(),
             docs_include: docs.indexing_include().to_vec(),
             docs_exclude: docs.indexing_exclude().to_vec(),
+            docs_freshness: docs.indexing_freshness(),
             timing: diagnostics.timing,
             debug: diagnostics.debug,
             ..Default::default()

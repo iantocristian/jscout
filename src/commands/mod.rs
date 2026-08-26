@@ -638,6 +638,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     dependencies: &dependencies,
                     docs_include: runtime.effective.docs.indexing_include(),
                     docs_exclude: runtime.effective.docs.indexing_exclude(),
+                    docs_freshness: runtime.effective.docs.indexing_freshness(),
                     enrich_on_change: enrich,
                     enrich_timeout: std::time::Duration::from_secs(enrich_timeout),
                     checker_sidecar: sidecar_path.as_deref().or(runtime
@@ -652,6 +653,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     reconcile_interval: std::time::Duration::from_secs(reconcile_seconds),
                     config_fingerprint: &runtime.fingerprint,
                     config_loaded: runtime.config_loaded,
+                    config_path: runtime.config_path.as_deref(),
+                    config_explicit: runtime.config_explicit,
                 },
             )
         }

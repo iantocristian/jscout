@@ -608,6 +608,9 @@ pub(super) enum DocsCommand {
         /// Skip model reranking even when configured
         #[arg(long, conflicts_with = "rerank")]
         no_rerank: bool,
+        /// Preserve pure relevance order while still reporting provenance
+        #[arg(long)]
+        no_freshness: bool,
         /// Maximum bytes in the complete rendered response
         #[arg(long)]
         response_bytes: Option<usize>,

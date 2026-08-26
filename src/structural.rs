@@ -435,7 +435,7 @@ pub(crate) fn compute_snapshot_with_resolution(
     resolution_hash: &str,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-structural-snapshot-v4\0");
+    hasher.update(b"jscout-structural-snapshot-v5\0");
     hasher.update(PROJECTION_VERSION.as_bytes());
     hasher.update(b"\0code-extraction-contract\0");
     hasher.update(crate::entity::EXTRACTION_VERSION.as_bytes());
@@ -516,6 +516,21 @@ pub(crate) fn compute_snapshot_with_resolution(
         hasher.update(b"\0rust-edition-context\0");
         hasher.update(edition_context.as_bytes());
     }
+    hasher.update(b"\0documentation-provenance-contract\0");
+    hasher.update(crate::docs::PROVENANCE_FORMAT_VERSION.as_bytes());
+    let documentation_provenance_format = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='documentation_provenance_format_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    // As with parser and extraction contracts, hash both the producer and the
+    // published marker so an interrupted contract transition cannot retain an
+    // apparently current snapshot.
+    hasher.update(b"\0documentation-published-provenance-format\0");
+    hasher.update(documentation_provenance_format.as_bytes());
     let mut stmt = conn.prepare(
         "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
                 COALESCE(f.package_path, ''),
@@ -549,9 +564,91 @@ pub(crate) fn compute_snapshot_with_resolution(
             hasher.update(value.as_bytes());
         }
     }
+    hasher.update(b"\0documentation-file-provenance\0");
+    let mut file_provenance = conn.prepare(
+        "SELECT f.path, f.hash, provenance.status
+         FROM files f
+         LEFT JOIN doc_file_provenance provenance ON provenance.file_id=f.id
+         WHERE f.corpus='docs'
+         ORDER BY f.path COLLATE BINARY, f.hash COLLATE BINARY",
+    )?;
+    let rows = file_provenance.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, file_hash, status) = row?;
+        hash_snapshot_field(&mut hasher, path.as_bytes());
+        hash_snapshot_field(&mut hasher, file_hash.as_bytes());
+        hash_snapshot_optional_field(&mut hasher, status.as_deref());
+    }
+    hasher.update(b"\0documentation-chunk-provenance\0");
+    let mut chunk_provenance = conn.prepare(
+        "SELECT f.path, c.start, c.end, c.hash,
+                metadata.freshness_basis, metadata.freshness_author_time
+         FROM files f
+         JOIN chunks c ON c.file_id=f.id
+         JOIN doc_chunk_meta metadata ON metadata.chunk_id=c.id
+         WHERE f.corpus='docs'
+         ORDER BY f.path COLLATE BINARY, c.start, c.end, c.hash COLLATE BINARY,
+                  metadata.freshness_basis COLLATE BINARY,
+                  metadata.freshness_author_time IS NOT NULL,
+                  metadata.freshness_author_time",
+    )?;
+    let rows = chunk_provenance.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, start, end, chunk_hash, basis, author_time) = row?;
+        hash_snapshot_field(&mut hasher, path.as_bytes());
+        hasher.update(&start.to_le_bytes());
+        hasher.update(&end.to_le_bytes());
+        hash_snapshot_field(&mut hasher, chunk_hash.as_bytes());
+        hash_snapshot_field(&mut hasher, basis.as_bytes());
+        hash_snapshot_optional_i64(&mut hasher, author_time);
+    }
     hasher.update(b"\0module-resolution\0");
     hasher.update(resolution_hash.as_bytes());
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn hash_snapshot_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_snapshot_optional_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(b"\x01");
+            hash_snapshot_field(hasher, value.as_bytes());
+        }
+        None => {
+            hasher.update(b"\x00");
+        }
+    }
+}
+
+fn hash_snapshot_optional_i64(hasher: &mut blake3::Hasher, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            hasher.update(b"\x01");
+            hasher.update(&value.to_le_bytes());
+        }
+        None => {
+            hasher.update(b"\x00");
+        }
+    }
 }
 
 /// Rebuild the disposable structural graph from canonical extraction tables.

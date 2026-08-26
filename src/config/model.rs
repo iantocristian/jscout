@@ -54,6 +54,30 @@ pub struct DocsSettings {
     pub search: DocsSearchSettings,
 }
 
+/// The only repository configuration fields a running watcher hot-reloads.
+/// Other runtime settings remain pinned to process startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocsIndexingSettings {
+    pub enabled: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub freshness: bool,
+}
+
+impl DocsIndexingSettings {
+    pub fn effective_include(&self) -> &[String] {
+        if self.enabled { &self.include } else { &[] }
+    }
+
+    pub fn effective_exclude(&self) -> &[String] {
+        if self.enabled { &self.exclude } else { &[] }
+    }
+
+    pub const fn effective_freshness(&self) -> bool {
+        self.enabled && self.freshness
+    }
+}
+
 impl DocsSettings {
     pub fn indexing_include(&self) -> &[String] {
         if self.enabled { &self.include } else { &[] }
@@ -62,12 +86,21 @@ impl DocsSettings {
     pub fn indexing_exclude(&self) -> &[String] {
         if self.enabled { &self.exclude } else { &[] }
     }
+
+    /// Whether an indexing generation should resolve Git-backed freshness.
+    /// Search policy cannot enable provenance for a disabled documentation
+    /// corpus because there will be no admitted documentation rows.
+    pub const fn indexing_freshness(&self) -> bool {
+        self.enabled && self.search.freshness
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DocsSearchSettings {
     pub vector: bool,
     pub rerank: bool,
+    pub freshness: bool,
+    pub max_rank_movement: usize,
     pub limit: usize,
     pub response_bytes: usize,
 }
