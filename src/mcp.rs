@@ -624,7 +624,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
         },
         {
             "name": "file_outline",
-            "description": "Structural outline of one file: chunks (functions, classes, components) with line ranges and the symbols they use.",
+            "description": "Outline of one indexed code file. AST-backed formats return structural chunks (functions, classes, components) with symbols. Plain-text formats return span-only line ranges with null names; read the relevant source by those ranges.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

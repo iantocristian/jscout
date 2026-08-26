@@ -543,6 +543,33 @@ fn rust_semantic_search_expand_stays_lexical_at_mcp_boundary() -> Result<()> {
     assert_eq!(response["graph"]["seeds"], json!([]));
     assert_eq!(response["graph"]["nodes"], json!({}));
     assert_eq!(response["graph"]["edges"], json!([]));
+
+    let tools = tool_defs(ToolProfile::Structural, true);
+    let outline_tool = tools
+        .as_array()
+        .expect("tool definitions")
+        .iter()
+        .find(|tool| tool["name"] == "file_outline")
+        .expect("file_outline definition");
+    assert!(
+        outline_tool["description"].as_str().is_some_and(
+            |description| description.contains("span-only line ranges with null names")
+        )
+    );
+    let outline = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "file_outline",
+        &json!({ "path": "native.rs" }),
+    )?;
+    let outline: serde_json::Value = serde_json::from_str(&outline)?;
+    let ranges = outline["outline"].as_array().expect("Rust outline ranges");
+    assert!(!ranges.is_empty());
+    assert!(ranges.iter().all(|range| range["name"].is_null()));
+    assert!(ranges.iter().all(|range| range["lines"].is_array()));
     Ok(())
 }
 

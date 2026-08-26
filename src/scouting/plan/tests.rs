@@ -664,6 +664,10 @@ fn targeted_card_files_and_recon_subjects_never_widen() -> Result<()> {
         repo.path().join("README.md"),
         "# Target documentation\n\nThis is not a semantic card source.\n",
     )?;
+    std::fs::write(
+        repo.path().join("native.rs"),
+        "pub fn rust_target() -> usize { 1 }\n",
+    )?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
 
@@ -694,6 +698,21 @@ fn targeted_card_files_and_recon_subjects_never_widen() -> Result<()> {
     )
     .expect_err("documentation must not be accepted as a semantic card file");
     assert!(docs_error.to_string().contains("not an indexed code file"));
+
+    let rust_error = super::cards_with_selectors(
+        repo.path(),
+        &conn,
+        &super::CardSelectors {
+            files: vec!["native.rs".into()],
+            ..super::CardSelectors::default()
+        },
+    )
+    .expect_err("plain-text code must fail before structural subject discovery");
+    assert!(
+        rust_error
+            .to_string()
+            .contains("does not provide the structural symbols required by scouting cards")
+    );
 
     conn.execute(
         "INSERT INTO scout_runs(

@@ -171,11 +171,13 @@ architecture, or regressions involving multiple mechanisms.
 
 After localization, use exact-anchor `who_uses` for callers, `file_outline` for
 one file, `calls` for member-method or object-option questions, and `events`
-for string-keyed wiring. When the structural profile exposes them, use
-`entities` or `paths` for named boundaries and bounded routes. If jscout
-returns no relevant evidence, or the question requires literal
-regex/substring coverage outside the indexed scope, fall back to
-repository-local search and state that boundary.
+for string-keyed wiring. For plain-text formats, `file_outline` returns
+span-only line ranges with `name: null`; read the relevant source by the
+returned range. When the structural profile exposes them, use `entities` or
+`paths` for named boundaries and bounded routes. If jscout returns no relevant
+evidence, or the question requires literal regex/substring coverage outside
+the indexed scope, fall back to repository-local search and state that
+boundary.
 
 ## Write back verified durable knowledge
 

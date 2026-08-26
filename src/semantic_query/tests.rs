@@ -77,7 +77,7 @@ fn replace_concept_chunks(conn: &rusqlite::Connection, spans: &[(i64, i64)]) -> 
 }
 
 #[test]
-fn documentation_file_is_not_a_semantic_evidence_scope() -> Result<()> {
+fn semantic_evidence_file_scope_uses_code_lexical_capability() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::write(
         repo.path().join("main.ts"),
@@ -86,6 +86,10 @@ fn documentation_file_is_not_a_semantic_evidence_scope() -> Result<()> {
     std::fs::write(
         repo.path().join("README.md"),
         "# Guide\n\nDocumentation is retrieved separately.\n",
+    )?;
+    std::fs::write(
+        repo.path().join("native.rs"),
+        "pub fn lexical_evidence() -> bool { true }\n",
     )?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
@@ -100,7 +104,51 @@ fn documentation_file_is_not_a_semantic_evidence_scope() -> Result<()> {
         },
     )
     .expect_err("documentation must not be accepted as a semantic evidence scope");
-    assert!(error.to_string().contains("not indexed in the code corpus"));
+    assert!(error.to_string().contains("code-lexical format"));
+
+    assert!(
+        crate::formats::eligible_ids(crate::formats::Capability::CodeLexical)
+            .contains(&crate::formats::RUST)
+    );
+    assert!(
+        !crate::formats::eligible_ids(crate::formats::Capability::Structural)
+            .contains(&crate::formats::RUST)
+    );
+    let rust = query(
+        repo.path(),
+        &conn,
+        None,
+        &QueryOptions {
+            file: Some("native.rs".into()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(rust.resolved_evidence_scope, ["file:native.rs"]);
+
+    // Keep the row in the code corpus while poisoning its registered format:
+    // the capability gate, rather than `code_files` membership alone, must
+    // reject it.
+    conn.execute(
+        "UPDATE files SET format='markdown' WHERE path='main.ts'",
+        [],
+    )?;
+    let still_code: i64 = conn.query_row(
+        "SELECT count(*) FROM code_files WHERE path='main.ts'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(still_code, 1);
+    let poisoned = query(
+        repo.path(),
+        &conn,
+        None,
+        &QueryOptions {
+            file: Some("main.ts".into()),
+            ..Default::default()
+        },
+    )
+    .expect_err("code-corpus membership must not bypass format capability admission");
+    assert!(poisoned.to_string().contains("code-lexical format"));
     Ok(())
 }
 

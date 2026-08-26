@@ -486,18 +486,25 @@ fn targeted_card_subjects(
     }
 
     let mut target_files = BTreeMap::<String, (String, String)>::new();
+    let structural_formats = crate::formats::eligible_ids(crate::formats::Capability::Structural);
     for file in &selectors.files {
         let file = file.strip_prefix("./").unwrap_or(file);
-        let exists = conn
+        let format = conn
             .query_row(
-                "SELECT origin FROM code_files
+                "SELECT format FROM code_files
                  WHERE path=?1 AND origin IN ('repository','workspace')",
                 [file],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if exists.is_none() {
+        let Some(format) = format else {
             bail!("target card file `{file}` is not an indexed code file in repository/workspace");
+        };
+        if !structural_formats.contains(&format.as_str()) {
+            bail!(
+                "target card file `{file}` uses format `{format}`, which does not provide the \
+                 structural symbols required by scouting cards"
+            );
         }
         target_files.insert(
             file.to_string(),

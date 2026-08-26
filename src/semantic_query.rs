@@ -815,19 +815,25 @@ fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<Su
         .file
         .as_deref()
         .map(|file| file.strip_prefix("./").unwrap_or(file).to_string());
+    // Evidence-file scoping is a source-retrieval boundary, not a structural
+    // one. Admit every code-lexical format (including plain-text Rust) without
+    // requiring graph or exact-definition eligibility.
+    let evidence_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::CodeLexical);
     if let Some(file) = &file {
         let origins_json = serde_json::to_string(&options.file_origins)?;
         let indexed = conn
             .query_row(
                 "SELECT 1 FROM code_files
-                 WHERE path=?1 AND origin IN (SELECT value FROM json_each(?2))",
-                rusqlite::params![file, origins_json],
+                 WHERE path=?1 AND origin IN (SELECT value FROM json_each(?2))
+                   AND format IN (SELECT value FROM json_each(?3))",
+                rusqlite::params![file, origins_json, evidence_formats],
                 |_| Ok(()),
             )
             .optional()?;
         if indexed.is_none() {
             bail!(
-                "semantic evidence file `{file}` is not indexed in the code corpus for the requested origins"
+                "semantic evidence file `{file}` is not indexed in a code-lexical format for the requested origins"
             );
         }
     }
@@ -837,9 +843,12 @@ fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<Su
         let allowed = conn
             .prepare(
                 "SELECT path FROM code_files
-                 WHERE origin IN (SELECT value FROM json_each(?1))",
+                 WHERE origin IN (SELECT value FROM json_each(?1))
+                   AND format IN (SELECT value FROM json_each(?2))",
             )?
-            .query_map([origins_json], |row| row.get::<_, String>(0))?
+            .query_map(rusqlite::params![origins_json, evidence_formats], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<HashSet<_>, _>>()?;
         recon::current_subject_members(conn, subject)?
             .into_iter()
