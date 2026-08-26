@@ -416,14 +416,17 @@ pub fn unique_anchor_for_symbol_target(
 /// Resolve a snapshot-scoped structural symbol anchor to the exact canonical
 /// symbol row consumed by definition and usage queries. This deliberately does
 /// not accept file anchors or fall back to fuzzy name matching.
-pub fn find_symbol_by_anchor_in_origins(
+pub fn find_symbol_by_anchor_in_scope(
     conn: &Connection,
     anchor: &str,
     expected_snapshot: Option<&str>,
     file_origins: &[String],
+    requested_formats: &[String],
 ) -> Result<(SymbolTarget, SymbolAnchorResolution)> {
-    let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
+    let eligible_formats = crate::formats::eligible_ids_in_scope_json(
+        crate::formats::Capability::ExactDefinition,
+        requested_formats,
+    );
     let snapshot = crate::structural::current_snapshot(conn)?;
     let (resolved_anchor, anchor_status) = crate::structural::resolve_anchor_in_origins(
         conn,
@@ -482,10 +485,21 @@ pub fn who_uses_anchor_in_origins(
     anchor: &str,
     file_origins: &[String],
 ) -> Result<Vec<Usage>> {
+    who_uses_anchor_in_scope(conn, anchor, file_origins, &[])
+}
+
+pub fn who_uses_anchor_in_scope(
+    conn: &Connection,
+    anchor: &str,
+    file_origins: &[String],
+    requested_formats: &[String],
+) -> Result<Vec<Usage>> {
     crate::origin::validate_all(file_origins)?;
     let origins_json = serde_json::to_string(file_origins)?;
-    let occurrence_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
+    let occurrence_formats = crate::formats::eligible_ids_in_scope_json(
+        crate::formats::Capability::Structural,
+        requested_formats,
+    );
     let mut statement = conn.prepare(
         "SELECT file.path,file.origin,COALESCE(edge.line,source.line),
                 edge.kind,edge.confidence,
@@ -583,12 +597,23 @@ pub fn find_symbols_in_origins(
     spec: &str,
     file_origins: &[String],
 ) -> Result<Vec<SymbolTarget>> {
+    find_symbols_in_scope(conn, spec, file_origins, &[])
+}
+
+pub fn find_symbols_in_scope(
+    conn: &Connection,
+    spec: &str,
+    file_origins: &[String],
+    requested_formats: &[String],
+) -> Result<Vec<SymbolTarget>> {
     crate::origin::validate_all(file_origins)?;
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
-    let eligible_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::ExactDefinition);
+    let eligible_formats = crate::formats::eligible_ids_in_scope_json(
+        crate::formats::Capability::ExactDefinition,
+        requested_formats,
+    );
     let (path_filter, name) = match spec.rsplit_once(':') {
         Some((p, n)) => (Some(p.to_string()), n.to_string()),
         None => (None, spec.to_string()),
@@ -674,12 +699,25 @@ pub fn who_uses_in_origins(
     name: &str,
     file_origins: &[String],
 ) -> Result<Vec<Usage>> {
+    who_uses_in_scope(conn, graph, file_id, name, file_origins, &[])
+}
+
+pub fn who_uses_in_scope(
+    conn: &Connection,
+    graph: &ModuleGraph,
+    file_id: i64,
+    name: &str,
+    file_origins: &[String],
+    requested_formats: &[String],
+) -> Result<Vec<Usage>> {
     crate::origin::validate_all(file_origins)?;
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
-    let occurrence_formats =
-        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
+    let occurrence_formats = crate::formats::eligible_ids_in_scope_json(
+        crate::formats::Capability::Structural,
+        requested_formats,
+    );
     let mut usages = Vec::new();
 
     // Same-file references.

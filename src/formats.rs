@@ -298,7 +298,7 @@ pub const ALL: &[FormatSpec] = &[
         dependency: DependencyPolicy::Excluded,
         directory: DirectoryPolicy::CargoTarget,
         extractor: Extractor::RustText,
-        extractor_version: "rust-text-ra-ap-syntax-0.0.349-cargo-edition-v2",
+        extractor_version: "rust-text-ra-ap-syntax-0.0.349-cargo-edition-v3",
         ranked: RankedProjection::CodeLexical,
         exact_definition: ExactDefinitionPolicy::Disabled,
         exact_occurrence: ExactOccurrencePolicy::Disabled,
@@ -387,6 +387,14 @@ pub fn eligible_ids(capability: Capability) -> Vec<&'static str> {
 
 pub fn eligible_ids_json(capability: Capability) -> String {
     serde_json::to_string(&eligible_ids(capability)).expect("static format ids serialize")
+}
+
+pub fn eligible_ids_in_scope_json(capability: Capability, requested: &[String]) -> String {
+    let eligible = eligible_ids(capability)
+        .into_iter()
+        .filter(|format| requested.is_empty() || requested.iter().any(|value| value == format))
+        .collect::<Vec<_>>();
+    serde_json::to_string(&eligible).expect("static scoped format ids serialize")
 }
 
 pub fn contract_meta_key(format: &FormatSpec) -> String {
@@ -578,7 +586,7 @@ mod tests {
                 dependency: DependencyPolicy::Excluded,
                 directory: DirectoryPolicy::CargoTarget,
                 extractor: Extractor::RustText,
-                extractor_version: "rust-text-ra-ap-syntax-0.0.349-cargo-edition-v2",
+                extractor_version: "rust-text-ra-ap-syntax-0.0.349-cargo-edition-v3",
                 ranked: RankedProjection::CodeLexical,
                 exact_definition: ExactDefinitionPolicy::Disabled,
                 exact_occurrence: ExactOccurrencePolicy::Disabled,

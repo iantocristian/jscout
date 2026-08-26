@@ -155,12 +155,13 @@ pub(super) fn effective_search_response_byte_limit(
 
 pub(super) fn resolve_search_provider(
     vector: bool,
+    include_memory: bool,
     formats: &[String],
     embedding: &config::EmbeddingSettings,
     inference: &config::InferenceSettings,
 ) -> Result<Option<embed::Provider>> {
     search::validate_code_formats(formats)?;
-    if !vector || !search::format_scope_supports_code_vectors(formats) {
+    if !vector || (!include_memory && !search::format_scope_supports_code_vectors(formats)) {
         return Ok(None);
     }
     embed::Provider::from_settings(embedding, inference)
@@ -286,6 +287,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 or_configured(expand_file_roles, &configured.expansion.file_roles);
             let provider = resolve_search_provider(
                 vector,
+                include_memory,
                 &formats,
                 &runtime.effective.embedding,
                 &runtime.effective.inference,

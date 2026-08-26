@@ -213,33 +213,45 @@ fn effective_manifest_edition(
         return Err("resolve Rust package edition: expected a year or `workspace = true`".into());
     }
 
-    let explicit_workspace = package
-        .get("workspace")
-        .and_then(toml::Value::as_str)
-        .map(|workspace| normalize_relative(manifest_dir, Path::new(workspace)))
-        .transpose()?
-        .and_then(|directory| manifests.get_key_value(&directory));
-    let workspace = explicit_workspace.or_else(|| {
-        let mut directory = Some(manifest_dir);
-        while let Some(candidate) = directory {
-            if let Some(entry) = manifests.get_key_value(candidate)
-                && entry
-                    .1
-                    .value
-                    .as_ref()
-                    .and_then(|value| value.get("workspace"))
-                    .and_then(toml::Value::as_table)
-                    .is_some()
-            {
-                return Some(entry);
-            }
-            directory = candidate.parent();
+    let (_, workspace) = match package.get("workspace") {
+        Some(workspace) => {
+            let workspace = workspace.as_str().ok_or_else(|| {
+                "resolve Rust workspace: `package.workspace` must be a string".to_string()
+            })?;
+            let directory = normalize_relative(manifest_dir, Path::new(workspace))?;
+            manifests.get_key_value(&directory).ok_or_else(|| {
+                format!(
+                    "resolve Rust workspace: manifest referenced by `package.workspace` was not found at `{}`",
+                    directory.display()
+                )
+            })?
         }
-        None
-    });
-    let Some((_, workspace)) = workspace else {
-        return Err("resolve inherited Rust edition: workspace manifest was not found".into());
+        None => {
+            let mut directory = Some(manifest_dir);
+            let mut workspace = None;
+            while let Some(candidate) = directory {
+                if let Some(entry) = manifests.get_key_value(candidate)
+                    && entry
+                        .1
+                        .value
+                        .as_ref()
+                        .and_then(|value| value.get("workspace"))
+                        .and_then(toml::Value::as_table)
+                        .is_some()
+                {
+                    workspace = Some(entry);
+                    break;
+                }
+                directory = candidate.parent();
+            }
+            workspace.ok_or_else(|| {
+                "resolve inherited Rust edition: workspace manifest was not found".to_string()
+            })?
+        }
     };
+    if let Some(error) = workspace.error.as_ref() {
+        return Err(error.clone());
+    }
     let edition = workspace
         .value
         .as_ref()
@@ -593,6 +605,94 @@ mod tests {
             Edition::Edition2015
         );
         assert!(resolution.rejections.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_workspace_pointer_is_authoritative() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        for package in ["implicit", "explicit", "missing", "non-string"] {
+            std::fs::create_dir_all(root.join(package).join("src"))?;
+            std::fs::write(root.join(package).join("src/lib.rs"), "pub fn value() {}\n")?;
+        }
+        std::fs::create_dir_all(root.join("alternate"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['implicit', 'missing', 'non-string']\n[workspace.package]\nedition='2024'\n",
+        )?;
+        std::fs::write(
+            root.join("alternate/Cargo.toml"),
+            "[workspace]\nmembers=['../explicit']\n[workspace.package]\nedition='2021'\n",
+        )?;
+        std::fs::write(
+            root.join("implicit/Cargo.toml"),
+            "[package]\nname='implicit'\nversion='0.1.0'\nedition.workspace=true\n",
+        )?;
+        std::fs::write(
+            root.join("explicit/Cargo.toml"),
+            "[package]\nname='explicit'\nversion='0.1.0'\nworkspace='../alternate'\nedition.workspace=true\n",
+        )?;
+        std::fs::write(
+            root.join("missing/Cargo.toml"),
+            "[package]\nname='missing'\nversion='0.1.0'\nworkspace='../absent'\nedition.workspace=true\n",
+        )?;
+        std::fs::write(
+            root.join("non-string/Cargo.toml"),
+            "[package]\nname='non-string'\nversion='0.1.0'\nworkspace=true\nedition.workspace=true\n",
+        )?;
+
+        let files = [
+            "explicit/src/lib.rs",
+            "implicit/src/lib.rs",
+            "missing/src/lib.rs",
+            "non-string/src/lib.rs",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+        let manifests = [
+            "Cargo.toml",
+            "alternate/Cargo.toml",
+            "explicit/Cargo.toml",
+            "implicit/Cargo.toml",
+            "missing/Cargo.toml",
+            "non-string/Cargo.toml",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+        let resolution = resolve_editions(&root, &files, &manifests, &crate::fs_ops::OsFileSystem)?;
+
+        assert_eq!(
+            resolution.edition_for(&root.join("implicit/src/lib.rs")),
+            Edition::Edition2024
+        );
+        assert_eq!(
+            resolution.edition_for(&root.join("explicit/src/lib.rs")),
+            Edition::Edition2021
+        );
+        for path in ["missing/src/lib.rs", "non-string/src/lib.rs"] {
+            assert_eq!(
+                resolution.edition_for(&root.join(path)),
+                Edition::Edition2015
+            );
+        }
+
+        let rejections = resolution
+            .rejections
+            .iter()
+            .map(|rejection| (rejection.path.as_path(), rejection.error.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(rejections.len(), 2);
+        assert!(
+            rejections[&root.join("missing/Cargo.toml").as_path()]
+                .contains("manifest referenced by `package.workspace` was not found")
+        );
+        assert!(
+            rejections[&root.join("non-string/Cargo.toml").as_path()]
+                .contains("`package.workspace` must be a string")
+        );
         Ok(())
     }
 

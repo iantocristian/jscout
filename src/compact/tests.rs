@@ -64,6 +64,7 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
     let target = "sym:src/workflow.ts#::finish@20";
     let result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -192,7 +193,7 @@ fn file_only_search_hits_offer_only_file_compatible_followups() {
         include_followups: true,
         include_neighborhood_followup: true,
     };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid);
+    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
     assert_eq!(value["anchor"], "file:src/config.ts");
     assert_eq!(value["followups"]["calls"][0]["tool"], "file_outline");
     assert_eq!(value["followups"]["calls"][1]["tool"], "neighborhood");
@@ -237,11 +238,50 @@ fn dependency_followups_include_dependency_and_first_party_origins() {
         include_followups: true,
         include_neighborhood_followup: true,
     };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid);
+    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
     assert_eq!(
         value["followups"]["arguments"]["origins"],
         json!(["repository", "workspace", "dependency"])
     );
+}
+
+#[test]
+fn symbol_followups_preserve_explicit_formats_per_compatible_tool() {
+    let hit = Hit {
+        chunk_id: 1,
+        file: "src/config.ts".into(),
+        file_role: "production".into(),
+        repository_role: None,
+        file_origin: "repository".into(),
+        kind: "function".into(),
+        name: Some("configure".into()),
+        start_line: 1,
+        end_line: 2,
+        score: 1.0,
+        match_reason: MatchReason::ExactDefinition,
+        matched_identifiers: vec!["configure".into()],
+        match_lines: None,
+        snippet: "export function configure() {}".into(),
+        snippet_truncated: false,
+        anchors: vec!["sym:src/config.ts#::configure@1".into()],
+        file_anchor: Some("file:src/config.ts".into()),
+        uses: Vec::new(),
+        used_by: Vec::new(),
+        include_followups: true,
+        include_neighborhood_followup: true,
+    };
+    let formats = vec!["typescript".to_string(), "javascript".to_string()];
+    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &formats);
+    let calls = value["followups"]["calls"].as_array().unwrap();
+
+    assert_eq!(calls.len(), 3);
+    for call in &calls[..2] {
+        assert_eq!(call["arguments"]["formats"], json!(formats));
+    }
+    assert_eq!(calls[0]["tool"], "definition");
+    assert_eq!(calls[1]["tool"], "who_uses");
+    assert_eq!(calls[2]["tool"], "neighborhood");
+    assert!(calls[2]["arguments"].get("formats").is_none());
 }
 
 #[test]
@@ -288,7 +328,7 @@ fn ambiguous_search_hits_do_not_emit_copy_unsafe_followups() {
         include_followups: true,
         include_neighborhood_followup: true,
     };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid);
+    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
     assert_eq!(value["anchors"].as_array().map(Vec::len), Some(2));
     assert!(value.get("followups").is_none());
     assert!(value.get("followup_candidates").is_none());
@@ -326,6 +366,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
         .collect();
     let result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits,
@@ -350,6 +391,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
 fn search_memory_is_a_small_actionable_preview() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -444,6 +486,7 @@ fn annotation_claim_is_visible_in_memory_preview() {
 fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -485,6 +528,7 @@ fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Resul
 fn omitted_memory_keeps_the_follow_up_envelope() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),

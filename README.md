@@ -1094,9 +1094,14 @@ primary retrieval before candidate limits; the MCP `semantic_search` surface
 uses the equivalent plural `formats` array. The formats share one lexical FTS
 corpus, so the filter isolates candidates but not BM25 corpus statistics. Rust
 is lexical-only until its named-chunk phase; a Rust-only search does not invoke
-the code embedding provider. Rust parsing follows the package edition declared
-by the nearest visible `Cargo.toml`, including workspace-inherited editions;
-packages without one and standalone files use Rust 2015. Non-UTF-8 Rust and
+the embedding provider for code retrieval, although vector-enabled attached
+semantic memory still uses the shared provider. Rust parsing follows the
+package edition declared by the nearest visible `Cargo.toml`, including
+workspace-inherited editions.
+An explicit `package.workspace` pointer is authoritative; ancestor workspace
+discovery is used only when that key is absent. Malformed or missing explicit
+targets are reported and recover to the default. Packages without an edition
+and standalone files use Rust 2015. Non-UTF-8 Rust and
 deterministic extraction failures are reported and rejected per file without
 blocking accessible repository siblings.
 
@@ -1140,10 +1145,13 @@ omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
 Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
 and MCP responses retain their configured complete-response budgets.
 
-Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
-`arguments` object accepted unchanged by `definition`, `who_uses`, and
-`neighborhood`; ambiguous multi-anchor chunks expose their anchors but no
-follow-up object. A file-only hit returns per-tool call objects for
+Compact hits also expose copy-safe follow-ups. An unscoped symbol hit returns
+one shared `arguments` object accepted unchanged by `definition`, `who_uses`,
+and `neighborhood`. A format-scoped symbol hit instead returns per-tool calls:
+`definition` and `who_uses` preserve and enforce the original `formats`
+allowlist, while `neighborhood` receives no unsupported filter. Ambiguous
+multi-anchor chunks expose their anchors but no follow-up object. A file-only
+hit returns per-tool call objects for
 `file_outline` and `neighborhood`. The snapshot is part of exact-anchor
 arguments so stale anchors re-resolve by path/scope/name or fail closed instead
 of silently binding to a same-named declaration.

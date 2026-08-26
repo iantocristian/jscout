@@ -3490,7 +3490,10 @@ format. The decisions:
    exact, vector, reranker, and exhaustive candidate generation, is echoed in
    exhaustive `scope`, and binds its cursor. The original explicit allowlist is
    copied unchanged across compatible follow-ups and is never reconstructed
-   from echoed scope.
+   from echoed scope. A present MCP `formats` value must be a non-empty string
+   array. Format-scoped locator follow-ups use per-tool calls: `definition`
+   filters its target, `who_uses` filters its target and returned usage sites,
+   and `neighborhood` receives no unsupported format argument.
 3. The pinned parser is `ra_ap_syntax`: lossless byte ranges, error tolerance,
    and no C toolchain. Phase-1 chunks form a non-overlapping, gap-free partition
    of the source, carry `kind='rust_text'`, no name/symbol/scope, and an empty
@@ -3498,8 +3501,11 @@ format. The decisions:
    retained, and oversized ranges split only at a newline or UTF-8 boundary.
    Parse errors do not reject the file and are counted in index/watch refresh
    diagnostics. The parser edition comes from the nearest visible package
-   `Cargo.toml`, including `edition.workspace=true`; absent editions and
-   standalone files use Cargo's Rust-2015 default. The effective path-to-edition
+   `Cargo.toml`, including `edition.workspace=true`. When `package.workspace`
+   is present it is an authoritative string pointer; ancestor discovery occurs
+   only when it is absent, and malformed or missing explicit targets are
+   reported before default recovery. Absent editions and standalone files use
+   Cargo's Rust-2015 default. The effective path-to-edition
    map is a persisted extraction/snapshot input, so an edition-only manifest
    edit reparses only Rust files whose effective edition changed. Invalid
    edition context recovers visibly to the default. Non-UTF-8 source and

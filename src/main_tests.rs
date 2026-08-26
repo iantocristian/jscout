@@ -252,7 +252,7 @@ fn search_format_scope_is_repeatable_and_omitted_by_default() {
 }
 
 #[test]
-fn rust_only_cli_scope_skips_embedding_credential_resolution() -> Result<()> {
+fn rust_only_cli_scope_resolves_provider_only_for_vector_memory() -> Result<()> {
     let embedding = EmbeddingSettings {
         provider: Some("voyage".into()),
         model: Some("voyage-code-3".into()),
@@ -276,10 +276,20 @@ fn rust_only_cli_scope_skips_embedding_credential_resolution() -> Result<()> {
     };
 
     assert!(
-        resolve_search_provider(true, &["rust".into()], &embedding, &inference)?.is_none(),
-        "Rust is lexical-only, so CLI search must not resolve vector credentials"
+        resolve_search_provider(true, false, &["rust".into()], &embedding, &inference)?.is_none(),
+        "Rust-only code search must not resolve vector credentials"
     );
-    let Err(error) = resolve_search_provider(true, &["javascript".into()], &embedding, &inference)
+    assert!(
+        resolve_search_provider(false, true, &["rust".into()], &embedding, &inference)?.is_none(),
+        "disabling vectors must keep attached semantic memory lexical"
+    );
+    let Err(error) = resolve_search_provider(true, true, &["rust".into()], &embedding, &inference)
+    else {
+        panic!("vector-enabled attached memory still requires configured credentials")
+    };
+    assert!(error.to_string().contains("requires secret environment"));
+    let Err(error) =
+        resolve_search_provider(true, false, &["javascript".into()], &embedding, &inference)
     else {
         panic!("a vector-capable format still requires configured credentials")
     };

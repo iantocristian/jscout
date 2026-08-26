@@ -88,10 +88,11 @@ enter `chunks_fts`; code-vector materialization remains disabled.
 
 The pinned `ra_ap_syntax` parser supplies error-tolerant, lossless syntax
 ranges. Each Rust file uses the edition declared by its nearest visible
-`Cargo.toml`; `edition.workspace=true` resolves through the visible ancestor
-workspace manifest, and a package with no edition or a standalone source file
-uses Cargo's Rust-2015 default. Invalid edition inputs are reported at the
-`rust-edition` stage and recover with that default. The sorted effective
+`Cargo.toml`. For `edition.workspace=true`, an explicit string
+`package.workspace` pointer is authoritative; only its absence permits the
+visible-ancestor workspace search. A malformed pointer or missing target is a
+visible `rust-edition` rejection and recovers to the Rust-2015 default, as does
+a package with no edition or a standalone source file. The sorted effective
 path-to-edition map is fingerprinted as an extraction and snapshot input, so an
 edition-only manifest edit reparses only Rust files whose effective edition
 changed, without replacing other Rust or unchanged JavaScript/TypeScript rows.
@@ -145,13 +146,19 @@ filter.
 
 Code search accepts an optional plural `formats` allowlist containing registry
 ids (`javascript`, `typescript`, `rust`); omission spans every registered code
-format. The normalized selection intersects each producer's capability and is
+format. At the MCP boundary, a present value must be a non-empty array of
+strings; malformed input fails closed rather than becoming the omitted/all
+scope. The normalized selection intersects each producer's capability and is
 applied before limits to BM25, exact definitions, exact occurrences, vectors,
 reranker candidates, and exhaustive traversal. Exhaustive responses echo it in
 `scope.formats`, cursor fingerprints bind it, and completeness claims state
 `corpus`, `file_roles`, `origins`, `formats`, and `snapshot`. A continuation or
 compatible follow-up copies an explicitly supplied formats allowlist unchanged;
-it never synthesizes request filters from echoed scope.
+it never synthesizes request filters from echoed scope. `definition` filters
+its target and `who_uses` filters both target and usage-site formats. Because
+`neighborhood` has no format-filter contract, a format-scoped symbol hit emits
+per-tool calls: `definition` and `who_uses` carry `formats`, while
+`neighborhood` does not.
 
 The phase keeps one `chunks_fts` table for the code corpus. Candidate filtering
 therefore does not isolate FTS5 document-frequency or average-document-length
@@ -279,7 +286,9 @@ Rust stays lexical-only until phase 2a publishes named semantic chunks;
 embedding the phase-1 lossless partitions would spend provider calls on
 identities that the scheduled rechunk invalidates. Phase 1 adds `format` as a
 sqlite-vec partition key alongside profile and origin because KNN applies `k`
-before a relational format filter. Search queries each requested origin/format
+before a relational format filter. Lexical-only Rust constrains the code-vector
+stage only: vector-enabled attached semantic memory still resolves and uses the
+shared provider. Search queries each requested origin/format
 partition and merges same-profile cosine scores. Later Rust vectors reuse the
 configured code embedding model and content-addressed cache; different models
 require rank fusion. Only after named chunks and a Rust retrieval evaluation

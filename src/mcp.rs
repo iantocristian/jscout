@@ -540,7 +540,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "limit": { "type": "integer", "minimum": 1, "description": "Maximum ranked hits, or exhaustive page size (maximum 200); omit to use repository configuration" },
                     "cursor": { "type": "string", "description": "Opaque continuation token returned by a previous exhaustive page; valid only with exhaustive=true" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Primary-hit role allowlist; omit to use repository configuration" },
-                    "formats": { "type": "array", "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist; omit to search all registered code formats" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist; omit to search all registered code formats" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. workspace = owned monorepo/package files; repository = root or unowned first-party files, not the whole repository" },
                     "include_memory": { "type": "boolean", "description": "Attach evidence-connected semantic artifacts; omit to use repository configuration" },
                     "memory_limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Omit to use repository configuration" },
@@ -592,6 +592,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency symbols require explicit inclusion unless configured" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist copied from search follow-ups; omit to query all capability-eligible formats" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
                     "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
@@ -611,6 +612,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency definitions require explicit inclusion unless configured" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist copied from search follow-ups; omit to query all capability-eligible formats" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
                     "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
@@ -900,6 +902,7 @@ fn search_options_from_args(
     args: &Value,
     defaults: &config::SearchSettings,
 ) -> Result<(bool, search::SearchOptions)> {
+    let formats = code_formats(args)?;
     let exhaustive = args["exhaustive"].as_bool().unwrap_or(false);
     let cursor = match args.get("cursor") {
         None => None,
@@ -961,7 +964,7 @@ fn search_options_from_args(
             } else {
                 defaults.file_roles.clone()
             },
-            formats: json_string_array(args, "formats"),
+            formats,
             file_origins: file_origins.clone(),
             include_memory: !exhaustive
                 && profile == ToolProfile::Structural
@@ -1202,13 +1205,19 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 as usize;
             let graph = query::ModuleGraph::load(conn)?;
             let origins = configured_origins(args, search_defaults);
-            let (targets, resolution) = symbol_targets(conn, args, &origins)?;
+            let formats = code_formats(args)?;
+            let (targets, resolution) = symbol_targets(conn, args, &origins, &formats)?;
             let mut results = Vec::new();
             for t in &targets {
                 let usages = if let Some(resolution) = &resolution {
-                    query::who_uses_anchor_in_origins(conn, &resolution.resolved_anchor, &origins)?
+                    query::who_uses_anchor_in_scope(
+                        conn,
+                        &resolution.resolved_anchor,
+                        &origins,
+                        &formats,
+                    )?
                 } else {
-                    query::who_uses_in_origins(conn, &graph, t.file_id, &t.name, &origins)?
+                    query::who_uses_in_scope(conn, &graph, t.file_id, &t.name, &origins, &formats)?
                 };
                 results.push((t, usages));
             }
@@ -1250,7 +1259,8 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 .unwrap_or(scout::DEFAULT_SOURCE_BYTE_LIMIT as u64)
                 as usize;
             let origins = configured_origins(args, search_defaults);
-            let (targets, resolution) = symbol_targets(conn, args, &origins)?;
+            let formats = code_formats(args)?;
+            let (targets, resolution) = symbol_targets(conn, args, &origins, &formats)?;
             let matched_targets = targets.len();
             let mut results = Vec::new();
             for t in targets.into_iter().take(5) {
@@ -1641,6 +1651,7 @@ fn symbol_targets(
     conn: &Connection,
     args: &Value,
     origins: &[String],
+    formats: &[String],
 ) -> Result<(
     Vec<query::SymbolTarget>,
     Option<query::SymbolAnchorResolution>,
@@ -1652,14 +1663,18 @@ fn symbol_targets(
             if args.get("snapshot").and_then(Value::as_str).is_some() {
                 anyhow::bail!("`snapshot` is only valid with exact `anchor` mode");
             }
-            Ok((query::find_symbols_in_origins(conn, symbol, origins)?, None))
+            Ok((
+                query::find_symbols_in_scope(conn, symbol, origins, formats)?,
+                None,
+            ))
         }
         (None, Some(anchor)) if !anchor.trim().is_empty() => {
-            let (target, resolution) = query::find_symbol_by_anchor_in_origins(
+            let (target, resolution) = query::find_symbol_by_anchor_in_scope(
                 conn,
                 anchor,
                 args.get("snapshot").and_then(Value::as_str),
                 origins,
+                formats,
             )?;
             Ok((vec![target], Some(resolution)))
         }
@@ -1727,6 +1742,34 @@ fn json_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn optional_nonempty_string_array(args: &Value, key: &str) -> Result<Vec<String>> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{key}` must be an array of strings"))?;
+    if values.is_empty() {
+        anyhow::bail!("`{key}` must contain at least one value");
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("`{key}[{index}]` must be a string"))
+        })
+        .collect()
+}
+
+fn code_formats(args: &Value) -> Result<Vec<String>> {
+    let formats = optional_nonempty_string_array(args, "formats")?;
+    search::validate_code_formats(&formats)?;
+    Ok(formats)
 }
 
 fn json_string_array_or(
@@ -1965,11 +2008,12 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let search_defaults = &runtime.effective.search;
+    let requested_formats = optional_nonempty_string_array(args, "formats").ok();
     let requested_retrieval = match *tool {
         "semantic_search" => Some(json!({
             "vector": args["vector"].as_bool().unwrap_or(search_defaults.vector),
             "rerank": args["rerank"].as_bool().unwrap_or(search_defaults.rerank),
-            "formats": json_string_array(args, "formats"),
+            "formats": requested_formats,
             "memory": *profile == ToolProfile::Structural
                 && args["include_memory"]
                     .as_bool()

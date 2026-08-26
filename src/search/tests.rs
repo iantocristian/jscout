@@ -2334,6 +2334,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
     };
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -2381,6 +2382,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
 fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -2457,6 +2459,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
 fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -2556,6 +2559,7 @@ fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Re
     second_artifact.name = Some("second workflow".into());
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),

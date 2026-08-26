@@ -264,6 +264,8 @@ impl std::error::Error for ResponseBudgetTooSmall {}
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
+    #[serde(skip)]
+    pub(crate) requested_formats: Vec<String>,
     #[serde(flatten)]
     pub exhaustive: Option<ExhaustiveSearchMetadata>,
     pub retrieval: RetrievalStatus,
@@ -1917,6 +1919,7 @@ pub fn search(
             });
         let mut result = SearchResult {
             snapshot,
+            requested_formats: options.formats.clone(),
             exhaustive,
             retrieval,
             hits,
@@ -2625,7 +2628,7 @@ fn load_hit(
     // same-name reference counts are not callers of this exact declaration.
     let used_by = match anchors.as_slice() {
         [anchor] if anchor.starts_with("sym:") => {
-            let count = query::who_uses_anchor_in_origins(conn, anchor, file_origins)?
+            let count = query::who_uses_anchor_in_scope(conn, anchor, file_origins, file_formats)?
                 .into_iter()
                 .filter(|usage| usage.file != file)
                 .count();
