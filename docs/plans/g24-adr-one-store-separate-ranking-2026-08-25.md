@@ -1,7 +1,7 @@
 # Documentation in the main index: one store, separate ranking
 
 - Date: 2026-08-25
-- Status: accepted decision record; revises the storage half of G24 and introduces Proposed G25. Subordinate to PLAN.md — the G24/G25 entries win on any disagreement.
+- Status: accepted decision record; revises the storage half of G24 and introduces Proposed G25. Amended after Phase 3 to split optional provenance invalidation from `meta.snapshot`. Subordinate to PLAN.md — the G24/G25 entries win on any disagreement.
 - One line: docs live in the main index and lifecycle, but rank in their own corpus with their own surface — code search is untouched by construction, not by discipline.
 
 ## The question
@@ -16,7 +16,7 @@ Code and docs also have different truth models. Code's temporal model is already
 
 ## Decision
 
-1. **One database, one lifecycle.** One snapshot, one walker, one watcher, one entity plane. Docs are ordinary rows in `files`/`chunks`, captured by the shared repository inventory and published by the same index pass; Markdown and MDX extraction emit no code graph rows, including no `file:` graph node. Every admitted `files` row records `corpus` (`code` or `docs`) independently from `format` (the parser/format identity). `[docs].enabled` independently disables docs admission without disabling code indexing.
+1. **One database, one publication lifecycle.** One schema version, walker, watcher, entity plane, writer transaction, and public current-checkout marker. This does not require one invalidation identity for every logical plane. Docs are ordinary rows in `files`/`chunks`, captured by the shared repository inventory and published by the same index pass; Markdown and MDX extraction emit no code graph rows, including no `file:` graph node. Every admitted `files` row records `corpus` (`code` or `docs`) independently from `format` (the parser/format identity). `[docs].enabled` independently disables docs admission without disabling code indexing. Documentation source rows remain part of `meta.snapshot`; optional Git provenance publishes an internal `meta.documentation_provenance_digest` in the same transaction.
 
 2. **Ranking corpus is explicit file identity, not inferred metadata.** `files.corpus` determines ranking-corpus membership. Code keeps `chunks_fts` exactly as it is — same table, same term statistics, same pipeline; ranked content and statistics stay byte-identical modulo the shared snapshot identifier. Docs get their own FTS table and their own candidate pipeline. Vector candidates are materialized per corpus over the shared content-addressed embedding cache. `files.format` selects parser/format behavior, while `chunks.kind` describes structure within a parsed file; neither substitutes for `files.corpus`.
 
@@ -30,12 +30,15 @@ Code and docs also have different truth models. Code's temporal model is already
 
 In PLAN.md's storage-plane table, docs content joins the existing *disposable
 structural snapshot* row; `docs_fts` is one more disposable projection inside
-it. `files.corpus` is the ranking membership (`code` or `docs`),
+it. A lifecycle row describes replacement and durability, not a requirement
+that every field share one invalidation digest. `files.corpus` is the ranking membership (`code` or `docs`),
 `files.format` is parser/format identity, and `chunks.kind` is the structural
 role of one chunk within its file. These are independent dimensions. Code and
-docs are two corpora in one plane. No new plane is created; if the observation
-ledger ever ships, it is a durable-plane addition and owes the explicit
-cache-compatibility decision PLAN.md already requires for those.
+docs are two corpora in one plane. The provenance digest creates no new plane,
+database, or independently visible publication; it only stops Git-attribution
+metadata from invalidating code-bound products. If the observation ledger ever
+ships, it is a durable-plane addition and owes the explicit cache-compatibility
+decision PLAN.md already requires for those.
 
 ## Why one store
 
@@ -55,6 +58,7 @@ The monorepo questions worth having — an env var read in code but declared now
 | `code_files`, `code_chunks` | new disposable views | `code_files` is `files WHERE corpus='code'`; `code_chunks` joins through `code_files`, providing the explicit code-corpus boundary for canonical-row consumers |
 | `docs_fts` | new FTS5 | the docs ranking corpus — G24's field table as columns: title, meta, breadcrumb, body (rendered), path; rowid = chunk id |
 | `doc_chunk_meta` | new, chunk-id keyed | documentation retrieval metadata: title, description, lossless tags, breadcrumb, nearest heading, same-heading ordinal, embedding identity; later the freshness columns. It does not define corpus membership. |
+| `doc_file_provenance` + `meta.documentation_provenance_digest` | new, disposable/internal identity | current per-file Git-attribution projection plus a deterministic corpus fold, atomically published beside `meta.snapshot`; diagnostics and blame-cache mechanics are excluded from both the digest and structural invalidation |
 | `vec_doc_embeddings_{dimensions}` | new | docs vector candidates — separate because sqlite-vec applies KNN's k before any join filter can run, so vector corpus isolation cannot be done with a predicate |
 | `embeddings` | shared, durable | content-addressed cache; a docs embedding identity is just another hash in it |
 
@@ -70,7 +74,9 @@ The monorepo questions worth having — an env var read in code but declared now
 ## Accepted costs
 
 - Docs rows mirror into the docs FTS table (never `chunks_fts`), carry no `name`/`symbols` in shared rows (headings live in the docs corpus tables), and materialize their own vector candidates. Empty structural fields protect exact tiers but do not protect broad canonical-table consumers. The disposable code-corpus views therefore filter explicit `files.corpus` membership for checker inventory, code embeddings, structural support, reconnaissance, and scouting; they replace scattered negative documentation predicates. A future parser such as Groovy adds a `files.format` value and chooses a corpus without adding another membership sidecar.
-- Docs edits rotate the shared snapshot: full projection rebuild, checker batch invalidation, held anchors re-resolve. Accepted for v1 and instrumented; if measurement says it hurts, the fix is digest-splitting inside the one index — not a second database.
+- Phase 3 measurement exercised the planned internal digest split: a history-only Git-attribution change now updates `meta.documentation_provenance_digest` without rotating `meta.snapshot`. Documentation source edits still rotate the shared snapshot, rebuild projection, invalidate snapshot-bound code products, and require held anchors to re-resolve. Fixing that broader cost requires a separately measured code/docs content-digest split inside this database, not another database.
+- The structural hash contract advances once when the provenance inputs leave it, so the first reindex of a database published under the preceding domain may rotate `meta.snapshot`; this is a one-time contract transition, not recurring provenance churn.
+- Provenance Git-control events still request full watch generations and may schedule the existing optional phases. A provenance-scoped watch signal is a separate coordinator optimization; the digest fixes invalidation, not refresh classification.
 - One embedding model for both corpora, for now.
 
 ## First pass
@@ -79,4 +85,4 @@ Markdown and MDX, at the named-sections tier. Both use the same inert pinned Com
 
 ## Out of scope
 
-Tree-sitter, Helm template semantics, cross-path rename history, a combined interleaved surface, per-format embedding profiles.
+Tree-sitter, Helm template semantics, cross-path rename history, a combined interleaved surface, per-format embedding profiles, provenance-scoped watch refresh, and a full code/docs/public agent identity split.

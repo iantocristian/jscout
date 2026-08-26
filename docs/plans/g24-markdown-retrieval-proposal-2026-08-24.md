@@ -18,9 +18,10 @@ Jscout treats repository Markdown and MDX as a separate retrieval product inside
 main index. It is not a source extension of the structural chunker and not
 semantic memory. The surface is `jscout docs`: it owns its inventory,
 Markdown-compatible chunks, its own BM25 corpus and vector candidates, and its
-search results — all in the main database, published with the shared
-structural snapshot. The observation ledger is deferred to the supersession
-product.
+search results — all in the main database and one atomic publication
+transaction. `meta.snapshot` remains the public current-checkout marker, while
+optional Git provenance has an internal digest of its own. The observation
+ledger is deferred to the supersession product.
 
 BM25 always builds. Vector retrieval reuses the repository's existing
 `[embedding]` provider and model; when that provider is absent, documentation
@@ -60,16 +61,20 @@ generation.
 ## Storage in the main index
 
 The first review round showed the shared store cannot host a second
-lifecycle behind its gate: one global schema version and
-structural-snapshot-gated opens. The resolution is not a second database —
-the storage-planes contract already rejects physical splitting — but one
-lifecycle with a separate ranking corpus. Docs are ordinary rows of the
-disposable structural snapshot, separated from the code plane by an explicit
-corpus boundary:
+publication lifecycle behind its gate: it has one schema version, one writer
+transaction, and structural-snapshot-gated opens. That does not require every
+logical plane to share one invalidation identity. The resolution is not a
+second database — the storage-planes contract already rejects physical
+splitting — but one publication lifecycle with a separate ranking corpus and
+an internal provenance identity. Docs are ordinary rows of the disposable
+structural publication, separated from the code plane by an explicit corpus
+boundary:
 
 - docs files are `files` rows with `corpus='docs'` and `format='markdown'` for
   `.md` or `format='mdx'` for `.mdx`:
-  same walker, same snapshot hash, same publication, same entity plane;
+  same walker, publication transaction, public snapshot marker, and entity
+  plane; documentation source identity remains in `meta.snapshot`, while
+  optional Git-attribution metadata does not;
 - docs sections are `chunks` rows with `kind='markdown_section'` or
   `'markdown_document'`, no `name`, no symbols — `chunks.kind` is the
   intra-file structural role, not file classification, and the exact tiers
@@ -91,7 +96,7 @@ corpus boundary:
 
 Code search keeps the same statistics and pipeline as today; its ranked
 content stays byte-identical modulo the shared snapshot identifier. Docs
-search availability follows the shared snapshot lifecycle. Observation
+search availability follows the shared publication lifecycle. Observation
 history, when built, is local and never a replacement for repository version
 control.
 
@@ -416,8 +421,9 @@ Docs storage lives in the main database's disposable plane:
   or `format='mdx'` for `.mdx`, a
   repository-relative path, and a full-file BLAKE3 hash over the exact
   original bytes, including any BOM. The shared structural snapshot already
-  hashes every `files` row, so docs corpus identity is covered by the existing
-  snapshot with no separate fingerprint or sequence.
+  hashes every `files` row, so documentation source identity remains covered by
+  `meta.snapshot`. Only the optional Git-provenance projection receives a
+  separate identity in this step.
 - `chunks` (shared): one row per retrieval chunk. Free-text `kind`
   (`markdown_section`, `markdown_document`) records the intra-file structural
   role; it does not repeat the file corpus or format. Documentation chunks
@@ -439,6 +445,16 @@ Docs storage lives in the main database's disposable plane:
   readiness marker, published atomically with these rows. Missing means not
   ready. The provenance format marker is required only by an effectively
   freshness-enabled query.
+- `meta.documentation_provenance_digest` (new internal publication identity):
+  a domain-separated, deterministic fold over the enabled state, producer and
+  published provenance-format contracts, and each current documentation
+  source identity paired with its `doc_file_provenance.projection_hash`.
+  Per-file projection hashes cover status plus ordered chunk basis and
+  author/committer times; diagnostic text and blame-cache mechanics are
+  excluded. Missing format/readiness markers are distinct inputs; a missing
+  per-file projection rejects publication. The digest is published in the same
+  transaction as `meta.snapshot`, but it is not another database lifecycle or
+  public response field.
 - `docs_fts` (new FTS5): the docs ranking corpus — title, description/tags,
   breadcrumb, rendered body, path; rowid is the chunk id. Weighted at query
   time; its statistics never mix with `chunks_fts`.
@@ -451,7 +467,10 @@ Docs storage lives in the main database's disposable plane:
   readiness row is inserted only after every current embeddable chunk has
   both a cached vector and a matching index entry. Search may query vectors
   only through that exact ready generation; otherwise it reports degraded
-  vector status and uses BM25.
+  vector status and uses BM25. A full disposable refresh always attempts
+  provider-free rematerialization from the durable cache after rebuilding the
+  source rows, including when the recomputed `meta.snapshot` equals its prior
+  value; rematerialization is not dependent on provenance rotating that digest.
 - history tables (deferred with the supersession product), all durable and
   owing the explicit cache-compatibility decision PLAN.md requires:
   `snapshot_log` — a whole-codebase ordered snapshot timeline (sequence,
@@ -480,12 +499,25 @@ before commit leaves the previous snapshot active for docs and code alike;
 crash recovery exposes exactly one complete previous or replacement
 snapshot, never a partial mixture.
 
-For this implementation, enabled provenance remains input to the shared
-structural snapshot. A history-only attribution change can therefore rotate
-`meta.snapshot` and invalidate checker, semantic, or other snapshot-bound
-publications even when source bytes are unchanged. A separate provenance
-identity/generation is deferred to a post-merge follow-up; this opt-in change
-does not attempt that lifecycle split.
+Enabled provenance has an independent internal identity. A history-only
+attribution change updates `meta.documentation_provenance_digest` without
+rotating `meta.snapshot`; the enabled/current-format readiness checks remain
+the query gate, and public documentation hits continue to report the shared
+snapshot. This is an invalidation split inside one atomic publication, not a
+second lifecycle.
+
+The structural-snapshot domain version advances with this contract change. A
+database last indexed by the preceding binary may therefore receive one new
+`meta.snapshot` value on its first reindex even when checkout bytes are
+unchanged; that one-time contract invalidation is distinct from recurring
+provenance-only changes, which affect only the provenance digest.
+
+The split deliberately stops there. Documentation source edits still rotate
+`meta.snapshot`. A complete code/docs content-digest split, including the
+agent-facing contract for plane-specific identities, requires a separate plan
+and before/after measurement. Provenance Git-control events also remain full
+watch generations and may schedule the existing optional phases; a
+provenance-scoped watch signal is a later coordinator optimization.
 
 Before chunking, inventory candidates are sorted by their slash-normalized
 repository-relative UTF-8 path in ascending raw byte order, so filesystem
@@ -846,7 +878,12 @@ Deterministic tests:
   `disabled` file statuses, and `unknown` timestamp-free chunk bases without
   invoking Phase 3 Git commands, blame-cache operations, or provenance
   revalidation; an enabled index publishes the true marker and provenance rows
-  atomically;
+  atomically; both modes publish the matching provenance digest in that same
+  transaction;
+- enabled/disabled transitions and history-only attribution changes alter the
+  documentation provenance digest without altering `meta.snapshot`; diagnostic
+  text and blame-cache entries alter neither identity, per-file folds are bound
+  to path and file hash, and insertion order cannot change the digest;
 - an effectively enabled query accepts only a true marker with the current
   provenance format and otherwise requests `jscout index`; disabled docs
   search, `docs status`, `docs embed`, and unrelated read surfaces remain
@@ -896,6 +933,9 @@ Deterministic tests:
 - embedding failure after every possible batch, and after index materialization
   but before readiness publication, leaves cached vectors reusable but makes
   the current snapshot BM25-only;
+- a full disposable refresh with complete cached documentation vectors
+  rematerializes their current generation even when the recomputed shared
+  snapshot equals the preceding value;
 - code-search rankings, counts, and fingerprints remain identical after docs
   admission modulo the shared snapshot identifier; code or semantic operations
   never create a second documentation database or a partial docs projection;

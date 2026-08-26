@@ -120,6 +120,15 @@ The database file is an implementation container, not a shared lifecycle.
 Physical database splitting adds backup, transaction, and deployment
 complexity without improving this contract and is not planned.
 
+One database still has one schema version and one atomic publication
+transaction, but it does not require one invalidation identity. `meta.snapshot`
+remains the public current-checkout publication marker and the identity used by
+the existing structural/code-bound products. Optional documentation Git
+provenance publishes its own internal
+`meta.documentation_provenance_digest` in that same transaction. Splitting an
+identity does not create another database, writer lifecycle, or independently
+visible publication.
+
 `jscout index` is the reliable fixed-snapshot path. Its target behavior is a
 full disposable-plane rebuild followed by resolution, projection, and vector
 occurrence rematerialization, with publication of a current snapshot only
@@ -3268,7 +3277,9 @@ database, which the storage-planes contract rejects; the decision record is
 The revised decisions:
 
 1. Documentation lives in the main database and the disposable structural
-   snapshot. Every admitted `files` row carries two independent identities:
+   publication. Documentation source rows remain inputs to `meta.snapshot`,
+   while optional Git-attribution metadata has its own internal provenance
+   digest. Every admitted `files` row carries two independent identities:
    `corpus` is ranking-corpus membership (`code` or `docs`), while `format` is
    the parser/format identity (`markdown` for `.md`, `mdx` for `.mdx`).
    Documentation files are ordinary rows with `corpus='docs'` and the matching
@@ -3418,11 +3429,28 @@ The revised decisions:
    disables the query stage and preserves relevance order for comparison
    without changing the indexed projection.
 
-   Provenance still participates in the shared structural snapshot when the
-   option is enabled. A history-only attribution change can therefore rotate
-   `meta.snapshot` and invalidate other snapshot-bound products. Separating
-   provenance identity from the structural snapshot is a follow-up after this
-   pull request, not part of the opt-in correction.
+   The published provenance projection has an independent, domain-separated
+   `meta.documentation_provenance_digest`, folded deterministically from the
+   enabled state, producer and published format contracts, and each current
+   document's source identity plus `doc_file_provenance.projection_hash`.
+   Diagnostics and blame-cache mechanics are excluded. A history-only
+   attribution change therefore updates the provenance digest without rotating
+   `meta.snapshot`, so checker batches, semantic publication checks, and code
+   cursors do not become stale solely because Git authorship metadata changed.
+   The digest is internal in this step: the readiness gate remains
+   `documentation_provenance_enabled` plus the current provenance format, and
+   public responses continue to carry the shared snapshot.
+   The structural-snapshot hash domain advances once for this contract change,
+   so the first reindex of a database published by the preceding binary may
+   rotate its old digest; subsequent provenance-only changes do not.
+
+   Two broader corrections remain separate. Provenance Git-control events are
+   still classified as full watch generations and may schedule the existing
+   optional phases; a provenance-scoped refresh signal is a watcher
+   optimization, not part of this digest split. Documentation source edits
+   still change `meta.snapshot`, so a full code/docs content-digest split and
+   public plane-specific agent identities require their own design and
+   measurement.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
    file hash. Checkout source is read once into an immutable buffer, and only
@@ -3475,6 +3503,11 @@ provenance clocks; an effectively enabled query fails closed until the
 current-format provenance projection is indexed, while freshness-disabled docs
 queries and unrelated read surfaces remain available; captured-byte blame,
 including its Git conversion fingerprint, is revalidated before publication;
+history-only attribution changes update the atomically published documentation
+provenance digest without changing `meta.snapshot`, while diagnostics and the
+blame cache change neither identity; a full disposable refresh rematerializes
+complete cached documentation-vector generations even when the recomputed
+shared snapshot equals the preceding value;
 blame line/output bounds fail only provenance rather than document admission; a
 running watcher hot-reloads only the documentation indexing policy
 (`[docs].enabled/include/exclude` and `[docs.search].freshness`) and forces a
