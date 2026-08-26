@@ -1,0 +1,1008 @@
+#!/usr/bin/env node
+
+// This file is intentionally extensionless. It must not become JavaScript
+// corpus content in only one evaluation arm and perturb the ranking it measures.
+//
+// Baseline example:
+// node scripts/eval-g26-format-scope \
+//   --manifest eval/prereg/g26-format-scope-2026-08-26.json \
+//   --binary-repository /clean/baseline-source \
+//   --corpus-repository /clean/treatment-corpus \
+//   --database /tmp/g26-v3-baseline.db \
+//   --arm baseline --output /tmp/g26-v3-baseline.json
+//
+// Treatment adds:
+//   --baseline-report /tmp/g26-v3-baseline.json
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const REPORT_SCHEMA = "g26-format-scope-report-1";
+const FROZEN_BASELINE_REVISION = "444540e3a29b68bfd5adc42bc4df99b5c5a92386";
+const FROZEN_TREATMENT_REVISION = "10e1cd54e052fd5cc4ab81b7483c4d14f6f8621f";
+const FROZEN_HOLDOUT_SHA256 = "e4b66dddc243fd870c7d7387c0eab2127cfd11f9de01d8ccb8b5de852f3cb5a4";
+const FROZEN_QUERY_PAYLOAD_SHA256 = "ed7f93d3c9b9ebd36071c3c2b2f08a149ddbcb35a61b8316b94124ed24e1c7be";
+const FILTERED_FORMS = new Set(["exact_identifier", "lowercase_multi_token_prose"]);
+const MIXED_FORMS = new Set(["lowercase_multi_token_prose"]);
+const KNOWN_FORMATS = new Set(["javascript", "typescript", "rust"]);
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requireString(value, label) {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) {
+    throw new Error(`${label} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requireSha(value, label) {
+  requireString(value, label);
+  if (!/^[0-9a-f]{40}$/.test(value)) {
+    throw new Error(`${label} must be a full lowercase Git revision`);
+  }
+  return value;
+}
+
+function requirePositiveInteger(value, label) {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function assertUniqueStrings(values, label) {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error(`${label} must be a non-empty array`);
+  }
+  const seen = new Set();
+  for (const [index, value] of values.entries()) {
+    requireString(value, `${label}[${index}]`);
+    if (seen.has(value)) throw new Error(`${label} contains duplicate ${value}`);
+    seen.add(value);
+  }
+  return values;
+}
+
+function validateRelativePath(value, label) {
+  requireString(value, label);
+  if (value.includes("\\") || path.posix.isAbsolute(value) ||
+      path.posix.normalize(value) !== value || value === "." ||
+      value.startsWith("../") || value.includes("/../")) {
+    throw new Error(`${label} must be a normalized repository-relative POSIX path`);
+  }
+  return value;
+}
+
+function validateQuery(query, cohort, ids, texts) {
+  if (!isObject(query)) throw new Error(`${cohort}: query entries must be objects`);
+  requireString(query.id, `${cohort}.id`);
+  if (ids.has(query.id)) throw new Error(`duplicate query id: ${query.id}`);
+  ids.add(query.id);
+  requireString(query.query, `${query.id}.query`);
+  if (texts.has(query.query)) throw new Error(`duplicate query text: ${query.query}`);
+  texts.add(query.query);
+  requireString(query.rationale, `${query.id}.rationale`);
+
+  const allowedForms = cohort === "filtered_parity" ? FILTERED_FORMS : MIXED_FORMS;
+  if (!allowedForms.has(query.query_form)) {
+    throw new Error(`${query.id}: unsupported query_form ${query.query_form}`);
+  }
+  if (query.query_form === "exact_identifier" &&
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(query.query)) {
+    throw new Error(`${query.id}: exact_identifier must contain one identifier`);
+  }
+  if (query.query_form === "lowercase_multi_token_prose") {
+    const tokens = query.query.split(/\s+/);
+    if (query.query !== query.query.toLowerCase() || tokens.length < 2 ||
+        tokens.some((token) => !/^[a-z0-9]+$/.test(token))) {
+      throw new Error(`${query.id}: prose queries must contain lowercase alphanumeric tokens`);
+    }
+  }
+
+  if (!isObject(query.search_scope)) {
+    throw new Error(`${query.id}.search_scope must be an object`);
+  }
+  if (cohort === "filtered_parity") {
+    if (!sameJson(query.search_scope, { formats: ["javascript", "typescript"] })) {
+      throw new Error(`${query.id}: filtered controls require exactly javascript,typescript`);
+    }
+  } else {
+    if (query.search_scope.mode !== "unfiltered") {
+      throw new Error(`${query.id}: mixed queries must omit format filtering`);
+    }
+    const expected = assertUniqueStrings(
+      query.search_scope.expected_formats,
+      `${query.id}.search_scope.expected_formats`,
+    );
+    if (expected.some((format) => !KNOWN_FORMATS.has(format)) ||
+        !expected.includes("javascript") || !expected.includes("rust")) {
+      throw new Error(`${query.id}: mixed expected_formats must include javascript and rust`);
+    }
+    if (!sameJson(Object.keys(query.search_scope).sort(), ["expected_formats", "mode"])) {
+      throw new Error(`${query.id}: mixed search_scope has unsupported fields`);
+    }
+  }
+
+  const gold = assertUniqueStrings(query.gold_files, `${query.id}.gold_files`);
+  for (const [index, file] of gold.entries()) {
+    validateRelativePath(file, `${query.id}.gold_files[${index}]`);
+  }
+  if (!Array.isArray(query.judgments) || query.judgments.length === 0) {
+    throw new Error(`${query.id}.judgments must be a non-empty array`);
+  }
+  const judgedPaths = new Set();
+  const relevantPaths = [];
+  for (const [index, judgment] of query.judgments.entries()) {
+    if (!isObject(judgment)) throw new Error(`${query.id}.judgments[${index}] must be an object`);
+    validateRelativePath(judgment.path, `${query.id}.judgments[${index}].path`);
+    if (judgedPaths.has(judgment.path)) {
+      throw new Error(`${query.id}: duplicate judgment for ${judgment.path}`);
+    }
+    judgedPaths.add(judgment.path);
+    if (!Number.isInteger(judgment.grade) || judgment.grade < 1 || judgment.grade > 3) {
+      throw new Error(`${query.id}: judgment grades must be integers from 1 through 3`);
+    }
+    requireString(judgment.reason, `${query.id}.judgments[${index}].reason`);
+    if (judgment.grade >= 2) relevantPaths.push(judgment.path);
+  }
+  if (!sameJson([...gold].sort(), relevantPaths.sort())) {
+    throw new Error(`${query.id}: gold_files must equal the grade-2/3 judgment paths`);
+  }
+  if (cohort === "mixed_relevance") {
+    const relevantFormats = new Set(relevantPaths.map(formatForPath));
+    if (!relevantFormats.has("rust") ||
+        (!relevantFormats.has("javascript") && !relevantFormats.has("typescript"))) {
+      throw new Error(`${query.id}: mixed gold must contain Rust and JavaScript/TypeScript evidence`);
+    }
+  }
+}
+
+export function validateManifest(manifest) {
+  if (!isObject(manifest) || manifest.protocol_version !== 3) {
+    throw new Error("manifest protocol_version must be 3");
+  }
+  requireSha(manifest.baseline_revision, "baseline_revision");
+  requireSha(manifest.treatment_revision, "treatment_revision");
+  requireSha(manifest.corpus_revision, "corpus_revision");
+  if (manifest.baseline_revision !== FROZEN_BASELINE_REVISION ||
+      manifest.treatment_revision !== FROZEN_TREATMENT_REVISION ||
+      manifest.corpus_revision !== FROZEN_TREATMENT_REVISION) {
+    throw new Error("v3 revisions do not match the frozen protocol");
+  }
+  if (manifest.treatment_revision !== manifest.corpus_revision) {
+    throw new Error("treatment_revision and corpus_revision must match");
+  }
+  if (manifest.baseline_revision === manifest.treatment_revision) {
+    throw new Error("baseline_revision and treatment_revision must differ");
+  }
+  if (requirePositiveInteger(manifest.retrieval_k, "retrieval_k") !== 100 ||
+      requirePositiveInteger(manifest.file_k, "file_k") !== 10) {
+    throw new Error("v3 freezes retrieval_k=100 and file_k=10");
+  }
+  const gates = manifest.gates;
+  if (!isObject(gates) ||
+      gates.filtered_recall_at_10_must_not_decrease !== true ||
+      gates.filtered_mean_mrr_maximum_drop !== 0.02 ||
+      gates.filtered_baseline_top_five_gold_may_not_fall_below_rank !== 10 ||
+      gates.mixed_pooled_judgment_mean_ndcg_at_10_minimum !== 0.70) {
+    throw new Error("v3 gate constants do not match the frozen protocol");
+  }
+  if (!isObject(manifest.metric_policy) ||
+      !manifest.metric_policy.mixed_relevance?.includes("not declared irrelevant") ||
+      !manifest.metric_policy.language_representation?.includes("never enforce a language quota")) {
+    throw new Error("metric policy must preserve the unjudged-file and no-quota caveats");
+  }
+  if (!isObject(manifest.source_holdout) ||
+      manifest.source_holdout.source_sha256 !== FROZEN_HOLDOUT_SHA256 ||
+      manifest.source_holdout.copied_query_payload_sha256 !==
+        FROZEN_QUERY_PAYLOAD_SHA256 ||
+      manifest.source_holdout.authoring_constraints?.prospective !== true ||
+      manifest.source_holdout.authoring_constraints?.ranked_outputs_inspected !== false ||
+      manifest.source_holdout.authoring_constraints?.jscout_search_run !== false ||
+      manifest.source_holdout.authoring_constraints?.existing_g26_manifests_inspected !== false ||
+      manifest.source_holdout.authoring_constraints?.existing_eval_results_inspected !== false ||
+      manifest.source_holdout.authoring_constraints?.source_only_authoring !== true) {
+    throw new Error("source holdout provenance is incomplete");
+  }
+  if (!Array.isArray(manifest.filtered_parity_queries) ||
+      manifest.filtered_parity_queries.length !== 24) {
+    throw new Error("filtered_parity_queries must contain exactly 24 queries");
+  }
+  if (!Array.isArray(manifest.mixed_relevance_queries) ||
+      manifest.mixed_relevance_queries.length !== 24) {
+    throw new Error("mixed_relevance_queries must contain exactly 24 queries");
+  }
+
+  const ids = new Set();
+  const texts = new Set();
+  for (const query of manifest.filtered_parity_queries) {
+    validateQuery(query, "filtered_parity", ids, texts);
+  }
+  for (const query of manifest.mixed_relevance_queries) {
+    validateQuery(query, "mixed_relevance", ids, texts);
+  }
+  const filteredForms = manifest.filtered_parity_queries.reduce((counts, query) => {
+    counts[query.query_form] = (counts[query.query_form] ?? 0) + 1;
+    return counts;
+  }, {});
+  if (filteredForms.exact_identifier !== 12 ||
+      filteredForms.lowercase_multi_token_prose !== 12) {
+    throw new Error("filtered parity requires 12 exact and 12 prose queries");
+  }
+  if (queryManifestSha256(manifest) !== FROZEN_QUERY_PAYLOAD_SHA256) {
+    throw new Error("manifest queries do not match the frozen source-authored payload");
+  }
+  return manifest;
+}
+
+export function validateCorpusPaths(manifest, repository) {
+  const root = fs.realpathSync(repository);
+  const checked = new Set();
+  for (const query of [
+    ...manifest.filtered_parity_queries,
+    ...manifest.mixed_relevance_queries,
+  ]) {
+    for (const judgment of query.judgments) {
+      if (checked.has(judgment.path)) continue;
+      checked.add(judgment.path);
+      const candidate = path.resolve(root, ...judgment.path.split("/"));
+      const relative = path.relative(root, candidate);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw new Error(`${query.id}: judgment path escapes the corpus: ${judgment.path}`);
+      }
+      let stat;
+      try {
+        stat = fs.statSync(candidate);
+      } catch {
+        throw new Error(`${query.id}: judged corpus file does not exist: ${judgment.path}`);
+      }
+      if (!stat.isFile()) {
+        throw new Error(`${query.id}: judged corpus path is not a file: ${judgment.path}`);
+      }
+    }
+  }
+}
+
+export function deduplicateFiles(hits, fileK) {
+  requirePositiveInteger(fileK, "fileK");
+  if (!Array.isArray(hits)) throw new Error("hits must be an array");
+  const seen = new Set();
+  const files = [];
+  for (const [index, hit] of hits.entries()) {
+    if (!isObject(hit) || typeof hit.file !== "string" || hit.file.length === 0) {
+      throw new Error(`hits[${index}] must have a file`);
+    }
+    if (seen.has(hit.file)) continue;
+    seen.add(hit.file);
+    files.push(hit.file);
+    if (files.length === fileK) break;
+  }
+  return files;
+}
+
+function mean(values) {
+  if (!Array.isArray(values) || values.length === 0) throw new Error("cannot average an empty set");
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function scoreGold(goldFiles, rankedFiles) {
+  const goldRanks = goldFiles.map((file) => {
+    const index = rankedFiles.indexOf(file);
+    return { file, rank: index === -1 ? null : index + 1 };
+  });
+  const present = goldRanks.flatMap(({ rank }) => rank === null ? [] : [rank]);
+  const first = present.length === 0 ? null : Math.min(...present);
+  return {
+    gold_ranks: goldRanks,
+    recall_at_10: present.length / goldFiles.length,
+    first_gold_rank: first,
+    reciprocal_rank: first === null ? 0 : 1 / first,
+  };
+}
+
+export function scoreBaselineFiltered(manifest, queryRuns) {
+  const byId = new Map(queryRuns.map((run) => [run.id, run]));
+  if (byId.size !== queryRuns.length || queryRuns.length !== 24) {
+    throw new Error("baseline must contain exactly one run for each of 24 filtered queries");
+  }
+  const queries = manifest.filtered_parity_queries.map((query) => {
+    const run = byId.get(query.id);
+    if (!run) throw new Error(`missing baseline query run: ${query.id}`);
+    validateRawHitFormats(run.raw_hits, "filtered_parity", query.id);
+    const rankedFiles = deduplicateFiles(run.raw_hits, manifest.file_k);
+    return {
+      id: query.id,
+      query: query.query,
+      query_form: query.query_form,
+      gold_files: query.gold_files,
+      ranked_files: rankedFiles,
+      ...scoreGold(query.gold_files, rankedFiles),
+    };
+  });
+  return {
+    label: "filtered_js_ts_parity_baseline",
+    queries,
+    mean_recall_at_10: mean(queries.map((query) => query.recall_at_10)),
+    mean_reciprocal_rank: mean(queries.map((query) => query.reciprocal_rank)),
+  };
+}
+
+export function scoreFilteredParity(manifest, baselineReport, queryRuns) {
+  const baseline = new Map(baselineReport.queries.map((query) => [query.id, query]));
+  const byId = new Map(queryRuns.map((run) => [run.id, run]));
+  if (byId.size !== queryRuns.length || queryRuns.length !== 24) {
+    throw new Error("treatment filtered arm must contain exactly 24 unique query runs");
+  }
+  const queries = manifest.filtered_parity_queries.map((query) => {
+    const old = baseline.get(query.id);
+    const run = byId.get(query.id);
+    if (!old || !run) throw new Error(`missing filtered parity result: ${query.id}`);
+    validateRawHitFormats(run.raw_hits, "filtered_parity", query.id);
+    const rankedFiles = deduplicateFiles(run.raw_hits, manifest.file_k);
+    const current = scoreGold(query.gold_files, rankedFiles);
+    return {
+      id: query.id,
+      query: query.query,
+      query_form: query.query_form,
+      gold_files: query.gold_files,
+      baseline_ranked_files: old.ranked_files,
+      ranked_files: rankedFiles,
+      baseline_recall_at_10: old.recall_at_10,
+      recall_at_10: current.recall_at_10,
+      baseline_reciprocal_rank: old.reciprocal_rank,
+      reciprocal_rank: current.reciprocal_rank,
+      baseline_gold_ranks: old.gold_ranks,
+      gold_ranks: current.gold_ranks,
+    };
+  });
+  return {
+    label: "filtered_js_ts_parity",
+    queries,
+    baseline_mean_recall_at_10: mean(queries.map((query) => query.baseline_recall_at_10)),
+    mean_recall_at_10: mean(queries.map((query) => query.recall_at_10)),
+    baseline_mean_reciprocal_rank: mean(
+      queries.map((query) => query.baseline_reciprocal_rank),
+    ),
+    mean_reciprocal_rank: mean(queries.map((query) => query.reciprocal_rank)),
+  };
+}
+
+export function normalizedDiscountedCumulativeGain(rankedFiles, judgments, k = 10) {
+  requirePositiveInteger(k, "k");
+  const grades = new Map(judgments.map(({ path: file, grade }) => [file, grade]));
+  const gain = (grade) => (2 ** grade) - 1;
+  const dcg = rankedFiles.slice(0, k).reduce((score, file, index) => {
+    const grade = grades.get(file) ?? 0;
+    return score + gain(grade) / Math.log2(index + 2);
+  }, 0);
+  const idealGrades = [...grades.values()].sort((left, right) => right - left).slice(0, k);
+  const idealDcg = idealGrades.reduce(
+    (score, grade, index) => score + gain(grade) / Math.log2(index + 2),
+    0,
+  );
+  if (idealDcg === 0) throw new Error("nDCG requires at least one positive judgment");
+  return dcg / idealDcg;
+}
+
+export function formatForPath(file) {
+  const extension = path.posix.extname(file).toLowerCase();
+  if ([".js", ".jsx", ".mjs", ".cjs"].includes(extension)) return "javascript";
+  if ([".ts", ".tsx", ".mts", ".cts"].includes(extension)) return "typescript";
+  if (extension === ".rs") return "rust";
+  return "other";
+}
+
+export function validateRawHitFormats(hits, cohort, queryId) {
+  if (!Array.isArray(hits)) throw new Error(`${queryId}: raw hits must be an array`);
+  for (const [index, hit] of hits.entries()) {
+    if (!isObject(hit) || typeof hit.file !== "string" || hit.file.length === 0) {
+      throw new Error(`${queryId}: raw_hits[${index}] must have a file`);
+    }
+    const format = formatForPath(hit.file);
+    if (cohort === "filtered_parity") {
+      if (format !== "javascript" && format !== "typescript") {
+        throw new Error(
+          `${queryId}: filtered-parity raw hit is not JavaScript/TypeScript: ${hit.file}`,
+        );
+      }
+    } else if (cohort === "mixed_relevance") {
+      if (!KNOWN_FORMATS.has(format)) {
+        throw new Error(`${queryId}: mixed raw hit has an unregistered code format: ${hit.file}`);
+      }
+    } else {
+      throw new Error(`${queryId}: unknown query cohort ${cohort}`);
+    }
+  }
+}
+
+export function validateArmSnapshot(queryRuns, label = "arm") {
+  if (!Array.isArray(queryRuns) || queryRuns.length === 0) {
+    throw new Error(`${label}: query runs must be non-empty`);
+  }
+  const snapshot = requireString(queryRuns[0].snapshot, `${label}.snapshot`);
+  for (const run of queryRuns) {
+    if (run.snapshot !== snapshot) {
+      throw new Error(`${label}: every query response must use the same snapshot`);
+    }
+  }
+  return snapshot;
+}
+
+export function scoreMixedRelevance(manifest, queryRuns) {
+  const byId = new Map(queryRuns.map((run) => [run.id, run]));
+  if (byId.size !== queryRuns.length || queryRuns.length !== 24) {
+    throw new Error("mixed arm must contain exactly 24 unique query runs");
+  }
+  const queries = manifest.mixed_relevance_queries.map((query) => {
+    const run = byId.get(query.id);
+    if (!run) throw new Error(`missing mixed query run: ${query.id}`);
+    validateRawHitFormats(run.raw_hits, "mixed_relevance", query.id);
+    const rankedFiles = deduplicateFiles(run.raw_hits, manifest.file_k);
+    const judged = new Set(query.judgments.map((judgment) => judgment.path));
+    const representation = rankedFiles.reduce((counts, file) => {
+      const format = formatForPath(file);
+      counts[format] = (counts[format] ?? 0) + 1;
+      return counts;
+    }, {});
+    return {
+      id: query.id,
+      query: query.query,
+      query_form: query.query_form,
+      gold_files: query.gold_files,
+      judgments: query.judgments,
+      ranked_files: rankedFiles,
+      pooled_judgment_ndcg_at_10: normalizedDiscountedCumulativeGain(
+        rankedFiles,
+        query.judgments,
+        manifest.file_k,
+      ),
+      unjudged_returned_files: rankedFiles.filter((file) => !judged.has(file)),
+      observed_format_counts: representation,
+      expected_formats_for_observation: query.search_scope.expected_formats,
+    };
+  });
+  const formatCounts = queries.reduce((totals, query) => {
+    for (const [format, count] of Object.entries(query.observed_format_counts)) {
+      totals[format] = (totals[format] ?? 0) + count;
+    }
+    return totals;
+  }, {});
+  return {
+    label: "mixed_relevance_pooled_judgment",
+    metric_note: "Unjudged files score zero only for nDCG computation and are not declared irrelevant.",
+    representation_note: "Observed formats are descriptive only; no language quota is gated.",
+    queries,
+    mean_pooled_judgment_ndcg_at_10: mean(
+      queries.map((query) => query.pooled_judgment_ndcg_at_10),
+    ),
+    observed_format_counts: formatCounts,
+  };
+}
+
+export function evaluateTreatmentGates(manifest, filtered, mixed) {
+  const displaced = filtered.queries.flatMap((query) => {
+    const currentRanks = new Map(query.gold_ranks.map(({ file, rank }) => [file, rank]));
+    return query.baseline_gold_ranks
+      .filter(({ rank }) => rank !== null && rank <= 5)
+      .flatMap(({ file, rank }) => {
+        const current = currentRanks.get(file);
+        return current === null ||
+          current > manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank
+          ? [{
+              id: query.id,
+              file,
+              baseline_rank: rank,
+              treatment_rank: current ?? null,
+            }]
+          : [];
+      });
+  });
+  const mrrDrop = filtered.baseline_mean_reciprocal_rank -
+    filtered.mean_reciprocal_rank;
+  const outcomes = [{
+    gate: "filtered_recall_at_10_nondecrease",
+    baseline: filtered.baseline_mean_recall_at_10,
+    actual: filtered.mean_recall_at_10,
+    pass: filtered.mean_recall_at_10 >= filtered.baseline_mean_recall_at_10,
+  }, {
+    gate: "filtered_mean_mrr_maximum_drop",
+    threshold: manifest.gates.filtered_mean_mrr_maximum_drop,
+    actual_drop: mrrDrop,
+    pass: mrrDrop <= manifest.gates.filtered_mean_mrr_maximum_drop,
+  }, {
+    gate: "filtered_baseline_top_five_gold_stays_top_ten",
+    threshold: manifest.gates.filtered_baseline_top_five_gold_may_not_fall_below_rank,
+    failures: displaced,
+    pass: displaced.length === 0,
+  }, {
+    gate: "mixed_pooled_judgment_mean_ndcg_at_10",
+    threshold: manifest.gates.mixed_pooled_judgment_mean_ndcg_at_10_minimum,
+    actual: mixed.mean_pooled_judgment_ndcg_at_10,
+    pass: mixed.mean_pooled_judgment_ndcg_at_10 >=
+      manifest.gates.mixed_pooled_judgment_mean_ndcg_at_10_minimum,
+  }];
+  return {
+    decision: outcomes.every((outcome) => outcome.pass) ? "pass" : "fail",
+    outcomes,
+  };
+}
+
+export function queriesForArm(manifest, arm) {
+  if (arm === "baseline") {
+    return manifest.filtered_parity_queries.map((query) => ({
+      cohort: "filtered_parity",
+      query,
+    }));
+  }
+  if (arm === "treatment") {
+    return [
+      ...manifest.filtered_parity_queries.map((query) => ({
+        cohort: "filtered_parity",
+        query,
+      })),
+      ...manifest.mixed_relevance_queries.map((query) => ({
+        cohort: "mixed_relevance",
+        query,
+      })),
+    ];
+  }
+  throw new Error("arm must be baseline or treatment");
+}
+
+export function buildSearchArgs(manifest, arm, cohort, query, repository, database) {
+  const args = [
+    "search",
+    repository,
+    query.query,
+    "--database",
+    database,
+    "--limit",
+    String(manifest.retrieval_k),
+    "--origin",
+    "repository,workspace",
+    "--lexical-only",
+    "--no-memory",
+    "--no-expand",
+    "--debug-json",
+  ];
+  if (arm === "treatment" && cohort === "filtered_parity") {
+    args.push("--format", "javascript", "--format", "typescript");
+  }
+  return args;
+}
+
+export function queryManifestSha256(manifest) {
+  return createHash("sha256").update(JSON.stringify({
+    filtered_parity_queries: manifest.filtered_parity_queries,
+    mixed_relevance_queries: manifest.mixed_relevance_queries,
+  })).digest("hex");
+}
+
+export function validateBaselineReport(
+  manifest,
+  report,
+  manifestSha256,
+  expectedCorpusRepository = null,
+  expectedRunnerSha256 = null,
+) {
+  if (!isObject(report) || report.schema_version !== REPORT_SCHEMA ||
+      report.protocol_version !== 3 || report.arm !== "baseline") {
+    throw new Error("baseline report has the wrong schema, protocol, or arm");
+  }
+  if (report.manifest_sha256 !== manifestSha256 ||
+      report.query_manifest_sha256 !== queryManifestSha256(manifest)) {
+    throw new Error("baseline report does not match this frozen manifest");
+  }
+  if (report.binary_source?.revision !== manifest.baseline_revision ||
+      report.corpus?.revision !== manifest.corpus_revision) {
+    throw new Error("baseline report revision provenance does not match the manifest");
+  }
+  if (expectedCorpusRepository !== null) {
+    let reportedCorpus;
+    try {
+      reportedCorpus = fs.realpathSync(report.corpus?.repository);
+    } catch {
+      throw new Error("baseline report corpus checkout is unavailable");
+    }
+    if (reportedCorpus !== expectedCorpusRepository) {
+      throw new Error("baseline and treatment must index the same corpus checkout");
+    }
+  }
+  if (!/^[0-9a-f]{64}$/.test(report.binary_source?.sha256 ?? "") ||
+      !isObject(report.runner) ||
+      typeof report.runner.path !== "string" || report.runner.path.length === 0 ||
+      !/^[0-9a-f]{64}$/.test(report.runner.sha256 ?? "") ||
+      report.provider_free !== true ||
+      !sameJson(report.search_profiles, {
+        filtered_parity: {
+          formats: "omitted_for_baseline_binary_compatibility",
+          origins: ["repository", "workspace"],
+          retrieval_k: 100,
+          lexical_only: true,
+          memory: false,
+          expansion: false,
+        },
+        mixed_relevance: null,
+      })) {
+    throw new Error("baseline report execution provenance is invalid");
+  }
+  if (expectedRunnerSha256 !== null && report.runner.sha256 !== expectedRunnerSha256) {
+    throw new Error("baseline report runner SHA does not match the current runner bytes");
+  }
+  if (!Array.isArray(report.query_runs) || report.query_runs.length !== 24) {
+    throw new Error("baseline report must contain 24 raw query runs");
+  }
+  const expectedIds = manifest.filtered_parity_queries.map((query) => query.id);
+  if (!sameJson(report.query_runs.map((run) => run.id), expectedIds)) {
+    throw new Error("baseline report query order or membership does not match the manifest");
+  }
+  const baselineSnapshot = validateArmSnapshot(report.query_runs, "baseline report");
+  if (report.arm_snapshot !== baselineSnapshot) {
+    throw new Error("baseline report arm_snapshot does not match its query responses");
+  }
+  for (const [index, run] of report.query_runs.entries()) {
+    const query = manifest.filtered_parity_queries[index];
+    if (run.cohort !== "filtered_parity" || run.query !== query.query ||
+        run.query_form !== query.query_form || !Array.isArray(run.raw_hits) ||
+        run.raw_hits.length > manifest.retrieval_k ||
+        run.retrieval?.vector !== "disabled" ||
+        run.retrieval?.reranker !== "disabled") {
+      throw new Error(`${query.id}: baseline raw run provenance mismatch`);
+    }
+    deduplicateFiles(run.raw_hits, manifest.file_k);
+  }
+  const recomputed = scoreBaselineFiltered(manifest, report.query_runs);
+  if (!sameJson(report.metrics?.filtered_parity, recomputed)) {
+    throw new Error("baseline report metrics do not match its raw hits");
+  }
+  return recomputed;
+}
+
+function parseArgs(argv) {
+  const options = {};
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!flag?.startsWith("--") || value === undefined) {
+      throw new Error("arguments must be --name value pairs");
+    }
+    const name = flag.slice(2);
+    if (Object.hasOwn(options, name)) throw new Error(`duplicate argument --${name}`);
+    options[name] = value;
+  }
+  for (const required of [
+    "manifest",
+    "binary-repository",
+    "corpus-repository",
+    "database",
+    "arm",
+    "output",
+  ]) {
+    if (!options[required]) throw new Error(`--${required} is required`);
+  }
+  if (!["baseline", "treatment"].includes(options.arm)) {
+    throw new Error("--arm must be baseline or treatment");
+  }
+  if (options.arm === "treatment" && !options["baseline-report"]) {
+    throw new Error("--baseline-report is required for the treatment arm");
+  }
+  if (options.arm === "baseline" && options["baseline-report"]) {
+    throw new Error("--baseline-report is not accepted for the baseline arm");
+  }
+  return options;
+}
+
+function git(repository, args) {
+  return execFileSync("git", ["-C", repository, ...args], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  }).trim();
+}
+
+function sha256(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function assertCleanCheckout(repository, expectedRevision, label) {
+  const root = fs.realpathSync(repository);
+  const topLevel = fs.realpathSync(git(root, ["rev-parse", "--show-toplevel"]));
+  if (root !== topLevel) throw new Error(`${label} must name the checkout root`);
+  const revision = git(root, ["rev-parse", "HEAD"]);
+  if (revision !== expectedRevision) {
+    throw new Error(`${label} revision ${revision} does not match ${expectedRevision}`);
+  }
+  const dirty = git(root, ["status", "--porcelain", "--untracked-files=all"]);
+  if (dirty) throw new Error(`${label} must be clean before evaluation:\n${dirty}`);
+  return root;
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function assertExternalFreshPaths(paths, repositories) {
+  const absolute = paths.map((value) => path.resolve(value));
+  if (new Set(absolute).size !== absolute.length) {
+    throw new Error("database, output, and baseline report paths must be distinct");
+  }
+  for (const candidate of absolute) {
+    if (repositories.some((repository) => isInside(repository, candidate))) {
+      throw new Error(`evaluation artifacts must be outside evaluated checkouts: ${candidate}`);
+    }
+  }
+  for (const candidate of absolute.slice(0, 2)) {
+    if (fs.existsSync(candidate)) throw new Error(`path already exists: ${candidate}`);
+  }
+}
+
+function run(binary, args, options = {}) {
+  const result = spawnSync(binary, args, {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+    env: options.env ?? process.env,
+    cwd: options.cwd,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${path.basename(binary)} ${args[0]} failed (${result.status}): ${result.stderr.trim()}`);
+  }
+  return result;
+}
+
+function cleanProviderEnvironment() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("JSCOUT_EMBED_") || key.startsWith("JSCOUT_RERANK_")) delete env[key];
+  }
+  for (const key of ["OPENAI_API_KEY", "VOYAGE_API_KEY", "COHERE_API_KEY"]) delete env[key];
+  return env;
+}
+
+function validateSearchResponse(response, queryId, cohort, retrievalK) {
+  if (response.retrieval?.vector !== "disabled" ||
+      response.retrieval?.reranker !== "disabled") {
+    throw new Error(`${queryId}: search was not provider-free lexical`);
+  }
+  if (!Array.isArray(response.hits)) {
+    throw new Error(`${queryId}: debug JSON did not expose raw hits`);
+  }
+  if (response.hits.length > retrievalK) {
+    throw new Error(`${queryId}: search returned more than retrieval_k raw hits`);
+  }
+  requireString(response.snapshot, `${queryId}.snapshot`);
+  validateRawHitFormats(response.hits, cohort, queryId);
+  deduplicateFiles(response.hits, 10);
+}
+
+function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const runnerPath = fs.realpathSync(fileURLToPath(import.meta.url));
+  const runnerSha256 = sha256(runnerPath);
+  const manifestPath = path.resolve(options.manifest);
+  const manifestBytes = fs.readFileSync(manifestPath);
+  const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  const manifest = validateManifest(JSON.parse(manifestBytes.toString("utf8")));
+  const expectedBinaryRevision = options.arm === "baseline"
+    ? manifest.baseline_revision
+    : manifest.treatment_revision;
+  const binaryRepository = assertCleanCheckout(
+    options["binary-repository"],
+    expectedBinaryRevision,
+    "binary repository",
+  );
+  const corpusRepository = assertCleanCheckout(
+    options["corpus-repository"],
+    manifest.corpus_revision,
+    "corpus repository",
+  );
+  if (fs.existsSync(path.join(corpusRepository, ".jscout.toml"))) {
+    throw new Error("corpus-local .jscout.toml is not allowed by this provider-free protocol");
+  }
+  validateCorpusPaths(manifest, corpusRepository);
+
+  const database = path.resolve(options.database);
+  const output = path.resolve(options.output);
+  const baselineReportPath = options["baseline-report"]
+    ? path.resolve(options["baseline-report"])
+    : null;
+  assertExternalFreshPaths(
+    [database, output, ...(baselineReportPath ? [baselineReportPath] : [])],
+    [binaryRepository, corpusRepository],
+  );
+  let baselineReport = null;
+  let baselineMetrics = null;
+  let baselineReportSha256 = null;
+  if (baselineReportPath) {
+    if (!fs.statSync(baselineReportPath).isFile()) {
+      throw new Error("--baseline-report must name a regular file");
+    }
+    baselineReportSha256 = sha256(baselineReportPath);
+    baselineReport = JSON.parse(fs.readFileSync(baselineReportPath, "utf8"));
+    baselineMetrics = validateBaselineReport(
+      manifest,
+      baselineReport,
+      manifestSha256,
+      corpusRepository,
+      runnerSha256,
+    );
+  }
+
+  fs.mkdirSync(path.dirname(database), { recursive: true });
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const env = cleanProviderEnvironment();
+  run("cargo", ["build", "--release", "--locked"], { env, cwd: binaryRepository });
+  const binary = path.join(
+    binaryRepository,
+    "target",
+    "release",
+    process.platform === "win32" ? "jscout.exe" : "jscout",
+  );
+  if (!fs.statSync(binary).isFile()) throw new Error(`release build did not produce ${binary}`);
+  fs.accessSync(binary, fs.constants.X_OK);
+  const version = run(binary, ["--version"], { env }).stdout.trim();
+  const binarySha256 = sha256(binary);
+  const indexStarted = process.hrtime.bigint();
+  const indexed = run(binary, [
+    "index",
+    corpusRepository,
+    "--database",
+    database,
+  ], { env });
+  const indexDurationMs = Number(process.hrtime.bigint() - indexStarted) / 1e6;
+
+  const queryRuns = [];
+  for (const { cohort, query } of queriesForArm(manifest, options.arm)) {
+    const args = buildSearchArgs(
+      manifest,
+      options.arm,
+      cohort,
+      query,
+      corpusRepository,
+      database,
+    );
+    const result = run(binary, args, { env });
+    const response = JSON.parse(result.stdout);
+    validateSearchResponse(response, query.id, cohort, manifest.retrieval_k);
+    queryRuns.push({
+      id: query.id,
+      cohort,
+      query: query.query,
+      query_form: query.query_form,
+      raw_hits: response.hits,
+      retrieval: response.retrieval,
+      snapshot: response.snapshot,
+    });
+  }
+  const armSnapshot = validateArmSnapshot(queryRuns, `${options.arm} arm`);
+
+  const searchProfiles = options.arm === "baseline"
+    ? {
+        filtered_parity: {
+          formats: "omitted_for_baseline_binary_compatibility",
+          origins: ["repository", "workspace"],
+          retrieval_k: 100,
+          lexical_only: true,
+          memory: false,
+          expansion: false,
+        },
+        mixed_relevance: null,
+      }
+    : {
+        filtered_parity: {
+          formats: ["javascript", "typescript"],
+          origins: ["repository", "workspace"],
+          retrieval_k: 100,
+          lexical_only: true,
+          memory: false,
+          expansion: false,
+        },
+        mixed_relevance: {
+          formats: "omitted_all_code_formats",
+          origins: ["repository", "workspace"],
+          retrieval_k: 100,
+          lexical_only: true,
+          memory: false,
+          expansion: false,
+        },
+      };
+  const metrics = {};
+  let treatmentGates = null;
+  if (options.arm === "baseline") {
+    metrics.filtered_parity = scoreBaselineFiltered(manifest, queryRuns);
+    metrics.mixed_relevance = null;
+  } else {
+    const filteredRuns = queryRuns.filter((run) => run.cohort === "filtered_parity");
+    const mixedRuns = queryRuns.filter((run) => run.cohort === "mixed_relevance");
+    metrics.filtered_parity = scoreFilteredParity(manifest, baselineMetrics, filteredRuns);
+    metrics.mixed_relevance = scoreMixedRelevance(manifest, mixedRuns);
+    treatmentGates = evaluateTreatmentGates(
+      manifest,
+      metrics.filtered_parity,
+      metrics.mixed_relevance,
+    );
+  }
+
+  assertCleanCheckout(binaryRepository, expectedBinaryRevision, "binary repository");
+  assertCleanCheckout(corpusRepository, manifest.corpus_revision, "corpus repository");
+  const report = {
+    schema_version: REPORT_SCHEMA,
+    protocol_version: 3,
+    arm: options.arm,
+    manifest: path.relative(process.cwd(), manifestPath),
+    manifest_sha256: manifestSha256,
+    query_manifest_sha256: queryManifestSha256(manifest),
+    runner: {
+      path: runnerPath,
+      sha256: runnerSha256,
+    },
+    binary_source: {
+      repository: binaryRepository,
+      revision: expectedBinaryRevision,
+      binary,
+      sha256: binarySha256,
+      version,
+      build: "cargo build --release --locked",
+    },
+    corpus: {
+      repository: corpusRepository,
+      revision: manifest.corpus_revision,
+      shared_between_arms: true,
+    },
+    database,
+    database_bytes: fs.statSync(database).size,
+    index_duration_ms: indexDurationMs,
+    provider_free: true,
+    arm_snapshot: armSnapshot,
+    search_profiles: searchProfiles,
+    baseline_report: baselineReportPath
+      ? { path: baselineReportPath, sha256: baselineReportSha256 }
+      : null,
+    index_stdout: indexed.stdout.trim(),
+    index_stderr: indexed.stderr.trim(),
+    query_runs: queryRuns,
+    metrics,
+    treatment_gates: treatmentGates,
+  };
+  fs.writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+  process.stdout.write(`${JSON.stringify({
+    output,
+    manifest_sha256: manifestSha256,
+    runner_sha256: runnerSha256,
+    binary_sha256: binarySha256,
+    baseline_report_sha256: baselineReportSha256,
+    arm_snapshot: armSnapshot,
+    treatment_decision: treatmentGates?.decision ?? null,
+    metric_aggregates: options.arm === "baseline"
+      ? {
+          filtered_mean_recall_at_10: metrics.filtered_parity.mean_recall_at_10,
+          filtered_mean_reciprocal_rank: metrics.filtered_parity.mean_reciprocal_rank,
+        }
+      : {
+          filtered_baseline_mean_recall_at_10:
+            metrics.filtered_parity.baseline_mean_recall_at_10,
+          filtered_mean_recall_at_10: metrics.filtered_parity.mean_recall_at_10,
+          filtered_baseline_mean_reciprocal_rank:
+            metrics.filtered_parity.baseline_mean_reciprocal_rank,
+          filtered_mean_reciprocal_rank:
+            metrics.filtered_parity.mean_reciprocal_rank,
+          mixed_mean_pooled_judgment_ndcg_at_10:
+            metrics.mixed_relevance.mean_pooled_judgment_ndcg_at_10,
+        },
+    gate_outcomes: treatmentGates?.outcomes ?? null,
+  }, null, 2)}\n`);
+  if (treatmentGates?.decision === "fail") process.exitCode = 1;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main();
+}

@@ -46,7 +46,9 @@ known code.
    identifier. Exhaustive mode searches indexed source content and disables
    vector search, reranking, expansion, and attached memory. Do not use a
    ranked result limit as a completeness boundary; exhaustive `limit` is only
-   a page size.
+   a page size. Search spans all registered code formats by default. When the
+   question names a language or implementation surface, pass its explicit
+   `formats` allowlist.
 2. Inspect the first page before committing to traversal. Exhaustive FTS joins
    multiple effective terms with OR, so a punctuation-qualified input can
    become a much broader evidence set than intended. If the response warns
@@ -59,7 +61,7 @@ known code.
 3. For a correctly specified traversal, page sequentially. Record the response
    `snapshot` and the full G22 envelope:
    `effective.{vector,rerank,expand,include_memory,
-   page_size}`, normalized `scope.{corpus,file_roles,origins,snapshot}`,
+   page_size}`, normalized `scope.{corpus,file_roles,origins,formats,snapshot}`,
    `total_chunks`, page-local `returned`, `truncated`, and `next_cursor`, plus
    each hit's `match_lines`. While `truncated` is true, preserve the original
    query and filter inputs and set only `cursor` to the returned `next_cursor`
@@ -86,9 +88,9 @@ known code.
    When no exact anchor is available, human-authored `symbol` mode remains a
    fuzzy localization fallback, not evidence of same-name exactness. Whenever
    manually constructing a compatible locator follow-up, copy the original
-   search's explicit `origins` allowlist unchanged; if the search omitted
-   `origins`, keep it omitted. Never synthesize follow-up arguments from echoed
-   `scope.origins`.
+   search's explicit `origins` and `formats` allowlists unchanged; if the search
+   omitted either input, keep it omitted. Never synthesize follow-up arguments
+   from echoed `scope.origins` or `scope.formats`.
 5. Only after lexical localization, use a separate non-exhaustive ranked
    `semantic_search` with `vector: true` or `who_uses` when looking for aliases
    or callers that source-text matches do not enumerate. In the structural
@@ -99,7 +101,7 @@ known code.
    localization. For an exact-identifier follow-up, set `vector: false` and
    `rerank: false` unless lexical results are insufficient.
 6. A completeness answer must state the echoed scope: corpus, file roles,
-   origins, and snapshot. Exhaustive coverage is by indexed chunk plus unique
+   origins, formats, and snapshot. Exhaustive coverage is by indexed chunk plus unique
    `match_lines`; it is not regex, substring, or within-line occurrence
    coverage. Use repository-local text search when that stronger literal
    representation is required.
@@ -169,11 +171,13 @@ architecture, or regressions involving multiple mechanisms.
 
 After localization, use exact-anchor `who_uses` for callers, `file_outline` for
 one file, `calls` for member-method or object-option questions, and `events`
-for string-keyed wiring. When the structural profile exposes them, use
-`entities` or `paths` for named boundaries and bounded routes. If jscout
-returns no relevant evidence, or the question requires literal
-regex/substring coverage outside the indexed scope, fall back to
-repository-local search and state that boundary.
+for string-keyed wiring. For plain-text formats, `file_outline` returns
+span-only line ranges with `name: null`; read the relevant source by the
+returned range. When the structural profile exposes them, use `entities` or
+`paths` for named boundaries and bounded routes. If jscout returns no relevant
+evidence, or the question requires literal regex/substring coverage outside
+the indexed scope, fall back to repository-local search and state that
+boundary.
 
 ## Write back verified durable knowledge
 

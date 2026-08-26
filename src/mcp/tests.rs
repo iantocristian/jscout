@@ -492,6 +492,422 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
 }
 
 #[test]
+fn poisoned_rust_facts_do_not_cross_structural_mcp_boundaries() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("src/service.ts"),
+        "export function sharedNeedle(db: any, bus: any) {\n\
+           bus.emit('shared-event');\n\
+           db.items.sharedCall({ marker: true });\n\
+           return sharedNeedle(db, bus);\n\
+         }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let anchor: String = conn.query_row(
+        "SELECT node_key FROM graph_nodes
+         WHERE node_kind='symbol' AND display_name='sharedNeedle'",
+        [],
+        |row| row.get(0),
+    )?;
+    let typescript_file: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='src/service.ts'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let rust_source = "db.items.sharedCall({ marker: true });\n";
+    fs::write(repo.path().join("poison.rs"), rust_source)?;
+    conn.execute(
+        "INSERT INTO files(path,hash,corpus,format,role,origin)
+         VALUES('poison.rs',?1,'code','rust','production','repository')",
+        [blake3::hash(rust_source.as_bytes()).to_hex().to_string()],
+    )?;
+    let rust_file = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks(
+           file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(?1,'method','sharedNeedle','','sharedNeedle',0,39,1,1,
+                  'rust-poison-chunk',?2)",
+        rusqlite::params![rust_file, rust_source],
+    )?;
+    let rust_chunk = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'sharedNeedle','function',0,12,0,39,'',1,1)",
+        [rust_file],
+    )?;
+    conn.execute(
+        "INSERT INTO refs(
+           file_id,chunk_id,start,line,kind,confidence,target_request,target_name,local
+         ) VALUES(?1,?2,0,91,'call','certain','./src/service','sharedNeedle',0)",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+    conn.execute(
+        "INSERT INTO module_edges(from_file,request,to_file,resolution)
+         VALUES(?1,'./src/service',?2,'resolver')",
+        rusqlite::params![rust_file, typescript_file],
+    )?;
+    conn.execute(
+        "INSERT INTO events(file_id,chunk_id,line,role,name,method)
+         VALUES(?1,?2,92,'listen','shared-event','on')",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+    conn.execute(
+        "INSERT INTO member_calls(file_id,chunk_id,start,end,line,prop,object)
+         VALUES(?1,?2,0,39,93,'sharedCall','items')",
+        rusqlite::params![rust_file, rust_chunk],
+    )?;
+
+    for (tool, arguments) in [
+        (
+            "definition",
+            json!({
+                "symbol": "sharedNeedle",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "who_uses",
+            json!({
+                "anchor": anchor,
+                "snapshot": snapshot,
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "events",
+            json!({
+                "name": "shared-event",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+        (
+            "calls",
+            json!({
+                "method": "sharedCall",
+                "origins": ["repository"],
+                "response_bytes": 100_000
+            }),
+        ),
+    ] {
+        let rendered = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            tool,
+            &arguments,
+        )?;
+        assert!(
+            rendered.contains("src/service.ts"),
+            "{tool} did not exercise the eligible TypeScript control: {rendered}"
+        );
+        assert!(
+            !rendered.contains("poison.rs"),
+            "{tool} leaked a checker-ineligible Rust fact: {rendered}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_semantic_search_expand_stays_lexical_at_mcp_boundary() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn lexical_native_marker() { println!(\"native marker\"); }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rendered = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "lexical native marker",
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "expand": true,
+            "expand_mode": "paths",
+            "limit": 10,
+            "response_bytes": 100_000
+        }),
+    )?;
+    let response: serde_json::Value = serde_json::from_str(&rendered)?;
+    let hit = response["hits"]
+        .as_array()
+        .and_then(|hits| hits.iter().find(|hit| hit["at"] == "native.rs:1"))
+        .unwrap_or_else(|| panic!("missing compact Rust hit: {rendered}"));
+
+    assert!(hit.get("anchor").is_none());
+    let calls = hit["followups"]["calls"]
+        .as_array()
+        .expect("file-compatible follow-up calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "file_outline");
+    assert_eq!(calls[0]["arguments"]["path"], "native.rs");
+
+    assert_eq!(response["graph"]["projection"], "paths");
+    assert_eq!(response["graph"]["seeds"], json!([]));
+    assert_eq!(response["graph"]["nodes"], json!({}));
+    assert_eq!(response["graph"]["edges"], json!([]));
+
+    let tools = tool_defs(ToolProfile::Structural, true);
+    let outline_tool = tools
+        .as_array()
+        .expect("tool definitions")
+        .iter()
+        .find(|tool| tool["name"] == "file_outline")
+        .expect("file_outline definition");
+    assert!(
+        outline_tool["description"].as_str().is_some_and(
+            |description| description.contains("span-only line ranges with null names")
+        )
+    );
+    let outline = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "file_outline",
+        &json!({ "path": "native.rs" }),
+    )?;
+    let outline: serde_json::Value = serde_json::from_str(&outline)?;
+    let ranges = outline["outline"].as_array().expect("Rust outline ranges");
+    assert!(!ranges.is_empty());
+    assert!(ranges.iter().all(|range| range["name"].is_null()));
+    assert!(ranges.iter().all(|range| range["lines"].is_array()));
+    Ok(())
+}
+
+#[test]
+fn semantic_search_formats_scope_is_enforced_and_echoed_at_mcp_boundary() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("web.ts"),
+        "export const crossFormatMcpMarker = true;\n",
+    )?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub const crossFormatMcpMarker: bool = true;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rendered = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Baseline,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "crossFormatMcpMarker",
+            "formats": ["rust"],
+            "exhaustive": true,
+            "limit": 10,
+            "response_bytes": 100_000
+        }),
+    )?;
+    let response: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(response["scope"]["formats"], json!(["rust"]));
+    let hits = response["hits"].as_array().expect("compact hits");
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|hit| {
+        hit["at"]
+            .as_str()
+            .is_some_and(|location| location.starts_with("native.rs:"))
+    }));
+
+    let error = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Baseline,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "crossFormatMcpMarker",
+            "formats": ["markdown"],
+            "vector": false,
+            "rerank": false
+        }),
+    )
+    .expect_err("documentation formats must not enter code search");
+    assert!(error.to_string().contains("code format must be one of"));
+
+    for (formats, expected) in [
+        (json!("rust"), "`formats` must be an array of strings"),
+        (json!([]), "`formats` must contain at least one value"),
+        (json!([null]), "`formats[0]` must be a string"),
+        (json!(["rust", 1]), "`formats[1]` must be a string"),
+    ] {
+        let error = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            "semantic_search",
+            &json!({
+                "query": "crossFormatMcpMarker",
+                "formats": formats,
+                "vector": false,
+                "rerank": false
+            }),
+        )
+        .expect_err("malformed formats must fail closed");
+        assert_eq!(error.to_string(), expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("target.ts"),
+        "export function scopedFormatTarget() { return 'SCOPED_FORMAT_TARGET'; }\n",
+    )?;
+    fs::write(
+        repo.path().join("ts_caller.ts"),
+        "import { scopedFormatTarget } from './target';\nexport function callFromTs() { return scopedFormatTarget(); }\n",
+    )?;
+    fs::write(
+        repo.path().join("js_caller.js"),
+        "import { scopedFormatTarget } from './target';\nexport function callFromJs() { return scopedFormatTarget(); }\n",
+    )?;
+    fs::write(
+        repo.path().join("same_name.js"),
+        "export function scopedFormatTarget() { return 'JAVASCRIPT_SAME_NAME'; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let rendered = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "semantic_search",
+        &json!({
+            "query": "SCOPED_FORMAT_TARGET",
+            "formats": ["typescript"],
+            "vector": false,
+            "rerank": false,
+            "include_memory": false,
+            "limit": 3
+        }),
+    )?;
+    let search: serde_json::Value = serde_json::from_str(&rendered)?;
+    let hit = search["hits"]
+        .as_array()
+        .and_then(|hits| {
+            hits.iter().find(|hit| {
+                hit["at"]
+                    .as_str()
+                    .is_some_and(|location| location.starts_with("target.ts:"))
+            })
+        })
+        .unwrap_or_else(|| panic!("TypeScript target hit: {search}"));
+    let calls = hit["followups"]["calls"]
+        .as_array()
+        .expect("format-scoped per-tool follow-ups");
+    assert_eq!(hit["used_by"], json!(["scopedFormatTarget: 1 sites"]));
+    let arguments_for = |tool: &str| {
+        &calls
+            .iter()
+            .find(|call| call["tool"] == tool)
+            .unwrap_or_else(|| panic!("{tool} follow-up: {calls:?}"))["arguments"]
+    };
+    let definition_arguments = arguments_for("definition");
+    let who_uses_arguments = arguments_for("who_uses");
+    assert_eq!(definition_arguments["formats"], json!(["typescript"]));
+    assert_eq!(who_uses_arguments["formats"], json!(["typescript"]));
+    assert!(arguments_for("neighborhood").get("formats").is_none());
+
+    let definition = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        definition_arguments,
+    )?;
+    let definition: serde_json::Value = serde_json::from_str(&definition)?;
+    assert_eq!(definition["definitions"][0]["target"]["at"], "target.ts:1");
+
+    let usages = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "who_uses",
+        who_uses_arguments,
+    )?;
+    assert!(usages.contains("ts_caller.ts"));
+    assert!(!usages.contains("js_caller.js"));
+
+    let neighborhood = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "neighborhood",
+        arguments_for("neighborhood"),
+    )?;
+    let neighborhood: serde_json::Value = serde_json::from_str(&neighborhood)?;
+    assert_eq!(neighborhood["anchor"], hit["anchor"]);
+
+    let fuzzy_scoped = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({ "symbol": "scopedFormatTarget", "formats": ["typescript"] }),
+    )?;
+    let fuzzy_scoped: serde_json::Value = serde_json::from_str(&fuzzy_scoped)?;
+    assert_eq!(fuzzy_scoped["response"]["matched_targets"], 1);
+    assert_eq!(
+        fuzzy_scoped["definitions"][0]["target"]["at"],
+        "target.ts:1"
+    );
+
+    let fuzzy_unscoped = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({ "symbol": "scopedFormatTarget" }),
+    )?;
+    let fuzzy_unscoped: serde_json::Value = serde_json::from_str(&fuzzy_unscoped)?;
+    assert_eq!(fuzzy_unscoped["response"]["matched_targets"], 2);
+    Ok(())
+}
+
+#[test]
 fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() -> Result<()> {
     let defaults = config::SearchSettings {
         vector: false,
@@ -517,6 +933,7 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
     assert!(!options.include_memory);
     assert_eq!(options.limit, 3);
     assert_eq!(options.response_byte_limit, 9_000);
+    assert!(options.formats.is_empty());
     assert!(options.expand);
     assert_eq!(
         options.expansion.projection,
@@ -708,9 +1125,10 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "sym: anchor plus its snapshot",
             "strip only the leading file:",
             "Human-authored symbol mode",
-            "original search's explicit origins allowlist",
-            "never synthesize it from echoed scope.origins",
-            "corpus, file_roles, origins, and snapshot",
+            "spans all registered code formats by default",
+            "original search's explicit origins and formats allowlists",
+            "never synthesize it from echoed scope.origins or scope.formats",
+            "corpus, file_roles, origins, formats, and snapshot",
             "convention",
             "safe",
             "localize first",
@@ -793,6 +1211,32 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
                 .as_str()
                 .is_some_and(|description| description.contains("not the whole repository"))
         );
+        let formats = &search["inputSchema"]["properties"]["formats"];
+        assert!(formats.get("default").is_none());
+        assert_eq!(
+            formats["items"]["enum"],
+            json!(["javascript", "typescript", "rust"])
+        );
+        assert_eq!(formats["minItems"], 1);
+        assert!(
+            formats["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("all registered code formats"))
+        );
+        for tool_name in ["definition", "who_uses"] {
+            let tool = tools
+                .as_array()
+                .expect("tool definitions")
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} definition"));
+            let formats = &tool["inputSchema"]["properties"]["formats"];
+            assert_eq!(formats["minItems"], 1);
+            assert_eq!(
+                formats["items"]["enum"],
+                json!(["javascript", "typescript", "rust"])
+            );
+        }
     }
 }
 

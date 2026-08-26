@@ -184,6 +184,8 @@ fn candidate_files(
     let repository = file_origins.iter().any(|origin| origin == "repository");
     let workspace = file_origins.iter().any(|origin| origin == "workspace");
     let dependency = file_origins.iter().any(|origin| origin == "dependency");
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Structural);
     let mut stmt = conn.prepare(
         "SELECT DISTINCT f.id, f.path, f.hash, f.origin, f.package_path, p.canonical_root
          FROM member_calls call
@@ -193,10 +195,11 @@ fn candidate_files(
            AND ((?2 AND f.origin='repository')
              OR (?3 AND f.origin='workspace')
              OR (?4 AND f.origin='dependency'))
+           AND f.format IN (SELECT value FROM json_each(?5))
          ORDER BY f.path",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![method, repository, workspace, dependency],
+        rusqlite::params![method, repository, workspace, dependency, eligible_formats],
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -520,6 +523,40 @@ mod tests {
         let error = super::query(repo.path(), &conn, &query)
             .expect_err("changed candidate file must be rejected");
         assert!(error.to_string().contains("changed since indexing"));
+        Ok(())
+    }
+
+    #[test]
+    fn rust_member_call_rows_cannot_become_parser_candidates() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        std::fs::write(
+            repo.path().join("main.ts"),
+            "export const run = (db: any) => db.items.poisonCall({ marker: true });\n",
+        )?;
+        let conn = store::open(repo.path())?;
+        indexer::index_repo(repo.path(), &conn)?;
+
+        let rust_source = "db.items.poisonCall({ marker: true });\n";
+        std::fs::write(repo.path().join("poison.rs"), rust_source)?;
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role,origin)
+             VALUES('poison.rs',?1,'code','rust','production','repository')",
+            [blake3::hash(rust_source.as_bytes()).to_hex().to_string()],
+        )?;
+        let rust_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO member_calls(
+               file_id,start,end,line,end_line,prop,object,receiver,
+               receiver_start,receiver_end,property_start,property_end
+             ) VALUES(?1,0,39,1,1,'poisonCall','items','db.items',
+                      0,8,9,19)",
+            [rust_file],
+        )?;
+
+        let result = super::query(repo.path(), &conn, &base_query("poisonCall"))?;
+        assert_eq!(result.files_scanned, 1);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].file, "main.ts");
         Ok(())
     }
 

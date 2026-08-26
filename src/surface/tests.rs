@@ -64,6 +64,260 @@ fn entity_lookup_filters_evidence_and_overview_is_bounded() -> Result<()> {
 }
 
 #[test]
+fn entity_lookup_excludes_occurrences_from_non_structural_formats() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const visible = process.env.SURFACE_VISIBLE;\n",
+    )?;
+    fs::write(repo.path().join("poison.rs"), "pub fn poison() {}\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let baseline = entities(
+        &conn,
+        &EntityLookupOptions {
+            query: "SURFACE_VISIBLE".into(),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(baseline.entities.len(), 1);
+    let baseline_count = baseline.entities[0].occurrence_count;
+    let visible_entity_id: i64 = conn.query_row(
+        "SELECT id FROM entities WHERE name='SURFACE_VISIBLE'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rust_file_id: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='poison.rs' AND format='rust'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rust_chunk_id: i64 = conn.query_row(
+        "SELECT id FROM chunks WHERE file_id=?1 ORDER BY id LIMIT 1",
+        [rust_file_id],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT INTO entity_sites(
+           file_id,chunk_id,start,end,line,end_line,plane,entity_type,role,
+           identity_kind,identity_name,identity_start,extractor,provenance,confidence
+         ) VALUES(?1,?2,0,12,1,1,'general','environment_variable','read',
+                  'literal','SURFACE_VISIBLE',0,'fixture','fixture','certain')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    let mixed_site_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO entity_occurrences(
+           entity_id,site_id,file_id,chunk_id,start,end,line,end_line,role,
+           extractor,provenance,confidence
+         ) VALUES(?1,?2,?3,?4,0,12,1,1,'read','fixture','fixture','certain')",
+        rusqlite::params![
+            visible_entity_id,
+            mixed_site_id,
+            rust_file_id,
+            rust_chunk_id
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO entities(
+           entity_key,plane,entity_type,name,identity_anchor
+         ) VALUES('fixture:rust:secret','general','rust_fixture',
+                  'RUST_SURFACE_SECRET','poison.rs')",
+        [],
+    )?;
+    let rust_entity_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO entity_sites(
+           file_id,chunk_id,start,end,line,end_line,plane,entity_type,role,
+           identity_kind,identity_name,identity_start,extractor,provenance,confidence
+         ) VALUES(?1,?2,0,12,1,1,'general','rust_fixture','declaration',
+                  'literal','RUST_SURFACE_SECRET',0,'fixture','fixture','certain')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    let rust_site_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO entity_occurrences(
+           entity_id,site_id,file_id,chunk_id,start,end,line,end_line,role,
+           extractor,provenance,confidence
+         ) VALUES(?1,?2,?3,?4,0,12,1,1,'declaration',
+                  'fixture','fixture','certain')",
+        rusqlite::params![rust_entity_id, rust_site_id, rust_file_id, rust_chunk_id],
+    )?;
+
+    let visible = entities(
+        &conn,
+        &EntityLookupOptions {
+            query: "SURFACE_VISIBLE".into(),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(visible.entities.len(), 1);
+    assert_eq!(visible.entities[0].occurrence_count, baseline_count);
+    assert!(
+        visible.entities[0]
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.file == "main.ts")
+    );
+    let rust_only = entities(
+        &conn,
+        &EntityLookupOptions {
+            query: "RUST_SURFACE_SECRET".into(),
+            ..Default::default()
+        },
+    )?;
+    assert!(rust_only.entities.is_empty());
+    assert_eq!(rust_only.matched_entities, 0);
+    Ok(())
+}
+
+#[test]
+fn overview_preserves_rust_inventory_but_excludes_rust_structural_rows() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("src/app"))?;
+    fs::create_dir_all(repo.path().join("native"))?;
+    fs::write(
+        repo.path().join("src/app/main.ts"),
+        "export const visible = process.env.SURFACE_OVERVIEW;\n",
+    )?;
+    fs::write(
+        repo.path().join("native/poison.rs"),
+        "pub fn poison() -> usize { 1 }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let options = OverviewOptions {
+        area_limit: 100,
+        relation_limit: 100,
+        reconnaissance_limit: 0,
+        ..Default::default()
+    };
+    let baseline = overview_response(&conn, &options)?.overview;
+    assert_eq!(baseline.totals["files"], 2);
+    let baseline_native = baseline
+        .areas
+        .iter()
+        .find(|area| area.path == "native")
+        .expect("Rust area remains in code inventory");
+    assert_eq!(baseline_native.files, 1);
+    assert!(baseline_native.chunks > 0);
+
+    let rust_file_id: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='native/poison.rs' AND format='rust'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rust_chunk_id: i64 = conn.query_row(
+        "SELECT id FROM chunks WHERE file_id=?1 ORDER BY id LIMIT 1",
+        [rust_file_id],
+        |row| row.get(0),
+    )?;
+    let typescript_file_id: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='src/app/main.ts' AND format='typescript'",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'RUST_SURFACE_SYMBOL','function',0,12,0,12,'',1,1)",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO entities(entity_key,plane,entity_type,name,identity_anchor)
+         VALUES('fixture:rust:overview','general','rust_overview_fixture',
+                'RUST_OVERVIEW_ENTITY','native/poison.rs')",
+        [],
+    )?;
+    let rust_entity_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO entity_sites(
+           file_id,chunk_id,start,end,line,end_line,plane,entity_type,role,
+           identity_kind,identity_name,identity_start,extractor,provenance,confidence
+         ) VALUES(?1,?2,0,12,1,1,'general','rust_overview_fixture','declaration',
+                  'literal','RUST_OVERVIEW_ENTITY',0,'fixture','fixture','certain')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    let rust_site_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO entity_occurrences(
+           entity_id,site_id,file_id,chunk_id,start,end,line,end_line,role,
+           extractor,provenance,confidence
+         ) VALUES(?1,?2,?3,?4,0,12,1,1,'declaration',
+                  'fixture','fixture','certain')",
+        rusqlite::params![rust_entity_id, rust_site_id, rust_file_id, rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,line
+         ) VALUES('fixture:rust:source','fixture:target','surface_rust_poison',
+                  'certain','fixture',?1,1)",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,line
+         ) VALUES('fixture:ts:source','fixture:target','surface_ts_control',
+                  'certain','fixture',?1,1)",
+        [typescript_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance
+         ) VALUES('fixture:global:source','fixture:target',
+                  'surface_global_control','certain','fixture')",
+        [],
+    )?;
+
+    let after = overview_response(&conn, &options)?.overview;
+    assert_eq!(after.totals["files"], baseline.totals["files"]);
+    assert_eq!(after.totals["chunks"], baseline.totals["chunks"]);
+    assert_eq!(after.totals["symbols"], baseline.totals["symbols"]);
+    assert_eq!(
+        after.totals["entity_occurrences"],
+        baseline.totals["entity_occurrences"]
+    );
+    assert_eq!(
+        after.totals["graph_edges"],
+        baseline.totals["graph_edges"] + 2
+    );
+    let after_native = after
+        .areas
+        .iter()
+        .find(|area| area.path == "native")
+        .expect("Rust area remains in code inventory");
+    assert_eq!(after_native.files, baseline_native.files);
+    assert_eq!(after_native.chunks, baseline_native.chunks);
+    assert_eq!(after_native.symbols, 0);
+    assert_eq!(after_native.entity_occurrences, 0);
+    assert!(
+        after
+            .entity_inventory
+            .iter()
+            .all(|count| count.kind != "rust_overview_fixture")
+    );
+    assert!(
+        after
+            .relations
+            .iter()
+            .all(|relation| relation.kind != "surface_rust_poison")
+    );
+    for control in ["surface_ts_control", "surface_global_control"] {
+        assert_eq!(
+            after
+                .relations
+                .iter()
+                .find(|relation| relation.kind == control)
+                .map(|relation| relation.edges),
+            Some(1)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn dependency_areas_preserve_the_package_instance_prefix() {
     assert_eq!(
         repository_area("dependency:lodash@4.17.21#abc123/lodash.js"),

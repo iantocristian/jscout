@@ -62,7 +62,7 @@ fn test_project_fingerprints(
 }
 
 #[test]
-fn dirty_checker_inventory_excludes_documentation_files() -> Result<()> {
+fn dirty_checker_inventory_excludes_ineligible_formats_and_documentation() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let conn = crate::store::open(repo.path())?;
     conn.execute_batch(
@@ -70,6 +70,8 @@ fn dirty_checker_inventory_excludes_documentation_files() -> Result<()> {
            VALUES(1,'src/main.ts','code','production','repository','code','typescript');
          INSERT INTO files(id,path,hash,role,origin,corpus,format)
            VALUES(2,'README.md','docs','documentation','repository','docs','markdown');
+         INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(3,'src/lib.rs','rust','production','repository','code','rust');
          INSERT INTO chunks(
            id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
          ) VALUES(2,2,'markdown_document',NULL,'','',0,0,1,1,'doc-chunk','');
@@ -79,9 +81,51 @@ fn dirty_checker_inventory_excludes_documentation_files() -> Result<()> {
          ) VALUES(2,'README','',NULL,0,NULL,'absent');",
     )?;
 
-    let dirty =
-        current_dirty_source_files(&conn, &["README.md".to_string(), "src/main.ts".to_string()])?;
+    let dirty = current_dirty_source_files(
+        &conn,
+        &[
+            "README.md".to_string(),
+            "src/lib.rs".to_string(),
+            "src/main.ts".to_string(),
+        ],
+    )?;
     assert_eq!(dirty, BTreeSet::from(["src/main.ts".to_string()]));
+    Ok(())
+}
+
+#[test]
+fn occurrence_loading_excludes_checker_ineligible_code_formats() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let conn = crate::store::open(repo.path())?;
+    conn.execute_batch(
+        "INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(1,'src/main.ts','typescript','production','repository','code','typescript');
+         INSERT INTO files(id,path,hash,role,origin,corpus,format)
+           VALUES(2,'src/lib.rs','rust','production','repository','code','rust');
+         INSERT INTO symbols(
+           id,file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(1,1,'run','function',0,3,0,3,'',1,1);
+         INSERT INTO symbols(
+           id,file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(2,2,'rustOnly','function',0,8,0,8,'',1,1);
+         INSERT INTO member_calls(
+           file_id,start,end,line,end_line,prop,object,receiver,
+           receiver_start,receiver_end,property_start,property_end,receiver_unbound
+         ) VALUES(1,0,8,1,1,'run','service','service',0,3,4,7,0);
+         INSERT INTO member_calls(
+           file_id,start,end,line,end_line,prop,object,receiver,
+           receiver_start,receiver_end,property_start,property_end,receiver_unbound
+         ) VALUES(1,9,21,2,2,'rustOnly','service','service',9,12,13,21,0);
+         INSERT INTO member_calls(
+           file_id,start,end,line,end_line,prop,object,receiver,
+           receiver_start,receiver_end,property_start,property_end,receiver_unbound
+         ) VALUES(2,0,8,1,1,'run','service','service',0,3,4,7,0);",
+    )?;
+
+    let calls = load_occurrences(&conn)?;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].file, "src/main.ts");
+    assert_eq!(calls[0].member, "run");
     Ok(())
 }
 

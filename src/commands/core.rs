@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    calls, chunk, compact, config, embed, indexer, mcp, parse, query, search, semantic, stats,
-    store, structural, walk,
+    calls, chunk, compact, config, embed, formats, indexer, mcp, parse, query, search, semantic,
+    stats, store, structural, walk,
 };
 
 pub(super) fn open_database_for_write(
@@ -314,6 +314,12 @@ pub(super) fn cmd_index(
     if o.extraction_reset {
         println!("snapshot refresh: rebuilt disposable structural state");
     }
+    if o.rust_files_with_parse_errors > 0 {
+        println!(
+            "Rust parse diagnostics: {} files, {} errors (indexed)",
+            o.rust_files_with_parse_errors, o.rust_parse_error_count
+        );
+    }
     indexer::report_rejections(&o);
     if !dependencies.is_empty() {
         println!(
@@ -496,7 +502,21 @@ fn cli_who_uses_for_target(
 mod tests;
 
 pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
-    let files = walk::source_files(root)?;
+    let inventory = walk::source_inventory(root)?;
+    let editions = crate::rust_lang::resolve_editions(
+        root,
+        &inventory.files,
+        &inventory.cargo_manifests,
+        &crate::fs_ops::OsFileSystem,
+    )?;
+    for rejection in &editions.rejections {
+        eprintln!(
+            "skip Rust edition input {}: {}",
+            rejection.path.display(),
+            rejection.error
+        );
+    }
+    let files = inventory.files;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
@@ -510,10 +530,20 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
         let Ok(source) = std::fs::read_to_string(file) else {
             continue;
         };
-        let chunks = parse::with_parsed(&source, file, |ret, _| {
-            let chunker = chunk::Chunker::new(rel, &source, ret);
-            chunker.chunk_program(&ret.program, &ret.program.comments)
-        });
+        let Some(format) = formats::repository_code_for_path(file) else {
+            continue;
+        };
+        let chunks = match format.extractor {
+            formats::Extractor::EcmaScript => parse::with_parsed(&source, file, |ret, _| {
+                let chunker = chunk::Chunker::new(rel, &source, ret);
+                chunker.chunk_program(&ret.program, &ret.program.comments)
+            }),
+            formats::Extractor::RustText => {
+                crate::rust_lang::extract(rel, &source, editions.edition_for(file))
+                    .map(|extraction| extraction.chunks)
+            }
+            formats::Extractor::Documentation => continue,
+        };
         match chunks {
             Ok(chunks) => {
                 for c in chunks {
@@ -534,8 +564,15 @@ pub(super) fn cmd_stats(root: &Path) -> Result<()> {
     let mut parsed_files = 0usize;
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
     let mut total_bytes = 0usize;
+    let mut non_ecmascript_files = 0usize;
 
     for file in &files {
+        if !formats::repository_code_for_path(file)
+            .is_some_and(|format| format.structural == formats::StructuralPolicy::EcmaScript)
+        {
+            non_ecmascript_files += 1;
+            continue;
+        }
         let source = match std::fs::read_to_string(file) {
             Ok(s) => s,
             Err(e) => {
@@ -572,6 +609,9 @@ pub(super) fn cmd_stats(root: &Path) -> Result<()> {
         "source size:     {:.1} MB",
         total_bytes as f64 / 1_048_576.0
     );
+    if non_ecmascript_files > 0 {
+        println!("non-JS/TS files: {non_ecmascript_files} (not included in AST stats)");
+    }
     println!("functions:       {}", total.functions);
     println!("arrow functions: {}", total.arrow_functions);
     println!(

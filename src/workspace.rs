@@ -609,8 +609,6 @@ fn root_export_targets(pkg: &serde_json::Value) -> Vec<String> {
     out
 }
 
-const ENTRY_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-
 /// Pick the package's source entry file. Manifest targets (root export,
 /// `source`/`module`/`main`) win when they name an existing source file;
 /// package.json fields usually point at build output (`dist/…`) that is
@@ -812,7 +810,7 @@ impl SourceLookup for IndexedSources {
             let Some((stem, extension)) = relative.rsplit_once('.') else {
                 continue;
             };
-            if !ENTRY_EXTENSIONS.contains(&extension) {
+            if !crate::formats::ecmascript_resolution_extensions().contains(&extension) {
                 continue;
             }
             let parent = file
@@ -891,22 +889,18 @@ fn entry_candidates(field: &str, allow_build_output: bool) -> Vec<String> {
     if let Some((stem, ext)) = path.rsplit_once('.')
         && !ext.contains('/')
     {
-        return match ext {
-            "ts" | "tsx" | "mts" | "cts" | "jsx" => vec![path.to_string()],
-            "js" => vec![
-                format!("{stem}.ts"),
-                format!("{stem}.tsx"),
-                path.to_string(),
-                format!("{stem}.jsx"),
-            ],
-            "mjs" => vec![format!("{stem}.mts"), path.to_string()],
-            "cjs" => vec![format!("{stem}.cts"), path.to_string()],
-            // Not a JS entry (e.g. "./style.css").
-            _ => Vec::new(),
-        };
+        return crate::formats::ecmascript_entry_extension_candidates(ext)
+            .map(|extensions| {
+                extensions
+                    .iter()
+                    .map(|extension| format!("{stem}.{extension}"))
+                    .collect()
+            })
+            // Not an ECMAScript entry (e.g. "./style.css").
+            .unwrap_or_default();
     }
-    ENTRY_EXTENSIONS
-        .iter()
+    crate::formats::ecmascript_resolution_extensions()
+        .into_iter()
         .map(|ext| format!("{path}.{ext}"))
         .collect()
 }
@@ -1121,7 +1115,7 @@ fn collect_source_matches(
                 continue;
             }
             if rel == sub || rel.ends_with(&format!("/{sub}")) {
-                for ext in ENTRY_EXTENSIONS {
+                for ext in crate::formats::ecmascript_resolution_extensions() {
                     let index = path.join(format!("index.{ext}"));
                     if index.is_file() {
                         out.push(index);
@@ -1132,7 +1126,7 @@ fn collect_source_matches(
             collect_source_matches(base, &path, sub, depth + 1, out);
         } else if file_type.is_file()
             && let Some((stem, ext)) = rel.rsplit_once('.')
-            && ENTRY_EXTENSIONS.contains(&ext)
+            && crate::formats::ecmascript_resolution_extensions().contains(&ext)
             && (stem == sub || stem.ends_with(&format!("/{sub}")))
         {
             out.push(path);
@@ -1194,7 +1188,7 @@ fn collect_classified_source_matches(
                 continue;
             }
             if relative == sub || relative.ends_with(&format!("/{sub}")) {
-                for extension in ENTRY_EXTENSIONS {
+                for extension in crate::formats::ecmascript_resolution_extensions() {
                     let index = path.join(format!("index.{extension}"));
                     let Some(metadata) =
                         classified_io(&index, "workspace-alias", fs.metadata(&index), rejections)?
@@ -1210,7 +1204,7 @@ fn collect_classified_source_matches(
             collect_classified_source_matches(base, &path, sub, depth + 1, out, rejections, fs)?;
         } else if file_type.is_file()
             && let Some((stem, extension)) = relative.rsplit_once('.')
-            && ENTRY_EXTENSIONS.contains(&extension)
+            && crate::formats::ecmascript_resolution_extensions().contains(&extension)
             && (stem == sub || stem.ends_with(&format!("/{sub}")))
         {
             out.push(path);

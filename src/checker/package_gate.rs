@@ -13,8 +13,8 @@ pub(super) const POLICY_FINGERPRINT_DOMAIN: &str = "jscout-checker-package-gate-
 const ABSENT_INPUT_HASH: &str = "absent:v1";
 const INVENTORY_SQL: &str = "SELECT file.id, file.path, file.role FROM code_files file
      WHERE file.origin IN ('repository', 'workspace')
+       AND file.format IN (SELECT value FROM json_each(?1))
      ORDER BY file.path";
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const OUTPUT_DIRECTORIES: &[&str] = &["dist", "out", "build", "lib"];
 const OUTPUT_FLAVORS: &[&str] = &["esm", "cjs", "es", "es6", "mjs", "umd", "lib", "types"];
 
@@ -126,7 +126,8 @@ struct ManifestTarget {
 /// policy engine cannot silently describe different inventories.
 pub(super) fn inventory_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(INVENTORY_SQL)?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let checker_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+    let rows = statement.query_map([checker_formats], |row| row.get::<_, String>(1))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
@@ -241,7 +242,8 @@ pub(super) fn evaluate(
 
 fn load_inventory(conn: &Connection) -> Result<Vec<IndexedSource>> {
     let mut statement = conn.prepare(INVENTORY_SQL)?;
-    let rows = statement.query_map([], |row| {
+    let checker_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+    let rows = statement.query_map([checker_formats], |row| {
         Ok(IndexedSource {
             id: row.get(0)?,
             path: row.get(1)?,
@@ -538,11 +540,9 @@ fn script_path_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
             return None;
         }
         let path = Path::new(token);
-        let source_extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension));
-        (source_extension && (token.contains('/') || path.file_name().is_some()))
+        let checker_eligible =
+            crate::formats::for_path(path).is_some_and(|format| format.checker_eligible());
+        (checker_eligible && (token.contains('/') || path.file_name().is_some()))
             .then(|| token.replace('\\', "/"))
     })
 }
@@ -656,36 +656,34 @@ fn normalize_target(root: &Path, package: &Path, target: &str) -> Option<String>
 
 fn source_variants(path: &str) -> Vec<String> {
     if path.is_empty() {
-        return SOURCE_EXTENSIONS
-            .iter()
+        return crate::formats::ecmascript_resolution_extensions()
+            .into_iter()
             .map(|extension| format!("index.{extension}"))
             .collect();
     }
     let lower = path.to_ascii_lowercase();
-    for (extension, replacements) in [
-        (".js", &[".ts", ".tsx", ".js", ".jsx"][..]),
-        (".jsx", &[".tsx", ".jsx"][..]),
-        (".mjs", &[".mts", ".ts", ".tsx", ".mjs"][..]),
-        (".cjs", &[".cts", ".ts", ".tsx", ".cjs"][..]),
-    ] {
-        if lower.ends_with(extension) {
-            let stem = &path[..path.len() - extension.len()];
-            return replacements
-                .iter()
-                .map(|replacement| format!("{stem}{replacement}"))
-                .collect();
-        }
+    if let Some((stem, extension)) = lower.rsplit_once('.')
+        && let Some(replacements) =
+            crate::formats::ecmascript_source_mirror_extension_candidates(extension)
+    {
+        let original_stem_len = path.len() - extension.len() - 1;
+        let original_stem = &path[..original_stem_len];
+        debug_assert_eq!(stem.len(), original_stem.len());
+        return replacements
+            .iter()
+            .map(|replacement| format!("{original_stem}.{replacement}"))
+            .collect();
     }
     if Path::new(path).extension().is_some() {
         return vec![path.to_string()];
     }
-    let mut variants = SOURCE_EXTENSIONS
-        .iter()
+    let mut variants = crate::formats::ecmascript_resolution_extensions()
+        .into_iter()
         .map(|extension| format!("{path}.{extension}"))
         .collect::<Vec<_>>();
     variants.extend(
-        SOURCE_EXTENSIONS
-            .iter()
+        crate::formats::ecmascript_resolution_extensions()
+            .into_iter()
             .map(|extension| format!("{path}/index.{extension}")),
     );
     variants
@@ -755,12 +753,20 @@ fn path_matches(pattern: &str, value: &str) -> bool {
 
 fn runtime_reachable(conn: &Connection, seeds: &BTreeSet<i64>) -> Result<BTreeSet<i64>> {
     let mut adjacency = BTreeMap::<i64, Vec<i64>>::new();
+    let resolver_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Resolver);
     let mut statement = conn.prepare(
-        "SELECT from_file, to_file FROM module_edges
-         WHERE type_only=0 AND to_file IS NOT NULL
-         ORDER BY from_file, to_file",
+        "SELECT edge.from_file, edge.to_file
+         FROM module_edges edge
+         JOIN files importer ON importer.id=edge.from_file
+         JOIN files target ON target.id=edge.to_file
+         WHERE edge.type_only=0
+           AND importer.format IN (SELECT value FROM json_each(?1))
+           AND target.format IN (SELECT value FROM json_each(?1))
+         ORDER BY edge.from_file, edge.to_file",
     )?;
-    for row in statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))? {
+    for row in statement.query_map([resolver_formats], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })? {
         let (from, to) = row?;
         adjacency.entry(from).or_default().push(to);
     }
@@ -891,20 +897,12 @@ mod tests {
             fs::write(&absolute, "export const value = 1;\n")?;
             let id = self.next_id;
             self.next_id += 1;
-            let (corpus, format) = if path.ends_with(".md") {
-                ("docs", "markdown")
-            } else if [".ts", ".tsx", ".mts", ".cts"]
-                .iter()
-                .any(|suffix| path.ends_with(suffix))
-            {
-                ("code", "typescript")
-            } else {
-                ("code", "javascript")
-            };
+            let format = crate::formats::for_path(Path::new(path))
+                .ok_or_else(|| anyhow::anyhow!("unregistered fixture format for {path}"))?;
             self.conn.execute(
                 "INSERT INTO files(id,path,hash,role,origin,corpus,format)
                  VALUES(?1,?2,'fixture',?3,'repository',?4,?5)",
-                params![id, path, role, corpus, format],
+                params![id, path, role, format.corpus.as_str(), format.id],
             )?;
             Ok(id)
         }
@@ -955,17 +953,31 @@ mod tests {
     }
 
     #[test]
-    fn checker_inventory_excludes_documentation_corpus_files() -> Result<()> {
+    fn checker_inventory_excludes_ineligible_formats_and_documentation() -> Result<()> {
         let mut fixture = Fixture::new("{}")?;
         let code = fixture.file("src/main.ts", "production")?;
+        let rust = fixture.file("src/lib.rs", "production")?;
         let docs = fixture.file("README.md", "documentation")?;
         fixture.mark_documentation(docs)?;
 
         assert_eq!(inventory_paths(&fixture.conn)?, vec!["src/main.ts"]);
+        assert_eq!(
+            load_inventory(&fixture.conn)?
+                .into_iter()
+                .map(|source| source.path)
+                .collect::<Vec<_>>(),
+            vec!["src/main.ts"]
+        );
         let ownership = fixture.ownership(&["src/main.ts"])?;
         assert_eq!(ownership.len(), 1);
         assert_eq!(ownership[0].file, "src/main.ts");
-        assert_ne!(code, docs);
+        assert!(
+            evaluate(fixture.root.path(), &fixture.conn, &ownership, false)?
+                .admitted_orphans
+                .is_empty()
+        );
+        assert_ne!(code, rust);
+        assert_ne!(rust, docs);
         Ok(())
     }
 
@@ -1144,6 +1156,29 @@ mod tests {
             plan.admitted_orphans,
             BTreeSet::from(["src/deep.ts".into(), "src/reachable.ts".into()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_bfs_cannot_cross_a_resolver_ineligible_rust_file() -> Result<()> {
+        let mut fixture = Fixture::new(r#"{"main":"./src/entry.ts"}"#)?;
+        let entry = fixture.file("src/entry.ts", "production")?;
+        for path in ["src/owned-a.ts", "src/owned-b.ts", "src/owned-c.ts"] {
+            fixture.file(path, "production")?;
+        }
+        let rust = fixture.file("src/bridge.rs", "production")?;
+        let orphan = fixture.file("src/orphan.ts", "production")?;
+        fixture.edge(entry, rust, false)?;
+        fixture.edge(rust, orphan, false)?;
+        let ownership = fixture.ownership(&[
+            "src/entry.ts",
+            "src/owned-a.ts",
+            "src/owned-b.ts",
+            "src/owned-c.ts",
+        ])?;
+
+        let plan = evaluate(fixture.root.path(), &fixture.conn, &ownership, false)?;
+        assert!(plan.admitted_orphans.is_empty());
         Ok(())
     }
 

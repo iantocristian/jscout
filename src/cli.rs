@@ -108,6 +108,9 @@ pub(super) enum Command {
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
+        /// Restrict code retrieval to a registered format (repeatable; omitted means all)
+        #[arg(long = "format")]
+        formats: Vec<String>,
         /// Restrict hits and expansion to file origins (dependency is opt-in)
         #[arg(long = "origin", value_delimiter = ',')]
         file_origins: Vec<String>,

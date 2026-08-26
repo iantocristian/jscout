@@ -1,6 +1,7 @@
 # jscout
 
-A fast JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on [oxc](https://oxc.rs).
+A fast JavaScript/TypeScript structural and Rust lexical codebase indexer for
+RAG and agent retrieval, written in Rust with [oxc](https://oxc.rs) for JS/TS.
 
 The runtime value graph remains primary: functions, classes, components, calls,
 renders, and executable module edges work the same way for JavaScript and
@@ -1066,8 +1067,8 @@ Indexing continues past non-retryable file reads, permanent subtree/boundary
 failures, and deterministic extraction errors. The final summary reports both
 `removed=N` and `rejected=N`, followed by every rejected path, its stage
 (`walk`, `ignore`, `workspace-manifest`,
-`workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `read`, or
-`extract`), and the underlying error on stderr. `watch` prints those details
+`workspace-walk`, `workspace-alias`, `workspace-canonicalize`, `rust-edition`,
+`read`, or `extract`), and the underlying error on stderr. `watch` prints those details
 once per distinct rejection set, emits one recovery line when they clear, and
 keeps the count in every refresh summary. A recognized transient read error
 fails the phase instead, so a reduced corpus is not published; watch retries
@@ -1103,11 +1104,30 @@ Search returns a repository snapshot, retrieval-stage status, and ranked hits.
 requested vector stage failed and the returned ranking is lexical-only. This
 status is present in compact CLI/MCP and full diagnostic JSON, so an agent does
 not have to infer vector availability from stderr. Every hit includes a
-`file_role`, a `file_anchor`, and one or more snapshot-scoped `anchors`
-projected from the chunk's overlapping declarations. Roles are deterministic:
+`file_role`. Structurally eligible JavaScript/TypeScript hits also include a
+`file_anchor` and one or more snapshot-scoped `anchors` projected from the
+chunk's overlapping declarations, falling back to the file anchor. Rust lexical
+hits omit structural anchors and graph follow-ups. Roles are deterministic:
 `production`, `test`, `fixture`, `generated`, `documentation`, or `unknown`.
 Use repeatable `--file-role` flags to restrict primary hits. Chunks remain
 retrieval units; they do not become graph identity.
+
+Code search spans JavaScript, TypeScript, and Rust by default. Use repeatable
+`--format javascript`, `--format typescript`, or `--format rust` flags to scope
+primary retrieval before candidate limits; the MCP `semantic_search` surface
+uses the equivalent plural `formats` array. The formats share one lexical FTS
+corpus, so the filter isolates candidates but not BM25 corpus statistics. Rust
+is lexical-only until its named-chunk phase; a Rust-only search does not invoke
+the embedding provider for code retrieval, although vector-enabled attached
+semantic memory still uses the shared provider. Rust parsing follows the
+package edition declared by the nearest visible `Cargo.toml`, including
+workspace-inherited editions.
+An explicit `package.workspace` pointer is authoritative; ancestor workspace
+discovery is used only when that key is absent. Malformed or missing explicit
+targets are reported and recover to the default. Packages without an edition
+and standalone files use Rust 2015. Non-UTF-8 Rust and
+deterministic extraction failures are reported and rejected per file without
+blocking accessible repository siblings.
 
 Structural expansion is off by default and does not alter search scores. Add
 `--expand` to attach a separately labelled context pack:
@@ -1149,10 +1169,13 @@ omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
 Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
 and MCP responses retain their configured complete-response budgets.
 
-Compact hits also expose copy-safe follow-ups. A symbol hit returns one shared
-`arguments` object accepted unchanged by `definition`, `who_uses`, and
-`neighborhood`; ambiguous multi-anchor chunks expose their anchors but no
-follow-up object. A file-only hit returns per-tool call objects for
+Compact hits also expose copy-safe follow-ups. An unscoped symbol hit returns
+one shared `arguments` object accepted unchanged by `definition`, `who_uses`,
+and `neighborhood`. A format-scoped symbol hit instead returns per-tool calls:
+`definition` and `who_uses` preserve and enforce the original `formats`
+allowlist, while `neighborhood` receives no unsupported filter. Ambiguous
+multi-anchor chunks expose their anchors but no follow-up object. A file-only
+hit returns per-tool call objects for
 `file_outline` and `neighborhood`. The snapshot is part of exact-anchor
 arguments so stale anchors re-resolve by path/scope/name or fail closed instead
 of silently binding to a same-named declaration.
@@ -1348,7 +1371,8 @@ the new space or deleted automatically.
 
 Vector retrieval uses the statically linked `sqlite-vec` extension. jscout
 creates one cosine `vec0` virtual table per embedding dimension, partitioned by
-profile and source origin, and keeps occurrence rows in the same SQLite file.
+profile, source origin, and code format, and keeps occurrence rows in the same
+SQLite file.
 This removes the Rust full-table cosine loop. The stable `vec0` implementation
 is native exact KNN, not an HNSW/approximate index.
 

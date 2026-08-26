@@ -5,10 +5,6 @@ pub(crate) mod provenance_store;
 pub mod retrieval;
 pub mod store;
 
-/// Default documentation admission covers the two inert Markdown-family
-/// formats supported by the shared documentation parser.
-pub const DEFAULT_INCLUDE_GLOBS: &[&str] = &["**/*.md", "**/*.mdx"];
-
 /// Initial parser, rendering, and admission contract shared by lexical and
 /// vector documentation retrieval.
 pub const CHUNK_FORMAT_VERSION: &str = "documentation-v1";
@@ -22,8 +18,10 @@ pub const PROVENANCE_FORMAT_VERSION: &str = "documentation-provenance-v2";
 pub(crate) const PROVENANCE_ENABLED_META_KEY: &str = "documentation_provenance_enabled";
 
 pub fn default_include_globs() -> Vec<String> {
-    DEFAULT_INCLUDE_GLOBS
+    crate::formats::ALL
         .iter()
-        .map(|pattern| (*pattern).to_owned())
+        .filter(|format| format.documentation())
+        .flat_map(|format| format.extensions)
+        .map(|extension| format!("**/*.{extension}"))
         .collect()
 }

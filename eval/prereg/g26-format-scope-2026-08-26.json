@@ -1,0 +1,1850 @@
+{
+  "protocol_version": 3,
+  "title": "G26 format-scoped lexical retrieval prospective evaluation",
+  "goal": "Validate JavaScript/TypeScript filtered parity and mixed JavaScript/TypeScript/Rust relevance after Rust joins the shared code corpus.",
+  "repository": "iantocristian/jscout",
+  "preregistered_date": "2026-08-26",
+  "baseline_revision": "444540e3a29b68bfd5adc42bc4df99b5c5a92386",
+  "treatment_revision": "10e1cd54e052fd5cc4ab81b7483c4d14f6f8621f",
+  "corpus_revision": "10e1cd54e052fd5cc4ab81b7483c4d14f6f8621f",
+  "checkout_policy": "Both arms index the same clean checkout pinned to corpus_revision. The baseline binary is built from baseline_revision and ignores Rust; the treatment binary is built from treatment_revision.",
+  "execution": {
+    "runner": "scripts/eval-g26-format-scope",
+    "binary_build": "cargo build --release --locked in a separately validated clean binary-source checkout",
+    "database_policy": "Each arm requires a fresh external database path and a fresh output path.",
+    "scope_validation": "Every filtered-parity raw hit must be JavaScript or TypeScript. Mixed raw hits may use any registered code format.",
+    "snapshot_policy": "Every query response within one arm must carry the same nonempty snapshot. Baseline and treatment snapshots are not compared because their indexed memberships differ.",
+    "runner_provenance": "Each report records the runner path and SHA-256; treatment accepts a baseline report only when its runner SHA-256 matches the current runner bytes.",
+    "provider_mode": "provider_free_ranked_lexical",
+    "index_command": "jscout index <corpus-repository> --database <fresh-db>",
+    "common_search_arguments": [
+      "--limit",
+      "100",
+      "--origin",
+      "repository,workspace",
+      "--lexical-only",
+      "--no-memory",
+      "--no-expand",
+      "--debug-json"
+    ],
+    "baseline": "Run only filtered_parity_queries with the baseline binary and no unsupported --format arguments.",
+    "treatment_filtered_parity": "Run filtered_parity_queries with repeated --format javascript --format typescript arguments.",
+    "treatment_mixed_relevance": "Run mixed_relevance_queries with formats omitted."
+  },
+  "ranking_unit": "Retain 100 raw ranked chunk hits, deduplicate files by first chunk position, then truncate to 10 files.",
+  "retrieval_k": 100,
+  "file_k": 10,
+  "metric_policy": {
+    "filtered_parity": "Macro-average file Recall@10 and reciprocal rank over all 24 controls; also track every baseline top-five judged-gold file.",
+    "mixed_relevance": "Pooled-judgment mean graded nDCG@10 using gain 2^grade-1. Unjudged returned files receive gain zero only for metric computation: they are not declared irrelevant.",
+    "language_representation": "Observe and report returned formats for mixed queries, but never enforce a language quota."
+  },
+  "gates": {
+    "filtered_recall_at_10_must_not_decrease": true,
+    "filtered_mean_mrr_maximum_drop": 0.02,
+    "filtered_baseline_top_five_gold_may_not_fall_below_rank": 10,
+    "mixed_pooled_judgment_mean_ndcg_at_10_minimum": 0.7
+  },
+  "source_holdout": {
+    "source_path_at_freeze": "/private/tmp/g26-v3-holdout-draft.json",
+    "source_sha256": "e4b66dddc243fd870c7d7387c0eab2127cfd11f9de01d8ccb8b5de852f3cb5a4",
+    "copied_query_payload_sha256": "ed7f93d3c9b9ebd36071c3c2b2f08a149ddbcb35a61b8316b94124ed24e1c7be",
+    "schema_version": "g26-v3-holdout-draft-1",
+    "title": "Prospective G26 v3 source-authored holdout",
+    "repository": {
+      "path": "/private/tmp/jscout-g26-rust-phase1",
+      "head": "e3ac833e634472a1b7713e8516d7ce2c3bacf44e",
+      "basis": "working tree source files"
+    },
+    "authoring_constraints": {
+      "prospective": true,
+      "ranked_outputs_inspected": false,
+      "jscout_search_run": false,
+      "existing_g26_manifests_inspected": false,
+      "existing_eval_results_inspected": false,
+      "source_only_authoring": true
+    },
+    "grading_scale": {
+      "1": "supporting context that is relevant but not sufficient on its own",
+      "2": "substantial participant in transport, orchestration, validation, or persistence",
+      "3": "direct and authoritative implementation or contract for the requested behavior"
+    },
+    "judgment_policy": "gold_files contains every grade 2 or 3 file. Grade 1 files remain explicit supporting judgments. Unjudged files are not asserted irrelevant."
+  },
+  "filtered_parity_queries": [
+    {
+      "id": "v3-js-filter-exact-01",
+      "query": "chunkPlanMemberFiles",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Defines the byte-bounded plan membership chunker."
+        }
+      ],
+      "rationale": "A unique protocol helper whose definition is confined to the JavaScript checker protocol source."
+    },
+    {
+      "id": "v3-js-filter-exact-02",
+      "query": "takePlanMemberResultPage",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Defines cursor-bearing result page construction and frame-size enforcement."
+        }
+      ],
+      "rationale": "The identifier names a single exported paging implementation rather than a broad checker concept."
+    },
+    {
+      "id": "v3-js-filter-exact-03",
+      "query": "groupedInferredProjects",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Defines grouping and stable identities for inferred projects."
+        }
+      ],
+      "rationale": "A private worker symbol that directly names the inferred-project grouping algorithm."
+    },
+    {
+      "id": "v3-js-filter-exact-04",
+      "query": "declarationContext",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Defines repository, types, lib, vendored, and outside declaration provenance."
+        }
+      ],
+      "rationale": "The exact identifier targets the sole provenance classifier for TypeScript declarations."
+    },
+    {
+      "id": "v3-js-filter-exact-05",
+      "query": "resolveInProject",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Defines per-project receiver typing and declaration resolution."
+        }
+      ],
+      "rationale": "The symbol is the worker's central implementation for resolving one indexed member call in a built project."
+    },
+    {
+      "id": "v3-js-filter-exact-06",
+      "query": "sanitizeErrorMessage",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/protocol.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Defines credential, token, URL, and length sanitization for wire errors."
+        }
+      ],
+      "rationale": "A unique exported gateway protocol sanitizer with a narrow security purpose."
+    },
+    {
+      "id": "v3-js-filter-exact-07",
+      "query": "extractSubmission",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Defines validation and extraction of the sole structured submit tool call."
+        }
+      ],
+      "rationale": "The identifier points directly to the structured-output boundary."
+    },
+    {
+      "id": "v3-js-filter-exact-08",
+      "query": "requiredToolChoice",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Defines provider API specific forced-tool choice mapping."
+        }
+      ],
+      "rationale": "A unique provider-compatibility helper with an explicit switch over API families."
+    },
+    {
+      "id": "v3-js-filter-exact-09",
+      "query": "classifyProviderFailure",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Defines stable billing, capacity, auth, context, and connection error classes."
+        }
+      ],
+      "rationale": "The exact symbol isolates the gateway's provider failure classification logic."
+    },
+    {
+      "id": "v3-js-filter-exact-10",
+      "query": "parseOpenAICompatibleProviders",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Defines parsing and validation of custom OpenAI-compatible provider documents."
+        }
+      ],
+      "rationale": "The exported identifier names the complete JavaScript-side custom provider parser."
+    },
+    {
+      "id": "v3-js-filter-exact-11",
+      "query": "JsonCredentialStore",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Defines locked, atomic JSON credential storage."
+        }
+      ],
+      "rationale": "A unique class definition that anchors all credential-store lifecycle behavior."
+    },
+    {
+      "id": "v3-js-filter-exact-12",
+      "query": "GraphMemory",
+      "query_form": "exact_identifier",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "examples/graph-memory/demo.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "examples/graph-memory/demo.mjs",
+          "grade": 3,
+          "reason": "Defines the example graph memory class and its traversal and claim APIs."
+        }
+      ],
+      "rationale": "A distinctive exported class outside the sidecar code broadens the identifier holdout."
+    },
+    {
+      "id": "v3-js-filter-prose-01",
+      "query": "split checker membership uploads into bounded protocol frames",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Implements byte accounting, chunking, and frame limits."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 2,
+          "reason": "Implements begin, add, and finish sequencing and rejects oversized plan frames."
+        }
+      ],
+      "rationale": "The query describes the complete JavaScript host side of a logical membership upload without using source identifiers."
+    },
+    {
+      "id": "v3-js-filter-prose-02",
+      "query": "discover configured projects while ignoring inherited base configs",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Walks tsconfig files, resolves extends, skips non-selecting inherited bases, and parses projects."
+        }
+      ],
+      "rationale": "The wording targets a subtle configured-project discovery rule rather than generic TypeScript setup."
+    },
+    {
+      "id": "v3-js-filter-prose-03",
+      "query": "prefer general tsconfig owners over lint tooling projects",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Classifies tooling projects and selects or excludes owners with a fallback when only tooling remains."
+        }
+      ],
+      "rationale": "This probes purpose classification and ownership preference together."
+    },
+    {
+      "id": "v3-js-filter-prose-04",
+      "query": "group unconfigured files by package and module family into bounded projects",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "checker/src/inferred-options.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Finds package boundaries, assigns module families, packs roots, and builds inferred project identities."
+        },
+        {
+          "path": "checker/src/inferred-options.mjs",
+          "grade": 2,
+          "reason": "Defines the compiler options for each inferred module family."
+        }
+      ],
+      "rationale": "The query combines the actual grouping axes and cap that distinguish inferred projects."
+    },
+    {
+      "id": "v3-js-filter-prose-05",
+      "query": "convert utf8 byte offsets into typescript utf16 call spans",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Validates UTF-8 boundaries, converts offsets, and checks nested call, receiver, and property spans."
+        }
+      ],
+      "rationale": "This is a source-specific encoding seam with clear expected implementation evidence."
+    },
+    {
+      "id": "v3-js-filter-prose-06",
+      "query": "label declaration provenance as repository types library vendored or outside",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Classifies declaration source context and emits it with byte anchors and hashes."
+        }
+      ],
+      "rationale": "The requested categories exactly match the worker's declaration provenance contract."
+    },
+    {
+      "id": "v3-js-filter-prose-07",
+      "query": "retry transient provider failures with bounded exponential backoff",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Classifies retryable failures, computes capped delays, supports abort, and accumulates attempts."
+        }
+      ],
+      "rationale": "The query describes the gateway-owned retry loop rather than SDK retry behavior."
+    },
+    {
+      "id": "v3-js-filter-prose-08",
+      "query": "require exactly one structured submit tool call with object arguments",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Validates the declared tool and extracts exactly one matching call with object arguments."
+        }
+      ],
+      "rationale": "This captures the full structured-output contract using behavior-only wording."
+    },
+    {
+      "id": "v3-js-filter-prose-09",
+      "query": "redact credentials bearer tokens and sensitive url parts from errors",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/protocol.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Sanitizes authentication schemes, named secrets, recognizable token formats, URL userinfo, query values, and fragments."
+        }
+      ],
+      "rationale": "The query enumerates the main redaction surfaces implemented at the protocol boundary."
+    },
+    {
+      "id": "v3-js-filter-prose-10",
+      "query": "map reasoning effort and service tier onto provider transport options",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/completion.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Defines provider-specific reasoning mappings and service-tier eligibility."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 2,
+          "reason": "Applies the mapped options to the completion request."
+        }
+      ],
+      "rationale": "The query spans option validation and its actual use without relying on exported function names."
+    },
+    {
+      "id": "v3-js-filter-prose-11",
+      "query": "update json credentials with a heartbeat lock and atomic rename",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Implements lock acquisition, heartbeat, stale-lock recovery, restricted temporary writes, and atomic rename."
+        }
+      ],
+      "rationale": "The query names the concurrency and durability mechanisms of the credential store."
+    },
+    {
+      "id": "v3-js-filter-prose-12",
+      "query": "choose the platform binary and inject bundled checker and gateway paths",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "formats": [
+          "javascript",
+          "typescript"
+        ]
+      },
+      "gold_files": [
+        "npm/cli/bin/jscout.mjs"
+      ],
+      "judgments": [
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "grade": 3,
+          "reason": "Selects the optional platform package, resolves its binary, sets bundled sidecar variables, and spawns it."
+        }
+      ],
+      "rationale": "This covers distribution and sidecar bootstrapping, distinct from checker and gateway internals."
+    }
+  ],
+  "mixed_relevance_queries": [
+    {
+      "id": "v3-mixed-01",
+      "query": "versioned jsonl gateway handshake between the native client and node sidecar",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/protocol.mjs",
+        "gateway/src/main.mjs",
+        "gateway/src/server.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Owns JSONL framing, parsing, and protocol version validation."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 2,
+          "reason": "Connects stdin and stdout framing to the dispatcher."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Implements hello-first state and the ready response."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines the mirrored Rust envelopes, versions, and message variants."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Spawns the sidecar, sends hello, decodes ready, and rejects version skew."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Documents the gateway boundary and exposes negotiated versions in doctor output."
+        }
+      ],
+      "rationale": "Retrieving only one language misses half of the negotiated protocol; the direct implementations are intentionally symmetric gold."
+    },
+    {
+      "id": "v3-mixed-02",
+      "query": "cancel an active gateway completion by target id without corrupting later requests",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/protocol.mjs",
+        "gateway/src/main.mjs",
+        "gateway/src/server.mjs",
+        "gateway/src/completion.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 2,
+          "reason": "Dispatches lines without awaiting so cancel can interleave with completion."
+        },
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 2,
+          "reason": "Wires non-blocking message dispatch and active abort on stream end."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Tracks the active id, abort controller, cancel acknowledgement, and terminal canceled response."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 2,
+          "reason": "Makes provider execution and retry delays abortable and maps aborts to cancellation."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines cancel, canceled, and cancel-result wire shapes."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Publishes active ids safely, queues cancellation, validates acknowledgements, and preserves post-cancel usability."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Defines cancellation as a distinct terminal gateway error."
+        }
+      ],
+      "rationale": "Cancellation correctness is split between the Node active-request state machine and Rust ordering and acknowledgement checks."
+    },
+    {
+      "id": "v3-mixed-03",
+      "query": "enforce gateway request timeouts with remote abort and native client grace",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/server.mjs",
+        "gateway/src/completion.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Starts the request timer, aborts the provider call, and emits a retryable timeout error."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 2,
+          "reason": "Passes the abort signal through provider execution and retry waits."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Carries timeout milliseconds and typed remote errors."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Waits for the remote timeout with a bounded grace and distinguishes local timeout."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Defines local timeout and remote error outcomes for callers."
+        }
+      ],
+      "rationale": "The intended timeout result depends on coordinated budgets in both implementations."
+    },
+    {
+      "id": "v3-mixed-04",
+      "query": "parse model selections written in provider colon model form",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/server.mjs",
+        "src/llm/config.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Parses and validates the provider:model string for the Node registry."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 2,
+          "reason": "Uses the parsed provider and model for capabilities and completion dispatch."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 3,
+          "reason": "Defines equivalent Rust parsing and CLI-over-config resolution."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Uses the resolved model in gateway diagnosis."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 1,
+          "reason": "Carries the original model spec on capability and completion requests."
+        }
+      ],
+      "rationale": "Both sides independently validate the same user-facing model identity, so both are primary judgments."
+    },
+    {
+      "id": "v3-mixed-05",
+      "query": "report model capabilities authentication billing path and transport support",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/server.mjs",
+        "gateway/src/protocol.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Describes model transport features and determines billing path."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Builds the capability response and performs bounded auth checks."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 2,
+          "reason": "Frames and validates the capability exchange."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines provider and model capability response types including auth and billing fields."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Requests and decodes capabilities."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 3,
+          "reason": "Interprets and reports support and authentication status in the doctor flow."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 1,
+          "reason": "Resolves the model and sidecar used for the capability probe."
+        }
+      ],
+      "rationale": "The response is assembled in JavaScript, typed and transported in Rust, and given operational meaning by Rust doctor logic."
+    },
+    {
+      "id": "v3-mixed-06",
+      "query": "carry a structured submit tool contract from native request to node completion result",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs",
+        "gateway/src/server.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Validates the requested tool, forces it where supported, and extracts one object-valued call."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 2,
+          "reason": "Routes complete messages and returns started then structured result frames."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines submit tool schemas, complete requests, tool calls, and result messages."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 2,
+          "reason": "Transports the request and enforces the started-before-result sequence."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 3,
+          "reason": "Exposes the structured tool call as the completion outcome contract."
+        }
+      ],
+      "rationale": "The structured-output guarantee is only complete when request shape, Node validation, wire sequencing, and Rust outcome are retrieved together."
+    },
+    {
+      "id": "v3-mixed-07",
+      "query": "accumulate provider usage and attempt counts across bounded retries",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs",
+        "gateway/src/server.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Normalizes usage, sums every attempt, and returns the final attempt count."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 2,
+          "reason": "Emits the accumulated result on the protocol stream."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines normalized token, cache, cost, and attempts fields."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Decodes usage and attempts into the completion outcome."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 3,
+          "reason": "Carries accumulated usage and attempts to scouting callers."
+        }
+      ],
+      "rationale": "JavaScript owns aggregation while Rust owns the typed consumer, making both languages relevant gold."
+    },
+    {
+      "id": "v3-mixed-08",
+      "query": "preserve stable provider error categories retryability and sanitized messages across the gateway",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/completion.mjs",
+        "gateway/src/protocol.mjs",
+        "gateway/src/server.mjs",
+        "gateway/src/registry.mjs",
+        "src/llm/protocol.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Classifies provider failures and marks retryable or capacity conditions."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Sanitizes messages and encodes stable error flags."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Maps completion and registry exceptions to wire errors."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 2,
+          "reason": "Defines stable configuration, auth, and unsupported-option registry errors."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Deserializes code, message, retryable, and capacity fields."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 2,
+          "reason": "Turns remote error frames into native gateway errors."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 3,
+          "reason": "Preserves remote codes and distinguishes them from local transport failures."
+        }
+      ],
+      "rationale": "Classification, sanitization, transport, and native error identity are separate responsibilities that must be judged together."
+    },
+    {
+      "id": "v3-mixed-09",
+      "query": "send reasoning effort and service tier fields into provider specific options",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/completion.mjs",
+        "src/llm/protocol.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Validates reasoning values and maps reasoning and service tier by provider API."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Reads the wire fields and applies the resulting provider options."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 1,
+          "reason": "Routes the complete request containing these options."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 3,
+          "reason": "Defines reasoning and provider service-tier fields on the complete request."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 1,
+          "reason": "Resolves a CLI reasoning override over repository configuration."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 1,
+          "reason": "Serializes the complete request unchanged onto the gateway protocol."
+        }
+      ],
+      "rationale": "Rust defines the language-neutral request contract and JavaScript performs provider-specific interpretation."
+    },
+    {
+      "id": "v3-mixed-10",
+      "query": "enforce the node runtime floor and discover the gateway sidecar in installed or development layouts",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/main.mjs",
+        "npm/cli/bin/jscout.mjs",
+        "src/config/load.rs",
+        "src/llm/config.rs",
+        "src/llm/process.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/main.mjs",
+          "grade": 3,
+          "reason": "Rejects unsupported Node versions before importing gateway dependencies."
+        },
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "grade": 2,
+          "reason": "Publishes the bundled gateway path when no explicit override exists."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 2,
+          "reason": "Resolves explicit and internal bundled sidecar settings with precedence."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 3,
+          "reason": "Locates Node, verifies its version, and searches allowed gateway companion layouts."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 2,
+          "reason": "Uses the resolved runtime and gateway to launch the process."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Runs the same checks in the operational doctor flow."
+        }
+      ],
+      "rationale": "Distribution JavaScript supplies the bundled path, Rust resolves and verifies it, and the gateway enforces its own runtime floor."
+    },
+    {
+      "id": "v3-mixed-11",
+      "query": "configure and register custom openai compatible providers across the process boundary",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/server.mjs",
+        "src/config/load.rs",
+        "src/config/model.rs",
+        "src/llm/process.rs",
+        "src/llm/protocol.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Validates provider documents and registers OpenAI-compatible models and authentication."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Reads the serialized provider configuration and lazily builds the registry."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 3,
+          "reason": "Parses, normalizes, and validates repository or legacy environment provider definitions."
+        },
+        {
+          "path": "src/config/model.rs",
+          "grade": 2,
+          "reason": "Defines the serializable provider and model configuration types."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Serializes normalized providers into the gateway environment."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 2,
+          "reason": "Carries custom provider ids back in capabilities."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 1,
+          "reason": "Reports custom provider availability during diagnosis."
+        }
+      ],
+      "rationale": "This configuration path begins in Rust, crosses an environment boundary, and becomes executable provider registration in JavaScript."
+    },
+    {
+      "id": "v3-mixed-12",
+      "query": "resolve credential storage and provider authentication without exposing secret values",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/server.mjs",
+        "gateway/src/completion.mjs",
+        "src/config/load.rs",
+        "src/config/model.rs",
+        "src/llm/process.rs",
+        "src/llm/protocol.rs",
+        "src/llm/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "gateway/src/registry.mjs",
+          "grade": 3,
+          "reason": "Resolves auth paths, stores credentials safely, and supplies built-in or custom auth resolvers."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "grade": 3,
+          "reason": "Checks model authentication for capability reporting and returns only category metadata."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "grade": 3,
+          "reason": "Resolves provider auth before execution and emits only the auth source category."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "grade": 1,
+          "reason": "Provides defense-in-depth redaction for accidental secret-bearing diagnostics."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 3,
+          "reason": "Resolves the auth file and API-key environment name from configuration."
+        },
+        {
+          "path": "src/config/model.rs",
+          "grade": 2,
+          "reason": "Defines the native authentication-related LLM settings."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "grade": 3,
+          "reason": "Passes the auth path and controlled key environment to the child."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "grade": 2,
+          "reason": "Types auth source and auth status fields without credential values."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "grade": 2,
+          "reason": "Reports auth category and explicitly limits doctor conclusions to configuration."
+        }
+      ],
+      "rationale": "Credential location and transfer are native concerns while actual provider auth and safe metadata emission are Node concerns."
+    },
+    {
+      "id": "v3-mixed-13",
+      "query": "negotiate the versioned checker protocol before typescript resolution",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/mod.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Defines protocol version, JSONL envelopes, parsing, and line bounds."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Answers hello with sidecar, Node, and protocol versions."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines the mirrored outbound, inbound, and version structures."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Spawns the host, performs hello and ready, and rejects incompatible protocol versions."
+        },
+        {
+          "path": "src/checker/mod.rs",
+          "grade": 2,
+          "reason": "Launches the negotiated checker process and reports versions in doctor output."
+        }
+      ],
+      "rationale": "The handshake is jointly implemented and neither side alone explains the compatibility check."
+    },
+    {
+      "id": "v3-mixed-14",
+      "query": "upload one complete checker membership inventory through bounded frames",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 2,
+          "reason": "Defines plan frame and payload limits used by the host contract."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Validates begin, add, finish ordering, counts, uniqueness, and frame size before worker dispatch."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 2,
+          "reason": "Plans ownership only after receiving the complete inventory."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines the begin, add, and finish message variants."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Chunks files by encoded bytes, validates every acknowledgement, and sends one logical plan."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Requires a complete first-party inventory and deliberately avoids chunk-relative planning."
+        }
+      ],
+      "rationale": "Bounded transport must preserve whole-inventory semantics, which is enforced on both sides and consumed by enrichment."
+    },
+    {
+      "id": "v3-mixed-15",
+      "query": "page large checker ownership results with totals and monotonic cursors",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 3,
+          "reason": "Builds byte-bounded pages, first-page totals, and next cursors."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Owns result-page session state and validates requested cursors."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 2,
+          "reason": "Produces the complete ownership result that is paged by the host."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines page metadata, totals, ownership, projects, and cursor fields."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Consumes pages, rejects repeats or no-progress cursors, and validates totals and exact file order."
+        }
+      ],
+      "rationale": "The Node pager and Rust page validator form one integrity contract for large results."
+    },
+    {
+      "id": "v3-mixed-16",
+      "query": "keep checker cancellation responsive while typescript work runs in an isolated worker",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/protocol.mjs",
+          "grade": 2,
+          "reason": "Frames cancel and terminal messages under the shared request id contract."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 3,
+          "reason": "Keeps protocol handling in the host, terminates the worker, and suppresses one trailing plan frame after cancel."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 2,
+          "reason": "Contains the blocking TypeScript work isolated from the protocol host."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Defines cancel, canceled, and acknowledgement wire variants."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Routes interrupt cancellation to the active sidecar and distinguishes canceled, timeout, and crash outcomes."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 2,
+          "reason": "Maintains operation-scoped cancellation across per-project checker processes."
+        }
+      ],
+      "rationale": "Responsiveness is an architectural property of the Node host-worker split plus Rust interrupt routing."
+    },
+    {
+      "id": "v3-mixed-17",
+      "query": "discover the bundled typescript checker sidecar and verify its node runtime",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "npm/cli/bin/jscout.mjs",
+        "checker/src/main.mjs",
+        "src/config/load.rs",
+        "src/checker/mod.rs",
+        "src/llm/config.rs"
+      ],
+      "judgments": [
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "grade": 3,
+          "reason": "Sets the internal bundled checker path for the native binary."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 2,
+          "reason": "Is the checker entry point selected by the launcher and Rust resolver."
+        },
+        {
+          "path": "src/config/load.rs",
+          "grade": 3,
+          "reason": "Applies explicit-over-bundled checker path precedence."
+        },
+        {
+          "path": "src/checker/mod.rs",
+          "grade": 3,
+          "reason": "Resolves installed or development checker paths and launches the process."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "grade": 2,
+          "reason": "Provides the shared Node executable resolution and version floor used by checker launch."
+        }
+      ],
+      "rationale": "The npm shim contributes the JavaScript entry path while Rust owns precedence, validation, and launch."
+    },
+    {
+      "id": "v3-mixed-18",
+      "query": "prefer runtime project owners while retaining tooling owners and fallback evidence",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs",
+        "src/checker/package_gate.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Classifies lint tooling projects and emits selected, excluded, and fallback ownership."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Types project purpose, reasons, excluded owner ids, and fallback flags."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Transports and validates the paged ownership result."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Applies repository project policy, builds the selected plan, and records avoided and fallback occurrences."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 2,
+          "reason": "Treats excluded tooling owners as configured ownership for orphan admission."
+        },
+        {
+          "path": "src/recon.rs",
+          "grade": 1,
+          "reason": "Supplies repository-level runtime or auxiliary project role policy consumed by enrichment."
+        }
+      ],
+      "rationale": "The Node heuristic produces ownership evidence and Rust refines and consumes it without losing suppressed-owner semantics."
+    },
+    {
+      "id": "v3-mixed-19",
+      "query": "build bounded inferred typescript projects for files without configured owners",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "checker/src/inferred-options.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs",
+        "src/checker/package_gate.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Groups orphan files by package and module family, packs directories under the root cap, and validates reconstructed scopes."
+        },
+        {
+          "path": "checker/src/inferred-options.mjs",
+          "grade": 3,
+          "reason": "Defines NodeNext and bundler compiler options for inferred families."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 2,
+          "reason": "Carries inferred project summaries, ownership, and explicit project roots."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Transports the inferred plan and later supplies project roots for resolution."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Gates inferred coverage, verifies root caps and counts, and builds execution roots."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "grade": 3,
+          "reason": "Determines which unowned files are admitted to default inferred-project checking."
+        }
+      ],
+      "rationale": "Admission and planning are native responsibilities, while actual grouping and compiler semantics live in JavaScript."
+    },
+    {
+      "id": "v3-mixed-20",
+      "query": "fingerprint typescript runtime configuration options and source inputs for checker reuse",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs",
+        "src/store.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Builds stable fingerprints from protocol, TypeScript runtime, configs, normalized options, manifests, and source hashes."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Carries project configuration fingerprints, checker input fingerprints, and input file hashes."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Requests project validation and returns the typed fingerprints and inputs."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Checks fingerprint consistency, decides resume or carry eligibility, and validates inputs before completion."
+        },
+        {
+          "path": "src/store.rs",
+          "grade": 2,
+          "reason": "Defines and maintains persistent checker batch, project input, and fingerprint state."
+        }
+      ],
+      "rationale": "JavaScript computes the semantic identity and Rust uses and persists it to make reuse safe."
+    },
+    {
+      "id": "v3-mixed-21",
+      "query": "convert checker wire byte spans into typescript utf16 member call positions",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Validates UTF-8 byte boundaries, converts to UTF-16 offsets, and matches the exact TypeScript AST call."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines byte-valued call, receiver, and property ranges on member queries."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Serializes the member query ranges to the checker worker."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Copies indexed occurrence byte ranges into the wire member query."
+        }
+      ],
+      "rationale": "Rust owns the indexed byte contract and JavaScript must faithfully bridge it to TypeScript's UTF-16 API."
+    },
+    {
+      "id": "v3-mixed-22",
+      "query": "resolve receiver member declarations and preserve repository or external provenance",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Resolves receiver types, aliases and overloads, emits byte anchors, hashes, and provenance contexts."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines resolved status, receiver type, declaration sites, and context fields."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Transports and validates the member batch response variant."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Validates answer shapes, maps repository declarations to indexed anchors, and counts unmapped contexts."
+        },
+        {
+          "path": "src/store.rs",
+          "grade": 1,
+          "reason": "Provides the schema into which resolved target anchors and fingerprints are staged."
+        }
+      ],
+      "rationale": "TypeScript semantic resolution happens in JavaScript, but repository anchoring and treatment of non-repository declarations happen in Rust."
+    },
+    {
+      "id": "v3-mixed-23",
+      "query": "isolate inferred project checker failures by file while retaining healthy sibling results",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/main.mjs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/main.mjs",
+          "grade": 2,
+          "reason": "Returns worker batch results and distinguishes worker-level terminal failures."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Groups inferred queries by file, turns local span or checker faults into per-file failed answers, and keeps sibling results."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines per-result status and remote error details inside a project batch."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 2,
+          "reason": "Carries the batch result without collapsing per-item failures into a transport error."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Rejects mixed outcomes for one file, stages failed-file coverage, and publishes retained healthy work as partial failure."
+        }
+      ],
+      "rationale": "The isolation policy begins in the worker and is enforced and persisted by native enrichment."
+    },
+    {
+      "id": "v3-mixed-24",
+      "query": "revalidate checker project inputs after resolution before publishing enrichment",
+      "query_form": "lowercase_multi_token_prose",
+      "search_scope": {
+        "mode": "unfiltered",
+        "expected_formats": [
+          "javascript",
+          "rust"
+        ]
+      },
+      "gold_files": [
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs",
+        "src/checker/process.rs",
+        "src/checker/enrich.rs",
+        "src/store.rs"
+      ],
+      "judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "grade": 3,
+          "reason": "Rehashes loaded inputs, checks absent manifests and inferred package boundaries, and compares the requested fingerprint."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "grade": 3,
+          "reason": "Defines validation requests and responses with validity, fingerprint, and input hashes."
+        },
+        {
+          "path": "src/checker/process.rs",
+          "grade": 3,
+          "reason": "Sends validation on the same worker after resolution and returns typed results."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "grade": 3,
+          "reason": "Requires successful post-run validation before the project completion transaction."
+        },
+        {
+          "path": "src/store.rs",
+          "grade": 2,
+          "reason": "Persists validated project inputs and controls activation of checker batches."
+        }
+      ],
+      "rationale": "The sidecar proves its live inputs still match, and Rust gates publication on that proof."
+    }
+  ]
+}

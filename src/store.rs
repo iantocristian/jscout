@@ -146,6 +146,30 @@ pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
             crate::docs::CHUNK_FORMAT_VERSION,
         );
     }
+    for format in crate::formats::ALL {
+        let has_rows = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
+            [format.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_rows {
+            continue;
+        }
+        let key = crate::formats::contract_meta_key(format);
+        let actual = conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [&key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?
+            .unwrap_or_else(|| "missing".to_string());
+        if actual != format.extractor_version {
+            bail!(
+                "published index uses {} format contract {actual}, but this jscout requires {}; run `jscout index`",
+                format.id,
+                format.extractor_version,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -300,6 +324,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'documentation_provenance_format_version',
                'documentation_provenance_enabled'
              ) OR key LIKE 'embedding_index_synced_v1:%'
+               OR key LIKE 'format_contract_version:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
              UPDATE meta SET value='33' WHERE key='schema_version';",
         )?;
@@ -346,7 +371,8 @@ CREATE TABLE IF NOT EXISTS files(
   origin TEXT NOT NULL DEFAULT 'repository'
     CHECK(origin IN ('repository', 'workspace', 'dependency')),
   package_instance_id INTEGER REFERENCES package_instances(id) ON DELETE CASCADE,
-  package_path TEXT
+  package_path TEXT,
+  parse_error_count INTEGER NOT NULL DEFAULT 0 CHECK(parse_error_count >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_files_corpus ON files(corpus);
 
@@ -1354,6 +1380,178 @@ pub(crate) fn preserve_checker_carry_source_for_watch(conn: &Connection) -> Resu
     Ok(changed)
 }
 
+pub(crate) fn rebind_active_checker_batch(
+    conn: &Connection,
+    previous_snapshot: &str,
+    current_snapshot: &str,
+) -> Result<bool> {
+    if previous_snapshot == current_snapshot {
+        return Ok(false);
+    }
+    let Some(batch_id) = conn
+        .query_row(
+            "SELECT id FROM checker_enrichment_batches
+             WHERE active=1 AND source_snapshot=?1",
+            [previous_snapshot],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    for table in ["checker_occurrence_projects", "checker_enrichments"] {
+        let unmapped: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {table} item
+                 WHERE item.batch_id=?1 AND (
+                   SELECT COUNT(*)
+                   FROM files source
+                   JOIN member_calls call ON call.file_id=source.id
+                   WHERE source.path=item.source_file
+                     AND source.hash=item.source_hash
+                     AND call.start=item.call_start AND call.end=item.call_end
+                     AND call.receiver_start=item.receiver_start
+                     AND call.receiver_end=item.receiver_end
+                     AND call.property_start=item.property_start
+                     AND call.property_end=item.property_end
+                 )!=1"
+            ),
+            [batch_id],
+            |row| row.get(0),
+        )?;
+        if unmapped != 0 {
+            return Ok(false);
+        }
+    }
+    conn.execute(
+        "INSERT INTO checker_enrichment_batches(
+           source_snapshot, checker_version, checker_source,
+           checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+           selected_occurrences, total_projects, created_at, active
+         )
+         SELECT ?2, checker_version, checker_source,
+                checker_input_fingerprint, sidecar_protocol, plan_fingerprint,
+                selected_occurrences, total_projects, datetime('now'), 0
+         FROM checker_enrichment_batches
+         WHERE id=?1 AND active=1 AND source_snapshot=?3",
+        rusqlite::params![batch_id, current_snapshot, previous_snapshot],
+    )?;
+    if conn.changes() != 1 {
+        bail!("active checker batch disappeared before snapshot rebind cloning");
+    }
+    let rebound_batch = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO checker_project_runs(
+           batch_id, project_id, status, selected_occurrences,
+           completed_occurrences, planning_fingerprint,
+           checker_input_fingerprint, execution_kind,
+           peak_rss_bytes, peak_heap_bytes, error, updated_at
+         )
+         SELECT ?2, project_id, status, selected_occurrences,
+                completed_occurrences, planning_fingerprint,
+                checker_input_fingerprint,
+                CASE
+                  WHEN status='completed' THEN 'carried'
+                  WHEN completed_occurrences>0 THEN 'mixed'
+                  ELSE 'checked'
+                END,
+                0, 0, error, datetime('now')
+         FROM checker_project_runs WHERE batch_id=?1",
+        rusqlite::params![batch_id, rebound_batch],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id, project_id, input_kind, input_path, source_hash
+         )
+         SELECT ?2, project_id, input_kind, input_path, source_hash
+         FROM checker_project_inputs WHERE batch_id=?1",
+        rusqlite::params![batch_id, rebound_batch],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_occurrence_projects(
+           batch_id, member_call_id, source_file, source_hash,
+           call_start, call_end, receiver_start, receiver_end,
+           property_start, property_end, project_id,
+           checker_input_fingerprint, status
+         )
+         SELECT ?2, (
+                  SELECT call.rowid
+                  FROM files source
+                  JOIN member_calls call ON call.file_id=source.id
+                  WHERE source.path=item.source_file
+                    AND source.hash=item.source_hash
+                    AND call.start=item.call_start AND call.end=item.call_end
+                    AND call.receiver_start=item.receiver_start
+                    AND call.receiver_end=item.receiver_end
+                    AND call.property_start=item.property_start
+                    AND call.property_end=item.property_end
+                ),
+                item.source_file, item.source_hash,
+                item.call_start, item.call_end,
+                item.receiver_start, item.receiver_end,
+                item.property_start, item.property_end, item.project_id,
+                item.checker_input_fingerprint, item.status
+         FROM checker_occurrence_projects item WHERE item.batch_id=?1",
+        rusqlite::params![batch_id, rebound_batch],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_enrichments(
+           batch_id, member_call_id, source_file_id, source_file, source_hash,
+           call_start, call_end, receiver_start, receiver_end,
+           property_start, property_end, project_id, receiver_type,
+           target_anchor, target_fingerprint, confidence, provenance,
+           checker_input_fingerprint
+         )
+         SELECT ?2, call.rowid, source.id,
+                item.source_file, item.source_hash,
+                item.call_start, item.call_end,
+                item.receiver_start, item.receiver_end,
+                item.property_start, item.property_end, item.project_id,
+                item.receiver_type, item.target_anchor, item.target_fingerprint,
+                item.confidence, item.provenance, item.checker_input_fingerprint
+         FROM checker_enrichments item
+         JOIN files source
+           ON source.path=item.source_file AND source.hash=item.source_hash
+         JOIN member_calls call
+           ON call.file_id=source.id
+          AND call.start=item.call_start AND call.end=item.call_end
+          AND call.receiver_start=item.receiver_start
+          AND call.receiver_end=item.receiver_end
+          AND call.property_start=item.property_start
+          AND call.property_end=item.property_end
+         WHERE item.batch_id=?1",
+        rusqlite::params![batch_id, rebound_batch],
+    )?;
+    if conn.execute(
+        "UPDATE checker_enrichment_batches SET active=0
+         WHERE id=?1 AND active=1 AND source_snapshot=?2",
+        rusqlite::params![batch_id, previous_snapshot],
+    )? != 1
+    {
+        bail!("active checker batch disappeared before snapshot rebind publication");
+    }
+    if conn.execute(
+        "UPDATE checker_enrichment_batches SET active=1
+         WHERE id=?1 AND active=0 AND source_snapshot=?2",
+        rusqlite::params![rebound_batch, current_snapshot],
+    )? != 1
+    {
+        bail!("cloned checker batch could not be published for the current snapshot");
+    }
+    Ok(true)
+}
+
+pub(crate) fn deactivate_active_checker_batch_for_snapshot(
+    conn: &Connection,
+    snapshot: &str,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE checker_enrichment_batches SET active=0
+         WHERE active=1 AND source_snapshot=?1",
+        [snapshot],
+    )? != 0)
+}
+
 /// Remove a file and all derived rows (chunks/symbols/refs cascade).
 /// FTS rows are removed explicitly since fts5 isn't FK-aware.
 pub fn delete_file(conn: &Connection, file_id: i64) -> Result<()> {
@@ -1729,6 +1927,15 @@ mod tests {
              VALUES('documentation_chunk_format_version', ?1)",
             [crate::docs::CHUNK_FORMAT_VERSION],
         )?;
+        for format in crate::formats::ALL {
+            writer.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                rusqlite::params![
+                    crate::formats::contract_meta_key(format),
+                    format.extractor_version
+                ],
+            )?;
+        }
         writer.execute(
             "INSERT INTO meta(key, value)
              VALUES('documentation_provenance_format_version', ?1)",
@@ -1886,6 +2093,148 @@ mod tests {
         assert!(columns.iter().any(|column| column == "format"));
         let files: i64 = rebuilt.query_row("SELECT count(*) FROM files", [], |row| row.get(0))?;
         assert_eq!(files, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v31_rebuild_installs_rust_parse_diagnostics_contract() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v31.db");
+        let legacy = Connection::open(&database)?;
+        legacy.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES('schema_version', '31');
+             CREATE TABLE files(
+               id INTEGER PRIMARY KEY,
+               path TEXT UNIQUE NOT NULL,
+               hash TEXT NOT NULL,
+               corpus TEXT NOT NULL,
+               format TEXT NOT NULL,
+               role TEXT NOT NULL DEFAULT 'unknown'
+             );
+             INSERT INTO files(path,hash,corpus,format)
+             VALUES('old.ts','old','code','typescript');",
+        )?;
+        drop(legacy);
+
+        let rebuilt = open_path(&database)?;
+        let (not_null, default_value): (bool, Option<String>) = rebuilt.query_row(
+            "SELECT \"notnull\",dflt_value FROM pragma_table_info('files')
+             WHERE name='parse_error_count'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(not_null);
+        assert_eq!(default_value.as_deref(), Some("0"));
+        assert_eq!(
+            relation_columns(&rebuilt, "code_files")?,
+            relation_columns(&rebuilt, "files")?,
+        );
+        rebuilt.execute(
+            "INSERT INTO files(path,hash,corpus,format,role)
+             VALUES('guide.md','docs','docs','markdown','documentation')",
+            [],
+        )?;
+        assert_eq!(
+            rebuilt.query_row(
+                "SELECT parse_error_count FROM files WHERE path='guide.md'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+        );
+        assert!(
+            rebuilt
+                .execute(
+                    "UPDATE files SET parse_error_count=-1 WHERE path='guide.md'",
+                    [],
+                )
+                .is_err(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v32_rebuild_preserves_embedding_cache_and_replaces_code_vector_partition_schema()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v32.db");
+        let conn = open_path(&database)?;
+        conn.execute_batch(
+            "INSERT INTO embedding_profiles(
+               id,provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES(1,'test','tiny','profile',2,'{}');
+             INSERT INTO embeddings(chunk_hash,profile_id,vec)
+               VALUES('cached',1,x'0000000000000000');
+             INSERT INTO semantic_embeddings(document_hash,profile_id,vec)
+               VALUES('semantic-cached',1,x'0000000000000000');
+             INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(1,'src/old.ts','file','code','typescript','production','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,start,end,start_line,end_line,hash,content
+             ) VALUES(1,1,'module',0,1,1,1,'cached','x');
+             INSERT INTO embedding_index_entries(id,chunk_id,profile_id) VALUES(1,1,1);
+             CREATE VIRTUAL TABLE vec_embeddings_2 USING vec0(
+               embedding FLOAT[2] distance_metric=cosine,
+               profile_id INTEGER PARTITION KEY,
+               origin TEXT PARTITION KEY
+             );
+             INSERT INTO vec_embeddings_2(rowid,embedding,profile_id,origin)
+               VALUES(1,x'0000000000000000',1,'repository');
+             INSERT INTO meta(key,value) VALUES('embedding_index_synced_v1:1','1');
+             UPDATE meta SET value='32' WHERE key='schema_version';",
+        )?;
+        drop(conn);
+
+        let rebuilt = open_path(&database)?;
+        rebuilt.execute_batch(
+            "INSERT INTO files(id,path,hash,corpus,format,role,origin)
+               VALUES(2,'src/current.ts','file-current','code','typescript','production','repository');
+             INSERT INTO chunks(
+               id,file_id,kind,start,end,start_line,end_line,hash,content
+             ) VALUES(2,2,'module',0,1,1,1,'cached','x');",
+        )?;
+        crate::embed::materialize_cached_embeddings(&rebuilt)?;
+        let durable: (i64, i64, i64) = rebuilt.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_profiles),
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM semantic_embeddings)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(durable, (1, 1, 1));
+        assert_eq!(
+            relation_columns(&rebuilt, "vec_embeddings_2")?,
+            ["rowid", "embedding", "profile_id", "origin", "format",],
+        );
+        let disposable: (i64, i64) = rebuilt.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_index_entries),
+               (SELECT count(*) FROM vec_embeddings_2)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(disposable, (1, 1));
+        assert_eq!(
+            rebuilt.query_row(
+                "SELECT vector.format
+                 FROM vec_embeddings_2 vector
+                 JOIN embedding_index_entries entry ON entry.id=vector.rowid",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "typescript",
+            "the preserved cache must rematerialize under the current file format without a provider",
+        );
+        assert_eq!(
+            rebuilt.query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            SCHEMA_VERSION,
+        );
         Ok(())
     }
 

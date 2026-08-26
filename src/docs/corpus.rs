@@ -158,6 +158,7 @@ pub struct CapturedDocument {
 #[derive(Debug)]
 pub(crate) struct RepositoryCorpus {
     pub files: Vec<PathBuf>,
+    pub cargo_manifests: Vec<PathBuf>,
     pub rejections: Vec<crate::walk::WalkRejection>,
     pub documents: Vec<CapturedDocument>,
     pub decisions: Vec<Decision>,
@@ -291,6 +292,7 @@ fn repository_inventory_with_consumer(
     } = inventory.consumer;
     Ok(RepositoryCorpus {
         files: inventory.files,
+        cargo_manifests: inventory.cargo_manifests,
         rejections: inventory.rejections,
         documents,
         decisions,
@@ -688,13 +690,12 @@ fn hidden_path_is_excluded(path: &Path) -> bool {
 }
 
 fn is_document_path(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| {
-        extension == std::ffi::OsStr::new("md") || extension == std::ffi::OsStr::new("mdx")
-    })
+    crate::formats::documentation_for_path(path).is_some()
 }
 
 fn is_mdx_path(path: &Path) -> bool {
-    path.extension() == Some(std::ffi::OsStr::new("mdx"))
+    crate::formats::documentation_for_path(path)
+        .is_some_and(|format| format.id == crate::formats::MDX)
 }
 
 #[cfg(unix)]

@@ -1,0 +1,628 @@
+{
+  "attestation": {
+    "working_tree": "/private/tmp/jscout-g26-rust-phase1",
+    "read_only": true,
+    "inspected_only": [
+      "src/",
+      "gateway/src/",
+      "checker/src/",
+      "npm/cli/"
+    ],
+    "did_not_inspect": [
+      "eval/",
+      "git history or metadata",
+      "pull requests",
+      "search reports or databases",
+      "prior G26 query sets"
+    ],
+    "did_not_run": [
+      "jscout",
+      "repository search over evaluation artifacts"
+    ],
+    "fresh_authorship": true,
+    "query_count": 22,
+    "cross_language_check": "Every query has at least one grade-3 Rust judgment and one grade-3 JavaScript judgment."
+  },
+  "grading_scale": {
+    "3": "Direct primary implementation of the queried behavior.",
+    "2": "Important protocol, configuration, or lifecycle support.",
+    "1": "Focused corroborating entrypoint or test coverage."
+  },
+  "judgment_scope": "Positive judgments are recall sentinels, not an exhaustive relevant-file pool.",
+  "queries": [
+    {
+      "id": "g26v4-01",
+      "query": "How does the native client establish a versioned JSON-lines session with the model gateway and fail closed on protocol skew or mismatched request IDs?",
+      "positive_file_judgments": [
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Spawns the gateway, performs the greeting handshake, correlates replies, and poisons the client on unexpected IDs or malformed frames."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Implements bounded JSON-line parsing and validates protocol version, request ID, and message kind."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Defines the versioned envelopes and typed inbound and outbound wire messages."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Enforces greeting-first dispatch and returns the gateway version report."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-02",
+      "query": "How is an in-flight model request canceled on an interrupt without allowing cancellation to overtake dispatch or corrupt the next request?",
+      "positive_file_judgments": [
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Publishes active request IDs under an interrupt gate, queues cancellation outside the signal handler, and validates acknowledgements."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Associates abort controllers with active completions and emits cancellation results and terminal canceled replies."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Dispatches input lines without awaiting completion so cancellation can interleave."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-03",
+      "query": "Where are completion deadlines enforced so the gateway can return a provider-timeout result before the native client's grace window expires?",
+      "positive_file_judgments": [
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Waits for gateway replies using the request budget plus a bounded grace period and poisons stalled clients."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Starts the request timer, aborts provider work on expiry, and returns a retryable timeout error."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Carries the native timeout budget in completion requests."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-04",
+      "query": "How is a model forced to submit exactly one structured tool payload, and how does native scouting validate the returned tool and schema?",
+      "positive_file_judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Installs the single tool, chooses provider-specific forced-tool modes, and rejects missing, multiple, wrong, or malformed calls."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Builds task-specific tool schemas and validates returned tool names and arguments before publishing artifacts."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Defines the submitted tool schema and structured tool-call result carried across the boundary."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-05",
+      "query": "How do gateway-owned retries use bounded backoff while preserving aggregate token usage and attempt counts in native run records?",
+      "positive_file_judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Classifies retryability, performs abortable exponential backoff, disables hidden adapter retries, and aggregates usage across attempts."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Records aggregate usage, stop reason, attempt count, and response-model identity in scouting outcomes."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Receives retry metadata and usage as part of the terminal completion result."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Types the attempt counter and normalized usage fields on the wire."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-06",
+      "query": "How are raw provider failures reduced to stable billing, capacity, authentication, context, or connection errors and redacted before Rust surfaces them?",
+      "positive_file_judgments": [
+        {
+          "path": "gateway/src/completion.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Maps provider and transport messages into stable error categories with retryability and capacity semantics."
+        },
+        {
+          "path": "gateway/src/protocol.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Redacts credentials and sensitive URL components and bounds error text before serialization."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Converts sanitized remote errors into stable native error codes and user-facing diagnostics."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Deserializes stable code, message, retryable, and capacity fields."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-07",
+      "query": "How does model capability inspection resolve a provider-qualified model and report authentication, billing route, tool support, and context limits?",
+      "positive_file_judgments": [
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Handles capability requests, checks authentication, and assembles provider and model metadata."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Parses provider-qualified model specifications and describes billing, API, context, output, reasoning, and tool capabilities."
+        },
+        {
+          "path": "src/llm/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Implements the native diagnostic command and renders gateway, provider, authentication, and model capability information."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Validates and resolves provider-qualified model settings before capability lookup."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-08",
+      "query": "How does a command-line or repository reasoning level reach provider-specific request options, and where do unsupported levels fail explicitly?",
+      "positive_file_judgments": [
+        {
+          "path": "src/commands/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Resolves command-line reasoning overrides over repository configuration and passes the result into scouting."
+        },
+        {
+          "path": "src/scouting/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Places reasoning in completion requests and includes it in reuse fingerprints and run identity."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Validates normalized levels and translates them into OpenAI or Google transport options while rejecting unsupported providers or levels."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Applies the translated reasoning options to the provider request."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-09",
+      "query": "How does a requested service tier flow from scouting configuration to provider calls only when the selected API supports it?",
+      "positive_file_judgments": [
+        {
+          "path": "src/scouting/mod.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Carries the selected tier into completion requests and incorporates it into scouting input identity."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Restricts service tiers to verified response APIs and produces an explicit unsupported-option error otherwise."
+        },
+        {
+          "path": "src/llm/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Defines the provider-options field used to transport the tier."
+        },
+        {
+          "path": "gateway/src/completion.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Adds the validated tier to the concrete provider request."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-10",
+      "query": "How do custom OpenAI-compatible providers and base URLs cross the Rust-to-Node configuration boundary without serializing secret values into provider definitions?",
+      "positive_file_judgments": [
+        {
+          "path": "src/config/load.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Loads and validates typed compatible-provider definitions, endpoints, model limits, and secret variable names."
+        },
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Serializes non-secret provider metadata and gateway settings into the child environment while handling configured key variables separately."
+        },
+        {
+          "path": "gateway/src/registry.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Revalidates provider JSON, builds compatible providers, and resolves credentials from named environment variables at call time."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Lazily constructs the registry from the environment so configuration errors surface on provider-dependent requests."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-11",
+      "query": "How does the npm entrypoint supply packaged checker and model sidecars as built-in discovery while preserving repository configuration and operator overrides?",
+      "positive_file_judgments": [
+        {
+          "path": "npm/cli/bin/jscout.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Injects internal bundled sidecar paths only when neither an operator override nor an existing bundled path is present."
+        },
+        {
+          "path": "src/config/load.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Implements precedence from repository configuration to legacy override to internal bundled discovery and records the correct source."
+        },
+        {
+          "path": "src/checker/mod.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Validates the resolved checker path and provides local companion fallback."
+        },
+        {
+          "path": "src/llm/config.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Validates the resolved gateway path and provides local companion fallback."
+        },
+        {
+          "path": "npm/cli/test/launcher.test.mjs",
+          "language": "JavaScript",
+          "grade": 1,
+          "reason": "Corroborates bundled-path injection and preservation of explicit overrides."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-12",
+      "query": "How does configured model-call concurrency use independent native-managed gateway processes while each Node gateway permits only one active completion?",
+      "positive_file_judgments": [
+        {
+          "path": "src/llm/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Creates a fixed worker pool, dispatches bounded batches in parallel, and applies one interrupt admission across a batch."
+        },
+        {
+          "path": "gateway/src/server.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Maintains one active completion per process and returns a busy error for overlap."
+        },
+        {
+          "path": "src/config/load.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Loads and positively validates the explicit concurrency setting."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-13",
+      "query": "How is a complete repository ownership inventory uploaded in bounded frames and returned through ordered, total-checked, cursor-safe result pages?",
+      "positive_file_judgments": [
+        {
+          "path": "src/checker/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Sorts and chunks the upload, verifies acknowledgements, page metadata, totals, ordering, uniqueness, progress, and cursors."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Implements the upload session state machine and paged result exchange."
+        },
+        {
+          "path": "checker/src/protocol.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Enforces frame budgets and builds bounded pages across ownership, project, and configuration-problem sections."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Requires the streamed inventory to be planned as one global ownership snapshot."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-14",
+      "query": "How can an interrupt cancel blocking TypeScript work, terminate its worker, and discard a trailing planning frame without poisoning a reusable Rust client?",
+      "positive_file_judgments": [
+        {
+          "path": "src/checker/process.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Routes interrupts to the active logical request and tolerates asynchronous cancellation acknowledgements."
+        },
+        {
+          "path": "checker/src/main.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Keeps protocol handling outside the worker, terminates blocking work on cancel, and discards one trailing frame for the canceled session."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Runs synchronous TypeScript program and checker operations inside the disposable worker."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-15",
+      "query": "How are repository byte offsets checked as UTF-8 boundaries, converted to TypeScript positions, and matched to the exact indexed member-call occurrence?",
+      "positive_file_judgments": [
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Builds member-resolution requests from indexed call, receiver, and property byte spans and validates returned source identity."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Converts byte offsets to UTF-16, checks containment and boundaries, and finds the exact property-call AST node."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Defines all indexed byte-span fields in the cross-language query."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-16",
+      "query": "How are configured TypeScript projects discovered and invalid configurations reported while tooling-only owners are deprioritized but retained as a fallback?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Discovers configurations, parses membership, reports diagnostics, classifies tooling projects, and selects general owners with fallback semantics."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Consumes selected and excluded owners, applies repository project policy, preserves sole-owner fallback, and builds the execution plan."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Carries project purpose evidence, excluded owners, fallback state, and configuration problems."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-17",
+      "query": "How are files without configured ownership grouped by nearest package and module semantics into bounded inferred scopes, while Rust preserves and rechecks the complete scope?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Groups unowned files by package and compiler family, partitions large groups deterministically, and validates supplied inferred roots."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Gates inferred occurrences, retains complete project root sets independently of occurrence caps, and rechecks the root limit."
+        },
+        {
+          "path": "src/checker/package_gate.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Decides which unconfigured package files are admitted to inferred checking from the complete indexed inventory."
+        },
+        {
+          "path": "checker/src/inferred-options.mjs",
+          "language": "JavaScript",
+          "grade": 2,
+          "reason": "Defines Node and bundler compiler semantics used by inferred scopes."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-18",
+      "query": "How are compiler, configuration, membership, and source inputs fingerprinted and revalidated so changed inputs cannot activate or reuse stale checker facts?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Builds stable project-input fingerprints and re-reads recorded inputs and inferred package boundaries after resolution."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Compares fingerprints across batches, resets drifted staging, validates the completed project, and gates carry and activation on freshness."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Carries project fingerprints, validation status, and the exact input hash inventory."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-19",
+      "query": "How do both sides reject member-resolution results when source bytes differ from the indexed snapshot or returned batch identities do not match the request?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Hashes query files before checking and rejects changed source bytes before resolving spans."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Rechecks selected source files and verifies project, checker identity, result count, indexed hash, source hash, and answer fingerprint."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Types the request and response source identities used by the checks."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-20",
+      "query": "How are TypeScript declaration candidates assigned repository, type-package, standard-library, vendored, or outside provenance and then mapped safely to indexed symbols?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Resolves aliases and overloads, emits byte spans and source hashes, and classifies declaration-file provenance."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Skips non-repository lookups, maps repository declarations by name, tight span, and hash, and demotes incomplete candidate sets."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Defines declaration location, outside-root state, source identity, and provenance fields."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-21",
+      "query": "How does batched member resolution stay within request and response budgets, retry oversized replies with smaller batches, and accumulate peak worker memory?",
+      "positive_file_judgments": [
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Premeasures requests, sends bounded batches, halves batches after an oversized response, and aggregates peak RSS and heap usage."
+        },
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Bounds query counts and serialized response size and reports process memory with each batch."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Types batched results and resource-usage measurements."
+        }
+      ]
+    },
+    {
+      "id": "g26v4-22",
+      "query": "How are checker faults isolated to one source file for inferred projects while project-wide races and configured-project failures remain atomic?",
+      "positive_file_judgments": [
+        {
+          "path": "checker/src/worker.mjs",
+          "language": "JavaScript",
+          "grade": 3,
+          "reason": "Groups inferred queries by file, converts eligible local faults into failed answers, and rethrows source, protocol, or project races."
+        },
+        {
+          "path": "src/checker/enrich.rs",
+          "language": "Rust",
+          "grade": 3,
+          "reason": "Validates failed-answer shape, stages all occurrences of a failed file, skips later queries for it, and preserves project-level failure policy."
+        },
+        {
+          "path": "src/checker/protocol.rs",
+          "language": "Rust",
+          "grade": 2,
+          "reason": "Carries per-answer status and bounded structured error details."
+        }
+      ]
+    }
+  ]
+}

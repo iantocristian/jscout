@@ -369,12 +369,15 @@ fn discover_scope_subjects(root: &Path, conn: &Connection) -> Result<Vec<Discove
     }
 
     let mut unowned = BTreeSet::new();
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
     let mut statement = conn.prepare(
         "SELECT file.path FROM code_files file
          WHERE file.origin='repository' AND file.package_instance_id IS NULL
+           AND file.format IN (SELECT value FROM json_each(?1))
          ORDER BY file.path",
     )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = statement.query_map([&reconnaissance_formats], |row| row.get::<_, String>(0))?;
     for path in rows {
         let path = path?;
         let scope = path.split_once('/').map_or(".", |(head, _)| head);
@@ -489,15 +492,23 @@ fn all_first_party_files(conn: &Connection) -> Result<Vec<MemberFile>> {
     let mut statement = conn.prepare(
         "SELECT file.id, file.path, file.hash FROM code_files file
          WHERE file.origin IN ('repository','workspace')
+           AND file.format IN (SELECT value FROM json_each(?1))
+           AND file.format IN (SELECT value FROM json_each(?2))
          ORDER BY file.path",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok(MemberFile {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            hash: row.get(2)?,
-        })
-    })?;
+    let checker_formats = crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+    let reconnaissance_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
+    let rows = statement.query_map(
+        rusqlite::params![checker_formats, reconnaissance_formats],
+        |row| {
+            Ok(MemberFile {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                hash: row.get(2)?,
+            })
+        },
+    )?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
@@ -1581,12 +1592,23 @@ fn refresh_state(
             membership_fingerprint,
             config_fingerprint,
         } => {
+            let checker_formats =
+                crate::formats::eligible_ids_json(crate::formats::Capability::Checker);
+            let reconnaissance_formats =
+                crate::formats::eligible_ids_json(crate::formats::Capability::Reconnaissance);
             let mut members = Vec::new();
             for original in &item.state.members {
                 if let Some(member) = conn
                     .query_row(
-                        "SELECT id, path, hash FROM files WHERE path=?1",
-                        [&original.path],
+                        "SELECT id, path, hash FROM files
+                         WHERE path=?1
+                           AND format IN (SELECT value FROM json_each(?2))
+                           AND format IN (SELECT value FROM json_each(?3))",
+                        rusqlite::params![
+                            &original.path,
+                            &checker_formats,
+                            &reconnaissance_formats
+                        ],
                         |row| {
                             Ok(MemberFile {
                                 id: row.get(0)?,
@@ -2423,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn checker_planning_inventory_excludes_documentation_rows() -> Result<()> {
+    fn checker_planning_inventory_excludes_ineligible_formats_and_documentation() -> Result<()> {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
         conn.execute_batch(
@@ -2431,6 +2453,8 @@ mod tests {
                VALUES(1,'src/main.ts','code','production','repository','code','typescript');
              INSERT INTO files(id,path,hash,role,origin,corpus,format)
                VALUES(2,'README.md','docs','documentation','repository','docs','markdown');
+             INSERT INTO files(id,path,hash,role,origin,corpus,format)
+               VALUES(3,'src/lib.rs','rust','production','repository','code','rust');
              INSERT INTO chunks(
                id,file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
              ) VALUES(2,2,'markdown_document',NULL,'','',0,0,1,1,'doc-chunk','');

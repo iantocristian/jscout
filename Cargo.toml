@@ -23,6 +23,7 @@ oxc_semantic = "0.143.0"
 oxc_span = "0.143.0"
 oxc_syntax = "0.143.0"
 pulldown-cmark = "0.13.0"
+ra_ap_syntax = "=0.0.349"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

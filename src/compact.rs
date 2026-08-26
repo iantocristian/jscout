@@ -64,9 +64,15 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
                     hit,
                     &result.snapshot,
                     result.response_budget.exhaustive_locator_only,
+                    &result.requested_formats,
                 )
             } else {
-                compact_hit(hit, &result.snapshot, default_match)
+                compact_hit(
+                    hit,
+                    &result.snapshot,
+                    default_match,
+                    &result.requested_formats,
+                )
             }
         })
         .collect::<Vec<_>>();
@@ -233,7 +239,12 @@ fn semantic_preview(body: &Value) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
-fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchReason) -> Value {
+fn compact_hit(
+    hit: &search::Hit,
+    snapshot: &str,
+    default_match: search::MatchReason,
+    requested_formats: &[String],
+) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -265,12 +276,21 @@ fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchRe
             value.insert("anchors".into(), json!(anchors));
         }
         _ => {
-            value.insert("anchor".into(), json!(hit.file_anchor));
+            if let Some(file_anchor) = &hit.file_anchor {
+                value.insert("anchor".into(), json!(file_anchor));
+            }
         }
     }
     if hit.anchors.len() <= 1 {
-        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
-        value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
+        let anchor = hit
+            .anchors
+            .first()
+            .or(hit.file_anchor.as_ref())
+            .map_or("", String::as_str);
+        value.insert(
+            "followups".into(),
+            compact_followups(hit, anchor, snapshot, requested_formats),
+        );
     }
     if !hit.uses.is_empty() {
         value.insert("uses".into(), json!(hit.uses));
@@ -288,7 +308,12 @@ fn compact_hit(hit: &search::Hit, snapshot: &str, default_match: search::MatchRe
     Value::Object(value)
 }
 
-fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str, locator_only: bool) -> Value {
+fn compact_exhaustive_hit(
+    hit: &search::Hit,
+    snapshot: &str,
+    locator_only: bool,
+    requested_formats: &[String],
+) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -311,17 +336,31 @@ fn compact_exhaustive_hit(hit: &search::Hit, snapshot: &str, locator_only: bool)
             value.insert("anchors".into(), json!(anchors));
         }
         _ => {
-            value.insert("anchor".into(), json!(hit.file_anchor));
+            if let Some(file_anchor) = &hit.file_anchor {
+                value.insert("anchor".into(), json!(file_anchor));
+            }
         }
     }
     if !locator_only && hit.anchors.len() <= 1 {
-        let anchor = hit.anchors.first().unwrap_or(&hit.file_anchor);
-        value.insert("followups".into(), compact_followups(hit, anchor, snapshot));
+        let anchor = hit
+            .anchors
+            .first()
+            .or(hit.file_anchor.as_ref())
+            .map_or("", String::as_str);
+        value.insert(
+            "followups".into(),
+            compact_followups(hit, anchor, snapshot, requested_formats),
+        );
     }
     Value::Object(value)
 }
 
-fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
+fn compact_followups(
+    hit: &search::Hit,
+    anchor: &str,
+    snapshot: &str,
+    requested_formats: &[String],
+) -> Value {
     let origins = (hit.file_origin == "dependency").then(|| origin::ALL.to_vec());
     if anchor.starts_with("sym:") {
         let tools = if hit.include_neighborhood_followup {
@@ -329,16 +368,40 @@ fn compact_followups(hit: &search::Hit, anchor: &str, snapshot: &str) -> Value {
         } else {
             vec!["definition", "who_uses"]
         };
-        let mut arguments = Map::new();
-        arguments.insert("anchor".into(), json!(anchor));
-        arguments.insert("snapshot".into(), json!(snapshot));
-        if let Some(origins) = origins {
-            arguments.insert("origins".into(), json!(origins));
-        }
         let mut followups = Map::new();
         followups.insert("tools".into(), json!(tools));
-        if hit.include_followups {
-            followups.insert("arguments".into(), Value::Object(arguments));
+        if !hit.include_followups {
+            return Value::Object(followups);
+        }
+
+        let base_arguments = || {
+            let mut arguments = Map::new();
+            arguments.insert("anchor".into(), json!(anchor));
+            arguments.insert("snapshot".into(), json!(snapshot));
+            if let Some(origins) = &origins {
+                arguments.insert("origins".into(), json!(origins));
+            }
+            arguments
+        };
+        if requested_formats.is_empty() {
+            followups.insert("arguments".into(), Value::Object(base_arguments()));
+        } else {
+            let mut calls = ["definition", "who_uses"]
+                .into_iter()
+                .map(|tool| {
+                    let mut arguments = base_arguments();
+                    arguments.insert("formats".into(), json!(requested_formats));
+                    json!({ "tool": tool, "arguments": arguments })
+                })
+                .collect::<Vec<_>>();
+            if hit.include_neighborhood_followup {
+                calls.push(json!({
+                    "tool": "neighborhood",
+                    "arguments": base_arguments(),
+                }));
+            }
+            followups.remove("tools");
+            followups.insert("calls".into(), Value::Array(calls));
         }
         Value::Object(followups)
     } else {

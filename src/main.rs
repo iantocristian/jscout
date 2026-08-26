@@ -15,6 +15,7 @@ mod docs;
 mod embed;
 mod entity;
 mod file_role;
+mod formats;
 mod fs_ops;
 mod graph;
 mod heur;
@@ -29,6 +30,7 @@ mod parse;
 mod query;
 mod recon;
 mod runtime_identity;
+mod rust_lang;
 mod scout;
 mod scouting;
 mod search;
@@ -75,7 +77,7 @@ use cli::{ConfigCommand, ScoutCommand};
 #[cfg(test)]
 use commands::{
     effective_search_response_byte_limit, or_configured, render_cli_neighborhood,
-    render_semantic_memory_text, resolve_flag,
+    render_semantic_memory_text, resolve_flag, resolve_search_provider,
 };
 
 #[cfg(test)]

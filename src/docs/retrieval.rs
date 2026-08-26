@@ -792,15 +792,17 @@ fn finish_search(
 }
 
 fn embedding_documents(conn: &Connection) -> Result<Vec<EmbeddingDocument>> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
     let invalid: i64 = conn.query_row(
         "SELECT COUNT(*)
          FROM chunks c
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
-         WHERE f.corpus='docs'
+         WHERE f.format IN (SELECT value FROM json_each(?1))
            AND c.kind!='markdown_document'
            AND m.embedding_identity IS NULL",
-        [],
+        [&eligible_formats],
         |row| row.get(0),
     )?;
     ensure!(
@@ -822,11 +824,12 @@ fn embedding_documents(conn: &Connection) -> Result<Vec<EmbeddingDocument>> {
          JOIN docs_fts ON docs_fts.rowid=m.chunk_id
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.corpus='docs' AND m.embedding_identity IS NOT NULL
+         WHERE f.format IN (SELECT value FROM json_each(?1))
+           AND m.embedding_identity IS NOT NULL
          GROUP BY m.embedding_identity
          ORDER BY m.embedding_identity",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([&eligible_formats], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -1052,6 +1055,8 @@ fn rebuild_profile_generation_from_cache(
     snapshot: &str,
     profile: &ResolvedProfile,
 ) -> Result<Option<usize>> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
     let table = ensure_vector_table(conn, profile.dimensions)?;
     conn.execute(
         "DELETE FROM doc_vector_generations WHERE profile_id=?1",
@@ -1074,10 +1079,11 @@ fn rebuild_profile_generation_from_cache(
              JOIN files f ON f.id=c.file_id
              JOIN embeddings e
                ON e.chunk_hash=m.embedding_identity AND e.profile_id=?1
-             WHERE f.corpus='docs' AND m.embedding_identity IS NOT NULL
+             WHERE f.format IN (SELECT value FROM json_each(?2))
+               AND m.embedding_identity IS NOT NULL
              ORDER BY m.chunk_id",
         )?;
-        let rows = statement.query_map([profile.id], |row| {
+        let rows = statement.query_map(params![profile.id, &eligible_formats], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1087,8 +1093,9 @@ fn rebuild_profile_generation_from_cache(
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.corpus='docs' AND m.embedding_identity IS NOT NULL",
-        [],
+         WHERE f.format IN (SELECT value FROM json_each(?1))
+           AND m.embedding_identity IS NOT NULL",
+        [&eligible_formats],
         |row| row.get(0),
     )?;
     let expected = usize::try_from(expected)
@@ -1174,6 +1181,8 @@ fn vector_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<(i64, f64)>> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
     let table = vector_table(profile.dimensions);
     let exists: bool = conn.query_row(
         "SELECT EXISTS(
@@ -1199,6 +1208,9 @@ fn vector_search(
     );
     let query_blob = vec_to_blob(vector);
 
+    // The materialized documentation table must contain only eligible
+    // occurrences. Count it unfiltered so an obsolete/ineligible entry makes
+    // readiness fail closed instead of being hidden by the registry filter.
     let occurrence_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1",
         [profile.id],
@@ -1209,8 +1221,9 @@ fn vector_search(
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.corpus='docs' AND m.embedding_identity IS NOT NULL",
-        [],
+         WHERE f.format IN (SELECT value FROM json_each(?1))
+           AND m.embedding_identity IS NOT NULL",
+        [&eligible_formats],
         |row| row.get(0),
     )?;
     ensure!(
@@ -1223,9 +1236,22 @@ fn vector_search(
     let occurrence_count = usize::try_from(occurrence_count)
         .context("documentation vector occurrence count is negative")?;
     let candidates = if occurrence_count <= SQLITE_VEC_MAX_K {
-        knn_vector_candidates(conn, &table, profile.id, &query_blob, occurrence_count)?
+        knn_vector_candidates(
+            conn,
+            &table,
+            profile.id,
+            &query_blob,
+            occurrence_count,
+            &eligible_formats,
+        )?
     } else {
-        full_distance_vector_search(conn, profile.id, &query_blob, occurrence_count)?
+        full_distance_vector_search(
+            conn,
+            profile.id,
+            &query_blob,
+            occurrence_count,
+            &eligible_formats,
+        )?
     };
     Ok(finalize_vector_ranking(candidates, limit))
 }
@@ -1236,6 +1262,7 @@ fn knn_vector_candidates(
     profile_id: i64,
     query_vector: &[u8],
     k: usize,
+    eligible_formats: &str,
 ) -> Result<Vec<VectorCandidate>> {
     let mut statement = conn.prepare(&format!(
         "SELECT e.chunk_id, v.distance, f.path, c.start, c.end, docs_fts.body
@@ -1245,14 +1272,15 @@ fn knn_vector_candidates(
          JOIN files f ON f.id=c.file_id
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE v.embedding MATCH ?1 AND v.k=?2 AND v.profile_id=?3
-           AND f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?4))
          ORDER BY v.distance"
     ))?;
     let rows = statement.query_map(
         params![
             query_vector,
             i64::try_from(k).context("documentation vector K does not fit SQLite")?,
-            profile_id
+            profile_id,
+            eligible_formats,
         ],
         vector_candidate_from_row,
     )?;
@@ -1270,6 +1298,7 @@ fn full_distance_vector_search(
     profile_id: i64,
     query_vector: &[u8],
     expected: usize,
+    eligible_formats: &str,
 ) -> Result<Vec<VectorCandidate>> {
     let mut statement = conn.prepare(
         "SELECT entry.chunk_id, vec_distance_cosine(e.vec,?1), f.path,
@@ -1281,9 +1310,13 @@ fn full_distance_vector_search(
          JOIN chunks c ON c.id=entry.chunk_id
          JOIN files f ON f.id=c.file_id
          JOIN docs_fts ON docs_fts.rowid=c.id
-         WHERE entry.profile_id=?2 AND f.corpus='docs'",
+         WHERE entry.profile_id=?2
+           AND f.format IN (SELECT value FROM json_each(?3))",
     )?;
-    let rows = statement.query_map(params![query_vector, profile_id], vector_candidate_from_row)?;
+    let rows = statement.query_map(
+        params![query_vector, profile_id, eligible_formats],
+        vector_candidate_from_row,
+    )?;
     let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(
         candidates.len() == expected,
@@ -2258,6 +2291,188 @@ mod tests {
     }
 
     #[test]
+    fn documentation_vectors_follow_registry_eligibility_not_docs_corpus() -> Result<()> {
+        let (root, conn) = indexed_document()?;
+        let snapshot = store::current_snapshot(&conn)?;
+        let (eligible_chunk_id, eligible_identity): (i64, String) = conn.query_row(
+            "SELECT m.chunk_id, m.embedding_identity
+             FROM doc_chunk_meta m
+             JOIN chunks c ON c.id=m.chunk_id
+             JOIN files f ON f.id=c.file_id
+             WHERE f.path='README.md' AND m.embedding_identity IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        // This deliberately violates the registry's Rust corpus assignment
+        // while satisfying the schema-level docs-sidecar invariant. Any
+        // capability inferred from `corpus='docs'` would admit it.
+        let ineligible_body = "registryIneligibleVectorNeedle";
+        let ineligible_identity = "ineligible-rust-doc-vector";
+        conn.execute(
+            "INSERT INTO files(path,hash,corpus,format,role,origin)
+             VALUES('ineligible.md',?1,'docs','rust','documentation','repository')",
+            [blake3::hash(ineligible_body.as_bytes()).to_hex().as_str()],
+        )?;
+        let ineligible_file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(
+               file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+             ) VALUES(?1,'markdown_section',NULL,'','',0,?2,1,1,?3,?4)",
+            params![
+                ineligible_file_id,
+                i64::try_from(ineligible_body.len())?,
+                blake3::hash(ineligible_body.as_bytes()).to_hex().as_str(),
+                ineligible_body,
+            ],
+        )?;
+        let ineligible_chunk_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO doc_chunk_meta(
+               chunk_id,title,breadcrumb,nearest_heading,ordinal,
+               embedding_identity,front_matter_state
+             ) VALUES(?1,'Ineligible','','Ineligible',0,?2,'none')",
+            params![ineligible_chunk_id, ineligible_identity],
+        )?;
+        conn.execute(
+            "INSERT INTO docs_fts(rowid,title,metadata,breadcrumb,body,path)
+             VALUES(?1,'Ineligible','','',?2,'ineligible.md')",
+            params![ineligible_chunk_id, ineligible_body],
+        )?;
+
+        let documents = embedding_documents(&conn)?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].identity, eligible_identity);
+        assert!(!documents[0].text.contains(ineligible_body));
+
+        // One document request, one successful query request, and one query
+        // request whose stale materialization is rejected below.
+        let (endpoint, server) = spawn_openai_embedding_server(3)?;
+        let provider = test_provider(endpoint)?;
+        let report = embed_current(&conn, &provider, 16)?;
+        assert_eq!(report.unique_representations, 1);
+        assert_eq!(report.embeddable_occurrences, 1);
+        assert_eq!(report.occurrences_materialized, 1);
+        let profile_id = report.profile_id.context("missing docs profile")?;
+        let dimensions = report.dimensions.context("missing docs dimensions")?;
+        assert_eq!(dimensions, 2);
+
+        // Even a durable cache entry for the ineligible representation must
+        // not be rematerialized into the documentation sqlite-vec table.
+        conn.execute(
+            "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+            params![ineligible_identity, profile_id, vec_to_blob(&[0.0, 1.0]),],
+        )?;
+        rematerialize_cached_generations(&conn, &snapshot)?;
+        let profile = ResolvedProfile {
+            id: profile_id,
+            dimensions,
+        };
+        assert!(generation_is_ready(&conn, &snapshot, &profile)?);
+        let materialized = conn
+            .prepare(
+                "SELECT entry.chunk_id, f.path
+                 FROM doc_embedding_index_entries entry
+                 JOIN chunks c ON c.id=entry.chunk_id
+                 JOIN files f ON f.id=c.file_id
+                 WHERE entry.profile_id=?1
+                 ORDER BY entry.chunk_id",
+            )?
+            .query_map([profile_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(materialized, vec![(eligible_chunk_id, "README.md".into())]);
+
+        let required_vectors = SearchOptions {
+            limit: 5,
+            response_bytes: 100_000,
+            vector: true,
+            vector_required: true,
+            rerank: false,
+            ..SearchOptions::default()
+        };
+        let result = search(
+            &conn,
+            root.path(),
+            Some(&provider),
+            "zzRegistryVectorQueryOnly",
+            &required_vectors,
+        )?;
+        assert_eq!(result.diagnostics.vector_status, VectorStatus::Active);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].document.path, "README.md");
+        assert!(result.hits[0].vector_score.is_some());
+        assert!(result.hits[0].lexical_score.is_none());
+
+        // Simulate an obsolete materialized occurrence from a formerly
+        // eligible format. Full-distance candidates filter it, KNN refuses an
+        // underfilled eligible result set, and the public readiness check
+        // rejects the contaminated dedicated table before either can leak it.
+        conn.execute(
+            "INSERT INTO doc_embedding_index_entries(chunk_id,profile_id) VALUES(?1,?2)",
+            params![ineligible_chunk_id, profile_id],
+        )?;
+        let ineligible_entry_id = conn.last_insert_rowid();
+        let table = vector_table(dimensions);
+        conn.execute(
+            &format!("INSERT INTO {table}(rowid,embedding,profile_id) VALUES(?1,?2,?3)"),
+            params![ineligible_entry_id, vec_to_blob(&[0.0, 1.0]), profile_id,],
+        )?;
+        let eligible_formats =
+            crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
+        let full = full_distance_vector_search(
+            &conn,
+            profile_id,
+            &vec_to_blob(&[1.0, 0.0]),
+            1,
+            &eligible_formats,
+        )?;
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].chunk_id, eligible_chunk_id);
+        let knn_error = knn_vector_candidates(
+            &conn,
+            &table,
+            profile_id,
+            &vec_to_blob(&[1.0, 0.0]),
+            2,
+            &eligible_formats,
+        )
+        .unwrap_err();
+        assert!(
+            knn_error
+                .to_string()
+                .contains("expected 2 candidates, found 1")
+        );
+
+        assert!(generation_is_ready(&conn, &snapshot, &profile)?);
+        let error = search(
+            &conn,
+            root.path(),
+            Some(&provider),
+            "zzRegistryVectorQueryOnly",
+            &required_vectors,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("documentation vector generation is incomplete"),
+            "unexpected stale-generation error: {error:#}"
+        );
+
+        let requests = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("fake embedding server panicked"))??;
+        let document_inputs = requests[0]["input"]
+            .as_array()
+            .context("document embedding request input is not an array")?;
+        assert_eq!(document_inputs.len(), 1);
+        assert!(document_inputs[0].as_str().is_some_and(|input| {
+            input.contains("blue release") && !input.contains(ineligible_body)
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn final_materialization_rechecks_the_shared_snapshot() -> Result<()> {
         let root = tempfile::tempdir()?;
         let conn = crate::store::open(root.path())?;
@@ -2271,6 +2486,15 @@ mod tests {
              VALUES('documentation_chunk_format_version',?1)",
             [CHUNK_FORMAT_VERSION],
         )?;
+        for format in crate::formats::ALL {
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                rusqlite::params![
+                    crate::formats::contract_meta_key(format),
+                    format.extractor_version
+                ],
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key,value)
              VALUES('documentation_provenance_format_version',?1)",

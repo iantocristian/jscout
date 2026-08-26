@@ -1,0 +1,125 @@
+{
+  "baseline_revision": "4ad4ea2d9b94f7268d155ab3ff9bf27b78625393",
+  "generator": "cargo test emit_g26_phase_zero_baseline -- --nocapture",
+  "normalized_exceptions": [
+    "meta.schema_version",
+    "meta.root",
+    "meta.format_contract_version:*",
+    "files.parse_error_count (treatment-only column; zero default asserted separately)"
+  ],
+  "sections": [
+    [
+      "counts",
+      "5\u001f3\u001f2\u001f2\u001f\n"
+    ],
+    [
+      "files",
+      "guide.md\u001f566544a50ff40e2449b794baec987c11ee142d32f130d59252262e62438066ae\u001fdocs\u001fmarkdown\u001fdocumentation\u001frepository\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f\nguide.mdx\u001f84bf511606294290401ee72de79e9d6649a5c9262b0d71f5111009b5d05f48cb\u001fdocs\u001fmdx\u001fdocumentation\u001frepository\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f\nsrc/helper.js\u001fe8c2d06b625bfe32a24b906f7a889541e211525363c30d5b08c50f6e2a42f347\u001fcode\u001fjavascript\u001fproduction\u001frepository\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f\nsrc/main.ts\u001f90797d156efc89675fa541607830ff64bf862485d44c7f0f5202c1a053b135f3\u001fcode\u001ftypescript\u001fproduction\u001frepository\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f<null>\u001f\n"
+    ],
+    [
+      "chunks",
+      "guide.md\u001fmarkdown_section\u001f<null>\u001f\u001f\u001f56\u001f94\u001f7\u001f7\u001fd4ef4fbcc6d6de04df9f634dade5e4fb96dc627cc173a390eca52681149290c7\u001fphaseZeroDocumentation markdown body.\n\u001f\nguide.mdx\u001fmarkdown_section\u001f<null>\u001f\u001f\u001f42\u001f110\u001f5\u001f5\u001f1793ec6a979f67c3af102523ce0c02cd8629382284b704e07e909febde91a927\u001f<Badge label=\"Stable\">phaseZeroDocumentation component body</Badge>\n\u001f\nsrc/helper.js\u001ffunction\u001fphaseZeroHelper\u001f\u001fphaseZeroHelper\u001f0\u001f54\u001f1\u001f1\u001f14bdc92bd1fd89a05d32a597cec298f6f3afb60e68ece8212e78c25df4935bb0\u001fexport function phaseZeroHelper() { return 'stable'; }\u001f\nsrc/main.ts\u001ffunction\u001fphaseZeroEntry\u001f\u001fphaseZeroEntry\u001f47\u001f109\u001f2\u001f2\u001f06f6d63f11572af7f430977c3b921a48179c53914192d666382cb0e793cf15ea\u001fexport function phaseZeroEntry() { return phaseZeroHelper(); }\u001f\nsrc/main.ts\u001fimports\u001f<null>\u001f\u001f\u001f0\u001f46\u001f1\u001f1\u001f2b4cc09cd53a870a2ae9bf9fb4a48fe4066a34fa0c086e2e61f74265bb730096\u001fimport { phaseZeroHelper } from './helper.js';\u001f\n"
+    ],
+    [
+      "chunks_fts",
+      "src/helper.js\u001f0\u001fexport function phaseZeroHelper() { return 'stable'; }\u001fphaseZeroHelper\u001fphaseZeroHelper\u001fsrc/helper.js\u001f\nsrc/main.ts\u001f0\u001fimport { phaseZeroHelper } from './helper.js';\u001f\u001f\u001fsrc/main.ts\u001f\nsrc/main.ts\u001f47\u001fexport function phaseZeroEntry() { return phaseZeroHelper(); }\u001fphaseZeroEntry\u001fphaseZeroEntry\u001fsrc/main.ts\u001f\n"
+    ],
+    [
+      "doc_inventory",
+      "guide.md\u001ffile\u001findexed\u001f<null>\u001f<null>\u001f<null>\u001f\nguide.mdx\u001ffile\u001findexed\u001f<null>\u001f<null>\u001f<null>\u001f\n"
+    ],
+    [
+      "doc_chunk_meta",
+      "guide.md\u001f56\u001fPhase Zero Guide\u001f<null>\u001f[\"stable\"]\u001fStart\u001fStart\u001f0\u001f9e028e5d30bcf53f66dab7ca08035e03c734ad9c525fa5831278914512916bce\u001fvalid\u001f\nguide.mdx\u001f42\u001fMDX Guide\u001f<null>\u001f[]\u001fMDX Guide\u001fMDX Guide\u001f0\u001f895a829ac68f22f510c6e9e3226928a58329baff796350c81bc110c605da6e66\u001fabsent\u001f\n"
+    ],
+    [
+      "docs_fts",
+      "guide.md\u001f56\u001fPhase Zero Guide\u001fstable\u001fStart\u001fphaseZeroDocumentation markdown body.\u001fguide.md\u001f\nguide.mdx\u001f42\u001fMDX Guide\u001f\u001fMDX Guide\u001f<Badge label=\"Stable\">phaseZeroDocumentation component body</Badge>\u001fguide.mdx\u001f\n"
+    ],
+    [
+      "symbols",
+      "src/helper.js\u001fphaseZeroHelper\u001ffunction\u001f16\u001f31\u001f7\u001f54\u001f\u001f1\u001f1\u001f\nsrc/main.ts\u001fphaseZeroEntry\u001ffunction\u001f63\u001f77\u001f54\u001f109\u001f\u001f2\u001f1\u001f\n"
+    ],
+    [
+      "imports",
+      "src/main.ts\u001fphaseZeroHelper\u001fphaseZeroHelper\u001f./helper.js\u001f\n"
+    ],
+    [
+      "exports",
+      "src/helper.js\u001fphaseZeroHelper\u001fphaseZeroHelper\u001f<null>\u001f<null>\u001f\nsrc/main.ts\u001fphaseZeroEntry\u001fphaseZeroEntry\u001f<null>\u001f<null>\u001f\n"
+    ],
+    [
+      "contract_imports",
+      "src/main.ts\u001fphaseZeroHelper\u001fphaseZeroHelper\u001f./helper.js\u001f\n"
+    ],
+    [
+      "contract_exports",
+      "src/helper.js\u001fphaseZeroHelper\u001fphaseZeroHelper\u001f<null>\u001f<null>\u001f\nsrc/main.ts\u001fphaseZeroEntry\u001fphaseZeroEntry\u001f<null>\u001f<null>\u001f\n"
+    ],
+    [
+      "module_edges",
+      "src/main.ts\u001f./helper.js\u001fsrc/helper.js\u001f<null>\u001fresolver\u001f<null>\u001f<null>\u001f<null>\u001f0\u001f\n"
+    ],
+    [
+      "refs",
+      "src/main.ts\u001f47\u001f89\u001f2\u001fcall\u001fcertain\u001f./helper.js\u001fphaseZeroHelper\u001f0\u001f<null>\u001f\n"
+    ],
+    ["events", ""],
+    ["member_calls", ""],
+    ["receiver_value_flows", ""],
+    [
+      "function_return_flows",
+      "src/main.ts\u001fphaseZeroEntry\u001f63\u001f0\u001f0\u001ffactory\u001fidentifier\u001fphaseZeroHelper\u001f89\u001f\n"
+    ],
+    ["value_binding_flows", ""],
+    ["class_value_flows", ""],
+    ["instance_method_value_flows", ""],
+    ["class_member_value_flow_blockers", ""],
+    ["entity_sites", ""],
+    ["entities", ""],
+    ["entity_occurrences", ""],
+    ["entity_edges", ""],
+    [
+      "graph_nodes",
+      "file:src/helper.js\u001ffile\u001ffiles\u001fsrc/helper.js\u001fsrc/helper.js\u001f1\u001f{\"path\":\"src/helper.js\"}\u001f\nfile:src/main.ts\u001ffile\u001ffiles\u001fsrc/main.ts\u001fsrc/main.ts\u001f1\u001f{\"path\":\"src/main.ts\"}\u001f\nsym:src/helper.js#::phaseZeroHelper@1\u001fsymbol\u001fsymbols\u001fphaseZeroHelper\u001fsrc/helper.js\u001f1\u001f{\"path\":\"src/helper.js\",\"scope\":\"\",\"declaration\":[7,54]}\u001f\nsym:src/main.ts#::phaseZeroEntry@1\u001fsymbol\u001fsymbols\u001fphaseZeroEntry\u001fsrc/main.ts\u001f2\u001f{\"path\":\"src/main.ts\",\"scope\":\"\",\"declaration\":[54,109]}\u001f\n"
+    ],
+    [
+      "resolved_edges",
+      "file:src/main.ts\u001ffile:src/helper.js\u001fimport\u001fcertain\u001fresolver\u001fsrc/main.ts\u001f<null>\u001f{\"request\":\"./helper.js\"}\u001f\nsym:src/main.ts#::phaseZeroEntry@1\u001fsym:src/helper.js#::phaseZeroHelper@1\u001fcall\u001fcertain\u001fsemantic+resolver\u001fsrc/main.ts\u001f2\u001f{\"request\":\"./helper.js\",\"targetName\":\"phaseZeroHelper\",\"detail\":null,\"ambiguousTarget\":false,\"candidateCount\":1,\"candidates\":null}\u001f\n"
+    ],
+    ["scout_runs", ""],
+    ["scout_classifications", ""],
+    ["semantic_artifacts", ""],
+    ["semantic_supports", ""],
+    ["semantic_relations", ""],
+    ["embeddings", ""],
+    [
+      "meta",
+      "documentation_chunk_format_version\u001fdocumentation-v1\u001f\nextraction_version\u001f7\u001f\nprojection_version\u001f12\u001f\nresolution_hash\u001f9e913f761756bfbffafc92a172e8772997589d9e0d9c1b51108af882c00b4b88\u001f\nsnapshot\u001fd0b45f377bfc5a702cdbc869228c10d7009aecfb532e69faab1ab9c44bf06068\u001f\n"
+    ],
+    [
+      "code_vector_candidates",
+      "src/helper.js\u001f0\u001f14bdc92bd1fd89a05d32a597cec298f6f3afb60e68ece8212e78c25df4935bb0\u001f\nsrc/main.ts\u001f0\u001f2b4cc09cd53a870a2ae9bf9fb4a48fe4066a34fa0c086e2e61f74265bb730096\u001f\nsrc/main.ts\u001f47\u001f06f6d63f11572af7f430977c3b921a48179c53914192d666382cb0e793cf15ea\u001f\n"
+    ],
+    [
+      "docs_vector_candidates",
+      "guide.md\u001f56\u001f9e028e5d30bcf53f66dab7ca08035e03c734ad9c525fa5831278914512916bce\u001f\nguide.mdx\u001f42\u001f895a829ac68f22f510c6e9e3226928a58329baff796350c81bc110c605da6e66\u001f\n"
+    ],
+    [
+      "checker_membership",
+      "src/helper.js\u001f\nsrc/main.ts\u001f\n"
+    ],
+    [
+      "resolver_membership",
+      "[\"src/helper.js\",\"src/main.ts\"]"
+    ],
+    [
+      "public_code_search",
+      "[[\"src/helper.js\",\"function\",\"phaseZeroHelper\",1,1,\"exact_definition\"],[\"src/main.ts\",\"imports\",null,1,1,\"exact_occurrence\"],[\"src/main.ts\",\"function\",\"phaseZeroEntry\",2,2,\"exact_occurrence\"]]"
+    ],
+    [
+      "public_docs_search",
+      "[[\"guide.md\",\"Phase Zero Guide\",\"Start\",7,7],[\"guide.mdx\",\"MDX Guide\",\"MDX Guide\",5,5]]"
+    ]
+  ]
+}

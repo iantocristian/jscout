@@ -3504,7 +3504,8 @@ For each format it fixes the persisted `files.format`, `files.corpus`,
 comprehension tier (plain text → named sections → full AST), repository and
 dependency admission, extractor contract identity, lexical/vector projection,
 exact-definition and exact-occurrence eligibility and scanner, checker
-eligibility and watch affinity, and resolver strategy.
+eligibility and watch affinity, repository-reconnaissance/file-policy
+eligibility, and resolver strategy.
 `chunks.kind` remains the intra-file structural role emitted by the parser.
 Callers consume registry capabilities; they do not infer them from
 `corpus='code'`, copy extension lists, or maintain independent format switches.
@@ -3514,8 +3515,8 @@ capability from silently enabling another; that is all it buys. Each format
 still needs its own scanner and chunking contract (Markdown's took a full design
 cycle). A format joining the code corpus additionally pays BM25/vector
 integration, while exact tiers, checker participation, dependency admission,
-and structural projections remain separately gated capabilities. Text-only
-formats are cheap; languages are real work.
+repository reconnaissance, and structural projections remain separately gated
+capabilities. Text-only formats are cheap; languages are real work.
 
 MDX is already admitted by G24 as `format='mdx'` in the docs corpus, using the
 same inert named-sections scanner as Markdown: JSX, props, expressions, inner
@@ -3558,49 +3559,159 @@ format. The decisions:
    events schedule shared incremental refresh but carry no checker dirty path.
    `target` is not added to global `walk::SKIP_DIRS`; only a directory named
    `target` whose parent contains `Cargo.toml` is a Cargo-output root in phase 1.
+   Rust is also excluded from repository reconnaissance membership and its
+   disposable file-policy projection; lexical code-corpus admission does not
+   imply semantic-policy admission. Code search accepts an optional plural
+   `formats` allowlist of registry ids; omission means every registered code
+   format. The same normalized scope applies before limits to ranked lexical,
+   exact, vector, reranker, and exhaustive candidate generation, is echoed in
+   exhaustive `scope`, and binds its cursor. The original explicit allowlist is
+   copied unchanged across compatible follow-ups and is never reconstructed
+   from echoed scope. A present MCP `formats` value must be a non-empty string
+   array. Format-scoped locator follow-ups use per-tool calls: `definition`
+   filters its target, `who_uses` filters its target and returned usage sites,
+   and `neighborhood` receives no unsupported format argument.
 3. The pinned parser is `ra_ap_syntax`: lossless byte ranges, error tolerance,
    and no C toolchain. Phase-1 chunks form a non-overlapping, gap-free partition
    of the source, carry `kind='rust_text'`, no name/symbol/scope, and an empty
    graph. Top-level syntax ranges are preferred boundaries; residual text is
    retained, and oversized ranges split only at a newline or UTF-8 boundary.
    Parse errors do not reject the file and are counted in index/watch refresh
-   diagnostics. The Rust extractor contract is versioned per format; changing
-   it does not invalidate unchanged JavaScript or TypeScript rows.
-4. Phase 2 replaces the text projection with a non-overlapping partition of
+   diagnostics. The parser edition comes from the nearest visible package
+   `Cargo.toml`, including `edition.workspace=true`. When `package.workspace`
+   is present it is an authoritative string pointer; ancestor discovery occurs
+   only when it is absent, and malformed or missing explicit targets are
+   reported before default recovery. Absent editions and standalone files use
+   Cargo's Rust-2015 default. The effective path-to-edition
+   map is a persisted extraction/snapshot input, so an edition-only manifest
+   edit reparses only Rust files whose effective edition changed. Invalid
+   edition context recovers visibly to the default. Non-UTF-8 source and
+   deterministic extraction failures are per-file rejections; retryable I/O
+   and panics remain publication-fatal. The Rust extractor contract is
+   versioned per format; changing it does not invalidate unchanged JavaScript
+   or TypeScript rows.
+4. Phase 2a replaces the text projection with a non-overlapping partition of
    named item chunks plus residual unnamed chunks—never duplicate full-text and
-   named rows. It adds exact definitions only after a committed mixed-corpus
-   collision protocol passes. Rust-aware exact occurrences are a separate
-   capability and do not turn on merely because names exist.
+   named rows. Exact definitions, exact occurrences, and Rust vectors remain
+   disabled throughout 2a. Phase 2b may add exact definitions only after a
+   committed mixed-corpus collision protocol passes. Rust-aware exact
+   occurrences are a separate capability and do not turn on merely because
+   names exist.
 5. Phase 3 adds Rust module edges. Before code begins, its contract must fix the
    exact `cargo metadata` invocation, no-network/no-mutation policy, tool and
    input identity, failure behavior, supported path forms, and unresolved-edge
-   reporting. Cargo manifests/configuration and every other declared metadata
-   input become watch refresh boundaries in the same phase.
+   reporting. Phase 1 observes visible `Cargo.toml` only for output-directory
+   membership and parser edition; Cargo configuration and every other declared
+   metadata input become watch refresh boundaries in phase 3.
 6. Out of scope: entity extraction, events, member calls, checker enrichment,
    macro expansion, dependency-crate indexing, and rust-analyzer semantics.
    Inline `#[cfg(test)]` modules indexing with their containing file's role is a
-   recorded role-granularity limitation.
+   recorded role-granularity limitation. Exact `test.rs` and `tests.rs`
+   basenames carry the deterministic `test` file role.
+
+Canonical `files` and `chunks` remain shared, and phase 1 keeps one code FTS
+ranking corpus. A format filter is a scoping tool, not statistics isolation:
+FTS5 document frequency and average document length still include every code
+format, so filtered JS/TS ranks need not be byte-identical to a Rust-free
+database. The first treatment's post-hoc projection found only a small residual
+effect, but that inspected pilot is not confirmatory evidence. Separate
+per-format FTS statistics are revisited only if a prospectively judged
+mixed-language evaluation shows persistent domination—irrelevant
+cross-language hits pushing relevant same-language gold below K on
+single-language-intent queries—rather than relevant competition.
+
+Phase 1 adds `format` as a sqlite-vec partition key, searches each requested
+origin/format partition, and merges same-profile cosine scores. Rust vectors
+remain disabled until named phase-2a chunks exist and a Rust embedding
+evaluation passes. Later Rust enablement reuses the existing embedding model
+and cache; different models would require rank fusion instead. Only then does
+Rust change from `CodeLexical` to `CodeLexicalAndVector`.
 
 Phase 0 acceptance: a differential fixture indexes the same JS/TS/Markdown/MDX
 repository before and after the registry refactor and compares every public
-code/docs surface and canonical row byte-for-byte except newly introduced
-format-contract metadata—the refactor must otherwise be a complete no-op.
+code/docs surface and pre-existing canonical column byte-for-byte. The only
+normalized additions are newly introduced format-contract metadata and the
+phase-1 `files.parse_error_count` diagnostic column, whose zero default is
+asserted separately—the refactor must otherwise be a complete no-op.
 Phase 1 acceptance: repository `.rs` files
 index while selected dependency `.rs` files do not; authored non-Rust content
 under an ordinary `target/` remains admitted; Cargo-output `target/` is pruned;
 Rust rows never enter exact tiers, checker inventory, checker dirty affinity,
 JS-specific fact tables, or module edges; spans slice exactly on multibyte,
 raw-string, and CRLF content; malformed Rust remains searchable and reports its
-parse-error count; and a Rust-only change preserves all JS/TS canonical rows
-and checker carry inputs. A committed query manifest supplies gold JS/TS hits:
-all remain recall@10, no first-gold rank worsens by more than five positions,
-and exact-tier candidates/order remain byte-identical. Self-index timing,
-database size, chunk counts, parse diagnostics, and query results land in
-`eval/results/`. Phase 2 and 3 remain blocked until their own preregistered
-collision and edge-correctness protocols are committed. The detail document
+parse-error count; direct/workspace/default Cargo editions select parser
+context and edition-only changes re-extract Rust; deterministic Rust read or
+extraction failures reject only that file; and a Rust-only change preserves all
+JS/TS canonical rows and checker carry inputs. The prospectively committed v4
+provider-free protocol has clean baseline and treatment arms. Filtered parity reuses the
+previously inspected v3 JS/TS regression cohort; it is a regression guard, not
+fresh confirmatory evidence. It compares a Rust-free baseline with the mixed
+index searched using `formats=['javascript','typescript']`; JS/TS Recall@10
+does not decrease, MRR drops by no more than 0.02, and baseline top-five gold
+stays top-ten. Mixed relevance instead uses a fresh source-only holdout and
+searches with formats and file roles omitted, therefore admitting every
+deterministic role. For each query, one blinded pool unions the
+baseline and treatment top-ten files plus authored positive recall sentinels,
+and every pooled query-file pair receives an explicit `0`–`3` qrel. Baseline
+and treatment nDCG@10 use that same complete pool and gain `2^grade-1`;
+treatment mean nDCG@10 must be at least `0.70` and may trail baseline by no more
+than `0.02`. Missing qrels invalidate v4 scoring rather than receiving zero
+gain. Language representation and known-positive Recall@10 are reported but
+not gated. Both arms retain 100 raw ranked chunks, deduplicate files by first
+occurrence, and truncate to 10. Every filtered-parity raw hit must be
+JavaScript or TypeScript. Each arm's query responses share one nonempty
+snapshot; the two arms need not share a snapshot because their indexed
+memberships differ. V4 first writes arm reports, the blinded pool, qrels, and
+the score report to fresh paths outside every evaluated checkout. Those
+artifacts record indexing duration, database bytes, index stdout/stderr
+diagnostics, and raw query results. After scoring, a hash-linked result record
+and any selected immutable artifact copies are preserved under
+`eval/results/`. V4 completed as the decision-grade formal failure recorded in
+[eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
+The format-scoped JS/TS regression contract passed, but mixed treatment mean
+nDCG@10 was `0.597555`, below the frozen `0.70` absolute gate. Phase 2a named,
+item-local Rust chunks is therefore the current milestone. Exact definitions,
+exact occurrences, Rust vectors, and module edges remain disabled pending their
+own prospective acceptance protocols. The detail document
 [docs/plans/g26-rust-indexing-proposal-2026-08-25.md](docs/plans/g26-rust-indexing-proposal-2026-08-25.md)
 is subordinate and non-normative, this entry winning on any disagreement.
-Phases 0 and 1 are the current implementation milestone.
+Phases 0 and 1 remain the built substrate for that work.
+
+The first phase-1 treatment formally failed the preregistered mixed-corpus
+control gate: relevant Rust implementations displaced one legacy JS/TS gold
+file from the combined top ten. A post-hoc JS/TS-only projection stayed within
+the numerical thresholds, but it is diagnostic evidence, not a passing result.
+The v3 replacement's filtered regression arm passed: JS/TS Recall@10 remained
+`1.0000`, mean MRR improved from `0.8833` to `0.8854`, and every baseline
+top-five gold file stayed top-ten. Its mixed arm still failed the frozen
+`0.70` nDCG gate at `0.5084`, so the result remains a formal failure under
+`eval/results/`. That mixed score was not decision-grade,
+however: the evaluator called source-authored positive qrels a pool, judged
+only 68 of 240 returned top-ten slots, supplied no explicit zeroes, and treated
+every unjudged file as zero gain. The same output also contained real misses,
+so neither dismissing the failure nor changing its judgments after inspection
+is allowed.
+
+V4 then completed the blind pool and assigned explicit qrels to every pooled
+candidate, making its formal failure decision-grade. Filtered Recall@10 stayed
+`1.000000`, mean MRR improved from `0.883333` to `0.885417`, and no baseline
+top-five positive left the top ten, so format-scoped JS/TS retrieval remains
+validated. Mixed treatment nDCG@10 improved from the Rust-free baseline's
+`0.310561` to `0.597555`, and authored-positive Recall@10 improved from
+`0.319697` to `0.550000`; relevant Rust therefore improved the combined
+ranking, leaving no evidence for per-language statistics, quotas, or weights.
+The treatment nevertheless failed the frozen absolute `0.70` nDCG gate.
+
+G26 consequently advances to Phase 2a named, item-local Rust chunks while
+exact definitions, exact occurrences, Rust vectors, and module edges remain
+disabled. Identifier aliases must not be appended to the broad phase-1 chunks;
+any alias experiment belongs to the item-local projection and requires its own
+prospective test. The Phase-2a replacement protocol must freeze `file_roles`
+explicitly: default retrieval omits it and includes tests, while a separate
+production-only experiment requires a classifier audit and cannot silently
+reframe the all-role v4 result. The complete v4 result and immutable artifact
+hashes are recorded in
+[eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
 
 ## Evaluation decisions already made
 

@@ -6,10 +6,11 @@ use std::process::Command;
 use anyhow::Result;
 
 use super::{
-    IndexOptions, incremental_refresh_repo_with_options, index_repo, index_repo_with_fs,
-    index_repo_with_options, index_repo_with_options_and_fs,
-    index_repo_with_post_replacement_failure, index_repo_without_extraction_reset,
-    refresh_repo_with_options,
+    IndexOptions, incremental_refresh_repo_rebinding_checker,
+    incremental_refresh_repo_with_options, index_repo, index_repo_with_fs, index_repo_with_options,
+    index_repo_with_options_and_fs, index_repo_with_post_replacement_failure,
+    index_repo_with_rust_extraction_failure, refresh_repo_with_options,
+    watch_full_refresh_repo_rebinding_checker,
 };
 use crate::test_fs::{FaultFileSystem, FileOperation};
 use crate::{docs, embed, origin, query, search, semantic, store, structural};
@@ -1256,6 +1257,12 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
          WHERE key='documentation_chunk_format_version'",
         [],
     )?;
+    for format in [crate::formats::MARKDOWN, crate::formats::MDX] {
+        conn.execute(
+            "UPDATE meta SET value='documentation-v0' WHERE key=?1",
+            [format!("format_contract_version:{format}")],
+        )?;
+    }
     let old_format_snapshot = structural::compute_snapshot(&conn)?;
     conn.execute(
         "UPDATE meta SET value=?1 WHERE key='snapshot'",
@@ -1435,6 +1442,11 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
 
     conn.execute(
         "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE meta SET value='legacy'
+         WHERE key='format_contract_version:typescript'",
         [],
     )?;
     let legacy_contract_snapshot = structural::compute_snapshot(&conn)?;
@@ -2321,6 +2333,7 @@ fn canonical_dump(conn: &rusqlite::Connection) -> Result<Vec<(&'static str, Stri
         (
             "files",
             "SELECT f.path, f.hash, f.corpus, f.format, f.role, f.origin, f.package_path,
+                    f.parse_error_count,
                     p.origin, p.name, p.version, p.canonical_root, p.locator,
                     p.manifest_hash, p.status
              FROM files f LEFT JOIN package_instances p ON p.id=f.package_instance_id",
@@ -2732,6 +2745,799 @@ fn incremental_read_failure_removes_the_stale_file_row() -> Result<()> {
 }
 
 #[test]
+fn rust_phase_one_indexes_lossless_lexical_chunks_and_current_diagnostics() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let valid_source = concat!(
+        "//! module docs\r\n",
+        "/* outer /* nested */ comment */\r\n",
+        "pub fn borrowed<'a>(value: &'a str) -> &'a str {\r\n",
+        "    let raw = r###\"raw marker 🦀\"###;\r\n",
+        "    let bytes = b\"byte marker\";\r\n",
+        "    let _ = (raw, bytes);\r\n",
+        "    value\r\n",
+        "}\r\n",
+    );
+    let malformed_source = "pub fn broken( {\n    let searchable_malformed_tail_marker = 1;\n";
+    fs::write(repo.path().join("main.ts"), "export const stableTs = 1;\n")?;
+    fs::write(repo.path().join("valid.rs"), valid_source)?;
+    fs::write(repo.path().join("broken.rs"), malformed_source)?;
+    fs::write(repo.path().join("empty.rs"), "")?;
+    let conn = store::open(repo.path())?;
+
+    let first = index_repo(repo.path(), &conn)?;
+    assert_eq!(first.rust_files_with_parse_errors, 1);
+    assert!(first.rust_parse_error_count > 0);
+
+    let identities = conn
+        .prepare(
+            "SELECT path,corpus,format,parse_error_count
+             FROM files ORDER BY path",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(identities.len(), 4);
+    assert!(identities.contains(&("valid.rs".into(), "code".into(), "rust".into(), 0)));
+    assert!(identities.contains(&("main.ts".into(), "code".into(), "typescript".into(), 0,)));
+    assert!(
+        identities
+            .iter()
+            .any(|row| { row.0 == "broken.rs" && row.1 == "code" && row.2 == "rust" && row.3 > 0 })
+    );
+    assert!(identities.contains(&("empty.rs".into(), "code".into(), "rust".into(), 0)));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks chunk
+             JOIN files file ON file.id=chunk.file_id WHERE file.path='empty.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    for (path, source) in [("valid.rs", valid_source), ("broken.rs", malformed_source)] {
+        let rows = conn
+            .prepare(
+                "SELECT chunk.kind,chunk.name,chunk.scope_chain,chunk.symbols,
+                        chunk.start,chunk.end,chunk.start_line,chunk.end_line,chunk.content
+                 FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+                 WHERE file.path=?1 ORDER BY chunk.start",
+            )?
+            .query_map([path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(!rows.is_empty());
+        let mut cursor = 0usize;
+        for (kind, name, scope, symbols, start, end, start_line, end_line, content) in rows {
+            let start = usize::try_from(start)?;
+            let end = usize::try_from(end)?;
+            assert_eq!(kind, "rust_text");
+            assert_eq!(name, None);
+            assert_eq!(scope, "");
+            assert_eq!(symbols, "");
+            assert_eq!(start, cursor);
+            assert!(end > start && end - start <= 8_000);
+            assert_eq!(content.as_bytes(), &source.as_bytes()[start..end]);
+            assert!(start_line > 0 && end_line >= start_line);
+            cursor = end;
+        }
+        assert_eq!(cursor, source.len(), "{path} was not partitioned gap-free");
+    }
+
+    let hit = search::search(
+        &conn,
+        None,
+        "searchable_malformed_tail_marker",
+        &search::SearchOptions {
+            rerank: false,
+            include_memory: false,
+            expand: false,
+            ..search::SearchOptions::default()
+        },
+    )?;
+    assert!(hit.hits.iter().any(|hit| hit.file == "broken.rs"));
+
+    for table in [
+        "symbols",
+        "imports",
+        "exports",
+        "contract_imports",
+        "contract_exports",
+        "refs",
+        "events",
+        "member_calls",
+        "receiver_value_flows",
+        "function_return_flows",
+        "value_binding_flows",
+        "class_value_flows",
+        "instance_method_value_flows",
+        "class_member_value_flow_blockers",
+        "entity_sites",
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} item
+             JOIN files file ON file.id=item.file_id WHERE file.format='rust'"
+        );
+        assert_eq!(
+            conn.query_row(&sql, [], |row| row.get::<_, i64>(0))?,
+            0,
+            "Rust leaked into {table}"
+        );
+    }
+    for (label, sql) in [
+        (
+            "doc sidecar",
+            "SELECT COUNT(*) FROM doc_chunk_meta meta
+             JOIN chunks chunk ON chunk.id=meta.chunk_id
+             JOIN files file ON file.id=chunk.file_id WHERE file.format='rust'",
+        ),
+        (
+            "graph nodes",
+            "SELECT COUNT(*) FROM graph_nodes node
+             JOIN files file ON file.id=node.file_id WHERE file.format='rust'",
+        ),
+        (
+            "module edges",
+            "SELECT COUNT(*) FROM module_edges edge
+             JOIN files file ON file.id=edge.from_file WHERE file.format='rust'",
+        ),
+        (
+            "code vectors",
+            "SELECT COUNT(*) FROM embedding_index_entries entry
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id WHERE file.format='rust'",
+        ),
+        (
+            "documentation vectors",
+            "SELECT COUNT(*) FROM doc_embedding_index_entries entry
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id WHERE file.format='rust'",
+        ),
+    ] {
+        assert_eq!(
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))?,
+            0,
+            "{label}"
+        );
+    }
+
+    fs::write(
+        repo.path().join("broken.rs"),
+        "pub fn repaired() { let searchable_malformed_tail_marker = 1; }\n",
+    )?;
+    let repaired = index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        (
+            repaired.rust_files_with_parse_errors,
+            repaired.rust_parse_error_count,
+        ),
+        (0, 0)
+    );
+    fs::remove_file(repo.path().join("broken.rs"))?;
+    let deleted = index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        (
+            deleted.rust_files_with_parse_errors,
+            deleted.rust_parse_error_count,
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='broken.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+fn assert_invalid_utf8_rust_is_rejected(full_refresh: bool) -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let rust = repo.path().join("stable.rs");
+    fs::write(&rust, "pub fn stable_utf8_marker() {}\n")?;
+    fs::write(
+        repo.path().join("healthy.ts"),
+        "export const healthyMarker = 1;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    conn.execute(
+        "UPDATE meta SET value='stale-rust-contract'
+         WHERE key='format_contract_version:rust'",
+        [],
+    )?;
+
+    fs::write(&rust, [0xff, 0xfe, b'\n'])?;
+    let result = if full_refresh {
+        refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())
+    } else {
+        index_repo(repo.path(), &conn)
+    }?;
+    assert!(conn.is_autocommit());
+    assert_eq!((result.rejected, result.removed), (1, 1));
+    assert_eq!(result.rejections[0].path, "stable.rs");
+    assert_eq!(result.rejections[0].stage, "read");
+    assert!(!result.rejections[0].error.is_empty());
+    assert_eq!(result.extraction_reset, full_refresh);
+    assert_eq!(
+        (result.indexed, result.unchanged),
+        if full_refresh { (1, 0) } else { (0, 1) }
+    );
+    assert_ne!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='stable.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'healthyMarker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM meta WHERE key='format_contract_version:rust'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        crate::formats::by_id(crate::formats::RUST)
+            .expect("Rust format")
+            .extractor_version
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_utf8_rust_is_rejected_during_incremental_indexing() -> Result<()> {
+    assert_invalid_utf8_rust_is_rejected(false)
+}
+
+#[test]
+fn invalid_utf8_rust_is_rejected_during_full_refresh() -> Result<()> {
+    assert_invalid_utf8_rust_is_rejected(true)
+}
+
+#[test]
+fn rust_extraction_invariant_failure_rejects_only_that_file() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("healthy.ts"),
+        "export const healthyInvariantMarker = 1;\n",
+    )?;
+    fs::write(repo.path().join("broken.rs"), "pub fn before() {}\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let previous_snapshot = structural::current_snapshot(&conn)?;
+
+    fs::write(repo.path().join("broken.rs"), "pub fn after() {}\n")?;
+    let outcome = index_repo_with_rust_extraction_failure(repo.path(), &conn)?;
+
+    assert_eq!(
+        (
+            outcome.indexed,
+            outcome.unchanged,
+            outcome.removed,
+            outcome.rejected,
+        ),
+        (0, 1, 1, 1)
+    );
+    assert_eq!(outcome.rejections[0].path, "broken.rs");
+    assert_eq!(outcome.rejections[0].stage, "extract");
+    assert!(
+        outcome.rejections[0]
+            .error
+            .contains("injected Rust extraction invariant failure")
+    );
+    assert_ne!(structural::current_snapshot(&conn)?, previous_snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='broken.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts
+             WHERE chunks_fts MATCH 'healthyInvariantMarker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn cargo_edition_change_reextracts_unchanged_rust_source() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("src"))?;
+    let manifest = repo.path().join("Cargo.toml");
+    let rust = repo.path().join("src/lib.rs");
+    fs::create_dir_all(repo.path().join("other/src"))?;
+    fs::write(
+        &manifest,
+        "[package]\nname='edition-probe'\nversion='0.1.0'\nedition='2021'\n",
+    )?;
+    fs::write(&rust, "pub fn gen() {}\n")?;
+    fs::write(
+        repo.path().join("other/Cargo.toml"),
+        "[package]\nname='unchanged-edition'\nversion='0.1.0'\nedition='2021'\n",
+    )?;
+    fs::write(
+        repo.path().join("other/src/lib.rs"),
+        "pub fn unchanged_edition_control() {}\n",
+    )?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const editionControl = 1;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    let first = index_repo(repo.path(), &conn)?;
+    assert_eq!(first.rust_parse_error_count, 0);
+    let (source_hash, first_context): (String, String) = conn.query_row(
+        "SELECT file.hash,
+                (SELECT value FROM meta WHERE key='rust_edition_context_fingerprint')
+         FROM files file WHERE file.path='src/lib.rs'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let first_snapshot = structural::current_snapshot(&conn)?;
+
+    fs::write(
+        &manifest,
+        "[package]\nname='edition-probe'\nversion='0.1.0'\nedition='2024'\n",
+    )?;
+    let second = index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        (second.indexed, second.unchanged, second.extraction_reset),
+        (1, 2, false)
+    );
+    assert_eq!(second.rust_files_with_parse_errors, 1);
+    assert!(second.rust_parse_error_count > 0);
+    let (new_source_hash, second_context): (String, String) = conn.query_row(
+        "SELECT file.hash,
+                (SELECT value FROM meta WHERE key='rust_edition_context_fingerprint')
+         FROM files file WHERE file.path='src/lib.rs'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        new_source_hash, source_hash,
+        "files.hash remains a byte hash"
+    );
+    assert_ne!(second_context, first_context);
+    assert_ne!(structural::current_snapshot(&conn)?, first_snapshot);
+    Ok(())
+}
+
+fn normalize_g26_phase_zero_sections(sections: &mut [(String, String)]) {
+    for (name, value) in sections.iter_mut() {
+        if name == "files" {
+            *value = value
+                .lines()
+                .map(|line| {
+                    let mut fields = line.split('\x1f').collect::<Vec<_>>();
+                    // G26 adds `files.parse_error_count`; it is the only
+                    // file-column addition normalized by this pre-registry
+                    // golden.
+                    if fields.len() == 16 {
+                        fields.remove(7);
+                    }
+                    format!("{}\n", fields.join("\x1f"))
+                })
+                .collect();
+        } else if name == "meta" {
+            *value = value
+                .lines()
+                .filter(|line| {
+                    let key = line.split('\x1f').next().unwrap_or_default();
+                    key != "schema_version"
+                        && key != "root"
+                        && key != "snapshot"
+                        && key != "documentation_provenance_enabled"
+                        && key != "documentation_provenance_format_version"
+                        && !key.starts_with("format_contract_version:")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+        }
+    }
+}
+
+fn g26_phase_zero_normalized_dump(conn: &rusqlite::Connection) -> Result<Vec<(String, String)>> {
+    let mut sections = canonical_dump(conn)?
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect::<Vec<_>>();
+    normalize_g26_phase_zero_sections(&mut sections);
+    sections.push((
+        "code_vector_candidates".into(),
+        dump_section(
+            conn,
+            "SELECT file.path, chunk.start, chunk.hash
+             FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+             WHERE file.corpus='code'",
+        )?,
+    ));
+    sections.push((
+        "docs_vector_candidates".into(),
+        dump_section(
+            conn,
+            "SELECT file.path, chunk.start, metadata.embedding_identity
+             FROM doc_chunk_meta metadata
+             JOIN chunks chunk ON chunk.id=metadata.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             WHERE metadata.embedding_identity IS NOT NULL",
+        )?,
+    ));
+    sections.push((
+        "checker_membership".into(),
+        dump_section(
+            conn,
+            "SELECT path FROM code_files
+             WHERE origin IN ('repository','workspace')
+               AND format IN ('javascript','typescript')",
+        )?,
+    ));
+    let graph = query::ModuleGraph::load(conn)?;
+    let mut paths = graph.paths.into_values().collect::<Vec<_>>();
+    paths.sort();
+    sections.push(("resolver_membership".into(), serde_json::to_string(&paths)?));
+    let code = search::search(
+        conn,
+        None,
+        "phaseZeroHelper",
+        &search::SearchOptions::default(),
+    )?;
+    sections.push((
+        "public_code_search".into(),
+        serde_json::to_string(
+            &code
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.file.as_str(),
+                        hit.kind.as_str(),
+                        hit.name.as_deref(),
+                        hit.start_line,
+                        hit.end_line,
+                        hit.match_reason,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?,
+    ));
+    Ok(sections)
+}
+
+#[test]
+fn phase_zero_registry_refactor_matches_pre_registry_golden() -> Result<()> {
+    // This readable pre-registry dump pins canonical rows, FTS, candidate
+    // membership, resolver/checker membership, and public code/docs search.
+    // The same registry boundary is exercised through its real consumers by
+    // the vector-provider, checker-planning, watch-classification, and exact-
+    // collision tests in their owning modules.
+    let baseline: serde_json::Value = serde_json::from_str(include_str!(
+        "../../eval/prereg/g26-phase-zero-baseline-2026-08-25.json"
+    ))?;
+    assert_eq!(
+        baseline["baseline_revision"],
+        "4ad4ea2d9b94f7268d155ab3ff9bf27b78625393"
+    );
+
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"name":"phase-zero-fixture","type":"module"}"#,
+    )?;
+    fs::write(
+        repo.path().join("src/main.ts"),
+        "import { phaseZeroHelper } from './helper.js';\nexport function phaseZeroEntry() { return phaseZeroHelper(); }\n",
+    )?;
+    fs::write(
+        repo.path().join("src/helper.js"),
+        "export function phaseZeroHelper() { return 'stable'; }\n",
+    )?;
+    fs::write(
+        repo.path().join("guide.md"),
+        "---\ntitle: Phase Zero Guide\ntags: [stable]\n---\n# Start\n\nphaseZeroDocumentation markdown body.\n",
+    )?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        "import Badge from './badge'\n\n# MDX Guide\n\n<Badge label=\"Stable\">phaseZeroDocumentation component body</Badge>\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files
+             WHERE format!='rust' AND parse_error_count!=0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+    );
+    let mut sections = g26_phase_zero_normalized_dump(&conn)?;
+    let docs_result = docs::retrieval::search(
+        &conn,
+        repo.path(),
+        None,
+        "phaseZeroDocumentation",
+        &docs::retrieval::SearchOptions {
+            vector: false,
+            rerank: false,
+            ..Default::default()
+        },
+    )?;
+    sections.push((
+        "public_docs_search".into(),
+        serde_json::to_string(
+            &docs_result
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.document.path.as_str(),
+                        hit.document.title.as_str(),
+                        hit.document.breadcrumb.as_str(),
+                        hit.document.start_line,
+                        hit.document.end_line,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?,
+    ));
+    let mut expected =
+        serde_json::from_value::<Vec<(String, String)>>(baseline["sections"].clone())?;
+    // #111 intentionally adds documentation provenance publication state to
+    // the structural snapshot. Normalize that independent post-baseline delta
+    // on both sides so this test remains specific to the G26 registry refactor.
+    normalize_g26_phase_zero_sections(&mut expected);
+    assert_eq!(
+        sections, expected,
+        "phase-0 canonical/public differential changed; sections={sections:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn phase_zero_format_marker_bootstrap_is_otherwise_byte_identical() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.js"), "export const jsMarker = 1;\n")?;
+    fs::write(repo.path().join("main.ts"), "export const tsMarker = 1;\n")?;
+    fs::write(repo.path().join("guide.md"), "# Markdown\n\nBody.\n")?;
+    fs::write(
+        repo.path().join("guide.mdx"),
+        "# MDX\n\n<Badge>Body</Badge>\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let ids = conn
+        .prepare(
+            "SELECT file.path,file.id,chunk.id
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             ORDER BY file.path,chunk.start",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let before = canonical_dump(&conn)?;
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE 'format_contract_version:%'",
+        [],
+    )?;
+
+    let outcome = index_repo(repo.path(), &conn)?;
+    assert_eq!((outcome.indexed, outcome.unchanged), (0, 4));
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    let retained_ids = conn
+        .prepare(
+            "SELECT file.path,file.id,chunk.id
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             ORDER BY file.path,chunk.start",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(retained_ids, ids);
+    assert_eq!(canonical_dump(&conn)?, before);
+    for format in crate::formats::ALL {
+        let value: String = conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [crate::formats::contract_meta_key(format)],
+            |row| row.get(0),
+        )?;
+        assert_eq!(value, format.extractor_version);
+    }
+    Ok(())
+}
+
+#[test]
+fn absent_format_contracts_are_repaired_without_invalidating_a_javascript_snapshot() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.js"), "export const stable = 1;\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let before = canonical_dump(&conn)?;
+    let ids = conn
+        .prepare(
+            "SELECT file.id, chunk.id
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             WHERE file.path='main.js' ORDER BY chunk.start",
+        )?
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for format in ["typescript", "markdown", "mdx", "rust"] {
+        conn.execute(
+            "UPDATE meta SET value='future-contract'
+             WHERE key=?1",
+            [format!("format_contract_version:{format}")],
+        )?;
+    }
+
+    // The legacy global markers remain compatibility gates. Per-format
+    // markers only matter while rows produced by that format are present.
+    let reader = store::open_path_read_only(&repo.path().join(store::DB_FILE))?;
+    drop(reader);
+
+    let outcome = index_repo(repo.path(), &conn)?;
+    assert_eq!((outcome.indexed, outcome.unchanged), (0, 1));
+    assert!(!outcome.projection_rebuilt);
+    assert!(!outcome.extraction_reset);
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    let retained_ids = conn
+        .prepare(
+            "SELECT file.id, chunk.id
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             WHERE file.path='main.js' ORDER BY chunk.start",
+        )?
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(retained_ids, ids);
+    assert_eq!(canonical_dump(&conn)?, before);
+    Ok(())
+}
+
+#[test]
+fn rust_contract_invalidation_reextracts_only_rust() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    for (path, source) in [
+        ("main.js", "export const jsMarker = 1;\n"),
+        ("main.ts", "export const tsMarker = 1;\n"),
+        ("lib.rs", "pub fn rust_marker() {}\n"),
+        ("guide.md", "# Markdown\n\nBody.\n"),
+        ("guide.mdx", "# MDX\n\nBody.\n"),
+    ] {
+        fs::write(repo.path().join(path), source)?;
+    }
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let original_snapshot = structural::current_snapshot(&conn)?;
+    let original_ids = conn
+        .prepare(
+            "SELECT file.path,file.id,MIN(chunk.id)
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             GROUP BY file.id,file.path ORDER BY file.path",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+    conn.execute(
+        "UPDATE meta SET value='rust-text-v0'
+         WHERE key='format_contract_version:rust'",
+        [],
+    )?;
+    let stale_snapshot = structural::compute_snapshot(&conn)?;
+    assert_ne!(stale_snapshot, original_snapshot);
+    conn.execute(
+        "UPDATE meta SET value=?1 WHERE key='snapshot'",
+        [&stale_snapshot],
+    )?;
+
+    let outcome = index_repo(repo.path(), &conn)?;
+    assert_eq!((outcome.indexed, outcome.unchanged), (1, 4));
+    assert!(!outcome.extraction_reset);
+    assert_ne!(structural::current_snapshot(&conn)?, stale_snapshot);
+    let current_ids = conn
+        .prepare(
+            "SELECT file.path,file.id,MIN(chunk.id)
+             FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+             GROUP BY file.id,file.path ORDER BY file.path",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?
+        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+    for path in ["guide.md", "guide.mdx", "main.js", "main.ts"] {
+        assert_eq!(
+            current_ids.get(path),
+            original_ids.get(path),
+            "{path} moved"
+        );
+    }
+    assert_ne!(current_ids.get("lib.rs"), original_ids.get("lib.rs"));
+    Ok(())
+}
+
+#[test]
+fn rust_incremental_add_edit_delete_matches_full_refresh() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const tsStable = 1;\n")?;
+    fs::write(
+        repo.path().join("edited.rs"),
+        "pub fn edited() -> u8 { 1 }\n",
+    )?;
+    fs::write(repo.path().join("removed.rs"), "pub fn removed() {}\n")?;
+    let incremental = store::open_path(&repo.path().join("incremental.db"))?;
+    let full = store::open_path(&repo.path().join("full.db"))?;
+    refresh_repo_with_options(repo.path(), &incremental, &IndexOptions::default())?;
+    refresh_repo_with_options(repo.path(), &full, &IndexOptions::default())?;
+
+    fs::write(
+        repo.path().join("edited.rs"),
+        "pub fn edited() -> u8 { let changed = 2; changed }\n",
+    )?;
+    fs::remove_file(repo.path().join("removed.rs"))?;
+    fs::write(repo.path().join("added.rs"), "pub fn added() {}\n")?;
+    incremental_refresh_repo_with_options(repo.path(), &incremental, &IndexOptions::default())?;
+    refresh_repo_with_options(repo.path(), &full, &IndexOptions::default())?;
+
+    assert_eq!(
+        structural::current_snapshot(&incremental)?,
+        structural::current_snapshot(&full)?
+    );
+    assert_eq!(canonical_dump(&incremental)?, canonical_dump(&full)?);
+    Ok(())
+}
+
+#[test]
 fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::create_dir(repo.path().join(".git"))?;
@@ -2873,6 +3679,406 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
     Ok(())
 }
 
+fn seed_active_checker_publication(
+    repo: &std::path::Path,
+    conn: &rusqlite::Connection,
+    absolute_input: &std::path::Path,
+) -> Result<(i64, String, i64, i64)> {
+    let snapshot = structural::current_snapshot(conn)?;
+    let (
+        member_call_id,
+        source_file_id,
+        source_hash,
+        call_start,
+        call_end,
+        receiver_start,
+        receiver_end,
+        property_start,
+        property_end,
+    ) = conn.query_row(
+        "SELECT call.rowid,file.id,file.hash,call.start,call.end,
+                call.receiver_start,call.receiver_end,
+                call.property_start,call.property_end
+         FROM member_calls call JOIN files file ON file.id=call.file_id
+         WHERE file.path='service.ts' AND call.prop='load'",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        },
+    )?;
+    let (target, target_hash, target_start, target_end): (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT node.node_key,file.hash,symbol.decl_start,symbol.decl_end
+             FROM graph_nodes node
+             JOIN symbols symbol
+               ON node.native_table='symbols' AND node.native_id=symbol.id
+             JOIN files file ON file.id=symbol.file_id
+             WHERE node.display_name='load'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let target_fingerprint =
+        crate::checker::target_fingerprint(&target, &target_hash, target_start, target_end);
+    conn.execute(
+        "INSERT INTO checker_enrichment_batches(
+           source_snapshot,checker_version,checker_source,
+           checker_input_fingerprint,sidecar_protocol,created_at,active
+         ) VALUES(?1,'5.9.3','test','inputs',1,datetime('now'),1)",
+        [&snapshot],
+    )?;
+    let batch_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO checker_project_runs(
+           batch_id,project_id,status,selected_occurrences,
+           completed_occurrences,checker_input_fingerprint,execution_kind,updated_at
+         ) VALUES(?1,'tsconfig.json','completed',1,1,'inputs','checked',datetime('now'))",
+        [batch_id],
+    )?;
+    let absolute_bytes = fs::read(absolute_input)?;
+    let absolute_hash = blake3::hash(&absolute_bytes).to_hex().to_string();
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id,project_id,input_kind,input_path,source_hash
+         ) VALUES(?1,'tsconfig.json','repository','service.ts',?2)",
+        rusqlite::params![batch_id, source_hash],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_project_inputs(
+           batch_id,project_id,input_kind,input_path,source_hash
+         ) VALUES(?1,'tsconfig.json','absolute',?2,?3)",
+        rusqlite::params![batch_id, absolute_input.to_string_lossy(), absolute_hash,],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_enrichments(
+           batch_id,member_call_id,source_file_id,source_file,source_hash,
+           call_start,call_end,receiver_start,receiver_end,
+           property_start,property_end,project_id,receiver_type,
+           target_anchor,target_fingerprint,confidence,provenance,
+           checker_input_fingerprint
+         ) VALUES(
+           ?1,?2,?3,'service.ts',?4,?5,?6,?7,?8,?9,?10,
+           'tsconfig.json','Service',?11,?12,'likely','checker','inputs'
+         )",
+        rusqlite::params![
+            batch_id,
+            member_call_id,
+            source_file_id,
+            source_hash,
+            call_start,
+            call_end,
+            receiver_start,
+            receiver_end,
+            property_start,
+            property_end,
+            target,
+            target_fingerprint,
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO checker_occurrence_projects(
+           batch_id,member_call_id,source_file,source_hash,
+           call_start,call_end,receiver_start,receiver_end,
+           property_start,property_end,project_id,
+           checker_input_fingerprint,status
+         ) VALUES(?1,?2,'service.ts',?3,?4,?5,?6,?7,?8,?9,
+                  'tsconfig.json','inputs','resolved')",
+        rusqlite::params![
+            batch_id,
+            member_call_id,
+            source_hash,
+            call_start,
+            call_end,
+            receiver_start,
+            receiver_end,
+            property_start,
+            property_end,
+        ],
+    )?;
+    structural::rebuild_projection(conn, &snapshot)?;
+    assert!(repo.join("service.ts").is_file());
+    Ok((batch_id, target, source_file_id, member_call_id))
+}
+
+fn checker_rebind_fixture() -> Result<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    rusqlite::Connection,
+    i64,
+    String,
+    i64,
+    i64,
+)> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("service.ts"),
+        "export class Service { load() {} }\n\
+         export function run(service: Service) { service.load(); }\n",
+    )?;
+    let external = tempfile::tempdir()?;
+    let input = external.path().join("lib.d.ts");
+    fs::write(&input, "declare interface ExternalInput { stable: true }\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let (batch, target, source_file, member_call) =
+        seed_active_checker_publication(repo.path(), &conn, &input)?;
+    Ok((
+        repo,
+        external,
+        conn,
+        batch,
+        target,
+        source_file,
+        member_call,
+    ))
+}
+
+#[test]
+fn rust_only_incremental_refresh_rebinds_fresh_checker_facts_without_a_provider() -> Result<()> {
+    let (repo, external, conn, batch, target, _, _) = checker_rebind_fixture()?;
+    let old_snapshot = structural::current_snapshot(&conn)?;
+    fs::write(repo.path().join("000-rust.rs"), "pub fn added() {}\n")?;
+
+    let outcome =
+        incremental_refresh_repo_rebinding_checker(repo.path(), &conn, &IndexOptions::default())?;
+    let current = structural::current_snapshot(&conn)?;
+    assert_ne!(current, old_snapshot);
+    assert!(outcome.checker_rebound);
+    let (rebound_batch, rebound_snapshot): (i64, String) = conn.query_row(
+        "SELECT id,source_snapshot FROM checker_enrichment_batches WHERE active=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_ne!(rebound_batch, batch);
+    assert_eq!(rebound_snapshot, current);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot,active
+             FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )?,
+        (old_snapshot, false),
+    );
+    for table in [
+        "checker_project_runs",
+        "checker_project_inputs",
+        "checker_occurrence_projects",
+        "checker_enrichments",
+    ] {
+        let source_rows = conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE batch_id=?1"),
+            [batch],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE batch_id=?1"),
+                [rebound_batch],
+                |row| row.get::<_, i64>(0),
+            )?,
+            source_rows,
+            "{table} was not cloned into the rebound publication",
+        );
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT execution_kind FROM checker_project_runs
+             WHERE batch_id=?1 AND project_id='tsconfig.json'",
+            [rebound_batch],
+            |row| row.get::<_, String>(0),
+        )?,
+        "carried",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT execution_kind FROM checker_project_runs
+             WHERE batch_id=?1 AND project_id='tsconfig.json'",
+            [batch],
+            |row| row.get::<_, String>(0),
+        )?,
+        "checked",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+
+    fs::write(
+        external.path().join("lib.d.ts"),
+        "declare interface ExternalInput { changed: true }\n",
+    )?;
+    fs::write(
+        repo.path().join("000-rust.rs"),
+        "pub fn added() { let changed = true; }\n",
+    )?;
+    let stale =
+        incremental_refresh_repo_rebinding_checker(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(!stale.checker_rebound);
+    assert_ne!(structural::current_snapshot(&conn)?, current);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM checker_enrichment_batches WHERE id=?1 AND active=1",
+            [rebound_batch],
+            |row| row.get::<_, String>(0),
+        )?,
+        current
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_only_refresh_does_not_rebind_across_a_checker_format_contract_change() -> Result<()> {
+    let (repo, _external, conn, batch, _, _, _) = checker_rebind_fixture()?;
+    let old_snapshot = structural::current_snapshot(&conn)?;
+    conn.execute(
+        "UPDATE meta SET value='stale-typescript-contract'
+         WHERE key='format_contract_version:typescript'",
+        [],
+    )?;
+    fs::write(repo.path().join("000-rust.rs"), "pub fn added() {}\n")?;
+
+    let outcome =
+        incremental_refresh_repo_rebinding_checker(repo.path(), &conn, &IndexOptions::default())?;
+    let current_snapshot = structural::current_snapshot(&conn)?;
+
+    assert_ne!(current_snapshot, old_snapshot);
+    assert!(!outcome.checker_rebound);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM checker_enrichment_batches WHERE id=?1 AND active=1",
+            [batch],
+            |row| row.get::<_, String>(0),
+        )?,
+        old_snapshot,
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_checker_inputs_are_unpublished_even_when_rust_snapshot_is_unchanged() -> Result<()> {
+    let (repo, external, conn, batch, _, _, _) = checker_rebind_fixture()?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    fs::write(
+        external.path().join("lib.d.ts"),
+        "declare interface ExternalInput { changed: true }\n",
+    )?;
+
+    let outcome =
+        incremental_refresh_repo_rebinding_checker(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(!outcome.checker_rebound);
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert!(!conn.query_row(
+        "SELECT active FROM checker_enrichment_batches WHERE id=?1",
+        [batch],
+        |row| row.get::<_, bool>(0),
+    )?);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_only_full_refresh_rebinds_checker_rows_after_rowids_move() -> Result<()> {
+    let (repo, _external, conn, batch, target, old_file_id, old_call_id) =
+        checker_rebind_fixture()?;
+    let old_snapshot = structural::current_snapshot(&conn)?;
+    fs::write(
+        repo.path().join("000-rust.rs"),
+        "pub fn sorted_first() {}\n",
+    )?;
+
+    let outcome =
+        watch_full_refresh_repo_rebinding_checker(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(outcome.extraction_reset);
+    assert!(outcome.checker_rebound);
+    let (new_file_id, new_call_id): (i64, i64) = conn.query_row(
+        "SELECT file.id,call.rowid FROM files file
+         JOIN member_calls call ON call.file_id=file.id
+         WHERE file.path='service.ts' AND call.prop='load'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_ne!((new_file_id, new_call_id), (old_file_id, old_call_id));
+    let rebound_batch: i64 = conn.query_row(
+        "SELECT id FROM checker_enrichment_batches WHERE active=1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_ne!(rebound_batch, batch);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot,active
+             FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )?,
+        (old_snapshot, false),
+    );
+    let rebound_ids: (i64, i64) = conn.query_row(
+        "SELECT source_file_id,member_call_id
+         FROM checker_enrichments WHERE batch_id=?1",
+        [rebound_batch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(rebound_ids, (new_file_id, new_call_id));
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_file_id,member_call_id
+             FROM checker_enrichments WHERE batch_id=?1",
+            [batch],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?,
+        (old_file_id, old_call_id),
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    Ok(())
+}
+
 #[test]
 fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> {
     let repo = tempfile::tempdir()?;
@@ -3010,185 +4216,6 @@ fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> 
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     assert_eq!(counts, (0, 0));
-    Ok(())
-}
-
-#[test]
-fn forced_reextraction_reset_matches_per_file_replacement() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    fs::write(
-        repo.path().join("pnpm-workspace.yaml"),
-        "packages:\n  - packages/*\n",
-    )?;
-    let lib = repo.path().join("packages/lib");
-    fs::create_dir_all(lib.join("src"))?;
-    fs::write(
-        lib.join("package.json"),
-        r#"{"name": "@acme/lib", "module": "src/index.ts"}"#,
-    )?;
-    fs::write(
-        lib.join("src/index.ts"),
-        "export const greet = (name: string) => `hi ${name}`;\n\
-         export interface Shape { id: string }\n",
-    )?;
-    fs::write(
-        repo.path().join("helper.ts"),
-        "export const helper = (value: string) => value.trim();\n",
-    )?;
-    fs::write(
-        repo.path().join("main.ts"),
-        "import { greet } from '@acme/lib';\n\
-         import type { Shape } from '@acme/lib';\n\
-         import { EventEmitter } from 'node:events';\n\
-         import { helper } from './helper';\n\
-         import { inner } from 'selected-dep';\n\
-         import missing from 'not-installed-pkg';\n\
-         const emitter = new EventEmitter();\n\
-         emitter.on('ready', () => greet('x'));\n\
-         emitter.emit('ready');\n\
-         export function main(shape: Shape) {\n\
-           const key = process.env.API_KEY;\n\
-           return helper(greet(key ?? shape.id)) + inner() + missing;\n\
-         }\n\
-         export const spans = emitter.listeners(\n\
-           'ready',\n\
-         );\n",
-    )?;
-    let dependency = repo.path().join("node_modules/selected-dep");
-    fs::create_dir_all(&dependency)?;
-    fs::write(
-        dependency.join("package.json"),
-        r#"{"name":"selected-dep","version":"1.2.3","main":"index.js"}"#,
-    )?;
-    fs::write(
-        dependency.join("index.js"),
-        "export { inner } from './inner.js';\n",
-    )?;
-    fs::write(
-        dependency.join("inner.js"),
-        "export const inner = () => 42;\n",
-    )?;
-
-    let databases = tempfile::tempdir()?;
-    let per_file = store::open_path(&databases.path().join("per-file.db"))?;
-    let reset = store::open_path(&databases.path().join("reset.db"))?;
-    let options = IndexOptions {
-        dependencies: vec!["selected-dep".into()],
-        ..Default::default()
-    };
-    for conn in [&per_file, &reset] {
-        let outcome = index_repo_with_options(repo.path(), conn, &options)?;
-        assert!(!outcome.extraction_reset, "initial index must not reset");
-        // Semantic memory that must survive a forced re-extraction on
-        // both paths: a completed scout run, its classification, and an
-        // artifact with one support.
-        conn.execute_batch(
-            "INSERT INTO scout_runs(
-               id, scout_kind, status, gateway_protocol, provider, model,
-               billing_path, prompt_version, source_snapshot,
-               input_fingerprint, request_hash, started_at, completed_at
-             ) VALUES(7, 'workflow', 'completed', 1, 'test', 'test-model',
-                      'api', 'v1', 'snap', 'fp', 'req',
-                      '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
-             INSERT INTO scout_classifications(
-               run_id, anchor_key, decision, role, evidence_json
-             ) VALUES(7, 'sym:main.ts#::main@10', 'defining', 'entry', '{}');
-             INSERT INTO semantic_artifacts(
-               id, artifact_type, canonical_name, body_json, model,
-               prompt_version, confidence, source_snapshot, created_at,
-               scout_run_id, input_fingerprint, artifact_fingerprint
-             ) VALUES(3, 'workflow', 'checkout', '{}', 'test-model', 'v1',
-                      'likely', 'snap', '2026-01-01T00:01:00Z', 7, 'fp', 'af');
-             INSERT INTO semantic_supports(
-               artifact_id, claim_path, anchor_key, role, evidence_file,
-               evidence_start_line, evidence_end_line, source_hash,
-               context_hash, confidence
-             ) VALUES(3, '$.steps[0]', 'sym:main.ts#::main@10', 'entry',
-                      'main.ts', 10, 13, 'sh', 'ch', 'likely');",
-        )?;
-        // The v15-style forced re-extraction: clear every hash and
-        // invalidate the disposable projection and its public identity.
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta
-             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-        )?;
-    }
-
-    let slow = index_repo_without_extraction_reset(repo.path(), &per_file, &options)?;
-    assert!(!slow.extraction_reset);
-    let fast = index_repo_with_options(repo.path(), &reset, &options)?;
-    assert!(fast.extraction_reset, "cleared hashes must take the reset");
-    assert_eq!(
-        (fast.indexed, fast.unchanged, fast.rejected),
-        (slow.indexed, slow.unchanged, slow.rejected)
-    );
-
-    for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?
-        .iter()
-        .zip(canonical_dump(&reset)?)
-    {
-        assert_eq!(
-            slow_rows, &fast_rows,
-            "section `{section}` diverged between per-file and reset paths"
-        );
-    }
-
-    // Equality alone cannot prove survival; pin the preserved rows and a
-    // live FTS index on the reset path explicitly.
-    let (runs, artifacts, supports, classifications): (i64, i64, i64, i64) = reset.query_row(
-        "SELECT (SELECT count(*) FROM scout_runs),
-                (SELECT count(*) FROM semantic_artifacts),
-                (SELECT count(*) FROM semantic_supports),
-                (SELECT count(*) FROM scout_classifications)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
-    assert_eq!((runs, artifacts, supports, classifications), (1, 1, 1, 1));
-    let greet_hits: i64 = reset.query_row(
-        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'greet'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert!(greet_hits > 0, "rebuilt FTS index must serve matches");
-    Ok(())
-}
-
-#[test]
-fn extraction_reset_triggers_only_at_majority_cleared() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    for name in ["one", "two", "three"] {
-        fs::write(
-            repo.path().join(format!("{name}.ts")),
-            format!("export const {name} = 1;\n"),
-        )?;
-    }
-    let conn = store::open(repo.path())?;
-    let first = index_repo(repo.path(), &conn)?;
-    assert!(!first.extraction_reset);
-
-    let second = index_repo(repo.path(), &conn)?;
-    assert!(!second.extraction_reset, "no-op run must stay incremental");
-    assert_eq!((second.indexed, second.unchanged), (0, 3));
-
-    conn.execute("UPDATE files SET hash='' WHERE path='one.ts'", [])?;
-    let minority = index_repo(repo.path(), &conn)?;
-    assert!(
-        !minority.extraction_reset,
-        "one cleared hash out of three must replace per file"
-    );
-    assert_eq!((minority.indexed, minority.unchanged), (1, 2));
-
-    conn.execute(
-        "UPDATE files SET hash='' WHERE path IN ('one.ts', 'two.ts')",
-        [],
-    )?;
-    let majority = index_repo(repo.path(), &conn)?;
-    assert!(majority.extraction_reset, "majority cleared must reset");
-    assert_eq!((majority.indexed, majority.unchanged), (3, 0));
     Ok(())
 }
 

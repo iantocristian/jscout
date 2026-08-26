@@ -1,0 +1,553 @@
+{
+  "protocol_version": 4,
+  "title": "G26 format-scoped lexical retrieval prospective evaluation, protocol v4",
+  "goal": "Validate JavaScript/TypeScript filtered parity and judge unfiltered mixed JavaScript/TypeScript/Rust relevance from a blinded top-10 union pool.",
+  "repository": "iantocristian/jscout",
+  "preregistered_date": "2026-08-26",
+  "baseline_revision": "444540e3a29b68bfd5adc42bc4df99b5c5a92386",
+  "treatment_revision": "5b7d3f62406a782ef957f260104955691f661155",
+  "corpus_revision": "5b7d3f62406a782ef957f260104955691f661155",
+  "expected_runner_sha256": "502c72b2227cb258095d5ebf3a2d9c9ea0d187e1f2a02ff9b3285da693f1d9e5",
+  "checkout_policy": "Both arms index the same clean checkout pinned to corpus_revision. Each arm builds its binary from its separately pinned clean revision.",
+  "execution": {
+    "runner": "scripts/eval-g26-format-scope-v4",
+    "collection": "Run both frozen query cohorts in both arms. Baseline omits unsupported format flags; treatment filters only the parity cohort to JavaScript and TypeScript; mixed retrieval is unfiltered.",
+    "pool": "Union each arm's first ten deduplicated mixed files with authored positive recall sentinels, strip arm/rank/score provenance, deterministically shuffle paths, and bind the artifact to both source-report hashes.",
+    "scoring": "Require an explicit integer 0-3 qrel with a reason for every pooled path before computing any mixed metric.",
+    "provider_mode": "provider_free_ranked_lexical",
+    "binary_build": "cargo build --release --locked",
+    "database_policy": "Each arm uses distinct fresh external database and output paths."
+  },
+  "retrieval_k": 100,
+  "file_k": 10,
+  "pool_file_k": 10,
+  "pool_seed": "g26-format-scope-v4-2026-08-26",
+  "filtered_formats": [
+    "javascript",
+    "typescript"
+  ],
+  "adjudication": {
+    "unit": "query_file_pair",
+    "rubric": {
+      "0": "No meaningful evidence for the behavior requested by the query.",
+      "1": "Supporting or corroborating context, test, caller, or adjacent implementation; not a primary implementation or contract.",
+      "2": "A substantial participant in the requested behavior's transport, orchestration, validation, or persistence.",
+      "3": "The direct authoritative implementation or contract for the requested behavior."
+    },
+    "allowed_inputs": [
+      "blinded_pool_artifact",
+      "pinned_corpus_product_source",
+      "this_rubric"
+    ],
+    "prohibited_inputs": [
+      "manifest",
+      "source_holdout",
+      "arm_reports",
+      "raw_search_output",
+      "eval_results",
+      "prior_qrels",
+      "ranks",
+      "scores",
+      "arm_identity",
+      "git_history"
+    ],
+    "required_attestation": {
+      "adjudicators": "one_or_more_unique_nonempty_strings",
+      "candidate_input": "blinded_pool_only",
+      "corpus_revision": "must_equal_manifest_corpus_revision",
+      "rubric_sha256": "must_equal_manifest_rubric_sha256",
+      "independent_of_retrieval_generation": true,
+      "arm_identity_seen": false,
+      "rank_seen": false,
+      "score_seen": false,
+      "source_holdout_seen": false,
+      "manifest_seen": false,
+      "arm_reports_seen": false,
+      "raw_search_output_seen": false,
+      "eval_results_seen": false,
+      "prior_qrels_seen": false,
+      "git_history_seen": false
+    }
+  },
+  "metric_policy": {
+    "filtered_parity": "Macro-average file Recall@10 and reciprocal rank over the frozen JavaScript/TypeScript controls; every baseline top-five known positive must remain within the first ten files.",
+    "mixed_relevance": "Baseline and treatment file nDCG@10 over explicit 0-3 judgments for every candidate in the union of each arm's first ten deduplicated mixed files plus authored positive recall sentinels. Gain is 2^grade-1; treatment must meet the absolute gate and may not regress by more than the frozen tolerance.",
+    "known_positives": "Source-authored positive paths are recall sentinels only, not exhaustive relevance judgments. Report their Recall@10 descriptively; independent pool adjudication supplies the normative 0-3 qrels and may assign any pooled path, including a sentinel, grade zero.",
+    "judgment_coverage": "Every returned file through rank 10 in both arms must have an explicit qrel; missing qrels invalidate scoring.",
+    "language_representation": "Report observed returned formats; do not enforce a language quota or weight."
+  },
+  "gates": {
+    "filtered_recall_at_10_must_not_decrease": true,
+    "filtered_mean_mrr_maximum_drop": 0.02,
+    "filtered_baseline_top_five_gold_may_not_fall_below_rank": 10,
+    "mixed_treatment_mean_ndcg_at_10_minimum": 0.70,
+    "mixed_mean_ndcg_maximum_drop": 0.02,
+    "mixed_judged_at_10_required": 1
+  },
+  "source_holdout": {
+    "source_path_at_freeze": "/private/tmp/g26-v4-source-holdout.json",
+    "committed_path": "eval/prereg/g26-format-scope-v4-source-holdout-2026-08-26.json",
+    "source_sha256": "01ff607297f024075c8eaf850e0eb8b90bb3696350539be3ff5a666c1abcb3ec",
+    "copied_query_payload_sha256": "c44ac807b7b67183248b76101a806255532781d63e1865a1d1fa98febdbbd858",
+    "fresh_authorship": true,
+    "ranked_outputs_inspected": false,
+    "jscout_search_run": false,
+    "query_count": 22,
+    "judgment_scope": "Positive judgments are recall sentinels, not an exhaustive relevant-file pool.",
+    "cross_language_check": "The source author supplied at least one grade-3 Rust sentinel and one grade-3 JavaScript sentinel per query. Those labels are descriptive provenance only; the blinded pool adjudicator may independently assign any grade, including zero."
+  },
+  "filtered_parity_queries": [
+    {
+      "id": "v3-js-filter-exact-01",
+      "query": "chunkPlanMemberFiles",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "checker/src/protocol.mjs"
+      ],
+      "rationale": "A unique protocol helper whose definition is confined to the JavaScript checker protocol source."
+    },
+    {
+      "id": "v3-js-filter-exact-02",
+      "query": "takePlanMemberResultPage",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "checker/src/protocol.mjs"
+      ],
+      "rationale": "The identifier names a single exported paging implementation rather than a broad checker concept."
+    },
+    {
+      "id": "v3-js-filter-exact-03",
+      "query": "groupedInferredProjects",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "A private worker symbol that directly names the inferred-project grouping algorithm."
+    },
+    {
+      "id": "v3-js-filter-exact-04",
+      "query": "declarationContext",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "The exact identifier targets the sole provenance classifier for TypeScript declarations."
+    },
+    {
+      "id": "v3-js-filter-exact-05",
+      "query": "resolveInProject",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "The symbol is the worker's central implementation for resolving one indexed member call in a built project."
+    },
+    {
+      "id": "v3-js-filter-exact-06",
+      "query": "sanitizeErrorMessage",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/protocol.mjs"
+      ],
+      "rationale": "A unique exported gateway protocol sanitizer with a narrow security purpose."
+    },
+    {
+      "id": "v3-js-filter-exact-07",
+      "query": "extractSubmission",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "The identifier points directly to the structured-output boundary."
+    },
+    {
+      "id": "v3-js-filter-exact-08",
+      "query": "requiredToolChoice",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "A unique provider-compatibility helper with an explicit switch over API families."
+    },
+    {
+      "id": "v3-js-filter-exact-09",
+      "query": "classifyProviderFailure",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "The exact symbol isolates the gateway's provider failure classification logic."
+    },
+    {
+      "id": "v3-js-filter-exact-10",
+      "query": "parseOpenAICompatibleProviders",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "rationale": "The exported identifier names the complete JavaScript-side custom provider parser."
+    },
+    {
+      "id": "v3-js-filter-exact-11",
+      "query": "JsonCredentialStore",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "rationale": "A unique class definition that anchors all credential-store lifecycle behavior."
+    },
+    {
+      "id": "v3-js-filter-exact-12",
+      "query": "GraphMemory",
+      "query_form": "exact_identifier",
+      "authored_positive_files": [
+        "examples/graph-memory/demo.mjs"
+      ],
+      "rationale": "A distinctive exported class outside the sidecar code broadens the identifier holdout."
+    },
+    {
+      "id": "v3-js-filter-prose-01",
+      "query": "split checker membership uploads into bounded protocol frames",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/protocol.mjs",
+        "checker/src/main.mjs"
+      ],
+      "rationale": "The query describes the complete JavaScript host side of a logical membership upload without using source identifiers."
+    },
+    {
+      "id": "v3-js-filter-prose-02",
+      "query": "discover configured projects while ignoring inherited base configs",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "The wording targets a subtle configured-project discovery rule rather than generic TypeScript setup."
+    },
+    {
+      "id": "v3-js-filter-prose-03",
+      "query": "prefer general tsconfig owners over lint tooling projects",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "This probes purpose classification and ownership preference together."
+    },
+    {
+      "id": "v3-js-filter-prose-04",
+      "query": "group unconfigured files by package and module family into bounded projects",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "checker/src/inferred-options.mjs"
+      ],
+      "rationale": "The query combines the actual grouping axes and cap that distinguish inferred projects."
+    },
+    {
+      "id": "v3-js-filter-prose-05",
+      "query": "convert utf8 byte offsets into typescript utf16 call spans",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "This is a source-specific encoding seam with clear expected implementation evidence."
+    },
+    {
+      "id": "v3-js-filter-prose-06",
+      "query": "label declaration provenance as repository types library vendored or outside",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "checker/src/worker.mjs"
+      ],
+      "rationale": "The requested categories exactly match the worker's declaration provenance contract."
+    },
+    {
+      "id": "v3-js-filter-prose-07",
+      "query": "retry transient provider failures with bounded exponential backoff",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "The query describes the gateway-owned retry loop rather than SDK retry behavior."
+    },
+    {
+      "id": "v3-js-filter-prose-08",
+      "query": "require exactly one structured submit tool call with object arguments",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "This captures the full structured-output contract using behavior-only wording."
+    },
+    {
+      "id": "v3-js-filter-prose-09",
+      "query": "redact credentials bearer tokens and sensitive url parts from errors",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "gateway/src/protocol.mjs"
+      ],
+      "rationale": "The query enumerates the main redaction surfaces implemented at the protocol boundary."
+    },
+    {
+      "id": "v3-js-filter-prose-10",
+      "query": "map reasoning effort and service tier onto provider transport options",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "gateway/src/registry.mjs",
+        "gateway/src/completion.mjs"
+      ],
+      "rationale": "The query spans option validation and its actual use without relying on exported function names."
+    },
+    {
+      "id": "v3-js-filter-prose-11",
+      "query": "update json credentials with a heartbeat lock and atomic rename",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "gateway/src/registry.mjs"
+      ],
+      "rationale": "The query names the concurrency and durability mechanisms of the credential store."
+    },
+    {
+      "id": "v3-js-filter-prose-12",
+      "query": "choose the platform binary and inject bundled checker and gateway paths",
+      "query_form": "lowercase_multi_token_prose",
+      "authored_positive_files": [
+        "npm/cli/bin/jscout.mjs"
+      ],
+      "rationale": "This covers distribution and sidecar bootstrapping, distinct from checker and gateway internals."
+    }
+  ],
+  "mixed_relevance_queries": [
+    {
+      "id": "g26v4-01",
+      "query": "How does the native client establish a versioned JSON-lines session with the model gateway and fail closed on protocol skew or mismatched request IDs?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/llm/process.rs",
+        "gateway/src/protocol.mjs",
+        "src/llm/protocol.rs",
+        "gateway/src/server.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-02",
+      "query": "How is an in-flight model request canceled on an interrupt without allowing cancellation to overtake dispatch or corrupt the next request?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/llm/process.rs",
+        "gateway/src/server.mjs",
+        "gateway/src/protocol.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-03",
+      "query": "Where are completion deadlines enforced so the gateway can return a provider-timeout result before the native client's grace window expires?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/llm/process.rs",
+        "gateway/src/server.mjs",
+        "src/llm/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-04",
+      "query": "How is a model forced to submit exactly one structured tool payload, and how does native scouting validate the returned tool and schema?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs",
+        "src/scouting/mod.rs",
+        "src/llm/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-05",
+      "query": "How do gateway-owned retries use bounded backoff while preserving aggregate token usage and attempt counts in native run records?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs",
+        "src/scouting/mod.rs",
+        "src/llm/process.rs",
+        "src/llm/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-06",
+      "query": "How are raw provider failures reduced to stable billing, capacity, authentication, context, or connection errors and redacted before Rust surfaces them?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "gateway/src/completion.mjs",
+        "gateway/src/protocol.mjs",
+        "src/llm/mod.rs",
+        "src/llm/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-07",
+      "query": "How does model capability inspection resolve a provider-qualified model and report authentication, billing route, tool support, and context limits?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "gateway/src/server.mjs",
+        "gateway/src/registry.mjs",
+        "src/llm/mod.rs",
+        "src/llm/config.rs"
+      ]
+    },
+    {
+      "id": "g26v4-08",
+      "query": "How does a command-line or repository reasoning level reach provider-specific request options, and where do unsupported levels fail explicitly?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/commands/mod.rs",
+        "src/scouting/mod.rs",
+        "gateway/src/registry.mjs",
+        "gateway/src/completion.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-09",
+      "query": "How does a requested service tier flow from scouting configuration to provider calls only when the selected API supports it?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/scouting/mod.rs",
+        "gateway/src/registry.mjs",
+        "src/llm/protocol.rs",
+        "gateway/src/completion.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-10",
+      "query": "How do custom OpenAI-compatible providers and base URLs cross the Rust-to-Node configuration boundary without serializing secret values into provider definitions?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/config/load.rs",
+        "src/llm/process.rs",
+        "gateway/src/registry.mjs",
+        "gateway/src/server.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-11",
+      "query": "How does the npm entrypoint supply packaged checker and model sidecars as built-in discovery while preserving repository configuration and operator overrides?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "npm/cli/bin/jscout.mjs",
+        "src/config/load.rs",
+        "src/checker/mod.rs",
+        "src/llm/config.rs",
+        "npm/cli/test/launcher.test.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-12",
+      "query": "How does configured model-call concurrency use independent native-managed gateway processes while each Node gateway permits only one active completion?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/llm/process.rs",
+        "gateway/src/server.mjs",
+        "src/config/load.rs"
+      ]
+    },
+    {
+      "id": "g26v4-13",
+      "query": "How is a complete repository ownership inventory uploaded in bounded frames and returned through ordered, total-checked, cursor-safe result pages?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/checker/process.rs",
+        "checker/src/main.mjs",
+        "checker/src/protocol.mjs",
+        "src/checker/enrich.rs"
+      ]
+    },
+    {
+      "id": "g26v4-14",
+      "query": "How can an interrupt cancel blocking TypeScript work, terminate its worker, and discard a trailing planning frame without poisoning a reusable Rust client?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/checker/process.rs",
+        "checker/src/main.mjs",
+        "checker/src/worker.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-15",
+      "query": "How are repository byte offsets checked as UTF-8 boundaries, converted to TypeScript positions, and matched to the exact indexed member-call occurrence?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/checker/enrich.rs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-16",
+      "query": "How are configured TypeScript projects discovered and invalid configurations reported while tooling-only owners are deprioritized but retained as a fallback?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-17",
+      "query": "How are files without configured ownership grouped by nearest package and module semantics into bounded inferred scopes, while Rust preserves and rechecks the complete scope?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/package_gate.rs",
+        "checker/src/inferred-options.mjs"
+      ]
+    },
+    {
+      "id": "g26v4-18",
+      "query": "How are compiler, configuration, membership, and source inputs fingerprinted and revalidated so changed inputs cannot activate or reuse stale checker facts?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-19",
+      "query": "How do both sides reject member-resolution results when source bytes differ from the indexed snapshot or returned batch identities do not match the request?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-20",
+      "query": "How are TypeScript declaration candidates assigned repository, type-package, standard-library, vendored, or outside provenance and then mapped safely to indexed symbols?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-21",
+      "query": "How does batched member resolution stay within request and response budgets, retry oversized replies with smaller batches, and accumulate peak worker memory?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "src/checker/enrich.rs",
+        "checker/src/worker.mjs",
+        "src/checker/protocol.rs"
+      ]
+    },
+    {
+      "id": "g26v4-22",
+      "query": "How are checker faults isolated to one source file for inferred projects while project-wide races and configured-project failures remain atomic?",
+      "query_form": "natural_language",
+      "authored_positive_files": [
+        "checker/src/worker.mjs",
+        "src/checker/enrich.rs",
+        "src/checker/protocol.rs"
+      ]
+    }
+  ]
+}

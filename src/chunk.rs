@@ -19,6 +19,7 @@ pub enum ChunkKind {
     Method,
     Imports,
     Module, // merged top-level statements / misc
+    RustText,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +87,6 @@ pub struct Chunker<'s> {
 
 impl<'s> Chunker<'s> {
     pub fn new(path_rel: &Path, source: &'s str, ret: &ParserReturn<'_>) -> Self {
-        let ext = path_rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         let mut file_imports: Vec<String> = ret
             .module_record
             .requested_modules
@@ -97,7 +97,7 @@ impl<'s> Chunker<'s> {
         Self {
             source,
             file: path_rel.to_string_lossy().into_owned(),
-            is_jsx: matches!(ext, "jsx" | "tsx") || ret.program.source_type.is_jsx(),
+            is_jsx: ret.program.source_type.is_jsx(),
             lines: LineIndex::new(source),
             file_imports,
         }

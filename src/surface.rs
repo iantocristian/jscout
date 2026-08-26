@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{file_role, origin, semantic, store, structural};
+use crate::{file_role, formats, origin, semantic, store, structural};
 
 const OVERVIEW_CITATIONS_PER_CLASSIFICATION: usize = 3;
 const OVERVIEW_CITATION_CHARS: usize = 320;
@@ -94,6 +94,7 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
     let roles = serde_json::to_string(&options.roles)?;
     let file_roles = serde_json::to_string(&options.file_roles)?;
     let file_origins = serde_json::to_string(&options.file_origins)?;
+    let structural_formats = formats::eligible_ids_json(formats::Capability::Structural);
 
     let mut stmt = conn.prepare(
         "WITH ranked AS (
@@ -111,6 +112,7 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
              AND (?6 OR occurrence.role IN (SELECT value FROM json_each(?7)))
              AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))
              AND file.origin IN (SELECT value FROM json_each(?10))
+             AND file.format IN (SELECT value FROM json_each(?11))
            GROUP BY entity.id, entity.entity_key, entity.plane, entity.entity_type,
                     entity.name, entity.identity_anchor, entity.meta_json
          )
@@ -119,7 +121,7 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
          FROM ranked
          ORDER BY exact DESC, occurrence_count DESC,
                   plane, entity_type, name, entity_key
-         LIMIT ?11",
+         LIMIT ?12",
     )?;
     let rows = stmt.query_map(
         params![
@@ -133,6 +135,7 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
             options.file_roles.is_empty(),
             file_roles,
             file_origins,
+            structural_formats,
             options.limit as i64,
         ],
         |row| {
@@ -187,6 +190,7 @@ fn load_occurrences(
     let roles = serde_json::to_string(&options.roles)?;
     let file_roles = serde_json::to_string(&options.file_roles)?;
     let file_origins = serde_json::to_string(&options.file_origins)?;
+    let structural_formats = formats::eligible_ids_json(formats::Capability::Structural);
     let mut stmt = conn.prepare(
         "SELECT file.path, file.role, file.origin,
                 occurrence.line, occurrence.end_line,
@@ -199,10 +203,11 @@ fn load_occurrences(
            AND (?2 OR occurrence.role IN (SELECT value FROM json_each(?3)))
            AND (?4 OR file.role IN (SELECT value FROM json_each(?5)))
            AND file.origin IN (SELECT value FROM json_each(?6))
+           AND file.format IN (SELECT value FROM json_each(?7))
          ORDER BY occurrence.confidence='certain' DESC,
                   occurrence.confidence='likely' DESC,
                   file.path, occurrence.start, occurrence.id
-         LIMIT ?7",
+         LIMIT ?8",
     )?;
     let rows = stmt.query_map(
         params![
@@ -212,6 +217,7 @@ fn load_occurrences(
             options.file_roles.is_empty(),
             file_roles,
             file_origins,
+            structural_formats,
             options.occurrences_per_entity.saturating_add(1) as i64,
         ],
         |row| {
@@ -424,6 +430,7 @@ fn overview_unpinned(
     let repository = allowed_origins.contains("repository");
     let workspace = allowed_origins.contains("workspace");
     let dependency = allowed_origins.contains("dependency");
+    let structural_formats = formats::eligible_ids_json(formats::Capability::Structural);
     let mut areas: HashMap<String, AreaOverview> = HashMap::new();
     let mut files_by_origin = BTreeMap::new();
     let mut files_by_role = BTreeMap::new();
@@ -436,8 +443,11 @@ fn overview_unpinned(
     ]);
     let mut stmt = conn.prepare(
         "SELECT file.path, file.origin, file.role,
-                COALESCE(chunk.count, 0), COALESCE(symbol.count, 0),
-                COALESCE(site.count, 0)
+                COALESCE(chunk.count, 0),
+                CASE WHEN file.format IN (SELECT value FROM json_each(?1))
+                     THEN COALESCE(symbol.count, 0) ELSE 0 END,
+                CASE WHEN file.format IN (SELECT value FROM json_each(?1))
+                     THEN COALESCE(site.count, 0) ELSE 0 END
          FROM code_files file
          LEFT JOIN (SELECT file_id, count(*) AS count FROM code_chunks GROUP BY file_id) chunk
            ON chunk.file_id=file.id
@@ -447,7 +457,7 @@ fn overview_unpinned(
            ON site.file_id=file.id
          ORDER BY file.path",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![&structural_formats], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -504,20 +514,24 @@ fn overview_unpinned(
          FROM entities entity
          JOIN entity_occurrences occurrence ON occurrence.entity_id=entity.id
          JOIN code_files file ON file.id=occurrence.file_id
-         WHERE (?1 AND file.origin='repository')
-            OR (?2 AND file.origin='workspace')
-            OR (?3 AND file.origin='dependency')
+         WHERE ((?1 AND file.origin='repository')
+             OR (?2 AND file.origin='workspace')
+             OR (?3 AND file.origin='dependency'))
+           AND file.format IN (SELECT value FROM json_each(?4))
          GROUP BY entity.plane, entity.entity_type
          ORDER BY entity.plane, entity.entity_type",
     )?;
-    let rows = stmt.query_map(params![repository, workspace, dependency], |row| {
-        Ok(InventoryCount {
-            plane: row.get(0)?,
-            kind: row.get(1)?,
-            entities: row.get::<_, i64>(2)? as usize,
-            occurrences: row.get::<_, i64>(3)? as usize,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![repository, workspace, dependency, &structural_formats],
+        |row| {
+            Ok(InventoryCount {
+                plane: row.get(0)?,
+                kind: row.get(1)?,
+                entities: row.get::<_, i64>(2)? as usize,
+                occurrences: row.get::<_, i64>(3)? as usize,
+            })
+        },
+    )?;
     for row in rows {
         entity_inventory.push(row?);
     }
@@ -529,17 +543,21 @@ fn overview_unpinned(
          FROM resolved_edges edge
          LEFT JOIN code_files file ON file.id=edge.source_file_id
          WHERE edge.source_file_id IS NULL
-            OR (?1 AND file.origin='repository')
-            OR (?2 AND file.origin='workspace')
-            OR (?3 AND file.origin='dependency')
+            OR (((?1 AND file.origin='repository')
+              OR (?2 AND file.origin='workspace')
+              OR (?3 AND file.origin='dependency'))
+             AND file.format IN (SELECT value FROM json_each(?4)))
          GROUP BY edge.kind ORDER BY count(*) DESC, edge.kind",
     )?;
-    let rows = stmt.query_map(params![repository, workspace, dependency], |row| {
-        Ok(RelationCount {
-            kind: row.get(0)?,
-            edges: row.get::<_, i64>(1)? as usize,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![repository, workspace, dependency, &structural_formats],
+        |row| {
+            Ok(RelationCount {
+                kind: row.get(0)?,
+                edges: row.get::<_, i64>(1)? as usize,
+            })
+        },
+    )?;
     for row in rows {
         let relation = row?;
         relations.push(relation);

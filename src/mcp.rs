@@ -515,10 +515,11 @@ fn render_tool_result(
 const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout is the repository index for source-backed code localization. ",
     "Use documentation_search for repository Markdown, MDX, and authored guidance; it shares the repository snapshot but ranks in a separate corpus, and authored prose is not runtime proof. ",
+    "semantic_search spans all registered code formats by default; when the question names a language or implementation surface, pass its explicit formats allowlist. ",
     "For a code question with a usable identifier or file, localize first with the Investigation loop, even if the eventual question is causal or cross-file. Start with semantic_search exhaustive=true. Inspect the first page before traversing: if broad_or_query or the matches show a mis-specified evidence set, abandon that query, refine or use repository-local literal search, and never page merely because next_cursor exists; partial abandoned pages are not completeness evidence. For a valid traversal, preserve the original query and filter inputs and copy the exact returned next_cursor sequentially until truncated=false. The echoed scope is evidence, not a replacement request filter. Track total_chunks, page-local returned, and match_lines. ",
-    "For exact drill-down, use definition with one returned sym: anchor plus its snapshot. Preserve multi-anchor ambiguity instead of inventing a symbol anchor. For a file hit, copy its compatible call; otherwise strip only the leading file: from its returned anchor and pass the remainder as file_outline.path. Human-authored symbol mode is only a fuzzy localization fallback. When manually constructing a compatible locator follow-up, copy the original search's explicit origins allowlist unchanged; if it was omitted, keep it omitted, and never synthesize it from echoed scope.origins. ",
+    "For exact drill-down, use definition with one returned sym: anchor plus its snapshot. Preserve multi-anchor ambiguity instead of inventing a symbol anchor. For a file hit, copy its compatible call; otherwise strip only the leading file: from its returned anchor and pass the remainder as file_outline.path. Human-authored symbol mode is only a fuzzy localization fallback. When manually constructing a compatible locator follow-up, copy the original search's explicit origins and formats allowlists unchanged; if either was omitted, keep it omitted, and never synthesize it from echoed scope.origins or scope.formats. ",
     "If search reports response_budget_too_small with minimum_bytes=N, retry the same page and input cursor at response_bytes=N; the error is not cursor progress. ",
-    "A completeness claim must state the echoed scope fields corpus, file_roles, origins, and snapshot; matching code elsewhere establishes a convention, not that a change is safe. ",
+    "A completeness claim must state the echoed scope fields corpus, file_roles, origins, formats, and snapshot; matching code elsewhere establishes a convention, not that a change is safe. ",
     "Use a separate non-exhaustive ranked vector search or who_uses only when hunting aliases or callers outside source-text matches; set vector=false and rerank=false for exact-identifier follow-ups unless lexical evidence is insufficient. Baseline forces unavailable expansion and attached memory off. Independent small unexpanded searches may run in parallel, but each cursor traversal is sequential. After a snapshot change, restart the affected traversal and decisive exact reads. ",
     "Normally omit origins and trust the echoed scope; repository means root or unowned first-party files, not the whole repository. Use file_outline for one localized file, events for string-keyed wiring, and calls for exact member-method or object-option lookups. A computed-dispatch conclusion requires both the selection predicate and the selected subject's metadata or key. For causal or cross-file inquiry needing memory, overview, or graph expansion, use the structural profile. Verify decisive claims in source."
 );
@@ -526,8 +527,9 @@ const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
 const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout is persistent, evidence-backed repository memory with two conditional workflows. ",
     "Use documentation_search for repository Markdown, MDX, and authored guidance; it shares the repository snapshot but ranks in a separate corpus, and authored prose is not runtime proof. ",
+    "semantic_search spans all registered code formats by default; when the question names a language or implementation surface, pass its explicit formats allowlist. ",
     "Investigation loop for a code question with a usable identifier or file: localize first, even when the eventual question is causal or cross-file. Start with semantic_search exhaustive=true and inspect its first page. If broad_or_query or the matches show a mis-specified evidence set, abandon that query, refine or use repository-local literal search, and never page merely because next_cursor exists; partial abandoned pages are not completeness evidence. For a valid traversal, preserve the original query and filter inputs and copy the exact next_cursor sequentially until truncated=false. The echoed scope is evidence, not a replacement request filter. Track total_chunks, page-local returned, and match_lines. ",
-    "For exact drill-down, use definition with one returned sym: anchor plus its snapshot, preserving multi-anchor ambiguity without invention. For a file hit, copy its compatible call; otherwise strip only the leading file: from its returned anchor and pass the remainder as file_outline.path. Human-authored symbol mode is only a fuzzy localization fallback. When manually constructing a compatible locator follow-up, copy the original search's explicit origins allowlist unchanged; if it was omitted, keep it omitted, and never synthesize it from echoed scope.origins. If response_budget_too_small reports minimum_bytes=N, retry the same page and input cursor with response_bytes=N; the error is not cursor progress. State the echoed scope fields corpus, file_roles, origins, and snapshot in completeness answers, and treat repository convention as distinct from correctness or safety. Use a separate non-exhaustive ranked vector search with expand=false and include_memory=false, who_uses, or exact-anchor neighborhood only for aliases, callers, or relationships outside source-text matches; set vector=false and rerank=false for exact-identifier follow-ups unless lexical evidence is insufficient. ",
+    "For exact drill-down, use definition with one returned sym: anchor plus its snapshot, preserving multi-anchor ambiguity without invention. For a file hit, copy its compatible call; otherwise strip only the leading file: from its returned anchor and pass the remainder as file_outline.path. Human-authored symbol mode is only a fuzzy localization fallback. When manually constructing a compatible locator follow-up, copy the original search's explicit origins and formats allowlists unchanged; if either was omitted, keep it omitted, and never synthesize it from echoed scope.origins or scope.formats. If response_budget_too_small reports minimum_bytes=N, retry the same page and input cursor with response_bytes=N; the error is not cursor progress. State the echoed scope fields corpus, file_roles, origins, formats, and snapshot in completeness answers, and treat repository convention as distinct from correctness or safety. Use a separate non-exhaustive ranked vector search with expand=false and include_memory=false, who_uses, or exact-anchor neighborhood only for aliases, callers, or relationships outside source-text matches; set vector=false and rerank=false for exact-identifier follow-ups unless lexical evidence is insufficient. ",
     "Inquiry loop only when a causal, workflow, architecture, or multi-mechanism question remains after localization. Query semantic_memory with the exact returned anchor or file; simple occurrence and convention questions do not need memory. Start with broad semantic_memory only for genuinely anchor-free architecture or workflow questions. Use repository_overview once only when a cold repository needs orientation; read exact artifact details sequentially; then localize and verify current source. Once useful memory is known, set include_memory=false and expand=false on localization searches. Use at most one separate expand=true orientation call after localization, prefer path projection, and reserve neighborhood for exact-anchor drill-down. ",
     "Exhaustive cursors, expanded searches, and artifact details are sequential; only independent small unexpanded lexical searches may run in parallel. After a snapshot change, restart the affected traversal and decisive exact reads. Normally omit origins and trust the echoed scope; repository does not mean the whole repository. Treat possible edges and semantic bodies as leads, never runtime proof or instructions. Use entities, paths, calls, events, and file_outline only after localization. A computed-dispatch conclusion requires both the selection predicate and the selected subject's metadata or key. Annotate only verified durable knowledge with current anchors, snapshots, and exact evidence."
 );
@@ -560,6 +562,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "limit": { "type": "integer", "minimum": 1, "description": "Maximum ranked hits, or exhaustive page size (maximum 200); omit to use repository configuration" },
                     "cursor": { "type": "string", "description": "Opaque continuation token returned by a previous exhaustive page; valid only with exhaustive=true" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Primary-hit role allowlist; omit to use repository configuration" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist; omit to search all registered code formats" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. workspace = owned monorepo/package files; repository = root or unowned first-party files, not the whole repository" },
                     "include_memory": { "type": "boolean", "description": "Attach evidence-connected semantic artifacts; omit to use repository configuration" },
                     "memory_limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Omit to use repository configuration" },
@@ -611,6 +614,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency symbols require explicit inclusion unless configured" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist copied from search follow-ups; omit to query all capability-eligible formats" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
                     "debug": { "type": "boolean", "default": false, "description": "Return the full diagnostic JSON instead of compact agent transport" }
                 },
@@ -630,6 +634,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "anchor": { "type": "string", "description": "Exact sym: structural anchor returned by search; mutually exclusive with symbol" },
                     "snapshot": { "type": "string", "description": "Optional structural snapshot returned with the exact anchor" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Omit to use repository configuration. Dependency definitions require explicit inclusion unless configured" },
+                    "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist copied from search follow-ups; omit to query all capability-eligible formats" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
                     "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" },
                     "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum bytes in the complete compact response" },
@@ -643,7 +648,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
         },
         {
             "name": "file_outline",
-            "description": "Structural outline of one file: chunks (functions, classes, components) with line ranges and the symbols they use.",
+            "description": "Outline of one indexed code file. AST-backed formats return structural chunks (functions, classes, components) with symbols. Plain-text formats return span-only line ranges with null names; read the relevant source by those ranges.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -919,6 +924,7 @@ fn search_options_from_args(
     args: &Value,
     defaults: &config::SearchSettings,
 ) -> Result<(bool, search::SearchOptions)> {
+    let formats = code_formats(args)?;
     let exhaustive = args["exhaustive"].as_bool().unwrap_or(false);
     let cursor = match args.get("cursor") {
         None => None,
@@ -980,6 +986,7 @@ fn search_options_from_args(
             } else {
                 defaults.file_roles.clone()
             },
+            formats,
             file_origins: file_origins.clone(),
             include_memory: !exhaustive
                 && profile == ToolProfile::Structural
@@ -1222,13 +1229,19 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 as usize;
             let graph = query::ModuleGraph::load(conn)?;
             let origins = configured_origins(args, search_defaults);
-            let (targets, resolution) = symbol_targets(conn, args, &origins)?;
+            let formats = code_formats(args)?;
+            let (targets, resolution) = symbol_targets(conn, args, &origins, &formats)?;
             let mut results = Vec::new();
             for t in &targets {
                 let usages = if let Some(resolution) = &resolution {
-                    query::who_uses_anchor_in_origins(conn, &resolution.resolved_anchor, &origins)?
+                    query::who_uses_anchor_in_scope(
+                        conn,
+                        &resolution.resolved_anchor,
+                        &origins,
+                        &formats,
+                    )?
                 } else {
-                    query::who_uses_in_origins(conn, &graph, t.file_id, &t.name, &origins)?
+                    query::who_uses_in_scope(conn, &graph, t.file_id, &t.name, &origins, &formats)?
                 };
                 results.push((t, usages));
             }
@@ -1270,7 +1283,8 @@ fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) ->
                 .unwrap_or(scout::DEFAULT_SOURCE_BYTE_LIMIT as u64)
                 as usize;
             let origins = configured_origins(args, search_defaults);
-            let (targets, resolution) = symbol_targets(conn, args, &origins)?;
+            let formats = code_formats(args)?;
+            let (targets, resolution) = symbol_targets(conn, args, &origins, &formats)?;
             let matched_targets = targets.len();
             let mut results = Vec::new();
             for t in targets.into_iter().take(5) {
@@ -1661,6 +1675,7 @@ fn symbol_targets(
     conn: &Connection,
     args: &Value,
     origins: &[String],
+    formats: &[String],
 ) -> Result<(
     Vec<query::SymbolTarget>,
     Option<query::SymbolAnchorResolution>,
@@ -1672,14 +1687,18 @@ fn symbol_targets(
             if args.get("snapshot").and_then(Value::as_str).is_some() {
                 anyhow::bail!("`snapshot` is only valid with exact `anchor` mode");
             }
-            Ok((query::find_symbols_in_origins(conn, symbol, origins)?, None))
+            Ok((
+                query::find_symbols_in_scope(conn, symbol, origins, formats)?,
+                None,
+            ))
         }
         (None, Some(anchor)) if !anchor.trim().is_empty() => {
-            let (target, resolution) = query::find_symbol_by_anchor_in_origins(
+            let (target, resolution) = query::find_symbol_by_anchor_in_scope(
                 conn,
                 anchor,
                 args.get("snapshot").and_then(Value::as_str),
                 origins,
+                formats,
             )?;
             Ok((vec![target], Some(resolution)))
         }
@@ -1747,6 +1766,34 @@ fn json_string_array(args: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn optional_nonempty_string_array(args: &Value, key: &str) -> Result<Vec<String>> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("`{key}` must be an array of strings"))?;
+    if values.is_empty() {
+        anyhow::bail!("`{key}` must contain at least one value");
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("`{key}[{index}]` must be a string"))
+        })
+        .collect()
+}
+
+fn code_formats(args: &Value) -> Result<Vec<String>> {
+    let formats = optional_nonempty_string_array(args, "formats")?;
+    search::validate_code_formats(&formats)?;
+    Ok(formats)
 }
 
 fn json_string_array_or(
@@ -1985,10 +2032,12 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let profile_label =
         std::env::var("JSCOUT_PROFILE_LABEL").unwrap_or_else(|_| profile.as_str().to_string());
     let search_defaults = &runtime.effective.search;
+    let requested_formats = optional_nonempty_string_array(args, "formats").ok();
     let requested_retrieval = match *tool {
         "semantic_search" => Some(json!({
             "vector": args["vector"].as_bool().unwrap_or(search_defaults.vector),
             "rerank": args["rerank"].as_bool().unwrap_or(search_defaults.rerank),
+            "formats": requested_formats,
             "memory": *profile == ToolProfile::Structural
                 && args["include_memory"]
                     .as_bool()

@@ -12,12 +12,12 @@ use super::{
     DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit,
     MAX_EXHAUSTIVE_PAGE_SIZE, MatchReason, Reranker, ResponseBudget, ResponseBudgetTooSmall,
     RetrievalStatus, SearchExpansion, SearchMode, SearchOptions, SearchResult,
-    SearchScopeFileRoles, apply_repository_policy_penalty, apply_response_budget,
-    approximate_name_usage_occurrences, candidate_pool_limits, contains_code_identifier,
-    edge_identity, exact_intent_tokens, exhaustive_fts_query, exhaustive_warnings,
-    merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking, reranker_document,
-    resolve_search_limit, search, select_attached_memory, select_neighborhood_projection,
-    select_path_projection, tiered_candidates,
+    SearchScopeFileRoles, SearchScopeFormats, apply_repository_policy_penalty,
+    apply_response_budget, approximate_name_usage_occurrences, candidate_pool_limits,
+    contains_code_identifier, edge_identity, exact_intent_tokens, exhaustive_fts_query,
+    exhaustive_warnings, merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking,
+    reranker_document, resolve_search_limit, search, select_attached_memory,
+    select_neighborhood_projection, select_path_projection, tiered_candidates,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings, RerankerSettings};
 use crate::{
@@ -102,6 +102,366 @@ fn docs_corpus_named_chunks_cannot_enter_code_exact_lookup() -> Result<()> {
             &crate::origin::defaults(),
         )?
         .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_identifier_collisions_do_not_change_ecmascript_exact_candidates() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("definition.ts"),
+        "export function collisionNeedle() { return true; }\n",
+    )?;
+    fs::write(
+        repo.path().join("caller.js"),
+        "import { collisionNeedle } from './definition';\n\
+         export const result = collisionNeedle();\n\
+         export const state = { collisionNeedle: result };\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let before = super::exact_intent_candidates(
+        &conn,
+        "collisionNeedle",
+        32,
+        &[],
+        &origin::defaults(),
+        &[],
+    )?;
+    assert!(!before.definitions[0].is_empty());
+    assert!(!before.occurrences[0].is_empty());
+
+    conn.execute(
+        "INSERT INTO files(path,hash,role,origin,corpus,format)
+         VALUES('000-collision.rs','rust-file','production','repository','code','rust')",
+        [],
+    )?;
+    let rust_file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks(
+           file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content
+         ) VALUES(?1,'function','collisionNeedle','','collisionNeedle',0,80,1,3,
+                  'rust-chunk','fn collisionNeedle() { collisionNeedle(); }')",
+        [rust_file_id],
+    )?;
+    let rust_chunk_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO chunks_fts(rowid,content,name,symbols,path)
+         VALUES(?1,'fn collisionNeedle() { collisionNeedle(); }',
+                'collisionNeedle','collisionNeedle','000-collision.rs')",
+        [rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'collisionNeedle','function',3,18,0,40,'',1,1)",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO refs(
+           file_id,chunk_id,start,line,kind,confidence,target_name,local
+         ) VALUES(?1,?2,24,1,'use','certain','collisionNeedle',1)",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO member_calls(file_id,chunk_id,start,line,prop)
+         VALUES(?1,?2,25,1,'collisionNeedle')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+    conn.execute(
+        "INSERT INTO entity_sites(
+           file_id,chunk_id,start,end,line,end_line,plane,entity_type,role,
+           identity_kind,identity_name,identity_start,target_name,target_start,
+           extractor,provenance,confidence
+         ) VALUES(?1,?2,26,41,1,1,'general','symbol','use','reference',
+                  'collisionNeedle',26,'collisionNeedle',26,
+                  'fixture','fixture','certain')",
+        rusqlite::params![rust_file_id, rust_chunk_id],
+    )?;
+
+    let after = super::exact_intent_candidates(
+        &conn,
+        "collisionNeedle",
+        32,
+        &[],
+        &origin::defaults(),
+        &[],
+    )?;
+    assert_eq!(after.identifiers, before.identifiers);
+    assert_eq!(after.definitions, before.definitions);
+    assert_eq!(after.occurrences, before.occurrences);
+    assert!(
+        !after
+            .definitions
+            .iter()
+            .chain(&after.occurrences)
+            .flatten()
+            .any(|chunk_id| *chunk_id == rust_chunk_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn rust_lexical_hits_do_not_advertise_or_seed_structural_graph_calls() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn lexical_native_marker() { println!(\"native marker\"); }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let result = search(
+        &conn,
+        None,
+        "lexical native marker",
+        &SearchOptions {
+            rerank: false,
+            include_memory: false,
+            expand: true,
+            compact: true,
+            include_neighborhood_followups: true,
+            ..SearchOptions::default()
+        },
+    )?;
+    let hit = result
+        .hits
+        .iter()
+        .find(|hit| hit.file == "native.rs")
+        .expect("Rust lexical hit");
+    assert!(hit.anchors.is_empty());
+    assert!(hit.file_anchor.is_none());
+    assert!(!hit.include_neighborhood_followup);
+    let expansion = result.expansion.as_ref().expect("requested expansion");
+    assert!(expansion.seeds.is_empty());
+    assert!(expansion.nodes.is_empty());
+    assert!(expansion.edges.is_empty());
+
+    let compact = crate::compact::search_value(&result);
+    let rendered_hit = compact["hits"]
+        .as_array()
+        .and_then(|hits| hits.iter().find(|hit| hit["at"] == "native.rs:1"))
+        .expect("compact Rust hit");
+    assert!(rendered_hit.get("anchor").is_none());
+    let calls = rendered_hit["followups"]["calls"]
+        .as_array()
+        .expect("file follow-up calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool"], "file_outline");
+    Ok(())
+}
+
+#[test]
+fn ranked_format_scope_filters_lexical_and_exact_candidates_before_limits() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("definition.ts"),
+        "export function formatScopeNeedle() { return true; }\n",
+    )?;
+    fs::write(
+        repo.path().join("caller.js"),
+        "export const result = formatScopeNeedle();\n",
+    )?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn formatScopeNeedle() -> bool { true }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let scoped = |formats: Vec<String>| {
+        search(
+            &conn,
+            None,
+            "formatScopeNeedle",
+            &SearchOptions {
+                formats,
+                limit: 20,
+                rerank: false,
+                ..Default::default()
+            },
+        )
+    };
+
+    let rust = scoped(vec!["rust".into()])?;
+    assert!(!rust.hits.is_empty());
+    assert!(rust.hits.iter().all(|hit| hit.file == "native.rs"));
+    assert!(rust.hits.iter().all(|hit| {
+        !matches!(
+            hit.match_reason,
+            MatchReason::ExactDefinition | MatchReason::ExactOccurrence
+        )
+    }));
+    assert!(rust.hits.iter().all(|hit| {
+        hit.anchors.is_empty() && hit.file_anchor.is_none() && !hit.include_neighborhood_followup
+    }));
+
+    let typescript = scoped(vec!["typescript".into()])?;
+    assert!(!typescript.hits.is_empty());
+    assert!(
+        typescript
+            .hits
+            .iter()
+            .all(|hit| hit.file == "definition.ts")
+    );
+    assert!(
+        typescript
+            .hits
+            .iter()
+            .any(|hit| hit.match_reason == MatchReason::ExactDefinition)
+    );
+
+    let ecmascript = scoped(vec!["typescript".into(), "javascript".into()])?;
+    assert!(
+        ecmascript
+            .hits
+            .iter()
+            .all(|hit| hit.file.ends_with(".ts") || hit.file.ends_with(".js"))
+    );
+    assert!(ecmascript.hits.iter().any(|hit| hit.file == "caller.js"));
+    assert!(
+        ecmascript
+            .hits
+            .iter()
+            .any(|hit| hit.file == "definition.ts")
+    );
+
+    let all = scoped(Vec::new())?;
+    assert!(all.hits.iter().any(|hit| hit.file == "native.rs"));
+    assert!(all.hits.iter().any(|hit| hit.file == "caller.js"));
+    assert!(all.hits.iter().any(|hit| hit.file == "definition.ts"));
+    Ok(())
+}
+
+#[test]
+fn format_scope_rejects_unknown_and_document_formats() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const marker = true;\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    for format in ["markdown", "unknown"] {
+        let error = search(
+            &conn,
+            None,
+            "marker",
+            &SearchOptions {
+                formats: vec![format.into()],
+                rerank: false,
+                ..Default::default()
+            },
+        )
+        .expect_err("non-code format must be rejected");
+        assert_eq!(
+            error.to_string(),
+            format!("code format must be one of: javascript, typescript, rust; got `{format}`")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_only_ranked_scope_disables_vector_before_provider_resolution() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub fn rustOnlyVectorBypassMarker() {}\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let provider = embed::Provider::from_settings(
+        &EmbeddingSettings {
+            provider: Some("local".into()),
+            model: Some("unavailable/test-model".into()),
+            revision: Some("test-revision".into()),
+            url: None,
+            api_key_env: None,
+            query_prefix: None,
+            batch: 64,
+            origins: origin::defaults(),
+        },
+        &InferenceSettings {
+            url: "http://127.0.0.1:9".into(),
+            host: "127.0.0.1".into(),
+            port: 9,
+            project: None,
+            uv: "uv".into(),
+            allow_remote: false,
+            batch_size: 16,
+            max_length: 4_096,
+            model_cache_root: None,
+        },
+    )?
+    .expect("local provider");
+
+    let result = search(
+        &conn,
+        Some(&provider),
+        "rustOnlyVectorBypassMarker",
+        &SearchOptions {
+            formats: vec!["rust".into()],
+            rerank: false,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(result.retrieval.vector, "disabled");
+    assert!(!result.hits.is_empty());
+    assert!(result.hits.iter().all(|hit| hit.file == "native.rs"));
+    Ok(())
+}
+
+#[test]
+fn rust_test_module_filename_is_tagged_and_filtered_before_ranking() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("src/main.rs"),
+        "pub fn shared_rust_role_marker() -> bool { true }\n",
+    )?;
+    fs::write(
+        repo.path().join("src/tests.rs"),
+        "pub fn shared_rust_role_marker() -> bool { false }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let role = conn.query_row(
+        "SELECT role FROM files WHERE path='src/tests.rs'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    assert_eq!(role, "test");
+
+    let scoped = |role: &str| {
+        search(
+            &conn,
+            None,
+            "shared_rust_role_marker",
+            &SearchOptions {
+                file_roles: vec![role.into()],
+                formats: vec!["rust".into()],
+                rerank: false,
+                ..Default::default()
+            },
+        )
+    };
+    let test_only = scoped("test")?;
+    assert!(!test_only.hits.is_empty());
+    assert!(
+        test_only
+            .hits
+            .iter()
+            .all(|hit| hit.file == "src/tests.rs" && hit.file_role == "test")
+    );
+    let production_only = scoped("production")?;
+    assert!(!production_only.hits.is_empty());
+    assert!(
+        production_only
+            .hits
+            .iter()
+            .all(|hit| hit.file == "src/main.rs" && hit.file_role == "production")
     );
     Ok(())
 }
@@ -497,6 +857,7 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
         assert_eq!(metadata.scope.corpus, "indexed_chunks");
         assert_eq!(metadata.scope.file_roles, SearchScopeFileRoles::All);
         assert_eq!(metadata.scope.origins, ["repository", "workspace"]);
+        assert_eq!(metadata.scope.formats, SearchScopeFormats::All);
         assert_eq!(metadata.scope.snapshot, result.snapshot);
         if let Some(expected) = total_chunks {
             assert_eq!(metadata.total_chunks, expected);
@@ -506,6 +867,7 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
             let compact = crate::compact::search_value(&result);
             assert_eq!(compact["default_match"], "lexical");
             assert_eq!(compact["scope"]["file_roles"], "all");
+            assert_eq!(compact["scope"]["formats"], "all");
             assert_eq!(compact["effective"]["page_size"], 2);
             assert_eq!(compact["total_chunks"], metadata.total_chunks);
             assert_eq!(compact["returned"], metadata.returned);
@@ -1050,6 +1412,133 @@ fn exhaustive_search_normalizes_role_and_origin_scope_and_enforces_page_ceiling(
 }
 
 #[test]
+fn exhaustive_format_scope_filters_counts_echoes_and_binds_cursor() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    for path in ["a.ts", "b.ts"] {
+        fs::write(
+            repo.path().join(path),
+            "export const formatPagingNeedle = true;\n",
+        )?;
+    }
+    fs::write(
+        repo.path().join("native.rs"),
+        "pub const formatPagingNeedle: bool = true;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let first = search(
+        &conn,
+        None,
+        "formatPagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 1,
+            formats: vec!["typescript".into(), "typescript".into()],
+            rerank: false,
+            compact: true,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let metadata = first.exhaustive.as_ref().expect("exhaustive metadata");
+    assert_eq!(metadata.total_chunks, 2);
+    assert_eq!(
+        metadata.scope.formats,
+        SearchScopeFormats::Selected(vec!["typescript".into()])
+    );
+    assert_eq!(first.hits.len(), 1);
+    assert!(first.hits[0].file.ends_with(".ts"));
+    let compact = crate::compact::search_value(&first);
+    assert_eq!(
+        compact["scope"]["formats"],
+        serde_json::json!(["typescript"])
+    );
+    let cursor = metadata.next_cursor.clone().expect("continuation cursor");
+
+    let wrong_scope = search(
+        &conn,
+        None,
+        "formatPagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(cursor.clone()),
+            },
+            limit: 1,
+            formats: vec!["rust".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )
+    .expect_err("cursor must bind the normalized format scope");
+    assert!(wrong_scope.to_string().contains("query and scope"));
+
+    let continuation = search(
+        &conn,
+        None,
+        "formatPagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(cursor),
+            },
+            limit: 1,
+            formats: vec!["typescript".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(continuation.hits.len(), 1);
+    assert!(continuation.hits[0].file.ends_with(".ts"));
+    assert_ne!(continuation.hits[0].file, first.hits[0].file);
+
+    let rust = search(
+        &conn,
+        None,
+        "formatPagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            formats: vec!["rust".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let rust_metadata = rust.exhaustive.as_ref().expect("Rust exhaustive metadata");
+    assert_eq!(rust_metadata.total_chunks, 1);
+    assert_eq!(
+        rust_metadata.scope.formats,
+        SearchScopeFormats::Selected(vec!["rust".into()])
+    );
+    assert_eq!(rust.hits[0].file, "native.rs");
+    assert!(rust.hits[0].anchors.is_empty());
+    assert!(rust.hits[0].file_anchor.is_none());
+
+    let explicit_all = search(
+        &conn,
+        None,
+        "formatPagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive { cursor: None },
+            limit: 10,
+            formats: vec!["rust".into(), "javascript".into(), "typescript".into()],
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    let all_metadata = explicit_all
+        .exhaustive
+        .as_ref()
+        .expect("all-format exhaustive metadata");
+    assert_eq!(all_metadata.total_chunks, 3);
+    assert_eq!(all_metadata.scope.formats, SearchScopeFormats::All);
+    Ok(())
+}
+
+#[test]
 fn exhaustive_search_clamps_only_an_omitted_configured_limit() {
     let oversized = MAX_EXHAUSTIVE_PAGE_SIZE + 1;
     assert_eq!(
@@ -1363,7 +1852,7 @@ fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
         .iter()
         .find(|hit| hit.file == "a.ts" && hit.name.as_deref() == Some("greet"))
         .expect("greet definition hit");
-    assert_eq!(definition.file_anchor, "file:a.ts");
+    assert_eq!(definition.file_anchor.as_deref(), Some("file:a.ts"));
     assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
     assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
     assert!(approximate_name_usage_occurrences(&conn, &result.hits)? > 0);
@@ -1417,6 +1906,7 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
             expand: true,
             file_roles: Vec::new(),
             file_origins: origin::defaults(),
+            formats: Vec::new(),
             include_memory: true,
             memory_limit: 4,
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
@@ -1464,6 +1954,7 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
             expand: true,
             file_roles: Vec::new(),
             file_origins: origin::defaults(),
+            formats: Vec::new(),
             include_memory: true,
             memory_limit: 4,
             memory_graph_depth: DEFAULT_MEMORY_GRAPH_DEPTH,
@@ -1750,7 +2241,7 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
         snippet: "entry() { return nearby(); }".into(),
         snippet_truncated: false,
         anchors: vec![entry.clone()],
-        file_anchor: "file:entry.ts".into(),
+        file_anchor: Some("file:entry.ts".into()),
         uses: Vec::new(),
         used_by: Vec::new(),
         include_followups: true,
@@ -1843,6 +2334,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
     };
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -1890,6 +2382,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
 fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -1909,7 +2402,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
             snippet: "x".repeat(8_000),
             snippet_truncated: false,
             anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
-            file_anchor: "file:src/large.ts".into(),
+            file_anchor: Some("file:src/large.ts".into()),
             uses: vec!["helper (call)".into()],
             used_by: vec!["caller: 1 site".into()],
             include_followups: true,
@@ -1966,6 +2459,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
 fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -1985,7 +2479,7 @@ fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
             snippet: "export function target() { return 1; }".into(),
             snippet_truncated: false,
             anchors: vec!["sym:src/target.ts#::target@1".into()],
-            file_anchor: "file:src/target.ts".into(),
+            file_anchor: Some("file:src/target.ts".into()),
             uses: Vec::new(),
             used_by: Vec::new(),
             include_followups: true,
@@ -2065,6 +2559,7 @@ fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Re
     second_artifact.name = Some("second workflow".into());
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
+        requested_formats: Vec::new(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),

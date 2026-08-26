@@ -5,9 +5,14 @@ use serde_json::json;
 
 use super::{
     Cli, Command, ConfigCommand, ScoutCommand, effective_search_response_byte_limit, or_configured,
-    render_cli_neighborhood, render_semantic_memory_text, resolve_flag,
+    render_cli_neighborhood, render_semantic_memory_text, resolve_flag, resolve_search_provider,
 };
-use crate::{cli::DocsCommand, semantic::SemanticArtifact, structural};
+use crate::{
+    cli::DocsCommand,
+    config::{EmbeddingSettings, InferenceSettings},
+    semantic::SemanticArtifact,
+    structural,
+};
 use clap::Parser;
 
 #[test]
@@ -218,6 +223,78 @@ fn lexical_only_and_rerank_controls_parse_independently() {
     assert!(expand);
     assert_eq!(expand_mode.as_deref(), Some("neighborhood"));
     assert_eq!(expand_paths, Some(12));
+}
+
+#[test]
+fn search_format_scope_is_repeatable_and_omitted_by_default() {
+    let Cli { command, .. } = Cli::try_parse_from([
+        "jscout",
+        "search",
+        ".",
+        "checker protocol",
+        "--format",
+        "javascript",
+        "--format",
+        "typescript",
+    ])
+    .expect("format allowlist parses");
+    let Command::Search { formats, .. } = command else {
+        panic!("expected search")
+    };
+    assert_eq!(formats, ["javascript", "typescript"]);
+
+    let Cli { command, .. } = Cli::try_parse_from(["jscout", "search", ".", "checker protocol"])
+        .expect("omitted format scope parses");
+    let Command::Search { formats, .. } = command else {
+        panic!("expected search")
+    };
+    assert!(formats.is_empty());
+}
+
+#[test]
+fn rust_only_cli_scope_resolves_provider_only_for_vector_memory() -> Result<()> {
+    let embedding = EmbeddingSettings {
+        provider: Some("voyage".into()),
+        model: Some("voyage-code-3".into()),
+        revision: None,
+        url: None,
+        api_key_env: Some("JSCOUT_TEST_FORMAT_SCOPE_MISSING_VOYAGE_KEY_4C02A9".into()),
+        query_prefix: None,
+        batch: 64,
+        origins: crate::origin::defaults(),
+    };
+    let inference = InferenceSettings {
+        url: "http://127.0.0.1:11435".into(),
+        host: "127.0.0.1".into(),
+        port: 11_435,
+        project: None,
+        uv: "uv".into(),
+        allow_remote: false,
+        batch_size: 16,
+        max_length: 4_096,
+        model_cache_root: None,
+    };
+
+    assert!(
+        resolve_search_provider(true, false, &["rust".into()], &embedding, &inference)?.is_none(),
+        "Rust-only code search must not resolve vector credentials"
+    );
+    assert!(
+        resolve_search_provider(false, true, &["rust".into()], &embedding, &inference)?.is_none(),
+        "disabling vectors must keep attached semantic memory lexical"
+    );
+    let Err(error) = resolve_search_provider(true, true, &["rust".into()], &embedding, &inference)
+    else {
+        panic!("vector-enabled attached memory still requires configured credentials")
+    };
+    assert!(error.to_string().contains("requires secret environment"));
+    let Err(error) =
+        resolve_search_provider(true, false, &["javascript".into()], &embedding, &inference)
+    else {
+        panic!("a vector-capable format still requires configured credentials")
+    };
+    assert!(error.to_string().contains("requires secret environment"));
+    Ok(())
 }
 
 #[test]

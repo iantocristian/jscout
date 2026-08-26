@@ -80,6 +80,162 @@ fn snapshot_hashes_file_corpus_and_parser_format() -> Result<()> {
 }
 
 #[test]
+fn rust_canonical_fact_poison_cannot_enter_the_structural_projection() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[package]\nname = \"structural-poison\"\nversion = \"0.0.0\"\n",
+    )?;
+    write(
+        repo.path(),
+        "target.ts",
+        "export function stableTarget() {}\n",
+    )?;
+    write(repo.path(), "poison.rs", "pub fn poison_rust_target() {}\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = super::current_snapshot(&conn)?;
+    let baseline_resolution = super::compute_resolution_hash(&conn)?;
+
+    let projection = |conn: &rusqlite::Connection| -> Result<(Vec<String>, Vec<String>)> {
+        let nodes = conn
+            .prepare(
+                "SELECT node_key,node_kind,native_table,native_id,display_name,
+                        file_id,line,meta_json
+                 FROM graph_nodes ORDER BY node_key",
+            )?
+            .query_map([], |row| {
+                Ok(format!(
+                    "{:?}",
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, String>(7)?,
+                    )
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let edges = conn
+            .prepare(
+                "SELECT src_key,dst_key,kind,confidence,provenance,
+                        source_file_id,source_ref_id,line,detail_json
+                 FROM resolved_edges
+                 ORDER BY src_key,dst_key,kind,confidence,provenance,
+                          source_file_id,source_ref_id,line,detail_json",
+            )?
+            .query_map([], |row| {
+                Ok(format!(
+                    "{:?}",
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                    )
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((nodes, edges))
+    };
+    let baseline = projection(&conn)?;
+    let rust_file_id: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='poison.rs' AND format='rust'",
+        [],
+        |row| row.get(0),
+    )?;
+    let typescript_file_id: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='target.ts' AND format='typescript'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'poison_rust_target','function',0,30,0,30,'',1,1)",
+        [rust_file_id],
+    )?;
+    let rust_symbol_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO refs(
+           file_id,chunk_id,start,line,kind,confidence,target_request,
+           target_name,local,detail
+         ) VALUES(?1,NULL,1,1,'call','certain',NULL,
+                  'poison_rust_target',1,'injected Rust reference')",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO member_calls(
+           file_id,chunk_id,start,end,line,end_line,prop,object,
+           receiver_start,receiver_end,property_start,property_end
+         ) VALUES(?1,NULL,1,20,1,1,'stableTarget','rust_poison',
+                  1,12,13,19)",
+        [rust_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO module_edges(from_file,request,to_file,resolution,type_only)
+         VALUES(?1,'./target',?2,'resolver',0)",
+        rusqlite::params![rust_file_id, typescript_file_id],
+    )?;
+    conn.execute(
+        "INSERT INTO module_edges(from_file,request,to_file,resolution,type_only)
+         VALUES(?1,'./poison',?2,'resolver',0)",
+        rusqlite::params![typescript_file_id, rust_file_id],
+    )?;
+
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM symbols WHERE id=?1 AND file_id=?2",
+            rusqlite::params![rust_symbol_id, rust_file_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "the adversarial canonical fact must exist before projection"
+    );
+    assert_eq!(
+        super::compute_resolution_hash(&conn)?,
+        baseline_resolution,
+        "non-resolver Rust importers and targets must not perturb resolution identity"
+    );
+    rebuild_projection(&conn, &snapshot)?;
+
+    assert_eq!(projection(&conn)?, baseline);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM graph_nodes
+             WHERE file_id=?1 OR (native_table='symbols' AND native_id=?2)",
+            rusqlite::params![rust_file_id, rust_symbol_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM resolved_edges
+             WHERE source_file_id=?1 OR src_key LIKE '%poison_rust_target%'
+                OR dst_key LIKE '%poison_rust_target%'
+                OR src_key='member:unknown:stableTarget'
+                OR dst_key='member:unknown:stableTarget'",
+            [rust_file_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(repo.path(), "main.ts", "export const value = 1;\n")?;
@@ -251,6 +407,134 @@ fn docs_provenance_snapshot_orders_by_source_identity_not_row_id() -> Result<()>
         snapshot_for_order(&["a.md", "b.md"])?,
         snapshot_for_order(&["b.md", "a.md"])?
     );
+    Ok(())
+}
+
+#[test]
+fn poisoned_rust_graph_rows_cannot_resolve_traverse_or_change_workflow_degree() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    write(
+        repo.path(),
+        "flow.ts",
+        "export function allowedRoot() {}\nexport function allowedTarget() {}\n",
+    )?;
+    write(repo.path(), "poison.rs", "pub fn poisonedGraph() {}\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let (root, target, typescript_file): (String, String, i64) = conn.query_row(
+        "SELECT root.node_key,target.node_key,root.file_id
+         FROM graph_nodes root
+         JOIN graph_nodes target ON target.file_id=root.file_id
+         WHERE root.display_name='allowedRoot'
+           AND target.display_name='allowedTarget'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let rust_file: i64 = conn.query_row(
+        "SELECT id FROM files WHERE path='poison.rs' AND format='rust'",
+        [],
+        |row| row.get(0),
+    )?;
+    let baseline_degree = super::graph_degree(&conn, &root)?;
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         ) VALUES(?1,'poisonedGraph','function',0,13,0,26,'',1,1)",
+        [rust_file],
+    )?;
+    let rust_symbol = conn.last_insert_rowid();
+    let rust_anchor = "sym:poison.rs#::poisonedGraph@1";
+    conn.execute(
+        "INSERT INTO graph_nodes(
+           node_key,node_kind,native_table,native_id,display_name,file_id,line,meta_json
+         ) VALUES(?1,'symbol','symbols',?2,'poisonedGraph',?3,1,'{}')",
+        rusqlite::params![rust_anchor, rust_symbol, rust_file],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,?2,'call','certain','rust-poison',?3,'{}')",
+        rusqlite::params![root, rust_anchor, rust_file],
+    )?;
+    // Both endpoints are structurally eligible, so this separately proves an
+    // edge sourced from an ineligible format cannot enter traversal or degree.
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,?2,'call','certain','rust-poison',?3,'{}')",
+        rusqlite::params![root, target, rust_file],
+    )?;
+    // An eligible producer cannot make a Rust-backed or absent graph endpoint
+    // structurally visible. These cases exercise the joined identity filter
+    // used by traversal and degree calculation.
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,?2,'call','certain','typescript-to-rust-poison',?3,'{}')",
+        rusqlite::params![root, rust_anchor, typescript_file],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,'sym:missing.ts#::missing@1','call','certain',
+                  'missing-node-poison',?2,'{}')",
+        rusqlite::params![root, typescript_file],
+    )?;
+
+    assert_eq!(super::graph_degree(&conn, &root)?, baseline_degree);
+
+    assert!(super::resolve_current_anchor(&conn, rust_anchor).is_err());
+    assert!(super::resolve_current_anchor(&conn, "poisonedGraph").is_err());
+    let graph = neighborhood(
+        &conn,
+        &root,
+        &NeighborhoodOptions {
+            direction: "out".into(),
+            depth: 1,
+            kinds: vec!["call".into()],
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(graph.nodes.len(), 1);
+    assert!(graph.edges.is_empty());
+    let paths = super::paths(
+        &conn,
+        &root,
+        &target,
+        &super::PathOptions {
+            direction: "out".into(),
+            max_depth: 1,
+            kinds: vec!["call".into()],
+            ..Default::default()
+        },
+    )?;
+    assert!(paths.paths.is_empty());
+    assert!(super::paths(&conn, &root, rust_anchor, &super::PathOptions::default()).is_err());
+    let workflow = workflow_neighborhood(&conn, &root, 1, 20, 40, &origin::defaults())?;
+    assert_eq!(workflow.nodes.len(), 1);
+    assert_eq!(workflow.traversed_edges, 0);
+
+    // The TypeScript control remains a valid structural source when the same
+    // relation is published by an eligible producer.
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,?2,'call','certain','typescript-control',?3,'{}')",
+        rusqlite::params![root, target, typescript_file],
+    )?;
+    let allowed = neighborhood(
+        &conn,
+        &root,
+        &NeighborhoodOptions {
+            direction: "out".into(),
+            depth: 1,
+            kinds: vec!["call".into()],
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(allowed.edges.len(), 1);
+    assert_eq!(allowed.edges[0].provenance, "typescript-control");
+    assert_eq!(super::graph_degree(&conn, &root)?, baseline_degree + 1);
     Ok(())
 }
 
