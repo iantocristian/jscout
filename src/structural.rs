@@ -499,6 +499,23 @@ pub(crate) fn compute_snapshot_with_resolution(
         hasher.update(b"\0published\0");
         hasher.update(persisted.as_bytes());
     }
+    let rust_present = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
+        [crate::formats::RUST],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if rust_present {
+        let edition_context = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [crate::rust_lang::EDITION_CONTEXT_META_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        hasher.update(b"\0rust-edition-context\0");
+        hasher.update(edition_context.as_bytes());
+    }
     let mut stmt = conn.prepare(
         "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
                 COALESCE(f.package_path, ''),
@@ -3404,7 +3421,8 @@ fn enqueue_ranked_steps(
         let sql = if *direction == "out" {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
                     f.path, e.line, e.detail_json, other_file.role, other_file.origin,
-                    e.source_file_id, f.format
+                    e.source_file_id, f.format, other.node_key, other.file_id,
+                    other_file.format
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.dst_key
@@ -3413,7 +3431,8 @@ fn enqueue_ranked_steps(
         } else {
             "SELECT e.id, e.src_key, e.dst_key, e.kind, e.confidence, e.provenance,
                     f.path, e.line, e.detail_json, other_file.role, other_file.origin,
-                    e.source_file_id, f.format
+                    e.source_file_id, f.format, other.node_key, other.file_id,
+                    other_file.format
              FROM resolved_edges e
              LEFT JOIN files f ON e.source_file_id = f.id
              LEFT JOIN graph_nodes other ON other.node_key=e.src_key
@@ -3440,6 +3459,9 @@ fn enqueue_ranked_steps(
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, Option<i64>>(11)?,
                 r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
+                r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })?;
         for row in rows {
@@ -3450,8 +3472,16 @@ fn enqueue_ranked_steps(
                 other_file_origin,
                 source_file_id,
                 source_format,
+                other_node_key,
+                other_file_id,
+                other_format,
             ) = row?;
             if !structural_edge_source_eligible(source_file_id, source_format.as_deref())
+                || !structural_graph_node_identity_eligible(
+                    other_node_key.as_deref(),
+                    other_file_id,
+                    other_format.as_deref(),
+                )
                 || confidence_rank(&edge.confidence).unwrap_or(0) < min_rank
                 || (!allowed_kinds.is_empty() && !allowed_kinds.contains(edge.kind.as_str()))
                 || (!allowed_file_roles.is_empty()
@@ -3469,9 +3499,6 @@ fn enqueue_ranked_steps(
             } else {
                 edge.source.clone()
             };
-            if !structural_graph_node_exists(conn, &other)? {
-                continue;
-            }
             let degree = match degree_cache.get(&other) {
                 Some(degree) => *degree,
                 None => {
@@ -3517,24 +3544,35 @@ fn enqueue_ranked_steps(
 
 fn graph_degree(conn: &Connection, node: &str) -> Result<usize> {
     let mut statement = conn.prepare_cached(
-        "SELECT CASE WHEN edge.src_key=?1 THEN edge.dst_key ELSE edge.src_key END,
-                edge.source_file_id, source.format
+        "SELECT edge.source_file_id, source.format, neighbor.node_key,
+                neighbor.file_id, neighbor_file.format
          FROM resolved_edges edge
          LEFT JOIN files source ON source.id=edge.source_file_id
+         LEFT JOIN graph_nodes neighbor
+           ON neighbor.node_key=(CASE
+                WHEN edge.src_key=?1 THEN edge.dst_key ELSE edge.src_key END)
+         LEFT JOIN files neighbor_file ON neighbor_file.id=neighbor.file_id
          WHERE edge.src_key=?1 OR edge.dst_key=?1",
     )?;
     let neighbors = statement.query_map([node], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(0)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut degree = 0usize;
     for neighbor in neighbors {
-        let (neighbor, source_file_id, source_format) = neighbor?;
+        let (source_file_id, source_format, neighbor_key, neighbor_file_id, neighbor_format) =
+            neighbor?;
         if structural_edge_source_eligible(source_file_id, source_format.as_deref())
-            && structural_graph_node_exists(conn, &neighbor)?
+            && structural_graph_node_identity_eligible(
+                neighbor_key.as_deref(),
+                neighbor_file_id,
+                neighbor_format.as_deref(),
+            )
         {
             degree += 1;
         }
@@ -3705,27 +3743,35 @@ fn unique_anchor(anchor: &str, candidates: Vec<String>, status: &str) -> Result<
 fn structural_graph_node_exists(conn: &Connection, key: &str) -> Result<bool> {
     let identity = conn
         .query_row(
-            "SELECT node.file_id,file.format
+            "SELECT node.node_key,node.file_id,file.format
              FROM graph_nodes node
              LEFT JOIN files file ON file.id=node.file_id
              WHERE node.node_key=?1",
             [key],
             |row| {
                 Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
                 ))
             },
         )
         .optional()?;
-    Ok(match identity {
-        None => false,
-        Some((None, _)) => true,
-        Some((Some(_), Some(format))) => {
-            crate::formats::by_id(&format).is_some_and(|format| format.structural_eligible())
-        }
-        Some((Some(_), None)) => false,
-    })
+    Ok(identity.is_some_and(|(node_key, file_id, format)| {
+        structural_graph_node_identity_eligible(node_key.as_deref(), file_id, format.as_deref())
+    }))
+}
+
+fn structural_graph_node_identity_eligible(
+    node_key: Option<&str>,
+    file_id: Option<i64>,
+    format: Option<&str>,
+) -> bool {
+    node_key.is_some()
+        && (file_id.is_none()
+            || format
+                .and_then(crate::formats::by_id)
+                .is_some_and(|format| format.structural_eligible()))
 }
 
 fn structural_edge_source_eligible(

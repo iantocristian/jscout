@@ -66,7 +66,8 @@ pub fn classify(path: &Path, source: &str) -> &'static str {
             ".e2e-spec.",
             ".integration-test.",
         ],
-    ) {
+    ) || matches!(file, "test.rs" | "tests.rs")
+    {
         "test"
     // Singular `doc` is deliberately not a documentation marker: document-
     // domain production code commonly uses that directory name. `docs` and
@@ -200,6 +201,20 @@ mod tests {
         assert_eq!(
             super::penalty(Some(classify(Path::new("src/doc/job.ts"), ""))),
             1.0
+        );
+    }
+
+    #[test]
+    fn classifies_conventional_rust_test_module_filenames() {
+        assert_eq!(classify(Path::new("src/parser/test.rs"), ""), "test");
+        assert_eq!(classify(Path::new("src/parser/tests.rs"), ""), "test");
+        assert_eq!(
+            classify(Path::new("src/parser/contest.rs"), ""),
+            "production"
+        );
+        assert_eq!(
+            classify(Path::new("src/parser/tests.rs.bak"), ""),
+            "production"
         );
     }
 }

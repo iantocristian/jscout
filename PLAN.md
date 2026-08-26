@@ -3497,8 +3497,16 @@ format. The decisions:
    graph. Top-level syntax ranges are preferred boundaries; residual text is
    retained, and oversized ranges split only at a newline or UTF-8 boundary.
    Parse errors do not reject the file and are counted in index/watch refresh
-   diagnostics. The Rust extractor contract is versioned per format; changing
-   it does not invalidate unchanged JavaScript or TypeScript rows.
+   diagnostics. The parser edition comes from the nearest visible package
+   `Cargo.toml`, including `edition.workspace=true`; absent editions and
+   standalone files use Cargo's Rust-2015 default. The effective path-to-edition
+   map is a persisted extraction/snapshot input, so an edition-only manifest
+   edit reparses only Rust files whose effective edition changed. Invalid
+   edition context recovers visibly to the default. Non-UTF-8 source and
+   deterministic extraction failures are per-file rejections; retryable I/O
+   and panics remain publication-fatal. The Rust extractor contract is
+   versioned per format; changing it does not invalidate unchanged JavaScript
+   or TypeScript rows.
 4. Phase 2a replaces the text projection with a non-overlapping partition of
    named item chunks plus residual unnamed chunks—never duplicate full-text and
    named rows. Exact definitions, exact occurrences, and Rust vectors remain
@@ -3509,12 +3517,14 @@ format. The decisions:
 5. Phase 3 adds Rust module edges. Before code begins, its contract must fix the
    exact `cargo metadata` invocation, no-network/no-mutation policy, tool and
    input identity, failure behavior, supported path forms, and unresolved-edge
-   reporting. Cargo manifests/configuration and every other declared metadata
-   input become watch refresh boundaries in the same phase.
+   reporting. Phase 1 observes visible `Cargo.toml` only for output-directory
+   membership and parser edition; Cargo configuration and every other declared
+   metadata input become watch refresh boundaries in phase 3.
 6. Out of scope: entity extraction, events, member calls, checker enrichment,
    macro expansion, dependency-crate indexing, and rust-analyzer semantics.
    Inline `#[cfg(test)]` modules indexing with their containing file's role is a
-   recorded role-granularity limitation.
+   recorded role-granularity limitation. Exact `test.rs` and `tests.rs`
+   basenames carry the deterministic `test` file role.
 
 Canonical `files` and `chunks` remain shared, and phase 1 keeps one code FTS
 ranking corpus. A format filter is a scoping tool, not statistics isolation:
@@ -3546,15 +3556,18 @@ under an ordinary `target/` remains admitted; Cargo-output `target/` is pruned;
 Rust rows never enter exact tiers, checker inventory, checker dirty affinity,
 JS-specific fact tables, or module edges; spans slice exactly on multibyte,
 raw-string, and CRLF content; malformed Rust remains searchable and reports its
-parse-error count; and a Rust-only change preserves all JS/TS canonical rows
-and checker carry inputs. The prospectively committed v4 provider-free
-protocol has clean baseline and treatment arms. Filtered parity reuses the
+parse-error count; direct/workspace/default Cargo editions select parser
+context and edition-only changes re-extract Rust; deterministic Rust read or
+extraction failures reject only that file; and a Rust-only change preserves all
+JS/TS canonical rows and checker carry inputs. The prospectively committed v4
+provider-free protocol has clean baseline and treatment arms. Filtered parity reuses the
 previously inspected v3 JS/TS regression cohort; it is a regression guard, not
 fresh confirmatory evidence. It compares a Rust-free baseline with the mixed
 index searched using `formats=['javascript','typescript']`; JS/TS Recall@10
 does not decrease, MRR drops by no more than 0.02, and baseline top-five gold
 stays top-ten. Mixed relevance instead uses a fresh source-only holdout and
-searches with formats omitted. For each query, one blinded pool unions the
+searches with formats and file roles omitted, therefore admitting every
+deterministic role. For each query, one blinded pool unions the
 baseline and treatment top-ten files plus authored positive recall sentinels,
 and every pooled query-file pair receives an explicit `0`–`3` qrel. Baseline
 and treatment nDCG@10 use that same complete pool and gain `2^grade-1`;
@@ -3610,8 +3623,11 @@ G26 consequently advances to Phase 2a named, item-local Rust chunks while
 exact definitions, exact occurrences, Rust vectors, and module edges remain
 disabled. Identifier aliases must not be appended to the broad phase-1 chunks;
 any alias experiment belongs to the item-local projection and requires its own
-prospective test. The complete v4 result and immutable artifact hashes are
-recorded in
+prospective test. The Phase-2a replacement protocol must freeze `file_roles`
+explicitly: default retrieval omits it and includes tests, while a separate
+production-only experiment requires a classifier audit and cannot silently
+reframe the all-role v4 result. The complete v4 result and immutable artifact
+hashes are recorded in
 [eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
 
 ## Evaluation decisions already made

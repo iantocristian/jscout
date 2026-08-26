@@ -260,6 +260,7 @@ fn poisoned_rust_graph_rows_cannot_resolve_traverse_or_change_workflow_degree() 
         [],
         |row| row.get(0),
     )?;
+    let baseline_degree = super::graph_degree(&conn, &root)?;
     conn.execute(
         "INSERT INTO symbols(
            file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
@@ -288,6 +289,24 @@ fn poisoned_rust_graph_rows_cannot_resolve_traverse_or_change_workflow_degree() 
          ) VALUES(?1,?2,'call','certain','rust-poison',?3,'{}')",
         rusqlite::params![root, target, rust_file],
     )?;
+    // An eligible producer cannot make a Rust-backed or absent graph endpoint
+    // structurally visible. These cases exercise the joined identity filter
+    // used by traversal and degree calculation.
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,?2,'call','certain','typescript-to-rust-poison',?3,'{}')",
+        rusqlite::params![root, rust_anchor, typescript_file],
+    )?;
+    conn.execute(
+        "INSERT INTO resolved_edges(
+           src_key,dst_key,kind,confidence,provenance,source_file_id,detail_json
+         ) VALUES(?1,'sym:missing.ts#::missing@1','call','certain',
+                  'missing-node-poison',?2,'{}')",
+        rusqlite::params![root, typescript_file],
+    )?;
+
+    assert_eq!(super::graph_degree(&conn, &root)?, baseline_degree);
 
     assert!(super::resolve_current_anchor(&conn, rust_anchor).is_err());
     assert!(super::resolve_current_anchor(&conn, "poisonedGraph").is_err());
@@ -340,6 +359,7 @@ fn poisoned_rust_graph_rows_cannot_resolve_traverse_or_change_workflow_degree() 
     )?;
     assert_eq!(allowed.edges.len(), 1);
     assert_eq!(allowed.edges[0].provenance, "typescript-control");
+    assert_eq!(super::graph_degree(&conn, &root)?, baseline_degree + 1);
     Ok(())
 }
 

@@ -501,7 +501,21 @@ fn cli_who_uses_for_target(
 mod tests;
 
 pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
-    let files = walk::source_files(root)?;
+    let inventory = walk::source_inventory(root)?;
+    let editions = crate::rust_lang::resolve_editions(
+        root,
+        &inventory.files,
+        &inventory.cargo_manifests,
+        &crate::fs_ops::OsFileSystem,
+    )?;
+    for rejection in &editions.rejections {
+        eprintln!(
+            "skip Rust edition input {}: {}",
+            rejection.path.display(),
+            rejection.error
+        );
+    }
+    let files = inventory.files;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
@@ -524,7 +538,8 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
                 chunker.chunk_program(&ret.program, &ret.program.comments)
             }),
             formats::Extractor::RustText => {
-                crate::rust_lang::extract(rel, &source).map(|extraction| extraction.chunks)
+                crate::rust_lang::extract(rel, &source, editions.edition_for(file))
+                    .map(|extraction| extraction.chunks)
             }
             formats::Extractor::Documentation => continue,
         };

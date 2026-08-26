@@ -87,7 +87,17 @@ replacement discovery belongs to the phase-3 Cargo input contract. Rust chunks
 enter `chunks_fts`; code-vector materialization remains disabled.
 
 The pinned `ra_ap_syntax` parser supplies error-tolerant, lossless syntax
-ranges. The phase-1 projection is limited to:
+ranges. Each Rust file uses the edition declared by its nearest visible
+`Cargo.toml`; `edition.workspace=true` resolves through the visible ancestor
+workspace manifest, and a package with no edition or a standalone source file
+uses Cargo's Rust-2015 default. Invalid edition inputs are reported at the
+`rust-edition` stage and recover with that default. The sorted effective
+path-to-edition map is fingerprinted as an extraction and snapshot input, so an
+edition-only manifest edit reparses only Rust files whose effective edition
+changed, without replacing other Rust or unchanged JavaScript/TypeScript rows.
+This reads manifests observed by the
+authoritative repository walk and does not invoke Cargo or enable module
+resolution. The phase-1 projection is limited to:
 
 - `files`;
 - unnamed `chunks` with `kind='rust_text'`;
@@ -116,10 +126,12 @@ block comments, lifetimes, and mid-edit syntax errors.
 Parser errors do not reject the file. Recoverable errors publish all
 source-backed chunks and contribute to explicit
 `rust_files_with_parse_errors` and `rust_parse_error_count` diagnostics in the
-index/watch outcome and human status. An extractor panic, invalid UTF-8 input,
-or lossless-span invariant failure aborts publication rather than publishing a
-partial snapshot. The diagnostics describe the current indexed snapshot, not
-only work performed by the latest incremental run.
+index/watch outcome and human status. An extractor panic or retryable
+filesystem failure aborts publication. Non-UTF-8 Rust and a
+lossless-span invariant failure are deterministic per-file `read`/`extract`
+rejections: any stale row for that path is removed and accessible siblings
+still publish. The diagnostics describe the current indexed snapshot, not only
+work performed by the latest incremental run.
 
 ### Exact-tier isolation
 
@@ -170,6 +182,9 @@ incremental shared-inventory refresh as another repository source. Its dirty
 signal has no checker affinity. Watch state therefore distinguishes paths that
 require an index refresh from paths that may enter the TypeScript checker
 backlog. A Rust-only generation cannot create a checker plan or provider call.
+An admitted `Cargo.toml` edit also schedules an inventory refresh; a changed
+effective edition fingerprint forces Rust re-extraction even when `.rs` bytes
+are unchanged; files whose effective edition is unchanged remain incremental.
 Directory and unknown events remain conservative.
 
 Incremental Rust changes must converge to the same canonical database state as
@@ -192,8 +207,12 @@ The committed suite must prove:
 6. Rust below a Cargo-output `target` excluded while other formats there keep
    their existing policies, and authored Rust below an unrelated `target`
    remains admitted;
-7. malformed Rust searchable with current-snapshot parse diagnostics; and
-8. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
+7. malformed Rust searchable with current-snapshot parse diagnostics;
+8. direct, inherited, default, and changed Cargo editions select and invalidate
+   parser context deterministically;
+9. non-UTF-8 and deterministic extractor failures reject only their Rust file
+   while accessible siblings publish; and
+10. no behavior change in existing `chunks`, `stats`, MCP, or CLI surfaces when
    their input contains no Rust.
 
 The prospectively committed v4 protocol used clean baseline and treatment
@@ -204,7 +223,8 @@ cohort. That reused cohort is a regression guard, not fresh confirmatory
 evidence: file Recall@10 may not decrease, MRR may drop by at most 0.02, and
 baseline top-five gold remains top-ten. Mixed relevance uses a fresh
 source-only holdout, searches the default combined corpus with formats omitted,
-and uses blinded pooled cross-language judgments. Each query's pool unions the
+leaves `file_roles` omitted (therefore admitting every deterministic role), and
+uses blinded pooled cross-language judgments. Each query's pool unions the
 baseline and treatment top-ten files plus authored positive recall sentinels;
 every pooled query-file pair must receive an explicit `0`–`3` qrel. Baseline
 and treatment nDCG@10 use the same complete pool with gain `2^grade-1`.
@@ -279,6 +299,12 @@ Phase 2a. Because the v4 holdout and ranking are now inspected, item-local
 retrieval acceptance requires its own prospectively committed evaluation; v4
 cannot be reused as confirmatory evidence. Identifier aliases are not part of
 the initial projection and must never be appended to the broad phase-1 chunks.
+That replacement protocol must freeze its role scope explicitly. A default
+search comparison omits `file_roles` in both arms and includes test code; it
+must not reinterpret the existing v4 failure as production-only. A separate
+production-only experiment first requires a classifier audit because broad
+path/header roles still have known false positives and inline test modules have
+only their containing file role.
 
 ## Phase 2b — Rust exact tiers
 
@@ -341,4 +367,5 @@ Dependency crates, checker facts, entities, events, member calls, macro
 expansion, build-script output, trait or method resolution, procedural-macro
 output, and a rust-analyzer sidecar are separate goals. Inline `#[cfg(test)]`
 modules retain their containing file role and are reported as a known
-role-granularity limitation.
+role-granularity limitation. Exact `test.rs` and `tests.rs` basenames are
+classified as test files.

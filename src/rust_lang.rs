@@ -1,21 +1,287 @@
+use std::collections::BTreeMap;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, ensure};
-use ra_ap_syntax::{Edition, SourceFile};
+use anyhow::{Context, Result, ensure};
+pub use ra_ap_syntax::Edition;
+use ra_ap_syntax::SourceFile;
 
 use crate::chunk::{Chunk, ChunkKind, LineIndex};
+use crate::fs_ops::FileSystem;
 
 const TARGET_BYTES: usize = 4_800;
 const HARD_MAX_BYTES: usize = 8_000;
+pub(crate) const EDITION_CONTEXT_META_KEY: &str = "rust_edition_context_fingerprint";
+pub(crate) const EDITION_CONTEXTS_META_KEY: &str = "rust_edition_contexts";
 
 pub struct RustExtraction {
     pub chunks: Vec<Chunk>,
     pub parse_error_count: usize,
 }
 
-pub fn extract(path: &Path, source: &str) -> Result<RustExtraction> {
-    let parsed = SourceFile::parse(source, Edition::CURRENT);
+#[derive(Debug)]
+pub struct EditionRejection {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Effective parser editions for the Rust files admitted by one repository
+/// inventory. The fingerprint is an extraction input: changing a manifest's
+/// effective edition must reparse unchanged source bytes and advance the
+/// published snapshot.
+#[derive(Debug)]
+pub struct EditionResolution {
+    editions: BTreeMap<PathBuf, Edition>,
+    contexts: BTreeMap<String, String>,
+    pub fingerprint: String,
+    pub rejections: Vec<EditionRejection>,
+}
+
+impl EditionResolution {
+    pub fn edition_for(&self, path: &Path) -> Edition {
+        self.editions.get(path).copied().unwrap_or(Edition::DEFAULT)
+    }
+
+    pub fn has_rust_files(&self) -> bool {
+        !self.editions.is_empty()
+    }
+
+    pub fn context_for_relative(&self, path: &str) -> Option<&str> {
+        self.contexts
+            .get(&path.replace('\\', "/"))
+            .map(String::as_str)
+    }
+
+    pub fn contexts_json(&self) -> String {
+        serde_json::to_string(&self.contexts).expect("Rust edition contexts serialize")
+    }
+}
+
+#[derive(Debug)]
+struct Manifest {
+    path: PathBuf,
+    value: Option<toml::Value>,
+    error: Option<String>,
+}
+
+/// Resolve Cargo editions without invoking Cargo or rescanning the repository.
+/// Only visible manifests captured by the authoritative walk participate.
+/// Invalid or unreadable manifests are reported and recover with Cargo's
+/// language default (Rust 2015), while retryable I/O remains transaction-fatal.
+pub(crate) fn resolve_editions<F: FileSystem>(
+    root: &Path,
+    files: &[PathBuf],
+    manifest_paths: &[PathBuf],
+    fs: &F,
+) -> Result<EditionResolution> {
+    let rust_files = files
+        .iter()
+        .filter(|path| {
+            crate::formats::repository_code_for_path(path)
+                .is_some_and(|format| format.id == crate::formats::RUST)
+        })
+        .collect::<Vec<_>>();
+    if rust_files.is_empty() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"jscout-rust-edition-context-v1\0");
+        return Ok(EditionResolution {
+            editions: BTreeMap::new(),
+            contexts: BTreeMap::new(),
+            fingerprint: hasher.finalize().to_hex().to_string(),
+            rejections: Vec::new(),
+        });
+    }
+    let mut manifests = BTreeMap::new();
+    let mut rejection_by_path = BTreeMap::new();
+    for path in manifest_paths {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let directory = relative.parent().unwrap_or(Path::new("")).to_path_buf();
+        let (value, error) = match fs.read_to_string(path) {
+            Ok(source) => match toml::from_str::<toml::Value>(&source) {
+                Ok(value) => (Some(value), None),
+                Err(error) => (
+                    None,
+                    Some(format!("parse Cargo manifest for Rust edition: {error}")),
+                ),
+            },
+            Err(error) if crate::io_policy::is_inventory_race(&error) => (None, None),
+            Err(error) if crate::io_policy::is_retryable(&error) => {
+                return Err(error)
+                    .with_context(|| format!("read Cargo edition input `{}`", path.display()));
+            }
+            Err(error) => (
+                None,
+                Some(format!("read Cargo manifest for Rust edition: {error}")),
+            ),
+        };
+        manifests.insert(
+            directory,
+            Manifest {
+                path: path.clone(),
+                value,
+                error,
+            },
+        );
+    }
+
+    let mut editions = BTreeMap::new();
+    for file in rust_files {
+        let relative = file.strip_prefix(root).unwrap_or(file);
+        let Some((manifest_dir, manifest)) = nearest_manifest(relative, &manifests) else {
+            editions.insert(file.clone(), Edition::DEFAULT);
+            continue;
+        };
+        let edition = match effective_manifest_edition(manifest_dir, manifest, &manifests) {
+            Ok(edition) => edition,
+            Err(error) => {
+                rejection_by_path
+                    .entry(manifest.path.clone())
+                    .or_insert(error);
+                Edition::DEFAULT
+            }
+        };
+        editions.insert(file.clone(), edition);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"jscout-rust-edition-context-v1\0");
+    let mut contexts = BTreeMap::new();
+    for (path, edition) in &editions {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        let edition = edition.to_string();
+        contexts.insert(normalized.clone(), edition.clone());
+        for value in [normalized.as_str(), edition.as_str()] {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    let rejections = rejection_by_path
+        .into_iter()
+        .map(|(path, error)| EditionRejection { path, error })
+        .collect();
+    Ok(EditionResolution {
+        editions,
+        contexts,
+        fingerprint: hasher.finalize().to_hex().to_string(),
+        rejections,
+    })
+}
+
+fn nearest_manifest<'a>(
+    relative_file: &Path,
+    manifests: &'a BTreeMap<PathBuf, Manifest>,
+) -> Option<(&'a Path, &'a Manifest)> {
+    let mut directory = relative_file.parent().unwrap_or(Path::new(""));
+    loop {
+        if let Some((directory, manifest)) = manifests.get_key_value(directory) {
+            return Some((directory.as_path(), manifest));
+        }
+        let parent = directory.parent()?;
+        directory = parent;
+    }
+}
+
+fn effective_manifest_edition(
+    manifest_dir: &Path,
+    manifest: &Manifest,
+    manifests: &BTreeMap<PathBuf, Manifest>,
+) -> std::result::Result<Edition, String> {
+    if let Some(error) = manifest.error.as_ref() {
+        return Err(error.clone());
+    }
+    let Some(value) = manifest.value.as_ref() else {
+        return Ok(Edition::DEFAULT);
+    };
+    let Some(package) = value.get("package").and_then(toml::Value::as_table) else {
+        return Ok(Edition::DEFAULT);
+    };
+    let Some(edition) = package.get("edition") else {
+        return Ok(Edition::DEFAULT);
+    };
+    if let Some(edition) = edition.as_str() {
+        return edition
+            .parse()
+            .map_err(|error| format!("resolve Rust package edition: {error}"));
+    }
+    let inherited = edition
+        .as_table()
+        .and_then(|table| table.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    if !inherited {
+        return Err("resolve Rust package edition: expected a year or `workspace = true`".into());
+    }
+
+    let explicit_workspace = package
+        .get("workspace")
+        .and_then(toml::Value::as_str)
+        .map(|workspace| normalize_relative(manifest_dir, Path::new(workspace)))
+        .transpose()?
+        .and_then(|directory| manifests.get_key_value(&directory));
+    let workspace = explicit_workspace.or_else(|| {
+        let mut directory = Some(manifest_dir);
+        while let Some(candidate) = directory {
+            if let Some(entry) = manifests.get_key_value(candidate)
+                && entry
+                    .1
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.get("workspace"))
+                    .and_then(toml::Value::as_table)
+                    .is_some()
+            {
+                return Some(entry);
+            }
+            directory = candidate.parent();
+        }
+        None
+    });
+    let Some((_, workspace)) = workspace else {
+        return Err("resolve inherited Rust edition: workspace manifest was not found".into());
+    };
+    let edition = workspace
+        .value
+        .as_ref()
+        .and_then(|value| value.get("workspace"))
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("edition"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            "resolve inherited Rust edition: `workspace.package.edition` is missing".to_string()
+        })?;
+    edition
+        .parse()
+        .map_err(|error| format!("resolve inherited Rust edition: {error}"))
+}
+
+fn normalize_relative(base: &Path, value: &Path) -> std::result::Result<PathBuf, String> {
+    if value.is_absolute() {
+        return Err("resolve Rust workspace: absolute `package.workspace` is unsupported".into());
+    }
+    let mut normalized = base.to_path_buf();
+    for component in value.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if normalized.pop() => {}
+            Component::ParentDir => {
+                return Err(
+                    "resolve Rust workspace: `package.workspace` escapes the index root".into(),
+                );
+            }
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(_) | Component::RootDir => {
+                return Err("resolve Rust workspace: invalid `package.workspace` path".into());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+pub fn extract(path: &Path, source: &str, edition: Edition) -> Result<RustExtraction> {
+    let parsed = SourceFile::parse(source, edition);
     let syntax = parsed.syntax_node();
     let source_len = source.len();
     let syntax_end = u32::from(syntax.text_range().end()) as usize;
@@ -226,7 +492,7 @@ mod tests {
                 "pub const ITEM_{index}: &str = \"padding-{index}-界\";\r"
             );
         }
-        let extraction = extract(Path::new("src/lib.rs"), &source)?;
+        let extraction = extract(Path::new("src/lib.rs"), &source, Edition::Edition2024)?;
         assert!(extraction.chunks.len() > 3);
         assert_eq!(extraction.parse_error_count, 0);
         assert_contract(&source, &extraction);
@@ -236,7 +502,7 @@ mod tests {
     #[test]
     fn malformed_mid_edit_remains_lossless_and_counted() -> Result<()> {
         let source = "pub fn before() {}\nfn broken() { let value = ;\npub fn after() {}\n";
-        let extraction = extract(Path::new("broken.rs"), source)?;
+        let extraction = extract(Path::new("broken.rs"), source, Edition::Edition2024)?;
         assert!(extraction.parse_error_count > 0);
         assert_contract(source, &extraction);
         assert!(
@@ -250,7 +516,7 @@ mod tests {
 
     #[test]
     fn empty_source_emits_no_chunks() -> Result<()> {
-        let extraction = extract(Path::new("empty.rs"), "")?;
+        let extraction = extract(Path::new("empty.rs"), "", Edition::Edition2024)?;
         assert!(extraction.chunks.is_empty());
         assert_eq!(extraction.parse_error_count, 0);
         Ok(())
@@ -264,11 +530,128 @@ mod tests {
         source.push('界');
         source.push_str(&" ".repeat(HARD_MAX_BYTES));
 
-        let extraction = extract(Path::new("boundaries.rs"), &source)?;
+        let extraction = extract(Path::new("boundaries.rs"), &source, Edition::Edition2024)?;
 
         assert!(extraction.chunks.len() >= 3);
         assert_contract(&source, &extraction);
         assert_eq!(extraction.chunks[0].end as usize, HARD_MAX_BYTES - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn parser_diagnostics_respect_the_selected_edition() -> Result<()> {
+        let source = "pub fn gen() {}\n";
+        let legacy = extract(Path::new("legacy.rs"), source, Edition::Edition2021)?;
+        let current = extract(Path::new("current.rs"), source, Edition::Edition2024)?;
+        assert_eq!(legacy.parse_error_count, 0);
+        assert!(current.parse_error_count > 0);
+        assert_contract(source, &legacy);
+        assert_contract(source, &current);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_direct_default_and_workspace_inherited_editions() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        std::fs::create_dir_all(root.join("member/src"))?;
+        std::fs::create_dir_all(root.join("legacy/src"))?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['member', 'legacy']\n[workspace.package]\nedition='2021'\n",
+        )?;
+        std::fs::write(
+            root.join("member/Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition.workspace=true\n",
+        )?;
+        std::fs::write(
+            root.join("legacy/Cargo.toml"),
+            "[package]\nname='legacy'\nversion='0.1.0'\n",
+        )?;
+        for path in ["member/src/lib.rs", "legacy/src/lib.rs", "standalone.rs"] {
+            std::fs::write(root.join(path), "pub fn value() {}\n")?;
+        }
+        let files = ["member/src/lib.rs", "legacy/src/lib.rs", "standalone.rs"]
+            .into_iter()
+            .map(|path| root.join(path))
+            .collect::<Vec<_>>();
+        let manifests = ["Cargo.toml", "legacy/Cargo.toml", "member/Cargo.toml"]
+            .into_iter()
+            .map(|path| root.join(path))
+            .collect::<Vec<_>>();
+        let resolution = resolve_editions(&root, &files, &manifests, &crate::fs_ops::OsFileSystem)?;
+        assert_eq!(
+            resolution.edition_for(&root.join("member/src/lib.rs")),
+            Edition::Edition2021
+        );
+        assert_eq!(
+            resolution.edition_for(&root.join("legacy/src/lib.rs")),
+            Edition::Edition2015
+        );
+        assert_eq!(
+            resolution.edition_for(&root.join("standalone.rs")),
+            Edition::Edition2015
+        );
+        assert!(resolution.rejections.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn effective_edition_changes_the_context_fingerprint() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        std::fs::create_dir_all(root.join("src"))?;
+        let manifest = root.join("Cargo.toml");
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, "pub fn gen() {}\n")?;
+        std::fs::write(
+            &manifest,
+            "[package]\nname='sample'\nversion='0.1.0'\nedition='2021'\n",
+        )?;
+        let first = resolve_editions(
+            &root,
+            std::slice::from_ref(&source),
+            std::slice::from_ref(&manifest),
+            &crate::fs_ops::OsFileSystem,
+        )?;
+        std::fs::write(
+            &manifest,
+            "[package]\nname='sample'\nversion='0.1.0'\nedition='2024'\n",
+        )?;
+        let second = resolve_editions(
+            &root,
+            std::slice::from_ref(&source),
+            std::slice::from_ref(&manifest),
+            &crate::fs_ops::OsFileSystem,
+        )?;
+        assert_eq!(first.edition_for(&source), Edition::Edition2021);
+        assert_eq!(second.edition_for(&source), Edition::Edition2024);
+        assert_ne!(first.fingerprint, second.fingerprint);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_manifest_edition_is_visible_and_uses_cargo_default() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let root = repo.path().canonicalize()?;
+        std::fs::create_dir_all(root.join("src"))?;
+        let manifest = root.join("Cargo.toml");
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, "pub fn gen() {}\n")?;
+        std::fs::write(
+            &manifest,
+            "[package]\nname='sample'\nversion='0.1.0'\nedition='2099'\n",
+        )?;
+        let resolution = resolve_editions(
+            &root,
+            std::slice::from_ref(&source),
+            std::slice::from_ref(&manifest),
+            &crate::fs_ops::OsFileSystem,
+        )?;
+        assert_eq!(resolution.edition_for(&source), Edition::Edition2015);
+        assert_eq!(resolution.rejections.len(), 1);
+        assert_eq!(resolution.rejections[0].path, manifest);
+        assert!(resolution.rejections[0].error.contains("invalid edition"));
         Ok(())
     }
 }

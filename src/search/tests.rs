@@ -413,6 +413,60 @@ fn rust_only_ranked_scope_disables_vector_before_provider_resolution() -> Result
 }
 
 #[test]
+fn rust_test_module_filename_is_tagged_and_filtered_before_ranking() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("src"))?;
+    fs::write(
+        repo.path().join("src/main.rs"),
+        "pub fn shared_rust_role_marker() -> bool { true }\n",
+    )?;
+    fs::write(
+        repo.path().join("src/tests.rs"),
+        "pub fn shared_rust_role_marker() -> bool { false }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let role = conn.query_row(
+        "SELECT role FROM files WHERE path='src/tests.rs'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    assert_eq!(role, "test");
+
+    let scoped = |role: &str| {
+        search(
+            &conn,
+            None,
+            "shared_rust_role_marker",
+            &SearchOptions {
+                file_roles: vec![role.into()],
+                formats: vec!["rust".into()],
+                rerank: false,
+                ..Default::default()
+            },
+        )
+    };
+    let test_only = scoped("test")?;
+    assert!(!test_only.hits.is_empty());
+    assert!(
+        test_only
+            .hits
+            .iter()
+            .all(|hit| hit.file == "src/tests.rs" && hit.file_role == "test")
+    );
+    let production_only = scoped("production")?;
+    assert!(!production_only.hits.is_empty());
+    assert!(
+        production_only
+            .hits
+            .iter()
+            .all(|hit| hit.file == "src/main.rs" && hit.file_role == "production")
+    );
+    Ok(())
+}
+
+#[test]
 fn local_reranker_uses_resolved_inference_endpoint_and_pool_policy() {
     let reranker = Reranker::from_settings(
         &RerankerSettings {

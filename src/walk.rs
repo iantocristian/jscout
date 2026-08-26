@@ -21,6 +21,7 @@ pub struct WalkRejection {
 #[derive(Debug, Default)]
 pub struct SourceInventory {
     pub files: Vec<PathBuf>,
+    pub cargo_manifests: Vec<PathBuf>,
     // Keep one production/test result shape so callers that publish an
     // inventory can retain failures; file-list-only diagnostics ignore them.
     #[cfg_attr(
@@ -38,6 +39,10 @@ pub struct SourceInventory {
 #[derive(Debug)]
 pub(crate) struct RepositoryInventory<T> {
     pub files: Vec<PathBuf>,
+    /// Visible Cargo manifests observed by the same authoritative traversal
+    /// that admitted Rust source. Consumers use these paths for parser
+    /// context without acquiring a second repository snapshot.
+    pub cargo_manifests: Vec<PathBuf>,
     pub rejections: Vec<WalkRejection>,
     pub consumer: T,
 }
@@ -216,7 +221,15 @@ pub fn source_inventory(root: &Path) -> Result<SourceInventory> {
         })
         .collect::<Vec<_>>();
     files.sort();
-    Ok(SourceInventory { files, rejections })
+    let cargo_manifests = cargo_roots
+        .into_iter()
+        .map(|relative| root.join(relative).join("Cargo.toml"))
+        .collect();
+    Ok(SourceInventory {
+        files,
+        cargo_manifests,
+        rejections,
+    })
 }
 
 /// Run one deterministic repository traversal for code paths and another

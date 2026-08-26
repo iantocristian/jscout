@@ -73,9 +73,8 @@ pub struct IndexOutcome {
     /// False when the structural projection was provably identical (same
     /// snapshot, projection version, and module resolution) and was kept.
     pub projection_rebuilt: bool,
-    /// True when the disposable snapshot tables were truncated wholesale,
-    /// either for an explicit fixed-snapshot refresh or a forced extractor
-    /// re-extraction, instead of replacing files one at a time.
+    /// True when an explicit fixed-snapshot refresh truncated the disposable
+    /// snapshot tables wholesale instead of replacing files one at a time.
     pub extraction_reset: bool,
 }
 
@@ -197,7 +196,6 @@ pub fn index_repo_with_options(
         root,
         conn,
         options,
-        true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
         IndexOperation::new(&OsFileSystem),
@@ -224,7 +222,6 @@ pub(crate) fn index_repo_with_options_and_fs(
         root,
         conn,
         options,
-        true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
         IndexOperation::new(fs),
@@ -245,7 +242,6 @@ pub fn incremental_refresh_repo_with_options(
         root,
         conn,
         options,
-        true,
         IndexMode::Incremental,
         CheckerRetention::PreserveActiveForWatch,
         IndexOperation::new(&OsFileSystem),
@@ -266,7 +262,6 @@ pub fn incremental_refresh_repo_rebinding_checker(
         root,
         conn,
         options,
-        true,
         IndexMode::Incremental,
         CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
         IndexOperation::new(&OsFileSystem),
@@ -284,7 +279,6 @@ pub fn refresh_repo_with_options(
         root,
         conn,
         options,
-        true,
         IndexMode::FullRefresh,
         CheckerRetention::Drop,
         IndexOperation::new(&OsFileSystem),
@@ -303,7 +297,6 @@ pub fn watch_full_refresh_repo_with_options(
         root,
         conn,
         options,
-        true,
         IndexMode::FullRefresh,
         CheckerRetention::PreserveActiveForWatch,
         IndexOperation::new(&OsFileSystem),
@@ -323,7 +316,6 @@ pub fn watch_full_refresh_repo_rebinding_checker(
         root,
         conn,
         options,
-        true,
         IndexMode::FullRefresh,
         CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
         IndexOperation::new(&OsFileSystem),
@@ -348,6 +340,8 @@ enum CheckerRetention {
 /// `IndexOptions`; this private context carries the replaceable runtime seam.
 struct IndexOperation<'a, F: FileSystem> {
     fs: &'a F,
+    rust_extractor:
+        fn(&Path, &str, crate::rust_lang::Edition) -> Result<crate::rust_lang::RustExtraction>,
     #[cfg(test)]
     fail_after_canonical_replacement: bool,
 }
@@ -356,6 +350,7 @@ impl<'a, F: FileSystem> IndexOperation<'a, F> {
     const fn new(fs: &'a F) -> Self {
         Self {
             fs,
+            rust_extractor: crate::rust_lang::extract,
             #[cfg(test)]
             fail_after_canonical_replacement: false,
         }
@@ -365,9 +360,28 @@ impl<'a, F: FileSystem> IndexOperation<'a, F> {
     const fn failing_after_canonical_replacement(fs: &'a F) -> Self {
         Self {
             fs,
+            rust_extractor: crate::rust_lang::extract,
             fail_after_canonical_replacement: true,
         }
     }
+
+    #[cfg(test)]
+    const fn failing_rust_extraction(fs: &'a F) -> Self {
+        Self {
+            fs,
+            rust_extractor: injected_rust_extraction_failure,
+            fail_after_canonical_replacement: false,
+        }
+    }
+}
+
+#[cfg(test)]
+fn injected_rust_extraction_failure(
+    _path: &Path,
+    _source: &str,
+    _edition: crate::rust_lang::Edition,
+) -> Result<crate::rust_lang::RustExtraction> {
+    anyhow::bail!("injected Rust extraction invariant failure")
 }
 
 #[cfg(test)]
@@ -379,30 +393,24 @@ pub(crate) fn index_repo_with_post_replacement_failure(
         root,
         conn,
         &IndexOptions::default(),
-        true,
         IndexMode::Incremental,
         CheckerRetention::Drop,
         IndexOperation::failing_after_canonical_replacement(&OsFileSystem),
     )
 }
 
-/// The pre-reset code path: always replace files one at a time, even when
-/// every hash is cleared. Kept only so tests can prove the wholesale reset
-/// produces the same database.
 #[cfg(test)]
-pub(crate) fn index_repo_without_extraction_reset(
+pub(crate) fn index_repo_with_rust_extraction_failure(
     root: &Path,
     conn: &Connection,
-    options: &IndexOptions,
 ) -> Result<IndexOutcome> {
     index_repo_impl(
         root,
         conn,
-        options,
-        false,
+        &IndexOptions::default(),
         IndexMode::Incremental,
         CheckerRetention::Drop,
-        IndexOperation::new(&OsFileSystem),
+        IndexOperation::failing_rust_extraction(&OsFileSystem),
     )
 }
 
@@ -410,7 +418,6 @@ fn index_repo_impl<F: FileSystem>(
     root: &Path,
     conn: &Connection,
     options: &IndexOptions,
-    allow_extraction_reset: bool,
     mode: IndexMode,
     checker_retention: CheckerRetention,
     operation: IndexOperation<'_, F>,
@@ -432,6 +439,12 @@ fn index_repo_impl<F: FileSystem>(
             inventory_started.elapsed()
         );
     }
+    let rust_editions = crate::rust_lang::resolve_editions(
+        &root,
+        &inventory.files,
+        &inventory.cargo_manifests,
+        operation.fs,
+    )?;
     let workspace_discovery =
         crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
@@ -462,6 +475,13 @@ fn index_repo_impl<F: FileSystem>(
             rejection.error,
         );
     }
+    for rejection in &rust_editions.rejections {
+        outcome.record_rejection(
+            display_repository_path(&root, &rejection.path),
+            "rust-edition",
+            &rejection.error,
+        );
+    }
     for rejection in workspace_discovery.rejections {
         outcome.record_rejection(
             display_repository_path(&root, &rejection.path),
@@ -486,6 +506,15 @@ fn index_repo_impl<F: FileSystem>(
             .then(|| ProjectionIdentity::read(conn))
             .transpose()?;
         let changed_formats = ensure_format_contracts(conn)?;
+        let previous_rust_edition_contexts = ensure_rust_edition_context(
+            conn,
+            rust_editions.has_rust_files().then(|| {
+                (
+                    rust_editions.contexts_json(),
+                    rust_editions.fingerprint.as_str(),
+                )
+            }),
+        )?;
         let checker_contract_changed = formats::eligible_ids(Capability::Checker)
             .into_iter()
             .any(|format| changed_formats.contains(format));
@@ -518,28 +547,11 @@ fn index_repo_impl<F: FileSystem>(
             stored
         };
 
-        // A format-contract change clears hashes only for that format. Keep
-        // that replacement selective even when one format dominates the
-        // repository. Explicit/pre-existing empty hashes retain the legacy
-        // bulk-reset optimization because they do not encode that boundary.
-        let independently_cleared = existing
-            .values()
-            .filter(|(_, hash, _, corpus, format)| {
-                corpus == CODE_CORPUS
-                    && hash.is_empty()
-                    && !changed_formats.contains(format.as_str())
-            })
-            .count();
-        let extraction_reset = mode == IndexMode::FullRefresh
-            || (allow_extraction_reset
-                && !existing.is_empty()
-                && independently_cleared * 2 >= existing.len());
-        if extraction_reset {
-            if mode == IndexMode::FullRefresh {
-                store::reset_snapshot_state(conn)?;
-            } else {
-                store::reset_extraction_state(conn)?;
-            }
+        // Incremental contract invalidation is selective per format. A full
+        // refresh remains the only operation that truncates the whole
+        // disposable snapshot before rebuilding it.
+        if mode == IndexMode::FullRefresh {
+            store::reset_snapshot_state(conn)?;
             existing.clear();
             outcome.extraction_reset = true;
         }
@@ -561,13 +573,6 @@ fn index_repo_impl<F: FileSystem>(
                     source
                 }
                 Err(error) if io_policy::is_inventory_race(&error) => continue,
-                Err(error)
-                    if format.id == formats::RUST
-                        && error.kind() == std::io::ErrorKind::InvalidData =>
-                {
-                    return Err(anyhow::Error::new(error)
-                        .context(format!("invalid UTF-8 in Rust source `{rel}`")));
-                }
                 Err(error) if io_policy::is_retryable(&error) => {
                     return Err(retryable_read_failure(&rel, error));
                 }
@@ -586,6 +591,11 @@ fn index_repo_impl<F: FileSystem>(
                 && *old_hash == hash
                 && old_corpus == CODE_CORPUS
                 && old_format == format.id
+                && (format.id != formats::RUST
+                    || previous_rust_edition_contexts
+                        .get(&rel.replace('\\', "/"))
+                        .map(String::as_str)
+                        == rust_editions.context_for_relative(&rel))
             {
                 if old_role != role {
                     conn.execute("UPDATE files SET role=?1 WHERE id=?2", params![role, id])?;
@@ -597,7 +607,14 @@ fn index_repo_impl<F: FileSystem>(
             if options.debug {
                 eprintln!("extracting {rel}");
             }
-            match extract_file(file, &rel, &source, format) {
+            match extract_file(
+                file,
+                &rel,
+                &source,
+                format,
+                rust_editions.edition_for(file),
+                operation.rust_extractor,
+            ) {
                 Ok(data) => {
                     if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
                         store::delete_file(conn, *old_id)?;
@@ -617,11 +634,6 @@ fn index_repo_impl<F: FileSystem>(
                     outcome.chunks += chunks;
                     outcome.refs += refs;
                     published.insert(rel);
-                }
-                Err(error) if format.id == formats::RUST => {
-                    return Err(error.context(format!(
-                        "Rust lossless extraction invariant failed for `{rel}`"
-                    )));
                 }
                 Err(error) => {
                     if let Some((old_id, _, _, _, _)) = existing.get(&rel) {
@@ -1054,11 +1066,58 @@ fn ensure_format_contracts(conn: &Connection) -> Result<std::collections::HashSe
     Ok(changed)
 }
 
+fn ensure_rust_edition_context(
+    conn: &Connection,
+    current: Option<(String, &str)>,
+) -> Result<HashMap<String, String>> {
+    let previous = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [crate::rust_lang::EDITION_CONTEXTS_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let previous = previous
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    match current {
+        Some((contexts, fingerprint)) => {
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::rust_lang::EDITION_CONTEXT_META_KEY, fingerprint],
+            )?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![crate::rust_lang::EDITION_CONTEXTS_META_KEY, contexts],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2)",
+                params![
+                    crate::rust_lang::EDITION_CONTEXT_META_KEY,
+                    crate::rust_lang::EDITION_CONTEXTS_META_KEY
+                ],
+            )?;
+        }
+    }
+    Ok(previous)
+}
+
 fn extract_file(
     abs: &Path,
     rel: &str,
     source: &str,
     format: &formats::FormatSpec,
+    rust_edition: crate::rust_lang::Edition,
+    rust_extractor: fn(
+        &Path,
+        &str,
+        crate::rust_lang::Edition,
+    ) -> Result<crate::rust_lang::RustExtraction>,
 ) -> Result<FileData> {
     match format.extractor {
         Extractor::EcmaScript => parse::with_parsed(source, abs, |ret, semantic| {
@@ -1073,7 +1132,7 @@ fn extract_file(
             }
         }),
         Extractor::RustText => {
-            let extraction = crate::rust_lang::extract(Path::new(rel), source)?;
+            let extraction = rust_extractor(Path::new(rel), source, rust_edition)?;
             Ok(FileData {
                 chunks: extraction.chunks,
                 graph: FileGraph::default(),
@@ -1760,7 +1819,14 @@ fn index_dependency_files(
             if let Some(old) = existing.get(&file.display) {
                 store::delete_file(conn, old.id)?;
             }
-            match extract_file(&file.source_path, &file.display, &file.source, format) {
+            match extract_file(
+                &file.source_path,
+                &file.display,
+                &file.source,
+                format,
+                crate::rust_lang::Edition::DEFAULT,
+                crate::rust_lang::extract,
+            ) {
                 Ok(data) => {
                     let identity = FileIdentity {
                         path: &file.display,

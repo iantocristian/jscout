@@ -8,7 +8,7 @@ use super::{
     IndexOptions, incremental_refresh_repo_rebinding_checker,
     incremental_refresh_repo_with_options, index_repo, index_repo_with_fs, index_repo_with_options,
     index_repo_with_options_and_fs, index_repo_with_post_replacement_failure,
-    index_repo_without_extraction_reset, refresh_repo_with_options,
+    index_repo_with_rust_extraction_failure, refresh_repo_with_options,
     watch_full_refresh_repo_rebinding_checker,
 };
 use crate::test_fs::{FaultFileSystem, FileOperation};
@@ -2469,21 +2469,17 @@ fn rust_phase_one_indexes_lossless_lexical_chunks_and_current_diagnostics() -> R
     Ok(())
 }
 
-fn assert_invalid_utf8_rust_preserves_snapshot(full_refresh: bool) -> Result<()> {
+fn assert_invalid_utf8_rust_is_rejected(full_refresh: bool) -> Result<()> {
     let repo = tempfile::tempdir()?;
     let rust = repo.path().join("stable.rs");
-    let original = "pub fn stable_utf8_marker() {}\n";
-    fs::write(&rust, original)?;
+    fs::write(&rust, "pub fn stable_utf8_marker() {}\n")?;
+    fs::write(
+        repo.path().join("healthy.ts"),
+        "export const healthyMarker = 1;\n",
+    )?;
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
     let snapshot = structural::current_snapshot(&conn)?;
-    let original_row: (String, i64, String) = conn.query_row(
-        "SELECT file.hash,file.parse_error_count,chunk.content
-         FROM files file JOIN chunks chunk ON chunk.file_id=file.id
-         WHERE file.path='stable.rs'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
     conn.execute(
         "UPDATE meta SET value='stale-rust-contract'
          WHERE key='format_contract_version:rust'",
@@ -2495,40 +2491,170 @@ fn assert_invalid_utf8_rust_preserves_snapshot(full_refresh: bool) -> Result<()>
         refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())
     } else {
         index_repo(repo.path(), &conn)
-    };
-    let error = result
-        .err()
-        .expect("invalid UTF-8 Rust must abort publication");
-    assert!(error.to_string().contains("invalid UTF-8 in Rust source"));
+    }?;
     assert!(conn.is_autocommit());
-    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
-    let retained: (String, i64, String) = conn.query_row(
-        "SELECT file.hash,file.parse_error_count,chunk.content
-         FROM files file JOIN chunks chunk ON chunk.file_id=file.id
-         WHERE file.path='stable.rs'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    assert_eq!(retained, original_row);
+    assert_eq!((result.rejected, result.removed), (1, 1));
+    assert_eq!(result.rejections[0].path, "stable.rs");
+    assert_eq!(result.rejections[0].stage, "read");
+    assert!(!result.rejections[0].error.is_empty());
+    assert_eq!(result.extraction_reset, full_refresh);
+    assert_eq!(
+        (result.indexed, result.unchanged),
+        if full_refresh { (1, 0) } else { (0, 1) }
+    );
+    assert_ne!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='stable.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'healthyMarker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
     assert_eq!(
         conn.query_row(
             "SELECT value FROM meta WHERE key='format_contract_version:rust'",
             [],
             |row| row.get::<_, String>(0),
         )?,
-        "stale-rust-contract",
+        crate::formats::by_id(crate::formats::RUST)
+            .expect("Rust format")
+            .extractor_version
     );
     Ok(())
 }
 
 #[test]
-fn invalid_utf8_rust_aborts_incremental_and_preserves_the_last_snapshot() -> Result<()> {
-    assert_invalid_utf8_rust_preserves_snapshot(false)
+fn invalid_utf8_rust_is_rejected_during_incremental_indexing() -> Result<()> {
+    assert_invalid_utf8_rust_is_rejected(false)
 }
 
 #[test]
-fn invalid_utf8_rust_aborts_full_refresh_and_restores_the_last_snapshot() -> Result<()> {
-    assert_invalid_utf8_rust_preserves_snapshot(true)
+fn invalid_utf8_rust_is_rejected_during_full_refresh() -> Result<()> {
+    assert_invalid_utf8_rust_is_rejected(true)
+}
+
+#[test]
+fn rust_extraction_invariant_failure_rejects_only_that_file() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("healthy.ts"),
+        "export const healthyInvariantMarker = 1;\n",
+    )?;
+    fs::write(repo.path().join("broken.rs"), "pub fn before() {}\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+    let previous_snapshot = structural::current_snapshot(&conn)?;
+
+    fs::write(repo.path().join("broken.rs"), "pub fn after() {}\n")?;
+    let outcome = index_repo_with_rust_extraction_failure(repo.path(), &conn)?;
+
+    assert_eq!(
+        (
+            outcome.indexed,
+            outcome.unchanged,
+            outcome.removed,
+            outcome.rejected,
+        ),
+        (0, 1, 1, 1)
+    );
+    assert_eq!(outcome.rejections[0].path, "broken.rs");
+    assert_eq!(outcome.rejections[0].stage, "extract");
+    assert!(
+        outcome.rejections[0]
+            .error
+            .contains("injected Rust extraction invariant failure")
+    );
+    assert_ne!(structural::current_snapshot(&conn)?, previous_snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path='broken.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts
+             WHERE chunks_fts MATCH 'healthyInvariantMarker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn cargo_edition_change_reextracts_unchanged_rust_source() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("src"))?;
+    let manifest = repo.path().join("Cargo.toml");
+    let rust = repo.path().join("src/lib.rs");
+    fs::create_dir_all(repo.path().join("other/src"))?;
+    fs::write(
+        &manifest,
+        "[package]\nname='edition-probe'\nversion='0.1.0'\nedition='2021'\n",
+    )?;
+    fs::write(&rust, "pub fn gen() {}\n")?;
+    fs::write(
+        repo.path().join("other/Cargo.toml"),
+        "[package]\nname='unchanged-edition'\nversion='0.1.0'\nedition='2021'\n",
+    )?;
+    fs::write(
+        repo.path().join("other/src/lib.rs"),
+        "pub fn unchanged_edition_control() {}\n",
+    )?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "export const editionControl = 1;\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    let first = index_repo(repo.path(), &conn)?;
+    assert_eq!(first.rust_parse_error_count, 0);
+    let (source_hash, first_context): (String, String) = conn.query_row(
+        "SELECT file.hash,
+                (SELECT value FROM meta WHERE key='rust_edition_context_fingerprint')
+         FROM files file WHERE file.path='src/lib.rs'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let first_snapshot = structural::current_snapshot(&conn)?;
+
+    fs::write(
+        &manifest,
+        "[package]\nname='edition-probe'\nversion='0.1.0'\nedition='2024'\n",
+    )?;
+    let second = index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        (second.indexed, second.unchanged, second.extraction_reset),
+        (1, 2, false)
+    );
+    assert_eq!(second.rust_files_with_parse_errors, 1);
+    assert!(second.rust_parse_error_count > 0);
+    let (new_source_hash, second_context): (String, String) = conn.query_row(
+        "SELECT file.hash,
+                (SELECT value FROM meta WHERE key='rust_edition_context_fingerprint')
+         FROM files file WHERE file.path='src/lib.rs'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        new_source_hash, source_hash,
+        "files.hash remains a byte hash"
+    );
+    assert_ne!(second_context, first_context);
+    assert_ne!(structural::current_snapshot(&conn)?, first_snapshot);
+    Ok(())
 }
 
 fn g26_phase_zero_normalized_dump(conn: &rusqlite::Connection) -> Result<Vec<(String, String)>> {
@@ -3597,185 +3723,6 @@ fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> 
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     assert_eq!(counts, (0, 0));
-    Ok(())
-}
-
-#[test]
-fn forced_reextraction_reset_matches_per_file_replacement() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    fs::write(
-        repo.path().join("pnpm-workspace.yaml"),
-        "packages:\n  - packages/*\n",
-    )?;
-    let lib = repo.path().join("packages/lib");
-    fs::create_dir_all(lib.join("src"))?;
-    fs::write(
-        lib.join("package.json"),
-        r#"{"name": "@acme/lib", "module": "src/index.ts"}"#,
-    )?;
-    fs::write(
-        lib.join("src/index.ts"),
-        "export const greet = (name: string) => `hi ${name}`;\n\
-         export interface Shape { id: string }\n",
-    )?;
-    fs::write(
-        repo.path().join("helper.ts"),
-        "export const helper = (value: string) => value.trim();\n",
-    )?;
-    fs::write(
-        repo.path().join("main.ts"),
-        "import { greet } from '@acme/lib';\n\
-         import type { Shape } from '@acme/lib';\n\
-         import { EventEmitter } from 'node:events';\n\
-         import { helper } from './helper';\n\
-         import { inner } from 'selected-dep';\n\
-         import missing from 'not-installed-pkg';\n\
-         const emitter = new EventEmitter();\n\
-         emitter.on('ready', () => greet('x'));\n\
-         emitter.emit('ready');\n\
-         export function main(shape: Shape) {\n\
-           const key = process.env.API_KEY;\n\
-           return helper(greet(key ?? shape.id)) + inner() + missing;\n\
-         }\n\
-         export const spans = emitter.listeners(\n\
-           'ready',\n\
-         );\n",
-    )?;
-    let dependency = repo.path().join("node_modules/selected-dep");
-    fs::create_dir_all(&dependency)?;
-    fs::write(
-        dependency.join("package.json"),
-        r#"{"name":"selected-dep","version":"1.2.3","main":"index.js"}"#,
-    )?;
-    fs::write(
-        dependency.join("index.js"),
-        "export { inner } from './inner.js';\n",
-    )?;
-    fs::write(
-        dependency.join("inner.js"),
-        "export const inner = () => 42;\n",
-    )?;
-
-    let databases = tempfile::tempdir()?;
-    let per_file = store::open_path(&databases.path().join("per-file.db"))?;
-    let reset = store::open_path(&databases.path().join("reset.db"))?;
-    let options = IndexOptions {
-        dependencies: vec!["selected-dep".into()],
-        ..Default::default()
-    };
-    for conn in [&per_file, &reset] {
-        let outcome = index_repo_with_options(repo.path(), conn, &options)?;
-        assert!(!outcome.extraction_reset, "initial index must not reset");
-        // Semantic memory that must survive a forced re-extraction on
-        // both paths: a completed scout run, its classification, and an
-        // artifact with one support.
-        conn.execute_batch(
-            "INSERT INTO scout_runs(
-               id, scout_kind, status, gateway_protocol, provider, model,
-               billing_path, prompt_version, source_snapshot,
-               input_fingerprint, request_hash, started_at, completed_at
-             ) VALUES(7, 'workflow', 'completed', 1, 'test', 'test-model',
-                      'api', 'v1', 'snap', 'fp', 'req',
-                      '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
-             INSERT INTO scout_classifications(
-               run_id, anchor_key, decision, role, evidence_json
-             ) VALUES(7, 'sym:main.ts#::main@10', 'defining', 'entry', '{}');
-             INSERT INTO semantic_artifacts(
-               id, artifact_type, canonical_name, body_json, model,
-               prompt_version, confidence, source_snapshot, created_at,
-               scout_run_id, input_fingerprint, artifact_fingerprint
-             ) VALUES(3, 'workflow', 'checkout', '{}', 'test-model', 'v1',
-                      'likely', 'snap', '2026-01-01T00:01:00Z', 7, 'fp', 'af');
-             INSERT INTO semantic_supports(
-               artifact_id, claim_path, anchor_key, role, evidence_file,
-               evidence_start_line, evidence_end_line, source_hash,
-               context_hash, confidence
-             ) VALUES(3, '$.steps[0]', 'sym:main.ts#::main@10', 'entry',
-                      'main.ts', 10, 13, 'sh', 'ch', 'likely');",
-        )?;
-        // The v15-style forced re-extraction: clear every hash and
-        // invalidate the disposable projection and its public identity.
-        conn.execute("UPDATE files SET hash = ''", [])?;
-        conn.execute("DELETE FROM resolved_edges", [])?;
-        conn.execute("DELETE FROM graph_nodes", [])?;
-        conn.execute(
-            "DELETE FROM meta
-             WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
-            [],
-        )?;
-    }
-
-    let slow = index_repo_without_extraction_reset(repo.path(), &per_file, &options)?;
-    assert!(!slow.extraction_reset);
-    let fast = index_repo_with_options(repo.path(), &reset, &options)?;
-    assert!(fast.extraction_reset, "cleared hashes must take the reset");
-    assert_eq!(
-        (fast.indexed, fast.unchanged, fast.rejected),
-        (slow.indexed, slow.unchanged, slow.rejected)
-    );
-
-    for ((section, slow_rows), (_, fast_rows)) in canonical_dump(&per_file)?
-        .iter()
-        .zip(canonical_dump(&reset)?)
-    {
-        assert_eq!(
-            slow_rows, &fast_rows,
-            "section `{section}` diverged between per-file and reset paths"
-        );
-    }
-
-    // Equality alone cannot prove survival; pin the preserved rows and a
-    // live FTS index on the reset path explicitly.
-    let (runs, artifacts, supports, classifications): (i64, i64, i64, i64) = reset.query_row(
-        "SELECT (SELECT count(*) FROM scout_runs),
-                (SELECT count(*) FROM semantic_artifacts),
-                (SELECT count(*) FROM semantic_supports),
-                (SELECT count(*) FROM scout_classifications)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
-    assert_eq!((runs, artifacts, supports, classifications), (1, 1, 1, 1));
-    let greet_hits: i64 = reset.query_row(
-        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'greet'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert!(greet_hits > 0, "rebuilt FTS index must serve matches");
-    Ok(())
-}
-
-#[test]
-fn extraction_reset_triggers_only_at_majority_cleared() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    for name in ["one", "two", "three"] {
-        fs::write(
-            repo.path().join(format!("{name}.ts")),
-            format!("export const {name} = 1;\n"),
-        )?;
-    }
-    let conn = store::open(repo.path())?;
-    let first = index_repo(repo.path(), &conn)?;
-    assert!(!first.extraction_reset);
-
-    let second = index_repo(repo.path(), &conn)?;
-    assert!(!second.extraction_reset, "no-op run must stay incremental");
-    assert_eq!((second.indexed, second.unchanged), (0, 3));
-
-    conn.execute("UPDATE files SET hash='' WHERE path='one.ts'", [])?;
-    let minority = index_repo(repo.path(), &conn)?;
-    assert!(
-        !minority.extraction_reset,
-        "one cleared hash out of three must replace per file"
-    );
-    assert_eq!((minority.indexed, minority.unchanged), (1, 2));
-
-    conn.execute(
-        "UPDATE files SET hash='' WHERE path IN ('one.ts', 'two.ts')",
-        [],
-    )?;
-    let majority = index_repo(repo.path(), &conn)?;
-    assert!(majority.extraction_reset, "majority cleared must reset");
-    assert_eq!((majority.indexed, majority.unchanged), (3, 0));
     Ok(())
 }
 

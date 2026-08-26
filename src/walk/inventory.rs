@@ -220,6 +220,10 @@ pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
         })
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
+    let cargo_manifests = cargo_roots
+        .into_iter()
+        .map(|relative| canonical_root.join(relative).join("Cargo.toml"))
+        .collect::<Vec<_>>();
     rejections.sort_by(|left, right| {
         left.path
             .as_os_str()
@@ -229,6 +233,7 @@ pub(super) fn repository_inventory<C: RepositoryInventoryConsumer>(
     let consumer = consumer.finish(&canonical_root)?;
     Ok(RepositoryInventory {
         files,
+        cargo_manifests,
         rejections,
         consumer,
     })
