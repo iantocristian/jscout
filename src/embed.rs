@@ -1599,14 +1599,41 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
 /// Materialize newly indexed chunk occurrences that can reuse durable cached
 /// embeddings. Indexing calls this after canonical chunk changes; it does not
 /// perform the expensive legacy virtual-row audit owned by `jscout embed`.
+/// The profile table is shared, so documentation and semantic representations
+/// are excluded; a missing representation marker remains the code-profile
+/// fallback for durable rows created before that marker existed.
 pub fn materialize_cached_embeddings(conn: &Connection) -> Result<()> {
     let profiles = {
         let mut statement =
-            conn.prepare("SELECT id, dimensions FROM embedding_profiles ORDER BY id")?;
+            conn.prepare("SELECT id, dimensions, config_json FROM embedding_profiles ORDER BY id")?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+        let mut profiles = Vec::new();
+        for row in rows {
+            let (id, dimensions, config_json) = row?;
+            let Ok(configuration) = serde_json::from_str::<Value>(&config_json) else {
+                continue;
+            };
+            let Some(configuration) = configuration.as_object() else {
+                continue;
+            };
+            if configuration
+                .get("document_text")
+                .is_some_and(|format| format.as_str() != Some(DOCUMENT_TEXT_FORMAT))
+            {
+                continue;
+            }
+            profiles.push((
+                id,
+                usize::try_from(dimensions).context("code embedding dimensions are negative")?,
+            ));
+        }
+        profiles
     };
     if profiles.is_empty() {
         return Ok(());

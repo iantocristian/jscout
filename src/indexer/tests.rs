@@ -2152,6 +2152,86 @@ fn indexes_scoped_dependency_selected_by_exact_name() -> Result<()> {
 }
 
 #[test]
+fn dependency_only_insert_materializes_cached_code_vectors() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "import value from 'selected-dep';\nexport const result = value;\n",
+    )?;
+    let dependency = repo.path().join("node_modules/selected-dep");
+    fs::create_dir_all(&dependency)?;
+    fs::write(
+        dependency.join("package.json"),
+        r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+    )?;
+    fs::write(
+        dependency.join("index.js"),
+        "export const dependencyVectorMarker = 42;\nexport default dependencyVectorMarker;\n",
+    )?;
+
+    let conn = store::open(repo.path())?;
+    let options = IndexOptions {
+        dependencies: vec!["selected-dep".into()],
+        ..Default::default()
+    };
+    index_repo_with_options(repo.path(), &conn, &options)?;
+    let dependency_chunk_hash: String = conn.query_row(
+        "SELECT chunk.hash FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.origin='dependency'
+         ORDER BY chunk.id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE origin='dependency'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    let profile_config = serde_json::json!({
+        "document_text": "content-v2",
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','dependency-code-profile',2,?1)",
+        [profile_config],
+    )?;
+    let profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO embeddings(chunk_hash,profile_id,vec)
+         VALUES(?1,?2,X'0000803F00000000')",
+        rusqlite::params![&dependency_chunk_hash, profile_id],
+    )?;
+
+    let outcome = index_repo_with_options(repo.path(), &conn, &options)?;
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(outcome.dependency_files, 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_embeddings_2 vector
+             JOIN embedding_index_entries entry ON entry.id=vector.rowid
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             WHERE entry.profile_id=?1 AND chunk.hash=?2
+               AND file.origin='dependency'",
+            rusqlite::params![profile_id, &dependency_chunk_hash],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "a dependency-only insertion must trigger cached code-vector materialization"
+    );
+    Ok(())
+}
+
+#[test]
 fn non_retryable_dependency_rejections_remove_stale_rows() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -2733,9 +2813,10 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
     // Durable cache and memory rows deliberately coexist with disposable
     // rows in one database.
     conn.execute_batch(
-        "INSERT INTO embedding_profiles(
+        r#"INSERT INTO embedding_profiles(
            id, provider, model, config_fingerprint, dimensions, config_json
-         ) VALUES(1, 'test', 'tiny', 'test-profile', 2, '{}');
+         ) VALUES(1, 'test', 'tiny', 'test-profile', 2,
+                  '{"document_text":"content-v2"}');
          INSERT INTO checker_enrichment_batches(
            id, source_snapshot, checker_version, checker_source,
            checker_input_fingerprint, sidecar_protocol, created_at, active
@@ -2761,7 +2842,7 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
            scout_run_id, input_fingerprint, artifact_fingerprint
          ) VALUES(3, 'annotation', 'stable behavior', '{}', 'test-model',
                   'v1', 'likely', 'old', '2026-01-01T00:01:00Z', 7,
-                  'memory-fp', 'artifact-fp');",
+                  'memory-fp', 'artifact-fp');"#,
     )?;
     conn.execute(
         "UPDATE checker_enrichment_batches SET source_snapshot=?1 WHERE id=1",
@@ -4104,10 +4185,15 @@ fn docs_only_refresh_does_not_initialize_code_vector_storage() -> Result<()> {
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
 
-    conn.execute_batch(
+    let profile_config = serde_json::json!({
+        "document_text": "content-v2",
+    })
+    .to_string();
+    conn.execute(
         "INSERT INTO embedding_profiles(
            provider,model,config_fingerprint,dimensions,config_json
-         ) VALUES('test','tiny','code-only-profile',2,'{}');",
+         ) VALUES('test','tiny','code-only-profile',2,?1)",
+        [profile_config],
     )?;
     assert!(!conn.query_row(
         "SELECT EXISTS(
