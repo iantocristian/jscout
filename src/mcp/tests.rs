@@ -12,7 +12,7 @@ use super::{
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
     exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
     render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, tool_defs,
+    server_instructions, sum_durations, telemetry_snapshot, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -2599,6 +2599,27 @@ fn telemetry_counts_expansion_file_roles_without_recording_payloads() {
     assert_eq!(compact.file_nodes, 2);
     assert_eq!(compact.role_counts["production"], 1);
     assert_eq!(compact.test_fixture_generated, 1);
+}
+
+#[test]
+fn failed_tool_telemetry_uses_the_tool_plane_digest() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("a.ts"), "export const value = 1;\n")?;
+    fs::write(repo.path().join("README.md"), "# Guide\n\nDocumentation.\n")?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    let failed = Err(anyhow::anyhow!("retrieval failed"));
+
+    assert_eq!(
+        telemetry_snapshot(&conn, "documentation_search", &failed),
+        Some(identities.documentation)
+    );
+    assert_eq!(
+        telemetry_snapshot(&conn, "semantic_search", &failed),
+        Some(identities.code)
+    );
+    Ok(())
 }
 
 #[test]

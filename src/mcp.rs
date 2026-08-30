@@ -1933,6 +1933,18 @@ fn exhaustive_telemetry_metrics(result: Option<&Value>) -> ExhaustiveTelemetryMe
     }
 }
 
+fn telemetry_snapshot(conn: &Connection, tool: &str, result: &Result<String>) -> Option<String> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| value["snapshot"].as_str().map(str::to_string))
+        .or_else(|| match tool {
+            "documentation_search" => crate::docs::store::current_snapshot(conn).ok(),
+            _ => structural::current_snapshot(conn).ok(),
+        })
+}
+
 fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let Some(file) = telemetry else { return };
     let ToolCallTelemetry {
@@ -1958,12 +1970,7 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let session = std::env::var("JSCOUT_SESSION_ID")
         .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
     let task = std::env::var("JSCOUT_TASK_ID").ok();
-    let snapshot = result
-        .as_ref()
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|value| value["snapshot"].as_str().map(str::to_string))
-        .or_else(|| structural::current_snapshot(conn).ok());
+    let snapshot = telemetry_snapshot(conn, tool, result);
     let (ok, result_bytes) = match result {
         Ok(text) => (true, text.len()),
         Err(error) => (false, error.to_string().len()),
