@@ -25,10 +25,13 @@
 > without a same-binary, same-snapshot comparison. All four G24 repository
 > documentation retrieval phases are implemented. Git-basis freshness is
 > available as an opt-in, while its pre-registered evaluation rejected every
-> tested movement bound as the default. G25 multi-format admission is
-> scheduled as G26 phase 0. G26 Rust code indexing is the current implementation
-> goal and the first additional code-corpus format, motivated by self-indexing this
-> repository.
+> tested movement bound as the default. The G25 multi-format registry was
+> implemented by G26 phase 0; its further format admissions remain
+> unscheduled. G26 Rust code indexing is the current implementation goal and
+> the first additional code-corpus format, motivated by self-indexing this
+> repository. G27 is proposed to give code and documentation content their own
+> invalidation identities inside the one publication, so documentation edits
+> stop invalidating code-bound state.
 
 ## Document policy
 
@@ -3448,9 +3451,8 @@ The revised decisions:
    still classified as full watch generations and may schedule the existing
    optional phases; a provenance-scoped refresh signal is a watcher
    optimization, not part of this digest split. Documentation source edits
-   still change `meta.snapshot`, so a full code/docs content-digest split and
-   public plane-specific agent identities require their own design and
-   measurement.
+   still change `meta.snapshot`; the full code/docs content-digest split and
+   public plane-specific agent identities are Proposed G27.
 6. Retention: hit content is served from stored current rendered bodies and
    block text; source spans are snapshot-relative and carry the indexed full-
    file hash. Checkout source is read once into an immutable buffer, and only
@@ -3529,7 +3531,7 @@ and the decision record
 are incorporated by reference, this entry winning on any explicit
 disagreement.
 
-## G25 — multi-format admission (scheduled through G26 phase 0)
+## G25 — multi-format admission (registry implemented by G26 phase 0)
 
 One registry owns every format decision that otherwise leaks into walkers,
 watch classification, extraction, ranking, checker selection, and resolution.
@@ -3745,6 +3747,75 @@ production-only experiment requires a classifier audit and cannot silently
 reframe the all-role v4 result. The complete v4 result and immutable artifact
 hashes are recorded in
 [eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
+
+## Proposed G27 — per-plane content identities in one publication
+
+G24 accepted that documentation edits rotate the shared `meta.snapshot`, and
+instrumentation then priced the coupling: after any docs-only publication,
+checker enrichment edges leave the projection until the next enrichment cycle
+rebinds a batch through the TypeScript sidecar, `annotate` and scouting
+publication hard-fail on their snapshot guard and discard the model work
+already spent, and an in-flight exhaustive-search cursor dies mid-traversal;
+in the opposite direction, a code-only edit invalidates the documentation
+vector generation. The G24 provenance digest (PR #113) removed the
+attribution half of that churn; content churn remains. The consumer inventory
+behind that split also established the general fact: every rotation gate in
+the system is plane-scoped — checker batches, the semantic and scouting
+publication guards, and exhaustive cursors bind code-only claims, while
+documentation vector readiness binds docs-only state — no query joins the two
+corpora under a same-scan assumption, and only the publication marker and
+open-time validation are genuinely global, neither being a rotation gate. The
+storage-planes contract already records the principle: one database has one
+schema version and one atomic publication transaction, not one invalidation
+identity.
+
+1. Identities. `meta.code_digest` covers code-corpus file and package rows,
+   the code extraction and projection contracts, and module resolution.
+   `meta.documentation_digest` covers documentation-corpus source identity and
+   the documentation chunk-format contract. The existing
+   `documentation_provenance_digest` is unchanged. `meta.snapshot` remains the
+   published current-checkout marker and open-validation key — a fold of the
+   plane digests — and stops being compared by any consumer gate. All publish
+   in the one existing transaction; cross-plane consistency comes from that
+   transaction, not from a shared value.
+2. Re-keyed gates. Checker enrichment batches record and compare the code
+   digest; the annotate, workflow-candidate, and scouting publication guards
+   validate the code digest; the exhaustive-search cursor embeds the code
+   digest; anchor re-resolution reports staleness against the code digest.
+   Documentation vector generations and the `docs embed` guard key on the
+   documentation digest. Code and semantic vector sync are already
+   profile-keyed and do not change.
+3. Public contract. Each surface reports its own plane identity in the
+   existing `snapshot` response field: code and semantic surfaces report the
+   code digest, and `documentation_search` reports the documentation digest.
+   Cross-surface comparison of that field was never meaningful and becomes
+   explicitly undefined. Both MCP server instruction strings change in the
+   same pull request, as with G23: an identity change on a surface means
+   re-verifying that surface's evidence, and a documentation identity change
+   never requires restarting code traversals. `annotate` echoes back the
+   identity it was served, now plane-correct by construction.
+4. Boundaries. No new database, schema lifecycle, or second publication
+   transaction. Watch classification is untouched: a docs-only publication
+   that leaves the code digest byte-identical makes the scheduled enrichment
+   pass an exact reuse, while provenance-scoped refresh signals remain the
+   separate watcher optimization. If the deferred observation ledger is ever
+   built, it orders against the documentation digest rather than the global
+   marker; that decision lands with the ledger.
+5. Transition. Existing checker batches, publication inputs, and cursors
+   keyed to the old global value invalidate once on the first index under the
+   split — the same one-time contract-transition class as the PR #113
+   hash-domain advance — and recurring cross-plane churn ends there.
+
+Acceptance: after a docs-only edit, checker enrichment edges remain projected
+in the same commit, a publication validated against the pre-edit code digest
+succeeds, and an in-flight exhaustive cursor survives; after a code-only
+edit, documentation vector readiness is untouched; a code edit still rotates
+the code digest and invalidates every code-bound gate; the foreign plane's
+digest is byte-identical after any cross-plane operation; both MCP
+instruction strings ship in the same change; and a before/after measurement
+records the checker-stall and discarded-publication deltas against pre-split
+behavior. No implementation milestone is assigned and no current goal is
+displaced.
 
 ## Evaluation decisions already made
 
