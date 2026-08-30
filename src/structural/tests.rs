@@ -236,7 +236,7 @@ fn rust_canonical_fact_poison_cannot_enter_the_structural_projection() -> Result
 }
 
 #[test]
-fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()> {
+fn documentation_provenance_has_an_identity_outside_the_structural_snapshot() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(repo.path(), "main.ts", "export const value = 1;\n")?;
     write(repo.path(), "README.md", "# Guide\n\nCurrent guidance.\n")?;
@@ -272,18 +272,19 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
          WHERE chunk_id=?1",
         [chunk_id],
     )?;
-    let stable = compute_snapshot(&conn)?;
-    assert_eq!(compute_snapshot(&conn)?, stable);
+    let stable_snapshot = compute_snapshot(&conn)?;
+    let stable_provenance =
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?;
 
     conn.execute(
         "UPDATE doc_file_provenance
-         SET projection_hash='projection-b', detail='diagnostic-b'
+         SET detail='diagnostic-b'
          WHERE file_id=?1",
         [file_id],
     )?;
     conn.execute(
         "UPDATE doc_chunk_meta
-         SET freshness_committer_time=201, freshness_detail='diagnostic-b'
+         SET freshness_detail='diagnostic-b'
          WHERE chunk_id=?1",
         [chunk_id],
     )?;
@@ -298,8 +299,13 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
     )?;
     assert_eq!(
         compute_snapshot(&conn)?,
-        stable,
-        "diagnostics, committer time, projection caches, and blame cache identity are not search snapshot state"
+        stable_snapshot,
+        "provenance diagnostics and cache mechanics are not structural state"
+    );
+    assert_eq!(
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?,
+        stable_provenance,
+        "diagnostics and blame-cache mechanics are not provenance identity"
     );
 
     conn.execute(
@@ -309,103 +315,150 @@ fn snapshot_hashes_stable_docs_provenance_not_git_cache_mechanics() -> Result<()
              attribution_json='[{\"basis\":\"working_tree\"}]'",
         [],
     )?;
-    assert_eq!(compute_snapshot(&conn)?, stable);
+    assert_eq!(compute_snapshot(&conn)?, stable_snapshot);
+    assert_eq!(
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?,
+        stable_provenance
+    );
 
     conn.execute(
-        "UPDATE doc_chunk_meta SET freshness_author_time=101 WHERE chunk_id=?1",
-        [chunk_id],
+        "UPDATE doc_file_provenance
+         SET projection_hash='projection-b', status='blame_failed'
+         WHERE file_id=?1",
+        [file_id],
     )?;
-    let newer_author = compute_snapshot(&conn)?;
-    assert_ne!(newer_author, stable);
-
     conn.execute(
         "UPDATE doc_chunk_meta
-         SET freshness_basis='working_tree', freshness_author_time=100
+         SET freshness_basis='working_tree', freshness_author_time=NULL,
+             freshness_committer_time=NULL
          WHERE chunk_id=?1",
         [chunk_id],
     )?;
-    let working_tree = compute_snapshot(&conn)?;
-    assert_ne!(working_tree, stable);
-    assert_ne!(working_tree, newer_author);
+    assert_eq!(compute_snapshot(&conn)?, stable_snapshot);
+    let changed_projection =
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?;
+    assert_ne!(changed_projection, stable_provenance);
 
-    conn.execute(
-        "UPDATE doc_chunk_meta
-         SET freshness_basis='git', freshness_author_time=100
-         WHERE chunk_id=?1",
-        [chunk_id],
-    )?;
-    conn.execute(
-        "UPDATE doc_file_provenance SET status='blame_failed' WHERE file_id=?1",
-        [file_id],
-    )?;
-    assert_ne!(compute_snapshot(&conn)?, stable);
-
-    conn.execute(
-        "UPDATE doc_file_provenance SET status='resolved' WHERE file_id=?1",
-        [file_id],
-    )?;
     conn.execute(
         "UPDATE meta SET value='documentation-provenance-v0'
          WHERE key='documentation_provenance_format_version'",
         [],
     )?;
-    assert_ne!(compute_snapshot(&conn)?, stable);
+    assert_eq!(compute_snapshot(&conn)?, stable_snapshot);
+    let changed_format =
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?;
+    assert_ne!(changed_format, changed_projection);
+
+    conn.execute(
+        "UPDATE meta SET value='true' WHERE key='documentation_provenance_enabled'",
+        [],
+    )?;
+    assert_eq!(compute_snapshot(&conn)?, stable_snapshot);
+    assert_ne!(
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?,
+        changed_format,
+        "readiness remains provenance-plane state even for an unchanged corpus"
+    );
     Ok(())
 }
 
 #[test]
-fn docs_provenance_snapshot_orders_by_source_identity_not_row_id() -> Result<()> {
-    let snapshot_for_order = |paths: &[&str]| -> Result<String> {
+fn documentation_provenance_digest_is_ordered_bound_and_complete() -> Result<()> {
+    let digest_for_rows = |rows: &[(&str, &str)], enabled: &str| -> Result<String> {
         let repo = tempfile::tempdir()?;
         let conn = store::open(repo.path())?;
         conn.execute_batch(&format!(
             "INSERT INTO meta(key,value) VALUES
                ('extraction_version','{}'),
                ('documentation_chunk_format_version','{}'),
-               ('documentation_provenance_format_version','{}');",
+               ('documentation_provenance_format_version','{}'),
+               ('documentation_provenance_enabled','{}');",
             crate::entity::EXTRACTION_VERSION,
             crate::docs::CHUNK_FORMAT_VERSION,
             crate::docs::PROVENANCE_FORMAT_VERSION,
+            enabled,
         ))?;
-        for (offset, path) in paths.iter().enumerate() {
+        for (offset, (path, projection)) in rows.iter().enumerate() {
             let id = offset as i64 + 1;
-            let (status, basis, author_time) = if *path == "a.md" {
-                ("resolved", "git", Some(10_i64))
-            } else {
-                ("untracked_or_new", "unknown", None)
-            };
             conn.execute(
                 "INSERT INTO files(id,path,hash,corpus,format,role,origin)
                  VALUES(?1,?2,?3,'docs','markdown','documentation','repository')",
                 rusqlite::params![id, path, format!("file-{path}")],
             )?;
             conn.execute(
-                "INSERT INTO chunks(
-                   id,file_id,kind,name,scope_chain,symbols,start,end,
-                   start_line,end_line,hash,content
-                 ) VALUES(?1,?1,'markdown_section',NULL,'','',0,4,1,1,?2,'body')",
-                rusqlite::params![id, format!("chunk-{path}")],
-            )?;
-            conn.execute(
-                "INSERT INTO doc_chunk_meta(
-                   chunk_id,title,breadcrumb,ordinal,front_matter_state,
-                   freshness_basis,freshness_author_time
-                 ) VALUES(?1,?2,'',0,'absent',?3,?4)",
-                rusqlite::params![id, path, basis, author_time],
-            )?;
-            conn.execute(
                 "INSERT INTO doc_file_provenance(
                    file_id,projection_hash,status,detail
-                 ) VALUES(?1,?2,?3,NULL)",
-                rusqlite::params![id, format!("projection-{path}"), status],
+                 ) VALUES(?1,?2,'resolved',NULL)",
+                rusqlite::params![id, projection],
             )?;
         }
-        compute_snapshot(&conn)
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)
     };
 
     assert_eq!(
-        snapshot_for_order(&["a.md", "b.md"])?,
-        snapshot_for_order(&["b.md", "a.md"])?
+        digest_for_rows(
+            &[("a.md", "projection-a"), ("b.md", "projection-b")],
+            "true"
+        )?,
+        digest_for_rows(
+            &[("b.md", "projection-b"), ("a.md", "projection-a")],
+            "true"
+        )?
+    );
+    assert_ne!(
+        digest_for_rows(
+            &[("a.md", "projection-a"), ("b.md", "projection-b")],
+            "true"
+        )?,
+        digest_for_rows(
+            &[("a.md", "projection-b"), ("b.md", "projection-a")],
+            "true"
+        )?,
+        "projection identities must remain bound to document paths"
+    );
+    assert_ne!(
+        digest_for_rows(&[], "true")?,
+        digest_for_rows(&[], "false")?,
+        "readiness must distinguish an empty enabled corpus from a disabled one"
+    );
+
+    let repo = tempfile::tempdir()?;
+    let conn = store::open(repo.path())?;
+    conn.execute_batch(&format!(
+        "INSERT INTO meta(key,value) VALUES
+           ('documentation_provenance_format_version','{}'),
+           ('documentation_provenance_enabled','true');
+         INSERT INTO files(path,hash,corpus,format,role,origin)
+           VALUES('bound.md','file-a','docs','markdown','documentation','repository');
+         INSERT INTO doc_file_provenance(file_id,projection_hash,status,detail)
+           SELECT id,'projection','resolved',NULL FROM files WHERE path='bound.md';",
+        crate::docs::PROVENANCE_FORMAT_VERSION,
+    ))?;
+    let bound = crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?;
+    conn.execute("UPDATE files SET hash='file-b' WHERE path='bound.md'", [])?;
+    let changed_hash =
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?;
+    assert_ne!(changed_hash, bound, "the digest must bind the file hash");
+    conn.execute("UPDATE files SET format='mdx' WHERE path='bound.md'", [])?;
+    assert_ne!(
+        crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)?,
+        changed_hash,
+        "the digest must bind the document format"
+    );
+
+    let repo = tempfile::tempdir()?;
+    let conn = store::open(repo.path())?;
+    conn.execute(
+        "INSERT INTO files(path,hash,corpus,format,role,origin)
+         VALUES('missing.md','file','docs','markdown','documentation','repository')",
+        [],
+    )?;
+    let error = crate::docs::provenance_store::compute_documentation_provenance_digest(&conn)
+        .expect_err("a docs file without provenance must not publish a digest");
+    assert!(
+        error
+            .to_string()
+            .contains("missing documentation provenance projection")
     );
     Ok(())
 }

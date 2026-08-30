@@ -322,7 +322,8 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
                'root', 'snapshot', 'projection_version', 'resolution_hash',
                'extraction_version', 'documentation_chunk_format_version',
                'documentation_provenance_format_version',
-               'documentation_provenance_enabled'
+               'documentation_provenance_enabled',
+               'documentation_provenance_digest'
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'format_contract_version:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
@@ -1306,6 +1307,7 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
          DELETE FROM files;
          DELETE FROM resolved_edges;
          DELETE FROM graph_nodes;
+         DELETE FROM meta WHERE key='documentation_provenance_digest';
          DROP TABLE docs_fts;
          DROP TABLE chunks_fts;",
     )?;
@@ -1808,18 +1810,22 @@ mod tests {
                VALUES('documentation_provenance_format_version','test-v1');
              INSERT INTO meta(key,value)
                VALUES('documentation_provenance_enabled','true');
+             INSERT INTO meta(key,value)
+               VALUES('documentation_provenance_digest','test-digest');
              UPDATE meta SET value='32' WHERE key='schema_version';",
         )?;
         drop(conn);
 
         let upgraded = open_path(&database)?;
-        let state: (String, i64, i64, i64, i64, i64) = upgraded.query_row(
+        let state: (String, i64, i64, i64, i64, i64, i64) = upgraded.query_row(
             "SELECT
                (SELECT value FROM meta WHERE key='schema_version'),
                (SELECT count(*) FROM meta
                 WHERE key='documentation_provenance_format_version'),
                (SELECT count(*) FROM meta
                 WHERE key='documentation_provenance_enabled'),
+               (SELECT count(*) FROM meta
+                WHERE key='documentation_provenance_digest'),
                (SELECT count(*) FROM doc_chunk_meta),
                (SELECT count(*) FROM doc_file_provenance),
                (SELECT count(*) FROM doc_blame_cache)",
@@ -1832,10 +1838,11 @@ mod tests {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
-        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0, 0, 0, 0));
+        assert_eq!(state, (SCHEMA_VERSION.into(), 0, 0, 0, 0, 0, 0));
         Ok(())
     }
 
@@ -2651,6 +2658,8 @@ mod tests {
              INSERT INTO doc_vector_generations(
                snapshot,profile_id,dimensions,chunk_format_version
              ) VALUES('snapshot',1,2,'documentation-v1');
+             INSERT INTO meta(key,value)
+               VALUES('documentation_provenance_digest','test-digest');
              CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
                embedding FLOAT[2] distance_metric=cosine,
                profile_id INTEGER PARTITION KEY,
@@ -2661,7 +2670,7 @@ mod tests {
         )?;
 
         reset_extraction_state(&conn)?;
-        let state: (i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
+        let state: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = conn.query_row(
             "SELECT
                (SELECT count(*) FROM files),
                (SELECT count(*) FROM docs_fts),
@@ -2670,7 +2679,9 @@ mod tests {
                (SELECT count(*) FROM doc_inventory),
                (SELECT count(*) FROM vec_doc_embeddings_2),
                (SELECT count(*) FROM embeddings),
-               (SELECT count(*) FROM doc_blame_cache)",
+               (SELECT count(*) FROM doc_blame_cache),
+               (SELECT count(*) FROM meta
+                WHERE key='documentation_provenance_digest')",
             [],
             |row| {
                 Ok((
@@ -2682,10 +2693,11 @@ mod tests {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
-        assert_eq!(state, (0, 0, 0, 0, 0, 0, 1, 1));
+        assert_eq!(state, (0, 0, 0, 0, 0, 0, 1, 1, 0));
         Ok(())
     }
 

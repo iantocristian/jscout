@@ -234,10 +234,23 @@ provenance and the bounded temporal reorder. `--no-freshness` disables only the
 query reorder and preserves relevance order for comparison; it does not rebuild
 the indexed projection.
 
-Enabled provenance still participates in the shared structural snapshot. A
-history-only attribution change can therefore rotate `meta.snapshot` and
-invalidate other snapshot-bound products. Separating that identity is deferred
-to a follow-up after this pull request.
+Documentation provenance publishes an internal
+`meta.documentation_provenance_digest` in the same database transaction as the
+shared snapshot. A history-only attribution change updates that digest without
+rotating `meta.snapshot`, so code-bound checker, semantic, and cursor state does
+not become stale solely because Git authorship metadata changed. Documentation
+source edits still rotate `meta.snapshot`, and public responses continue to
+report that shared snapshot; a full code/docs identity split is separate work.
+Snapshot equality covers indexed source content, not optional provenance fields
+or freshness-adjusted ranking.
+The first reindex after installing the digest-split version may rotate an older
+structural digest once because the structural hash contract itself changed.
+
+Git provenance control-file events also still request a full watch generation.
+The digest prevents cross-plane invalidation, but it does not yet provide a
+provenance-only watcher fast path. Full refreshes rematerialize any complete
+documentation-vector generation from the durable cache even when the rebuilt
+shared snapshot digest is unchanged.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:

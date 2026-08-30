@@ -2660,11 +2660,15 @@ mod tests {
             }
         )?);
 
-        crate::indexer::refresh_repo_with_options(
+        let refresh = crate::indexer::refresh_repo_with_options(
             root.path(),
             &conn,
             &crate::indexer::IndexOptions::default(),
         )?;
+        assert!(
+            refresh.extraction_reset,
+            "this regression must exercise the destructive full-refresh path"
+        );
         let rebuilt_snapshot = store::current_snapshot(&conn)?;
         assert_eq!(rebuilt_snapshot, code_changed_snapshot);
         assert!(generation_is_ready(
@@ -2675,6 +2679,19 @@ mod tests {
                 dimensions: 2,
             }
         )?);
+        let rematerialized: (i64, i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM doc_vector_generations WHERE profile_id=?1),
+               (SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1),
+               (SELECT COUNT(*) FROM vec_doc_embeddings_2 WHERE profile_id=?1)",
+            [profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            rematerialized,
+            (1, 1, 1),
+            "an identical full refresh must rebuild docs vector readiness and occurrences"
+        );
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM embeddings WHERE profile_id=?1",

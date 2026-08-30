@@ -10,7 +10,7 @@ use super::{
     incremental_refresh_repo_with_options, index_repo, index_repo_with_fs, index_repo_with_options,
     index_repo_with_options_and_fs, index_repo_with_post_replacement_failure,
     index_repo_with_rust_extraction_failure, refresh_repo_with_options,
-    watch_full_refresh_repo_rebinding_checker,
+    watch_full_refresh_repo_rebinding_checker, watch_full_refresh_repo_with_options,
 };
 use crate::test_fs::{FaultFileSystem, FileOperation};
 use crate::{docs, embed, origin, query, search, semantic, store, structural};
@@ -102,6 +102,14 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
         )
         .map_err(Into::into)
     };
+    let read_digest = || -> Result<String> {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [docs::PROVENANCE_DIGEST_META_KEY],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    };
     let read_provenance = || -> Result<(String, String, Option<i64>, Option<i64>)> {
         conn.query_row(
             "SELECT provenance.status, metadata.freshness_basis,
@@ -118,6 +126,8 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
         .map_err(Into::into)
     };
     assert_eq!(read_marker()?, "false");
+    let disabled_snapshot = structural::current_snapshot(&conn)?;
+    let disabled_digest = read_digest()?;
     assert_eq!(
         read_provenance()?,
         ("disabled".into(), "unknown".into(), None, None)
@@ -177,6 +187,9 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
 
     index_repo_with_docs_freshness(repo.path(), &conn)?;
     assert_eq!(read_marker()?, "true");
+    assert_eq!(structural::current_snapshot(&conn)?, disabled_snapshot);
+    let enabled_digest = read_digest()?;
+    assert_ne!(enabled_digest, disabled_digest);
     assert_eq!(
         read_provenance()?,
         (
@@ -246,6 +259,8 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
 
     index_repo(repo.path(), &conn)?;
     assert_eq!(read_marker()?, "false");
+    assert_eq!(structural::current_snapshot(&conn)?, disabled_snapshot);
+    assert_eq!(read_digest()?, disabled_digest);
     assert_eq!(
         read_provenance()?,
         ("disabled".into(), "unknown".into(), None, None)
@@ -349,7 +364,7 @@ fn indexer_publishes_git_provenance_and_ignores_noncontributing_comment_age() ->
 }
 
 #[test]
-fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() -> Result<()> {
+fn provenance_only_author_rewrite_rotates_its_digest_without_structural_churn() -> Result<()> {
     if Command::new("git").arg("--version").output().is_err() {
         return Ok(());
     }
@@ -370,6 +385,11 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
     let conn = store::open(repo.path())?;
     index_repo_with_docs_freshness(repo.path(), &conn)?;
     let snapshot = structural::current_snapshot(&conn)?;
+    let provenance_digest: String = conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [docs::PROVENANCE_DIGEST_META_KEY],
+        |row| row.get(0),
+    )?;
     let initial = {
         let mut statement = conn.prepare(
             "SELECT file.id, chunk.id, metadata.embedding_identity,
@@ -425,7 +445,13 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
     );
 
     let amend = Command::new("git")
-        .args(["commit", "--amend", "--no-edit", "--quiet"])
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--quiet",
+            "--date=2002-01-01T00:00:00+00:00",
+        ])
         .current_dir(repo.path())
         .env("GIT_COMMITTER_DATE", "2002-01-01T00:00:00+00:00")
         .output()?;
@@ -437,7 +463,20 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
 
     let refreshed = index_repo_with_docs_freshness(repo.path(), &conn)?;
     assert_eq!((refreshed.indexed, refreshed.unchanged), (1, 0));
+    assert!(
+        !refreshed.projection_rebuilt,
+        "provenance-only history changes must not rebuild the structural projection"
+    );
     assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_ne!(
+        conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [docs::PROVENANCE_DIGEST_META_KEY],
+            |row| row.get::<_, String>(0),
+        )?,
+        provenance_digest,
+        "the isolated provenance digest must record rewritten attribution"
+    );
     let current = {
         let mut statement = conn.prepare(
             "SELECT file.id, chunk.id, metadata.embedding_identity,
@@ -463,18 +502,18 @@ fn provenance_only_amend_keeps_multi_heading_chunk_ids_and_vector_readiness() ->
     assert_eq!(
         current
             .iter()
-            .map(|row| (&row.0, &row.1, &row.2, &row.3))
+            .map(|row| (&row.0, &row.1, &row.2))
             .collect::<Vec<_>>(),
         initial
             .iter()
-            .map(|row| (&row.0, &row.1, &row.2, &row.3))
+            .map(|row| (&row.0, &row.1, &row.2))
             .collect::<Vec<_>>()
     );
     assert!(
         current
             .iter()
             .zip(&initial)
-            .all(|(after, before)| after.4 != before.4)
+            .all(|(after, before)| after.3 != before.3 && after.4 != before.4)
     );
     assert_eq!(
         conn.query_row(
@@ -1174,6 +1213,11 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
         |row| row.get(0),
     )?;
     assert_eq!(old_provenance_marker, "true");
+    let old_provenance_digest: String = conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [docs::PROVENANCE_DIGEST_META_KEY],
+        |row| row.get(0),
+    )?;
     let old_rows = conn
         .prepare("SELECT path, hash FROM files ORDER BY path")?
         .query_map([], |row| {
@@ -1206,6 +1250,15 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
         )?,
         old_provenance_marker,
         "failed refresh published a mismatched provenance readiness marker"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [docs::PROVENANCE_DIGEST_META_KEY],
+            |row| row.get::<_, String>(0),
+        )?,
+        old_provenance_digest,
+        "failed refresh published a mismatched provenance digest"
     );
     let retained_rows = conn
         .prepare("SELECT path, hash FROM files ORDER BY path")?
@@ -3163,6 +3216,7 @@ fn normalize_g26_phase_zero_sections(sections: &mut [(String, String)]) {
                         && key != "root"
                         && key != "snapshot"
                         && key != "documentation_provenance_enabled"
+                        && key != "documentation_provenance_digest"
                         && key != "documentation_provenance_format_version"
                         && !key.starts_with("format_contract_version:")
                 })
@@ -3319,9 +3373,9 @@ fn phase_zero_registry_refactor_matches_pre_registry_golden() -> Result<()> {
     ));
     let mut expected =
         serde_json::from_value::<Vec<(String, String)>>(baseline["sections"].clone())?;
-    // #111 intentionally adds documentation provenance publication state to
-    // the structural snapshot. Normalize that independent post-baseline delta
-    // on both sides so this test remains specific to the G26 registry refactor.
+    // #111 added documentation provenance publication metadata after this
+    // baseline was recorded. Normalize that independent delta on both sides so
+    // this test remains specific to the G26 registry refactor.
     normalize_g26_phase_zero_sections(&mut expected);
     assert_eq!(
         sections, expected,
@@ -4010,6 +4064,53 @@ fn stale_checker_inputs_are_unpublished_even_when_rust_snapshot_is_unchanged() -
             |row| row.get::<_, i64>(0),
         )?,
         0
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -> Result<()> {
+    let (repo, _external, conn, batch, target, old_file_id, old_call_id) =
+        checker_rebind_fixture()?;
+    let snapshot = structural::current_snapshot(&conn)?;
+
+    let outcome =
+        watch_full_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(outcome.extraction_reset);
+    assert!(outcome.projection_rebuilt);
+    assert!(!outcome.checker_rebound);
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT id FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        batch,
+        "an identical watcher refresh must retain the active checker publication"
+    );
+
+    let current_ids: (i64, i64) = conn.query_row(
+        "SELECT file.id,call.rowid FROM files file
+         JOIN member_calls call ON call.file_id=file.id
+         WHERE file.path='service.ts' AND call.prop='load'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(
+        current_ids,
+        (old_file_id, old_call_id),
+        "identical extraction must deterministically reproduce checker source rowids"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1 AND source_ref_id=?2",
+            rusqlite::params![target, current_ids.1],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "the retained checker fact must re-project against the rebuilt canonical row"
     );
     Ok(())
 }

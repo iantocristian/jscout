@@ -855,7 +855,11 @@ fn index_repo_attempt<F: FileSystem>(
         let prepared = prepare_dependency_files(&plans, &mut outcome, operation.fs)?;
 
         conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version', 'resolution_hash')",
+            "DELETE FROM meta
+             WHERE key IN (
+               'snapshot', 'projection_version', 'resolution_hash',
+               'documentation_provenance_digest'
+             )",
             [],
         )?;
         Ok((
@@ -901,6 +905,7 @@ fn index_repo_attempt<F: FileSystem>(
             [root.to_string_lossy()],
         )?;
         let resolution = crate::structural::compute_resolution_hash(conn)?;
+        provenance_store::publish_documentation_provenance_digest(conn)?;
         let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
         if let Some(repository) = provenance_repository.as_ref() {
             validate_documentation_provenance_publication(

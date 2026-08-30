@@ -10,6 +10,7 @@ use super::provenance::{
 };
 
 const PROJECTION_DOMAIN: &[u8] = b"jscout-doc-provenance-projection-v1\0";
+const DIGEST_DOMAIN: &[u8] = b"jscout-documentation-provenance-digest-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentProvenanceStatus {
@@ -334,6 +335,88 @@ fn hash_optional_i64(hasher: &mut blake3::Hasher, value: Option<i64>) {
             hasher.update(&[0]);
         }
     }
+}
+
+fn hash_optional_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hash_field(hasher, value.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+/// Fold the current per-file projection identities into one deterministic
+/// provenance-plane identity. Path and content hash bind each projection to
+/// the exact document it describes. Missing persisted markers are explicit
+/// inputs; a missing per-file projection rejects publication rather than
+/// aliasing a complete one.
+pub(crate) fn compute_documentation_provenance_digest(conn: &Connection) -> Result<String> {
+    let published_format = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='documentation_provenance_format_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let enabled = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [super::PROVENANCE_ENABLED_META_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DIGEST_DOMAIN);
+    hash_field(&mut hasher, super::PROVENANCE_FORMAT_VERSION.as_bytes());
+    hash_optional_field(&mut hasher, published_format.as_deref());
+    hash_optional_field(&mut hasher, enabled.as_deref());
+
+    let mut statement = conn.prepare(
+        "SELECT file.path, file.hash, file.format, provenance.projection_hash
+         FROM files file
+         LEFT JOIN doc_file_provenance provenance ON provenance.file_id=file.id
+         WHERE file.corpus='docs'
+         ORDER BY file.path COLLATE BINARY",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    hasher.update(&(rows.len() as u64).to_le_bytes());
+    for row in rows {
+        let (path, file_hash, format, projection_hash) = row;
+        let projection_hash = projection_hash
+            .with_context(|| format!("missing documentation provenance projection for {path}"))?;
+        hash_field(&mut hasher, path.as_bytes());
+        hash_field(&mut hasher, file_hash.as_bytes());
+        hash_field(&mut hasher, format.as_bytes());
+        hash_field(&mut hasher, projection_hash.as_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Publish the provenance identity inside the caller's existing index
+/// transaction. Readers therefore observe either the previous complete pair
+/// of rows/digest or the replacement complete pair, never a mixture.
+pub(crate) fn publish_documentation_provenance_digest(conn: &Connection) -> Result<String> {
+    let digest = compute_documentation_provenance_digest(conn)?;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![super::PROVENANCE_DIGEST_META_KEY, &digest],
+    )?;
+    Ok(digest)
 }
 
 enum CacheLookup {
