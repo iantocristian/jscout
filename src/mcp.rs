@@ -360,7 +360,6 @@ pub fn serve(
                 log_tool_call(
                     &mut telemetry,
                     &ToolCallTelemetry {
-                        conn: &conn,
                         profile,
                         source_view,
                         tool: name,
@@ -515,7 +514,7 @@ fn render_tool_result(
 const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout is the repository index for source-backed code localization. ",
     "Use documentation_search for repository Markdown, MDX, and authored guidance; it has a separate documentation snapshot, and authored prose is not runtime proof. ",
-    "Every response reports its plane digest as snapshot and the global publication fold as publication_snapshot; only snapshot is an invalidation key. ",
+    "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "semantic_search spans all registered code formats by default; when the question names a language or implementation surface, pass its explicit formats allowlist. ",
     "For a code question with a usable identifier or file, localize first with the Investigation loop, even if the eventual question is causal or cross-file. Start with semantic_search exhaustive=true. Inspect the first page before traversing: if broad_or_query or the matches show a mis-specified evidence set, abandon that query, refine or use repository-local literal search, and never page merely because next_cursor exists; partial abandoned pages are not completeness evidence. For a valid traversal, preserve the original query and filter inputs and copy the exact returned next_cursor sequentially until truncated=false. The echoed scope is evidence, not a replacement request filter. Track total_chunks, page-local returned, and match_lines. ",
     "For exact drill-down, use definition with one returned sym: anchor plus the response snapshot. Preserve multi-anchor ambiguity instead of inventing a symbol anchor. For a file hit, pass its path to file_outline. Human-authored symbol mode is only a fuzzy localization fallback. Carry the original search's explicit origins and formats allowlists into locator follow-ups unchanged; if either was omitted, keep it omitted, and never synthesize it from echoed scope.origins or scope.formats. ",
@@ -528,7 +527,7 @@ const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
 const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout is persistent, evidence-backed repository memory with two conditional workflows. ",
     "Use documentation_search for repository Markdown, MDX, and authored guidance; it has a separate documentation snapshot, and authored prose is not runtime proof. ",
-    "Every response reports its plane digest as snapshot and the global publication fold as publication_snapshot; only snapshot is an invalidation key. ",
+    "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "semantic_search spans all registered code formats by default; when the question names a language or implementation surface, pass its explicit formats allowlist. ",
     "Investigation loop for a code question with a usable identifier or file: localize first, even when the eventual question is causal or cross-file. Start with semantic_search exhaustive=true and inspect its first page. If broad_or_query or the matches show a mis-specified evidence set, abandon that query, refine or use repository-local literal search, and never page merely because next_cursor exists; partial abandoned pages are not completeness evidence. For a valid traversal, preserve the original query and filter inputs and copy the exact next_cursor sequentially until truncated=false. The echoed scope is evidence, not a replacement request filter. Track total_chunks, page-local returned, and match_lines. ",
     "For exact drill-down, use definition with one returned sym: anchor plus the response snapshot, preserving multi-anchor ambiguity without invention. For a file hit, pass its path to file_outline. Human-authored symbol mode is only a fuzzy localization fallback. Carry the original search's explicit origins and formats allowlists into locator follow-ups unchanged; if either was omitted, keep it omitted, and never synthesize it from echoed scope.origins or scope.formats. If response_budget_too_small reports minimum_bytes=N, retry the same page and input cursor with response_bytes=N; the error is not cursor progress. State the response snapshot and echoed scope fields corpus, file_roles, origins, and formats in completeness answers, and treat repository convention as distinct from correctness or safety. Use a separate non-exhaustive ranked vector search with expand=false and include_memory=false, who_uses, or exact-anchor neighborhood only for aliases, callers, or relationships outside source-text matches; set vector=false and rerank=false for exact-identifier follow-ups unless lexical evidence is insufficient. ",
@@ -1887,7 +1886,6 @@ fn settle_value_rendered_bytes(value: &mut Value) -> Result<usize> {
 }
 
 struct ToolCallTelemetry<'a> {
-    conn: &'a Connection,
     profile: ToolProfile,
     source_view: scout::SourceView,
     tool: &'a str,
@@ -1933,22 +1931,17 @@ fn exhaustive_telemetry_metrics(result: Option<&Value>) -> ExhaustiveTelemetryMe
     }
 }
 
-fn telemetry_snapshot(conn: &Connection, tool: &str, result: &Result<String>) -> Option<String> {
+fn telemetry_snapshot(result: &Result<String>) -> Option<String> {
     result
         .as_ref()
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .and_then(|value| value["snapshot"].as_str().map(str::to_string))
-        .or_else(|| match tool {
-            "documentation_search" => crate::docs::store::current_snapshot(conn).ok(),
-            _ => structural::current_snapshot(conn).ok(),
-        })
 }
 
 fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let Some(file) = telemetry else { return };
     let ToolCallTelemetry {
-        conn,
         profile,
         source_view,
         tool,
@@ -1970,7 +1963,7 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
     let session = std::env::var("JSCOUT_SESSION_ID")
         .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
     let task = std::env::var("JSCOUT_TASK_ID").ok();
-    let snapshot = telemetry_snapshot(conn, tool, result);
+    let snapshot = telemetry_snapshot(result);
     let (ok, result_bytes) = match result {
         Ok(text) => (true, text.len()),
         Err(error) => (false, error.to_string().len()),

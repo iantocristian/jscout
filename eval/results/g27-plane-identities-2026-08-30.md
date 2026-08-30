@@ -39,7 +39,9 @@ accepted one request, waited 30 seconds, and returned one valid card; no remote
 provider was contacted.
 
 The G27 release binary was rebuilt from a clean committed checkpoint before
-the run. Later changes in the implementation branch were documentation only.
+the run. Later branch changes updated documentation and corrected failed-call
+MCP telemetry plane attribution; they did not change indexing, identity gates,
+query responses, or the evaluated command paths.
 
 ## Real-repository smoke tests
 

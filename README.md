@@ -238,13 +238,14 @@ the indexed projection.
 Documentation provenance publishes an internal
 `meta.documentation_provenance_digest` in the same database transaction as the
 code and documentation digests. A history-only attribution change rotates the
-global `publication_snapshot` fold while leaving both content digests stable,
+canonical `publication_snapshot` fold while leaving both content digests stable,
 so code-bound checker, semantic, and cursor state does not become stale solely
 because Git authorship metadata changed. A documentation source edit rotates
 the documentation digest and publication fold but leaves the code digest
 unchanged. Code and semantic responses expose the code digest as `snapshot`;
-documentation responses expose the documentation digest; every indexed
-response also carries `publication_snapshot` for cross-response correlation.
+documentation responses expose the documentation digest. Successful atomic
+query/read responses and `annotate` also carry `publication_snapshot` for
+canonical indexed-publication correlation.
 The first reindex after installing the split rebuilds disposable pre-split
 state once through the schema gate.
 

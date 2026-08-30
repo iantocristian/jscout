@@ -1223,7 +1223,7 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "one returned sym: anchor plus the response snapshot",
             "For a file hit, pass its path to file_outline",
             "plane digest as snapshot",
-            "global publication fold as publication_snapshot",
+            "canonical indexed publication identity as publication_snapshot",
             "Human-authored symbol mode",
             "spans all registered code formats by default",
             "original search's explicit origins and formats allowlists",
@@ -2602,24 +2602,12 @@ fn telemetry_counts_expansion_file_roles_without_recording_payloads() {
 }
 
 #[test]
-fn failed_tool_telemetry_uses_the_tool_plane_digest() -> Result<()> {
-    let repo = tempfile::tempdir()?;
-    fs::write(repo.path().join("a.ts"), "export const value = 1;\n")?;
-    fs::write(repo.path().join("README.md"), "# Guide\n\nDocumentation.\n")?;
-    let conn = store::open(repo.path())?;
-    indexer::index_repo(repo.path(), &conn)?;
-    let identities = crate::publication::Identities::read(&conn)?;
+fn failed_tool_telemetry_does_not_guess_a_snapshot() {
     let failed = Err(anyhow::anyhow!("retrieval failed"));
+    let successful = Ok(json!({ "snapshot": "observed" }).to_string());
 
-    assert_eq!(
-        telemetry_snapshot(&conn, "documentation_search", &failed),
-        Some(identities.documentation)
-    );
-    assert_eq!(
-        telemetry_snapshot(&conn, "semantic_search", &failed),
-        Some(identities.code)
-    );
-    Ok(())
+    assert_eq!(telemetry_snapshot(&failed), None);
+    assert_eq!(telemetry_snapshot(&successful).as_deref(), Some("observed"));
 }
 
 #[test]
