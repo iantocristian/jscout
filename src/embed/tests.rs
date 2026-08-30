@@ -2,15 +2,15 @@ use rusqlite::Connection;
 
 use super::{
     DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile,
-    SEMANTIC_DOCUMENT_TEXT_FORMAT, VectorFailureKind, code_vector_failure_action,
-    embed_missing_for_selection_report, embed_semantic_missing_report, embed_text, ensure_profile,
-    exact_semantic_vector_search, exact_vector_search, existing_profile,
-    materialize_cached_embeddings, missing_embedding_documents, profile_fingerprint,
-    ready_search_profile, semantic_embedding_documents, semantic_vector_failure,
-    semantic_vector_failure_action, semantic_vector_index_has_gaps, semantic_vector_table,
-    sync_semantic_vector_index, sync_vector_index, synchronize_vector_index, validate_endpoint,
-    vec_to_blob, vector_failure, vector_index_has_completed_sync, vector_index_needs_sync,
-    vector_search, vector_table, vector_table_exists,
+    SEMANTIC_DOCUMENT_TEXT_FORMAT, VectorFailureKind, clear_vector_rows,
+    code_vector_failure_action, embed_missing_for_selection_report, embed_semantic_missing_report,
+    embed_text, ensure_profile, exact_semantic_vector_search, exact_vector_search,
+    existing_profile, materialize_cached_embeddings, missing_embedding_documents,
+    profile_fingerprint, ready_search_profile, semantic_embedding_documents,
+    semantic_vector_failure, semantic_vector_failure_action, semantic_vector_index_has_gaps,
+    semantic_vector_table, sync_semantic_vector_index, sync_vector_index, synchronize_vector_index,
+    validate_endpoint, vec_to_blob, vector_failure, vector_index_has_completed_sync,
+    vector_index_needs_sync, vector_search, vector_table, vector_table_exists,
 };
 use crate::config::{EmbeddingSettings, InferenceSettings};
 
@@ -644,15 +644,20 @@ fn index_time_code_materialization_skips_other_profile_planes() -> anyhow::Resul
         )?;
     }
 
+    let assert_profile_tables = || -> anyhow::Result<()> {
+        for (_, dimensions, _, expected) in &profiles {
+            assert_eq!(
+                vector_table_exists(&connection, *dimensions)?,
+                *expected,
+                "unexpected code-vector materialization for dimension {dimensions}"
+            );
+        }
+        Ok(())
+    };
+    clear_vector_rows(&connection)?;
+    assert_profile_tables()?;
     materialize_cached_embeddings(&connection)?;
-
-    for (_, dimensions, _, expected) in profiles {
-        assert_eq!(
-            vector_table_exists(&connection, dimensions)?,
-            expected,
-            "unexpected code-vector materialization for dimension {dimensions}"
-        );
-    }
+    assert_profile_tables()?;
     Ok(())
 }
 

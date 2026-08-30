@@ -1086,19 +1086,7 @@ fn documentation_profiles(conn: &Connection) -> Result<Vec<ResolvedProfile>> {
 }
 
 fn clear_all_materialized_generations(conn: &Connection) -> Result<()> {
-    let tables = {
-        let mut statement = conn.prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type='table'
-               AND name GLOB 'vec_doc_embeddings_[0-9]*'
-               AND substr(name, length('vec_doc_embeddings_') + 1)
-                   NOT GLOB '*[^0-9]*'
-             ORDER BY name",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for table in tables {
+    for table in crate::embed::dimensioned_vector_tables(conn, "vec_doc_embeddings_")? {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
     conn.execute("DELETE FROM doc_vector_generations", [])?;
