@@ -932,8 +932,20 @@ fn index_repo_attempt<F: FileSystem>(
             #[cfg(test)]
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {
+                let remap_required = outcome.extraction_reset
+                    && previous.code_digest.as_deref() == Some(identities.code.as_str());
+                let remapped = if remap_required {
+                    store::rebind_active_checker_batch(conn, &identities.code, &identities.code)?
+                } else {
+                    false
+                };
+                let deactivated = if remap_required && !remapped {
+                    store::deactivate_active_checker_batch_for_snapshot(conn, &identities.code)?
+                } else {
+                    false
+                };
                 let _ = store::preserve_checker_carry_source_for_watch(conn)?;
-                false
+                remapped || deactivated
             }
             CheckerRetention::ValidateActive {
                 retain_failed_for_watch,
@@ -949,7 +961,9 @@ fn index_repo_attempt<F: FileSystem>(
                         }
                         None => false,
                     };
-                let rebound = if can_rebind {
+                let already_bound =
+                    previous.code_digest.as_deref() == Some(identities.code.as_str());
+                let rebound = if can_rebind && (outcome.extraction_reset || !already_bound) {
                     match previous.code_digest.as_deref() {
                         Some(old_code_digest) => store::rebind_active_checker_batch(
                             conn,
@@ -961,10 +975,16 @@ fn index_repo_attempt<F: FileSystem>(
                 } else {
                     false
                 };
-                outcome.checker_rebound = rebound;
-                let already_bound =
-                    previous.code_digest.as_deref() == Some(identities.code.as_str());
-                let retained = can_rebind && (already_bound || rebound);
+                // Keep the report plane-scoped: an equal-digest clone repairs
+                // extraction-local row IDs, but does not rebind the checker
+                // publication to a different code digest.
+                outcome.checker_rebound = rebound && !already_bound;
+                let retained = can_rebind
+                    && if outcome.extraction_reset {
+                        rebound
+                    } else {
+                        already_bound || rebound
+                    };
                 let active_changed = if retained {
                     if retain_failed_for_watch {
                         let _ = store::preserve_checker_carry_source_for_watch(conn)?;

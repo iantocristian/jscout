@@ -3993,7 +3993,39 @@ fn checker_rebind_fixture() -> Result<(
     i64,
     i64,
 )> {
+    checker_rebind_fixture_with_fragmented_ids(false)
+}
+
+fn fragmented_checker_rebind_fixture() -> Result<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    rusqlite::Connection,
+    i64,
+    String,
+    i64,
+    i64,
+)> {
+    checker_rebind_fixture_with_fragmented_ids(true)
+}
+
+fn checker_rebind_fixture_with_fragmented_ids(
+    fragment_ids: bool,
+) -> Result<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    rusqlite::Connection,
+    i64,
+    String,
+    i64,
+    i64,
+)> {
     let repo = tempfile::tempdir()?;
+    if fragment_ids {
+        fs::write(
+            repo.path().join("000-removed.ts"),
+            "declare const warmupProbe: { warmup(): void };\nwarmupProbe.warmup();\n",
+        )?;
+    }
     fs::write(
         repo.path().join("service.ts"),
         "export class Service { load() {} }\n\
@@ -4004,6 +4036,10 @@ fn checker_rebind_fixture() -> Result<(
     fs::write(&input, "declare interface ExternalInput { stable: true }\n")?;
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
+    if fragment_ids {
+        fs::remove_file(repo.path().join("000-removed.ts"))?;
+        index_repo(repo.path(), &conn)?;
+    }
     let (batch, target, source_file, member_call) =
         seed_active_checker_publication(repo.path(), &conn, &input)?;
     Ok((
@@ -4225,27 +4261,23 @@ fn stale_checker_inputs_are_unpublished_even_when_rust_snapshot_is_unchanged() -
     Ok(())
 }
 
-#[test]
-fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -> Result<()> {
+fn assert_identical_full_refresh_remaps_fragmented_checker_rowids(
+    refresh: fn(
+        &std::path::Path,
+        &rusqlite::Connection,
+        &IndexOptions,
+    ) -> Result<super::IndexOutcome>,
+    preserve_old_batch: bool,
+) -> Result<()> {
     let (repo, _external, conn, batch, target, old_file_id, old_call_id) =
-        checker_rebind_fixture()?;
+        fragmented_checker_rebind_fixture()?;
     let snapshot = structural::current_snapshot(&conn)?;
 
-    let outcome =
-        watch_full_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+    let outcome = refresh(repo.path(), &conn, &IndexOptions::default())?;
     assert!(outcome.extraction_reset);
     assert!(outcome.projection_rebuilt);
     assert!(!outcome.checker_rebound);
     assert_eq!(structural::current_snapshot(&conn)?, snapshot);
-    assert_eq!(
-        conn.query_row(
-            "SELECT id FROM checker_enrichment_batches WHERE active=1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?,
-        batch,
-        "an identical watcher refresh must retain the active checker publication"
-    );
 
     let current_ids: (i64, i64) = conn.query_row(
         "SELECT file.id,call.rowid FROM files file
@@ -4254,11 +4286,43 @@ fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(
+    assert_ne!(
         current_ids,
         (old_file_id, old_call_id),
-        "identical extraction must deterministically reproduce checker source rowids"
+        "the fixture must reach the same code digest through fragmented row IDs"
     );
+    let (current_batch, current_batch_snapshot): (i64, String) = conn.query_row(
+        "SELECT id,source_snapshot FROM checker_enrichment_batches WHERE active=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_ne!(current_batch, batch);
+    assert_eq!(current_batch_snapshot, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_file_id,member_call_id
+             FROM checker_enrichments WHERE batch_id=?1",
+            [current_batch],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?,
+        current_ids,
+        "the retained checker publication must use rebuilt extraction row IDs"
+    );
+    let old_batch_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM checker_enrichment_batches WHERE id=?1",
+        [batch],
+        |row| row.get(0),
+    )?;
+    if preserve_old_batch {
+        assert_eq!(old_batch_count, 1);
+        assert!(!conn.query_row(
+            "SELECT active FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| row.get::<_, bool>(0),
+        )?);
+    } else {
+        assert_eq!(old_batch_count, 0);
+    }
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM resolved_edges
@@ -4270,6 +4334,80 @@ fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -
         "the retained checker fact must re-project against the rebuilt canonical row"
     );
     Ok(())
+}
+
+#[test]
+fn identical_manual_full_refresh_remaps_fragmented_checker_rowids() -> Result<()> {
+    assert_identical_full_refresh_remaps_fragmented_checker_rowids(refresh_repo_with_options, false)
+}
+
+#[test]
+fn identical_watch_full_refresh_remaps_fragmented_checker_rowids() -> Result<()> {
+    assert_identical_full_refresh_remaps_fragmented_checker_rowids(
+        watch_full_refresh_repo_with_options,
+        true,
+    )
+}
+
+fn assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+    refresh: fn(
+        &std::path::Path,
+        &rusqlite::Connection,
+        &IndexOptions,
+    ) -> Result<super::IndexOutcome>,
+    preserve_old_batch: bool,
+) -> Result<()> {
+    let (repo, _external, conn, batch, _target, _file_id, _call_id) = checker_rebind_fixture()?;
+    conn.execute(
+        "UPDATE checker_enrichments SET call_start=call_start+1 WHERE batch_id=?1",
+        [batch],
+    )?;
+
+    let outcome = refresh(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(outcome.extraction_reset);
+    assert!(!outcome.checker_rebound);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "an unremappable checker publication must not remain active",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| row.get::<_, i64>(0),
+        )?,
+        i64::from(preserve_old_batch),
+    );
+    Ok(())
+}
+
+#[test]
+fn manual_full_refresh_drops_unremappable_checker_rows() -> Result<()> {
+    assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+        refresh_repo_with_options,
+        false,
+    )
+}
+
+#[test]
+fn watch_full_refresh_hides_unremappable_checker_rows_as_carry() -> Result<()> {
+    assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+        watch_full_refresh_repo_with_options,
+        true,
+    )
 }
 
 #[test]

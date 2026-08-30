@@ -1397,9 +1397,6 @@ pub(crate) fn rebind_active_checker_batch(
     previous_snapshot: &str,
     current_snapshot: &str,
 ) -> Result<bool> {
-    if previous_snapshot == current_snapshot {
-        return Ok(false);
-    }
     let Some(batch_id) = conn
         .query_row(
             "SELECT id FROM checker_enrichment_batches
